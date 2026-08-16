@@ -4122,6 +4122,25 @@ final class ZonvieCore {
         /// Last grid rows/cols set by applyExternalGridConfig (for exact change detection).
         var lastGridRows: UInt32 = 0
         var lastGridCols: UInt32 = 0
+        /// Stationary-edge anchors detected from the user's live-resize drag.
+        /// When grid_resize snaps the window to a cell-quantized size, the snap
+        /// must keep the edge the user is NOT dragging fixed (default: top-left).
+        var userResizeAnchorsBottom = false
+        var userResizeAnchorsRight = false
+        /// When the most recent live resize ended. The anchors describe one
+        /// gesture, so they expire shortly after it: see anchorsDescribeCurrentGesture.
+        private var liveResizeEndedAt = -Double.greatestFiniteMagnitude
+        /// Previous window frame, used to detect which edges moved during live resize.
+        private var previousFrame: NSRect?
+
+        /// Neovim confirms a drag's final size a few milliseconds after mouse-up,
+        /// so the anchors must outlive the gesture by a short grace period. They
+        /// then expire on their own, keeping them out of later Neovim-driven
+        /// resizes (:resize, <C-w>+, guifont change), which must anchor top-left.
+        /// The window covers the observed ext-grid flush stalls with margin.
+        var anchorsDescribeCurrentGesture: Bool {
+            ProcessInfo.processInfo.systemUptime - liveResizeEndedAt < 0.25
+        }
 
         init(core: ZonvieCore, gridId: Int64, cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
             self.core = core
@@ -4132,12 +4151,26 @@ final class ZonvieCore {
         }
 
         func windowDidResize(_ notification: Notification) {
+            guard let window = notification.object as? NSWindow else { return }
+            let frame = window.frame
+            defer { previousFrame = frame }
+
             // Skip resize callback when window is being resized programmatically
             // (from Neovim grid_resize). Only report back on user-initiated resizes.
             if suppressResizeCallback { return }
 
-            guard let window = notification.object as? NSWindow,
-                  let core = core else { return }
+            if window.inLiveResize, let prev = previousFrame {
+                // The stationary edge is the anchor the programmatic cell-snap
+                // must preserve (macOS coords: minY = bottom edge).
+                let bottomMoved = abs(prev.minY - frame.minY) > 0.5
+                let topMoved = abs(prev.maxY - frame.maxY) > 0.5
+                if topMoved != bottomMoved { userResizeAnchorsBottom = topMoved }
+                let leftMoved = abs(prev.minX - frame.minX) > 0.5
+                let rightMoved = abs(prev.maxX - frame.maxX) > 0.5
+                if leftMoved != rightMoved { userResizeAnchorsRight = leftMoved }
+            }
+
+            guard let core = core else { return }
 
             let scale = window.backingScaleFactor
             let contentSize = window.contentView?.frame.size ?? window.frame.size
@@ -4160,6 +4193,18 @@ final class ZonvieCore {
             if rows > 0 && cols > 0 {
                 ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(rows) cols=\(cols)")
                 core.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
+            }
+        }
+
+        func windowDidEndLiveResize(_ notification: Notification) {
+            liveResizeEndedAt = ProcessInfo.processInfo.systemUptime
+        }
+
+        func windowDidMove(_ notification: Notification) {
+            // Keep previousFrame fresh so the first live-resize event after a
+            // title-bar drag compares against the post-move frame.
+            if let window = notification.object as? NSWindow {
+                previousFrame = window.frame
             }
         }
 
@@ -4820,16 +4865,25 @@ final class ZonvieCore {
             delegate?.lastGridCols = cols
             delegate?.suppressResizeCallback = true
 
-            // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
+            // Anchor the edge the user is not dragging: default top-left, but a
+            // top-edge drag keeps the bottom fixed and a left-edge drag keeps
+            // the right fixed (macOS coords: origin.y + height = top).
+            // The anchors describe one drag, so they apply while it is running
+            // and to its trailing confirmation; every other resize falls back
+            // to the top-left anchor.
             let oldFrame = window.frame
             let oldTop = oldFrame.origin.y + oldFrame.height
+            let anchorsApply = window.inLiveResize
+                || (delegate?.anchorsDescribeCurrentGesture ?? false)
+            let anchorBottom = anchorsApply && (delegate?.userResizeAnchorsBottom ?? false)
+            let anchorRight = anchorsApply && (delegate?.userResizeAnchorsRight ?? false)
 
             // Use setContentSize approach: compute new frame from desired content rect
             let contentRect = NSRect(x: oldFrame.origin.x, y: 0, width: contentWidth, height: contentHeight)
             let frameRect = window.frameRect(forContentRect: contentRect)
             let newFrame = NSRect(
-                x: oldFrame.origin.x,
-                y: oldTop - frameRect.height,
+                x: anchorRight ? oldFrame.maxX - frameRect.width : oldFrame.origin.x,
+                y: anchorBottom ? oldFrame.origin.y : oldTop - frameRect.height,
                 width: frameRect.width,
                 height: frameRect.height
             )
