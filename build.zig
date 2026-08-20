@@ -291,6 +291,30 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(coordinator_tests).step);
 
+    // Contract A2 settle-animation math is std-only and must execute on the
+    // native host, including WSL/Linux builds.
+    const settle_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/settle_math.zig"),
+    });
+    const settle_math_tests = b.addTest(.{
+        .name = "zonvie-settle-math-tests",
+        .root_module = settle_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(settle_math_tests).step);
+
+    const settle_policy_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/settle_policy.zig"),
+    });
+    const settle_policy_tests = b.addTest(.{
+        .name = "zonvie-settle-policy-tests",
+        .root_module = settle_policy_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(settle_policy_tests).step);
+
     // Contract A2 flush-stage accumulation (A0 extension) is std-only and
     // must execute on the native host, including WSL/Linux builds.
     const stage_math_test_mod = b.createModule(.{
