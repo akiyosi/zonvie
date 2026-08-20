@@ -304,6 +304,31 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(settle_math_tests).step);
 
+    // Contract B grid-continuity ease math is std-only and executes natively.
+    const ease_math_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/ease_math.zig"),
+    });
+    const ease_math_tests = b.addTest(.{
+        .name = "zonvie-ease-math-tests",
+        .root_module = ease_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(ease_math_tests).step);
+
+    // Contract B1 CPU retention ring bookkeeping is std-only and runs on the
+    // native host; the app-side vertex storage is intentionally not imported.
+    const retention_ring_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/retention_ring.zig"),
+    });
+    const retention_ring_tests = b.addTest(.{
+        .name = "zonvie-retention-ring-tests",
+        .root_module = retention_ring_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(retention_ring_tests).step);
+
     const settle_policy_test_mod = b.createModule(.{
         .target = b.graph.host,
         .optimize = optimize,
@@ -327,6 +352,19 @@ pub fn build(b: *std.Build) !void {
         .root_module = stage_math_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(stage_math_tests).step);
+
+    // Contract B main-record routing/ledger helpers are std-only and must
+    // execute on the native host, including WSL/Linux builds.
+    const route_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/route_math.zig"),
+    });
+    const route_math_tests = b.addTest(.{
+        .name = "zonvie-route-math-tests",
+        .root_module = route_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(route_math_tests).step);
 
     // Key input tests
     const key_test_mod = b.createModule(.{
