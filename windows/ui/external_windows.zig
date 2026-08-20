@@ -13,6 +13,20 @@ const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const core = @import("zonvie_core");
+const scroll_types = @import("../scroll/types.zig");
+const smooth_session = @import("../scroll/session.zig");
+
+fn setExternalTransition(app: *App, hwnd: c.HWND, dpi: bool, value: bool) void {
+    app.mu.lockUncancelable(core.clock.io());
+    var it = app.external_windows.valueIterator();
+    while (it.next()) |ext| {
+        if (ext.*.hwnd == hwnd) {
+            if (dpi) ext.*.dpi_changing = value else ext.*.resizing = value;
+            break;
+        }
+    }
+    app.mu.unlock(core.clock.io());
+}
 
 const ExternalSurfaceKind = enum {
     normal,
@@ -1671,6 +1685,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
+    // Advance the surface incarnation under app.mu; the token built from
+    // (grid_id, incarnation) keeps stale smooth-scroll callbacks and records
+    // off a window that reuses this grid_id or HWND after destruction.
+    app.external_incarnation_counter += 1;
     ext_window_ptr.* = app_mod.ExternalWindow{
         .hwnd = hwnd.?,
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
@@ -1678,6 +1696,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         .renderer = renderer,
         .surface = .{ .rows = req.rows, .cols = req.cols },
         .is_float_external = is_float,
+        .incarnation = app.external_incarnation_counter,
     };
     if (!window_mod.installWindowWakeCookie(hwnd.?, ext_window_ptr.window_wake_cookie)) {
         app.mu.unlock(core.clock.io());
@@ -1801,7 +1820,8 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_external_window_close: grid_id={d}\n", .{grid_id});
-
+    // This callback runs on the core thread. Request the UI-thread teardown
+    // without touching DM/DirectComposition here.
     // Mark the window as pending close (don't remove from HashMap yet to avoid use-after-free)
     // The actual removal and cleanup will happen on the UI thread in closeExternalWindowOnUIThread.
     //
@@ -1814,9 +1834,11 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     // will find no match and be a no-op when the UI thread processes it.
     app.mu.lockUncancelable(core.clock.io());
     const main_hwnd = app.hwnd;
+    var closed_surface: ?scroll_types.SurfaceToken = null;
     if (app.external_windows.get(grid_id)) |ext_win| {
         ext_win.is_pending_close = true;
         app.external_close_drain_needed = true;
+        closed_surface = .{ .grid_id = grid_id, .incarnation = ext_win.incarnation };
     }
     var i: usize = 0;
     var removed: usize = 0;
@@ -1857,6 +1879,11 @@ pub fn onExternalWindowClose(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
         }
     }
     app.mu.unlock(core.clock.io());
+    if (closed_surface) |surface| {
+        if (smooth_session.activeIdentity()) |active| {
+            if (active.surface.eql(surface)) smooth_session.requestReset(app, active, .generation_mismatch);
+        }
+    }
     if (removed > 0 and applog.isEnabled()) {
         applog.appLog("[win] on_external_window_close: dropped {d} stale pending request(s) for grid_id={d}\n", .{ removed, grid_id });
     }
@@ -1910,8 +1937,10 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
     // Check if paint is in progress - if so, defer the close
     // DXGI operations can pump messages, so close could be triggered during paint
+    var owned_hwnd: ?c.HWND = null;
     app.mu.lockUncancelable(core.clock.io());
     if (app.external_windows.get(grid_id)) |ew| {
+        owned_hwnd = ew.hwnd;
         if (ew.paint_ref_count > 0) {
             // Paint is in progress - just mark as pending and let paint trigger close when done
             ew.is_pending_close = true;
@@ -1920,6 +1949,9 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
             return;
         }
     }
+    app.mu.unlock(core.clock.io());
+    if (owned_hwnd) |hwnd| smooth_session.onSurfaceInvalidated(app, hwnd, .generation_mismatch);
+    app.mu.lockUncancelable(core.clock.io());
 
     // Save window position before removing (for tab switch restoration)
     if (app.external_windows.get(grid_id)) |ew| {
@@ -2074,6 +2106,31 @@ pub export fn ExternalWndProc(
     lParam: c.LPARAM,
 ) callconv(.winapi) c.LRESULT {
     switch (msg) {
+        c.WM_POINTERDOWN, c.DM_POINTERHITTEST => {
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                var grid_id: ?i64 = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| if (entry.value_ptr.*.hwnd == hwnd) {
+                    grid_id = entry.key_ptr.*;
+                    break;
+                };
+                app.mu.unlock(core.clock.io());
+                if (grid_id) |gid| {
+                    // Use GET_POINTERID_WPARAM(wParam) semantics for both
+                    // entry points; the MinGW Zig macro has a c_int/
+                    // c_ulonglong conflict, so keep its LOWORD operation
+                    // explicit and never reuse an earlier arming id.
+                    const pointer_id: u32 = @intCast(@as(usize, @bitCast(wParam)) & 0xffff);
+                    const consumed = if (msg == c.WM_POINTERDOWN)
+                        smooth_session.onPointerDown(app, hwnd, gid, pointer_id)
+                    else
+                        smooth_session.onDmPointerHitTest(app, hwnd, gid, pointer_id);
+                    if (consumed) return 0;
+                }
+            }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+        },
         // Keep the acrylic backdrop blurred when the window is inactive by
         // forcing DWM to treat it as active (matches the main window).
         c.WM_NCACTIVATE => {
@@ -2086,6 +2143,9 @@ pub export fn ExternalWndProc(
         },
         0x02E0 => { // WM_DPICHANGED
             if (app_mod.getApp(hwnd)) |app| {
+                setExternalTransition(app, hwnd, true, true);
+                defer setExternalTransition(app, hwnd, true, false);
+                smooth_session.onSurfaceInvalidated(app, hwnd, .generation_mismatch);
                 // Device/D2D/renderer creation in WM_APP_DEVICE_LOST_RECOVER
                 // can pump messages and reenter this handler on the same UI
                 // thread while that handler still holds app.mu/atlas.mu for
@@ -2209,6 +2269,7 @@ pub export fn ExternalWndProc(
         },
         c.WM_CLOSE => {
             // Don't destroy - just hide or let the core handle it
+            if (app_mod.getApp(hwnd)) |app| smooth_session.onSurfaceInvalidated(app, hwnd, .generation_mismatch);
             _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
         },
@@ -2320,6 +2381,9 @@ pub export fn ExternalWndProc(
         },
         c.WM_SIZE => {
             if (app_mod.getApp(hwnd)) |app| {
+                setExternalTransition(app, hwnd, false, true);
+                defer setExternalTransition(app, hwnd, false, false);
+                smooth_session.onSurfaceInvalidated(app, hwnd, .generation_mismatch);
                 // See WM_DPICHANGED's identical guard above — device-lost
                 // recovery can reenter this handler on the same UI thread
                 // while still holding app.mu/atlas.mu for parts of its own
@@ -2395,14 +2459,16 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, false);
+                    if (!smooth_session.processWheel(app, hwnd, grid_id.?, c.WM_MOUSEWHEEL, wParam, lParam, false)) {
+                        input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, false);
 
-                    // Show scrollbar on scroll if in scroll mode
-                    if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
-                        scrollbar.showScrollbarForExternal(hwnd, ext_window.?);
-                        // Auto-hide after delay
-                        const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
-                        _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+                        // Show scrollbar on scroll if in scroll mode
+                        if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
+                            scrollbar.showScrollbarForExternal(hwnd, ext_window.?);
+                            // Auto-hide after delay
+                            const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
+                            _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+                        }
                     }
                 }
                 return 0;
@@ -2425,7 +2491,32 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, true);
+                    if (!smooth_session.processWheel(app, hwnd, grid_id.?, c.WM_MOUSEHWHEEL, wParam, lParam, true)) {
+                        input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, true);
+                    }
+                }
+                return 0;
+            }
+        },
+
+        c.WM_POINTERWHEEL, c.WM_POINTERHWHEEL => {
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                var grid_id: ?i64 = null;
+                var it = app.external_windows.iterator();
+                while (it.next()) |entry| {
+                    if (entry.value_ptr.*.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
+                        break;
+                    }
+                }
+                app.mu.unlock(core.clock.io());
+
+                if (grid_id) |gid| {
+                    const horizontal = msg == c.WM_POINTERHWHEEL;
+                    if (!smooth_session.processWheel(app, hwnd, gid, msg, wParam, lParam, horizontal)) {
+                        input.handleMouseWheel(hwnd, wParam, lParam, app, gid, horizontal);
+                    }
                 }
                 return 0;
             }
@@ -3512,6 +3603,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
 
+    // A2 records force a Present even when there is no retained back-buffer
+    // damage. They are retired only after that Present succeeds.
+    const a2_due = tbs_snapshot.outermost_paint and ext_win.tbs.hasSettleCommitsUpTo(tbs_snapshot.commit_rev);
+
     if (is_row_mode_normal and tbs_committed.metrics_gen != shared_metrics_gen_snapshot) {
         requeueExternalFullPaint(app, grid_id, hwnd);
         return;
@@ -3566,11 +3661,17 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             break :blk (cw != g.width or ch != g.height);
         };
         if (size_mismatch) {
+            smooth_session.onSurfaceInvalidatedFromPaint(app, hwnd, .generation_mismatch);
             g.resize() catch |e| {
+                ext_win.a2_settle.drop(!g.device_lost);
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             };
+            // Renderer resize already snaps the permanent visual and commits;
+            // discard only the ended animation/state here, without a second
+            // DirectComposition Commit.
+            ext_win.a2_settle.drop(!g.device_lost);
             // back_tex was recreated — force full repaint so all rows are redrawn.
             ext_paint_full = true;
 
@@ -3646,6 +3747,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
             g.presentOnlyFromBack(null) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
+                smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, false);
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             };
@@ -3654,6 +3756,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
+            smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, true);
             completeExternalPaintRetry(ext_win);
             return;
         }
@@ -3696,11 +3799,13 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             }
         }
 
-        if (!force_full_present and ext_win.paint_present_rects.items.len == 0) {
+        const semantic_due = smooth_session.semanticDue(app, ext_win, tbs_snapshot);
+        if (!force_full_present and ext_win.paint_present_rects.items.len == 0 and !semantic_due and !a2_due) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
             completeExternalPaintRetry(ext_win);
             return;
         }
+        if (semantic_due and applog.isEnabled()) applog.appLog("[smooth] semantic-due Present forced commit_rev={d}\n", .{tbs_snapshot.commit_rev});
 
         g.presentFromBackRectsWithCursorNoResize(
             ext_win.paint_present_rects.items,
@@ -3712,13 +3817,17 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             null,
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow partial present failed: {any}\n", .{e});
+            smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, false);
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         };
         if (g.device_lost) {
+            ext_win.a2_settle.drop(false);
+            smooth_session.onSurfaceInvalidatedFromPaint(app, hwnd, .presentation_failure);
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         }
+        smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, true);
         completeExternalPaintRetry(ext_win);
     } else {
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});

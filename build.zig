@@ -366,6 +366,56 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(route_math_tests).step);
 
+    // Contract A session-owner decision tests. The module imports Win32 app
+    // plumbing, so WSL/Linux builds compile this Windows test artifact instead
+    // of trying to execute it on the host.
+    const smooth_session_test_mod = b.createModule(.{
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = true,
+        // Same-module source imports are traversed by Zig's test discovery;
+        // windows/main.zig reaches scroll/session.zig through window.zig.
+        .root_source_file = b.path("windows/main.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    // Session tests exercise pure owner/coordinator predicates. Link the core
+    // archive only on a native Windows build where its target matches this PE.
+    if (@import("builtin").os.tag == .windows) smooth_session_test_mod.linkLibrary(core_lib);
+    smooth_session_test_mod.linkSystemLibrary("user32", .{});
+    smooth_session_test_mod.linkSystemLibrary("gdi32", .{});
+    smooth_session_test_mod.linkSystemLibrary("kernel32", .{});
+    smooth_session_test_mod.linkSystemLibrary("imm32", .{});
+    smooth_session_test_mod.linkSystemLibrary("dwrite", .{});
+    smooth_session_test_mod.linkSystemLibrary("d2d1", .{});
+    smooth_session_test_mod.linkSystemLibrary("ole32", .{});
+    smooth_session_test_mod.linkSystemLibrary("d3d11", .{});
+    smooth_session_test_mod.linkSystemLibrary("dxgi", .{});
+    smooth_session_test_mod.linkSystemLibrary("d3dcompiler_47", .{});
+    smooth_session_test_mod.linkSystemLibrary("dcomp", .{});
+    smooth_session_test_mod.linkSystemLibrary("dwmapi", .{});
+    smooth_session_test_mod.linkSystemLibrary("credui", .{});
+    smooth_session_test_mod.linkSystemLibrary("advapi32", .{});
+    smooth_session_test_mod.linkSystemLibrary("shell32", .{});
+    smooth_session_test_mod.linkSystemLibrary("winmm", .{});
+    smooth_session_test_mod.linkSystemLibrary("msimg32", .{});
+    smooth_session_test_mod.linkSystemLibrary("comdlg32", .{});
+    const smooth_session_tests = b.addTest(.{
+        .name = "zonvie-windows-smooth-session-tests",
+        .root_module = smooth_session_test_mod,
+    });
+    const smooth_session_run = b.addRunArtifact(smooth_session_tests);
+    // The WSL host cannot execute a Windows PE test binary; Windows hosts
+    // execute the artifact normally while cross-target test builds remain
+    // part of the test graph.
+    if (@import("builtin").os.tag == .windows) {
+        test_step.dependOn(&smooth_session_run.step);
+    } else {
+        test_step.dependOn(&smooth_session_tests.step);
+    }
+
     // Key input tests
     const key_test_mod = b.createModule(.{
         .target = target,
