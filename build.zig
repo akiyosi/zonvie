@@ -280,6 +280,30 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Pure Contract A Windows smooth-scroll accounting tests.
+    const coordinator_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/coordinator.zig"),
+    });
+    const coordinator_tests = b.addTest(.{
+        .root_module = coordinator_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(coordinator_tests).step);
+
+    // Contract A2 flush-stage accumulation (A0 extension) is std-only and
+    // must execute on the native host, including WSL/Linux builds.
+    const stage_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/stage_math.zig"),
+    });
+    const stage_math_tests = b.addTest(.{
+        .name = "zonvie-stage-math-tests",
+        .root_module = stage_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(stage_math_tests).step);
+
     // Key input tests
     const key_test_mod = b.createModule(.{
         .target = target,
