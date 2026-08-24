@@ -307,6 +307,11 @@ test "e2e:msg_ext_float_timeout" {
     try @import("scenarios/msg_ext_float_timeout.zig").run(testing.allocator);
 }
 
+test "e2e:msg_ext_float_width_shrink" {
+    try requireNvim();
+    try @import("scenarios/msg_ext_float_width_shrink.zig").run(testing.allocator);
+}
+
 test "e2e:msg_repeat_updates" {
     try requireNvim();
     try @import("scenarios/msg_repeat_updates.zig").run(testing.allocator);
