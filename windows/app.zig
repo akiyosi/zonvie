@@ -3820,7 +3820,7 @@ pub const App = struct {
     // hasPresentedOnce on MetalTerminalRenderer.
     back_tex_valid: bool = false,
 
-    linespace_px: u32 = 0,
+    linespace_px: i32 = 0,
 
     // DPI scaling factor (e.g. 1.0 at 96 DPI, 2.0 at 192 DPI)
     dpi_scale: f32 = 1.0,
@@ -4049,6 +4049,15 @@ pub const App = struct {
     pub const max_row_buffers: u32 = 20_000;
 
     pub const AtlasResetAdmission = render_pipeline_helpers.AtlasResetAdmission;
+
+    /// Height of one grid row: the cell plus 'linespace'. Neovim allows
+    /// 'linespace' to be negative to tighten rows under a font that reserves
+    /// too much room between lines, so the sum is taken signed and floored —
+    /// the layout divides the client area by this to get its row count.
+    pub fn rowHeightPx(self: *const App) u32 {
+        const total: i32 = @as(i32, @intCast(self.cell_h_px)) + self.linespace_px;
+        return if (total < 1) 1 else @intCast(total);
+    }
 
     /// Close paint admission before onAtlasCreate invalidates the atlas.
     /// This is non-blocking because the core callback can hold grid_mu while a
@@ -4892,7 +4901,7 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const h = content.h;
 
     const cw: u32 = @max(1, app.cell_w_px);
-    const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const ch: u32 = app.rowHeightPx();
 
     if (applog.isEnabled()) applog.appLog(
         "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
@@ -4978,7 +4987,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
 
     const cw: u32 = @max(1, app.cell_w_px);
-    const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const ch: u32 = app.rowHeightPx();
 
     const rows: u32 = @intCast(@max(1, h / ch));
     const cols: u32 = @intCast(@max(1, w / cw));

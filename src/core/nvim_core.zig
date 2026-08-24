@@ -748,7 +748,7 @@ pub const Core = struct {
     cell_h_px: u32 = 1,
 
     /// Extra pixels between lines (Neovim 'linespace').
-    linespace_px: u32 = 0,
+    linespace_px: i32 = 0,
 
     /// Set by zonvie_core_abort_flush() from on_flush_begin callback.
     /// When true, the flush pipeline skips vertex generation and atlas operations.
