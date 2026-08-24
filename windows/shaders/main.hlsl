@@ -11,17 +11,119 @@ struct VSIn {
     float deco_phase : TEXCOORD1;
 };
 
+// Decoration bits shared with zonvie_core.h. SCROLLABLE is transport-only and
+// must not alter pixel output when the offset count is zero.
+#define DECO_UNDERCURL     (1u << 0)
+#define DECO_UNDERLINE     (1u << 1)
+#define DECO_UNDERDOUBLE   (1u << 2)
+#define DECO_UNDERDOTTED   (1u << 3)
+#define DECO_UNDERDASHED   (1u << 4)
+#define DECO_STRIKETHROUGH (1u << 5)
+#define DECO_CURSOR         (1u << 6)
+#define DECO_SCROLLABLE     (1u << 7)
+#define DECO_OVERLINE       (1u << 8)
+#define DECO_GLOW           (1u << 9)
+#define DECO_COLOR_EMOJI    (1u << 10)
+
+// The CPU upload is exactly 28 bytes per entry.  grid_id is the low 32 bits
+// of the i64 vertex id; the high word remains in the vertex input only so the
+// existing ABI and input layout stay unchanged.
+struct ScrollOffset {
+    int grid_id;
+    float offset_ndc;
+    float content_top_ndc;    // local NDC in the content viewport
+    float content_bottom_ndc; // local NDC in the content viewport
+    int move_all;
+    int pin_edges;
+    int zindex;
+};
+
+// b0 is shared by the main color, cursor, and bloom-extract VS/PS entrypoints.
+// content_viewport_height_px is cell-snapped and uses the same value as the
+// vertex viewport.  row_translation_ndc is deliberately zero until the
+// recompose path switches from viewport translation to shader translation.
+cbuffer ScrollParams : register(b0) {
+    uint scrollOffsetCount;
+    float content_viewport_top_px;
+    float content_viewport_height_px;
+    float row_translation_ndc;
+};
+
+// t2 is reserved for this structured SRV (atlasTex remains t0, glowTex t1).
+StructuredBuffer<ScrollOffset> scrollOffsets : register(t2);
+
 struct VSOut {
     float4 pos : SV_Position;
     float2 uv  : TEXCOORD0;
     float4 col : COLOR0;
     uint deco_flags : BLENDINDICES0;
     float deco_phase : TEXCOORD1;
+    float was_scrolled : TEXCOORD2;
+    float content_top_ndc : TEXCOORD3;
+    float content_bottom_ndc : TEXCOORD4;
 };
 
 VSOut VSMain(VSIn i) {
     VSOut o;
-    o.pos = float4(i.pos.xy, 0.0, 1.0);
+    float2 pos = i.pos;
+    o.was_scrolled = 0.0;
+    o.content_top_ndc = 2.0;
+    o.content_bottom_ndc = -2.0;
+
+    // Count is checked before any new work.  With the identity gate (count
+    // zero) this is the old pass-through shader path, including row translation
+    // staying at its zero default.
+    if (scrollOffsetCount != 0u) {
+        // Row translation is intentionally before the pin test.  The current
+        // app path still expresses it through the D3D viewport and leaves this
+        // value at zero; the two forms are required to remain equivalent.
+        pos.y += row_translation_ndc;
+
+        // scrollOffsets is sorted by signed grid_id.  Compare only the low
+        // 32-bit word of the i64 vertex id (int2.x is the little-endian low
+        // word supplied by the existing BLENDINDICES ABI).
+        uint match = scrollOffsetCount;
+        uint lo = 0u;
+        uint hi = scrollOffsetCount;
+        while (lo < hi) {
+            uint mid = lo + ((hi - lo) >> 1u);
+            if (scrollOffsets[mid].grid_id < i.grid_id.x) {
+                lo = mid + 1u;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < scrollOffsetCount && scrollOffsets[lo].grid_id == i.grid_id.x) {
+            match = lo;
+        }
+
+        if (match < scrollOffsetCount) {
+            ScrollOffset scroll = scrollOffsets[match];
+            o.content_top_ndc = scroll.content_top_ndc;
+            o.content_bottom_ndc = scroll.content_bottom_ndc;
+
+            if (scroll.move_all != 0 || (i.deco_flags & DECO_SCROLLABLE) != 0) {
+                // Background quads use uv.x below zero; the -1 sentinel
+                // distinguishes them from the negative icon markers.
+                bool is_background = i.uv.x < 0.0 && abs(i.uv.x + 1.0) < 0.001;
+                bool pinned = false;
+                if (is_background && scroll.move_all == 0 && scroll.pin_edges != 0) {
+                    // Positive NDC offset opens the bottom gap; negative NDC
+                    // offset opens the top gap.  Keep only the edge vertex at
+                    // that opening fixed, within the contract epsilon.
+                    if (scroll.offset_ndc > 0.0) {
+                        pinned = abs(pos.y - scroll.content_bottom_ndc) < 0.001;
+                    } else if (scroll.offset_ndc < 0.0) {
+                        pinned = abs(pos.y - scroll.content_top_ndc) < 0.001;
+                    }
+                }
+                if (!pinned) pos.y += scroll.offset_ndc;
+                o.was_scrolled = 1.0;
+            }
+        }
+    }
+
+    o.pos = float4(pos, 0.0, 1.0);
     o.uv  = i.uv;
     o.col = i.col;
     o.deco_flags = i.deco_flags;
@@ -31,16 +133,6 @@ VSOut VSMain(VSIn i) {
 
 Texture2D atlasTex : register(t0);
 SamplerState samp0 : register(s0);
-
-#define DECO_UNDERCURL     (1u << 0)
-#define DECO_UNDERLINE     (1u << 1)
-#define DECO_UNDERDOUBLE   (1u << 2)
-#define DECO_UNDERDOTTED   (1u << 3)
-#define DECO_UNDERDASHED   (1u << 4)
-#define DECO_STRIKETHROUGH (1u << 5)
-#define DECO_OVERLINE      (1u << 8)
-#define DECO_GLOW          (1u << 9)
-#define DECO_COLOR_EMOJI   (1u << 10)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -113,6 +205,14 @@ float4 renderIconSDF(float4 col, float sdf) {
 }
 
 float4 PSMain(VSOut i) : SV_Target {
+    if (i.was_scrolled > 0.5 && content_viewport_height_px > 0.0) {
+        // SV_Position is in target pixels and includes the content viewport
+        // origin (tab bar/sidebar).  Reconstruct the local band coordinate
+        // using the same cell-snapped height used by the vertex viewport.
+        float local_y_px = i.pos.y - content_viewport_top_px;
+        float local_ndc_y = 1.0 - 2.0 * local_y_px / content_viewport_height_px;
+        if (local_ndc_y > i.content_top_ndc || local_ndc_y < i.content_bottom_ndc) discard;
+    }
     // Tabline texture mode: sample BGRA texture directly
     if (i.uv.x <= TABLINE_TEXTURE + 0.1 && i.uv.x >= TABLINE_TEXTURE - 0.1) {
         // UV coordinates stored in (uv.y, deco_phase) for tabline texture
@@ -302,6 +402,11 @@ CustomPostVSOut VSCustomPost(uint id : SV_VertexID) {
 // Non-glow vertices and non-glyph vertices are discarded.
 // Output is premultiplied alpha.
 float4 PSGlowExtract(VSOut i) : SV_Target {
+    if (i.was_scrolled > 0.5 && content_viewport_height_px > 0.0) {
+        float local_y_px = i.pos.y - content_viewport_top_px;
+        float local_ndc_y = 1.0 - 2.0 * local_y_px / content_viewport_height_px;
+        if (local_ndc_y > i.content_top_ndc || local_ndc_y < i.content_bottom_ndc) discard;
+    }
     // Only extract DECO_GLOW flagged glyphs
     if (!(i.deco_flags & DECO_GLOW)) discard;
     // Skip non-glyph quads (backgrounds/decorations have uv.x < 0)
@@ -356,7 +461,7 @@ float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
 
 // Glow composite: blend blurred glow onto back buffer with additive blending.
 // Pipeline uses additive blend state (ONE, ONE), so we just scale by intensity.
-cbuffer GlowParams : register(b0) {
+cbuffer GlowParams : register(b1) {
     float glowIntensity;
     float3 _pad;
 };

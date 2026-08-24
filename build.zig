@@ -296,6 +296,142 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
+    // Pure Contract A Windows smooth-scroll accounting tests.
+    const coordinator_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/coordinator.zig"),
+    });
+    const coordinator_tests = b.addTest(.{
+        .root_module = coordinator_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(coordinator_tests).step);
+
+    // Contract A2 settle-animation math is std-only and must execute on the
+    // native host, including WSL/Linux builds.
+    const settle_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/settle_math.zig"),
+    });
+    const settle_math_tests = b.addTest(.{
+        .name = "zonvie-settle-math-tests",
+        .root_module = settle_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(settle_math_tests).step);
+
+    // Contract B grid-continuity ease math is std-only and executes natively.
+    const ease_math_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/ease_math.zig"),
+    });
+    const ease_math_tests = b.addTest(.{
+        .name = "zonvie-ease-math-tests",
+        .root_module = ease_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(ease_math_tests).step);
+
+    // Contract B1 CPU retention ring bookkeeping is std-only and runs on the
+    // native host; the app-side vertex storage is intentionally not imported.
+    const retention_ring_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/retention_ring.zig"),
+    });
+    const retention_ring_tests = b.addTest(.{
+        .name = "zonvie-retention-ring-tests",
+        .root_module = retention_ring_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(retention_ring_tests).step);
+
+    const settle_policy_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/settle_policy.zig"),
+    });
+    const settle_policy_tests = b.addTest(.{
+        .name = "zonvie-settle-policy-tests",
+        .root_module = settle_policy_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(settle_policy_tests).step);
+
+    // Contract A2 flush-stage accumulation (A0 extension) is std-only and
+    // must execute on the native host, including WSL/Linux builds.
+    const stage_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/stage_math.zig"),
+    });
+    const stage_math_tests = b.addTest(.{
+        .name = "zonvie-stage-math-tests",
+        .root_module = stage_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(stage_math_tests).step);
+
+    // Contract B main-record routing/ledger helpers are std-only and must
+    // execute on the native host, including WSL/Linux builds.
+    const route_math_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/scroll/route_math.zig"),
+    });
+    const route_math_tests = b.addTest(.{
+        .name = "zonvie-route-math-tests",
+        .root_module = route_math_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(route_math_tests).step);
+
+    // Contract A session-owner decision tests. The module imports Win32 app
+    // plumbing, so WSL/Linux builds compile this Windows test artifact instead
+    // of trying to execute it on the host.
+    const smooth_session_test_mod = b.createModule(.{
+        .target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu }),
+        .optimize = optimize,
+        .link_libc = true,
+        // Same-module source imports are traversed by Zig's test discovery;
+        // windows/main.zig reaches scroll/session.zig through window.zig.
+        .root_source_file = b.path("windows/main.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+            .{ .name = "toml", .module = zig_toml.module("toml") },
+        },
+    });
+    // Session tests exercise pure owner/coordinator predicates. Link the core
+    // archive only on a native Windows build where its target matches this PE.
+    if (@import("builtin").os.tag == .windows) smooth_session_test_mod.linkLibrary(core_lib);
+    smooth_session_test_mod.linkSystemLibrary("user32", .{});
+    smooth_session_test_mod.linkSystemLibrary("gdi32", .{});
+    smooth_session_test_mod.linkSystemLibrary("kernel32", .{});
+    smooth_session_test_mod.linkSystemLibrary("imm32", .{});
+    smooth_session_test_mod.linkSystemLibrary("dwrite", .{});
+    smooth_session_test_mod.linkSystemLibrary("d2d1", .{});
+    smooth_session_test_mod.linkSystemLibrary("ole32", .{});
+    smooth_session_test_mod.linkSystemLibrary("d3d11", .{});
+    smooth_session_test_mod.linkSystemLibrary("dxgi", .{});
+    smooth_session_test_mod.linkSystemLibrary("d3dcompiler_47", .{});
+    smooth_session_test_mod.linkSystemLibrary("dcomp", .{});
+    smooth_session_test_mod.linkSystemLibrary("dwmapi", .{});
+    smooth_session_test_mod.linkSystemLibrary("credui", .{});
+    smooth_session_test_mod.linkSystemLibrary("advapi32", .{});
+    smooth_session_test_mod.linkSystemLibrary("shell32", .{});
+    smooth_session_test_mod.linkSystemLibrary("winmm", .{});
+    smooth_session_test_mod.linkSystemLibrary("msimg32", .{});
+    smooth_session_test_mod.linkSystemLibrary("comdlg32", .{});
+    const smooth_session_tests = b.addTest(.{
+        .name = "zonvie-windows-smooth-session-tests",
+        .root_module = smooth_session_test_mod,
+    });
+    const smooth_session_run = b.addRunArtifact(smooth_session_tests);
+    // The WSL host cannot execute a Windows PE test binary; Windows hosts
+    // execute the artifact normally while cross-target test builds remain
+    // part of the test graph.
+    if (@import("builtin").os.tag == .windows) {
+        test_step.dependOn(&smooth_session_run.step);
+    } else {
+        test_step.dependOn(&smooth_session_tests.step);
+    }
+
     // Key input tests
     const key_test_mod = b.createModule(.{
         .target = target,

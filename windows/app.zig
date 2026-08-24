@@ -13,6 +13,18 @@ const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
+// Shared smooth-scroll identity/record types (orchestrator-owned; see
+// .agents/docs/windows-smooth-scroll-design.md, Contract A).
+pub const scroll_types = @import("scroll/types.zig");
+// Contract B main-record routing/ledger helpers (std-only, natively tested).
+pub const scroll_route = @import("scroll/route_math.zig");
+pub const retention_ring = @import("scroll/retention_ring.zig");
+// Direct Manipulation COM plumbing and the DmSnapshot mailbox. Runtime-inert
+// until the input-eligibility wiring lands; imported here so the windows
+// build type-checks it (see the comptime coverage block in that file).
+pub const direct_manipulation = @import("scroll/direct_manipulation.zig");
+pub const dcomp_presenter = @import("scroll/dcomp_presenter.zig");
+pub const settle_presenter = @import("scroll/settle_presenter.zig");
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
@@ -49,6 +61,9 @@ pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
 pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
 pub const zonvie_core_try_get_cursor_blink = core.zonvie_core_try_get_cursor_blink;
 pub const zonvie_core_send_mouse_scroll = core.zonvie_core_send_mouse_scroll;
+pub const zonvie_core_set_gesture_smooth_scroll = core.zonvie_core_set_gesture_smooth_scroll;
+pub const zonvie_core_get_mousescroll_ver = core.zonvie_core_get_mousescroll_ver;
+pub const zonvie_core_try_get_mode_state = core.zonvie_core_try_get_mode_state;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
@@ -86,6 +101,7 @@ pub const zonvie_version = core.zonvie_version;
 pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;
 pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
 pub const zonvie_core_retry_flush = core.zonvie_core_retry_flush;
+pub const zonvie_core_force_resend = core.zonvie_core_force_resend;
 pub const zonvie_core_flush_had_atlas_corruption = core.zonvie_core_flush_had_atlas_corruption;
 pub const zonvie_core_flush_was_aborted = core.zonvie_core_flush_was_aborted;
 pub const zonvie_core_flush_is_retryable = core.zonvie_core_flush_is_retryable;
@@ -96,6 +112,7 @@ pub const Callbacks = core.Callbacks;
 pub const VERT_UPDATE_MAIN = core.VERT_UPDATE_MAIN;
 pub const VERT_UPDATE_CURSOR = core.VERT_UPDATE_CURSOR;
 pub const DECO_CURSOR = core.DECO_CURSOR;
+pub const DECO_SCROLLABLE = core.DECO_SCROLLABLE;
 pub const CmdlineChunk = core.CmdlineChunk;
 pub const BufferEntry = core.BufferEntry;
 pub const GridInfo = core.GridInfo;
@@ -210,6 +227,15 @@ pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 40;
 /// delta. Posted (not sent) because the callback runs on the core thread with
 /// grid_mu held, and SetWindowPos would re-enter updateLayoutToCore.
 pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
+/// Coalesced wakeup posted from onFlushEnd (core thread) after a semantic
+/// smooth-scroll commit landed in a target external TBS. The message carries
+/// no payload; the source of truth is that TBS's semantic_commits ring.
+pub const WM_APP_SMOOTH_SCROLL_COMMIT: c.UINT = c.WM_APP + 42;
+/// Coalesced wakeup posted from the Direct Manipulation delegate callback
+/// (DM thread) after it overwrites the DmSnapshot mailbox. The message
+/// carries no payload; the UI thread reads the latest snapshot from the
+/// mailbox in windows/scroll/direct_manipulation.zig.
+pub const WM_APP_DM_UPDATE: c.UINT = c.WM_APP + 43;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -283,6 +309,9 @@ pub const TIMER_MSG_THROTTLE: c.UINT_PTR = 19;
 /// Replays a main-window WM_SIZE suppressed during device recovery so the
 /// recovered HWND size is also propagated to Neovim rows/cols.
 pub const TIMER_MAIN_SIZE_REPLAY: c.UINT_PTR = 20;
+/// Deadline timer for the UI-thread smooth-scroll coordinator. It never
+/// drives animation; it only retries borrows/restores and stale credits.
+pub const TIMER_SMOOTH_SCROLL_DEADLINE: c.UINT_PTR = 21;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 pub const MSG_SCROLL_RETRY_INTERVAL_MS: c.UINT = 16;
@@ -556,6 +585,348 @@ pub const CursorSet = struct {
     }
 };
 
+/// CPU-only retained row storage.  The core thread fills these buffers during
+/// a flush; publication is performed under TripleBufferedSurface.rotation_mu.
+/// The UI thread inspects the published metadata and uploads through the
+/// separate RetentionVB cache below; D3D resources never enter this storage.
+pub const RetentionCapture = struct {
+    /// Bumped only when stageRetentionCapture writes this slot's vertex
+    /// buffer. Carried (restaged) slots keep their generation, so the GPU
+    /// upload cache survives accumulation shifts and republishes.
+    content_gen: u64 = 0,
+    source_row: i32 = 0,
+    /// Logical row the retained content occupies after the shift. Negative
+    /// values are legitimate: rows retained past the top edge draw as
+    /// virtual rows above the viewport.
+    target_row: i32 = 0,
+    grid_id: i64 = 0,
+    cell_height_px: f32 = 0,
+    vertex_count: u32 = 0,
+    commit_rev: u64 = 0,
+    valid: bool = false,
+};
+
+pub const RetentionStorage = struct {
+    pub const MAX_GRIDS = retention_ring.max_retained_grids;
+    pub const DEPTH_ROWS = retention_ring.retention_depth_rows;
+    pub const IN_FLIGHT_SLOTS = retention_ring.in_flight_slots;
+    pub const SLOT_COUNT = retention_ring.capacity;
+
+    buffers: [SLOT_COUNT]std.ArrayListUnmanaged(Vertex) = [_]std.ArrayListUnmanaged(Vertex){.empty} ** SLOT_COUNT,
+    metadata: [SLOT_COUNT]RetentionCapture = [_]RetentionCapture{.{}} ** SLOT_COUNT,
+    staged: [SLOT_COUNT]u16 = [_]u16{0} ** SLOT_COUNT,
+    published: [SLOT_COUNT]u16 = [_]u16{0} ** SLOT_COUNT,
+    staged_count: u16 = 0,
+    published_count: u16 = 0,
+    dropped_grids: [MAX_GRIDS]i64 = [_]i64{0} ** MAX_GRIDS,
+    dropped_count: u8 = 0,
+    /// Ledger-drop signals for the UI thread. Separate from dropped_grids,
+    /// which doubles as the per-bracket staging gate and is cleared by every
+    /// beginFlush - a paint may run several flushes later and must not lose
+    /// the signal.
+    pending_ledger_drops: [MAX_GRIDS]i64 = [_]i64{0} ** MAX_GRIDS,
+    pending_ledger_drop_count: u8 = 0,
+    content_gen_counter: u64 = 0,
+    bookkeeping: retention_ring.Ring = .{},
+
+    pub fn beginFlush(self: *RetentionStorage) void {
+        self.bookkeeping.beginFlush();
+        self.staged_count = 0;
+        self.dropped_count = 0;
+    }
+
+    /// Carry one grid's retained rows into the current stage. The ring flips
+    /// slots in place, so the vertex buffers remain untouched; only target-row
+    /// metadata moves with the content. Rows at or beyond the depth boundary,
+    /// or past the pivot on the opposite side, are dropped.
+    pub fn beginStepForGrid(
+        self: *RetentionStorage,
+        grid_id: i64,
+        rows_delta: i32,
+        pivot_target_row: i32,
+    ) void {
+        if (rows_delta == 0 or self.isDropped(grid_id)) return;
+
+        for (0..SLOT_COUNT) |index| {
+            const state = self.bookkeeping.slotState(index);
+            if (state != .published and state != .staged) continue;
+            const capture = self.bookkeeping.captureAt(index) orelse continue;
+            if (capture.grid_id != grid_id) continue;
+            if (!self.metadata[index].valid) {
+                if (state == .published) {
+                    _ = self.bookkeeping.prunePublishedSlot(index);
+                } else {
+                    _ = self.bookkeeping.releaseStagedSlot(index);
+                }
+                continue;
+            }
+            if (!self.bookkeeping.restageSlot(index)) continue;
+            const shifted = self.metadata[index].target_row - rows_delta;
+            self.metadata[index].target_row = shifted;
+            _ = self.bookkeeping.updateTargetRow(index, shifted);
+        }
+
+        self.rebuildStagedIndex();
+        var stage_index: usize = 0;
+        while (stage_index < @as(usize, self.staged_count)) {
+            const slot = self.staged[stage_index];
+            const capture = self.metadata[slot];
+            if (capture.valid and capture.grid_id == grid_id) {
+                const distance = capture.target_row - pivot_target_row;
+                const outside_depth = @abs(distance) >= @as(i32, @intCast(DEPTH_ROWS));
+                const past_pivot = (rows_delta > 0 and distance > 0) or
+                    (rows_delta < 0 and distance < 0);
+                if (outside_depth or past_pivot) {
+                    // Carried rows keep metadata.valid: the removal is
+                    // deferred to commit (dropped_pending) so mid-bracket
+                    // paints and abort still see the prior publication.
+                    // publish() invalidates whatever commit finally frees.
+                    _ = self.bookkeeping.releaseStagedSlot(@intCast(slot));
+                }
+            }
+            stage_index += 1;
+        }
+        self.rebuildStagedIndex();
+
+        // A malformed or coalesced plan must still respect the fixed depth.
+        // Keep the rows nearest the exposed pivot and release farther rows.
+        while (self.countStagedForGrid(grid_id) > DEPTH_ROWS) {
+            var farthest: ?u16 = null;
+            var farthest_distance: u32 = 0;
+            for (self.staged[0..@as(usize, self.staged_count)]) |slot| {
+                const capture = self.metadata[slot];
+                if (!capture.valid or capture.grid_id != grid_id) continue;
+                if (self.bookkeeping.droppedPendingAt(@intCast(slot))) continue;
+                const distance = @abs(capture.target_row - pivot_target_row);
+                if (farthest == null or distance > farthest_distance) {
+                    farthest = slot;
+                    farthest_distance = distance;
+                }
+            }
+            const slot = farthest orelse break;
+            _ = self.bookkeeping.releaseStagedSlot(@intCast(slot));
+            self.rebuildStagedIndex();
+        }
+    }
+
+    /// Drop every capture (staged and published) of one grid. Used when a
+    /// whole-band jump makes the grid's carried rows meaningless.
+    pub fn dropGridRetention(self: *RetentionStorage, grid_id: i64) void {
+        for (0..SLOT_COUNT) |index| {
+            const state = self.bookkeeping.slotState(index);
+            if (state == .free) continue;
+            const capture = self.bookkeeping.captureAt(index) orelse continue;
+            if (capture.grid_id != grid_id) continue;
+            self.metadata[index].valid = false;
+            if (state == .published) {
+                _ = self.bookkeeping.prunePublishedSlot(index);
+            } else {
+                _ = self.bookkeeping.releaseStagedSlot(index);
+            }
+        }
+        self.rebuildStagedIndex();
+        self.rebuildPublishedIndex();
+    }
+
+    fn countStagedForGrid(self: *const RetentionStorage, grid_id: i64) usize {
+        var count: usize = 0;
+        for (self.staged[0..@as(usize, self.staged_count)]) |slot| {
+            if (self.bookkeeping.droppedPendingAt(@intCast(slot))) continue;
+            if (self.metadata[slot].valid and self.metadata[slot].grid_id == grid_id) count += 1;
+        }
+        return count;
+    }
+
+    fn rebuildStagedIndex(self: *RetentionStorage) void {
+        self.staged_count = 0;
+        for (0..SLOT_COUNT) |index| {
+            if (self.bookkeeping.slotState(index) != .staged) continue;
+            std.debug.assert(@as(usize, self.staged_count) < SLOT_COUNT);
+            self.staged[self.staged_count] = @intCast(index);
+            self.staged_count += 1;
+        }
+    }
+
+    fn rebuildPublishedIndex(self: *RetentionStorage) void {
+        self.published_count = 0;
+        for (0..SLOT_COUNT) |index| {
+            if (self.bookkeeping.slotState(index) != .published) continue;
+            std.debug.assert(@as(usize, self.published_count) < SLOT_COUNT);
+            self.published[self.published_count] = @intCast(index);
+            self.published_count += 1;
+        }
+    }
+
+    /// Filter and stage one outgoing row. Only matching scrollable vertices
+    /// enter the retention storage; border and margin vertices are excluded.
+    pub fn stageRetentionCapture(
+        self: *RetentionStorage,
+        alloc: std.mem.Allocator,
+        grid_id: i64,
+        source_row: i32,
+        target_row: i32,
+        cell_height_px: f32,
+        vertices: []const Vertex,
+    ) bool {
+        var kept: usize = 0;
+        for (vertices) |vertex| {
+            if (vertex.grid_id == grid_id and (vertex.deco_flags & DECO_SCROLLABLE) != 0) kept += 1;
+        }
+        if (kept == 0) return false;
+        self.rebuildStagedIndex();
+        // The ring's depth clamp frees old slots without shrinking staged[],
+        // so the index list needs its own fail-closed bound: a bracket that
+        // accumulates more successful stages than slots drops the grid
+        // instead of writing past the array.
+        if (@as(usize, self.staged_count) >= SLOT_COUNT) {
+            self.dropGrid(grid_id);
+            return false;
+        }
+        const slot_index = self.bookkeeping.stage(.{
+            .source_row = source_row,
+            .target_row = target_row,
+            .grid_id = grid_id,
+            .cell_height = cell_height_px,
+            .vertex_count = @intCast(kept),
+            .storage_slot = 0,
+        }) orelse {
+            self.dropGrid(grid_id);
+            return false;
+        };
+        const slot: u16 = @intCast(slot_index);
+        var dst = &self.buffers[slot];
+        dst.ensureTotalCapacity(alloc, kept) catch {
+            // Fail-closed per grid: releasing only the just-staged slot keeps
+            // the rest of the bracket (and the ring/publish handshake) intact,
+            // where a whole-ring abort would desync publish against the ease
+            // seeds this flush still commits.
+            _ = self.bookkeeping.releaseStagedSlot(slot_index);
+            self.dropGrid(grid_id);
+            return false;
+        };
+        dst.clearRetainingCapacity();
+        for (vertices) |vertex| {
+            if (vertex.grid_id == grid_id and (vertex.deco_flags & DECO_SCROLLABLE) != 0) {
+                dst.appendAssumeCapacity(vertex);
+            }
+        }
+        self.content_gen_counter += 1;
+        self.metadata[slot] = .{
+            .content_gen = self.content_gen_counter,
+            .source_row = source_row,
+            .target_row = target_row,
+            .grid_id = grid_id,
+            .cell_height_px = cell_height_px,
+            .vertex_count = @intCast(kept),
+            .valid = true,
+        };
+        self.rebuildStagedIndex();
+        return true;
+    }
+
+    pub fn queueRetentionReplay(self: *RetentionStorage, grid_id: i64, rows_delta: i32) void {
+        self.bookkeeping.queueReplay(.{ .grid_id = grid_id, .rows_delta = rows_delta });
+    }
+
+    pub fn retentionReplayCount(self: *const RetentionStorage) usize {
+        return self.bookkeeping.replayCount();
+    }
+
+    pub fn publish(self: *RetentionStorage, commit_rev: u64) void {
+        self.rebuildStagedIndex();
+        const staged_slots = self.staged[0..@as(usize, self.staged_count)];
+        _ = self.bookkeeping.commit();
+        for (staged_slots) |slot| {
+            if (self.bookkeeping.slotState(@intCast(slot)) == .published) {
+                self.metadata[slot].commit_rev = commit_rev;
+            } else {
+                self.metadata[slot].valid = false;
+            }
+        }
+        self.rebuildPublishedIndex();
+        self.staged_count = 0;
+    }
+
+    pub fn abortFlush(self: *RetentionStorage) void {
+        self.rebuildStagedIndex();
+        self.bookkeeping.abort();
+        for (self.staged[0..@as(usize, self.staged_count)]) |slot| {
+            if (self.bookkeeping.slotState(@intCast(slot)) == .published) {
+                if (self.bookkeeping.captureAt(@intCast(slot))) |capture| {
+                    self.metadata[slot].target_row = capture.target_row;
+                }
+            } else {
+                self.metadata[slot].valid = false;
+            }
+        }
+        self.staged_count = 0;
+        self.rebuildPublishedIndex();
+    }
+
+    pub fn clear(self: *RetentionStorage) void {
+        for (self.published[0..@as(usize, self.published_count)]) |slot| self.metadata[slot].valid = false;
+        self.bookkeeping.clearPublished();
+        self.published_count = 0;
+        self.dropped_count = 0;
+    }
+
+    /// Remove captures for grids that are no longer represented by the
+    /// active shader-offset ledger. Captures from a newer commit remain held
+    /// until that commit becomes paint-visible. Walks the RING's published
+    /// state, never the compact index: slots restaged by an open bracket are
+    /// mid-carry and must not be touched here (killing them at the
+    /// settle-to-scroll boundary discarded the accumulation).
+    pub fn pruneInactive(self: *RetentionStorage, commit_rev: u64, active_grid_ids: []const i64) void {
+        for (0..SLOT_COUNT) |index| {
+            if (self.bookkeeping.slotState(index) != .published) continue;
+            const capture = self.metadata[index];
+            if (!capture.valid) {
+                _ = self.bookkeeping.prunePublishedSlot(index);
+                continue;
+            }
+            if (capture.commit_rev > commit_rev) continue;
+            var active = false;
+            for (active_grid_ids) |grid_id| {
+                if (grid_id == capture.grid_id) {
+                    active = true;
+                    break;
+                }
+            }
+            if (active) continue;
+            self.metadata[index].valid = false;
+            _ = self.bookkeeping.prunePublishedSlot(index);
+        }
+        self.rebuildPublishedIndex();
+    }
+
+    pub fn deinit(self: *RetentionStorage, alloc: std.mem.Allocator) void {
+        for (&self.buffers) |*buffer| buffer.deinit(alloc);
+    }
+
+    fn isDropped(self: *const RetentionStorage, grid_id: i64) bool {
+        for (self.dropped_grids[0..@as(usize, self.dropped_count)]) |id| if (id == grid_id) return true;
+        return false;
+    }
+
+    fn dropGrid(self: *RetentionStorage, grid_id: i64) void {
+        if (!self.isDropped(grid_id) and self.dropped_count < MAX_GRIDS) {
+            self.dropped_grids[self.dropped_count] = grid_id;
+            self.dropped_count += 1;
+        }
+        var pending_seen = false;
+        for (self.pending_ledger_drops[0..@as(usize, self.pending_ledger_drop_count)]) |id| {
+            if (id == grid_id) {
+                pending_seen = true;
+                break;
+            }
+        }
+        if (!pending_seen and self.pending_ledger_drop_count < MAX_GRIDS) {
+            self.pending_ledger_drops[self.pending_ledger_drop_count] = grid_id;
+            self.pending_ledger_drop_count += 1;
+        }
+    }
+};
+
 /// Snapshot returned by acquireForPaint.
 pub const PaintSnapshot = struct {
     committed_index: u8,
@@ -568,6 +939,49 @@ pub const PaintSnapshot = struct {
     /// Scroll region in rows, matching remapRowSlots' [row_start, row_end).
     scroll_row_start: u32 = 0,
     scroll_row_end: u32 = 0,
+    /// TBS commit revision of the committed set, copied while acquireForPaint
+    /// holds rotation_mu. Never re-read from the TBS after paint: a flush can
+    /// commit mid-paint and a re-read would publish a newer revision than the
+    /// content actually drawn.
+    commit_rev: u64 = 0,
+    /// Number of published CPU captures visible at this revision. Drawing is
+    /// intentionally deferred, but the snapshot is atomic with commit_rev.
+    retention_count: u16 = 0,
+    /// True only for the outermost paint on this TBS. Reentrant paints may
+    /// draw but can never publish semantic movement.
+    outermost_paint: bool = false,
+};
+
+/// Semantic scroll movement staged for one flush, handed to
+/// commitFlushWithSemantic by the flush-local stage (callbacks.zig).
+pub const SemanticCommitInput = struct {
+    session_generation: u64,
+    surface: scroll_types.SurfaceToken,
+    /// Positive means content moved up on screen (on_grid_scroll convention).
+    rows_delta: i32,
+};
+
+/// Contract B main-composite ease delta staged for one flush, handed to
+/// commitFlushWithBEase by the flush-local stage (callbacks.zig). Main-grid
+/// records are session-independent (session_generation 0) and the main
+/// surface has no incarnation counter, so grid identity alone suffices.
+pub const BEaseCommitInput = struct {
+    grid_id: i64,
+    /// Positive means content moved up on screen (on_grid_scroll convention).
+    rows_delta: i32,
+};
+
+pub const SemanticCommitResult = enum {
+    /// Visual commit published and the semantic record appended under the
+    /// same rotation_mu critical section.
+    committed,
+    /// This TBS had no open row write set, so no commit_rev advanced here.
+    /// Any cursor-only transaction was still committed; the caller must
+    /// discard the stage (never back-date the delta onto an older revision).
+    not_in_flush,
+    /// Visual commit published but the record ring was full. The caller fails
+    /// only the smooth-scroll session, never the editor flush.
+    ring_overflow,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -590,6 +1004,46 @@ pub const TripleBufferedSurface = struct {
     flush_source_index: u8 = 1,
     is_in_flush: bool = false,
     commit_rev: u64 = 0,
+
+    // Semantic smooth-scroll commit records (rotation_mu protected). The core
+    // thread appends inside commitFlushWithSemantic's commit critical section;
+    // the UI thread reads undelivered acknowledgements and removes records
+    // once their revision is published (Present + epoch Commit succeeded).
+    // Fixed capacity: no allocation on the flush or paint paths.
+    semantic_commits: scroll_types.FixedRing(
+        scroll_types.SemanticCommitRecord,
+        scroll_types.MaxSemanticCommits,
+    ) = .{},
+
+    // Contract A2 discrete-settle commit records (rotation_mu protected).
+    // DEDICATED ring, never shared with semantic_commits: a foreign-kind
+    // record at the FIFO head would wedge the pop-based A1 retirement in
+    // scroll/session.zig (and vice versa). Overflow drops the OLDEST record —
+    // settle is cosmetic, so losing an old record only skips one animation —
+    // and never touches the A1 fail-closed machinery. The ring is embedded in
+    // the TBS, so window destruction disposes of it automatically.
+    a2_settle_commits: scroll_types.FixedRing(
+        scroll_types.SemanticCommitRecord,
+        scroll_types.MaxSemanticCommits,
+    ) = .{},
+
+    // Contract B main-composite ease records (rotation_mu protected).
+    // Only the MAIN window's TBS ever populates this ring; it stays empty on
+    // external TBSes. DEDICATED ring for the same reason as a2_settle_commits:
+    // a foreign-kind record at a FIFO head would wedge kind-specific drains.
+    // Records are cosmetic — overflow drops the OLDEST record. The core
+    // thread appends inside commitFlushWithBEase's commit critical section;
+    // the UI thread drains covered records at the main paint barrier
+    // (drainBEaseRecordsUpTo). Contract:
+    // .agents/docs/windows-smooth-scroll-b-main-region.md 「会計と照合」.
+    b_ease_commits: scroll_types.FixedRing(
+        scroll_types.SemanticCommitRecord,
+        scroll_types.MaxSemanticCommits,
+    ) = .{},
+
+    // Contract B1 CPU retention captures. Publication is bound to commit_rev
+    // by commitFlushWithBEase while rotation_mu is held.
+    retention_storage: RetentionStorage = .{},
 
     // Per-set UI read refcount (rotation_mu protected).
     // Re-entrant WM_PAINT: DXGIs Present/ResizeBuffers can pump messages,
@@ -718,6 +1172,9 @@ pub const TripleBufferedSurface = struct {
         self.flush_vb_shift = 0;
         self.flush_scroll_row_start = 0;
         self.flush_scroll_row_end = 0;
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        self.retention_storage.beginFlush();
+        self.rotation_mu.unlock(core.clock.io());
 
         self.is_in_flush = true;
         return true;
@@ -831,6 +1288,9 @@ pub const TripleBufferedSurface = struct {
     /// Cancel a flush (reset is_in_flush without committing).
     pub fn cancelFlush(self: *TripleBufferedSurface) void {
         if (self.is_in_flush) self.sparse_sync.row_sync_full[self.write_index] = true;
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        self.retention_storage.abortFlush();
+        self.rotation_mu.unlock(core.clock.io());
         self.is_in_flush = false;
         self.main_cursor_in_flush = false;
         self.main_cursor_flush_paint_full = false;
@@ -844,7 +1304,276 @@ pub const TripleBufferedSurface = struct {
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
+        self.commitFlushLocked(alloc);
+        self.retention_storage.publish(self.commit_rev);
+    }
 
+    /// Commit the write set and append the flush's staged semantic scroll
+    /// records in the SAME rotation_mu critical section, binding them to the
+    /// commit_rev this commit publishes. This is the single publication
+    /// transaction required by the Contract A design doc: a paint entered
+    /// after the lock is released can never Present the new content without
+    /// the records already being visible in their rings.
+    ///
+    /// `a1` is the active session's staged delta (semantic_commits ring, all
+    /// fail-closed semantics unchanged). `a2` is a Contract A2 settle delta
+    /// for this surface (session_generation 0), appended to the dedicated
+    /// a2_settle_commits ring; its overflow policy and failures never affect
+    /// the A1 machinery or the returned result.
+    pub fn commitFlushWithSemantic(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        a1: ?SemanticCommitInput,
+        a2: ?SemanticCommitInput,
+    ) SemanticCommitResult {
+        if (!self.is_in_flush) {
+            // No row write set joined this flush, so commit_rev does not
+            // advance here. Commit whatever else is open (cursor transaction)
+            // and report not_in_flush so the caller discards the A1 stage.
+            // An A2 delta has no revision to bind to either; it is dropped
+            // silently (settle is cosmetic, never fail-closed).
+            self.commitFlush(alloc);
+            return .not_in_flush;
+        }
+
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.commitFlushLocked(alloc);
+        self.retention_storage.publish(self.commit_rev);
+        if (a2) |settle| {
+            // Dedicated ring: on overflow drop the OLDEST record and keep the
+            // new one. An old settle record only represents a missed cosmetic
+            // animation; the newest record matches the content just committed.
+            if (self.a2_settle_commits.isFull()) _ = self.a2_settle_commits.popFront();
+            _ = self.a2_settle_commits.push(.{
+                .kind = .a2_settle,
+                .session_generation = 0,
+                .surface = settle.surface,
+                .commit_rev = self.commit_rev,
+                .rows_delta = settle.rows_delta,
+            });
+        }
+        if (a1) |semantic| {
+            if (!self.semantic_commits.push(.{
+                .kind = .a1_session,
+                .session_generation = semantic.session_generation,
+                .surface = semantic.surface,
+                .commit_rev = self.commit_rev,
+                .rows_delta = semantic.rows_delta,
+            })) {
+                // Ring overflow: keep the visual commit; only the smooth-scroll
+                // session fails (fail-closed), the editor flush never aborts.
+                return .ring_overflow;
+            }
+        }
+        return .committed;
+    }
+
+    /// Commit the write set and append the flush's staged Contract B
+    /// main-composite ease records in the SAME rotation_mu critical section,
+    /// binding them to the commit_rev this commit publishes — the same
+    /// single-transaction rule commitFlushWithSemantic implements for
+    /// external surfaces (contract: windows-smooth-scroll-b-main-region.md
+    /// 「会計と照合」: "publish は main TBS の set・pending scroll・commit_rev
+    /// と同一の rotation_mu transaction で行う"). A paint entered after the
+    /// lock is released can never Present the new content without the records
+    /// already being visible in the ring.
+    ///
+    /// The records are cosmetic (no fail-closed machinery): with no open row
+    /// write set there is no revision to bind to and the deltas are dropped
+    /// (an accepted snap), and ring overflow drops the OLDEST record.
+    pub fn commitFlushWithBEase(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        deltas: []const BEaseCommitInput,
+    ) void {
+        if (!self.is_in_flush) {
+            // Commit whatever else is open (cursor transaction); commit_rev
+            // does not advance, so the ease deltas have nothing to bind to.
+            self.commitFlush(alloc);
+            return;
+        }
+
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.commitFlushLocked(alloc);
+        self.retention_storage.publish(self.commit_rev);
+        for (deltas) |d| {
+            if (self.b_ease_commits.isFull()) _ = self.b_ease_commits.popFront();
+            _ = self.b_ease_commits.push(.{
+                .kind = .b_ease,
+                .session_generation = 0,
+                .surface = .{ .grid_id = d.grid_id, .incarnation = 0 },
+                .commit_rev = self.commit_rev,
+                .rows_delta = d.rows_delta,
+            });
+        }
+    }
+
+    /// Drain covered records without aggregating grids.  The plain-ease
+    /// adapter has a per-event cap, so preserving FIFO event boundaries is
+    /// required at the paint barrier.
+    pub fn drainBEaseRecordsUpTo(
+        self: *TripleBufferedSurface,
+        commit_rev: u64,
+        grid_ids: *[scroll_types.MaxSemanticCommits]i64,
+        rows: *[scroll_types.MaxSemanticCommits]i32,
+    ) usize {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        var drained: usize = 0;
+        while (self.b_ease_commits.front()) |record| {
+            if (record.commit_rev > commit_rev) break;
+            if (drained < grid_ids.len) {
+                grid_ids[drained] = record.surface.grid_id;
+                rows[drained] = record.rows_delta;
+                drained += 1;
+            }
+            _ = self.b_ease_commits.popFront();
+        }
+        return drained;
+    }
+
+    /// Drop every undelivered b_ease record (resize / device-loss reset:
+    /// the geometry the records were accounted against no longer exists).
+    pub fn clearBEaseCommits(self: *TripleBufferedSurface) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.b_ease_commits.clear();
+    }
+
+    /// Stage one retained row from the core thread. The caller must provide
+    /// the pre-scroll vertex slice; no D3D object is accessed here.
+    pub fn stageRetentionCapture(
+        self: *TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        grid_id: i64,
+        source_row: i32,
+        target_row: i32,
+        cell_height_px: f32,
+        vertices: []const Vertex,
+    ) bool {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        return self.retention_storage.stageRetentionCapture(
+            alloc,
+            grid_id,
+            source_row,
+            target_row,
+            cell_height_px,
+            vertices,
+        );
+    }
+
+    pub fn beginRetentionStepForGrid(
+        self: *TripleBufferedSurface,
+        grid_id: i64,
+        rows_delta: i32,
+        pivot_target_row: i32,
+    ) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.retention_storage.beginStepForGrid(grid_id, rows_delta, pivot_target_row);
+    }
+
+    pub fn queueRetentionReplay(self: *TripleBufferedSurface, grid_id: i64, rows_delta: i32) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.retention_storage.queueRetentionReplay(grid_id, rows_delta);
+    }
+
+    pub fn dropRetentionForGrid(self: *TripleBufferedSurface, grid_id: i64) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.retention_storage.dropGridRetention(grid_id);
+    }
+
+    /// Snapshot published captures at the paint barrier. Captures remain held
+    /// until clearRetention; drawing is intentionally deferred to a later unit.
+    pub fn publishedRetentionCount(self: *TripleBufferedSurface, commit_rev: u64) u16 {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        var count: u16 = 0;
+        for (self.retention_storage.published[0..@as(usize, self.retention_storage.published_count)]) |slot| {
+            if (self.retention_storage.metadata[slot].commit_rev <= commit_rev and
+                self.retention_storage.metadata[slot].valid) count += 1;
+        }
+        return count;
+    }
+
+    /// Paint-side snapshot with metric fail-closed validation. A retention
+    /// row captured at a different cell height cannot be placed safely, so it
+    /// is invalidated before any later unit can consume it.
+    pub fn drainRetentionForPaint(self: *TripleBufferedSurface, commit_rev: u64, cell_height_px: f32) u16 {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        var count: u16 = 0;
+        for (self.retention_storage.published[0..@as(usize, self.retention_storage.published_count)]) |slot| {
+            var capture = &self.retention_storage.metadata[slot];
+            if (!capture.valid or capture.commit_rev > commit_rev) continue;
+            if (@abs(capture.cell_height_px - cell_height_px) > 0.001) {
+                capture.valid = false;
+                continue;
+            }
+            count += 1;
+        }
+        return count;
+    }
+
+    pub fn clearRetention(self: *TripleBufferedSurface) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.retention_storage.clear();
+    }
+
+    /// Drain retention-overflow grid ids for UI-thread ledger invalidation.
+    /// The dropped list is produced by the core thread; this is the sole
+    /// UI-side read and holds rotation_mu while copying and clearing it.
+    pub fn drainDroppedGrids(self: *TripleBufferedSurface, out: []i64) usize {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        const count = @min(out.len, @as(usize, self.retention_storage.pending_ledger_drop_count));
+        for (self.retention_storage.pending_ledger_drops[0..count], 0..) |grid_id, index| {
+            out[index] = grid_id;
+        }
+        self.retention_storage.pending_ledger_drop_count = 0;
+        return count;
+    }
+
+    pub fn pruneRetentionInactive(
+        self: *TripleBufferedSurface,
+        commit_rev: u64,
+        active_grid_ids: []const i64,
+    ) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        self.retention_storage.pruneInactive(commit_rev, active_grid_ids);
+    }
+
+    /// Drain the covered A2 prefix and return its aggregate row displacement.
+    /// The ring is per surface, so the caller can apply the sum without any
+    /// cross-window lookup or allocation.
+    pub fn takeSettleRowsUpTo(self: *TripleBufferedSurface, commit_rev: u64) i64 {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        var total_rows: i64 = 0;
+        while (self.a2_settle_commits.front()) |record| {
+            if (record.commit_rev > commit_rev) break;
+            total_rows += @as(i64, record.rows_delta);
+            _ = self.a2_settle_commits.popFront();
+        }
+        return total_rows;
+    }
+
+    pub fn hasSettleCommitsUpTo(self: *TripleBufferedSurface, commit_rev: u64) bool {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        return self.a2_settle_commits.front() != null and self.a2_settle_commits.front().?.commit_rev <= commit_rev;
+    }
+
+    /// Lock-held commit body shared by commitFlush and
+    /// commitFlushWithSemantic. Caller must hold rotation_mu.
+    fn commitFlushLocked(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
         // Cursor and rows publish while holding the same lock. A paint can
         // therefore observe either the complete old pair or complete new pair,
         // never new rows with the previous cursor (or vice versa).
@@ -1067,6 +1796,12 @@ pub const TripleBufferedSurface = struct {
             self.pending_scroll_row_end = 0;
         }
 
+        const outermost_paint = self.paint_nesting == 0;
+        var retention_count: u16 = 0;
+        for (self.retention_storage.published[0..@as(usize, self.retention_storage.published_count)]) |slot| {
+            const capture = self.retention_storage.metadata[slot];
+            if (capture.valid and capture.commit_rev <= self.commit_rev) retention_count += 1;
+        }
         self.paint_nesting += 1;
         return .{
             .committed_index = ci,
@@ -1077,6 +1812,11 @@ pub const TripleBufferedSurface = struct {
             .vb_shift = vb_shift,
             .scroll_row_start = scroll_row_start,
             .scroll_row_end = scroll_row_end,
+            // Copied under rotation_mu; the Present gate must use this value
+            // and never re-read commit_rev from the TBS after paint.
+            .commit_rev = self.commit_rev,
+            .retention_count = retention_count,
+            .outermost_paint = outermost_paint,
         };
     }
 
@@ -1090,7 +1830,7 @@ pub const TripleBufferedSurface = struct {
         self.paint_nesting -= 1;
         // When nesting returns to 0, check if new dirty state accumulated.
         const needs_reinvalidate = (self.paint_nesting == 0) and
-            (self.pending_dirty.count() > 0 or self.pending_paint_full);
+            (self.pending_dirty.count() > 0 or self.pending_paint_full or self.semantic_commits.count() > 0);
         return needs_reinvalidate;
     }
 
@@ -1271,6 +2011,7 @@ pub const TripleBufferedSurface = struct {
         self.pending_dirty.deinit(alloc);
         self.sparse_sync.deinit(alloc);
         self.paint_dirty_snapshot.deinit(alloc);
+        self.retention_storage.deinit(alloc);
     }
 };
 
@@ -1659,6 +2400,30 @@ pub const RowVB = struct {
     uploaded_ver: u64 = 0,
 };
 
+/// GPU-side buffers for the fixed CPU retention ring. The stored capture
+/// fields form the upload identity, so slot reuse cannot draw stale vertices.
+pub const RetentionVB = struct {
+    vb: ?*c.ID3D11Buffer = null,
+    vb_bytes: usize = 0,
+    /// Upload identity: the slot's vertex CONTENT only. Placement
+    /// (target_row) is a VS constant applied at draw time, and carried rows
+    /// republish under new commit_revs without their vertices changing, so
+    /// neither belongs in the cache key.
+    uploaded_content_gen: u64 = 0,
+    uploaded_grid_id: i64 = 0,
+    uploaded_vertex_count: u32 = 0,
+    uploaded_valid: bool = false,
+};
+
+pub const RetentionDrawSnapshot = struct {
+    captures: [retention_ring.capacity]RetentionCapture = undefined,
+    slots: [retention_ring.capacity]u16 = undefined,
+    needs_upload: [retention_ring.capacity]bool = undefined,
+    ready: [retention_ring.capacity]bool = undefined,
+    count: usize = 0,
+    failed_rows: u32 = 0,
+};
+
 pub const RowVBPhysicalBudget = render_pipeline_helpers.RowVBPhysicalBudget;
 
 // =========================================================================
@@ -1856,6 +2621,23 @@ pub const ExternalWindow = struct {
     win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
 
+    // Contract A2/A1 handoff state. The embedded renderer is the per-window
+    // owner of the permanent settle visual; this flag is the single
+    // suppression query used by the A2 retarget path while A1 is attached.
+    smooth_scroll_a1_active: bool = false,
+    // UI-thread-only A2 settle state; the renderer owns the permanent visual.
+    a2_settle: settle_presenter.SettlePresenter = .{},
+    // Set when a failed A2 publication cannot safely touch the old COM
+    // generation.  The next successful paint snaps the rebuilt visual to zero
+    // and includes that scalar change in its publication Commit.
+    a2_zero_snap_pending: bool = false,
+
+    // Surface incarnation for smooth-scroll identity (SurfaceToken).
+    // Assigned from App.external_incarnation_counter at creation so stale
+    // semantic callbacks/records never apply to a window that reuses a
+    // grid_id or HWND after destruction.
+    incarnation: u64 = 0,
+
     // Shared CPU-side surface state (vertices, grid dims, dirty tracking).
     surface: SurfaceState = .{},
 
@@ -1871,6 +2653,8 @@ pub const ExternalWindow = struct {
     paint_retry_deadline_ms: u64 = 0,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
+    resizing: bool = false,
+    dpi_changing: bool = false,
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
@@ -1995,6 +2779,9 @@ pub const ExternalWindow = struct {
         if (self.scrollbar_vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
         }
+        // The renderer is about to release the DirectComposition device. Reset
+        // and release the animation while its COM generation is still valid.
+        self.a2_settle.drop(!self.renderer.device_lost);
         self.renderer.deinit();
     }
 };
@@ -2185,6 +2972,155 @@ pub fn ensureRowVBReadyFromSlot(
     return false;
 }
 
+/// Ensure one retained capture has a reusable, geometrically growing VB and
+/// upload it only when its publication identity or size changes.
+pub fn ensureRetentionVBReady(
+    g: *d3d11.Renderer,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
+    vb: *RetentionVB,
+    capture: RetentionCapture,
+    vertices: []const Vertex,
+) !bool {
+    if (!capture.valid or vertices.len == 0) return false;
+    const need_bytes = vertices.len * @sizeOf(Vertex);
+    if (vb.uploaded_valid and vb.uploaded_content_gen == capture.content_gen and
+        vb.uploaded_grid_id == capture.grid_id and
+        vb.uploaded_vertex_count == capture.vertex_count and
+        vb.vb != null and vb.vb_bytes >= need_bytes) return false;
+    try ensureBudgetedRowVertexBuffer(
+        g,
+        budget,
+        surface_retained_bytes,
+        &vb.vb,
+        &vb.vb_bytes,
+        need_bytes,
+    );
+    try g.uploadVertsToVB(vb.vb.?, vertices);
+    vb.uploaded_content_gen = capture.content_gen;
+    vb.uploaded_grid_id = capture.grid_id;
+    vb.uploaded_vertex_count = capture.vertex_count;
+    vb.uploaded_valid = true;
+    return true;
+}
+
+/// Snapshot published captures before taking the D3D context lock. CPU
+/// payloads are copied only for slots whose cached GPU identity is stale.
+pub fn snapshotRetainedRows(
+    alloc: std.mem.Allocator,
+    tbs: *TripleBufferedSurface,
+    retention_vbs: []RetentionVB,
+    cpu_snapshots: []std.ArrayListUnmanaged(Vertex),
+    commit_rev: u64,
+    snapshot: *RetentionDrawSnapshot,
+) void {
+    snapshot.* = .{};
+    const max_count = @min(retention_vbs.len, cpu_snapshots.len);
+    tbs.rotation_mu.lockUncancelable(core.clock.io());
+    const storage = &tbs.retention_storage;
+    // Walk the ring's paint view, not the compact published index: an open
+    // flush bracket restages carried slots in place, and mid-bracket paints
+    // must keep drawing the PRE-shift publication (matching the on-screen
+    // commit) until the bracket publishes. paintViewAt returns exactly that.
+    for (0..RetentionStorage.SLOT_COUNT) |slot| {
+        if (snapshot.count >= max_count) break;
+        const view = storage.bookkeeping.paintViewAt(slot) orelse continue;
+        const slot_u16: u16 = @intCast(slot);
+        var capture = storage.metadata[slot];
+        if (!capture.valid or capture.commit_rev > commit_rev) continue;
+        // Metadata may already carry the bracket's shifted rows; the view's
+        // placement fields are the paint-consistent ones.
+        capture.source_row = view.source_row;
+        capture.target_row = view.target_row;
+        capture.vertex_count = view.vertex_count;
+        const vertices = storage.buffers[slot].items;
+        if (vertices.len == 0) continue;
+        const vb = &retention_vbs[slot];
+        const need_bytes = vertices.len * @sizeOf(Vertex);
+        const cached = vb.uploaded_valid and vb.uploaded_content_gen == capture.content_gen and
+            vb.uploaded_grid_id == capture.grid_id and
+            vb.uploaded_vertex_count == capture.vertex_count and
+            vb.vb != null and vb.vb_bytes >= need_bytes;
+        snapshot.captures[snapshot.count] = capture;
+        snapshot.slots[snapshot.count] = slot_u16;
+        snapshot.needs_upload[snapshot.count] = !cached;
+        snapshot.ready[snapshot.count] = true;
+        if (!cached) {
+            cpu_snapshots[slot].ensureTotalCapacity(alloc, vertices.len) catch {
+                snapshot.failed_rows += 1;
+                snapshot.ready[snapshot.count] = false;
+                snapshot.count += 1;
+                continue;
+            };
+            cpu_snapshots[slot].clearRetainingCapacity();
+            cpu_snapshots[slot].appendSliceAssumeCapacity(vertices);
+        }
+        snapshot.count += 1;
+    }
+    tbs.rotation_mu.unlock(core.clock.io());
+}
+
+/// Draw the published retained captures as virtual rows. The caller invokes
+/// this only for shader-recompose paints and after the live remapped rows;
+/// each capture's translation is target-row minus source-row in pixel space.
+pub fn drawRetainedRows(
+    g: *d3d11.Renderer,
+    snapshot: *const RetentionDrawSnapshot,
+    retention_vbs: []RetentionVB,
+    cpu_snapshots: []std.ArrayListUnmanaged(Vertex),
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
+    row_h_px: i32,
+    base_vp_h: f32,
+    metrics: *SurfaceRowDrawMetrics,
+) !void {
+    if (row_h_px <= 0 or base_vp_h <= 0) return;
+    defer g.setRowTranslationNdc(0.0) catch {};
+    for (0..snapshot.count) |i| {
+        if (!snapshot.ready[i]) continue;
+        const slot: usize = @intCast(snapshot.slots[i]);
+        const capture = snapshot.captures[i];
+        const vertices = if (snapshot.needs_upload[i]) cpu_snapshots[slot].items else &[_]Vertex{};
+        const draw_count: usize = if (snapshot.needs_upload[i]) vertices.len else @intCast(capture.vertex_count);
+        const uploaded = ensureRetentionVBReady(
+            g,
+            budget,
+            surface_retained_bytes,
+            &retention_vbs[slot],
+            capture,
+            vertices,
+        ) catch |err| {
+            if (err == error.RowVBPhysicalBudgetExceeded) return err;
+            metrics.failed_rows += 1;
+            continue;
+        };
+        if (uploaded) {
+            metrics.vb_upload_rows += 1;
+            metrics.vb_upload_rows_bytes += @as(u64, @intCast(vertices.len * @sizeOf(Vertex)));
+        }
+        const delta_px: f32 = @floatFromInt((capture.target_row - capture.source_row) * row_h_px);
+        try g.setRowTranslationNdc(-2.0 * delta_px / base_vp_h);
+        const vb = retention_vbs[slot].vb orelse continue;
+        g.drawVB(vb, draw_count) catch {
+            metrics.failed_rows += 1;
+            continue;
+        };
+        metrics.drawn_rows += 1;
+    }
+}
+
+pub fn releaseRetentionVBs(
+    retention_vbs: []RetentionVB,
+    budget: *RowVBPhysicalBudget,
+    surface_retained_bytes: *usize,
+) void {
+    for (retention_vbs) |*rvb| {
+        if (rvb.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        budget.release(surface_retained_bytes, rvb.vb_bytes);
+        rvb.* = .{};
+    }
+}
+
 /// Shift the row_vbs array to match a scroll delta.
 /// After scroll up by N (delta > 0): row_vbs[i] = row_vbs[i+N], vacated tail entries reset.
 /// After scroll down by N (delta < 0): row_vbs[i] = row_vbs[i-N], vacated head entries reset.
@@ -2305,13 +3241,19 @@ pub const ScrollShiftResult = struct {
 ///   row_h_px:            Row height in pixels
 ///   effective_rows:      Total valid row count
 ///   y_offset:            Content Y offset in back_tex pixels (e.g. tabbar height). 0 for ext windows.
-pub fn applyScrollShift(
+///   back_tex_blit_allowed: ease_math.scrollBackTexAllowed(shader_recompose_frame).
+///                        Contract B 描画フレーム契約 item 2: a recompose paint
+///                        applies the RowVB metadata shift but must suppress the
+///                        physical back_tex blit — otherwise the shader offset
+///                        moves already-blitted pixels a second time.
+pub fn applyScrollShiftGated(
     g: *d3d11.Renderer,
     alloc: std.mem.Allocator,
     row_vbs: []RowVB,
     shift_scratch: *std.ArrayListUnmanaged(RowVB),
     rows_to_draw: *std.ArrayListUnmanaged(u32),
     row_merge_scratch: *std.ArrayListUnmanaged(u32),
+    back_tex_blit_allowed: bool,
     scroll_rect: c.RECT,
     scroll_dy_px: i32,
     vb_shift_rows: i32,
@@ -2366,7 +3308,13 @@ pub fn applyScrollShift(
     filled.top += y_offset;
     filled.bottom += y_offset;
 
-    const scroll_copy_ok = g.scrollBackTex(filled, scroll_dy_px);
+    // Contract B blit suppression (描画フレーム契約 item 2): the metadata
+    // shift above always runs; the pixel copy runs only when the caller's
+    // scrollBackTexAllowed(recompose) said so. A suppressed copy takes the
+    // same "pixels were never shifted" recovery below, so every row of the
+    // scroll region joins rows_to_draw (a recompose paint redraws all rows
+    // anyway — 描画フレーム契約 item 1).
+    const scroll_copy_ok = back_tex_blit_allowed and g.scrollBackTex(filled, scroll_dy_px);
 
     // 4. When multiple scroll flushes accumulate before a paint, the back buffer
     //    shift leaves gap rows with stale pixels.  The per-flush dirty bitmap
@@ -2433,6 +3381,47 @@ pub fn applyScrollShift(
     return .{ .scroll_rect = filled };
 }
 
+/// Compatibility entry for callers outside Contract B's main-composite scope
+/// (external windows, Contract A2): the physical back_tex blit stays
+/// unconditionally allowed there. The main WM_PAINT path calls
+/// applyScrollShiftGated with ease_math.scrollBackTexAllowed(recompose).
+pub fn applyScrollShift(
+    g: *d3d11.Renderer,
+    alloc: std.mem.Allocator,
+    row_vbs: []RowVB,
+    shift_scratch: *std.ArrayListUnmanaged(RowVB),
+    rows_to_draw: *std.ArrayListUnmanaged(u32),
+    row_merge_scratch: *std.ArrayListUnmanaged(u32),
+    scroll_rect: c.RECT,
+    scroll_dy_px: i32,
+    vb_shift_rows: i32,
+    scroll_row_start: u32,
+    scroll_row_end: u32,
+    last_cursor_row_ptr: *?u32,
+    row_h_px: i32,
+    effective_rows: u32,
+    y_offset: i32,
+) ScrollShiftResult {
+    return applyScrollShiftGated(
+        g,
+        alloc,
+        row_vbs,
+        shift_scratch,
+        rows_to_draw,
+        row_merge_scratch,
+        true,
+        scroll_rect,
+        scroll_dy_px,
+        vb_shift_rows,
+        scroll_row_start,
+        scroll_row_end,
+        last_cursor_row_ptr,
+        row_h_px,
+        effective_rows,
+        y_offset,
+    );
+}
+
 /// Draw rows from slot-based row_map with separate RowVB GPU buffers.
 /// This is the TBS-equivalent of drawSurfaceRowsVB.
 pub fn drawSurfaceRowsVBFromSlots(
@@ -2451,11 +3440,22 @@ pub fn drawSurfaceRowsVBFromSlots(
     y_offset: i32,
     content_right: i32,
     row_h_px: i32,
+    use_vs_row_translation: bool,
     log_enabled: bool,
     metrics: *SurfaceRowDrawMetrics,
 ) !void {
     const row_count: usize = if (rows_to_draw) |rows| rows.len else row_map.len;
     var vp_dirty = false;
+    // Contract B row-translation separation (描画フレーム契約 item 4): the
+    // ordinary path keeps DrawOpts.row_translation_ndc at its zero default and
+    // uses the per-row viewport translation below. A recompose paint
+    // (use_vs_row_translation) disables per-row scissor/viewport (the caller
+    // passes null fns) and instead expresses the same logical
+    // row_translation = logical_row - origin_row through the step-3
+    // row_translation_ndc VS constant; the NDC form
+    // `-2 * delta_px / viewport_h` is the documented pixel-equivalent of the
+    // viewport translation (see the bloom NDC adjustment in
+    // drawRowModeSetupAndRows).
     var i: usize = 0;
     while (i < row_count) : (i += 1) {
         const row: u32 = if (rows_to_draw) |rows| rows[i] else @intCast(i);
@@ -2467,6 +3467,13 @@ pub fn drawSurfaceRowsVBFromSlots(
 
         const mapping = row_map[@intCast(row)];
         if (mapping.slot == SLOT_NONE) {
+            if (use_vs_row_translation) {
+                // Recompose paints cleared the whole content viewport to the
+                // background first (描画フレーム契約 item 1, 「空行含む」): a
+                // row with no slot is legitimately background, not a failure.
+                metrics.drawn_rows += 1;
+                continue;
+            }
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
             if (metrics.first_empty_row == null) {
@@ -2477,6 +3484,13 @@ pub fn drawSurfaceRowsVBFromSlots(
 
         const slot = pool.slotPtrConst(mapping.slot);
         const src = slot.verts.items;
+        if (src.len == 0 and use_vs_row_translation) {
+            // Same as SLOT_NONE above: the full clear already painted this
+            // "clear row" (core sends vert_count==0 as clear), and drawing a
+            // scissored bg quad is impossible without per-row scissor.
+            metrics.drawn_rows += 1;
+            continue;
+        }
         if (src.len == 0) {
             // Core sends vert_count==0 as "clear row" (flush.zig:2904).
             // Draw a bg-fill quad to overwrite stale back_tex pixels.
@@ -2572,6 +3586,22 @@ pub fn drawSurfaceRowsVBFromSlots(
             }
         }
 
+        if (use_vs_row_translation and row_h_px > 0 and base_vp.h > 0) {
+            // Contract B recompose translation (描画フレーム契約 item 4): the
+            // remapped logical-minus-origin delta rides the VS constant so the
+            // draw needs no per-row viewport (and therefore no per-row
+            // scissor). Viewport TopLeftY += delta_px is pixel-equivalent to
+            // NDC y -= 2 * delta_px / viewport_h.
+            const origin_i32: i32 = @intCast(slot.origin_row);
+            const row_delta = @as(i32, @intCast(row)) - origin_i32;
+            const delta_px: f32 = @floatFromInt(row_delta * row_h_px);
+            g.setRowTranslationNdc(-2.0 * delta_px / base_vp.h) catch {
+                metrics.skipped_empty += 1;
+                metrics.failed_rows += 1;
+                continue;
+            };
+        }
+
         const row_vb = vb.vb orelse {
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
@@ -2587,6 +3617,15 @@ pub fn drawSurfaceRowsVBFromSlots(
             metrics.draw_vb_ns += core.clock.nowNs() - t_draw_start;
         }
         metrics.drawn_rows += 1;
+    }
+
+    // Recompose: the VS row translation is per-row state. Reset it before the
+    // later passes (cursor, bloom, scrollbar overlay) so the pass order of the
+    // 描画フレーム契約 draws them untranslated.
+    if (use_vs_row_translation) {
+        g.setRowTranslationNdc(0.0) catch {
+            metrics.failed_rows += 1;
+        };
     }
 
     // Restore base viewport if modified.
@@ -2629,6 +3668,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
             .present = false,
             .preserve_on_null_dirty = params.preserve_back,
             .content_height = params.content_height,
+            .row_translation_ndc = params.row_translation_ndc,
             .content_width = params.content_width,
             .content_y_offset = params.content_y_offset,
             .content_x_offset = params.content_x_offset,
@@ -2688,6 +3728,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         params.y_offset,
         params.content_right,
         params.row_h_px,
+        params.use_vs_row_translation,
         log_enabled,
         &result.metrics,
     );
@@ -2778,6 +3819,20 @@ pub const DetachedRowVB = struct {
 
 pub fn detachOneRowVB(row_vbs: []RowVB) ?DetachedRowVB {
     for (row_vbs) |*rvb| {
+        if (rvb.vb) |vb| {
+            const bytes = rvb.vb_bytes;
+            rvb.* = .{};
+            return .{ .buffer = vb, .bytes = bytes };
+        }
+    }
+    return null;
+}
+
+/// Detach one retained-row GPU buffer without calling COM. Device-loss
+/// recovery releases the returned buffer after dropping app.mu, just like the
+/// ordinary row-buffer path.
+pub fn detachOneRetentionVB(retention_vbs: []RetentionVB) ?DetachedRowVB {
+    for (retention_vbs) |*rvb| {
         if (rvb.vb) |vb| {
             const bytes = rvb.vb_bytes;
             rvb.* = .{};
@@ -2887,6 +3942,13 @@ pub const RowModeDrawParams = struct {
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
     tabbar_bg_color: ?[4]f32 = null,
+    // Kept at zero while per-row viewport translation remains active.
+    row_translation_ndc: f32 = 0.0,
+    // Contract B recompose paint (描画フレーム契約 item 4): per-row scissor
+    // is disabled (use_row_scissor=false) while row translation is expressed
+    // per-row through the step-3 row_translation_ndc VS constant instead of
+    // the viewport. Only WM_PAINT's shader_recompose_frame path sets this.
+    use_vs_row_translation: bool = false,
 
     /// Compute bloom viewport from these params.
     pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
@@ -2932,6 +3994,7 @@ pub fn drawRowModeSetupAndRows(
             .present = false,
             .preserve_on_null_dirty = params.preserve_back,
             .content_height = params.content_height,
+            .row_translation_ndc = params.row_translation_ndc,
             .content_width = params.content_width,
             .content_y_offset = params.content_y_offset,
             .content_x_offset = params.content_x_offset,
@@ -3510,6 +4573,11 @@ pub const App = struct {
     // External windows (grid_id -> ExternalWindow)
     external_windows: std.AutoHashMapUnmanaged(i64, *ExternalWindow) = .{},
 
+    // Monotonic source for ExternalWindow.incarnation (guarded by app.mu;
+    // bumped on every external window creation). Forms
+    // scroll_types.SurfaceToken.incarnation for smooth-scroll identity.
+    external_incarnation_counter: u64 = 0,
+
     // UI-thread custom-shader animation snapshot. Capacity tracks the
     // high-water external-window count so the 60 Hz path allocates only when
     // that population grows and never truncates at a fixed grid count.
@@ -3601,6 +4669,29 @@ pub const App = struct {
 
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
     tbs: TripleBufferedSurface = .{},
+    // Contract B step-5 recompose state (all UI thread confinement, no lock —
+    // 「Lock / thread 契約」). Main b_ease records are converted directly at
+    // the paint barrier so per-event caps remain observable.
+    b_offset_ledger: scroll_route.EaseOffsetLedger = .{},
+    // 「Frame 遷移規則」 step 4: was_active_last_frame persisted across paints.
+    b_was_active_last_frame: bool = false,
+    // 「無効化」: a forced drop (WM_SIZE / device loss) between paints must
+    // still produce exactly one final recompose frame; the drop site arms
+    // this and the next paint's derivation consumes it.
+    b_forced_zero_pending: bool = false,
+    // Core-thread invalidation requests are consumed at the UI paint barrier.
+    // The offset ledger itself remains UI-thread confined.
+    b_drop_all_request: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // True while the native resize/move modal loop is active; ease records are
+    // drained during this interval but cannot seed new transforms.
+    b_in_size_move: bool = false,
+    // Whether the previous outermost paint ran the recompose path. The first
+    // ordinary paint after a recompose run re-primes the scrollbar underlay
+    // (underlay 遷移規則) via a one-shot full-row redraw.
+    b_prev_paint_recompose: bool = false,
+    // Timestamp of the previous ease decay tick (dt source; the decay itself
+    // is rate independent via ease_math.elapsedFrames).
+    b_last_ease_tick_ns: i128 = 0,
     // Cross-thread flush bracket state. The core thread publishes it from
     // onFlushBegin and clears it while atomically committing/cancelling in
     // onFlushEnd. Main and external TBS write sets join lazily on mutation;
@@ -3632,6 +4723,12 @@ pub const App = struct {
     row_vb_retained_bytes: usize = 0,
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
+    // Fixed GPU cache corresponding to TripleBufferedSurface's retention ring.
+    retention_vbs: [retention_ring.capacity]RetentionVB = [_]RetentionVB{.{}} ** retention_ring.capacity,
+    // UI-side stable copies used when a published capture must be uploaded
+    // after releasing rotation_mu; this keeps D3D calls outside the core lock.
+    retention_cpu_snapshots: [retention_ring.capacity]std.ArrayListUnmanaged(Vertex) =
+        [_]std.ArrayListUnmanaged(Vertex){.empty} ** retention_ring.capacity,
     // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
     row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent destination for linear dirty-row/range union during scroll.
@@ -3686,6 +4783,20 @@ pub const App = struct {
     // Scrollbar update coalescing: set by on_flush_end (core thread), cleared by WM_APP_UPDATE_SCROLLBAR (UI thread).
     scrollbar_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     msg_throttle_arm_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // WM_APP_SMOOTH_SCROLL_COMMIT coalescing: set by onFlushEnd (core thread)
+    // after a semantic commit, cleared by the UI-thread handler before it
+    // drains the TBS semantic_commits ring.
+    smooth_scroll_commit_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Durable fail-closed smooth-scroll reset request. Set by the core thread
+    // (onFlushEnd) when a staged semantic delta could not be committed or its
+    // wakeup could not be posted; consumed (with a session reset) by the
+    // UI-thread coordinator drain that lands in a later step; never cleared
+    // by anything else until then.
+    smooth_scroll_reset_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // WM_APP_DM_UPDATE coalescing: set by the Direct Manipulation delegate
+    // callback (DM thread) after a mailbox write, cleared by the UI-thread
+    // handler before it reads the mailbox.
+    dm_update_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Claimed by the first glow warm-up request in an enabled period. A flush
     // with glow disabled clears it so later runtime re-enable warms renderers
     // created while glow was off.
@@ -4388,6 +5499,12 @@ pub const App = struct {
             &self.row_vb_budget,
             &self.row_vb_retained_bytes,
         );
+        releaseRetentionVBs(
+            self.retention_vbs[0..],
+            &self.row_vb_budget,
+            &self.row_vb_retained_bytes,
+        );
+        for (&self.retention_cpu_snapshots) |*snapshot| snapshot.deinit(self.alloc);
         self.row_vbs.deinit(self.alloc);
         // Scratch holds shallow copies during a shift; GPU buffers belong to
         // row_vbs, so only free the list storage.

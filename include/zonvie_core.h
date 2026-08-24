@@ -1182,10 +1182,11 @@ ZONVIE_API int32_t zonvie_core_try_get_viewport(
    restore arriving twice is harmless. Windows without 'wrap' are skipped: the
    option does nothing there.
 
-   No-op off macOS (sub-cell trackpad scrolling is a macOS frontend feature).
-   Returns 1 when the request was issued, 0 when it could not be (grid lock
-   busy, or no window known for the grid yet) — the caller must try again, which
-   matters most for the restore. */
+   Used by both the macOS and Windows frontends' sub-cell trackpad scrolling.
+   Returns 1 when the request was issued, and also for a restore of a grid
+   with no window (the option went with it; nothing is left to restore).
+   Returns 0 when it could not be issued — grid lock busy, or a borrow for a
+   grid with no window known yet — the caller must try again. */
 ZONVIE_API int32_t zonvie_core_set_gesture_smooth_scroll(
     zonvie_core *core,
     int64_t grid_id,
@@ -1269,8 +1270,8 @@ ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value)
    option changes, so sub-cell scrolling can account an event as the N rows it
    is actually worth. 'ver:0' disables mouse scrolling in Neovim altogether —
    it is not a page-relative setting — and reports 0, as does a null core.
-   The reporter is installed on macOS only; elsewhere this returns Neovim's
-   default (3) and should not be relied on. */
+   The reporter is installed for every frontend; the macOS and Windows
+   sub-cell scroll paths read it, others may simply ignore it. */
 ZONVIE_API uint32_t zonvie_core_get_mousescroll_ver(zonvie_core *core);
 
 /* Check if cursor is visible.

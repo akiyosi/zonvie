@@ -8,6 +8,7 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const builtin = @import("builtin");
 const config_mod = app_mod.config_mod;
+const scroll_types = app_mod.scroll_types;
 
 // Sub-module imports
 const callbacks = @import("callbacks.zig");
@@ -19,6 +20,9 @@ const input = @import("input.zig");
 const dialogs = @import("ui/dialogs.zig");
 const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
+const smooth_session = @import("scroll/session.zig");
+const ease_math = @import("scroll/ease_math.zig");
+const scroll_route = app_mod.scroll_route;
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
 /// single-instance forwarding and the WM_COPYDATA handler below). 'ZONV'.
@@ -932,6 +936,10 @@ pub fn serviceDeferredUiRetries(hwnd: c.HWND, app: *App) void {
     }
 
     const now_ms = c.GetTickCount64();
+    smooth_session.servicePendingReset(app);
+    smooth_session.serviceDeferredUiWork(app);
+    smooth_session.serviceFallbackDeadline(app, now_ms);
+    smooth_session.servicePendingResend(app);
     if (app_mod.g_device_lost_retry_delivery_failed.swap(false, .acq_rel)) {
         app.device_lost_retry_needed = true;
     }
@@ -983,6 +991,7 @@ fn includeDeadline(deadline_ms: u64, now_ms: u64, timeout_ms: *c.DWORD) void {
 }
 
 pub fn nextDeferredUiRetryTimeoutMs(app: *App) c.DWORD {
+    if (app.smooth_scroll_reset_pending.load(.acquire)) return 0;
     const now_ms = c.GetTickCount64();
     var timeout_ms: c.DWORD = c.INFINITE;
     includeDeadline(app.device_lost_retry_deadline_ms, now_ms, &timeout_ms);
@@ -990,6 +999,7 @@ pub fn nextDeferredUiRetryTimeoutMs(app: *App) c.DWORD {
     includeDeadline(app.main_paint_retry_deadline_ms, now_ms, &timeout_ms);
     includeDeadline(app.external_create_retry_deadline_ms, now_ms, &timeout_ms);
     includeDeadline(external_windows.nextPaintRetryDeadlineMs(app), now_ms, &timeout_ms);
+    includeDeadline(smooth_session.fallbackDeadlineMs(app), now_ms, &timeout_ms);
     return timeout_ms;
 }
 
@@ -1305,6 +1315,12 @@ fn releaseMainRecoveryBuffers(app: *App) void {
             }
         }
         if (vb == null) {
+            if (app_mod.detachOneRetentionVB(app.retention_vbs[0..])) |detached| {
+                vb = detached.buffer;
+                row_vb_bytes = detached.bytes;
+            }
+        }
+        if (vb == null) {
             vb = app.cursor_vb;
             app.cursor_vb = null;
             app.cursor_vb_bytes = 0;
@@ -1519,6 +1535,7 @@ fn makeCoreCbs() core.Callbacks {
         .on_main_grid_size = callbacks.onMainGridSize,
         .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
+        .on_grid_scroll = callbacks.onGridScroll,
     };
 }
 
@@ -2140,6 +2157,141 @@ pub export fn WndProc(
                         }
                     }
                 }
+                // Contract B paint drain barrier (windows-smooth-scroll-b-main-
+                // region.md 「paint 側 drain barrier(順序固定)」 and 「Frame
+                // 遷移規則」 steps 1-2):
+                //   1. acquireForPaint(revision 束縛 snapshot、rotation_mu 下で
+                //      commit_rev コピー)  — done just above
+                //   2. main record を snapshot.commit_rev まで drain(ledger へ)
+                //      — HERE, before step 5 (pending scroll 消費: the
+                //      snapshot's scroll_rect is consumed by applyScrollShift
+                //      further below) and before step 6 (頂点消費).
+                // Reentrant paints never consume pending scroll (their snapshot
+                // carries none), so the drain is gated on the outermost paint,
+                // matching the A2 consumption rule.
+                // Convert drained records at this barrier before any pending
+                // scroll or vertex consumption.
+                // Contract B step 5: shader_recompose_frame for this paint.
+                // Determined once at the barrier (「Frame 遷移規則」: 確定後、
+                // frame 内で不変); false for reentrant paints, whose snapshots
+                // carry no pending scroll and which must not tick the ledger.
+                var b_recompose_frame = false;
+                var b_schedule_next_frame = false;
+                // First ordinary paint after a recompose run (underlay 遷移規則).
+                var b_leaving_recompose = false;
+                if (tbs_snapshot.outermost_paint) {
+                    // Core-thread invalidation requests are consumed here, on
+                    // the UI thread that owns the offset ledger. A consumed
+                    // drop also discards THIS paint's drained records: the
+                    // core-side clearBEaseCommits races the drain below under
+                    // rotation_mu, and pre-change records that win the race
+                    // must not re-seed onto the freshly dropped ledger with
+                    // stale geometry (TOCTOU found in review).
+                    var b_discard_seeds_this_paint = false;
+                    if (app.b_drop_all_request.swap(false, .seq_cst)) {
+                        if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
+                        b_discard_seeds_this_paint = true;
+                    }
+                    var dropped_ledger_grids: [app_mod.RetentionStorage.MAX_GRIDS]i64 = undefined;
+                    const dropped_ledger_count = app.tbs.drainDroppedGrids(&dropped_ledger_grids);
+                    var dropped_active_grid = false;
+                    for (dropped_ledger_grids[0..dropped_ledger_count]) |dropped_grid_id| {
+                        if (app.b_offset_ledger.dropGrid(dropped_grid_id)) dropped_active_grid = true;
+                    }
+                    if (dropped_active_grid and app.b_offset_ledger.count() == 0) {
+                        app.b_forced_zero_pending = true;
+                    }
+                    // Frame transition step 2: rate-independent spring tick,
+                    // BEFORE drain/seed (v5.1 causal-dt rule). Integrating a
+                    // just-arrived seed over the idle gap that preceded it
+                    // would settle it instantly, reintroducing pause-dependent
+                    // snap-vs-glide nondeterminism. Existing entries correctly
+                    // integrate wall-clock time. QPC-backed monotonic time
+                    // keeps the spring rate-independent; wall-clock
+                    // adjustments cannot stretch or reverse dt.
+                    const b_now_ns = core.clock.monotonicNs();
+                    const b_dt_sec: f64 = if (app.b_last_ease_tick_ns == 0)
+                        0.0
+                    else
+                        @as(f64, @floatFromInt(@max(0, b_now_ns - app.b_last_ease_tick_ns))) / 1_000_000_000.0;
+                    app.b_last_ease_tick_ns = b_now_ns;
+                    const b_reached_zero = app.b_offset_ledger.tick(b_dt_sec);
+
+                    var drained_grid_ids: [scroll_types.MaxSemanticCommits]i64 = undefined;
+                    var drained_rows: [scroll_types.MaxSemanticCommits]i32 = undefined;
+                    const b_ease_drained = app.tbs.drainBEaseRecordsUpTo(
+                        tbs_snapshot.commit_rev,
+                        &drained_grid_ids,
+                        &drained_rows,
+                    );
+                    if (b_ease_drained != 0 and log_enabled) {
+                        applog.appLog(
+                            "[smooth] b_ease drain records={d} commit_rev={d}\n",
+                            .{ b_ease_drained, tbs_snapshot.commit_rev },
+                        );
+                    }
+
+                    app.mu.lockUncancelable(core.clock.io());
+                    const row_height_px: f64 = @floatFromInt(app.cell_h_px + app.linespace_px);
+                    app.mu.unlock(core.clock.io());
+                    var b_real_seeded = false;
+                    if (!app.b_in_size_move and !b_discard_seeds_this_paint) {
+                        for (drained_grid_ids[0..b_ease_drained], drained_rows[0..b_ease_drained]) |grid_id, rows_delta| {
+                            switch (app.b_offset_ledger.seedArrival(grid_id, rows_delta, row_height_px, false)) {
+                                .seeded => b_real_seeded = true,
+                                .capacity_drop => applog.appLog(
+                                    "[smooth] b_ease drop grid={d} rows={d} reason=offset-ledger-capacity\n",
+                                    .{ grid_id, rows_delta },
+                                ),
+                                .skipped => {},
+                            }
+                        }
+                    }
+
+                    // 「Frame 遷移規則」 step 4: derive and freeze; persist
+                    // was_active_last_frame := active_now; consume the forced
+                    // drop flag armed by the 無効化 sites (WM_SIZE/device loss).
+                    // Capture a pending final-zero wake before this paint
+                    // consumes it.  A natural spring settling crossing is rendered by
+                    // this paint itself; it must not schedule one extra idle
+                    // paint after the final-zero frame has run.
+                    const b_final_zero_pending_before = app.b_forced_zero_pending;
+                    const b_paint_tick = scroll_route.deriveRecomposeForPaint(.{
+                        .offset_active = app.b_offset_ledger.hasActive(),
+                        .seeded_this_frame = b_real_seeded,
+                        .reached_zero_this_frame = b_reached_zero,
+                        .forced_zero_pending = app.b_forced_zero_pending,
+                        .was_active_last_frame = app.b_was_active_last_frame,
+                    });
+                    app.b_forced_zero_pending = false;
+                    app.b_was_active_last_frame = b_paint_tick.was_active_next;
+                    b_recompose_frame = b_paint_tick.shader_recompose_frame;
+                    b_schedule_next_frame = scroll_route.shouldScheduleNextFrame(
+                        b_paint_tick.recompose.offset_active,
+                        b_final_zero_pending_before,
+                        tbs_snapshot.outermost_paint,
+                    );
+
+                    // Underlay 遷移規則 transition edge. If this paint fails
+                    // before drawing, its recovery path requeues a full paint
+                    // (paint_full), which re-primes the underlay anyway.
+                    b_leaving_recompose = app.b_prev_paint_recompose and !b_recompose_frame;
+                    app.b_prev_paint_recompose = b_recompose_frame;
+                    if (log_enabled and (b_recompose_frame or b_leaving_recompose)) {
+                        applog.appLog(
+                            "[smooth] b_recompose frame={d} leaving={d} active={d} seeded={d} final_zero={d} ledger_grids={d}\n",
+                            .{
+                                @as(u32, @intFromBool(b_recompose_frame)),
+                                @as(u32, @intFromBool(b_leaving_recompose)),
+                                @as(u32, @intFromBool(b_paint_tick.recompose.offset_active)),
+                                @as(u32, @intFromBool(b_paint_tick.recompose.seeded_this_frame)),
+                                @as(u32, @intFromBool(b_paint_tick.recompose.final_zero_frame or b_paint_tick.recompose.final_zero_frame_pending)),
+                                app.b_offset_ledger.count(),
+                            },
+                        );
+                    }
+                }
+
                 const committed = &app.tbs.sets[tbs_snapshot.committed_index];
                 const committed_cursor = &app.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
 
@@ -2164,6 +2316,22 @@ pub export fn WndProc(
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
                 const row_h_px_snapshot: u32 = app.rowHeightPx();
                 const scrollbar_alpha_snapshot = app.scrollbar_alpha;
+
+                // Retention is paint-side state: validate its cell metric only
+                // after the spring tick/drain barrier and before any vertices
+                // are consumed. Captures for settled grids have no useful
+                // destination and are invalidated here, matching the macOS
+                // retention prune.
+                if (tbs_snapshot.outermost_paint) {
+                    _ = app.tbs.drainRetentionForPaint(
+                        tbs_snapshot.commit_rev,
+                        @floatFromInt(row_h_px_snapshot),
+                    );
+                    app.tbs.pruneRetentionInactive(
+                        tbs_snapshot.commit_rev,
+                        app.b_offset_ledger.grid_ids[0..app.b_offset_ledger.len],
+                    );
+                }
 
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
                 // Take pointers to the option payloads instead.
@@ -2199,6 +2367,10 @@ pub export fn WndProc(
                         app.need_full_seed.store(true, .seq_cst);
                         app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
+                        // Retained captures carry pre-reset atlas UVs; live rows
+                        // re-seed but the retention ring would keep drawing the
+                        // stale glyphs (無効化 contract: drop, never partial).
+                        app.tbs.clearRetention();
                         // After atlas reset, external window paints may consume
                         // shared pending_uploads before the main window sees them.
                         // Schedule a full atlas upload to ensure all glyph data is present.
@@ -2347,11 +2519,39 @@ pub export fn WndProc(
                     t_atlas_end_ns = core.clock.nowNs();
                 }
 
+                var retention_snapshot = app_mod.RetentionDrawSnapshot{};
+                if (b_recompose_frame) {
+                    app_mod.snapshotRetainedRows(
+                        app.alloc,
+                        &app.tbs,
+                        app.retention_vbs[0..],
+                        app.retention_cpu_snapshots[0..],
+                        tbs_snapshot.commit_rev,
+                        &retention_snapshot,
+                    );
+                }
+
                 var render_ok = false;
                 if (gpu_ptr) |g| {
                     // Lock D3D context for thread-safe rendering
                     g.lockContext();
                     defer g.unlockContext();
+
+                    // Contract B: leaving recompose (描画フレーム契約 item 5 —
+                    // その後 blit / 部分 present / scissor 経路へ復帰) clears
+                    // the per-grid offsets so the HLSL identity gate
+                    // (count == 0) restores the exact pre-B pipeline. Guarded
+                    // by the live count so a paint that failed on the
+                    // transition frame still gets the clear on its retry. Only
+                    // the row-mode recompose path uploads offsets, so a
+                    // non-row paint always clears too.
+                    if ((!b_recompose_frame or !row_mode) and g.scroll_offset_count != 0) {
+                        g.clearScrollOffsets() catch |e| {
+                            if (log_enabled) applog.appLog("clearScrollOffsets failed: {any}\n", .{e});
+                            recoverMainPaintFailure(hwnd, app);
+                            return 0;
+                        };
+                    }
 
                     // Calculate content width for "always" scrollbar mode
                     // When content_hwnd exists, use its size (D3D11 is bound to content_hwnd)
@@ -2532,8 +2732,19 @@ pub export fn WndProc(
                         // relying on those flags alone leaves a window where back_tex is
                         // cleared but only dirty rows are drawn — non-dirty rows show the
                         // clear color until Neovim re-sends grid_line.
+                        // Contract B additions:
+                        //   b_recompose_frame — 描画フレーム契約 item 1: full
+                        //   recomposition draws every row (空行含む).
+                        //   b_leaving_recompose — underlay 遷移規則: the first
+                        //   ordinary paint after a recompose run redraws every
+                        //   row once, erasing the scrollbar overlay that the
+                        //   recompose frames baked into back_tex without an
+                        //   underlay capture, so the capture below re-primes
+                        //   from clean pixels.
                         const force_full_rows =
                             did_need_seed or
+                            b_recompose_frame or
+                            b_leaving_recompose or
                             (dirty == null) or
                             paint_full_snapshot or
                             seed_clear_pending_snapshot or
@@ -2749,11 +2960,20 @@ pub export fn WndProc(
                         // this frame's row/cursor updates; the returned strip is
                         // real back_tex damage and must reach every swapchain
                         // buffer through the per-buffer damage queue.
-                        const restored_scrollbar_rect = g.restoreScrollbarUnderlay() catch |e| {
-                            if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
-                            recoverMainPaintFailure(hwnd, app);
-                            return 0;
-                        };
+                        // Contract B underlay 遷移規則: a recompose paint does
+                        // not use underlay capture/restore at all — the full
+                        // clear below repaints the strip, and drawEx's clear
+                        // invalidates any saved underlay so a later ordinary
+                        // paint can never restore stale pre-recompose pixels
+                        // (古い underlay の restore 禁止).
+                        const restored_scrollbar_rect = if (b_recompose_frame)
+                            null
+                        else
+                            g.restoreScrollbarUnderlay() catch |e| {
+                                if (log_enabled) applog.appLog("restoreScrollbarUnderlay failed: {any}\n", .{e});
+                                recoverMainPaintFailure(hwnd, app);
+                                return 0;
+                            };
                         if (restored_scrollbar_rect) |restored_rect| {
                             present_rects.append(app.alloc, restored_rect) catch {
                                 present_rects_fallback_full = true;
@@ -2949,7 +3169,13 @@ pub export fn WndProc(
                         // alpha blending accumulates on retained back_tex, producing faint ghost
                         // text on rows that are drawn over without an intervening clear (matches
                         // external window logic in drawNormalExtRowMode).
+                        // Contract B 描画フレーム契約 item 1: a recompose paint
+                        // never preserves — the content viewport is cleared to
+                        // the background color and fully recomposed. (drawEx's
+                        // clear also invalidates the saved scrollbar underlay,
+                        // which the underlay 遷移規則 requires.)
                         const preserve_back = !seed_clear and
+                            !b_recompose_frame and
                             back_tex_valid_snapshot and
                             !glow_enabled and
                             g.opacity >= 1.0;
@@ -2974,7 +3200,11 @@ pub export fn WndProc(
                             // preserving a valid back_tex (incremental updates on top of
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
-                            .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
+                            // Contract B 描画フレーム契約 item 4: a recompose paint
+                            // disables per-row scissor while keeping row translation
+                            // through the VS constant (use_vs_row_translation).
+                            .use_row_scissor = (!seed_pending_snapshot or back_tex_valid_snapshot) and !b_recompose_frame,
+                            .use_vs_row_translation = b_recompose_frame,
                             .glow_enabled = glow_enabled,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
@@ -3003,41 +3233,255 @@ pub export fn WndProc(
 
                         // Apply scroll pixel shift (row_vbs shift + cursor ghost + back_tex shift).
                         // Scroll state is bundled in PaintSnapshot, atomically consistent with committed set.
+                        // Contract B 「Frame 遷移規則」 step 5 / drain-barrier
+                        // order: pending scroll is consumed after the barrier
+                        // above and before any vertex consumption below. The
+                        // RowVB metadata shift is applied on every path; the
+                        // back_tex blit runs only when
+                        // ease_math.scrollBackTexAllowed(recompose) (描画
+                        // フレーム契約 item 2 — a recompose paint that also
+                        // blitted would double-move the pixels).
                         var scroll_shift_result = app_mod.ScrollShiftResult{};
-                        if (preserve_back) {
-                            if (tbs_snapshot.scroll_rect) |sr| {
-                                scroll_shift_result = app_mod.applyScrollShift(
-                                    g,
-                                    app.alloc,
-                                    app.row_vbs.items,
-                                    &app.row_vbs_shift_scratch,
-                                    rows_to_draw,
-                                    &app.scroll_rows_merge_scratch,
-                                    sr,
-                                    tbs_snapshot.scroll_dy_px,
-                                    tbs_snapshot.vb_shift,
-                                    tbs_snapshot.scroll_row_start,
-                                    tbs_snapshot.scroll_row_end,
-                                    &app.last_painted_cursor_row,
-                                    row_h_px,
-                                    effective_rows,
-                                    content_y_offset_i32,
-                                );
-                                if (!scroll_shift_result.rows_complete) {
-                                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                    app.tbs.pending_paint_full = true;
-                                    app.tbs.rotation_mu.unlock(core.clock.io());
-                                    scheduleMainPaintRetry(hwnd, app);
-                                    return 0;
-                                }
+                        if (tbs_snapshot.scroll_rect != null and (preserve_back or b_recompose_frame)) {
+                            const sr = tbs_snapshot.scroll_rect.?;
+                            scroll_shift_result = app_mod.applyScrollShiftGated(
+                                g,
+                                app.alloc,
+                                app.row_vbs.items,
+                                &app.row_vbs_shift_scratch,
+                                rows_to_draw,
+                                &app.scroll_rows_merge_scratch,
+                                ease_math.scrollBackTexAllowed(b_recompose_frame),
+                                sr,
+                                tbs_snapshot.scroll_dy_px,
+                                tbs_snapshot.vb_shift,
+                                tbs_snapshot.scroll_row_start,
+                                tbs_snapshot.scroll_row_end,
+                                &app.last_painted_cursor_row,
+                                row_h_px,
+                                effective_rows,
+                                content_y_offset_i32,
+                            );
+                            if (!scroll_shift_result.rows_complete) {
+                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
+                                app.tbs.pending_paint_full = true;
+                                app.tbs.rotation_mu.unlock(core.clock.io());
+                                scheduleMainPaintRetry(hwnd, app);
+                                return 0;
                             }
-                        } else {
+                        } else if (!preserve_back) {
                             // No scroll shift, but still apply pending vb shift to scroll region.
                             if (tbs_snapshot.vb_shift != 0 and tbs_snapshot.scroll_row_end > tbs_snapshot.scroll_row_start) {
                                 const abs_shift: u32 = @intCast(if (tbs_snapshot.vb_shift < 0) -tbs_snapshot.vb_shift else tbs_snapshot.vb_shift);
                                 app_mod.ensureShiftScratch(app.alloc, &app.row_vbs_shift_scratch, abs_shift);
                                 app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end, app.row_vbs_shift_scratch.items);
                             }
+                        }
+
+                        // Contract B recompose: upload the offset ledger before
+                        // any vertex consumption (描画フレーム契約 item 1 pass
+                        // order — the offset buffer must be bound for the main
+                        // color, cursor, and bloom-extract passes; Shader ABI
+                        // section for the NDC formula). Fixed-size stack array:
+                        // no allocation on the paint path.
+                        if (b_recompose_frame) {
+                            var b_offset_entries: [d3d11.max_scroll_offsets]d3d11.ScrollOffset = undefined;
+                            var b_offset_count: usize = 0;
+                            const b_ledger = &app.b_offset_ledger;
+                            const visible_grids: []const app_mod.GridInfo = if (app.corep) |corep|
+                                app.getVisibleGridsCached(corep)
+                            else
+                                &[_]app_mod.GridInfo{};
+                            const content_height_f64: f64 = @floatFromInt(content_height);
+                            const row_height_f64: f64 = @floatFromInt(row_h_px_snapshot);
+                            const cell_height_ndc: f64 = if (content_height_f64 > 0.0)
+                                2.0 * row_height_f64 / content_height_f64
+                            else
+                                0.0;
+                            var b_capacity_dropped = false;
+                            var b_oi: usize = 0;
+                            while (b_oi < b_ledger.len) {
+                                const grid_id = b_ledger.grid_ids[b_oi];
+                                // A fixed float above an animating grid owns the
+                                // pixels in its rectangle. Drop the source entry,
+                                // rather than merely omitting it, so the residual
+                                // offset cannot reappear when the float closes.
+                                var covered_by_fixed_float = false;
+                                var anim_start_row: i64 = 0;
+                                var anim_start_col: i64 = 0;
+                                var anim_end_row: i64 = 0;
+                                var anim_end_col: i64 = 0;
+                                var anim_found = false;
+                                for (visible_grids) |anim_grid| {
+                                    if (anim_grid.grid_id != grid_id) continue;
+                                    anim_found = true;
+                                    anim_start_row = @as(i64, anim_grid.start_row);
+                                    anim_start_col = @as(i64, anim_grid.start_col);
+                                    anim_end_row = anim_start_row + @max(@as(i64, anim_grid.rows), 0);
+                                    anim_end_col = anim_start_col + @max(@as(i64, anim_grid.cols), 0);
+                                    break;
+                                }
+                                for (visible_grids) |fixed_grid| {
+                                    if (!anim_found) break;
+                                    if (fixed_grid.zindex <= 0 or fixed_grid.follows_scroll != 0) continue;
+                                    if (fixed_grid.grid_id == grid_id) continue;
+                                    const fixed_start_row: i64 = @as(i64, fixed_grid.start_row);
+                                    const fixed_start_col: i64 = @as(i64, fixed_grid.start_col);
+                                    const fixed_end_row = fixed_start_row + @max(@as(i64, fixed_grid.rows), 0);
+                                    const fixed_end_col = fixed_start_col + @max(@as(i64, fixed_grid.cols), 0);
+                                    if (anim_start_row < fixed_end_row and fixed_start_row < anim_end_row and
+                                        anim_start_col < fixed_end_col and fixed_start_col < anim_end_col)
+                                    {
+                                        covered_by_fixed_float = true;
+                                        break;
+                                    }
+                                }
+                                if (covered_by_fixed_float) {
+                                    // Arm the pending flag like every sibling
+                                    // drop site. Today the was_active edge
+                                    // already guarantees the final recompose
+                                    // frame, but this site must not silently
+                                    // depend on that if the derivation ever
+                                    // changes.
+                                    if (b_ledger.dropGrid(grid_id)) app.b_forced_zero_pending = true;
+                                    continue;
+                                }
+                                if (b_offset_count >= b_offset_entries.len) {
+                                    _ = b_ledger.dropAll();
+                                    app.b_forced_zero_pending = true;
+                                    b_offset_count = 0;
+                                    b_capacity_dropped = true;
+                                    if (log_enabled) applog.appLog("[smooth] offset frame dropped: renderer capacity exceeded\n", .{});
+                                    break;
+                                }
+                                var content_top_ndc: f64 = 1.0;
+                                var content_bottom_ndc: f64 = -1.0;
+                                for (visible_grids) |visible_grid| {
+                                    if (visible_grid.grid_id != grid_id) continue;
+                                    if (visible_grid.start_row < 0 or visible_grid.rows <= 0) continue;
+                                    const grid_start_row: i64 = @max(@as(i64, visible_grid.start_row), 0);
+                                    const grid_rows: i64 = @max(@as(i64, visible_grid.rows), 0);
+                                    const margin_top: i64 = @max(@as(i64, visible_grid.margin_top), 0);
+                                    const margin_bottom: i64 = @max(@as(i64, visible_grid.margin_bottom), 0);
+                                    const content_start_row = grid_start_row + @min(margin_top, grid_rows);
+                                    // Exclusive end = start + rows - margin_bottom (macOS
+                                    // parity); subtracting margin_top here too would clip
+                                    // the last scrollable row of a split with a winbar.
+                                    const content_end_row = @max(
+                                        content_start_row,
+                                        grid_start_row + grid_rows - @min(margin_bottom, grid_rows),
+                                    );
+                                    const top_px = @min(content_height_f64, @as(f64, @floatFromInt(content_start_row)) * row_height_f64);
+                                    const bottom_px = @min(content_height_f64, @as(f64, @floatFromInt(content_end_row)) * row_height_f64);
+                                    content_top_ndc = ease_math.localNdcY(top_px, content_height_f64);
+                                    content_bottom_ndc = ease_math.localNdcY(bottom_px, content_height_f64);
+                                    break;
+                                }
+                                var retained_count: i32 = 0;
+                                for (0..retention_snapshot.count) |ri| {
+                                    // Only rows that will actually draw may release the
+                                    // pin; a failed snapshot copy must keep the stretch.
+                                    if (!retention_snapshot.ready[ri]) continue;
+                                    if (retention_snapshot.captures[ri].grid_id == grid_id) retained_count += 1;
+                                }
+                                const offset_ndc = ease_math.offsetNdc(
+                                    b_ledger.offsets_px[b_oi],
+                                    content_height_f64,
+                                );
+                                b_offset_entries[b_offset_count] = .{
+                                    // Low 32-bit word match (Shader ABI section).
+                                    .grid_id = @truncate(grid_id),
+                                    // offset_ndc = -2 * offset_px / snapped
+                                    // viewport height (Shader ABI: 正 = 画面下方向).
+                                    .offset_ndc = @floatCast(offset_ndc),
+                                    .content_top_ndc = @floatCast(content_top_ndc),
+                                    .content_bottom_ndc = @floatCast(content_bottom_ndc),
+                                    .move_all = 0,
+                                    // Keep the exposed edge pinned until the
+                                    // published retention rows cover its band.
+                                    .pin_edges = if (ease_math.coversBand(retained_count, offset_ndc, cell_height_ndc)) 0 else 1,
+                                    .zindex = 0,
+                                };
+                                b_offset_count += 1;
+                                b_oi += 1;
+                            }
+                            // Following floats are a second pass: only entries
+                            // produced by the ledger loop can act as anchors.
+                            if (!b_capacity_dropped) {
+                                for (visible_grids) |float_grid| {
+                                    if (float_grid.zindex <= 0 or float_grid.grid_id == 1 or
+                                        float_grid.follows_scroll == 0 or float_grid.anchor_grid <= 1) continue;
+                                    var has_entry = false;
+                                    for (b_offset_entries[0..b_offset_count]) |entry| {
+                                        if (@as(i64, entry.grid_id) == float_grid.grid_id) {
+                                            has_entry = true;
+                                            break;
+                                        }
+                                    }
+                                    if (has_entry) continue;
+                                    var anchor_is_visible = false;
+                                    for (visible_grids) |anchor_grid| {
+                                        if (anchor_grid.grid_id == float_grid.anchor_grid and anchor_grid.zindex <= 0) {
+                                            anchor_is_visible = true;
+                                            break;
+                                        }
+                                    }
+                                    if (!anchor_is_visible) continue;
+                                    var anchor_entry: ?d3d11.ScrollOffset = null;
+                                    for (b_offset_entries[0..b_offset_count]) |entry| {
+                                        if (@as(i64, entry.grid_id) == float_grid.anchor_grid) {
+                                            anchor_entry = entry;
+                                            break;
+                                        }
+                                    }
+                                    if (anchor_entry) |anchor| {
+                                        if (b_offset_count >= b_offset_entries.len) {
+                                            _ = b_ledger.dropAll();
+                                            app.b_forced_zero_pending = true;
+                                            b_offset_count = 0;
+                                            b_capacity_dropped = true;
+                                            if (log_enabled) applog.appLog("[smooth] offset frame dropped: renderer capacity exceeded\n", .{});
+                                            break;
+                                        }
+                                        b_offset_entries[b_offset_count] = .{
+                                            .grid_id = @truncate(float_grid.grid_id),
+                                            .offset_ndc = anchor.offset_ndc,
+                                            .content_top_ndc = 2.0,
+                                            .content_bottom_ndc = -2.0,
+                                            .move_all = 1,
+                                            .pin_edges = 0,
+                                            .zindex = @truncate(float_grid.zindex),
+                                        };
+                                        b_offset_count += 1;
+                                    }
+                                }
+                            }
+                            if (b_offset_count == 0) {
+                                // Final-zero frame (描画フレーム契約 item 5): the
+                                // ledger is empty but the frame must still be a
+                                // full recomposition with row translation live.
+                                // The HLSL identity gate skips row_translation
+                                // entirely when the count is zero, so publish
+                                // one neutral entry whose grid_id matches no
+                                // vertex (offset_ndc 0 = no movement either way).
+                                b_offset_entries[0] = .{
+                                    .grid_id = std.math.maxInt(i32),
+                                    .offset_ndc = 0.0,
+                                    .content_top_ndc = 1.0,
+                                    .content_bottom_ndc = -1.0,
+                                    .move_all = 0,
+                                    .pin_edges = 0,
+                                    .zindex = 0,
+                                };
+                                b_offset_count = 1;
+                            }
+                            g.updateScrollOffsets(b_offset_entries[0..b_offset_count]) catch |e| {
+                                // Fail-closed (「無効化」): without the offsets
+                                // the full-row draw would land untranslated.
+                                if (log_enabled) applog.appLog("updateScrollOffsets failed: {any}\n", .{e});
+                                recoverMainPaintFailure(hwnd, app);
+                                return 0;
+                            };
                         }
 
                         // TBS lock-free draw: committed set is protected by refcount,
@@ -3065,6 +3509,35 @@ pub export fn WndProc(
                             return 0;
                         }
 
+                        // Contract B retention pass: retained captures are
+                        // virtual rows and must follow the live remapped rows
+                        // while the scroll-offset SRV is still bound. Their
+                        // per-capture VS translation is reset before cursor,
+                        // bloom, and fixed-overlay passes consume vertices.
+                        var retention_metrics = app_mod.SurfaceRowDrawMetrics{
+                            .failed_rows = retention_snapshot.failed_rows,
+                        };
+                        if (b_recompose_frame) {
+                            app_mod.drawRetainedRows(
+                                g,
+                                &retention_snapshot,
+                                app.retention_vbs[0..],
+                                app.retention_cpu_snapshots[0..],
+                                &app.row_vb_budget,
+                                &app.row_vb_retained_bytes,
+                                row_h_px,
+                                @floatFromInt(content_height),
+                                &retention_metrics,
+                            ) catch |e| {
+                                // Retention is cosmetic: a budget trip here skips the
+                                // retained rows (pin stays via the ready-count rule)
+                                // instead of failing the whole paint like a live-row
+                                // budget overrun would.
+                                retention_metrics.failed_rows += 1;
+                                if (log_enabled) applog.appLog("drawRetainedRows failed: {any}\n", .{e});
+                            };
+                        }
+
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) seed_state rows={d} row_valid={d} rows_to_draw={d} row_verts_len={d} committed_rows={d} committed_cols={d} row_map_len={d}\n",
                             .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
@@ -3072,7 +3545,7 @@ pub export fn WndProc(
 
                         const drawn_rows = row_draw_result.metrics.drawn_rows;
                         const skipped_empty = row_draw_result.metrics.skipped_empty;
-                        const failed_rows = row_draw_result.metrics.failed_rows;
+                        const failed_rows = row_draw_result.metrics.failed_rows + retention_metrics.failed_rows;
                         const first_empty_row = row_draw_result.metrics.first_empty_row;
                         const log_vb_upload_rows = row_draw_result.metrics.vb_upload_rows;
                         const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
@@ -3111,7 +3584,12 @@ pub export fn WndProc(
                             .content_height = content_height,
                             .row_h_px = row_h_px,
                             .ctx_ptr = ctx_ptr,
-                            .rs_set_sc_fn = rs_set_sc_fn,
+                            // Contract B 描画フレーム契約 item 4: no per-row
+                            // scissor on a recompose paint — the cursor pass
+                            // draws under the full-content scissor set by the
+                            // row draw, so the shader offset cannot clip it
+                            // against its logical row band.
+                            .rs_set_sc_fn = if (b_recompose_frame) null else rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
                             .row_already_redrawn = force_full_rows,
                         }) catch |e| {
@@ -3273,7 +3751,27 @@ pub export fn WndProc(
                                     var scrollbar_verts: [12]core.Vertex = undefined;
                                     const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
                                     if (scrollbar_vert_count != 0) {
-                                        if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
+                                        if (b_recompose_frame) {
+                                            // Contract B 描画フレーム契約 item 1
+                                            // (pass order): the scrollbar/fixed
+                                            // overlay draws directly onto the
+                                            // freshly recomposed back_tex —
+                                            // underlay capture/restore is not
+                                            // used. The first ordinary paint
+                                            // after this run re-primes the
+                                            // capture (underlay 遷移規則) via
+                                            // b_leaving_recompose's full-row
+                                            // redraw above.
+                                            app_mod.drawScrollbarOverlay(
+                                                g,
+                                                &app.scrollbar_vb,
+                                                &app.scrollbar_vb_bytes,
+                                                scrollbar_verts[0..scrollbar_vert_count],
+                                            ) catch |e| {
+                                                if (log_enabled) applog.appLog("drawScrollbarOverlay failed: {any}\n", .{e});
+                                                break :present_frame;
+                                            };
+                                        } else if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
                                             const captured_scrollbar_rect = g.captureScrollbarUnderlay(track_rect) catch |e| {
                                                 if (log_enabled) applog.appLog("captureScrollbarUnderlay failed: {any}\n", .{e});
                                                 break :present_frame;
@@ -3303,7 +3801,16 @@ pub export fn WndProc(
                                 // back_tex_valid_snapshot is true the swapchain has already been
                                 // synced to a complete frame, and partial present rects keep
                                 // DXGI from copying unchanged regions every paint.
+                                // Contract B 描画フレーム契約 item 3: a recompose
+                                // paint registers full-viewport damage on every
+                                // swapchain buffer (a dirty-rect partial present
+                                // would leave old glyphs outside the moved
+                                // fragment clip). b_recompose_frame already
+                                // implies force_full_rows; the explicit term
+                                // keeps the damage rule independent of the
+                                // row-selection rule.
                                 const force_full_present = force_full_rows or
+                                    b_recompose_frame or
                                     (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
                                     seed_clear or
                                     present_rects_fallback_full;
@@ -3446,6 +3953,13 @@ pub export fn WndProc(
                 input.updateImePreeditOverlay(hwnd, app);
 
                 // Tabline is now rendered via D3D11 texture (see renderTablineToD3D call before gpu rendering)
+                if (b_schedule_next_frame) {
+                    // Active offsets or the required final-zero frame are the
+                    // complete wake condition; when both clear, no idle
+                    // counter is needed because this remains false.
+                    const content_hwnd = app.content_hwnd orelse hwnd;
+                    _ = c.InvalidateRect(content_hwnd, null, c.FALSE);
+                }
             }
 
             return 0;
@@ -3519,6 +4033,11 @@ pub export fn WndProc(
                     app.main_dpi_change_in_progress = false;
                     _ = app.finishActiveOperation();
                 }
+                // DPI changes invalidate geometry immediately; do not rely
+                // on the nested WM_SIZE generated by SetWindowPos.
+                app.tbs.clearBEaseCommits();
+                app.tbs.clearRetention();
+                if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
                 // Device/D2D/renderer creation in WM_APP_DEVICE_LOST_RECOVER
                 // can pump messages and reenter this handler on the same UI
                 // thread while that handler still holds app.mu/atlas.mu for
@@ -3622,6 +4141,19 @@ pub export fn WndProc(
                 updateRowsColsFromClientForce(hwnd, app);
                 app.mu.unlock(core.clock.io());
 
+                // Contract B fail-closed reset (「無効化」: resize drops the
+                // grid's transforms wholesale): undrained b_ease records and
+                // retained ledger rows were accounted against the pre-resize
+                // row geometry — clear both alongside the full-seed reset
+                // above. UI thread, so the lock-free ledger clear is safe.
+                app.tbs.clearBEaseCommits();
+                app.tbs.clearRetention();
+                // 「無効化」: the forced zeroing of active px offsets must, like
+                // natural spring settling, still produce exactly one final recompose
+                // frame (Frame 遷移規則: 自然減衰・強制 drop のどちらでも成立)
+                // before the blit path resumes.
+                if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
+
                 var rc: c.RECT = undefined;
                 _ = c.GetClientRect(hwnd, &rc);
 
@@ -3716,6 +4248,21 @@ pub export fn WndProc(
                 // 5) repaint
                 _ = c.InvalidateRect(hwnd, null, 0);
             }
+            return 0;
+        },
+
+        c.WM_ENTERSIZEMOVE => {
+            if (getApp(hwnd)) |app| {
+                app.b_in_size_move = true;
+                app.tbs.clearBEaseCommits();
+                app.tbs.clearRetention();
+                if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
+            }
+            return 0;
+        },
+
+        c.WM_EXITSIZEMOVE => {
+            if (getApp(hwnd)) |app| app.b_in_size_move = false;
             return 0;
         },
 
@@ -4561,6 +5108,8 @@ pub export fn WndProc(
                         }
                     }
                 }
+            } else if (wParam == app_mod.TIMER_SMOOTH_SCROLL_DEADLINE) {
+                if (getApp(hwnd)) |app| smooth_session.onDeadline(app);
             } else if (wParam == app_mod.TIMER_MSG_THROTTLE) {
                 _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_THROTTLE);
                 if (getApp(hwnd)) |app| {
@@ -4937,6 +5486,20 @@ pub export fn WndProc(
                     return 0;
                 }
 
+                smooth_session.onDeviceLost(app);
+                // Contract B fail-closed reset (「無効化」: device loss drops
+                // the transforms wholesale, mirroring the A1 session reset
+                // above): stale ease accounting must not survive into the
+                // rebuilt device generation. UI thread, so the lock-free
+                // ledger clear is safe.
+                app.tbs.clearBEaseCommits();
+                app.tbs.clearRetention();
+                // 「無効化」: a device-loss drop of active px offsets also owes
+                // one final recompose frame (Frame 遷移規則: 強制 drop でも
+                // final_zero が成立) on the rebuilt device before the blit
+                // path resumes.
+                if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
+
                 _ = c.KillTimer(hwnd, app_mod.TIMER_DEVICE_LOST_RETRY);
                 app.device_lost_retry_needed = false;
                 app.device_lost_retry_deadline_ms = 0;
@@ -5280,6 +5843,16 @@ pub export fn WndProc(
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     }
+                    // The old renderer belongs to the lost COM generation.
+                    // Drop A2 without Reset/Release, and discard records that
+                    // were bound to the old surface before publishing the
+                    // replacement renderer.  The fresh renderer recreates
+                    // the settle visual at offset zero.
+                    ext_win.a2_settle.drop(false);
+                    ext_win.a2_zero_snap_pending = false;
+                    ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
+                    ext_win.tbs.a2_settle_commits.clear();
+                    ext_win.tbs.rotation_mu.unlock(core.clock.io());
                     var old_renderer = ext_win.renderer;
                     ext_win.renderer = new_renderer;
                     // Force full atlas + content reseed on the fresh device.
@@ -6122,12 +6695,28 @@ pub export fn WndProc(
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
+                // The main HWND is not an eligible external grid. Keep its
+                // hit-tested grid routing on the legacy path.
                 input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false);
                 return 0;
             }
         },
 
         c.WM_MOUSEHWHEEL => {
+            if (getApp(hwnd)) |app| {
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true);
+                return 0;
+            }
+        },
+
+        c.WM_POINTERWHEEL => {
+            if (getApp(hwnd)) |app| {
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false);
+                return 0;
+            }
+        },
+
+        c.WM_POINTERHWHEEL => {
             if (getApp(hwnd)) |app| {
                 input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true);
                 return 0;
@@ -6141,6 +6730,32 @@ pub export fn WndProc(
                 // Clear pending flag BEFORE processing (allows new PostMessage during updateScrollbar)
                 app.scrollbar_update_pending.store(false, .release);
                 scrollbar.updateScrollbar(hwnd, app);
+                return 0;
+            }
+        },
+
+        app_mod.WM_APP_SMOOTH_SCROLL_COMMIT => {
+            if (getApp(hwnd)) |app| {
+                // Coalesced wakeup posted from onFlushEnd (core thread) after
+                // a semantic smooth-scroll commit. Clear the flag BEFORE any
+                // processing so a commit landing from here on can post again.
+                // The session owner drains the target TBS semantic ring and
+                // feeds the UI-thread coordinator below.
+                app.smooth_scroll_commit_posted.store(false, .release);
+                smooth_session.onSmoothCommit(app);
+                return 0;
+            }
+        },
+
+        app_mod.WM_APP_DM_UPDATE => {
+            if (getApp(hwnd)) |app| {
+                // Coalesced wakeup posted from the Direct Manipulation
+                // delegate callback after a DmSnapshot mailbox write. Clear
+                // the flag BEFORE any processing so a snapshot landing from
+                // here on can post again. The coordinator drain that reads
+                // the mailbox is performed by the session owner below.
+                app.dm_update_posted.store(false, .release);
+                smooth_session.onDmUpdate(app);
                 return 0;
             }
         },
@@ -6755,6 +7370,7 @@ pub export fn WndProc(
 
         c.WM_NCDESTROY => {
             if (getApp(hwnd)) |app| {
+                smooth_session.shutdown(app);
                 // End the recovery lifecycle before removing HWND ownership.
                 // Queued messages are rejected by the wake cookie, while the
                 // durable deadline and USER timer are cancelled explicitly.

@@ -1425,9 +1425,10 @@ pub export fn zonvie_core_try_get_viewport(
 }
 
 /// Borrow 'smoothscroll' for a grid's window while a trackpad gesture runs, and
-/// hand it back afterwards. No-op off macOS. Returns 0 when the request could
-/// not be issued (grid lock busy, or no window known yet) — the caller must try
-/// again, which matters most for the restore.
+/// hand it back afterwards. Returns 0 when the request could not be issued
+/// (grid lock busy, or a borrow for a grid with no window known yet) — the
+/// caller must try again. A restore with no window reports 1: the option went
+/// with the window and nothing is left to restore.
 pub export fn zonvie_core_set_gesture_smooth_scroll(
     p: ?*zonvie_core,
     grid_id: i64,
@@ -1537,9 +1538,10 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
 }
 
 /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
-/// Reported by the auto-injected reporter (macOS only) and refreshed when the
-/// option changes. Returns 0 for 'ver:0', which disables mouse scrolling in
-/// Neovim rather than making it page-relative. Lock-free atomic read.
+/// Reported by the auto-injected reporter (installed for every frontend) and
+/// refreshed when the option changes. Returns 0 for 'ver:0', which disables
+/// mouse scrolling in Neovim rather than making it page-relative. Lock-free
+/// atomic read.
 pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {
     if (p == null) return 0;
     const box = asBox(p.?);

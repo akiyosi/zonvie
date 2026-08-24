@@ -1409,11 +1409,9 @@ pub fn setupAgentStatus(self: *Core) void {
 /// Lua fallback is for a missing component, never for an explicit 0.
 /// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 ///
-/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
-/// the Windows frontend scrolls by whole rows, so injecting the reporter
-/// there would cost an exec_lua and an autocmd for a value nothing reads.
+/// Installed for every frontend; the macOS and Windows sub-cell scroll paths
+/// read the reported value, others simply never ask for it.
 pub fn setupMouseScrollReporter(self: *Core) void {
-    if (comptime builtin.os.tag != .macos) return;
     const lua_code =
         \\local function report()
         \\  local ms = vim.o.mousescroll or ''
@@ -1459,15 +1457,15 @@ pub fn setupMouseScrollReporter(self: *Core) void {
 /// the restore are each a set, and Neovim fires OptionSet even when the value
 /// does not change), which user config can observe.
 ///
-/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature.
+/// Used by both the macOS and Windows frontends' sub-cell trackpad scrolling.
 ///
-/// Returns false when the request could not be issued — the grid lock was busy,
-/// or no window is known yet. Called from the input path, so it never blocks on
-/// the lock; the caller is expected to try again, which matters most for the
-/// restore.
+/// Returns false when the request could not be issued — the grid lock was
+/// busy, or (for a borrow) no window is known for the grid yet. A restore
+/// with no window returns true: the option went with the window, and a caller
+/// retrying it would do so forever. Called from the input path, so it never
+/// blocks on the lock; the caller is expected to try again, which matters
+/// most for the restore.
 pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
-    if (comptime builtin.os.tag != .macos) return true;
-
     const win = blk: {
         if (!self.grid_mu.tryLock()) {
             self.log.write("[ss_borrow] grid={d} enable={any} lock busy\n", .{ grid_id, enable });
@@ -1478,11 +1476,15 @@ pub fn setGestureSmoothScroll(self: *Core, grid_id: i64, enable: bool) bool {
         break :blk vp.win;
     };
     if (win == 0) {
-        // Reported as done, not as busy. No window means the grid is gone —
-        // its window-local option and the stash went with it, so there is
-        // nothing left to restore and a caller retrying would do so forever.
+        // No window is known for the grid: it is gone, or no win_viewport has
+        // been seen yet. A restore reports done — the window-local option and
+        // the stash went with the window, so there is nothing left to restore
+        // and a caller retrying would do so forever. A borrow must NOT report
+        // success: no option was set, and a caller trusting it would scroll a
+        // wrapped window by more screen rows than it booked. The caller
+        // retries until a window is known or its gesture ends.
         self.log.write("[ss_borrow] grid={d} enable={any} no window\n", .{ grid_id, enable });
-        return true;
+        return !enable;
     }
 
     const enable_lua =

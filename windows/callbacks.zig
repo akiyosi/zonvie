@@ -6,6 +6,12 @@ const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
+const scroll_types = @import("scroll/types.zig");
+const scroll_coordinator = @import("scroll/coordinator.zig");
+const scroll_session = @import("scroll/session.zig");
+const scroll_stage = @import("scroll/stage_math.zig");
+const scroll_route = @import("scroll/route_math.zig");
+const ease_math = @import("scroll/ease_math.zig");
 
 // ---- Logging globals for atlas ensure callbacks ----
 var log_atlas_ensure_calls: u64 = 0;
@@ -20,6 +26,42 @@ var log_styled_glyph_calls: u64 = 0;
 var log_styled_glyph_ok: u64 = 0;
 var log_styled_glyph_fail: u64 = 0;
 var log_styled_glyph_last_report_ns: i128 = 0;
+
+// =========================================================================
+// Smooth-scroll semantic bridge (Contract A, core thread only)
+// Design contract: .agents/docs/windows-smooth-scroll-design.md
+// =========================================================================
+
+/// Flush-local stage for on_grid_scroll deltas (multi-slot, Contract A2's A0
+/// extension). Slot 0 holds the active A1 session's delta exactly as the old
+/// single-slot stage did; other external grids stage as A2 settle deltas.
+/// Only the core thread touches it, and only between on_flush_begin and
+/// on_flush_end; no lock is needed and no allocation ever happens on this
+/// path (fixed-capacity array, pure logic in scroll/stage_math.zig).
+var g_semantic_stage: scroll_stage.FlushStage = .{};
+
+fn dropStaleSemanticCommit(ext_win: *app_mod.ExternalWindow, session: scroll_types.ScrollSessionId) void {
+    ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
+    defer ext_win.tbs.rotation_mu.unlock(core.clock.io());
+    var kept: scroll_types.FixedRing(scroll_types.SemanticCommitRecord, scroll_types.MaxSemanticCommits) = .{};
+    while (ext_win.tbs.semantic_commits.popFront()) |record| {
+        if (record.session_generation == session.generation and record.surface.eql(session.surface)) continue;
+        _ = kept.push(record);
+    }
+    ext_win.tbs.semantic_commits = kept;
+}
+
+fn requestSmoothScrollReset(app: *App, expected: ?scroll_types.ScrollSessionId, reason: scroll_coordinator.ResetReason) void {
+    scroll_session.requestReset(app, expected, reason);
+}
+
+/// Snapshot the active smooth-scroll session at flush begin. The scroll
+/// owner publishes this identity through a lock-free seqlock so the core
+/// thread never shares a render/input lock with the UI thread.
+fn activeScrollSessionForFlush(app: *App) ?scroll_types.ScrollSessionId {
+    _ = app;
+    return scroll_session.activeIdentity();
+}
 
 // =========================================================================
 // Helper functions used by callbacks
@@ -267,6 +309,150 @@ fn stripCursorVerts(verts: *std.ArrayListUnmanaged(app_mod.Vertex)) void {
         }
     }
     verts.items.len = write;
+}
+
+/// Whole-band replacement: retention for every grid found in the region is
+/// dropped, because carried rows have no shiftable target after such a jump.
+fn dropRegionRetention(app: *App, row_start: u32, row_end: u32) void {
+    const ws = app.tbs.writeSet();
+    var grids: [8]i64 = undefined;
+    var grid_count: usize = 0;
+    var row: u32 = row_start;
+    while (row < row_end) : (row += 1) {
+        if (row >= ws.row_map.items.len) break;
+        const mapping = ws.row_map.items[row];
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        const slot = app.tbs.pool.slotPtrConst(mapping.slot);
+        for (slot.verts.items) |vertex| {
+            if (vertex.grid_id <= 1) continue;
+            var seen = false;
+            for (grids[0..grid_count]) |existing| {
+                if (existing == vertex.grid_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen and grid_count < grids.len) {
+                grids[grid_count] = vertex.grid_id;
+                grid_count += 1;
+            }
+        }
+    }
+    for (grids[0..grid_count]) |drop_grid_id| {
+        app.tbs.dropRetentionForGrid(drop_grid_id);
+    }
+}
+
+/// Copy the rows that leave a scroll band before remapping the write set.  The
+/// row map is still the pre-scroll map here, so its slots are the only stable
+/// source for the outgoing vertices.  RetentionStorage owns the copy; this
+/// callback never touches a D3D object. The storage-side capture method
+/// applies the grid/deco predicate while reusing its warmed buffers.
+fn captureRetainedRows(
+    app: *App,
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    grid_id: i64,
+) void {
+    if (!app.tbs.is_in_flush) return;
+    const plan = ease_math.planRetention(
+        @intCast(row_start),
+        @intCast(row_end),
+        rows_delta,
+        ease_math.retention_depth_rows,
+    ) orelse {
+        // No plan with a nonzero delta means the whole band was replaced
+        // (jump >= region height). Carried rows cannot be shifted to a
+        // meaningful target, so drop the region's grids' retention instead
+        // of letting stale targets draw as ghosts.
+        if (rows_delta != 0) {
+            dropRegionRetention(app, row_start, row_end);
+        }
+        return;
+    };
+    const ws = app.tbs.writeSet();
+
+    const cell_height_px: f32 = @floatFromInt(@max(1, app.cell_h_px + app.linespace_px));
+    var replay_grids: [8]i64 = undefined;
+    var replay_count: usize = 0;
+    var begun_grids: [8]i64 = undefined;
+    var begun_count: usize = 0;
+    var staged_any = false;
+    var i: i32 = 0;
+    while (i < plan.count_rows) : (i += 1) {
+        const source_i = ease_math.planRetentionRow(plan, i, rows_delta);
+        if (source_i < 0 or @as(u32, @intCast(source_i)) >= ws.row_map.items.len) continue;
+        const mapping = ws.row_map.items[@intCast(source_i)];
+        if (mapping.slot == app_mod.SLOT_NONE) continue;
+        const slot = app.tbs.pool.slotPtrConst(mapping.slot);
+        // Negative targets are legitimate: rows retained past the top edge.
+        const target: i32 = source_i - rows_delta;
+        const source_row: i32 = @intCast(slot.origin_row);
+        var grids: [8]i64 = undefined;
+        var grid_count: usize = 0;
+        for (slot.verts.items) |vertex| {
+            if (grid_id > 1 and vertex.grid_id != grid_id) continue;
+            if (vertex.grid_id <= 1) continue;
+            var seen = false;
+            for (grids[0..grid_count]) |existing| {
+                if (existing == vertex.grid_id) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen and grid_count < grids.len) {
+                grids[grid_count] = vertex.grid_id;
+                grid_count += 1;
+            }
+        }
+        // Contract Retention: 混在 grid 行は skip(pin が埋める)。 A row
+        // shared by more than one grid (a float overlapping a scrolling
+        // window) would translate the overlay with the buffer and draw it
+        // twice; macOS refuses the whole row for the same reason.
+        if (grid_count != 1) continue;
+        for (grids[0..grid_count]) |captured_grid_id| {
+            var begun = false;
+            for (begun_grids[0..begun_count]) |existing| {
+                if (existing == captured_grid_id) {
+                    begun = true;
+                    break;
+                }
+            }
+            if (!begun and begun_count < begun_grids.len) {
+                app.tbs.beginRetentionStepForGrid(captured_grid_id, rows_delta, plan.pivot_target_row);
+                begun_grids[begun_count] = captured_grid_id;
+                begun_count += 1;
+            }
+
+            const staged = app.tbs.stageRetentionCapture(
+                app.alloc,
+                captured_grid_id,
+                source_row,
+                target,
+                cell_height_px,
+                slot.verts.items,
+            );
+            staged_any = staged_any or staged;
+
+            var replay_seen = false;
+            for (replay_grids[0..replay_count]) |existing| {
+                if (existing == captured_grid_id) {
+                    replay_seen = true;
+                    break;
+                }
+            }
+            if (!replay_seen and replay_count < replay_grids.len) {
+                replay_grids[replay_count] = captured_grid_id;
+                replay_count += 1;
+            }
+        }
+    }
+    if (staged_any) {
+        for (replay_grids[0..replay_count]) |captured_grid_id| {
+            app.tbs.queueRetentionReplay(captured_grid_id, rows_delta);
+        }
+    }
 }
 
 /// Swap and shift row vertex buffers for a scroll region.
@@ -1711,6 +1897,9 @@ pub fn onMainRowScroll(
         return;
     }
 
+    // Capture from the pre-scroll write-set map.  Once remapRowSlots runs,
+    // the vacated source mappings are no longer recoverable.
+    captureRetainedRows(app, row_start, row_end, rows_delta, 0);
     swapAndShiftRows(app.surface.row_verts.items, row_start, row_end, rows_delta, &app.row_valid);
 
     recomputeRowValidCount(app);
@@ -1824,6 +2013,14 @@ pub fn onGridRowScroll(
 
     if (rows_delta == 0 or row_end <= row_start) return;
     if (col_start != 0 or col_end != total_cols) return;
+
+    // Main-composite grid scrolls are reported through this per-grid callback
+    // as well.  Dedicated external windows have their own TBS and are
+    // explicitly excluded.  Capture still precedes every possible mutation
+    // (including the pending replacement surface shift below).
+    if (!app.external_windows.contains(grid_id) and grid_id > 1) {
+        captureRetainedRows(app, row_start, row_end, rows_delta, grid_id);
+    }
 
     // A pre-window/replacement capture is the frontend's only copy of rows the
     // core omits on its scroll fast path. Shift it before the vacated rows are
@@ -1973,6 +2170,9 @@ pub fn onGridRowScroll(
         return;
     }
 
+    // External grids own a dedicated TBS and therefore do not participate in
+    // Contract B main-composite retention.  The pending/main surface path is
+    // handled above; this branch intentionally captures nothing.
     swapAndShiftRows(ext_win.surface.row_verts.items, row_start, row_end, rows_delta, null);
 
     // Update last_cursor_row to follow the scroll shift.
@@ -2055,6 +2255,21 @@ pub fn onGridRowScroll(
     // InvalidateRect deferred to onFlushEnd for coalescing.
 }
 
+/// Core on_grid_scroll callback — the sole report of semantic screen-row
+/// movement (real grid_scroll plus win_viewport-derived smoothscroll
+/// repaints). Runs on the core thread during flush; it only accumulates into
+/// the flush-local stage and never touches a TBS or the coordinator directly.
+/// Publication happens with the target TBS commit in onFlushEnd.
+pub fn onGridScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
+    _ = ctx;
+    // The active A1 session's grid keeps its original single-slot routing;
+    // every other external grid stages a Contract A2 settle delta. Main-grid
+    // and reserved-id notifications are ignored; a flush where main and a
+    // target both scroll is never mixed-fatal. Overflow beyond the fixed
+    // stage capacity drops only excess A2 deltas (reported in onFlushEnd).
+    g_semantic_stage.addGridScroll(grid_id, rows_delta);
+}
+
 /// Called at the start of each flush cycle (core thread, on_flush_begin callback).
 /// Opens the global transaction; each surface write set is prepared lazily by
 /// its first vertex/scroll mutation so no-op and cursor-only main flushes do
@@ -2065,6 +2280,12 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     if (ctx_bits % @alignOf(App) != 0) return;
     const app: *App = @ptrFromInt(ctx_bits);
     _ = app.core_flush_generation.fetchAdd(1, .acq_rel);
+
+    // Snapshot the active smooth-scroll session into the flush-local stage
+    // (slot 0; other slots collect A2 settle deltas as they arrive).
+    // onFlushEnd consumes and resets the stage on every path, including
+    // aborted flushes (on_flush_end still runs via the core's defer).
+    g_semantic_stage.beginFlush(activeScrollSessionForFlush(app));
 
     if (!preparePendingAtlasCreate(app)) return;
 
@@ -2103,6 +2324,35 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const atlas_corrupted = if (app.corep) |corep| app_mod.zonvie_core_flush_had_atlas_corruption(corep) else false;
     const core_aborted = if (app.corep) |corep| app_mod.zonvie_core_flush_was_aborted(corep) else false;
     const retryable = if (app.corep) |corep| app_mod.zonvie_core_flush_is_retryable(corep) else false;
+
+    // Consume the flush-local semantic stage exactly once per flush. An A1
+    // delta is never re-staged or back-dated onto an older commit revision;
+    // every path that fails to commit it instead requests a durable session
+    // reset below (smooth_scroll_reset_pending). A2 settle deltas carry no
+    // fail-closed machinery: a delta that cannot commit is simply dropped
+    // (the retried flush repaints cell-aligned, i.e. an accepted snap).
+    const semantic_stage = g_semantic_stage;
+    g_semantic_stage = .{};
+    const a1_stage = semantic_stage.a1Entry();
+    const a1_session: ?scroll_types.ScrollSessionId = if (a1_stage) |a1| .{
+        .generation = a1.session_generation,
+        .surface = .{ .grid_id = a1.grid_id, .incarnation = a1.surface_incarnation },
+    } else null;
+    if (semantic_stage.dropped_a2 != 0 and applog.isEnabled()) {
+        applog.appLog("[smooth] a2 settle stage overflow: dropped {d} delta(s)\n", .{semantic_stage.dropped_a2});
+    }
+    var semantic_committed = false;
+    var semantic_reset_required = false;
+    var semantic_reset_reason: scroll_coordinator.ResetReason = .protocol_mismatch;
+
+    // Contract B main routing (windows-smooth-scroll-b-main-region.md
+    // 「会計と照合」): staged non-A1 deltas whose grid has NO external window
+    // belong to the main composite (grid >= 2 splits / following floats) and
+    // publish as .b_ease records with the main TBS commit below. Bounded by
+    // the stage capacity, so a fixed array suffices (no allocation).
+    var main_ease: [scroll_stage.stage_capacity]app_mod.BEaseCommitInput = undefined;
+    var main_ease_len: usize = 0;
+
     app.mu.lockUncancelable(core.clock.io());
     const failed = app.flush_failed or atlas_corrupted or core_aborted;
     app.flush_failed = false;
@@ -2138,7 +2388,85 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     } else {
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
-            entry.value_ptr.*.tbs.commitFlush(app.alloc);
+            const ext_win = entry.value_ptr.*;
+            const grid_id = entry.key_ptr.*;
+            // Publish the staged semantic movement in the same transaction as
+            // the target surface's own commit. For A1, grid ID and incarnation
+            // must both match so a reused grid_id never receives a stale
+            // session's record; a zero delta has nothing to acknowledge and
+            // commits normally; every non-committed outcome requests a durable
+            // session reset (the core has already consumed the on_grid_scroll
+            // notification, so the delta can never be observed again).
+            var a1_input: ?app_mod.SemanticCommitInput = null;
+            if (a1_stage) |a1| {
+                if (grid_id == a1.grid_id and
+                    ext_win.incarnation == a1.surface_incarnation and
+                    a1.rows_delta != 0)
+                {
+                    a1_input = .{
+                        .session_generation = a1.session_generation,
+                        .surface = a1_session.?.surface,
+                        .rows_delta = a1.rows_delta,
+                    };
+                }
+            }
+            // Contract A2: a settle delta binds to the window's CURRENT
+            // incarnation, resolved here under app.mu at commit time (the
+            // stage never snapshots it). session_generation 0 marks the
+            // record session-independent.
+            var a2_input: ?app_mod.SemanticCommitInput = null;
+            if (semantic_stage.a2DeltaForGrid(grid_id)) |settle_rows| {
+                a2_input = .{
+                    .session_generation = 0,
+                    .surface = .{ .grid_id = grid_id, .incarnation = ext_win.incarnation },
+                    .rows_delta = settle_rows,
+                };
+            }
+            if (a1_input == null and a2_input == null) {
+                ext_win.tbs.commitFlush(app.alloc);
+                continue;
+            }
+            const commit_result = ext_win.tbs.commitFlushWithSemantic(app.alloc, a1_input, a2_input);
+            // Result handling belongs exclusively to the A1 machinery; an
+            // A2-only commit never resets a session (a not_in_flush outcome
+            // just dropped the cosmetic settle delta inside the TBS).
+            if (a1_input != null) switch (commit_result) {
+                .committed => {
+                    const current = scroll_session.activeIdentity();
+                    if (current == null or current.?.generation != a1_session.?.generation or !current.?.surface.eql(a1_session.?.surface)) {
+                        dropStaleSemanticCommit(ext_win, a1_session.?);
+                        semantic_reset_required = true;
+                        semantic_reset_reason = .generation_mismatch;
+                    } else {
+                        semantic_committed = true;
+                    }
+                },
+                // Record NOT appended (ring full); visual commit kept.
+                // Fail only the scroll session, never the flush.
+                .ring_overflow => {
+                    semantic_reset_required = true;
+                    semantic_reset_reason = .ring_overflow;
+                },
+                // Target TBS did not join this flush; no commit_rev
+                // advanced, so the delta cannot be bound to any revision.
+                .not_in_flush => semantic_reset_required = true,
+            };
+        }
+
+        // Route the remaining staged deltas to the main TBS ring. Grid
+        // ownership is resolved here under app.mu at commit time, mirroring
+        // the A2 incarnation resolution above: a grid with an external window
+        // was already delivered by the loop; everything else is a main
+        // composite grid. Grid 1 and the reserved negative ids can never
+        // appear here — stage_math.addGridScroll rejects grid_id <= 1 (seed
+        // matrix; see its "non-external grids are ignored" test).
+        for (scroll_route.settleEntries(&semantic_stage)) |entry| {
+            if (app.external_windows.contains(entry.grid_id)) continue;
+            main_ease[main_ease_len] = .{
+                .grid_id = entry.grid_id,
+                .rows_delta = entry.rows_delta,
+            };
+            main_ease_len += 1;
         }
     }
     const log_row_callbacks = app.log_flush_row_callbacks;
@@ -2146,10 +2474,33 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     app.core_flush_active.store(false, .release);
     app.mu.unlock(core.clock.io());
 
+    // Fail closed on any staged movement that did not reach a semantic
+    // commit: a failed/aborted flush, a missing or replaced target window,
+    // an incarnation mismatch, a target TBS that never joined, or a full
+    // record ring. The core consumed the on_grid_scroll notification when it
+    // staged the delta, and an aborted flush's retry redraws the moved
+    // content WITHOUT another notification (grid.zig uncovered_scroll_rows
+    // are cleared on delivery), so the movement is unrecoverable — request a
+    // durable session reset instead of silently diverging the accounting.
+    // Runtime-inert today: the A1 slot is never staged while no session
+    // exists, and A2 settle deltas are exempt from this fail-closed check.
+    if (a1_stage != null and a1_stage.?.rows_delta != 0 and !semantic_committed) {
+        semantic_reset_required = true;
+    }
+
+    if (semantic_reset_required) requestSmoothScrollReset(app, a1_session, semantic_reset_reason);
+
     // The main TBS has no UI-thread pending-seed path, so it can be finalized
     // outside app.mu without reopening the external publication race above.
     if (failed) {
         app.tbs.cancelFlush();
+    } else if (main_ease_len != 0) {
+        // Contract B same-transaction publish: the staged main-grid deltas
+        // are appended to tbs.b_ease_commits inside the SAME rotation_mu
+        // critical section as the commit body, bound to the commit_rev this
+        // commit publishes. Cosmetic records: a failed flush above simply
+        // drops them (an accepted snap), never a session reset.
+        app.tbs.commitFlushWithBEase(app.alloc, main_ease[0..main_ease_len]);
     } else {
         app.tbs.commitFlush(app.alloc);
     }
@@ -2239,6 +2590,48 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             app.glow_prepare_posted.store(false, .release);
         }
     }
+
+    // Coalesced smooth-scroll wakeup after a semantic commit. The message is
+    // only a wakeup: the source of truth stays in the target TBS's
+    // semantic_commits ring. A coalesced post (CAS lost: a wakeup is already
+    // queued) loses nothing, but an actually FAILED post leaves the committed
+    // record with no guaranteed drain — paint is not one of the design's
+    // drain points — so fail closed and request a durable session reset
+    // rather than rely on an eventual DM-update drain.
+    if (semantic_committed) {
+        if (app.smooth_scroll_commit_posted.cmpxchgStrong(false, true, .release, .monotonic) == null) {
+            if (app.hwnd) |hwnd| {
+                if (c.PostMessageW(hwnd, app_mod.WM_APP_SMOOTH_SCROLL_COMMIT, 0, 0) == 0) {
+                    app.smooth_scroll_commit_posted.store(false, .release);
+                    semantic_reset_required = true;
+                    semantic_reset_reason = .presentation_failure;
+                }
+            } else {
+                // No main HWND: the wakeup cannot be posted at all.
+                app.smooth_scroll_commit_posted.store(false, .release);
+                semantic_reset_required = true;
+                semantic_reset_reason = .presentation_failure;
+            }
+        }
+        // A semantic record is itself a paint obligation even when the flush
+        // carried no dirty rows. Wake the target external HWND so the
+        // outermost paint can execute Present + epoch Commit.
+        app.mu.lockUncancelable(core.clock.io());
+        var semantic_it = app.external_windows.iterator();
+        while (semantic_it.next()) |entry| {
+            if (entry.key_ptr.* == a1_session.?.surface.grid_id and
+                entry.value_ptr.*.incarnation == a1_session.?.surface.incarnation)
+            {
+                _ = c.InvalidateRect(entry.value_ptr.*.hwnd, null, c.FALSE);
+                break;
+            }
+        }
+        app.mu.unlock(core.clock.io());
+    }
+
+    // A failed semantic wake is discovered after the earlier fail-closed
+    // stage check. Publish the same durable reset request here as well.
+    if (semantic_reset_required) requestSmoothScrollReset(app, a1_session, semantic_reset_reason);
 
     // Coalesce: only post if not already pending (atomic CAS: false -> true)
     if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
@@ -2915,6 +3308,14 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
     app.mu.unlock(core.clock.io());
 
+    if (font_changed) {
+        app.b_drop_all_request.store(true, .release);
+        app.tbs.clearBEaseCommits();
+        // 無効化 contract: a font change invalidates retained captures even
+        // at an unchanged cell height - their vertices carry old atlas UVs.
+        app.tbs.clearRetention();
+        requestSmoothScrollReset(app, null, .generation_mismatch);
+    }
     if (corep_to_invalidate) |cp| {
         app_mod.zonvie_core_invalidate_glyph_cache(cp);
     }
@@ -3039,6 +3440,12 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 
     app.mu.unlock(core.clock.io());
 
+    app.b_drop_all_request.store(true, .release);
+    app.tbs.clearBEaseCommits();
+    // Row height changed: retained captures with the old cell metric would
+    // fail drain validation anyway, but drop them eagerly (無効化 contract).
+    app.tbs.clearRetention();
+    requestSmoothScrollReset(app, null, .generation_mismatch);
     if (hwnd) |h| {
         app_mod.updateLayoutToCore(h, app);
         _ = c.InvalidateRect(h, null, 0);

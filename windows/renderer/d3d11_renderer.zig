@@ -10,6 +10,32 @@ const CustomShaderPipeline = custom_shader_mod.CustomShaderPipeline;
 
 const MaxSwapchainBuffers: usize = 4;
 const MaxPendingBackDamageRects: usize = 64;
+const MaxScrollOffsets: usize = 128;
+pub const max_scroll_offsets: usize = MaxScrollOffsets;
+
+/// CPU/GPU ABI for the per-grid shader offset buffer (28 bytes, matching the
+/// ScrollOffset struct in windows/shaders/main.hlsl). grid_id is the low
+/// 32-bit word used by the shader when matching the existing i64 vertex id.
+pub const ScrollOffset = extern struct {
+    grid_id: i32,
+    offset_ndc: f32,
+    content_top_ndc: f32,
+    content_bottom_ndc: f32,
+    move_all: i32,
+    pin_edges: i32,
+    zindex: i32,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(ScrollOffset) == 28);
+}
+
+const ScrollParamsCpu = extern struct {
+    count: u32,
+    content_viewport_top_px: f32,
+    content_viewport_height_px: f32,
+    row_translation_ndc: f32,
+};
 
 const BackCopyDamage = struct {
     full: bool = false,
@@ -63,7 +89,7 @@ const IDCompositionVisual = extern struct {
         SetOffsetX_1: *const anyopaque,
         SetOffsetX_2: *const anyopaque,
         SetOffsetY_1: *const anyopaque,
-        SetOffsetY_2: *const anyopaque,
+        SetOffsetY_2: *const fn (*IDCompositionVisual, f32) callconv(.c) HRESULT,
         SetTransform_1: *const anyopaque,
         SetTransform_2: *const anyopaque,
         SetTransformParent: *const anyopaque,
@@ -73,6 +99,10 @@ const IDCompositionVisual = extern struct {
         SetClip_1: *const anyopaque,
         SetClip_2: *const anyopaque,
         SetContent: *const fn (*IDCompositionVisual, ?*c.IUnknown) callconv(.c) HRESULT,
+        AddVisual: *const fn (*IDCompositionVisual, *IDCompositionVisual, c.BOOL, ?*IDCompositionVisual) callconv(.c) HRESULT,
+        RemoveVisual: *const fn (*IDCompositionVisual, *IDCompositionVisual) callconv(.c) HRESULT,
+        RemoveAllVisuals: *const anyopaque,
+        SetCompositeMode: *const anyopaque,
     };
 };
 
@@ -210,6 +240,17 @@ pub const Renderer = struct {
 
     // VS constant buffer (inv viewport)
     vs_cb: ?*c.ID3D11Buffer = null,
+
+    // Contract B shader ABI. The structured buffer is fixed-capacity and
+    // dynamic so future frames can update it with WRITE_DISCARD without
+    // reallocating. The count remains zero until smooth-scroll steps 5-6.
+    scroll_offsets: ?*c.ID3D11Buffer = null,
+    scroll_offsets_srv: ?*c.ID3D11ShaderResourceView = null,
+    scroll_cb: ?*c.ID3D11Buffer = null,
+    scroll_offset_count: u32 = 0,
+    scroll_content_top_px: f32 = 0,
+    scroll_content_height_px: f32 = 1,
+    row_translation_ndc: f32 = 0,
 
     // Dynamic vertex buffer
     vb: ?*c.ID3D11Buffer = null,
@@ -351,6 +392,9 @@ pub const Renderer = struct {
     dcomp_device: ?*IDCompositionDevice = null,
     dcomp_target: ?*IDCompositionTarget = null,
     dcomp_visual: ?*IDCompositionVisual = null,
+    // Permanent per-window A2 parent. The renderer owns this visual together
+    // with the target/content graph and recreates it with every DComp device.
+    dcomp_settle_visual: ?*IDCompositionVisual = null,
 
     /// Create a D3D11 device without a swap chain. Returns the device and context.
     /// Called early (e.g. WM_CREATE) so the device is available for D2D context creation.
@@ -527,6 +571,91 @@ pub const Renderer = struct {
         self.default_bg_rgb.store(rgb, .release);
     }
 
+    /// Upload sorted per-grid offsets for one paint. Called by the main
+    /// WM_PAINT recompose path (Contract B 描画フレーム契約) with the offset
+    /// ledger's entries before the full row draw; ordinary paints keep the
+    /// count at zero (clearScrollOffsets) so the HLSL identity gate holds.
+    pub fn updateScrollOffsets(self: *Renderer, entries: []const ScrollOffset) !void {
+        if (entries.len > MaxScrollOffsets) return error.ScrollOffsetCapacityExceeded;
+        const ctx = self.ctx orelse return error.NoContext;
+        const buffer = self.scroll_offsets orelse return error.NoScrollOffsetBuffer;
+
+        var sorted: [MaxScrollOffsets]ScrollOffset = undefined;
+        @memcpy(sorted[0..entries.len], entries);
+        // Keep the CPU order identical to the signed binary search in HLSL.
+        var i: usize = 1;
+        while (i < entries.len) : (i += 1) {
+            const value = sorted[i];
+            var j = i;
+            while (j > 0 and sorted[j - 1].grid_id > value.grid_id) : (j -= 1) {
+                sorted[j] = sorted[j - 1];
+            }
+            sorted[j] = value;
+        }
+
+        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+        const res: *c.ID3D11Resource = @ptrCast(buffer);
+        const hr = mapDiscard(ctx, res, &mapped);
+        if (c.FAILED(hr)) return error.D3DMapFailed;
+        const dst: [*]u8 = @ptrCast(mapped.pData);
+        const byte_len = entries.len * @sizeOf(ScrollOffset);
+        std.mem.copyForwards(u8, dst[0..byte_len], std.mem.sliceAsBytes(sorted[0..entries.len]));
+        unmap0(ctx, res);
+
+        self.scroll_offset_count = @intCast(entries.len);
+        try self.updateScrollParams();
+    }
+
+    /// Clear the ABI count without touching the fixed-capacity GPU buffer.
+    pub fn clearScrollOffsets(self: *Renderer) !void {
+        self.scroll_offset_count = 0;
+        try self.updateScrollParams();
+    }
+
+    /// Set the optional VS-side row translation for the next draw. The row
+    /// renderer currently leaves this at zero and uses viewport translation;
+    /// this hook makes the two paths switchable without changing the ABI.
+    pub fn setRowTranslationNdc(self: *Renderer, translation_ndc: f32) !void {
+        if (self.row_translation_ndc == translation_ndc) return;
+        self.row_translation_ndc = translation_ndc;
+        try self.updateScrollParams();
+    }
+
+    fn updateScrollParams(self: *Renderer) !void {
+        const ctx = self.ctx orelse return error.NoContext;
+        const cb = self.scroll_cb orelse return error.NoScrollParamsBuffer;
+        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+        const res: *c.ID3D11Resource = @ptrCast(cb);
+        const hr = mapDiscard(ctx, res, &mapped);
+        if (c.FAILED(hr)) return error.D3DMapFailed;
+        const dst: *ScrollParamsCpu = @ptrCast(@alignCast(mapped.pData));
+        dst.* = .{
+            .count = self.scroll_offset_count,
+            .content_viewport_top_px = self.scroll_content_top_px,
+            .content_viewport_height_px = self.scroll_content_height_px,
+            .row_translation_ndc = self.row_translation_ndc,
+        };
+        unmap0(ctx, res);
+    }
+
+    /// Bind the Contract B ABI for a main-color, cursor, or bloom-extract
+    /// draw. The structured SRV is VS-only; the cbuffer is consumed by both
+    /// VS and PS for row translation and fragment clipping.
+    fn bindScrollAbi(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) void {
+        if (ctx_vtbl.*.VSSetShaderResources) |set_srvs| {
+            var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.scroll_offsets_srv};
+            set_srvs(ctx, 2, 1, @ptrCast(&srvs));
+        }
+        if (ctx_vtbl.*.VSSetConstantBuffers) |set_cbs| {
+            var cbs: [1]?*c.ID3D11Buffer = .{self.scroll_cb};
+            set_cbs(ctx, 0, 1, @ptrCast(&cbs));
+        }
+        if (ctx_vtbl.*.PSSetConstantBuffers) |set_cbs| {
+            var cbs: [1]?*c.ID3D11Buffer = .{self.scroll_cb};
+            set_cbs(ctx, 0, 1, @ptrCast(&cbs));
+        }
+    }
+
     pub fn lockContext(self: *Renderer) void {
         self.ctx_mu.lockUncancelable(core.clock.io());
     }
@@ -562,6 +691,10 @@ pub const Renderer = struct {
         safeRelease(&self.additive_blend);
         safeRelease(&self.bilinear_sampler);
         safeRelease(&self.glow_cb);
+
+        safeRelease(&self.scroll_offsets_srv);
+        safeRelease(&self.scroll_offsets);
+        safeRelease(&self.scroll_cb);
 
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
@@ -609,9 +742,21 @@ pub const Renderer = struct {
         self.bb_rtv = null;
         self.bb_tex = null;
 
-        safeRelease(&self.dcomp_visual);
-        safeRelease(&self.dcomp_target);
-        safeRelease(&self.dcomp_device);
+        // Dissociate the root before releasing the permanent settle edge.
+        // On a lost device the entire COM generation is stale; abandon all
+        // DComp aliases without calling through dead vtables.
+        if (self.device_lost) {
+            self.dcomp_settle_visual = null;
+            self.dcomp_visual = null;
+            self.dcomp_target = null;
+            self.dcomp_device = null;
+        } else {
+            if (self.dcomp_target) |target| _ = target.lpVtbl.SetRoot(target, null);
+            safeRelease(&self.dcomp_settle_visual);
+            safeRelease(&self.dcomp_visual);
+            safeRelease(&self.dcomp_target);
+            safeRelease(&self.dcomp_device);
+        }
 
         safeRelease(&self.swapchain);
         safeRelease(&self.swapchain1);
@@ -778,6 +923,18 @@ pub const Renderer = struct {
         return self.back_rtv != null and self.back_tex != null and self.bb_tex != null and !self.needs_resize_retry and !self.device_lost;
     }
 
+    fn resetDCompSettleOffset(self: *Renderer) void {
+        const settle = self.dcomp_settle_visual orelse return;
+        const device = self.dcomp_device orelse return;
+        if (c.FAILED(settle.lpVtbl.SetOffsetY_2(settle, 0.0))) {
+            if (applog.isEnabled()) applog.appLog("[d3d] resize: failed to reset settle offset\n", .{});
+            return;
+        }
+        if (c.FAILED(device.lpVtbl.Commit(device))) {
+            if (applog.isEnabled()) applog.appLog("[d3d] resize: failed to commit settle reset\n", .{});
+        }
+    }
+
     pub fn resize(self: *Renderer) !void {
         var rc: c.RECT = undefined;
         _ = c.GetClientRect(self.hwnd, &rc);
@@ -875,6 +1032,9 @@ pub const Renderer = struct {
 
         try self.createBackTargets();
         self.needs_resize_retry = false;
+        // A resize is a publication boundary: preserve the permanent settle
+        // edge but snap its offset to the rebuilt swap-chain origin.
+        self.resetDCompSettleOffset();
     }
 
     pub fn atlasUploadRect(self: *Renderer, x: u32, y: u32, w: u32, h: u32, data: [*]const u8, row_pitch: u32) bool {
@@ -959,6 +1119,12 @@ pub const Renderer = struct {
         // Must match the core's NDC viewport calculation (grid_rows * cell_h).
         // If null, uses (self.height - content_y_offset).
         content_height: ?u32 = null,
+
+        // Optional shader-side row translation. The current path keeps this
+        // at zero and uses the existing per-row viewport translation; the
+        // recompose path may switch to this value only when the two are
+        // pixel-equivalent.
+        row_translation_ndc: f32 = 0.0,
 
         // Tabbar background color (RGBA, premultiplied alpha).
         // If non-null and content_y_offset is set, draws a solid rect in the tabbar area.
@@ -1070,6 +1236,10 @@ pub const Renderer = struct {
         const viewport_width = if (base_width > viewport_x_offset + sidebar_right_w) base_width - viewport_x_offset - sidebar_right_w else 1;
         const viewport_height = opts.content_height orelse
             (if (self.height > viewport_y_offset) self.height - viewport_y_offset else 1);
+        self.row_translation_ndc = opts.row_translation_ndc;
+        self.scroll_content_top_px = @floatFromInt(viewport_y_offset);
+        self.scroll_content_height_px = @floatFromInt(viewport_height);
+        try self.updateScrollParams();
         {
             var vp: c.D3D11_VIEWPORT = .{
                 .TopLeftX = @floatFromInt(viewport_x_offset),
@@ -1143,6 +1313,8 @@ pub const Renderer = struct {
             const pp_samps: [*c]?*c.ID3D11SamplerState =
                 @as([*c]?*c.ID3D11SamplerState, @ptrCast(&samps));
             ps_set_samp(ctx, 0, 1, pp_samps);
+
+            self.bindScrollAbi(ctx, ctx_vtbl);
 
             // Alpha blend
             const om_set_blend = ctx_vtbl.*.OMSetBlendState orelse return;
@@ -1305,7 +1477,9 @@ pub const Renderer = struct {
         }
 
         // ---- Draw in two batches ----
+        self.bindScrollAbi(ctx, ctx_vtbl); // main color pass
         try self.drawVertices(main);
+        self.bindScrollAbi(ctx, ctx_vtbl); // cursor pass uses the same ABI
         try self.drawVertices(cursor);
 
         // ---- Post-process bloom (neon glow) ----
@@ -2588,10 +2762,11 @@ pub const Renderer = struct {
         if (ctx_vtbl.*.RSSetScissorRects) |f| f(ctx, 1, &sr);
     }
 
-    /// Build a complete DirectComposition graph and publish it only after every
-    /// HRESULT succeeds. The HWNDs use WS_EX_NOREDIRECTIONBITMAP, so accepting a
-    /// composition swapchain without a committed visual would create a
-    /// permanently blank renderer that otherwise looks initialized.
+    /// Build the permanent per-window DirectComposition graph and publish it
+    /// only after every HRESULT succeeds. The HWNDs use
+    /// WS_EX_NOREDIRECTIONBITMAP, so accepting a composition swapchain without
+    /// a committed target -> settle -> content edge would create a permanently
+    /// blank renderer that otherwise looks initialized.
     fn createDirectComposition(self: *Renderer, sc1: *c.IDXGISwapChain1, dxgi_dev: *c.IDXGIDevice) !void {
         var dcomp_dev: ?*IDCompositionDevice = null;
         errdefer safeRelease(&dcomp_dev);
@@ -2609,10 +2784,19 @@ pub const Renderer = struct {
         const visual_hr = vtbl.CreateVisual(dcomp_dev.?, &dcomp_visual);
         if (c.FAILED(visual_hr) or dcomp_visual == null) return error.DCompositionCreateVisualFailed;
 
+        var settle_visual: ?*IDCompositionVisual = null;
+        errdefer safeRelease(&settle_visual);
+        const settle_hr = vtbl.CreateVisual(dcomp_dev.?, &settle_visual);
+        if (c.FAILED(settle_hr) or settle_visual == null) return error.DCompositionCreateVisualFailed;
+
         const sc_unk: *c.IUnknown = @ptrCast(sc1);
         const content_hr = dcomp_visual.?.lpVtbl.SetContent(dcomp_visual.?, sc_unk);
         if (c.FAILED(content_hr)) return error.DCompositionSetContentFailed;
-        const root_hr = dcomp_target.?.lpVtbl.SetRoot(dcomp_target.?, dcomp_visual);
+        const settle_offset_hr = settle_visual.?.lpVtbl.SetOffsetY_2(settle_visual.?, 0.0);
+        if (c.FAILED(settle_offset_hr)) return error.DCompositionSetRootFailed;
+        const edge_hr = settle_visual.?.lpVtbl.AddVisual(settle_visual.?, dcomp_visual.?, c.FALSE, null);
+        if (c.FAILED(edge_hr)) return error.DCompositionSetRootFailed;
+        const root_hr = dcomp_target.?.lpVtbl.SetRoot(dcomp_target.?, settle_visual);
         if (c.FAILED(root_hr)) return error.DCompositionSetRootFailed;
         const commit_hr = vtbl.Commit(dcomp_dev.?);
         if (c.FAILED(commit_hr)) return error.DCompositionCommitFailed;
@@ -2620,9 +2804,11 @@ pub const Renderer = struct {
         self.dcomp_device = dcomp_dev;
         self.dcomp_target = dcomp_target;
         self.dcomp_visual = dcomp_visual;
+        self.dcomp_settle_visual = settle_visual;
         dcomp_dev = null;
         dcomp_target = null;
         dcomp_visual = null;
+        settle_visual = null;
     }
 
     /// Create swap chain and DirectComposition using the pre-set self.device/self.ctx.
@@ -4252,12 +4438,36 @@ pub const Renderer = struct {
 
             ps_set_fn(ctx, self.ps_glow_extract.?, null, 0);
 
+            // Bloom extract renders into a half-resolution target, so the
+            // fragment formula must receive the correspondingly scaled
+            // viewport origin/height while retaining the same NDC clip band.
+            const full_scroll_top = self.scroll_content_top_px;
+            const full_scroll_height = self.scroll_content_height_px;
+            self.scroll_content_top_px = ex_y;
+            self.scroll_content_height_px = ex_h;
+            self.updateScrollParams() catch {};
+            self.bindScrollAbi(ctx, ctx_vtbl); // bloom extract pass
+
+            var extract_ok = true;
             if (bloom_rows_draw_fn) |draw_rows| {
                 draw_rows(bloom_rows_ctx, self, ctx, ex_x, ex_y, ex_w, ex_h);
             } else {
-                self.drawVertices(main) catch return;
+                self.drawVertices(main) catch {
+                    extract_ok = false;
+                };
             }
-            self.drawVertices(cursor) catch return;
+            if (extract_ok) {
+                self.bindScrollAbi(ctx, ctx_vtbl); // bloom cursor pass
+                self.drawVertices(cursor) catch {
+                    extract_ok = false;
+                };
+            }
+
+            self.scroll_content_top_px = full_scroll_top;
+            self.scroll_content_height_px = full_scroll_height;
+            self.updateScrollParams() catch {};
+
+            if (!extract_ok) return;
 
             ps_set_fn(ctx, self.ps.?, null, 0);
         }
@@ -4403,7 +4613,8 @@ pub const Renderer = struct {
 
             const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
             var cbs: [1]?*c.ID3D11Buffer = .{self.glow_cb.?};
-            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
+            // GlowParams lives at b1; b0 is reserved for ScrollParams.
+            ps_set_cb(ctx, 1, 1, @ptrCast(&cbs));
 
             om_set_blend(ctx, self.additive_blend.?, &blend_factor, 0xFFFFFFFF);
 
@@ -4415,7 +4626,7 @@ pub const Renderer = struct {
             ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
 
             var null_cbs: [1]?*c.ID3D11Buffer = .{null};
-            ps_set_cb(ctx, 0, 1, @ptrCast(&null_cbs));
+            ps_set_cb(ctx, 1, 1, @ptrCast(&null_cbs));
 
             vs_set_fn(ctx, self.vs.?, null, 0);
             ps_set_fn(ctx, self.ps.?, null, 0);
@@ -4714,6 +4925,58 @@ pub const Renderer = struct {
             const hr = create_buf(dev, &bd, null, &cb);
             if (c.FAILED(hr) or cb == null) return error.D3DCreateVSCBFailed;
             self.vs_cb = cb;
+        }
+
+        // --- Contract B scroll offset ABI ---
+        // Structured SRV: 128 x 28-byte entries, dynamic WRITE_DISCARD.
+        {
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateScrollOffsetBufferFailed;
+            var bd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            bd.ByteWidth = @intCast(MaxScrollOffsets * @sizeOf(ScrollOffset));
+            bd.Usage = c.D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+            bd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+            bd.MiscFlags = c.D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+            bd.StructureByteStride = @intCast(@sizeOf(ScrollOffset));
+
+            var buffer: ?*c.ID3D11Buffer = null;
+            const hr = create_buf(dev, &bd, null, &buffer);
+            if (c.FAILED(hr) or buffer == null) return error.D3DCreateScrollOffsetBufferFailed;
+
+            const create_srv = dev_vtbl.*.CreateShaderResourceView orelse {
+                safeRelease(&buffer);
+                return error.D3DCreateScrollOffsetSRVFailed;
+            };
+            var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
+            srv_desc.Format = c.DXGI_FORMAT_UNKNOWN;
+            srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_BUFFEREX;
+            srv_desc.unnamed_0.BufferEx.FirstElement = 0;
+            srv_desc.unnamed_0.BufferEx.NumElements = @intCast(MaxScrollOffsets);
+            srv_desc.unnamed_0.BufferEx.Flags = 0;
+
+            var srv: ?*c.ID3D11ShaderResourceView = null;
+            const srv_hr = create_srv(dev, @ptrCast(buffer.?), &srv_desc, &srv);
+            if (c.FAILED(srv_hr) or srv == null) {
+                safeRelease(&buffer);
+                return error.D3DCreateScrollOffsetSRVFailed;
+            }
+            self.scroll_offsets = buffer;
+            self.scroll_offsets_srv = srv;
+        }
+
+        // b0 ABI cbuffer: count + content viewport origin/height + row
+        // translation, all in a single 16-byte register block.
+        {
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateScrollParamsBufferFailed;
+            var bd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            bd.ByteWidth = @sizeOf(ScrollParamsCpu);
+            bd.Usage = c.D3D11_USAGE_DYNAMIC;
+            bd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+            bd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+            var cb: ?*c.ID3D11Buffer = null;
+            const hr = create_buf(dev, &bd, null, &cb);
+            if (c.FAILED(hr) or cb == null) return error.D3DCreateScrollParamsBufferFailed;
+            self.scroll_cb = cb;
         }
 
         // --- Sampler
