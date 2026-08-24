@@ -255,6 +255,22 @@ pub fn build(b: *std.Build) !void {
         run_row_provision_test.addFileArg(row_provision_test_exe);
         test_step.dependOn(&run_row_provision_test.step);
 
+        // Baseline placement inside a cell: FreeType's grid-fitted metrics
+        // overflow the line height it reports, and anchoring on them clips the
+        // glyph at the cell edge where rows join.
+        const compile_font_cell_fit_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_font_cell_fit_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_font_cell_fit_test.addFileArg(b.path("macos/Sources/Font/FontCellFit.swift"));
+        compile_font_cell_fit_test.addFileArg(b.path("macos/Tests/FontCellFitTests.swift"));
+        compile_font_cell_fit_test.addArg("-o");
+        const font_cell_fit_test_exe = compile_font_cell_fit_test.addOutputFileArg("font-cell-fit-tests");
+        const run_font_cell_fit_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
+        test_step.dependOn(&run_font_cell_fit_test.step);
+
         // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
         // where they must be drawn, and that staged rows reach the screen only
         // through their own bracket's commit.

@@ -20,7 +20,7 @@ typedef struct zonvie_glyph_entry {
     float bbox_origin_px[2];
     float bbox_size_px[2];
     float advance_px;
-    float ascent_px;
+    float ascent_px;             /* baseline offset from the cell top; see zonvie_glyph_bitmap */
     float descent_px;
     uint32_t bytes_per_pixel;    /* 1=grayscale, 3=ClearType RGB, 4=RGBA color (emoji) */
 } zonvie_glyph_entry;
@@ -37,8 +37,12 @@ typedef struct zonvie_glyph_bitmap {
     int32_t  bearing_x;          /* horizontal bearing: pen to left edge (pixels) */
     int32_t  bearing_y;          /* vertical bearing: baseline to top edge (pixels, positive=up) */
     int32_t  advance_26_6;       /* horizontal advance in 26.6 fixed-point */
-    float    ascent_px;          /* font ascent in pixels */
-    float    descent_px;         /* font descent in pixels */
+    float    ascent_px;          /* baseline offset in pixels from the cell top: the core
+                                    places the text baseline at row_top + top_pad + ascent_px.
+                                    Need not equal the font's nominal ascent — the frontend may
+                                    re-balance it so ascent + descent fits the cell height
+                                    (macOS centres the ink box; Windows sends DWrite's ascent). */
+    float    descent_px;         /* font descent in pixels (stored; not used for placement) */
     uint32_t bytes_per_pixel;    /* 1=grayscale (R8), 3=ClearType RGB, 4=RGBA */
 } zonvie_glyph_bitmap;
 
