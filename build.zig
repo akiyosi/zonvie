@@ -475,6 +475,17 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
 
+    // Platform-independent placement tests for the ext_messages floats.
+    const windows_msg_float_layout_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/ui/msg_float_layout_test.zig"),
+    });
+    const windows_msg_float_layout_tests = b.addTest(.{
+        .root_module = windows_msg_float_layout_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(windows_msg_float_layout_tests).step);
+
     // Platform-independent coverage for the Windows frontend's lossy,
     // non-blocking logging queue.
     const windows_app_log_test_mod = b.createModule(.{

@@ -12,6 +12,7 @@ const dialogs = @import("dialogs.zig");
 const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
+const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
 
 const ExternalSurfaceKind = enum {
@@ -1161,6 +1162,37 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
 
 /// Apply a changed lifecycle callback to an already-published HWND without
 /// replacing its renderer/surface contents. Must be called on the UI thread.
+/// Top-right placement for the message floats. Resolves the Win32 state and
+/// defers the arithmetic to msg_float_layout, which is covered by
+/// windows/ui/msg_float_layout_test.zig.
+///
+/// Must be called with `app.mu` NOT held; getExtFloatTargetRect expects the
+/// lock and does not take it itself.
+fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) msg_float_layout.Point {
+    app.mu.lockUncancelable(core.clock.io());
+    const target_rect = app.getExtFloatTargetRect();
+    // msg_show stacks below msg_history when both are up; msg_history itself
+    // always sits at the top.
+    const history_hwnd: ?c.HWND = if (is_msg_history) null else blk: {
+        if (app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID)) |hw| break :blk hw.hwnd;
+        break :blk null;
+    };
+    app.mu.unlock(core.clock.io());
+
+    var history_bottom: ?i32 = null;
+    if (history_hwnd) |hwnd| {
+        var history_rect: c.RECT = undefined;
+        if (c.GetWindowRect(hwnd, &history_rect) != 0) history_bottom = history_rect.bottom;
+    }
+
+    return msg_float_layout.msgFloatTopRight(.{
+        .left = target_rect.left,
+        .top = target_rect.top,
+        .right = target_rect.right,
+        .bottom = target_rect.bottom,
+    }, window_w, history_bottom);
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
@@ -1235,6 +1267,11 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         } else {
             flags |= c.SWP_NOMOVE;
         }
+    } else if (is_msg_show or is_msg_history) {
+        const pos = msgFloatTopRight(app, is_msg_history, window_w);
+        x = pos.x;
+        y = pos.y;
+        if (applog.isEnabled()) applog.appLog("[win] msg float re-anchored top-right: ({d},{d}) w={d}\n", .{ x, y, window_w });
     } else {
         flags |= c.SWP_NOMOVE;
     }
@@ -1486,40 +1523,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             pos_y = @divTrunc(screen_h - window_h, 2);
             if (applog.isEnabled()) applog.appLog("[win] popupmenu fallback center: ({d},{d})\n", .{ pos_x, pos_y });
         }
-    } else if (is_msg_history) {
-        // Message history: position at top-right based on config
-        app.mu.lockUncancelable(core.clock.io());
-        const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock(core.clock.io());
-        pos_x = target_rect.right - window_w - 10;
-        pos_y = target_rect.top + 10; // 10px from top
-        if (applog.isEnabled()) applog.appLog("[win] msg_history at top-right: ({d},{d})\n", .{ pos_x, pos_y });
-    } else if (is_msg_show) {
-        // Message show (e.g. "Press ENTER..."): position below msg_history if visible, otherwise at top-right
-        app.mu.lockUncancelable(core.clock.io());
-        const msg_history_win = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
-        const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock(core.clock.io());
-
-        if (msg_history_win) |hw| {
-            // Position below msg_history window
-            var history_rect: c.RECT = undefined;
-            if (c.GetWindowRect(hw.hwnd, &history_rect) != 0) {
-                pos_x = target_rect.right - window_w - 10;
-                pos_y = history_rect.bottom + 4; // 4px gap below history window
-                if (applog.isEnabled()) applog.appLog("[win] msg_show below msg_history: ({d},{d})\n", .{ pos_x, pos_y });
-            } else {
-                // Fallback: top-right
-                pos_x = target_rect.right - window_w - 10;
-                pos_y = target_rect.top + 10;
-                if (applog.isEnabled()) applog.appLog("[win] msg_show at top-right (fallback): ({d},{d})\n", .{ pos_x, pos_y });
-            }
-        } else {
-            // No msg_history: position at top-right
-            pos_x = target_rect.right - window_w - 10;
-            pos_y = target_rect.top + 10;
-            if (applog.isEnabled()) applog.appLog("[win] msg_show at top-right: ({d},{d})\n", .{ pos_x, pos_y });
-        }
+    } else if (is_msg_history or is_msg_show) {
+        // Message floats: top-right, msg_show stacked below msg_history.
+        // Shared with the geometry-update path so the two cannot drift apart.
+        const pos = msgFloatTopRight(app, is_msg_history, window_w);
+        pos_x = pos.x;
+        pos_y = pos.y;
+        if (applog.isEnabled()) applog.appLog("[win] msg float at top-right: ({d},{d}) history={any}\n", .{ pos_x, pos_y, is_msg_history });
     }
 
     // Create window using external window class
