@@ -180,7 +180,7 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
+            const cell_h = app.rowHeightPx();
             const hide_cursor_for_ime = app.ime_composing;
             const border_r = app.cmdline_border_color[0];
             const border_g = app.cmdline_border_color[1];
@@ -346,7 +346,7 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
+            const cell_h = app.rowHeightPx();
             const icon_color: [4]f32 = .{
                 app.cmdline_icon_color[0],
                 app.cmdline_icon_color[1],
@@ -1168,7 +1168,7 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
 
     const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
     const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
@@ -1262,7 +1262,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Get cell dimensions from main atlas
     // Note: cell_h must include linespace_px to match core's vertex generation
     const cell_w: u32 = app.cell_w_px;
-    const cell_h: u32 = app.cell_h_px + app.linespace_px;
+    const cell_h: u32 = app.rowHeightPx();
     const content_w: c_int = @intCast(req.cols * cell_w);
     const content_h: c_int = @intCast(req.rows * cell_h);
 
@@ -2353,7 +2353,7 @@ pub export fn ExternalWndProc(
                 }
 
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px + app.linespace_px;
+                const cell_h = app.rowHeightPx();
                 const corep = app.corep;
 
                 app.mu.unlock(core.clock.io());
@@ -3287,7 +3287,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // vertices so an old vertex set is never drawn using new scissor/row
     // geometry.
     const shared_metrics_gen_snapshot = app.shared_metrics_gen;
-    const row_h_px_snapshot = app.cell_h_px + app.linespace_px;
+    const row_h_px_snapshot = app.rowHeightPx();
 
     // Get renderer and atlas
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
@@ -3360,7 +3360,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
                         const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
-                        const cell_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
+                        const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;
                         const right_main = center_x + cell_w * 0.5;
                         const top_main = center_y - cell_h * 0.5;

@@ -270,7 +270,10 @@ typedef void (*zonvie_on_guifont_fn)(
 );
 
 /* linespace notification:
-   pixels of extra line spacing (Neovim 'linespace' option). */
+   pixels of extra line spacing (Neovim 'linespace' option). May be negative —
+   Neovim documents negative values for fonts that leave too much room between
+   lines. The value is delivered unclamped; the frontend adds it to the font's
+   cell height and floors the resulting row height at 1px. */
 typedef void (*zonvie_on_linespace_fn)(
     void* ctx,
     int32_t linespace_px
