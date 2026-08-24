@@ -3916,9 +3916,7 @@ pub const FlushCtx = struct {
             const dw: f32 = @as(f32, @floatFromInt(grid_cols)) * cellW;
             const dh: f32 = @as(f32, @floatFromInt(grid_rows)) * cellH;
 
-            const lineSpacePx: u32 = ctx.core.linespace_px;
-            const topPadPx: u32 = lineSpacePx / 2;
-            const topPad: f32 = @floatFromInt(topPadPx);
+            const topPad: f32 = @floatFromInt(rowTopPadPx(ctx.core.linespace_px));
 
             const Helpers = struct {
                 fn ndc(x: f32, y: f32, vw: f32, vh: f32) [2]f32 {
@@ -5833,10 +5831,11 @@ pub const FlushCtx = struct {
     }
 
     pub fn onLinespace(ctx: *FlushCtx, px: i32) !void {
-        // Store in core and notify frontend.
-        const clamped: i32 = if (px < 0) 0 else px;
-        ctx.core.linespace_px = @as(u32, @intCast(clamped));
-        ctx.core.emitLineSpace(clamped);
+        // Store in core and notify frontend. Negative values are Neovim's way
+        // of tightening rows under a font that reserves too much room between
+        // lines; the frontend keeps the resulting row height positive.
+        ctx.core.linespace_px = px;
+        ctx.core.emitLineSpace(px);
     }
 
     pub fn onSetTitle(ctx: *FlushCtx, title: []const u8) !void {
@@ -5974,6 +5973,14 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
 
 fn externalCursorVisibleOnGrid(grid: *const grid_mod.Grid, grid_id: i64) bool {
     return grid.cursor_grid == grid_id and grid.cursor_valid and grid.cursor_visible;
+}
+
+/// Pixels of the row's line spacing that sit above the text, the rest going
+/// below. Neovim allows 'linespace' to be negative to pull lines together when
+/// a font reserves more room for ascent and descent than the text needs, so
+/// this is signed and the row is then shorter than the font's own cell.
+fn rowTopPadPx(linespace_px: i32) i32 {
+    return @divTrunc(linespace_px, 2);
 }
 
 fn externalCursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
@@ -6452,9 +6459,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const cellW: f32 = @floatFromInt(self.cell_w_px);
     const cellH: f32 = @floatFromInt(self.cell_h_px);
 
-    const lineSpacePx: u32 = self.linespace_px;
-    const topPadPx: u32 = lineSpacePx / 2;
-    const topPad: f32 = @floatFromInt(topPadPx);
+    const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
 
     const Helpers = struct {
         fn ndc(x: f32, y: f32, vw: f32, vh: f32) [2]f32 {
@@ -10543,6 +10548,18 @@ test "external cursor visibility includes validity and busy visibility" {
     grid.cursor_visible = true;
     grid.cursor_valid = false;
     try std.testing.expect(!externalCursorVisibleOnGrid(&grid, 7));
+}
+
+test "negative linespace splits above and below the text" {
+    // Neovim's 'linespace' may be negative when a font leaves too much room
+    // between lines; the shrink must reach the row, not be clamped away.
+    try std.testing.expectEqual(@as(i32, 0), rowTopPadPx(0));
+    try std.testing.expectEqual(@as(i32, 2), rowTopPadPx(5));
+    try std.testing.expectEqual(@as(i32, 3), rowTopPadPx(6));
+    // The odd pixel stays below the text in both directions, so a row keeps
+    // the same text position whether it grew or shrank by the same amount.
+    try std.testing.expectEqual(@as(i32, -2), rowTopPadPx(-5));
+    try std.testing.expectEqual(@as(i32, -3), rowTopPadPx(-6));
 }
 
 test "external cursor color glyph retains emoji decoration" {

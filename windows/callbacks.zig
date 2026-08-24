@@ -223,7 +223,7 @@ pub fn rectFromVerts(hwnd: c.HWND, verts: []const app_mod.Vertex) ?c.RECT {
 }
 
 pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
-    const row_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const row_h: u32 = app.rowHeightPx();
 
     // When ext_tabline is enabled (and content_hwnd is not used), the rect coordinates
     // are in hwnd (main window) coordinate system which includes the tabbar.
@@ -536,7 +536,7 @@ pub fn appendRowsFromUpdateRegion(
     const got_bytes: c.DWORD = c.GetRegionData(hrgn, need_bytes, rgndata);
     if (got_bytes == 0) return;
 
-    const row_h_px0: i32 = @intCast(@as(i32, @intCast(app.cell_h_px + app.linespace_px)));
+    const row_h_px0: i32 = @intCast(app.rowHeightPx());
 
     // RECT array starts at rgndata.Buffer (flexible array).
     const rects_ptr_u8: [*]u8 = @ptrCast(&rgndata.Buffer);
@@ -710,7 +710,7 @@ pub fn onVerticesPartial(
                 else
                     client_w;
                 const vp_w: u32 = if (base_w > vp_x + sidebar_r) base_w - vp_x - sidebar_r else 1;
-                const cell_total_h: u32 = @max(1, app.cell_h_px + app.linespace_px);
+                const cell_total_h: u32 = app.rowHeightPx();
                 const drawable_h: u32 = if (client_h > vp_y) client_h - vp_y else 0;
                 const vp_h: u32 = @max((drawable_h / cell_total_h) * cell_total_h, cell_total_h);
 
@@ -1199,7 +1199,7 @@ pub fn onVerticesRow(
             // Use deferred resize via PostMessage to avoid deadlock with WM_SIZE handler
             if (grid_id == app_mod.POPUPMENU_GRID_ID and size_changed) {
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px + app.linespace_px;
+                const cell_h = app.rowHeightPx();
                 const content_w: c_int = @intCast(total_cols * cell_w);
                 const content_h: c_int = @intCast(total_rows * cell_h);
 
@@ -1757,7 +1757,7 @@ pub fn onMainRowScroll(
 
     // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
     // This ensures scroll state is atomically visible with the corresponding committed set.
-    const row_h: i32 = @intCast(@max(1, app.cell_h_px + app.linespace_px));
+    const row_h: i32 = @intCast(app.rowHeightPx());
     const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
     const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
     // rows_delta > 0 means content scrolls up (j-key), so pixels shift up (negative dy).
@@ -2023,7 +2023,7 @@ pub fn onGridRowScroll(
     }
 
     // Accumulate scroll state on TBS (flush-local, merged at commitFlush).
-    const row_h: i32 = @intCast(@max(1, app.cell_h_px + app.linespace_px));
+    const row_h: i32 = @intCast(app.rowHeightPx());
     const scroll_top_px: i32 = @as(i32, @intCast(row_start)) * row_h;
     const scroll_bot_px: i32 = @as(i32, @intCast(row_end)) * row_h;
     const delta_px: i32 = -rows_delta * row_h;
@@ -2841,7 +2841,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
 
     // Calculate pending resize for all external windows (same as onLineSpace)
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
     var ext_it = app.external_windows.iterator();
     while (ext_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;
@@ -2950,21 +2950,25 @@ pub fn onMainGridSize(ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void 
 pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
 
-    const v: u32 = if (linespace_px <= 0) 0 else @intCast(linespace_px);
+    // Negative values are kept: Neovim uses them to tighten rows under a font
+    // that reserves too much room between lines. rowHeightPx() floors the
+    // result so the layout never divides the client area by zero.
+    const v: i32 = linespace_px;
 
     // Defer external window resizes via PostMessage to avoid deadlock.
     // SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler calls
     // zonvie_core_try_resize_grid which needs core locks held by the flush path.
     app.mu.lockUncancelable(core.clock.io());
+    const changed = app.linespace_px != v;
+    app.linespace_px = v;
     if (applog.isEnabled()) applog.appLog(
         "[win] onLineSpace: linespace_px={d} v={d} cell_h_px={d} -> row_h={d}\n",
-        .{ linespace_px, v, app.cell_h_px, app.cell_h_px + v },
+        .{ linespace_px, v, app.cell_h_px, app.rowHeightPx() },
     );
-    if (app.linespace_px != v) {
+    if (changed) {
         app.row_layout_gen +%= 1;
         app.shared_metrics_gen +%= 1;
     }
-    app.linespace_px = v;
     const hwnd = app.hwnd;
     if (hwnd) |h| {
         app_mod.updateRowsColsFromClientForce(h, app);
@@ -2972,7 +2976,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 
     // Calculate pending resize for all external windows
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + v;
+    const cell_h = app.rowHeightPx();
     var ext_it = app.external_windows.iterator();
     while (ext_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;

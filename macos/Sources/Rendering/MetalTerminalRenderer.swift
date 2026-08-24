@@ -640,7 +640,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         let ls = linespacePx
         lock.unlock()
-        return atlas.fontMetricsSnapshot().height + Float(ls)
+        // 'linespace' may be negative (Neovim allows it to tighten rows under
+        // a font that reserves too much room between lines), so the sum has to
+        // stay positive: the grid divides the drawable by this to get its row
+        // count, and rows also cannot be measured in zero pixels.
+        return max(1, atlas.fontMetricsSnapshot().height + Float(ls))
     }
 
 
@@ -2130,7 +2134,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func setLineSpace(px: Int32) {
         lock.lock()
         defer { lock.unlock() }
-        linespacePx = max(0, px)
+        // Kept signed: cellHeightPx floors the row height that results.
+        linespacePx = px
     }
 
     /// Update scroll offsets for smooth scrolling.
