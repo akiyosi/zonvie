@@ -41,6 +41,22 @@ fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
     };
 }
 
+/// Report pointer enter/exit on a message surface so the core holds the view's
+/// auto-hide countdown while the user reads it or reaches for the copy button.
+/// Only transitions are posted, so an ordinary mouse move over the surface
+/// costs nothing.
+fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovered: bool) void {
+    switch (classifyExternalSurface(grid_id)) {
+        .msg_show, .msg_history => {},
+        else => return,
+    }
+    if (ext_win.msg_hover == hovered) return;
+    const hwnd = app.hwnd orelse return;
+    const wparam: c.WPARAM = if (hovered) 1 else 0;
+    if (c.PostMessageW(hwnd, app_mod.WM_APP_MSG_HOVER, wparam, @intCast(grid_id)) == 0) return;
+    ext_win.msg_hover = hovered;
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -1803,6 +1819,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         if (applog.isEnabled()) applog.appLog("[win] put message window below cmdline (cmdline created)\n", .{});
     }
 
+    // A message float routinely appears right under a stationary pointer, and
+    // no WM_MOUSEMOVE follows one that never moves. Seed the hover state from
+    // the cursor's actual position, after the deferred repositioning above has
+    // settled the window's final rect.
+    var window_rect: c.RECT = undefined;
+    var cursor: c.POINT = undefined;
+    if (c.GetWindowRect(hwnd, &window_rect) != 0 and c.GetCursorPos(&cursor) != 0) {
+        if (c.PtInRect(&window_rect, cursor) != 0) {
+            setMsgHover(app, ext_window_ptr, req.grid_id, true);
+        }
+    }
+
     // Activate this external window
     _ = c.SetForegroundWindow(hwnd);
     return .published;
@@ -2564,6 +2592,10 @@ pub export fn ExternalWndProc(
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
 
+                    // The pointer is somewhere on the surface, copy button
+                    // included — the message must not vanish under it.
+                    setMsgHover(app, ext_win, grid_id.?, true);
+
                     // Check for scrollbar hover
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
                         var client: c.RECT = undefined;
@@ -2606,10 +2638,12 @@ pub export fn ExternalWndProc(
         c.WM_MOUSELEAVE => {
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());
+                var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.*.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
                         ext_window = entry.value_ptr.*;
                         break;
                     }
@@ -2617,6 +2651,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
+                    setMsgHover(app, ext_win, grid_id.?, false);
                     if (ext_win.copy_button_hover) {
                         ext_win.copy_button_hover = false;
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
