@@ -688,6 +688,24 @@ fn clampGridLineRepeat(col: u32, cols: u32, repeat: u32) u32 {
     return @min(repeat, cols - col);
 }
 
+/// Narrow Neovim's 'linespace' to the width the callback carries. Negative
+/// values are legal and must survive: Neovim documents them for fonts that
+/// leave too much room between lines (options.txt 'linespace'). The frontends
+/// floor the row height that results, so nothing downstream needs a zero here.
+fn linespacePxFromWire(v: i64) i32 {
+    return @intCast(std.math.clamp(v, std.math.minInt(i32), std.math.maxInt(i32)));
+}
+
+test "linespace keeps negative values coming off the wire" {
+    try std.testing.expectEqual(@as(i32, 0), linespacePxFromWire(0));
+    try std.testing.expectEqual(@as(i32, 4), linespacePxFromWire(4));
+    // Clamping this to zero silently discards the setting: the value reaches
+    // the frontend unchanged and the row simply gets shorter.
+    try std.testing.expectEqual(@as(i32, -5), linespacePxFromWire(-5));
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), linespacePxFromWire(std.math.minInt(i64)));
+    try std.testing.expectEqual(@as(i32, std.math.maxInt(i32)), linespacePxFromWire(std.math.maxInt(i64)));
+}
+
 test "grid_line repeat clamp handles untrusted u32 bounds" {
     try std.testing.expectEqual(@as(u32, 2), clampGridLineRepeat(2, 4, std.math.maxInt(u32)));
     try std.testing.expectEqual(@as(u32, 0), clampGridLineRepeat(4, 4, 1));
@@ -1920,8 +1938,7 @@ pub fn handleRedraw(
 
                         switch (t[1]) {
                             .int => {
-                                const v = t[1].int;
-                                px_i32 = if (v < 0) 0 else @as(i32, @intCast(@min(v, std.math.maxInt(i32))));
+                                px_i32 = linespacePxFromWire(t[1].int);
                             },
                             .nil => {
                                 px_i32 = 0;

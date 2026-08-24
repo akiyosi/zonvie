@@ -249,8 +249,7 @@ pub fn handleMouseWheel(
     // Get cell dimensions
     app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px;
-    const linespace = app.linespace_px;
+    const row_h = app.rowHeightPx();
     const corep = app.corep;
     app.mu.unlock(core.clock.io());
 
@@ -258,7 +257,6 @@ pub fn handleMouseWheel(
     // Mirror the click handler's content-offset rules (window.zig WM_LBUTTONDOWN):
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
-    const row_h = cell_h + linespace;
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
     const content_x: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
         pt.x - @as(c.LONG, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
@@ -388,7 +386,7 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const corep = app.corep;
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
-    const linespace = app.linespace_px;
+    const row_h_px = app.rowHeightPx();
     const ext_tabline_enabled = app.ext_tabline_enabled;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
@@ -396,7 +394,7 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     if (corep == null) return;
 
     // Row height includes linespace (for row positioning)
-    const row_h: i32 = @intCast(cell_h + linespace);
+    const row_h: i32 = @intCast(row_h_px);
 
     var row: i32 = 0;
     var col: i32 = 0;
@@ -568,7 +566,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const corep = app.corep;
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
-    const linespace = app.linespace_px;
+    const row_h_px = app.rowHeightPx();
     const comp_str = app.ime_composition_str.items;
     const target_start = app.ime_target_start;
     const target_end = app.ime_target_end;
@@ -601,7 +599,7 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     }
 
     // Row height includes linespace
-    const row_h: u32 = cell_h + linespace;
+    const row_h: u32 = row_h_px;
 
     var row: i32 = 0;
     var col: i32 = 0;
