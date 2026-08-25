@@ -67,6 +67,7 @@ pub const zonvie_core_set_ext_messages = core.zonvie_core_set_ext_messages;
 pub const zonvie_core_set_ext_tabline = core.zonvie_core_set_ext_tabline;
 pub const zonvie_core_tick_msg_throttle = core.zonvie_core_tick_msg_throttle;
 pub const zonvie_core_try_next_msg_timeout_ms = core.zonvie_core_try_next_msg_timeout_ms;
+pub const zonvie_core_set_msg_hover = core.zonvie_core_set_msg_hover;
 pub const zonvie_core_set_blur_enabled = core.zonvie_core_set_blur_enabled;
 pub const zonvie_core_set_inherit_cwd = core.zonvie_core_set_inherit_cwd;
 pub const zonvie_core_set_glyph_cache_size = core.zonvie_core_set_glyph_cache_size;
@@ -210,6 +211,12 @@ pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 40;
 /// delta. Posted (not sent) because the callback runs on the core thread with
 /// grid_mu held, and SetWindowPos would re-enter updateLayoutToCore.
 pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
+/// Posted when the pointer enters or leaves a message surface. wParam = 1 for
+/// entered, 0 for left; lParam = grid id. Posted (not sent) because the mouse
+/// message can be dispatched from a nested message pump inside DXGI Present,
+/// which runs while the core's grid lock is held — taking that lock from the
+/// handler directly would self-deadlock.
+pub const WM_APP_MSG_HOVER: c.UINT = c.WM_APP + 42;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -1931,6 +1938,10 @@ pub const ExternalWindow = struct {
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // Pointer is over a message surface, reported to the core so it holds the
+    // view's auto-hide countdown. Tracked here so an ordinary mouse move does
+    // not take the core's grid lock on every WM_MOUSEMOVE.
+    msg_hover: bool = false,
     // OLE drop target (cmdline surface only). See ui/drop_target.zig; opaque
     // here so app.zig carries none of the COM plumbing.
     drop_target: ?*anyopaque = null,

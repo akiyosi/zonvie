@@ -1368,6 +1368,27 @@ final class ZonvieCore {
         zonvie_core_tick_msg_throttle(core)
     }
 
+    /// Report pointer enter/exit on a message ext_float window so the core can
+    /// hold its auto-hide countdown while the user reads the message or reaches
+    /// for the copy button.
+    ///
+    /// Deliberately async even though it is already on the main thread: the
+    /// call takes the core's grid lock, and AppKit can drive a tracking-area
+    /// update from inside a core callback that already holds it
+    /// (zonvie_core_tick_msg_throttle fires on_external_window_close and
+    /// on_msg_clear on this thread with the lock held). Hopping to the next
+    /// runloop turn keeps that from self-deadlocking; the queue preserves
+    /// enter/exit order.
+    func setMsgHover(gridId: Int64, hovered: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let core = self.core else { return }
+            zonvie_core_set_msg_hover(core, gridId, hovered ? 1 : 0)
+            // Pausing or resuming moved the earliest deadline, so the one-shot
+            // timer armed for the old one has to be re-armed.
+            self.terminalView?.scheduleMsgTimer()
+        }
+    }
+
     /// Milliseconds until the core's earliest pending msg_show/msg_history
     /// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
     /// timeout is armed. Used to schedule a one-shot tick instead of polling.
@@ -4091,6 +4112,55 @@ final class ZonvieCore {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     }
 
+    /// Content view of the decorated message windows (msg_show / msg_history).
+    ///
+    /// Reports pointer enter/exit so the core can hold the view's auto-hide
+    /// countdown while the user reads the message or reaches for the copy
+    /// button. The tracking area covers the whole container, so moving onto the
+    /// copy button — a subview with its own tracking area — is not an exit.
+    final class MsgHoverContainerView: NSView {
+        var onHoverChange: ((Bool) -> Void)?
+        private var hoverTrackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let hoverTrackingArea {
+                removeTrackingArea(hoverTrackingArea)
+            }
+            // .activeAlways for the same reason as CopyContentButton: these
+            // windows never become key.
+            let area = NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self
+            )
+            addTrackingArea(area)
+            hoverTrackingArea = area
+            reportPointerIfInside()
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            onHoverChange?(true)
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            onHoverChange?(false)
+        }
+
+        /// AppKit posts no mouseEntered for an area installed under a pointer
+        /// that never moves, and a message float routinely appears right under
+        /// one. Without this the countdown would run while the user is already
+        /// on the window. Only entry is reported: the core drops the flag
+        /// itself when the view hides.
+        private func reportPointerIfInside() {
+            guard let window else { return }
+            let pointInView = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            if bounds.contains(pointInView) {
+                onHoverChange?(true)
+            }
+        }
+    }
+
     /// Content view of the decorated cmdline window.
     ///
     /// AppKit resolves a drag destination by hit-testing and then walking UP
@@ -6233,6 +6303,12 @@ final class ZonvieCore {
             dropContainer.dropTarget = gridView
             dropContainer.registerForDraggedTypes([.fileURL])
             containerView = dropContainer
+        } else if kind == .msgShow || kind == .msgHistory {
+            let hoverContainer = MsgHoverContainerView(frame: containerFrame)
+            hoverContainer.onHoverChange = { [weak self] hovered in
+                self?.setMsgHover(gridId: gridId, hovered: hovered)
+            }
+            containerView = hoverContainer
         } else {
             containerView = NSView(frame: containerFrame)
         }

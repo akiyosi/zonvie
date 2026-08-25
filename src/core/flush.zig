@@ -8964,6 +8964,20 @@ fn channelAutoHideSlot(self: *Core, ch: MsgChannel) *?i128 {
     };
 }
 
+fn channelAutoHideNsSlot(self: *Core, ch: MsgChannel) *?i128 {
+    return switch (ch) {
+        .show => &self.msg_show_auto_hide_ns,
+        .history => &self.msg_history_auto_hide_ns,
+    };
+}
+
+fn channelHoverSlot(self: *Core, ch: MsgChannel) *bool {
+    return switch (ch) {
+        .show => &self.msg_show_hovered,
+        .history => &self.msg_history_hovered,
+    };
+}
+
 /// Run one display cycle for a channel: show every view holding content,
 /// hide every empty view the core still owns. Returns false when the flush
 /// must be retried.
@@ -9023,8 +9037,13 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 },
             }
             // timeout=0 means no auto-hide, e.g. errors.
-            channelAutoHideSlot(self, ch).* = if (messageTimeoutNs(state.timeout)) |ns|
-                clock.nowNs() + ns
+            const timeout_ns = messageTimeoutNs(state.timeout);
+            channelAutoHideNsSlot(self, ch).* = timeout_ns;
+            // A message can land on a float the pointer is already resting on.
+            // Arming it there would hide the view mid-read; the pointer leaving
+            // starts the countdown instead.
+            channelAutoHideSlot(self, ch).* = if (timeout_ns) |ns|
+                (if (channelHoverSlot(self, ch).*) null else clock.nowNs() + ns)
             else
                 null;
         },
@@ -9134,6 +9153,11 @@ pub fn hideChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType) vo
             .history => hideMsgHistory(self),
         }
         channelAutoHideSlot(self, ch).* = null;
+        channelAutoHideNsSlot(self, ch).* = null;
+        // The window can close under a stationary pointer, and AppKit/Win32
+        // deliver no leave event for a window that is gone. Dropping the flag
+        // here keeps a stale hover from suppressing the next view's countdown.
+        channelHoverSlot(self, ch).* = false;
     }
     channelViews(self, ch).markHidden(view);
 }
@@ -9377,6 +9401,29 @@ pub fn pauseChannelAutoHide(self: *Core, ch: MsgChannel) void {
         self.log.write("[msg] channel={s}: auto-hide paused (user interaction)\n", .{@tagName(ch)});
         channelAutoHideSlot(self, ch).* = null;
     }
+}
+
+/// Restart a paused countdown at full length. Unlike the scroll pause, hover
+/// has a defined end, so the pointer leaving resumes the view rather than
+/// waiting for the next show cycle. Only a view the core still shows, and whose
+/// timeout was non-zero, is re-armed.
+fn resumeChannelAutoHide(self: *Core, ch: MsgChannel) void {
+    if (!channelViews(self, ch).state(.ext_float).visible) return;
+    const slot = channelAutoHideSlot(self, ch);
+    if (slot.* != null) return;
+    const ns = channelAutoHideNsSlot(self, ch).* orelse return;
+    slot.* = clock.nowNs() + ns;
+    self.log.write("[msg] channel={s}: auto-hide resumed (hover ended)\n", .{@tagName(ch)});
+}
+
+/// Frontend hover state for a channel's ext_float window. Entering stops the
+/// countdown, leaving restarts it at full length.
+/// IMPORTANT: Caller must hold grid_mu (via the c_api entry point).
+pub fn setChannelHover(self: *Core, ch: MsgChannel, hovered: bool) void {
+    const slot = channelHoverSlot(self, ch);
+    if (slot.* == hovered) return;
+    slot.* = hovered;
+    if (hovered) pauseChannelAutoHide(self, ch) else resumeChannelAutoHide(self, ch);
 }
 
 pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
@@ -13821,6 +13868,102 @@ test "scrolling the message float pauses its auto-hide" {
     try std.testing.expect(core.msg_show_auto_hide_at == null);
     try std.testing.expect(core.msg_views.state(.ext_float).visible);
     try std.testing.expect(core.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID));
+}
+
+test "hovering the message float pauses its auto-hide" {
+    // Same reasoning as the scroll pause: the pointer resting on the float is
+    // the user reading it, or reaching for the copy button. The countdown must
+    // stop, and the float must stay visible.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "readable");
+    _ = sendMsgShow(&core);
+    try std.testing.expect(core.msg_show_auto_hide_at != null);
+
+    setChannelHover(&core, .show, true);
+
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+}
+
+test "leaving the message float re-arms the full timeout" {
+    // Unlike the scroll pause, hover is a state with a defined end: the pointer
+    // leaving restarts the countdown at full length rather than waiting for the
+    // next show cycle.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "readable");
+    _ = sendMsgShow(&core);
+    const armed_at = core.msg_show_auto_hide_at.?;
+
+    setChannelHover(&core, .show, true);
+    setChannelHover(&core, .show, false);
+
+    // Full length, not the remainder: the resumed deadline is no earlier than
+    // the original one.
+    const resumed_at = core.msg_show_auto_hide_at orelse return error.NotReArmed;
+    try std.testing.expect(resumed_at >= armed_at);
+}
+
+test "a message shown while hovered does not arm its auto-hide" {
+    // A new message can land on a float the pointer is already over. Arming it
+    // would hide the float mid-read, which is exactly what hover prevents.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "first");
+    _ = sendMsgShow(&core);
+    setChannelHover(&core, .show, true);
+
+    try appendTestMessage(&core, 2, "echo", "second");
+    _ = sendMsgShow(&core);
+
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+    try std.testing.expect(core.msg_views.state(.ext_float).visible);
+}
+
+test "leaving a hidden message float does not resurrect its deadline" {
+    // The window can close under a stationary pointer (msg_clear, auto-hide),
+    // and the frontend's exit event arrives afterwards. Resume must not re-arm
+    // a view the core no longer shows, or nextMsgTimeoutNs would wake forever.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "readable");
+    _ = sendMsgShow(&core);
+    setChannelHover(&core, .show, true);
+
+    core.grid.message_state.clearMessages(core.grid.alloc);
+    hideChannelView(&core, .show, .ext_float);
+
+    setChannelHover(&core, .show, false);
+
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
+}
+
+test "a zero-timeout message stays un-armed across a hover cycle" {
+    // timeout=0 means "no auto-hide" (errors). Resume must respect that rather
+    // than inventing a countdown for a message that should persist.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    try appendTestMessage(&core, 1, "echo", "sticky");
+    _ = sendMsgShow(&core);
+    // Emulate a route whose view timeout is 0 by clearing what the show armed.
+    core.msg_show_auto_hide_at = null;
+    core.msg_show_auto_hide_ns = null;
+
+    setChannelHover(&core, .show, true);
+    setChannelHover(&core, .show, false);
+
+    try std.testing.expect(core.msg_show_auto_hide_at == null);
 }
 
 test "hiding the history grid drops its retry deadline" {

@@ -4816,6 +4816,18 @@ pub export fn WndProc(
             return 0;
         },
 
+        app_mod.WM_APP_MSG_HOVER => {
+            if (getApp(hwnd)) |app| {
+                if (app.corep) |corep| {
+                    app_mod.zonvie_core_set_msg_hover(corep, @intCast(lParam), @intCast(wParam));
+                    // Pausing or resuming moved the earliest deadline, so the
+                    // timer armed for the old one has to be re-armed.
+                    armMsgThrottleTimer(hwnd, app);
+                }
+            }
+            return 0;
+        },
+
         app_mod.WM_APP_MSG_THROTTLE_ARM => {
             if (getApp(hwnd)) |app| {
                 app.msg_throttle_arm_posted.store(false, .release);
