@@ -1326,6 +1326,26 @@ pub export fn zonvie_core_try_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c)
     return @intCast(remaining_ms);
 }
 
+/// Report whether the pointer rests on a message ext_float window. While
+/// hovered the view's auto-hide countdown is stopped — the user is reading it,
+/// or reaching for its copy button — and leaving restarts it at full length.
+/// Ignores any grid that is not a message float.
+///
+/// Both transitions change the earliest pending deadline, so the caller must
+/// re-arm its one-shot timer from zonvie_core_next_msg_timeout_ms afterwards.
+pub export fn zonvie_core_set_msg_hover(p: ?*zonvie_core, grid_id: i64, hovered: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    const ch: flush_mod.MsgChannel = switch (grid_id) {
+        grid_mod.MESSAGE_GRID_ID => .show,
+        grid_mod.MSG_HISTORY_GRID_ID => .history,
+        else => return,
+    };
+    box.core.grid_mu.lockUncancelable(clock.io());
+    defer box.core.grid_mu.unlock(clock.io());
+    flush_mod.setChannelHover(&box.core, ch, hovered != 0);
+}
+
 pub export fn zonvie_core_set_blur_enabled(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);

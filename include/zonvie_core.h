@@ -907,6 +907,14 @@ int64_t zonvie_core_next_msg_timeout_ms(zonvie_core *core);
  * its timer for a short fixed retry instead of trusting a stale value. */
 int64_t zonvie_core_try_next_msg_timeout_ms(zonvie_core *core);
 
+/* Report whether the pointer rests on a message ext_float window (grid -102 or
+ * -103; any other grid_id is ignored). While hovered the view's auto-hide
+ * countdown is stopped -- the user is reading it, or reaching for its copy
+ * button -- and leaving restarts it at full length.
+ * Both transitions move the earliest pending deadline, so the caller must
+ * re-arm its one-shot timer from zonvie_core_next_msg_timeout_ms afterwards. */
+void zonvie_core_set_msg_hover(zonvie_core *core, int64_t grid_id, int hovered);
+
 /* Enable blur transparency for background (macOS only).
  * When enabled, default background uses semi-transparent alpha for blur effect.
  * Windows should NOT enable this (causes rendering artifacts). */

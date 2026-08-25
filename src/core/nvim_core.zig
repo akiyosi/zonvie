@@ -919,6 +919,18 @@ pub const Core = struct {
     msg_show_auto_hide_at: ?i128 = null, // grid -102 auto-hide deadline
     msg_history_auto_hide_at: ?i128 = null, // grid -103 auto-hide deadline
 
+    // Auto-hide length of the currently shown view (nanos), kept so a hover
+    // pause can restart the countdown at full length instead of waiting for
+    // the next show cycle. null mirrors "no auto-hide" (timeout=0).
+    msg_show_auto_hide_ns: ?i128 = null,
+    msg_history_auto_hide_ns: ?i128 = null,
+
+    // Pointer resting on the channel's ext_float window. While set, the view
+    // never arms an auto-hide deadline: the user is reading it, or reaching
+    // for its copy button.
+    msg_show_hovered: bool = false,
+    msg_history_hovered: bool = false,
+
     // Scroll state for msg_show ext-float (Zonvie's own grid)
     msg_scroll_offset: u32 = 0, // Current scroll offset (lines from top)
     msg_total_lines: u32 = 0, // Total line count in current message content
