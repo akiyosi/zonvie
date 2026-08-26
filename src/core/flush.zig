@@ -5576,7 +5576,13 @@ pub const FlushCtx = struct {
                                     try cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6);
                                     const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_SCROLLABLE);
+                                        // DECO_CURSOR for the same reason the cursor background
+                                        // quad above carries it: without it these rects are plain
+                                        // solid quads, and the shader fades plain solids to
+                                        // `backgroundAlpha` once blur is on. The box behind the
+                                        // glyph would stay opaque while the glyph itself went
+                                        // translucent. The external-grid path already sets it.
+                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                                     }
                                 }
                             } else {
