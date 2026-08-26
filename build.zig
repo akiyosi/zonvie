@@ -475,6 +475,17 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
 
+    // Platform-independent resampler tests for the ext_images store.
+    const windows_ext_images_resample_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/ext_images_resample.zig"),
+    });
+    const windows_ext_images_resample_tests = b.addTest(.{
+        .root_module = windows_ext_images_resample_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(windows_ext_images_resample_tests).step);
+
     // Platform-independent placement tests for the ext_messages floats.
     const windows_msg_float_layout_test_mod = b.createModule(.{
         .target = target,

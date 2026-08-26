@@ -16,6 +16,7 @@ const flush = @import("flush.zig");
 const rpc_session = @import("rpc_session.zig");
 const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
+const image_placeholder = @import("image_placeholder.zig");
 const vertexgen = @import("vertexgen.zig");
 const clock = @import("clock.zig");
 
@@ -74,6 +75,15 @@ pub const TransportKind = enum {
     /// stdin_file and stdout_file alias the same fd; stderr_file is null.
     socket,
 };
+
+/// Cell extent of a virtual placement's placeholder grid.
+pub const ImageTileGrid = struct { cols: u16, rows: u16 };
+
+/// Atlas cache key for one tile of a virtual placement. The cell pixel box is
+/// part of the key: unlike a glyph (sized by the font), a tile is rasterized to
+/// fill its cell, so a 'linespace' or cell-metric change makes every cached
+/// tile the wrong resolution rather than merely repositioned.
+pub const ImageTileKey = struct { id: i64, row: u16, col: u16, px_w: u32, px_h: u32 };
 
 pub const Callbacks = struct {
     on_vertices_partial: ?*const fn (
@@ -371,6 +381,11 @@ pub const Callbacks = struct {
     /// frontend last supplied via updateLayoutPx, i.e. Neovim changed it
     /// rather than echoing the UI's own resize request.
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    on_image_data: ?*const fn (ctx: ?*anyopaque, id: i64, data: [*]const u8, data_len: usize) callconv(.c) void = null,
+    on_image_set: ?*const fn (ctx: ?*anyopaque, id: i64, virtual_placement: c_int, row: i32, col: i32, width: i32, height: i32, zindex: i32) callconv(.c) void = null,
+    on_image_del: ?*const fn (ctx: ?*anyopaque, id: i64) callconv(.c) void = null,
+    on_rasterize_image_tile: ?*const fn (ctx: ?*anyopaque, id: i64, tile_row: u16, tile_col: u16, tile_rows: u16, tile_cols: u16, px_w: u32, px_h: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int = null,
 };
 
 const PipeReader = rpc_session.PipeReader;
@@ -882,6 +897,35 @@ pub const Core = struct {
     // ext_popupmenu UI extension flag (set before start)
     ext_popupmenu_enabled: bool = false,
 
+    // Experimental Neovim ext_images protocol. Enabled by default; it is
+    // negotiated after ui_attach so older Neovim can reject it harmlessly.
+    ext_images_enabled: bool = true,
+
+    // Virtual ext_images placements: image id -> its tile grid extent in cells.
+    // Direct placements are not tracked here; the frontend draws those from the
+    // on_image_set callback alone.
+    images_virtual: std.AutoHashMapUnmanaged(i64, ImageTileGrid) = .{},
+
+    // Image tiles resident in the glyph atlas, keyed by image and tile. Cleared
+    // together with the glyph caches, since a tile is rasterized at cell size.
+    image_tiles: std.AutoHashMapUnmanaged(ImageTileKey, c_api.GlyphEntry) = .{},
+
+    // Set once Neovim accepts the ext_images option, which is the only state in
+    // which placeholder cells can reach the grid. It gates the per-row
+    // placeholder scan, so a Neovim without ext_images pays nothing for it.
+    // Written by the RPC reader thread when Neovim answers the negotiation,
+    // read by whichever thread composes rows; atomic for the same reason
+    // ui_attached is.
+    ext_images_active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    // Msgid of the in-flight nvim_ui_set_option that negotiates ext_images.
+    ext_images_msgid: i64 = 0,
+
+    // Columns of the row being generated that an image tile has consumed. The
+    // glyph passes read it through getOverflowForCell so a placeholder's
+    // diacritics are never rendered as combining marks over the tile.
+    image_blank_cols: std.DynamicBitSetUnmanaged = .{},
+
     // ext_messages UI extension flag (set before start)
     ext_messages_enabled: bool = false,
 
@@ -1214,6 +1258,9 @@ pub const Core = struct {
 
     /// Cleanup for test-created Core instances (no threads/processes to join).
     pub fn deinitForTest(self: *Core) void {
+        self.image_blank_cols.deinit(self.alloc);
+        self.images_virtual.deinit(self.alloc);
+        self.image_tiles.deinit(self.alloc);
         self.hl.deinit();
         self.grid.deinit();
         self.main_verts.deinit(self.alloc);
@@ -1402,6 +1449,13 @@ pub const Core = struct {
             // In-flight RPC IDs from the dead channel — drop tracking so any
             // stale response from the new server cannot match.
             self.get_api_info_msgid = null;
+            self.ext_images_msgid = 0;
+            self.ext_images_active.store(false, .release);
+            // Images belong to the dead session. Neovim never retransmits, so
+            // anything kept here would be served for an id the NEW session
+            // recycles — the spec's "ignore unknown ids" rule, inverted.
+            self.images_virtual.clearRetainingCapacity();
+            self.image_tiles.clearRetainingCapacity();
             self.quit_request_msgid.store(0, .release);
             self.glow_request_msgid.store(0, .release);
 
@@ -1852,6 +1906,9 @@ pub const Core = struct {
         self.main_vertex_row_counts.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
+        self.images_virtual.deinit(self.alloc);
+        self.image_tiles.deinit(self.alloc);
+        self.image_blank_cols.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
         self.ext_float_entries.deinit(self.alloc);
         self.ext_float_anchor_entries.deinit(self.alloc);
@@ -2100,6 +2157,8 @@ pub const Core = struct {
             const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
             @memset(buf, INVALID_KEY);
         }
+        // Image tiles live in the same atlas and are sized from the cell box.
+        self.image_tiles.clearRetainingCapacity();
     }
 
     /// Reset shaping result cache. Called on guifont/font feature change.
@@ -2913,6 +2972,10 @@ pub const Core = struct {
         }
         self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_non_ascii, self.glyph_keys_non_ascii);
         self.dropKeyedEntriesInDeadShelves(packer, order, &live, self.glyph_cache_by_id, self.glyph_keys_by_id);
+        // Image tiles share the atlas and are cached for its lifetime, so a
+        // scrolled-off image whose shelves get reclaimed would otherwise keep
+        // serving UVs that now name someone else's glyphs.
+        self.dropImageTilesInDeadShelves(packer, order, &live);
         // Only now that no cache entry names a reclaimed shelf can shelves be
         // renumbered. Fusing the free runs is what lets a tall glyph land in
         // space vacated by short ones.
@@ -2935,6 +2998,32 @@ pub const Core = struct {
         const y: u32 = @intFromFloat(@min(uv_y * h_f, h_f - 1));
         const idx = packer.shelfIndexForYOrdered(order, y) orelse return false;
         return !live[idx];
+    }
+
+    /// Same reclamation rule as the glyph caches, over the image tile map.
+    /// The map is small (one entry per visible tile), so the doomed-key buffer
+    /// is bounded by what actually fits on screen.
+    fn dropImageTilesInDeadShelves(
+        self: *Core,
+        packer: *const shelf_packer.ShelfPacker,
+        order: []const u16,
+        live: *const [shelf_packer.max_shelves]bool,
+    ) void {
+        if (self.image_tiles.count() == 0) return;
+        var doomed: std.ArrayListUnmanaged(ImageTileKey) = .empty;
+        defer doomed.deinit(self.alloc);
+        var it = self.image_tiles.iterator();
+        while (it.next()) |e| {
+            if (!self.entryLivesInDeadShelf(packer, order, live, e.value_ptr.*)) continue;
+            doomed.append(self.alloc, e.key_ptr.*) catch {
+                // Dropping every tile is always safe: they re-rasterize on
+                // demand. Only the reclaimed ones MUST go, so over-clearing
+                // costs work, never correctness.
+                self.image_tiles.clearRetainingCapacity();
+                return;
+            };
+        }
+        for (doomed.items) |key| _ = self.image_tiles.remove(key);
     }
 
     fn dropKeyedEntriesInDeadShelves(
@@ -3108,6 +3197,111 @@ pub const Core = struct {
         }
 
         return self.packAndUploadBitmap(&bm);
+    }
+
+    /// Ready the per-row placeholder mask for a row of `cols` cells. The bitset
+    /// keeps its capacity across rows and flushes; only the bits are cleared.
+    pub fn ensureImageBlankCols(self: *Core, cols: u32) !void {
+        if (self.image_blank_cols.bit_length < cols) {
+            try self.image_blank_cols.resize(self.alloc, cols, false);
+        }
+        self.image_blank_cols.unsetAll();
+    }
+
+    /// Record a virtual placement's tile grid, or drop it when Neovim moved the
+    /// image to a direct placement. `width_cells`/`height_cells` are -1 when
+    /// Neovim omitted them, in which case the image cannot be tiled.
+    pub fn setVirtualImage(self: *Core, id: i64, width_cells: i32, height_cells: i32) void {
+        if (width_cells <= 0 or height_cells <= 0) {
+            self.clearVirtualImage(id);
+            return;
+        }
+        const grid_extent = ImageTileGrid{
+            .cols = @intCast(@min(width_cells, image_placeholder.MAX_INDEX + 1)),
+            .rows = @intCast(@min(height_cells, image_placeholder.MAX_INDEX + 1)),
+        };
+        // A resized placement re-tiles the image, so the cached tiles no longer
+        // describe the same source region.
+        if (self.images_virtual.get(id)) |prev| {
+            if (prev.cols != grid_extent.cols or prev.rows != grid_extent.rows) self.purgeImageTiles(id);
+        }
+        self.images_virtual.put(self.alloc, id, grid_extent) catch |e| {
+            self.log.write("[images] virtual placement {d} dropped: {any}\n", .{ id, e });
+            return;
+        };
+    }
+
+    /// Forget a virtual placement and every tile it owns in the atlas. The
+    /// atlas region itself is reclaimed only by the next atlas reset; images
+    /// are long-lived, so leaving the shelf allocation is preferable to
+    /// repacking on every deletion.
+    pub fn clearVirtualImage(self: *Core, id: i64) void {
+        if (!self.images_virtual.remove(id)) return;
+        self.purgeImageTiles(id);
+    }
+
+    /// Drop every cached tile of `id`. Called when the image's data or tile
+    /// grid changes, so stale pixels are never re-used for a new source.
+    pub fn purgeImageTiles(self: *Core, id: i64) void {
+        if (self.image_tiles.count() == 0) return;
+        var doomed: std.ArrayListUnmanaged(ImageTileKey) = .empty;
+        defer doomed.deinit(self.alloc);
+        var it = self.image_tiles.keyIterator();
+        while (it.next()) |key| {
+            if (key.id != id) continue;
+            doomed.append(self.alloc, key.*) catch {
+                // Out of memory while purging: clearing everything is correct,
+                // just more expensive, since tiles re-rasterize on demand.
+                self.image_tiles.clearRetainingCapacity();
+                return;
+            };
+        }
+        for (doomed.items) |key| _ = self.image_tiles.remove(key);
+    }
+
+    /// Tile grid of a virtual placement, or null when `id` has none (an unknown
+    /// or direct-placement image, which placeholder cells must ignore).
+    pub fn virtualImageGrid(self: *Core, id: i64) ?ImageTileGrid {
+        return self.images_virtual.get(id);
+    }
+
+    /// Resolve one image tile to an atlas entry, rasterizing and packing it on
+    /// first use. Tiles are cached for the atlas' lifetime: unlike glyphs they
+    /// are never re-requested per row.
+    ///
+    /// The atlas footprint needs no separate budget even though the placeholder
+    /// scheme allows a 297x297-cell image: only cells actually on screen reach
+    /// this function, so live tiles are bounded by the drawable, and tiles left
+    /// behind by scrolling are reclaimed by the same dead-shelf collection that
+    /// reclaims glyphs (dropImageTilesInDeadShelves).
+    pub fn ensureImageTile(
+        self: *Core,
+        id: i64,
+        tile_row: u16,
+        tile_col: u16,
+        grid_extent: ImageTileGrid,
+        px_w: u32,
+        px_h: u32,
+    ) ?c_api.GlyphEntry {
+        const key = ImageTileKey{ .id = id, .row = tile_row, .col = tile_col, .px_w = px_w, .px_h = px_h };
+        if (self.image_tiles.get(key)) |entry| return entry;
+
+        const rasterize = self.cb.on_rasterize_image_tile orelse return null;
+        if (!self.ensureAtlasInit()) return null;
+        if (px_w == 0 or px_h == 0) return null;
+
+        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
+        const ok = rasterize(self.ctx, id, tile_row, tile_col, grid_extent.rows, grid_extent.cols, px_w, px_h, &bm);
+        if (self.flush_aborted) return null;
+        if (ok == 0) return null;
+
+        const entry = self.packAndUploadBitmap(&bm) orelse return null;
+        self.image_tiles.put(self.alloc, key, entry) catch |e| {
+            // The tile is already in the atlas; only the cache entry is lost,
+            // so the next row re-rasterizes it rather than rendering nothing.
+            self.log.write("[images] tile cache insert failed: {any}\n", .{e});
+        };
+        return entry;
     }
 
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
@@ -4530,6 +4724,29 @@ pub const Core = struct {
         }
     }
 
+    /// ext_images is experimental: a Neovim without it rejects the whole
+    /// nvim_ui_attach option map, which would leave the UI unattached. Set it
+    /// after attaching instead, as a request so an unsupported build answers
+    /// with an error response that handleRpcResponse just logs.
+    fn requestExtImagesOption(self: *Core) !void {
+        if (!self.ext_images_enabled) return;
+        // Claiming the capability suppresses Neovim's terminal fallback, so a
+        // frontend that wired up neither placement path must not ask for it.
+        if (self.cb.on_image_set == null and self.cb.on_rasterize_image_tile == null) return;
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+
+        try self.sendRequestHeader(&buf, id, "nvim_ui_set_option");
+        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packStr(&buf, self.alloc, "ext_images");
+        try rpc.packBool(&buf, self.alloc, true);
+        try self.sendRaw(buf.items);
+        self.ext_images_msgid = id;
+
+        self.log.write("rpc send: nvim_ui_set_option ext_images (id={d})\n", .{id});
+    }
+
     pub fn requestUiAttach(self: *Core, rows: u32, cols: u32) !void {
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
@@ -4538,6 +4755,7 @@ pub const Core = struct {
         try self.packUiAttachParams(&buf, rows, cols);
 
         try self.sendRaw(buf.items);
+        try self.requestExtImagesOption();
 
         self.log.write("rpc send: nvim_ui_attach (notification, rows={d}, cols={d}, ext_cmdline={any}, ext_popupmenu={any}, ext_messages={any}, ext_tabline={any}, ext_windows={any})\n", .{ rows, cols, self.ext_cmdline_enabled, self.ext_popupmenu_enabled, self.ext_messages_enabled, self.ext_tabline_enabled, self.ext_windows_enabled });
     }
@@ -4565,6 +4783,7 @@ pub const Core = struct {
         try self.sendRequestHeader(&buf, id, "nvim_ui_attach");
         try self.packUiAttachParams(&buf, rows, cols);
         try self.sendRaw(buf.items);
+        try self.requestExtImagesOption();
         return id;
     }
 
@@ -7337,4 +7556,60 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
 
     try std.testing.expect(!core.collectAtlasGarbage());
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}
+
+fn putTestImageTile(core: *Core, uv_y: f32) !void {
+    try core.image_tiles.put(core.alloc, .{ .id = 7, .row = 0, .col = 0, .px_w = 12, .px_h = 1 }, .{
+        .uv_min = .{ 0, uv_y },
+        .uv_max = .{ 1, uv_y },
+        .bbox_origin_px = .{ 0, 0 },
+        .bbox_size_px = .{ 12, 1 },
+        .advance_px = 12,
+        .ascent_px = 0,
+        .descent_px = 0,
+        .bytes_per_pixel = 4,
+    });
+}
+
+/// Middle of the first shelf, as a v coordinate.
+fn firstShelfUvY(core: *Core) f32 {
+    const packer = &(core.atlas_packer.?);
+    const y: f32 = @floatFromInt(packer.shelves[0].y);
+    return (y + 0.5) / @as(f32, @floatFromInt(packer.height));
+}
+
+test "atlas reclamation drops image tiles from recycled shelves" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+    try putTestImageTile(&core, firstShelfUvY(&core));
+
+    // Nothing on screen references the atlas, so every shelf is reclaimed. A
+    // surviving tile entry would be a permanent cache hit onto space that now
+    // holds someone else's glyphs.
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expectEqual(@as(usize, 0), core.image_tiles.count());
+}
+
+test "atlas reclamation keeps image tiles whose shelf is still on screen" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try initCoreForAtlasGcTest(&core, 4);
+    const uv_y = firstShelfUvY(&core);
+    try putTestImageTile(&core, uv_y);
+
+    // One on-screen quad sampling that shelf keeps it live.
+    try core.scroll_cache.items[0].append(core.alloc, .{
+        .position = .{ 0, 0 },
+        .texCoord = .{ 0, uv_y },
+        .color = .{ 1, 1, 1, 1 },
+        .grid_id = 1,
+        .deco_flags = 0,
+        .deco_phase = 0,
+    });
+
+    _ = core.collectAtlasGarbage();
+    try std.testing.expectEqual(@as(usize, 1), core.image_tiles.count());
 }

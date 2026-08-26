@@ -328,6 +328,9 @@ fn noopSetTitle(_: *NoopCtx, _: []const u8) anyerror!void {}
 fn noopDefaultColors(_: *NoopCtx, _: u32, _: u32) anyerror!void {}
 fn noopRestart(_: *NoopCtx, _: []const u8) anyerror!void {}
 fn noopConnect(_: *NoopCtx, _: []const u8) anyerror!void {}
+fn noopImageData(_: *NoopCtx, _: i64, _: []const u8) anyerror!void {}
+fn noopImageSet(_: *NoopCtx, _: i64, _: bool, _: i32, _: i32, _: i32, _: i32, _: i32) anyerror!void {}
+fn noopImageDel(_: *NoopCtx, _: i64) anyerror!void {}
 
 fn runOldFull(
     arena: std.mem.Allocator,
@@ -361,6 +364,9 @@ fn runOldFull(
         noopDefaultColors,
         noopRestart,
         noopConnect,
+        noopImageData,
+        noopImageSet,
+        noopImageDel,
     );
 }
 
@@ -400,6 +406,9 @@ fn runNewFull(
         noopDefaultColors,
         noopRestart,
         noopConnect,
+        noopImageData,
+        noopImageSet,
+        noopImageDel,
     );
 }
 

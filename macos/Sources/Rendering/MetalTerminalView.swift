@@ -4,6 +4,7 @@ import MetalKit
 
 final class MetalTerminalView: MTKView {
     var renderer: MetalTerminalRenderer!
+    private let imageOverlay = ExtImageOverlayView()
 
     /// Expose drawable size without requiring MetalKit import at call site.
     var currentDrawableSize: CGSize { drawableSize }
@@ -769,11 +770,17 @@ final class MetalTerminalView: MTKView {
         renderer = newRenderer
         delegate = renderer
 
+        imageOverlay.frame = bounds
+        imageOverlay.autoresizingMask = [.width, .height]
+        imageOverlay.clipsToBounds = true
+        addSubview(imageOverlay)
+
         renderer.onCellMetricsChanged = { [weak self] (newCellW: Float, newCellH: Float) in
             guard let self else { return }
             self.maybeResizeCoreGrid()
             // Resize external windows to match new cell metrics
             self.core?.resizeExternalWindows(cellWidthPx: CGFloat(newCellW), cellHeightPx: CGFloat(newCellH))
+            self.imageOverlay.updateCellMetrics(widthPx: CGFloat(newCellW), heightPx: CGFloat(newCellH), scale: self.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
             // Do not request redraw here; Neovim will redraw on the next "flush" after resize.
         }
 
@@ -1093,6 +1100,15 @@ final class MetalTerminalView: MTKView {
         ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
         layoutScrollbar()
+        if let renderer {
+            imageOverlay.updateCellMetrics(widthPx: CGFloat(renderer.cellWidthPx), heightPx: CGFloat(renderer.cellHeightPx), scale: window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
+        }
+    }
+
+    /// Repaint the ext_images direct-placement overlay. Main thread only.
+    func imageOverlayNeedsDisplay() {
+        imageOverlay.store = core?.imageStore
+        imageOverlay.needsDisplay = true
     }
 
     private func layoutScrollbar() {
@@ -3585,6 +3601,65 @@ final class MetalTerminalView: MTKView {
         let maxOffsetPx = safeCellHeightPx * cells
         guard maxOffsetPx > 0 else { return 0 }
         return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
+    }
+}
+
+/// AppKit overlay for Neovim's experimental ext_images DIRECT placements: an
+/// image pinned to cells of the global layout, not anchored to any buffer.
+///
+/// Virtual placements do not come through here — the core renders those as
+/// atlas-backed quads at their U+10EEEE placeholder cells, so they scroll and
+/// clip with the text they belong to.
+private final class ExtImageOverlayView: NSView {
+    /// Shared image state, written by the core thread. Read only on main.
+    weak var store: ExtImageStore?
+    private var cellWidth: CGFloat = 1
+    private var cellHeight: CGFloat = 1
+    private var backingScale: CGFloat = 1
+
+    override var isFlipped: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    func updateCellMetrics(widthPx: CGFloat, heightPx: CGFloat, scale: CGFloat) {
+        let safeScale = max(1, scale)
+        backingScale = safeScale
+        cellWidth = max(1, widthPx / safeScale)
+        cellHeight = max(1, heightPx / safeScale)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let store, let ctx = NSGraphicsContext.current?.cgContext else { return }
+        for entry in store.directPlacementsInDrawOrder() {
+            let placement = entry.placement
+            guard placement.row >= 0, placement.col >= 0 else { continue }
+            // An omitted extent means "derive it from the intrinsic image
+            // size" (:help ui-images). The image is measured in device pixels
+            // while this view draws in points, and the result is a cell extent,
+            // so round up to whole cells the way an explicit extent already is.
+            let width = placement.width > 0
+                ? CGFloat(placement.width) * cellWidth
+                : (CGFloat(entry.image.width) / backingScale / cellWidth).rounded(.up) * cellWidth
+            let height = placement.height > 0
+                ? CGFloat(placement.height) * cellHeight
+                : (CGFloat(entry.image.height) / backingScale / cellHeight).rounded(.up) * cellHeight
+            let rect = NSRect(
+                x: CGFloat(placement.col) * cellWidth,
+                y: CGFloat(placement.row) * cellHeight,
+                width: width,
+                height: height
+            )
+            // The view is flipped, so draw through a flipped CTM to keep the
+            // image upright.
+            ctx.saveGState()
+            ctx.translateBy(x: 0, y: rect.maxY + rect.minY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.interpolationQuality = .high
+            ctx.draw(entry.image, in: rect)
+            ctx.restoreGState()
+        }
     }
 }
 

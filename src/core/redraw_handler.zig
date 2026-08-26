@@ -68,6 +68,9 @@ pub const RedrawEvent = enum {
     set_title,
     restart,
     connect,
+    img_data,
+    img_set,
+    img_del,
     flush,
 };
 
@@ -1003,6 +1006,9 @@ pub fn handleRedrawStream(
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
+    image_data_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64, data: []const u8) anyerror!void,
+    image_set_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64, virtual_placement: bool, row: i32, col: i32, width: i32, height: i32, zindex: i32) anyerror!void,
+    image_del_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64) anyerror!void,
 ) !void {
     const redraw_epoch = grid.beginRedrawBatch();
     std.debug.assert(grid.redraw_epoch_override == null);
@@ -1069,6 +1075,9 @@ pub fn handleRedrawStream(
             default_colors_fn,
             restart_fn,
             connect_fn,
+            image_data_fn,
+            image_set_fn,
+            image_del_fn,
         ) catch |re| {
             log.write("redraw dispatch err: {any}\n", .{re});
             const remaining = n_events - ei - 1;
@@ -1098,6 +1107,9 @@ pub fn handleRedraw(
     default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
     restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
     connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
+    image_data_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64, data: []const u8) anyerror!void,
+    image_set_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64, virtual_placement: bool, row: i32, col: i32, width: i32, height: i32, zindex: i32) anyerror!void,
+    image_del_fn: *const fn (ctx: @TypeOf(flush_ctx), id: i64) anyerror!void,
 ) !void {
     const redraw_epoch = grid.redraw_epoch_override orelse grid.beginRedrawBatch();
 
@@ -2730,6 +2742,48 @@ pub fn handleRedraw(
                         if (log.cb != null) log.write("connect: server_addr={s}\n", .{server_addr});
                         try fn_ptr(opt_ctx, server_addr);
                     }
+                }
+            },
+            .img_data => {
+                // img_data: [id, raw_png, opts]. The payload belongs to this
+                // redraw arena, so the frontend must copy it synchronously.
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2 or t[0] != .int or t[1] != .str) continue;
+                    // opts is documented as reserved, and is where the PR author
+                    // intends chunked transfer to land. Say so the first time it
+                    // appears rather than silently treating one chunk as a whole
+                    // image.
+                    if (t.len >= 3 and t[2] == .map and t[2].map.len != 0) {
+                        log.write("img_data: unhandled opts ({d} keys) — protocol moved on\n", .{t[2].map.len});
+                    }
+                    try image_data_fn(flush_ctx, t[0].int, t[1].str);
+                }
+            },
+            .img_set => {
+                // img_set: [id, {virtual?, row?, col?, width?, height?, zindex?}]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 2 or t[0] != .int or t[1] != .map) continue;
+                    const opts = t[1].map;
+                    const virtual_placement = mapGetBool(opts, "virtual") orelse false;
+                    const row = std.math.cast(i32, mapGetInt(opts, "row") orelse -1) orelse -1;
+                    const col = std.math.cast(i32, mapGetInt(opts, "col") orelse -1) orelse -1;
+                    const width = std.math.cast(i32, mapGetInt(opts, "width") orelse -1) orelse -1;
+                    const height = std.math.cast(i32, mapGetInt(opts, "height") orelse -1) orelse -1;
+                    const zindex = std.math.cast(i32, mapGetInt(opts, "zindex") orelse 0) orelse 0;
+                    try image_set_fn(flush_ctx, t[0].int, virtual_placement, row, col, width, height, zindex);
+                }
+            },
+            .img_del => {
+                // img_del: [id]
+                for (tuples) |tv| {
+                    if (tv != .arr) continue;
+                    const t = tv.arr;
+                    if (t.len < 1 or t[0] != .int) continue;
+                    try image_del_fn(flush_ctx, t[0].int);
                 }
             },
             .flush => {

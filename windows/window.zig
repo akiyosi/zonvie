@@ -1517,6 +1517,13 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
+        // ext_images: data + virtual-placement tiles. on_image_set stays
+        // unwired until direct placements get a Windows renderer path; the
+        // core still tracks virtual placements itself, and wiring the tile
+        // rasterizer is what lets the core claim the capability.
+        .on_image_data = callbacks.onImageData,
+        .on_image_del = callbacks.onImageDel,
+        .on_rasterize_image_tile = callbacks.onRasterizeImageTile,
         .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
     };

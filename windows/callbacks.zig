@@ -2457,6 +2457,56 @@ pub fn onRasterizeGlyph(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bit
     return 0;
 }
 
+/// ctx -> *App with the same alignment sanity check every core callback does.
+fn appFromCtx(ctx: ?*anyopaque) ?*App {
+    const ctxp = ctx orelse return null;
+    const ctx_bits: usize = @intFromPtr(ctxp);
+    if (ctx_bits % @alignOf(App) != 0) return null;
+    return @ptrFromInt(ctx_bits);
+}
+
+// =========================================================================
+// ext_images (experimental): image data + virtual-placement tiles.
+// All three run on the core callback thread; the store is single-threaded.
+// =========================================================================
+
+pub fn onImageData(ctx: ?*anyopaque, id: i64, data: [*]const u8, data_len: usize) callconv(.c) void {
+    const app = appFromCtx(ctx) orelse return;
+    // The payload lives in the redraw arena and dies when this returns;
+    // decode now, exactly like the macOS store.
+    app.ext_images.setImage(app.alloc, id, data[0..data_len]);
+}
+
+pub fn onImageDel(ctx: ?*anyopaque, id: i64) callconv(.c) void {
+    const app = appFromCtx(ctx) orelse return;
+    app.ext_images.remove(app.alloc, id);
+}
+
+pub fn onRasterizeImageTile(
+    ctx: ?*anyopaque,
+    id: i64,
+    tile_row: u16,
+    tile_col: u16,
+    tile_rows: u16,
+    tile_cols: u16,
+    px_w: u32,
+    px_h: u32,
+    out_bitmap: *app_mod.GlyphBitmap,
+) callconv(.c) c_int {
+    const app = appFromCtx(ctx) orelse return 0;
+    return if (app.ext_images.rasterizeTile(
+        app.alloc,
+        id,
+        tile_row,
+        tile_col,
+        tile_rows,
+        tile_cols,
+        px_w,
+        px_h,
+        out_bitmap,
+    )) 1 else 0;
+}
+
 pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const app_mod.GlyphBitmap) callconv(.c) void {
     const ctxp = ctx orelse return;
     const ctx_bits: usize = @intFromPtr(ctxp);
@@ -3054,7 +3104,10 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 // =========================================================================
 
 pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
+    // Images belong to the session that transmitted them; Neovim never
+    // retransmits, so the new session must not inherit them (the core clears
+    // its own half in resetProtocolState).
+    if (appFromCtx(ctx)) |app| app.ext_images.reset(app.alloc);
     if (!applog.isEnabled()) return;
     if (addr_ptr) |p| {
         applog.appLog("[win] on_restart: reconnecting to listen_addr={s}\n", .{p[0..addr_len]});
@@ -3068,7 +3121,7 @@ pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) call
 /// keeps running headless instead of dying. The core handles the actual
 /// hot-swap; this callback is informational only.
 pub fn onConnect(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
+    if (appFromCtx(ctx)) |app| app.ext_images.reset(app.alloc); // see onRestart
     if (!applog.isEnabled()) return;
     if (addr_ptr) |p| {
         applog.appLog("[win] on_connect: hot-swap to server_addr={s}\n", .{p[0..addr_len]});

@@ -12,6 +12,7 @@ pub const applog = @import("app_log.zig");
 const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
+pub const ext_images_mod = @import("ext_images.zig");
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
@@ -3505,6 +3506,10 @@ pub const App = struct {
     // Atlas builder (DirectWrite + CPU atlas, metrics)
     atlas: ?dwrite_d2d.Renderer = null,
 
+    // ext_images: decoded PNGs + virtual-placement tile rasterization.
+    // Core callback thread only (see ext_images.zig).
+    ext_images: ext_images_mod.Store = .{},
+
     // Early atlas from doEarlyCoreInit (reused in WM_APP_DEFERRED_INIT for native mode)
     early_atlas: ?dwrite_d2d.Renderer = null,
 
@@ -4389,6 +4394,7 @@ pub const App = struct {
                 if (rel) |f| _ = f(p);
             }
         }
+        self.ext_images.deinit(self.alloc);
         self.surface.deinitCpuState(self.alloc);
 
         // Triple-buffered surface cleanup (handles slot release + pool deinit)
