@@ -16,7 +16,6 @@ pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const msgpack = @import("msgpack.zig");
-pub const mpack_stream = @import("mpack_stream.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
 pub const highlight = @import("highlight.zig");

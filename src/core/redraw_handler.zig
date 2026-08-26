@@ -1,6 +1,5 @@
 const std = @import("std");
 const mp = @import("msgpack.zig");
-const mps = @import("mpack_stream.zig");
 const grid_mod = @import("grid.zig");
 const Grid = grid_mod.Grid;
 const ModeInfo = grid_mod.ModeInfo;
@@ -77,8 +76,7 @@ fn parseExtHandle(ext: mp.Ext) i64 {
     // Neovim encodes window/tab/buffer handles as MessagePack EXT with the
     // payload itself a nested MessagePack integer (e.g. handle 128 is the
     // 2-byte payload \xcc\x80: uint8 tag + value 128) — NOT a raw
-    // big-endian integer. Ported from mpack_stream.zig's parseExtHandle,
-    // the reference-correct implementation for the streaming decoder.
+    // big-endian integer.
     // This path is normally unreachable in practice: mp.decode's own `ext`
     // branch already pre-unwraps well-formed integer payloads into `.int`
     // before this function ever sees a `.ext` Value, so this only runs on
@@ -628,57 +626,6 @@ fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Streaming helpers — used by handleRedrawStream / streamGridLine for the
-// zero-copy redraw path. These are defined here rather than in
-// `mpack_stream.zig` to keep the streaming decoder module decoupled from
-// handler-specific "skip malformed tuple" tolerance semantics. The helpers
-// are intentionally tolerant of type mismatches (they skip the value and
-// return `null`), matching the existing Value-tree path's per-tuple
-// `continue` behaviour so that parity tests can assert bit-identical grid
-// state after both code paths consume the same byte sequence.
-// ---------------------------------------------------------------------------
-
-/// Advance `in` past the payload of a `ValueHead` that was already consumed
-/// via `readHead`. For scalars this is a no-op; for Str/Bin/Ext it skips
-/// the payload bytes; for Array/Map it recursively skips nested items.
-fn skipHeadPayload(in: *mps.InnerDecoder, head: mps.ValueHead) mps.MpackError!void {
-    const sz = head.itemSize();
-    if (sz.bytes > 0) {
-        if (in.data.len < sz.bytes) return error.EOFError;
-        in.data = in.data[@intCast(sz.bytes)..];
-    }
-    if (sz.items > 0) try in.skipAny(sz.items);
-}
-
-/// Read one value. If it's an `Int`, or a `UInt` that fits in `i64`,
-/// return the value. Otherwise skip its payload and return `null`.
-/// `EOFError` propagates to the caller.
-fn readIntOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?i64 {
-    const head = try in.readHead();
-    return switch (head) {
-        .Int => |v| v,
-        .UInt => |v| if (v > std.math.maxInt(i64)) null else @intCast(v),
-        else => blk: {
-            try skipHeadPayload(in, head);
-            break :blk null;
-        },
-    };
-}
-
-/// Read one value. If it's an `Array`, return its element count.
-/// Otherwise skip its payload and return `null`.
-fn readArrayLenOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?u32 {
-    const head = try in.readHead();
-    return switch (head) {
-        .Array => |n| n,
-        else => blk: {
-            try skipHeadPayload(in, head);
-            break :blk null;
-        },
-    };
-}
-
 /// Bound one grid_line cell tuple to the destination row. This is applied
 /// even when `repeat` was omitted or malformed (defaulting to one), so a
 /// hostile starting column can neither wrap u32 nor turn no-op writes beyond
@@ -712,6 +659,385 @@ test "grid_line repeat clamp handles untrusted u32 bounds" {
     try std.testing.expectEqual(@as(u32, 0), clampGridLineRepeat(std.math.maxInt(u32), 4, std.math.maxInt(u32)));
 }
 
+// ---------------------------------------------------------------------------
+// grid_line semantics
+//
+// These drive the real `handleRedraw` with hand-built event trees and assert
+// the resulting grid state. They replace the parity suite that used to pin
+// this behaviour by diffing two decoder implementations against each other:
+// once the streaming decoder was removed there was no second implementation
+// left to compare against, and the per-cell rules below — sticky hl, the
+// `-1` left-inherit, `repeat == 0` writing nothing — are subtle enough that
+// they need pinning on their own terms rather than by mutual agreement.
+// ---------------------------------------------------------------------------
+
+/// One `grid_line` cell: `[text]`, `[text, hl]` or `[text, hl, repeat]`.
+/// `hl`/`repeat` of null omit that field, which is how Neovim asks for
+/// "keep the previous hl" and "write once".
+fn testCell(arena: std.mem.Allocator, text: []const u8, hl: ?i64, repeat: ?i64) !mp.Value {
+    // `repeat` occupies field 2, so asking for it without an `hl` still has to
+    // put something in field 1. Neovim itself never sends that shape; a nil
+    // there keeps the array well-formed rather than leaving it uninitialised.
+    const n: usize = if (repeat != null) 3 else if (hl != null) 2 else 1;
+    const fields = try arena.alloc(mp.Value, n);
+    fields[0] = .{ .str = text };
+    if (n >= 2) fields[1] = if (hl) |h| .{ .int = h } else .nil;
+    if (repeat) |r| fields[2] = .{ .int = r };
+    return .{ .arr = fields };
+}
+
+/// One `grid_line` tuple, built with all five fields Neovim actually sends
+/// (`[grid, row, col_start, cells, wrap]`). A four-field tuple is silently
+/// discarded by the `t.len < 5` guard, so building one by accident would make
+/// a test assert against a grid nothing was ever written to.
+fn testGridLineTuple(
+    arena: std.mem.Allocator,
+    grid_id: i64,
+    row: i64,
+    col: i64,
+    cells: []const mp.Value,
+) !mp.Value {
+    const cells_copy = try arena.dupe(mp.Value, cells);
+    const tuple = try arena.alloc(mp.Value, 5);
+    tuple[0] = .{ .int = grid_id };
+    tuple[1] = .{ .int = row };
+    tuple[2] = .{ .int = col };
+    tuple[3] = .{ .arr = cells_copy };
+    tuple[4] = .{ .bool = false }; // wrap
+    return .{ .arr = tuple };
+}
+
+/// A `grid_line` event carrying the given tuples, in order.
+fn testGridLineEventOf(arena: std.mem.Allocator, tuples: []const mp.Value) !mp.Value {
+    const ev = try arena.alloc(mp.Value, 1 + tuples.len);
+    ev[0] = .{ .str = "grid_line" };
+    for (tuples, 0..) |t, i| ev[1 + i] = t;
+    return .{ .arr = ev };
+}
+
+/// The common case: one `grid_line` event carrying one tuple.
+fn testGridLineEvent(
+    arena: std.mem.Allocator,
+    grid_id: i64,
+    row: i64,
+    col: i64,
+    cells: []const mp.Value,
+) !mp.Value {
+    const t = try testGridLineTuple(arena, grid_id, row, col, cells);
+    return testGridLineEventOf(arena, &[_]mp.Value{t});
+}
+
+fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, events: []mp.Value) !void {
+    var log = Logger{};
+    const noop = struct {
+        fn preFlush(_: *u8) anyerror!void {}
+        fn flush(_: *u8, _: u32, _: u32) anyerror!void {}
+        fn guifont(_: *u8, _: []const u8) anyerror!void {}
+        fn linespace(_: *u8, _: i32) anyerror!void {}
+    };
+    var ctx: u8 = 0;
+    try handleRedraw(
+        grid,
+        hl,
+        arena,
+        events,
+        &log,
+        &ctx,
+        noop.preFlush,
+        noop.flush,
+        &ctx,
+        noop.guifont,
+        &ctx,
+        noop.linespace,
+        null,
+        null,
+        null,
+        null,
+    );
+}
+
+test "grid_line keeps hl sticky across cells and inherits leftwards on -1" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 8); // rows, cols
+
+    const cells = [_]mp.Value{
+        // hl 5 is given once and must stick to the next cell, which omits it.
+        try testCell(arena, "a", 5, null),
+        try testCell(arena, "b", null, null),
+        // -1 past column 0 inherits whatever the left neighbour resolved to.
+        try testCell(arena, "c", -1, null),
+        // A fresh id ends the inheritance.
+        try testCell(arena, "d", 9, null),
+    };
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 'a'), grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 5), grid.getCellHL(0, 0));
+    try std.testing.expectEqual(@as(u32, 5), grid.getCellHL(0, 1)); // sticky
+    try std.testing.expectEqual(@as(u32, 5), grid.getCellHL(0, 2)); // inherited
+    try std.testing.expectEqual(@as(u32, 9), grid.getCellHL(0, 3));
+}
+
+test "grid_line -1 at column 0 falls back to the default highlight" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // There is no left neighbour to inherit from, so this must resolve to 0
+    // rather than reading the cell at col - 1 and underflowing.
+    const cells = [_]mp.Value{try testCell(arena, "x", -1, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 'x'), grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 0), grid.getCellHL(0, 0));
+}
+
+test "grid_line repeat writes that many cells and zero writes none" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 8);
+
+    const cells = [_]mp.Value{
+        try testCell(arena, "-", 3, 3), // columns 0..2
+        // repeat 0 must write NOTHING and must not advance the column, so the
+        // next cell lands on column 3. Treating it as 1 would shift the rest
+        // of the row right by one.
+        try testCell(arena, "Z", 4, 0),
+        try testCell(arena, "e", 7, null), // column 3
+    };
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    for (0..3) |c| {
+        try std.testing.expectEqual(@as(u32, '-'), grid.getCell(0, @intCast(c)).cp);
+        try std.testing.expectEqual(@as(u32, 3), grid.getCellHL(0, @intCast(c)));
+    }
+    try std.testing.expectEqual(@as(u32, 'e'), grid.getCell(0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 7), grid.getCellHL(0, 3));
+}
+
+test "grid_line clamps a repeat that would run past the last column" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // A hostile repeat must stop at the row edge instead of wrapping the
+    // column counter or looping billions of times.
+    const cells = [_]mp.Value{try testCell(arena, "#", 2, std.math.maxInt(u32))};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 1, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, ' '), grid.getCell(0, 0).cp); // untouched
+    for (1..4) |c| {
+        try std.testing.expectEqual(@as(u32, '#'), grid.getCell(0, @intCast(c)).cp);
+    }
+}
+
+test "grid_line keeps a multi-codepoint cluster addressable from its base cell" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // U+26A0 U+FE0F — the variation selector must reach the overflow map
+    // rather than being dropped or occupying a cell of its own.
+    const cells = [_]mp.Value{try testCell(arena, "\u{26A0}\u{FE0F}", 1, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 0x26A0), grid.getCell(0, 0).cp);
+    const extras = grid.getOverflow(1, 0, 0);
+    try std.testing.expect(extras != null);
+    try std.testing.expectEqual(@as(usize, 1), extras.?.len);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), extras.?[0]);
+}
+
+test "grid_line ignores a tuple that is missing the wrap field" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // Four-field tuples are discarded by the `t.len < 5` guard. This is
+    // pinned deliberately: a benchmark once built its payload this way and
+    // silently measured a decode path that never wrote a single cell.
+    const cell = try testCell(arena, "q", 1, null);
+    const cells_copy = try arena.dupe(mp.Value, &[_]mp.Value{cell});
+    const short = try arena.alloc(mp.Value, 4);
+    short[0] = .{ .int = 1 };
+    short[1] = .{ .int = 0 };
+    short[2] = .{ .int = 0 };
+    short[3] = .{ .arr = cells_copy };
+
+    // A well-formed tuple rides along so the assertion below distinguishes
+    // "the short tuple was dropped" from "the event was never processed".
+    const good_cells = [_]mp.Value{try testCell(arena, "r", 2, null)};
+    const good = try testGridLineTuple(arena, 1, 0, 1, &good_cells);
+
+    var events = [_]mp.Value{try testGridLineEventOf(arena, &[_]mp.Value{ .{ .arr = short }, good })};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, ' '), grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 'r'), grid.getCell(0, 1).cp);
+}
+
+test "grid_line maps an hl_id beyond u32 to the default highlight" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // The hl table is u32-keyed. A raw @intCast of an out-of-range id would
+    // panic the redraw thread, so it has to fall back to the default style.
+    const cells = [_]mp.Value{try testCell(arena, "x", @as(i64, 1) << 32, null)};
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 'x'), grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 0), grid.getCellHL(0, 0));
+}
+
+test "grid_line drops a tuple whose col_start is out of range" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // Both the omitted-repeat and explicit-repeat shapes must be rejected by
+    // the clamp rather than wrapping the column counter.
+    const plain = [_]mp.Value{try testCell(arena, "a", 1, null)};
+    const huge = [_]mp.Value{try testCell(arena, "b", 1, std.math.maxInt(u32))};
+    var events = [_]mp.Value{
+        try testGridLineEvent(arena, 1, 0, std.math.maxInt(u32), &plain),
+        try testGridLineEvent(arena, 1, 0, std.math.maxInt(u32), &huge),
+    };
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    for (0..4) |c| {
+        try std.testing.expectEqual(@as(u32, ' '), grid.getCell(0, @intCast(c)).cp);
+        try std.testing.expectEqual(@as(u32, 0), grid.getCellHL(0, @intCast(c)));
+    }
+}
+
+test "grid_line writes an oversized cluster as one replacement glyph" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // 17 codepoints exceed the 16-slot cluster buffer. The cell collapses to
+    // U+FFFD with no overflow entry, and must not consume extra columns.
+    const cells = [_]mp.Value{
+        try testCell(arena, "abcdefghijklmnopq", 1, null),
+        try testCell(arena, "x", 1, null),
+    };
+    var events = [_]mp.Value{try testGridLineEvent(arena, 1, 0, 0, &cells)};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 0xFFFD), grid.getCell(0, 0).cp);
+    try std.testing.expect(grid.getOverflow(1, 0, 0) == null);
+    try std.testing.expectEqual(@as(u32, 'x'), grid.getCell(0, 1).cp);
+}
+
+test "grid_line skips a malformed tuple but keeps the rest of the event" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(1, 4);
+
+    // A tuple that is not an array at all must cost only itself. Aborting the
+    // whole batch here would leave the grid half-applied relative to Neovim.
+    const cells = [_]mp.Value{try testCell(arena, "a", 1, null)};
+    const good = try testGridLineTuple(arena, 1, 0, 0, &cells);
+    var events = [_]mp.Value{try testGridLineEventOf(arena, &[_]mp.Value{ .{ .bool = false }, good })};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 'a'), grid.getCell(0, 0).cp);
+}
+
+test "grid_line starts each tuple with a fresh highlight state" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 4);
+
+    // hl is sticky *within* a tuple only. A second tuple that omits hl must
+    // start from the default, not inherit 5 from the tuple before it.
+    const first = [_]mp.Value{try testCell(arena, "a", 5, null)};
+    const second = [_]mp.Value{try testCell(arena, "b", null, null)};
+    var events = [_]mp.Value{try testGridLineEventOf(arena, &[_]mp.Value{
+        try testGridLineTuple(arena, 1, 0, 0, &first),
+        try testGridLineTuple(arena, 1, 1, 0, &second),
+    })};
+    try runRedrawEvents(&grid, &hl, arena, &events);
+
+    try std.testing.expectEqual(@as(u32, 5), grid.getCellHL(0, 0));
+    try std.testing.expectEqual(@as(u32, 'b'), grid.getCell(1, 0).cp);
+    try std.testing.expectEqual(@as(u32, 0), grid.getCellHL(1, 0));
+}
+
 test "cell cluster extraction rejects rather than truncates codepoint 17" {
     var buf: [16]u32 = undefined;
     try std.testing.expectEqual(@as(u32, 16), try extractAllCodepoints("abcdefghijklmnop", &buf));
@@ -720,362 +1046,6 @@ test "cell cluster extraction rejects rather than truncates codepoint 17" {
     try std.testing.expect(wire_result.replaced_oversized);
     try std.testing.expectEqual(@as(u32, 1), wire_result.count);
     try std.testing.expectEqual(@as(u32, 0xFFFD), buf[0]);
-}
-
-/// Read one value as a `Str` or `Bin`, returning a zero-copy slice into
-/// the caller's input buffer. Non-string types are skipped and `null`
-/// is returned.
-fn readStrOrSkipped(in: *mps.InnerDecoder) mps.MpackError!?[]const u8 {
-    const head = try in.readHead();
-    return switch (head) {
-        .Str, .Bin => |n| blk: {
-            if (in.data.len < n) return error.EOFError;
-            const s = in.data[0..n];
-            in.data = in.data[n..];
-            break :blk s;
-        },
-        else => blk: {
-            try skipHeadPayload(in, head);
-            break :blk null;
-        },
-    };
-}
-
-/// Streaming `grid_line` handler. Consumes `n_tuples` tuples from `in`
-/// without materialising any `Value` tree, writing cells directly into
-/// `grid`. The caller is `handleRedrawStream`; `in` must be positioned
-/// immediately after the `["grid_line", ...]` event-array header has
-/// been consumed (i.e., the next value in the stream is the first tuple
-/// of the event).
-///
-/// Parity guarantees vs. the existing Value-tree `.grid_line` branch of
-/// `handleRedraw`:
-///   * tuples with `t.len < 5` are skipped (`continue`-equivalent);
-///   * non-int `grid_id`/`row`/`col` or non-array cells field aborts the
-///     current tuple and moves on;
-///   * non-array or empty cells within the array are skipped;
-///   * non-str cell text aborts that cell;
-///   * non-int `hl_id` is ignored (hl_state unchanged), non-int `repeat`
-///     is ignored (repeat stays 1) — matching the old code's
-///     `c[1] == .int` / `c[2] == .int` gating;
-///   * `hl_state` is sticky within the event, `hl_state == -1` inherits
-///     from the left cell except at col 0, `repeat <= 0` writes nothing;
-///   * multi-codepoint cells populate the overflow map and force-mark
-///     dirty on overflow change.
-///
-/// Logging differs from the Value-tree path by design: the per-tuple
-/// `logValue()` pretty-print would require materialisation that defeats
-/// the whole purpose of this function, so only the summary "ui_ev
-/// grid_line tuples={N}" line is emitted. Grid/hl/dirty side effects
-/// match bit-for-bit.
-fn streamGridLine(
-    grid: *Grid,
-    in: *mps.InnerDecoder,
-    n_tuples: u32,
-    log: *Logger,
-    redraw_epoch: u64,
-) !void {
-    if (log.cb != null) log.write("ui_ev grid_line tuples={d}\n", .{n_tuples});
-
-    var ti: u32 = 0;
-    tuples: while (ti < n_tuples) : (ti += 1) {
-        const t_n = try in.expectArray();
-        if (t_n < 5) {
-            try in.skipAny(t_n);
-            continue;
-        }
-
-        var t_consumed: u32 = 0;
-
-        // Field 0: grid_id.
-        const grid_id_opt = try readIntOrSkipped(in);
-        t_consumed = 1;
-        const grid_id = checkedGridId(grid_id_opt orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        }) orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-
-        // Field 1: row.
-        const row_opt = try readIntOrSkipped(in);
-        t_consumed = 2;
-        const row_i = row_opt orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-        // Validate row fits u32 here (before the still-unread `cells` field
-        // is touched) so an out-of-range value can bail via the same
-        // "skip remaining top-level fields" idiom used above — at this
-        // point `cells` has not been read at all yet, so skipping it whole
-        // (along with any trailing fields) is safe and keeps the stream
-        // decoder in sync.
-        const row = checkedU32(row_i) orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-
-        // Field 2: col_start.
-        const col_opt = try readIntOrSkipped(in);
-        t_consumed = 3;
-        const col_i = col_opt orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-        var col = checkedU32(col_i) orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-
-        // Field 3: cells array header.
-        const cells_n_opt = try readArrayLenOrSkipped(in);
-        t_consumed = 4;
-        const cells_n = cells_n_opt orelse {
-            try in.skipAny(t_n - t_consumed);
-            continue :tuples;
-        };
-
-        if (log.cb != null and grid.input_trace_seq != 0 and
-            grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq)
-        {
-            const now_ns = clock.nowNs();
-            const delta_us: i64 = @intCast(@divTrunc(
-                @max(@as(i128, 0), now_ns - @as(i128, grid.input_trace_sent_ns)),
-                1000,
-            ));
-            log.write("[perf_input] seq={d} stage=grid_line delta_us={d} grid={d} row={d}\n", .{
-                grid.input_trace_seq, delta_us, grid_id, row_i,
-            });
-            grid.input_trace_first_grid_event_logged_seq = grid.input_trace_seq;
-        }
-
-        grid.noteGridLine(grid_id, redraw_epoch);
-
-        // Resolve once per tuple. Besides avoiding a sub-grid hash probe per
-        // cell, this is the trust boundary for hostile col/repeat values.
-        const grid_cols: u32 = if (grid_id == 1)
-            grid.cols
-        else if (grid.sub_grids.get(grid_id)) |sg|
-            sg.cols
-        else
-            0;
-
-        // hl_state persists across cells within this grid_line event.
-        var hl_state: i64 = 0;
-
-        var ci: u32 = 0;
-        cells: while (ci < cells_n) : (ci += 1) {
-            // Cell array header.
-            const c_n_opt = try readArrayLenOrSkipped(in);
-            const c_n = c_n_opt orelse continue :cells;
-            if (c_n < 1) {
-                try in.skipAny(c_n);
-                continue :cells;
-            }
-
-            // Field 0: text (str/bin required). Non-string → skip this cell.
-            const text_opt = try readStrOrSkipped(in);
-            var c_consumed: u32 = 1;
-            const text = text_opt orelse {
-                try in.skipAny(c_n - c_consumed);
-                continue :cells;
-            };
-
-            var cp_buf: [16]u32 = undefined;
-            const extracted = extractCellCodepoints(text, &cp_buf);
-            const cp_count = extracted.count;
-            if (extracted.replaced_oversized) {
-                log.write("[redraw] oversized grid_line cluster grid={d} row={d} col={d} bytes={d}; using U+FFFD\n", .{
-                    grid_id, row, col, text.len,
-                });
-            }
-            const cp = cp_buf[0];
-            const has_overflow = cp_count > 1;
-
-            // Field 1: hl_id (optional). Non-int ignored, hl_state unchanged.
-            if (c_n >= 2) {
-                if (try readIntOrSkipped(in)) |v| hl_state = v;
-                c_consumed = 2;
-            }
-
-            // Field 2: repeat (optional). Non-int ignored, stays 1. 0/neg → skip cell.
-            var repeat: u32 = 1;
-            var skip_cell = false;
-            if (c_n >= 3) {
-                if (try readIntOrSkipped(in)) |r64| {
-                    if (r64 <= 0) {
-                        skip_cell = true;
-                    } else if (checkedU32(r64)) |r32| {
-                        repeat = r32;
-                    } else {
-                        skip_cell = true;
-                    }
-                }
-                c_consumed = 3;
-            }
-
-            // Forward-compat: skip any extra fields Neovim may add later.
-            if (c_n > c_consumed) try in.skipAny(c_n - c_consumed);
-
-            if (skip_cell) continue :cells;
-            repeat = clampGridLineRepeat(col, grid_cols, repeat);
-            if (repeat == 0) continue :cells;
-
-            // Write `repeat` copies of the cell starting at `col`.
-            var i: u32 = 0;
-            while (i < repeat) : (i += 1) {
-                var hl_to_use: u32 = 0;
-                if (hl_state != -1 or col == 0) {
-                    if (hl_state >= 0) {
-                        // Match the Value-tree path: hostile hl_ids outside
-                        // the u32-keyed highlight table use the default style
-                        // instead of trapping the redraw thread.
-                        hl_to_use = std.math.cast(u32, hl_state) orelse 0;
-                    } else {
-                        // hl_state == -1 at col 0 → treat as 0.
-                        hl_to_use = 0;
-                    }
-                } else {
-                    // hl_state == -1 and col > 0 → inherit from left neighbour.
-                    hl_to_use = grid.getCellHLGrid(grid_id, row, col - 1);
-                }
-
-                try grid.putCellGridCluster(
-                    grid_id,
-                    row,
-                    col,
-                    cp,
-                    hl_to_use,
-                    if (has_overflow) cp_buf[1..cp_count] else &.{},
-                );
-
-                col += 1;
-            }
-        }
-
-        // Skip remaining outer-tuple fields (field 4 "wrap" and any future extras).
-        try in.skipAny(t_n - t_consumed);
-    }
-}
-
-/// Streaming entry point for "redraw" notifications. Dispatches `grid_line`
-/// events directly via `streamGridLine` (zero Value allocation on the hot
-/// cell loop). Every other event is materialised per-event via
-/// `mp.decodeFromStream` and passed into the existing `handleRedraw` using
-/// a single-event synthetic params array, which lets the 47 non-grid_line
-/// branches be reused verbatim without copying their bodies here.
-///
-/// Arena allocations in the fallback path (`decodeFromStream` per event
-/// plus each event's `synth_ev` / `synth_params` wrappers) accumulate
-/// across every non-grid_line event processed in the current frame: the
-/// arena is reset only by the run loop between RPC frames, not between
-/// events. The peak is therefore bounded by the total non-grid_line
-/// payload in the frame, not by a single event. This is still strictly
-/// smaller than the pre-streaming Value-tree path (which additionally
-/// allocated for every `grid_line` cell), because `streamGridLine`
-/// writes cells directly into `grid` and does not touch the arena.
-///
-/// The caller is responsible for having skip-validated the full events
-/// array before invoking this function, because the non-grid_line events
-/// that fall through to `handleRedraw` invoke side-effectful frontend
-/// callbacks that cannot safely be re-entered mid-frame.
-///
-/// Currently unused in production (`rpc_session` still materialises the
-/// whole frame via `mp.decode`); the function is kept ready for a later
-/// commit that wires it into the RPC run loop behind a redraw-only fast
-/// path.
-pub fn handleRedrawStream(
-    grid: *Grid,
-    hl: *Highlights,
-    arena: std.mem.Allocator,
-    in: *mps.InnerDecoder,
-    n_events: u32,
-    log: *Logger,
-    flush_ctx: anytype,
-    pre_flush_fn: *const fn (ctx: @TypeOf(flush_ctx)) anyerror!void,
-    flush_fn: *const fn (ctx: @TypeOf(flush_ctx), rows: u32, cols: u32) anyerror!void,
-    opt_ctx: anytype,
-    guifont_fn: *const fn (ctx: @TypeOf(opt_ctx), font: []const u8) anyerror!void,
-    linespace_ctx: anytype,
-    linespace_fn: *const fn (ctx: @TypeOf(linespace_ctx), px: i32) anyerror!void,
-    set_title_fn: ?*const fn (ctx: @TypeOf(opt_ctx), title: []const u8) anyerror!void,
-    default_colors_fn: ?*const fn (ctx: @TypeOf(opt_ctx), fg: u32, bg: u32) anyerror!void,
-    restart_fn: ?*const fn (ctx: @TypeOf(opt_ctx), listen_addr: []const u8) anyerror!void,
-    connect_fn: ?*const fn (ctx: @TypeOf(opt_ctx), server_addr: []const u8) anyerror!void,
-) !void {
-    const redraw_epoch = grid.beginRedrawBatch();
-    std.debug.assert(grid.redraw_epoch_override == null);
-    grid.redraw_epoch_override = redraw_epoch;
-    defer grid.redraw_epoch_override = null;
-
-    var ei: u32 = 0;
-    while (ei < n_events) : (ei += 1) {
-        const ev_n = try in.expectArray();
-        if (ev_n < 1) {
-            try in.skipAny(ev_n);
-            continue;
-        }
-
-        // Event name (required). Non-str name → skip the rest of the event.
-        const name_opt = try readStrOrSkipped(in);
-        const name = name_opt orelse {
-            try in.skipAny(ev_n - 1);
-            continue;
-        };
-        const n_tuples = ev_n - 1;
-
-        const tag = std.meta.stringToEnum(RedrawEvent, name) orelse {
-            // Unknown event — forward-compat skip.
-            try in.skipAny(n_tuples);
-            continue;
-        };
-
-        if (tag == .grid_line) {
-            try streamGridLine(grid, in, n_tuples, log, redraw_epoch);
-            continue;
-        }
-
-        // Fallback: materialise this single event into a `Value` tree and
-        // invoke `handleRedraw` with a 1-event synthetic params array.
-        const synth_ev = try arena.alloc(mp.Value, ev_n);
-        synth_ev[0] = .{ .str = try arena.dupe(u8, name) };
-        var ti: u32 = 0;
-        while (ti < n_tuples) : (ti += 1) {
-            synth_ev[1 + ti] = try mp.decodeFromStream(arena, in);
-        }
-
-        const synth_params = try arena.alloc(mp.Value, 1);
-        synth_params[0] = .{ .arr = synth_ev };
-
-        // Keep the stream aligned on dispatch failure, then propagate the
-        // error. A future production caller must poison/recover the UI epoch;
-        // presenting or post-processing this partially-applied batch would
-        // permanently diverge from Neovim's protocol state.
-        handleRedraw(
-            grid,
-            hl,
-            arena,
-            synth_params,
-            log,
-            flush_ctx,
-            pre_flush_fn,
-            flush_fn,
-            opt_ctx,
-            guifont_fn,
-            linespace_ctx,
-            linespace_fn,
-            set_title_fn,
-            default_colors_fn,
-            restart_fn,
-            connect_fn,
-        ) catch |re| {
-            log.write("redraw dispatch err: {any}\n", .{re});
-            const remaining = n_events - ei - 1;
-            in.skipAny(remaining) catch {};
-            return re;
-        };
-    }
 }
 
 /// Supported redraw events:

@@ -68,8 +68,8 @@ pub const PipeReader = struct {
     }
 };
 
-/// Contiguous buffered reader designed to feed `mpack_stream.SkipDecoder`
-/// with zero-copy slices.
+/// Contiguous buffered reader that hands the MessagePack decoder zero-copy
+/// slices of the pending frame.
 ///
 /// Invariants:
 ///   - `buf[pos..end]` is the unconsumed window visible to the decoder
@@ -118,8 +118,8 @@ pub const FrameReader = struct {
     }
 
     /// Commit an advance position expressed as the remaining (uneaten) slice
-    /// of the view — i.e., the `data` field of an `InnerDecoder` / `SkipDecoder`
-    /// after a successful run. `remaining` must be a sub-slice of `view()`.
+    /// of the view, as a decoder that consumes from the front would leave it.
+    /// `remaining` must be a sub-slice of `view()`.
     pub fn consumeTo(self: *FrameReader, remaining: []const u8) void {
         const base_addr = @intFromPtr(self.buf.ptr) + self.pos;
         const rem_addr = @intFromPtr(remaining.ptr);
@@ -2561,11 +2561,14 @@ pub fn runLoop(self: *Core) void {
         // Passed to cleanupSession as `kill_on_restart_pending`.
         var remote_restart_break: bool = false;
 
-        // Inner reader loop — same for both transports. Earlier iterations
-        // experimented with a streaming fast path here; microbenchmarks
-        // showed the Value-tree path was 1.24x–1.94x faster, so the
-        // streaming machinery (mpack_stream / decodeFromStream) is kept
-        // only as a reference implementation.
+        // Inner reader loop — same for both transports. An earlier iteration
+        // experimented with a zero-copy streaming decoder here. It lost this
+        // path by 1.24x-1.94x at building Value trees, which is a real
+        // measurement; the separate bench meant to show its zero-allocation
+        // cell writes paying off never actually wrote a cell, so that half
+        // proved nothing. The machinery was removed rather than kept as an
+        // unwired reference. See DEVELOPMENT.md, "Speeding up grid_line
+        // decoding", before attempting it again.
         outer: while (!self.stop_flag.load(.seq_cst)) {
             var root: mp.Value = undefined;
             const log_on_msg = self.log.cb != null;
