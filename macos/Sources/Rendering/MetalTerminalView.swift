@@ -1882,10 +1882,11 @@ final class MetalTerminalView: MTKView {
             if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
             if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
 
-            // When Option is treated as Meta, use charactersIgnoringModifiers
-            // as the primary characters to avoid macOS Option-transformed chars
-            // (e.g. ƒ instead of f).  Neovim will see <A-f>, not <A-ƒ>.
-            let chars = optionIsMeta ? event.charactersIgnoringModifiers : event.characters
+            let chars = KeyCharacterSelection.primaryCharacters(
+                optionIsMeta: optionIsMeta,
+                characters: event.characters,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers
+            )
 
             ZonvieCore.appLogScrollMode("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
             core.sendKeyEvent(

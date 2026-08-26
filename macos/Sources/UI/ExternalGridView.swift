@@ -3953,10 +3953,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
             if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
 
+            let chars = KeyCharacterSelection.primaryCharacters(
+                optionIsMeta: optionIsMeta,
+                characters: event.characters,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers
+            )
+
             core.sendKeyEvent(
                 keyCode: UInt32(event.keyCode),
                 mods: mods,
-                characters: event.characters,
+                characters: chars,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers
             )
             return
