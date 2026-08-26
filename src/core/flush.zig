@@ -750,18 +750,6 @@ pub const RenderCells = struct {
         self.style_flags_arr.items[i] = flags;
         self.overline_arr.items[i] = overline;
     }
-
-    /// Write a single cell at index i, including deco base flags.
-    pub inline fn setWithDeco(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8, overline: u8, deco: u32) void {
-        self.scalars.items[i] = scalar;
-        self.fg_rgbs.items[i] = fg;
-        self.bg_rgbs.items[i] = bg;
-        self.sp_rgbs.items[i] = sp;
-        self.grid_ids.items[i] = gid;
-        self.style_flags_arr.items[i] = flags;
-        self.overline_arr.items[i] = overline;
-        self.deco_base_flags.items[i] = deco;
-    }
 };
 
 /// Pack style flags from ResolvedAttrWithStyles into u8.
@@ -11477,7 +11465,7 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
     try core.row_cells.ensureTotalCapacity(core.alloc, 3);
     core.row_cells.setLen(3);
     for (0..3) |col| {
-        core.row_cells.setWithDeco(
+        core.row_cells.set(
             col,
             ' ',
             0xFFFFFF,
@@ -11486,8 +11474,8 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
             1,
             0,
             0,
-            0,
         );
+        core.row_cells.deco_base_flags.items[col] = 0;
         core.row_cells.glow_arr.items[col] = 0;
     }
 
@@ -11552,7 +11540,7 @@ test "row generation preserves left and right margin flags in every emitted laye
     const style = STYLE_UNDERLINE | STYLE_STRIKETHROUGH;
     for (0..5) |col| {
         const deco: u32 = if (col >= 1 and col < 4) c_api.DECO_SCROLLABLE else 0;
-        core.row_cells.setWithDeco(
+        core.row_cells.set(
             col,
             0x2588,
             0xFFFFFF,
@@ -11561,8 +11549,8 @@ test "row generation preserves left and right margin flags in every emitted laye
             1,
             style,
             1,
-            deco,
         );
+        core.row_cells.deco_base_flags.items[col] = deco;
         core.row_cells.glow_arr.items[col] = 0;
     }
     core.cb.on_atlas_ensure_glyph = State.ensure;
@@ -12124,10 +12112,11 @@ test "wide block geometry spans continuation across legacy and shaped runs" {
     try core.grid.resizeGrid(1, 1, 2);
     try core.row_cells.ensureTotalCapacity(core.alloc, 2);
     core.row_cells.setLen(2);
-    core.row_cells.setWithDeco(0, 0x2588, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    core.row_cells.set(0, 0x2588, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
     // A different color deliberately splits the SIMD run. Width detection is
     // based on Neovim's continuation cell, not the current style/color run.
-    core.row_cells.setWithDeco(1, 0, 0x00FF00, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    core.row_cells.set(1, 0, 0x00FF00, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
     @memset(core.row_cells.glow_arr.items, 0);
 
     var state = State{};
@@ -12302,7 +12291,8 @@ test "shaping includes overflow tails in input and cache key" {
     try core.grid.resizeGrid(1, 1, 1);
     try core.row_cells.ensureTotalCapacity(core.alloc, 1);
     core.row_cells.setLen(1);
-    core.row_cells.setWithDeco(0, 'e', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, c_api.DECO_SCROLLABLE);
+    core.row_cells.set(0, 'e', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.deco_base_flags.items[0] = c_api.DECO_SCROLLABLE;
     core.row_cells.glow_arr.items[0] = 0;
     try core.initGlyphCache();
 
