@@ -2466,8 +2466,12 @@ pub fn runLoop(self: *Core) void {
         self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
 
         // If config.toml [font] family is set, push it to nvim's `guifont`
-        // BEFORE ui_attach (avoids a second paint round-trip; see original
-        // statusline-on-Windows note for context).
+        // BEFORE ui_attach. Setting it afterwards lands mid-redraw: nvim emits
+        // an option_set carrying its default guifont during its initial paint,
+        // then a second one once it processes ours. That second paint
+        // round-trip was observed briefly dropping the statusline text on
+        // Windows at startup; resizing the window forced a full re-seed that
+        // restored it. The ordering itself is not platform-specific.
         if (self.msg_config.font.family_explicit) {
             var guifont_buf: [256]u8 = undefined;
             const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
