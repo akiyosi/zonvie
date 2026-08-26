@@ -221,7 +221,17 @@ pub const ShelfPacker = struct {
 
     /// Index of the closed shelf covering `y`, or null when `y` belongs to the
     /// still-open shelf or to no shelf at all.
-    pub fn shelfIndexForY(self: *const ShelfPacker, y: u32) ?u32 {
+    ///
+    /// This is the reference form, kept deliberately as a linear scan that is
+    /// obviously right by inspection. Atlas garbage collection uses
+    /// `shelfIndexForYOrdered` instead, and the test "the ordered lookup
+    /// answers exactly what the linear scan answers" pins that binary search
+    /// against this one across every y in the atlas.
+    ///
+    /// Not `pub`: it exists so the ordered form has something to be checked
+    /// against, and nothing outside this file should reach for the O(n) scan
+    /// when collection walks it once per live vertex.
+    fn shelfIndexForY(self: *const ShelfPacker, y: u32) ?u32 {
         var i: u32 = 0;
         while (i < self.shelf_count) : (i += 1) {
             const shelf = self.shelves[i];
@@ -417,14 +427,19 @@ test "shelfIndexForY resolves closed shelves and rejects the open one" {
 test "the ordered lookup answers exactly what the linear scan answers" {
     var p = ShelfPacker.init(64, 512);
 
-    // Mix bump-closed shelves with split-appended surplus bands so the shelf
-    // array is genuinely out of y order, which is what the ordering exists for.
+    // One tall band at the bottom, then a run of short ones bumped above it.
     _ = p.alloc(20, 30).?;
-    _ = p.alloc(50, 1).?;
-    _ = p.alloc(50, 8).?;
-    _ = p.alloc(50, 4).?;
+    _ = p.alloc(50, 6).?;
+    _ = p.alloc(50, 6).?;
+    _ = p.alloc(50, 6).?;
+    _ = p.alloc(50, 6).?;
     p.beginEpoch();
-    const live = [_]bool{ false, false, false };
+    // Retire the bottom band alone. Being the only candidate, it is the one
+    // that gets split, and the split appends its surplus after every higher-y
+    // shelf already in the array — which is how the array ends up out of y
+    // order at all. Retiring the whole set instead lets the reuse search pick
+    // a short shelf near the top, and the array stays sorted.
+    const live = [_]bool{ false, true, true, true, true };
     _ = p.recycleDeadShelves(&live);
     _ = p.alloc(4, 4).?;
     _ = p.alloc(2, 2).?;
@@ -432,6 +447,17 @@ test "the ordered lookup answers exactly what the linear scan answers" {
 
     var order_buf: [max_shelves]u16 = undefined;
     const order = order_buf[0..p.buildYOrder(&order_buf)];
+
+    // Guard the premise. If the fixture ever drifts back to shelves that are
+    // already sorted, `order` degenerates to the identity and the comparison
+    // below stops testing the indirection at all: shelves[order[mid]] and
+    // shelves[mid] agree, and so does returning order[mid] versus mid. The
+    // assertion would still pass while covering nothing.
+    var ordering_is_identity = true;
+    for (order, 0..) |shelf_idx, pos| {
+        if (shelf_idx != @as(u16, @intCast(pos))) ordering_is_identity = false;
+    }
+    try std.testing.expect(!ordering_is_identity);
 
     // Including the gaps: y values above the bump frontier and inside bands no
     // shelf covers must stay null in both forms.
