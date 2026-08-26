@@ -12,6 +12,7 @@ const dialogs = @import("dialogs.zig");
 const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
+const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
 
 const ExternalSurfaceKind = enum {
@@ -38,6 +39,22 @@ fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
         app_mod.MSG_HISTORY_GRID_ID => .msg_history,
         else => .normal,
     };
+}
+
+/// Report pointer enter/exit on a message surface so the core holds the view's
+/// auto-hide countdown while the user reads it or reaches for the copy button.
+/// Only transitions are posted, so an ordinary mouse move over the surface
+/// costs nothing.
+fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovered: bool) void {
+    switch (classifyExternalSurface(grid_id)) {
+        .msg_show, .msg_history => {},
+        else => return,
+    }
+    if (ext_win.msg_hover == hovered) return;
+    const hwnd = app.hwnd orelse return;
+    const wparam: c.WPARAM = if (hovered) 1 else 0;
+    if (c.PostMessageW(hwnd, app_mod.WM_APP_MSG_HOVER, wparam, @intCast(grid_id)) == 0) return;
+    ext_win.msg_hover = hovered;
 }
 
 /// Whether the decorated surface of `kind` shows a copy-content button.
@@ -180,7 +197,7 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
+            const cell_h = app.rowHeightPx();
             const hide_cursor_for_ime = app.ime_composing;
             const border_r = app.cmdline_border_color[0];
             const border_g = app.cmdline_border_color[1];
@@ -346,7 +363,7 @@ fn drawDecoratedExternalSurface(
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
             const cell_w = app.cell_w_px;
-            const cell_h = app.cell_h_px + app.linespace_px;
+            const cell_h = app.rowHeightPx();
             const icon_color: [4]f32 = .{
                 app.cmdline_icon_color[0],
                 app.cmdline_icon_color[1],
@@ -1161,6 +1178,37 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
 
 /// Apply a changed lifecycle callback to an already-published HWND without
 /// replacing its renderer/surface contents. Must be called on the UI thread.
+/// Top-right placement for the message floats. Resolves the Win32 state and
+/// defers the arithmetic to msg_float_layout, which is covered by
+/// windows/ui/msg_float_layout_test.zig.
+///
+/// Must be called with `app.mu` NOT held; getExtFloatTargetRect expects the
+/// lock and does not take it itself.
+fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) msg_float_layout.Point {
+    app.mu.lockUncancelable(core.clock.io());
+    const target_rect = app.getExtFloatTargetRect();
+    // msg_show stacks below msg_history when both are up; msg_history itself
+    // always sits at the top.
+    const history_hwnd: ?c.HWND = if (is_msg_history) null else blk: {
+        if (app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID)) |hw| break :blk hw.hwnd;
+        break :blk null;
+    };
+    app.mu.unlock(core.clock.io());
+
+    var history_bottom: ?i32 = null;
+    if (history_hwnd) |hwnd| {
+        var history_rect: c.RECT = undefined;
+        if (c.GetWindowRect(hwnd, &history_rect) != 0) history_bottom = history_rect.bottom;
+    }
+
+    return msg_float_layout.msgFloatTopRight(.{
+        .left = target_rect.left,
+        .top = target_rect.top,
+        .right = target_rect.right,
+        .bottom = target_rect.bottom,
+    }, window_w, history_bottom);
+}
+
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
     const is_cmdline = req.grid_id == app_mod.CMDLINE_GRID_ID;
     const is_popupmenu = req.grid_id == app_mod.POPUPMENU_GRID_ID;
@@ -1168,7 +1216,7 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const is_msg_history = req.grid_id == app_mod.MSG_HISTORY_GRID_ID;
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
 
     const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
     const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
@@ -1235,6 +1283,11 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         } else {
             flags |= c.SWP_NOMOVE;
         }
+    } else if (is_msg_show or is_msg_history) {
+        const pos = msgFloatTopRight(app, is_msg_history, window_w);
+        x = pos.x;
+        y = pos.y;
+        if (applog.isEnabled()) applog.appLog("[win] msg float re-anchored top-right: ({d},{d}) w={d}\n", .{ x, y, window_w });
     } else {
         flags |= c.SWP_NOMOVE;
     }
@@ -1262,7 +1315,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Get cell dimensions from main atlas
     // Note: cell_h must include linespace_px to match core's vertex generation
     const cell_w: u32 = app.cell_w_px;
-    const cell_h: u32 = app.cell_h_px + app.linespace_px;
+    const cell_h: u32 = app.rowHeightPx();
     const content_w: c_int = @intCast(req.cols * cell_w);
     const content_h: c_int = @intCast(req.rows * cell_h);
 
@@ -1486,40 +1539,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             pos_y = @divTrunc(screen_h - window_h, 2);
             if (applog.isEnabled()) applog.appLog("[win] popupmenu fallback center: ({d},{d})\n", .{ pos_x, pos_y });
         }
-    } else if (is_msg_history) {
-        // Message history: position at top-right based on config
-        app.mu.lockUncancelable(core.clock.io());
-        const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock(core.clock.io());
-        pos_x = target_rect.right - window_w - 10;
-        pos_y = target_rect.top + 10; // 10px from top
-        if (applog.isEnabled()) applog.appLog("[win] msg_history at top-right: ({d},{d})\n", .{ pos_x, pos_y });
-    } else if (is_msg_show) {
-        // Message show (e.g. "Press ENTER..."): position below msg_history if visible, otherwise at top-right
-        app.mu.lockUncancelable(core.clock.io());
-        const msg_history_win = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
-        const target_rect = app.getExtFloatTargetRect();
-        app.mu.unlock(core.clock.io());
-
-        if (msg_history_win) |hw| {
-            // Position below msg_history window
-            var history_rect: c.RECT = undefined;
-            if (c.GetWindowRect(hw.hwnd, &history_rect) != 0) {
-                pos_x = target_rect.right - window_w - 10;
-                pos_y = history_rect.bottom + 4; // 4px gap below history window
-                if (applog.isEnabled()) applog.appLog("[win] msg_show below msg_history: ({d},{d})\n", .{ pos_x, pos_y });
-            } else {
-                // Fallback: top-right
-                pos_x = target_rect.right - window_w - 10;
-                pos_y = target_rect.top + 10;
-                if (applog.isEnabled()) applog.appLog("[win] msg_show at top-right (fallback): ({d},{d})\n", .{ pos_x, pos_y });
-            }
-        } else {
-            // No msg_history: position at top-right
-            pos_x = target_rect.right - window_w - 10;
-            pos_y = target_rect.top + 10;
-            if (applog.isEnabled()) applog.appLog("[win] msg_show at top-right: ({d},{d})\n", .{ pos_x, pos_y });
-        }
+    } else if (is_msg_history or is_msg_show) {
+        // Message floats: top-right, msg_show stacked below msg_history.
+        // Shared with the geometry-update path so the two cannot drift apart.
+        const pos = msgFloatTopRight(app, is_msg_history, window_w);
+        pos_x = pos.x;
+        pos_y = pos.y;
+        if (applog.isEnabled()) applog.appLog("[win] msg float at top-right: ({d},{d}) history={any}\n", .{ pos_x, pos_y, is_msg_history });
     }
 
     // Create window using external window class
@@ -1791,6 +1817,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     if (deferred_setpos_cmdline) |sp| {
         _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
         if (applog.isEnabled()) applog.appLog("[win] put message window below cmdline (cmdline created)\n", .{});
+    }
+
+    // A message float routinely appears right under a stationary pointer, and
+    // no WM_MOUSEMOVE follows one that never moves. Seed the hover state from
+    // the cursor's actual position, after the deferred repositioning above has
+    // settled the window's final rect.
+    var window_rect: c.RECT = undefined;
+    var cursor: c.POINT = undefined;
+    if (c.GetWindowRect(hwnd, &window_rect) != 0 and c.GetCursorPos(&cursor) != 0) {
+        if (c.PtInRect(&window_rect, cursor) != 0) {
+            setMsgHover(app, ext_window_ptr, req.grid_id, true);
+        }
     }
 
     // Activate this external window
@@ -2353,7 +2391,7 @@ pub export fn ExternalWndProc(
                 }
 
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px + app.linespace_px;
+                const cell_h = app.rowHeightPx();
                 const corep = app.corep;
 
                 app.mu.unlock(core.clock.io());
@@ -2554,6 +2592,10 @@ pub export fn ExternalWndProc(
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
 
+                    // The pointer is somewhere on the surface, copy button
+                    // included — the message must not vanish under it.
+                    setMsgHover(app, ext_win, grid_id.?, true);
+
                     // Check for scrollbar hover
                     if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
                         var client: c.RECT = undefined;
@@ -2596,10 +2638,12 @@ pub export fn ExternalWndProc(
         c.WM_MOUSELEAVE => {
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());
+                var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     if (entry.value_ptr.*.hwnd == hwnd) {
+                        grid_id = entry.key_ptr.*;
                         ext_window = entry.value_ptr.*;
                         break;
                     }
@@ -2607,6 +2651,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
+                    setMsgHover(app, ext_win, grid_id.?, false);
                     if (ext_win.copy_button_hover) {
                         ext_win.copy_button_hover = false;
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
@@ -3287,7 +3332,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // vertices so an old vertex set is never drawn using new scissor/row
     // geometry.
     const shared_metrics_gen_snapshot = app.shared_metrics_gen;
-    const row_h_px_snapshot = app.cell_h_px + app.linespace_px;
+    const row_h_px_snapshot = app.rowHeightPx();
 
     // Get renderer and atlas
     const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
@@ -3360,7 +3405,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
                         const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
-                        const cell_h: f32 = @floatFromInt(app.cell_h_px + app.linespace_px);
+                        const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;
                         const right_main = center_x + cell_w * 0.5;
                         const top_main = center_y - cell_h * 0.5;

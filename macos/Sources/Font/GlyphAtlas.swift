@@ -768,12 +768,23 @@ final class GlyphAtlas {
             let descPx = Float(-desc26_6) / 64.0 // FT descender is typically negative
             let heightPx = Float(height26_6) / 64.0
     
-            if ascPx > 0 { ascentPx = Float(ceil(ascPx)) }
             if descPx > 0 { descentPx = Float(ceil(descPx)) }
     
             // Use FT height if valid; fallback to asc+desc.
             let h = (heightPx > 0) ? heightPx : (ascPx + descPx)
             if h > 0 { cellHeightPx = Float(ceil(h)) }
+    
+            // FreeType reports both metrics already grid-fitted outward, so the
+            // baseline is placed from CoreText's unrounded values for the same
+            // face instead. Rounding them here would drop the glyph's descender
+            // past the bottom of the cell, where it gets clipped away.
+            if ascPx > 0 {
+                ascentPx = FontCellFit.baselinePx(
+                    fontAscentPx: Float(CTFontGetAscent(font)),
+                    fontDescentPx: Float(CTFontGetDescent(font)),
+                    cellHeightPx: cellHeightPx
+                )
+            }
     
             // --- Determine cellWidthPx from FT advance (monospace assumption) ---
             // Prefer space; fallback to 'M' if space has no glyph/advance.

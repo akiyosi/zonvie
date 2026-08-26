@@ -1,0 +1,10 @@
+# Fixture for scenarios that need the custom-shader draw path (which
+# replaces the back-buffer blit) WITHOUT an animated shader, so pixel
+# comparison across frames stays meaningful.
+[window]
+blur = false
+opacity = 0.8
+
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/static_probe.glsl"]

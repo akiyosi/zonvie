@@ -126,6 +126,20 @@ pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image
     return cgImageToRGBA(alloc, img);
 }
 
+/// Capture any window of the app by its CGWindowID, so a scenario can
+/// observe an external float rather than the main window.
+pub fn captureWindow(alloc: std.mem.Allocator, window_number: u32) !Image {
+    if (!hasScreenAccess()) return error.ScreenRecordingPermission;
+    const img = CGWindowListCreateImage(
+        CGRectNull,
+        kCGWindowListOptionIncludingWindow,
+        window_number,
+        kCGWindowImageBoundsIgnoreFraming,
+    ) orelse return error.CaptureFailed;
+    defer CGImageRelease(img);
+    return cgImageToRGBA(alloc, img);
+}
+
 fn rgbaToCGImage(img: Image) !CGImageRef {
     const space = CGColorSpaceCreateDeviceRGB() orelse return error.ColorSpaceFailed;
     defer CGColorSpaceRelease(space);

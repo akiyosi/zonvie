@@ -86,6 +86,58 @@ test "gui:mini_message_bulk" {
     }
 }
 
+test "gui:extfloat_margin_scroll_flicker" {
+    // macOS only: the external-window smooth-scroll path is macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:main_margin_scroll_flicker" {
+    // macOS only: drives the macOS frontend's main-window smooth-scroll path.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:main_float_margin_scroll_flicker" {
+    // macOS only: a bordered float composited into the main window is the
+    // one configuration with a real BOTTOM margin row there.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_float_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extfloat_move_cursor_shader" {
+    // macOS only: the shader cursor plumbing lives in the macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_move_cursor_shader.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extfloat_resize_shader_stall" {
+    // macOS only: the animated-shader draw loop and the external-float
+    // window plumbing this exercises live in the macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_resize_shader_stall.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_message_position" {
     // macOS only: exercises the macOS frontend's ext-float anchoring
     // (getExtFloatTargetFrame); the Windows frontend has its own message UI.

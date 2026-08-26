@@ -345,6 +345,38 @@ pub const Gui = struct {
         }
     }
 
+    /// Make the app under test the active application, so its window is
+    /// key and its views get the frontmost app's event/display treatment.
+    /// Some behavior only shows up in that state.
+    ///
+    /// macOS only, and by unix id — NEVER by process name. Two zonvie
+    /// instances can be running (this driver's, and one hosting the
+    /// developer's session) and a name lookup has picked the wrong one
+    /// before. Best effort: a failure is reported, not fatal.
+    pub fn activateApp(g: *Gui) void {
+        if (builtin.os.tag != .macos) return;
+        const script = std.fmt.allocPrint(
+            g.alloc,
+            "tell application \"System Events\" to set frontmost of (first process whose unix id is {d}) to true",
+            .{g.app_pid},
+        ) catch return;
+        defer g.alloc.free(script);
+        const result = std.process.run(g.alloc, gui_io.io(), .{
+            .argv = &.{ "osascript", "-e", script },
+        }) catch {
+            std.debug.print("[gui] activateApp: osascript failed to run\n", .{});
+            return;
+        };
+        defer g.alloc.free(result.stdout);
+        defer g.alloc.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| if (code != 0) {
+                std.debug.print("[gui] activateApp: osascript exited {d}: {s}\n", .{ code, result.stderr });
+            },
+            else => {},
+        }
+    }
+
     // ── GUI observation ────────────────────────────────────────────────
 
     pub fn windowCount(g: *Gui) u32 {

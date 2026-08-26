@@ -377,7 +377,7 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
 
     // External window with auto-hide
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
     const padding: c_int = app.scalePx(16);
 
     // Get app window position and size (position relative to app window, not screen)
@@ -690,7 +690,7 @@ pub fn updateExtFloatPositions(app: *App) void {
     // Get data while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
     const pos_mode = app.config.messages.msg_pos.ext_float;
     const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
     const msg_show_entry = app.external_windows.get(app_mod.MESSAGE_GRID_ID);
@@ -843,7 +843,7 @@ pub fn updateMiniWindows(app: *App) void {
     // Get cell dimensions and config
     app.mu.lockUncancelable(core.clock.io());
     const cell_w = app.cell_w_px;
-    const cell_h = app.cell_h_px + app.linespace_px;
+    const cell_h = app.rowHeightPx();
     const mini_pos_mode = app.config.messages.msg_pos.mini;
     app.mu.unlock(core.clock.io());
 

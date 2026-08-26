@@ -1,7 +1,9 @@
 // linespace_geometry_persist — verify linespace is stored in core.
 //
-// Bug: onLinespace callback does not save linespace_px
-// Fix: store clamped px value in core.linespace_px
+// Bug 1: onLinespace callback does not save linespace_px.
+// Bug 2: negative values (legal per Neovim's 'linespace' docs, for fonts that
+// leave too much room between lines) were clamped to 0 in the option_set
+// parser, so the setting silently never reached the core or the frontends.
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -42,5 +44,23 @@ pub fn run(alloc: std.mem.Allocator) !void {
         h.core.grid_mu.unlock(zc.clock.io());
         std.debug.print("[e2e] linespace_geometry_persist: linespace not saved: expected 10 got {d}\n", .{got});
         return error.LinespaceNotPersisted;
+    };
+
+    // A negative value must arrive unclamped: this pins the full wire path
+    // (option_set parse -> onLinespace -> core field) that used to zero it.
+    try h.command("set linespace=-5");
+
+    h.waitUntil({}, struct {
+        fn check(_: void, hh: *Harness) bool {
+            hh.core.grid_mu.lockUncancelable(zc.clock.io());
+            defer hh.core.grid_mu.unlock(zc.clock.io());
+            return hh.core.linespace_px == -5;
+        }
+    }.check, h.opts.timeout_ms) catch {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        const got = h.core.linespace_px;
+        h.core.grid_mu.unlock(zc.clock.io());
+        std.debug.print("[e2e] linespace_geometry_persist: negative linespace clamped: expected -5 got {d}\n", .{got});
+        return error.NegativeLinespaceClamped;
     };
 }

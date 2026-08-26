@@ -381,6 +381,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // main grid, so this must not be materially tighter than that cap.
     private let maxRowBuffers = 20000
 
+    /// Occlusion and window-move observers; see viewDidMoveToWindow.
+    private var occlusionObserver: NSObjectProtocol?
+    private var moveObservers: [NSObjectProtocol] = []
+
+    /// Last cursor box this view forwarded to the shared shader cursor
+    /// state, in this view's local NDC, so a window move can re-project it.
+    /// Nil while the cursor is not on this view's grid.
+    private var lastForwardedCursorNdc: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
+    private var lastForwardedCursorColor: (Float, Float, Float, Float)?
+
     // Active rendering mode: when new commits arrive, switch to isPaused=false
     // so MTKView draws at preferredFramesPerSecond (60fps). After idle, pause.
     private var activeDrawIdleFrames: Int = 0
@@ -752,6 +762,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Invalidate scrollbar hide timer to break its run-loop retain.
         scrollbarHideTimer?.invalidate()
         scrollbarHideTimer = nil
+
+        // viewDidMoveToWindow(nil) normally removes this on teardown, since
+        // every current close path clears contentView first. Dropping it here
+        // too keeps a future path that releases the view without detaching it
+        // from leaving a registration behind.
+        if let observer = occlusionObserver {
+            NotificationCenter.default.removeObserver(observer)
+            occlusionObserver = nil
+        }
+        for observer in moveObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        moveObservers.removeAll()
 
         // Release Metal buffers held by all three SurfaceBufferSet objects.
         // Each set contains per-row MTLBuffer references that can total ~8MB.
@@ -1514,13 +1537,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         )
     }
 
+
     /// Copy the rows about to leave this window's scroll region into the
     /// retention, so the band the smooth-scroll offset opens shows them
     /// instead of the edge row's background stretched across it.
     ///
-    /// The whole row is copied: an external window owns its surface outright,
-    /// so unlike the main composite there is no other grid's content mixed
-    /// into it. Called from inside the flush bracket, before the slot remap.
+    /// Only the row's DECO_SCROLLABLE vertices are copied (shared filter with
+    /// the main renderer's grid_scroll capture — see
+    /// copyRetainedScrollableRow). An external window owns its surface
+    /// outright, so no OTHER grid mixes in, but its own rows still hold
+    /// non-scrollable cells: a float border's "│" columns. A whole-row copy
+    /// let those escape the offset shift and the content clip, landing them
+    /// on the margin rows. Called from inside the flush bracket, before the
+    /// slot remap.
     private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int) {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         guard ws.rowState.usingRowBuffers else { return }
@@ -1555,12 +1584,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 )
                 stepOpened = true
             }
-            let needed = vc * MemoryLayout<Vertex>.stride
-            guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
-            memcpy(dstBuf.contents(), srcBuf.contents(), needed)
+            guard let copied = copyRetainedScrollableRow(
+                retention: retention,
+                srcBuf: srcBuf,
+                vertexCount: vc,
+                gridId: gridId,
+                scrollableMask: ZONVIE_DECO_SCROLLABLE
+            ) else { continue }
             retention.stage(RetainedScrollRow(
-                buffer: dstBuf,
-                count: vc,
+                buffer: copied.buffer,
+                count: copied.count,
                 gridId: gridId,
                 sourceRow: sourceRow,
                 targetRow: outgoingRow - rowsDelta,
@@ -1774,6 +1807,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // window drawable px using the same screen-space
                 // parameters the shader uniforms use.
                 forwardExternalCursorToMainShader(ptr: validPtr, count: count)
+            } else {
+                // The cursor left this window: stop republishing its rect on
+                // window moves, or this view would keep overwriting whichever
+                // surface now owns the cursor.
+                lastForwardedCursorNdc = nil
             }
             return
         }
@@ -2005,16 +2043,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// popupmenu / a float window.
     private func forwardExternalCursorToMainShader(ptr: UnsafePointer<zonvie_vertex>, count: Int) {
         guard count > 0 else { return }
-        guard let mainView = mainTerminalView,
-              let renderer = mainView.renderer else { return }
-        // Same screen-space parameters the shader uniforms use, so the
-        // cursor rect lands in the same coordinate system the shader
-        // resolves against.
-        let (screenRes, windowOffset) = screenSpaceParameters(
-            mainView: mainView,
-            selfView: self
-        )
-        // Convert NDC bounding box to main drawable pixels.
         var minX: Float = ptr[0].position.0
         var maxX: Float = minX
         var minY: Float = ptr[0].position.1
@@ -2026,6 +2054,38 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if p.1 < minY { minY = p.1 }
             if p.1 > maxY { maxY = p.1 }
         }
+        let c = ptr[0].color
+        lastForwardedCursorNdc = (minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+        lastForwardedCursorColor = (c.0, c.1, c.2, c.3)
+        republishCursorShaderState()
+    }
+
+    /// Project the last forwarded cursor NDC box into the main window's
+    /// drawable pixels and publish it as the shader cursor rect.
+    ///
+    /// Split out from the forwarder because the projection depends on where
+    /// the two windows are, not only on the verts: `screenSpaceParameters`
+    /// measures this view's top-left relative to the main view's. Dragging
+    /// either window changes that offset without producing a single new
+    /// cursor vertex, which used to leave the cursor shader burning at the
+    /// float's pre-move position until the next cursor update.
+    private func republishCursorShaderState(reanchor: Bool = false) {
+        guard let ndc = lastForwardedCursorNdc,
+              let color = lastForwardedCursorColor else { return }
+        guard let mainView = mainTerminalView,
+              let renderer = mainView.renderer else { return }
+        // Same screen-space parameters the shader uniforms use, so the
+        // cursor rect lands in the same coordinate system the shader
+        // resolves against.
+        let (screenRes, windowOffset) = screenSpaceParameters(
+            mainView: mainView,
+            selfView: self
+        )
+        let minX = ndc.minX
+        let maxX = ndc.maxX
+        let minY = ndc.minY
+        let maxY = ndc.maxY
+        // Convert NDC bounding box to main drawable pixels.
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
         // Map the cursor's NDC center through the SAME viewport the grid is
@@ -2059,18 +2119,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let botPx = centerPxY + cellH * 0.5
         // Ghostty's cursor shaders treat iCurrentCursor.y as the
         // BOTTOM edge of the cursor rect (rect spans y-h..y).
-        let c0 = ptr[0].color
         // Tag the rect with this window's grid so the shader-cursor position
         // follows its smooth-scroll displacement the same way the main
         // window's does. Omitting it does not just leave this window
         // uncorrected: the cursor shader state is shared with the main view
         // (renderer is mainView.renderer), so a default of "no grid" would
         // switch the main window's correction off too.
-        renderer.setCursorShaderState(
-            rect: (leftPx, botPx, rightPx - leftPx, botPx - topPx),
-            color: (c0.0, c0.1, c0.2, c0.3),
-            gridId: gridId
-        )
+        let rect = (leftPx, botPx, rightPx - leftPx, botPx - topPx)
+        if reanchor {
+            // Window move: no commit will come to publish a staged value, and
+            // the cursor has not moved relative to its text.
+            renderer.reanchorCursorShaderState(rect: rect, gridId: gridId)
+        } else {
+            renderer.setCursorShaderState(rect: rect, color: color, gridId: gridId)
+        }
     }
 
     /// Allocate the two ping-pong textures used by multi-pass custom
@@ -2241,12 +2303,46 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 return
             }
 
+            // Nothing may be drawn while this window is not on screen.
+            //
+            // A window that is miniaturized or fully covered stops being
+            // composited, so its CAMetalLayer never gets its presented
+            // drawables back, and `currentDrawable` below then takes about
+            // a second to return one — measured at 993ms and 1002ms (see
+            // [perf] ext_acquire_drawable). It is a MAIN-thread call, so
+            // that freezes the whole app: the main window's shader
+            // animation, Neovim redraws and key event delivery all stop for
+            // a second at a time, once per frame this view attempts.
+            //
+            // It stayed hidden until a custom shader started animating.
+            // Before that, an idle external window parked its draw loop and
+            // never reached this line; the animation exception below makes
+            // it attempt a frame every vsync even with nothing to show,
+            // which is exactly when being invisible starts to cost a
+            // second. Re-armed by the occlusion observer in
+            // viewDidMoveToWindow, and by commitFlush on any new content.
+            //
+            // hasPresentedOnce gates it: occlusionState is published
+            // asynchronously by the window server, so a window that was
+            // just ordered in still reports "not visible" for a frame or
+            // two. Parking there would leave a brand-new cmdline or
+            // popupmenu panel empty until the notification lands — and a
+            // window with nothing on screen yet has no stale content worth
+            // protecting, so it is allowed to pay the acquire once.
+            if hasPresentedOnce, let win = view.window,
+               win.isMiniaturized || !win.occlusionState.contains(.visible) {
+                ZonvieCore.appLog("[ext_draw_skip] gridId=\(gridId) window not visible; skipping frame")
+                deactivateDrawLoop()
+                return
+            }
+
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
                 ZonvieCore.appLog("[ExternalGridView draw] gridId=\(gridId) early return: drawableSize invalid (\(view.drawableSize))")
                 return
             }
 
-            // Skip rendering for minimized windows.
+            // Skip rendering for minimized windows. Reached only before the
+            // first present, when the guard above stands down.
             // No frame-completion notification is needed here: unlike
             // MetalTerminalView (which uses redrawPending/didDrawFrame to
             // gate future redraws), ExternalGridView is driven directly
@@ -2744,7 +2840,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // back to the edge it left through; the shader then applies this
             // grid's scroll offset like any other row, and the existing
             // content clip discards the part outside the window.
-            let retainedRows = smoothScrolling ? retainedSnapshot : []
+            //
+            // Gated on hasScrollOffset, not smoothScrolling: both the offset
+            // shift and the content clip come from this grid's ScrollOffset
+            // entry, matched by grid_id in the vertex shader. On the settle's
+            // final frame the offset resolves to nil (smoothScrolling stays
+            // true via wasScrollOffsetActiveInLastPresentedFrame), so a
+            // retained row drawn then matches no entry and lands unshifted
+            // and UNCLIPPED at its targetRow — which sits in the margin rows
+            // above the content edge it left through. With no offset the band
+            // is closed and every real row is drawn on the cell grid, so
+            // there is nothing for a retained row to cover.
+            let retainedRows = hasScrollOffset ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
             let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
@@ -2972,7 +3079,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     if !nonZeroTranslations.isEmpty {
                         ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
                     }
-                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows)")
+                    ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPx.y)")
                 }
 
                 let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
@@ -3277,7 +3384,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // --- Blit back buffer to drawable ---
-            guard let drawable = view.currentDrawable else {
+            // Timed, mirroring the main view's draw_acquire_drawable: this
+            // is a MAIN-thread call with no non-blocking variant, and it is
+            // where an invisible window used to cost ~1s per frame.
+            var tAcquire: CFAbsoluteTime = 0
+            if ZonvieCore.appLogEnabled { tAcquire = CFAbsoluteTimeGetCurrent() }
+            let acquired = view.currentDrawable
+            if ZonvieCore.appLogEnabled {
+                let us = (CFAbsoluteTimeGetCurrent() - tAcquire) * 1_000_000
+                ZonvieCore.appLogPerf("[perf] ext_acquire_drawable gridId=\(gridId) us=\(String(format: "%.1f", us)) got=\(acquired != nil)")
+            }
+            guard let drawable = acquired else {
                 // Capture semaphore and lock directly so the signal fires even
                 // if the view is deallocated before the GPU finishes.
                 let sem = inflightSemaphore
@@ -3621,7 +3738,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 scrollOffset.pin_edges = 0
             }
 
-            ZonvieCore.appLog("[ExternalGridView] scroll offset: gridId=\(gridId) offsetPx=\(info.offsetYPx) marginTop=\(info.marginTop) marginBottom=\(info.marginBottom)")
+            ZonvieCore.appLog("[ExternalGridView] scroll offset: gridId=\(gridId) offsetPx=\(info.offsetYPx) marginTop=\(info.marginTop) marginBottom=\(info.marginBottom) ndc=\(scrollOffset.offset_y) top=\(scrollOffset.content_top_y) bot=\(scrollOffset.content_bottom_y) pin=\(scrollOffset.pin_edges) retained=\(retention.publishedCount(gridId: gridId)) gridTop=\(info.gridTopYNDC) cellNDC=\(cellHeightNDC) vpH=\(viewportHeight)")
 
             lock.lock()
             defer { lock.unlock() }
@@ -4061,6 +4178,49 @@ extension ExternalGridView: NSTextInputClient {
         // Deactivate draw loop when removed from window
         if window == nil {
             deactivateDrawLoop()
+        }
+
+        // draw() parks the loop while this window is invisible, so a window
+        // that becomes visible again with no Neovim traffic behind it would
+        // otherwise stay on its stale last frame.
+        if let previous = occlusionObserver {
+            NotificationCenter.default.removeObserver(previous)
+            occlusionObserver = nil
+        }
+        for observer in moveObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        moveObservers.removeAll()
+
+        if let win = window {
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: win,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self, self.window?.occlusionState.contains(.visible) == true else { return }
+                self.activateDrawLoop()
+                self.setNeedsDisplay(self.bounds)
+            }
+
+            // The shader cursor rect is expressed in the MAIN window's
+            // drawable pixels, so it depends on the offset between the two
+            // windows — dragging either one invalidates it without producing
+            // a cursor update to recompute it from. Both are watched: this
+            // window is the one the user drags, and the main window moving
+            // shifts the same offset the other way.
+            let movedWindows = [win, mainTerminalView?.window].compactMap { $0 }
+            for moved in movedWindows {
+                moveObservers.append(NotificationCenter.default.addObserver(
+                    forName: NSWindow.didMoveNotification,
+                    object: moved,
+                    queue: .main
+                ) { [weak self] _ in
+                    guard let self else { return }
+                    self.republishCursorShaderState(reanchor: true)
+                    self.mainTerminalView?.requestRedraw()
+                })
+            }
         }
 
         let scrollbarConfig = ZonvieConfig.shared.scrollbar

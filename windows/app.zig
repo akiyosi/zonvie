@@ -67,6 +67,7 @@ pub const zonvie_core_set_ext_messages = core.zonvie_core_set_ext_messages;
 pub const zonvie_core_set_ext_tabline = core.zonvie_core_set_ext_tabline;
 pub const zonvie_core_tick_msg_throttle = core.zonvie_core_tick_msg_throttle;
 pub const zonvie_core_try_next_msg_timeout_ms = core.zonvie_core_try_next_msg_timeout_ms;
+pub const zonvie_core_set_msg_hover = core.zonvie_core_set_msg_hover;
 pub const zonvie_core_set_blur_enabled = core.zonvie_core_set_blur_enabled;
 pub const zonvie_core_set_inherit_cwd = core.zonvie_core_set_inherit_cwd;
 pub const zonvie_core_set_glyph_cache_size = core.zonvie_core_set_glyph_cache_size;
@@ -210,6 +211,12 @@ pub const WM_APP_SHOW_CONNECT_DIALOG: c.UINT = c.WM_APP + 40;
 /// delta. Posted (not sent) because the callback runs on the core thread with
 /// grid_mu held, and SetWindowPos would re-enter updateLayoutToCore.
 pub const WM_APP_RESIZE_TO_GRID: c.UINT = c.WM_APP + 41;
+/// Posted when the pointer enters or leaves a message surface. wParam = 1 for
+/// entered, 0 for left; lParam = grid id. Posted (not sent) because the mouse
+/// message can be dispatched from a nested message pump inside DXGI Present,
+/// which runs while the core's grid lock is held — taking that lock from the
+/// handler directly would self-deadlock.
+pub const WM_APP_MSG_HOVER: c.UINT = c.WM_APP + 42;
 
 // =========================================================================
 // Timer IDs and timing constants
@@ -1931,6 +1938,10 @@ pub const ExternalWindow = struct {
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // Pointer is over a message surface, reported to the core so it holds the
+    // view's auto-hide countdown. Tracked here so an ordinary mouse move does
+    // not take the core's grid lock on every WM_MOUSEMOVE.
+    msg_hover: bool = false,
     // OLE drop target (cmdline surface only). See ui/drop_target.zig; opaque
     // here so app.zig carries none of the COM plumbing.
     drop_target: ?*anyopaque = null,
@@ -3820,7 +3831,7 @@ pub const App = struct {
     // hasPresentedOnce on MetalTerminalRenderer.
     back_tex_valid: bool = false,
 
-    linespace_px: u32 = 0,
+    linespace_px: i32 = 0,
 
     // DPI scaling factor (e.g. 1.0 at 96 DPI, 2.0 at 192 DPI)
     dpi_scale: f32 = 1.0,
@@ -4049,6 +4060,15 @@ pub const App = struct {
     pub const max_row_buffers: u32 = 20_000;
 
     pub const AtlasResetAdmission = render_pipeline_helpers.AtlasResetAdmission;
+
+    /// Height of one grid row: the cell plus 'linespace'. Neovim allows
+    /// 'linespace' to be negative to tighten rows under a font that reserves
+    /// too much room between lines, so the sum is taken signed and floored —
+    /// the layout divides the client area by this to get its row count.
+    pub fn rowHeightPx(self: *const App) u32 {
+        const total: i32 = @as(i32, @intCast(self.cell_h_px)) + self.linespace_px;
+        return if (total < 1) 1 else @intCast(total);
+    }
 
     /// Close paint admission before onAtlasCreate invalidates the atlas.
     /// This is non-blocking because the core callback can hold grid_mu while a
@@ -4892,7 +4912,7 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
     const h = content.h;
 
     const cw: u32 = @max(1, app.cell_w_px);
-    const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const ch: u32 = app.rowHeightPx();
 
     if (applog.isEnabled()) applog.appLog(
         "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
@@ -4978,7 +4998,7 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
 
     const cw: u32 = @max(1, app.cell_w_px);
-    const ch: u32 = @max(1, app.cell_h_px + app.linespace_px);
+    const ch: u32 = app.rowHeightPx();
 
     const rows: u32 = @intCast(@max(1, h / ch));
     const cols: u32 = @intCast(@max(1, w / cw));

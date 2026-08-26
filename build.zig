@@ -255,6 +255,22 @@ pub fn build(b: *std.Build) !void {
         run_row_provision_test.addFileArg(row_provision_test_exe);
         test_step.dependOn(&run_row_provision_test.step);
 
+        // Baseline placement inside a cell: FreeType's grid-fitted metrics
+        // overflow the line height it reports, and anchoring on them clips the
+        // glyph at the cell edge where rows join.
+        const compile_font_cell_fit_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_font_cell_fit_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_font_cell_fit_test.addFileArg(b.path("macos/Sources/Font/FontCellFit.swift"));
+        compile_font_cell_fit_test.addFileArg(b.path("macos/Tests/FontCellFitTests.swift"));
+        compile_font_cell_fit_test.addArg("-o");
+        const font_cell_fit_test_exe = compile_font_cell_fit_test.addOutputFileArg("font-cell-fit-tests");
+        const run_font_cell_fit_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
+        test_step.dependOn(&run_font_cell_fit_test.step);
+
         // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
         // where they must be drawn, and that staged rows reach the screen only
         // through their own bracket's commit.
@@ -459,6 +475,17 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
 
+    // Platform-independent placement tests for the ext_messages floats.
+    const windows_msg_float_layout_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/ui/msg_float_layout_test.zig"),
+    });
+    const windows_msg_float_layout_tests = b.addTest(.{
+        .root_module = windows_msg_float_layout_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(windows_msg_float_layout_tests).step);
+
     // Platform-independent coverage for the Windows frontend's lossy,
     // non-blocking logging queue.
     const windows_app_log_test_mod = b.createModule(.{
@@ -573,6 +600,7 @@ pub fn build(b: *std.Build) !void {
             gui_mod.linkFramework("CoreGraphics", .{});
             gui_mod.linkFramework("CoreFoundation", .{});
             gui_mod.linkFramework("ImageIO", .{}); // CGImageDestination/Source (PNG)
+            gui_mod.linkFramework("ApplicationServices", .{}); // AXUIElement (drag-resize emulation)
         } else {
             gui_mod.linkSystemLibrary("user32", .{});
             gui_mod.linkSystemLibrary("gdi32", .{}); // DIB capture

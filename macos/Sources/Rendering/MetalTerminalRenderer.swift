@@ -640,7 +640,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         let ls = linespacePx
         lock.unlock()
-        return atlas.fontMetricsSnapshot().height + Float(ls)
+        // 'linespace' may be negative (Neovim allows it to tighten rows under
+        // a font that reserves too much room between lines), so the sum has to
+        // stay positive: the grid divides the drawable by this to get its row
+        // count, and rows also cannot be measured in zero pixels.
+        return max(1, atlas.fontMetricsSnapshot().height + Float(ls))
     }
 
 
@@ -1029,6 +1033,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorChangeTime: Float = 0
+    /// Last cursor rect handed to a shader, so the log fires on change only.
+    private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     /// The rect as the core measured it, and the grid it belongs to. Turned
     /// into the screen-space state above by `evaluateCursorShaderChange`, once
     /// the frame's displacement for that grid is known. Written under `lock`.
@@ -2128,7 +2134,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func setLineSpace(px: Int32) {
         lock.lock()
         defer { lock.unlock() }
-        linespacePx = max(0, px)
+        // Kept signed: cellHeightPx floors the row height that results.
+        linespacePx = px
     }
 
     /// Update scroll offsets for smooth scrolling.
@@ -2202,7 +2209,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
             let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
-            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(info.gridId) offsetYPx=\(info.offsetYPx) ndc=\(ndc) contentTop=\(contentTopY) contentBottom=\(contentBottomY)")
             scrollOffsetData.append(ScrollOffset(
                 grid_id: Int32(truncatingIfNeeded: info.gridId),
                 offset_y: ndc,
@@ -2217,6 +2223,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // (main, extract, and cursor) observes the same ordering contract.
         scrollOffsetData.sort { $0.grid_id < $1.grid_id }
 
+        // The parameter is shadowed by the pruning snapshot below; keep the
+        // input infos reachable for the per-entry log line.
+        let offsetInfos = offsets
         // A retained row is only meaningful while its grid is displaced: with
         // no offset it would be drawn one row above real content.
         let offsets = scrollOffsetData
@@ -2226,14 +2235,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
             let retained = retention.publishedCount(gridId: gid)
-            guard retained > 0, cellHeightNDC > 0 else { continue }
-            if ScrollRetention.coversBand(
+            if retained > 0, cellHeightNDC > 0, ScrollRetention.coversBand(
                 retainedRows: retained,
                 offsetNDC: scrollOffsetData[i].offset_y,
                 cellHeightNDC: cellHeightNDC
             ) {
                 scrollOffsetData[i].pin_edges = 0
             }
+            // Logged AFTER the pin decision so pin/retained carry the values
+            // a frame actually renders with — the GUI harness derives the
+            // margin band and asserts retained-row band coverage from these
+            // fields, mirroring the [ExternalGridView] scroll offset line.
+            let info = offsetInfos.first { $0.gridId == gid }
+            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(gid) offsetYPx=\(info?.offsetYPx ?? 0) marginTop=\(info?.marginTop ?? 0) marginBottom=\(info?.marginBottom ?? 0) ndc=\(scrollOffsetData[i].offset_y) top=\(scrollOffsetData[i].content_top_y) bot=\(scrollOffsetData[i].content_bottom_y) pin=\(scrollOffsetData[i].pin_edges) retained=\(retained) gridTop=\(info?.gridTopYNDC ?? 0) cellNDC=\(cellHeightNDC) vpH=\(drawableHeight)")
         }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
@@ -2349,10 +2363,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
             (view as? MetalTerminalView)?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
         }
-        // Skip all rendering for minimized windows.
+        // Skip all rendering while this window is not on screen.
         // Metal's currentDrawable blocks/crashes when the window is in the
         // Dock, and onPreDraw accesses the Zig core (unnecessary CPU work).
-        if let window = view.window, window.isMiniaturized {
+        // A fully covered window has the same problem for the same reason —
+        // it stops being composited, so its layer never recovers the
+        // drawables it presented — and an animating custom shader keeps
+        // asking for a frame every vsync regardless of visibility.
+        // ExternalGridView.draw carries the same guard, where the block was
+        // first measured at ~1s per attempt.
+        if let window = view.window, window.isMiniaturized || !window.occlusionState.contains(.visible) {
+            // Drain the scroll clears anyway. They are appended from the core
+            // thread as grid_scroll arrives and are drained ONLY from inside
+            // draw(), so skipping the draw makes the queue append-only for as
+            // long as the window stays hidden. Being miniaturized is a short
+            // user-driven state; being covered is not, and a background
+            // :terminal producing scroll traffic for an hour would leave both
+            // an unbounded array and an O(external x N) scan to pay on the
+            // first frame after the window comes back. This is lock and
+            // dictionary work, not GPU work.
+            (view as? MetalTerminalView)?.processPendingScrollClears()
             (view as? MetalTerminalView)?.didDrawFrame()
             return
         }
@@ -4466,6 +4496,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             defer { lock.unlock() }
             return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime)
         }()
+        // Log the value the shader actually receives, not the one some
+        // upstream stage computed — the two came apart once already, when a
+        // re-projected rect stayed in the staging slot. Emitted only when it
+        // changes, so this stays off the per-frame cost.
+        if ZonvieCore.appLogEnabled, cursorCur != lastLoggedShaderCursor {
+            lastLoggedShaderCursor = cursorCur
+            ZonvieCore.appLog(
+                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3)"
+            )
+        }
         uniforms.iCurrentCursor = cursorCur
         uniforms.iPreviousCursor = cursorPrev
         uniforms.iCurrentCursorColor = cursorCurColor
@@ -4532,6 +4572,50 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         stagedShaderCursor = (rect: rect, color: color, gridId: gridId)
         lock.unlock()
+    }
+
+    /// Re-anchor the shader cursor after the WINDOW that owns it moved.
+    ///
+    /// setCursorShaderState only stages: the value reaches the uniforms when
+    /// a surface commits. A window drag produces no commit, so a freshly
+    /// projected rect would sit in the staging slot and the shader would keep
+    /// burning at the pre-move position. This writes through instead.
+    ///
+    /// It also translates rather than replaces. The cursor did not move
+    /// relative to its text — the window did — so rotating previous/current
+    /// (what evaluateCursorShaderChange does for a real cursor move) would
+    /// fire the cursor-move animation and drag a trail across the screen from
+    /// where the window used to be. Both endpoints shift by the same delta and
+    /// iTimeCursorChange is left alone, so an in-flight trail keeps playing at
+    /// its new location.
+    ///
+    /// Ignored unless `gridId` still owns the shader cursor, so a window that
+    /// no longer has the cursor cannot hijack it by being dragged.
+    func reanchorCursorShaderState(rect: (Float, Float, Float, Float), gridId: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard shaderCursorGridId == gridId else { return }
+        let dx = rect.0 - shaderCursorRawRect.0
+        let dy = rect.1 - shaderCursorRawRect.1
+        guard dx != 0 || dy != 0 else { return }
+        shaderCursorRawRect = rect
+        shaderCursorCurrent = (
+            shaderCursorCurrent.0 + dx,
+            shaderCursorCurrent.1 + dy,
+            shaderCursorCurrent.2,
+            shaderCursorCurrent.3
+        )
+        shaderCursorPrevious = (
+            shaderCursorPrevious.0 + dx,
+            shaderCursorPrevious.1 + dy,
+            shaderCursorPrevious.2,
+            shaderCursorPrevious.3
+        )
+        // A cursor update that arrived during the drag is still waiting for a
+        // commit; move it too, or the commit would undo this re-anchor.
+        if let staged = stagedShaderCursor, staged.gridId == gridId {
+            stagedShaderCursor = (rect: rect, color: staged.color, gridId: staged.gridId)
+        }
     }
 
     /// Hand the staged cursor state to the shader uniforms, together with the
@@ -5345,14 +5429,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             if alreadyRetained { continue }
 
-            let needed = vc * MemoryLayout<Vertex>.stride
-            guard let dstBuf = retention.takeBuffer(needed: needed) else { continue }
-            memcpy(dstBuf.contents(), srcBuf.contents(), needed)
+            // Content cells only, same invariant as the grid_scroll capture
+            // (see copyRetainedScrollableRow). The rows this path can reach
+            // today — full-width, single-grid, no float anchored — happen to
+            // hold only scrollable cells, but that rests on what Neovim
+            // currently reports, not on a check: win_viewport_margins allows
+            // left/right margins on any window, and a margin column retained
+            // whole would land unshifted and unclipped on the margin rows,
+            // exactly the external-float border bug.
+            guard let copied = copyRetainedScrollableRow(
+                retention: retention,
+                srcBuf: srcBuf,
+                vertexCount: vc,
+                gridId: gid,
+                scrollableMask: ZONVIE_DECO_SCROLLABLE
+            ) else { continue }
 
             bracketStagedGrids.insert(gid)
             retention.stage(RetainedScrollRow(
-                buffer: dstBuf,
-                count: vc,
+                buffer: copied.buffer,
+                count: copied.count,
                 gridId: gid,
                 // Its place once this scroll is applied: just outside the
                 // region edge it left through.
@@ -5511,31 +5607,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
         let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : row
 
-        // Content cells only. Counted before a ring slot is taken, because
-        // taking one advances the ring.
-        let scrollable = ZONVIE_DECO_SCROLLABLE
-        let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
-        var kept = 0
-        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
-            kept += 1
-        }
-        guard kept > 0 else { return }
-
         // Read before locking: the accessor takes `lock` itself, which is not
         // recursive.
         let capturedCellHeightPx = cellHeightPx
-        guard let dstBuf = retention.takeBuffer(needed: kept * MemoryLayout<Vertex>.stride) else { return }
-        let dstPtr = dstBuf.contents().bindMemory(to: Vertex.self, capacity: kept)
-        var w = 0
-        for i in 0..<vc where src[i].grid_id == gridId && (src[i].deco_flags & scrollable) != 0 {
-            dstPtr[w] = src[i]
-            w += 1
-        }
+        // Content cells only — see copyRetainedScrollableRow.
+        guard let copied = copyRetainedScrollableRow(
+            retention: retention,
+            srcBuf: srcBuf,
+            vertexCount: vc,
+            gridId: gridId,
+            scrollableMask: ZONVIE_DECO_SCROLLABLE
+        ) else { return }
 
         bracketStagedGrids.insert(gridId)
         retention.stage(RetainedScrollRow(
-            buffer: dstBuf,
-            count: kept,
+            buffer: copied.buffer,
+            count: copied.count,
             gridId: gridId,
             sourceRow: sourceRow,
             targetRow: targetRow,

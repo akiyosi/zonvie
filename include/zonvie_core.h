@@ -20,7 +20,7 @@ typedef struct zonvie_glyph_entry {
     float bbox_origin_px[2];
     float bbox_size_px[2];
     float advance_px;
-    float ascent_px;
+    float ascent_px;             /* baseline offset from the cell top; see zonvie_glyph_bitmap */
     float descent_px;
     uint32_t bytes_per_pixel;    /* 1=grayscale, 3=ClearType RGB, 4=RGBA color (emoji) */
 } zonvie_glyph_entry;
@@ -37,8 +37,12 @@ typedef struct zonvie_glyph_bitmap {
     int32_t  bearing_x;          /* horizontal bearing: pen to left edge (pixels) */
     int32_t  bearing_y;          /* vertical bearing: baseline to top edge (pixels, positive=up) */
     int32_t  advance_26_6;       /* horizontal advance in 26.6 fixed-point */
-    float    ascent_px;          /* font ascent in pixels */
-    float    descent_px;         /* font descent in pixels */
+    float    ascent_px;          /* baseline offset in pixels from the cell top: the core
+                                    places the text baseline at row_top + top_pad + ascent_px.
+                                    Need not equal the font's nominal ascent — the frontend may
+                                    re-balance it so ascent + descent fits the cell height
+                                    (macOS centres the ink box; Windows sends DWrite's ascent). */
+    float    descent_px;         /* font descent in pixels (stored; not used for placement) */
     uint32_t bytes_per_pixel;    /* 1=grayscale (R8), 3=ClearType RGB, 4=RGBA */
 } zonvie_glyph_bitmap;
 
@@ -266,7 +270,10 @@ typedef void (*zonvie_on_guifont_fn)(
 );
 
 /* linespace notification:
-   pixels of extra line spacing (Neovim 'linespace' option). */
+   pixels of extra line spacing (Neovim 'linespace' option). May be negative —
+   Neovim documents negative values for fonts that leave too much room between
+   lines. The value is delivered unclamped; the frontend adds it to the font's
+   cell height and floors the resulting row height at 1px. */
 typedef void (*zonvie_on_linespace_fn)(
     void* ctx,
     int32_t linespace_px
@@ -899,6 +906,14 @@ int64_t zonvie_core_next_msg_timeout_ms(zonvie_core *core);
  * pending" (that is -1, a real answer) -- on -2 the caller should re-arm
  * its timer for a short fixed retry instead of trusting a stale value. */
 int64_t zonvie_core_try_next_msg_timeout_ms(zonvie_core *core);
+
+/* Report whether the pointer rests on a message ext_float window (grid -102 or
+ * -103; any other grid_id is ignored). While hovered the view's auto-hide
+ * countdown is stopped -- the user is reading it, or reaching for its copy
+ * button -- and leaving restarts it at full length.
+ * Both transitions move the earliest pending deadline, so the caller must
+ * re-arm its one-shot timer from zonvie_core_next_msg_timeout_ms afterwards. */
+void zonvie_core_set_msg_hover(zonvie_core *core, int64_t grid_id, int hovered);
 
 /* Enable blur transparency for background (macOS only).
  * When enabled, default background uses semi-transparent alpha for blur effect.

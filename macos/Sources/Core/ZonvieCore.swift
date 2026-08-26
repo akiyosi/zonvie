@@ -1368,6 +1368,27 @@ final class ZonvieCore {
         zonvie_core_tick_msg_throttle(core)
     }
 
+    /// Report pointer enter/exit on a message ext_float window so the core can
+    /// hold its auto-hide countdown while the user reads the message or reaches
+    /// for the copy button.
+    ///
+    /// Deliberately async even though it is already on the main thread: the
+    /// call takes the core's grid lock, and AppKit can drive a tracking-area
+    /// update from inside a core callback that already holds it
+    /// (zonvie_core_tick_msg_throttle fires on_external_window_close and
+    /// on_msg_clear on this thread with the lock held). Hopping to the next
+    /// runloop turn keeps that from self-deadlocking; the queue preserves
+    /// enter/exit order.
+    func setMsgHover(gridId: Int64, hovered: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let core = self.core else { return }
+            zonvie_core_set_msg_hover(core, gridId, hovered ? 1 : 0)
+            // Pausing or resuming moved the earliest deadline, so the one-shot
+            // timer armed for the old one has to be re-armed.
+            self.terminalView?.scheduleMsgTimer()
+        }
+    }
+
     /// Milliseconds until the core's earliest pending msg_show/msg_history
     /// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
     /// timeout is armed. Used to schedule a one-shot tick instead of polling.
@@ -4091,6 +4112,55 @@ final class ZonvieCore {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     }
 
+    /// Content view of the decorated message windows (msg_show / msg_history).
+    ///
+    /// Reports pointer enter/exit so the core can hold the view's auto-hide
+    /// countdown while the user reads the message or reaches for the copy
+    /// button. The tracking area covers the whole container, so moving onto the
+    /// copy button — a subview with its own tracking area — is not an exit.
+    final class MsgHoverContainerView: NSView {
+        var onHoverChange: ((Bool) -> Void)?
+        private var hoverTrackingArea: NSTrackingArea?
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            if let hoverTrackingArea {
+                removeTrackingArea(hoverTrackingArea)
+            }
+            // .activeAlways for the same reason as CopyContentButton: these
+            // windows never become key.
+            let area = NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self
+            )
+            addTrackingArea(area)
+            hoverTrackingArea = area
+            reportPointerIfInside()
+        }
+
+        override func mouseEntered(with event: NSEvent) {
+            onHoverChange?(true)
+        }
+
+        override func mouseExited(with event: NSEvent) {
+            onHoverChange?(false)
+        }
+
+        /// AppKit posts no mouseEntered for an area installed under a pointer
+        /// that never moves, and a message float routinely appears right under
+        /// one. Without this the countdown would run while the user is already
+        /// on the window. Only entry is reported: the core drops the flag
+        /// itself when the view hides.
+        private func reportPointerIfInside() {
+            guard let window else { return }
+            let pointInView = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            if bounds.contains(pointInView) {
+                onHoverChange?(true)
+            }
+        }
+    }
+
     /// Content view of the decorated cmdline window.
     ///
     /// AppKit resolves a drag destination by hit-testing and then walking UP
@@ -4122,6 +4192,25 @@ final class ZonvieCore {
         /// Last grid rows/cols set by applyExternalGridConfig (for exact change detection).
         var lastGridRows: UInt32 = 0
         var lastGridCols: UInt32 = 0
+        /// Stationary-edge anchors detected from the user's live-resize drag.
+        /// When grid_resize snaps the window to a cell-quantized size, the snap
+        /// must keep the edge the user is NOT dragging fixed (default: top-left).
+        var userResizeAnchorsBottom = false
+        var userResizeAnchorsRight = false
+        /// When the most recent live resize ended. The anchors describe one
+        /// gesture, so they expire shortly after it: see anchorsDescribeCurrentGesture.
+        private var liveResizeEndedAt = -Double.greatestFiniteMagnitude
+        /// Previous window frame, used to detect which edges moved during live resize.
+        private var previousFrame: NSRect?
+
+        /// Neovim confirms a drag's final size a few milliseconds after mouse-up,
+        /// so the anchors must outlive the gesture by a short grace period. They
+        /// then expire on their own, keeping them out of later Neovim-driven
+        /// resizes (:resize, <C-w>+, guifont change), which must anchor top-left.
+        /// The window covers the observed ext-grid flush stalls with margin.
+        var anchorsDescribeCurrentGesture: Bool {
+            ProcessInfo.processInfo.systemUptime - liveResizeEndedAt < 0.25
+        }
 
         init(core: ZonvieCore, gridId: Int64, cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
             self.core = core
@@ -4132,12 +4221,26 @@ final class ZonvieCore {
         }
 
         func windowDidResize(_ notification: Notification) {
+            guard let window = notification.object as? NSWindow else { return }
+            let frame = window.frame
+            defer { previousFrame = frame }
+
             // Skip resize callback when window is being resized programmatically
             // (from Neovim grid_resize). Only report back on user-initiated resizes.
             if suppressResizeCallback { return }
 
-            guard let window = notification.object as? NSWindow,
-                  let core = core else { return }
+            if window.inLiveResize, let prev = previousFrame {
+                // The stationary edge is the anchor the programmatic cell-snap
+                // must preserve (macOS coords: minY = bottom edge).
+                let bottomMoved = abs(prev.minY - frame.minY) > 0.5
+                let topMoved = abs(prev.maxY - frame.maxY) > 0.5
+                if topMoved != bottomMoved { userResizeAnchorsBottom = topMoved }
+                let leftMoved = abs(prev.minX - frame.minX) > 0.5
+                let rightMoved = abs(prev.maxX - frame.maxX) > 0.5
+                if leftMoved != rightMoved { userResizeAnchorsRight = leftMoved }
+            }
+
+            guard let core = core else { return }
 
             let scale = window.backingScaleFactor
             let contentSize = window.contentView?.frame.size ?? window.frame.size
@@ -4160,6 +4263,18 @@ final class ZonvieCore {
             if rows > 0 && cols > 0 {
                 ZonvieCore.appLog("[external_window] resize gridId=\(gridId) rows=\(rows) cols=\(cols)")
                 core.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
+            }
+        }
+
+        func windowDidEndLiveResize(_ notification: Notification) {
+            liveResizeEndedAt = ProcessInfo.processInfo.systemUptime
+        }
+
+        func windowDidMove(_ notification: Notification) {
+            // Keep previousFrame fresh so the first live-resize event after a
+            // title-bar drag compares against the post-move frame.
+            if let window = notification.object as? NSWindow {
+                previousFrame = window.frame
             }
         }
 
@@ -4820,16 +4935,25 @@ final class ZonvieCore {
             delegate?.lastGridCols = cols
             delegate?.suppressResizeCallback = true
 
-            // Keep the top-left corner fixed (macOS coords: origin.y + height = top)
+            // Anchor the edge the user is not dragging: default top-left, but a
+            // top-edge drag keeps the bottom fixed and a left-edge drag keeps
+            // the right fixed (macOS coords: origin.y + height = top).
+            // The anchors describe one drag, so they apply while it is running
+            // and to its trailing confirmation; every other resize falls back
+            // to the top-left anchor.
             let oldFrame = window.frame
             let oldTop = oldFrame.origin.y + oldFrame.height
+            let anchorsApply = window.inLiveResize
+                || (delegate?.anchorsDescribeCurrentGesture ?? false)
+            let anchorBottom = anchorsApply && (delegate?.userResizeAnchorsBottom ?? false)
+            let anchorRight = anchorsApply && (delegate?.userResizeAnchorsRight ?? false)
 
             // Use setContentSize approach: compute new frame from desired content rect
             let contentRect = NSRect(x: oldFrame.origin.x, y: 0, width: contentWidth, height: contentHeight)
             let frameRect = window.frameRect(forContentRect: contentRect)
             let newFrame = NSRect(
-                x: oldFrame.origin.x,
-                y: oldTop - frameRect.height,
+                x: anchorRight ? oldFrame.maxX - frameRect.width : oldFrame.origin.x,
+                y: anchorBottom ? oldFrame.origin.y : oldTop - frameRect.height,
                 width: frameRect.width,
                 height: frameRect.height
             )
@@ -6179,6 +6303,12 @@ final class ZonvieCore {
             dropContainer.dropTarget = gridView
             dropContainer.registerForDraggedTypes([.fileURL])
             containerView = dropContainer
+        } else if kind == .msgShow || kind == .msgHistory {
+            let hoverContainer = MsgHoverContainerView(frame: containerFrame)
+            hoverContainer.onHoverChange = { [weak self] hovered in
+                self?.setMsgHover(gridId: gridId, hovered: hovered)
+            }
+            containerView = hoverContainer
         } else {
             containerView = NSView(frame: containerFrame)
         }

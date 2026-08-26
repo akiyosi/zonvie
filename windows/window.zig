@@ -2162,7 +2162,7 @@ pub export fn WndProc(
                 const row_valid_count_snapshot = app.row_valid_count;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
-                const row_h_px_snapshot: u32 = app.cell_h_px + app.linespace_px;
+                const row_h_px_snapshot: u32 = app.rowHeightPx();
                 const scrollbar_alpha_snapshot = app.scrollbar_alpha;
 
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
@@ -4347,7 +4347,7 @@ pub export fn WndProc(
 
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w: u32 = app.cell_w_px;
-                const cell_h: u32 = app.cell_h_px + app.linespace_px;
+                const cell_h: u32 = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
                 if (cell_w == 0 or cell_h == 0) return 0;
 
@@ -4405,7 +4405,7 @@ pub export fn WndProc(
 
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w: u32 = app.cell_w_px;
-                const cell_h: u32 = app.cell_h_px + app.linespace_px;
+                const cell_h: u32 = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
                 if (cell_w == 0 or cell_h == 0) return 0;
 
@@ -4811,6 +4811,18 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie) {
                     external_windows.consumeExternalCreateRetryWake(app, @intCast(wParam));
+                }
+            }
+            return 0;
+        },
+
+        app_mod.WM_APP_MSG_HOVER => {
+            if (getApp(hwnd)) |app| {
+                if (app.corep) |corep| {
+                    app_mod.zonvie_core_set_msg_hover(corep, @intCast(lParam), @intCast(wParam));
+                    // Pausing or resuming moved the earliest deadline, so the
+                    // timer armed for the old one has to be re-armed.
+                    armMsgThrottleTimer(hwnd, app);
                 }
             }
             return 0;
@@ -6208,11 +6220,9 @@ pub export fn WndProc(
                 // Get cell dimensions
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
-                const linespace = app.linespace_px;
+                const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                     @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
@@ -6310,11 +6320,9 @@ pub export fn WndProc(
                 // Get cell dimensions
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
-                const linespace = app.linespace_px;
+                const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                     @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
@@ -6364,11 +6372,9 @@ pub export fn WndProc(
 
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
-                const linespace = app.linespace_px;
+                const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const row_h = cell_h + linespace;
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                     @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
                 else
@@ -6413,11 +6419,9 @@ pub export fn WndProc(
 
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
-                const linespace = app.linespace_px;
+                const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const row_h = cell_h + linespace;
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                     @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
                 else
@@ -6487,11 +6491,9 @@ pub export fn WndProc(
 
                     app.mu.lockUncancelable(core.clock.io());
                     const sc_cell_w = app.cell_w_px;
-                    const sc_cell_h = app.cell_h_px;
-                    const sc_ls = app.linespace_px;
+                    const sc_row_h = app.rowHeightPx();
                     app.mu.unlock(core.clock.io());
 
-                    const sc_row_h = sc_cell_h + sc_ls;
                     const sc_cx: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                         @as(i32, mx) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
                     else
@@ -6645,11 +6647,9 @@ pub export fn WndProc(
                 // Get cell dimensions
                 app.mu.lockUncancelable(core.clock.io());
                 const cell_w = app.cell_w_px;
-                const cell_h = app.cell_h_px;
-                const linespace = app.linespace_px;
+                const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const row_h = cell_h + linespace;
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
                 const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
                     @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
