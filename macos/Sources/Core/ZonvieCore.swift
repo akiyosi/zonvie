@@ -7134,9 +7134,20 @@ final class ZonvieCore {
         }
     }
 
+    // Nothing below this line ever runs. Of the cmdline callbacks the core
+    // dispatches, only on_cmdline_show does; pos, special_char and the three
+    // block ones are never invoked, so these appLog lines have no output to
+    // produce. cmdline state goes into the grid instead (setCmdlinePos,
+    // setCmdlineBlockShow and friends), flush composes it into
+    // CMDLINE_GRID_ID, and it arrives here as an external window like any
+    // other grid — logged core-side on the way through.
+    //
+    // The C struct keeps the slots because removing them would shift every
+    // field after them in zonvie_callbacks; these stay pointed at them so an
+    // empty slot is not mistaken for a missing implementation.
+
     private func onCmdlinePos(pos: UInt32, level: UInt32) {
         ZonvieCore.appLog("[cmdline_pos] pos=\(pos) level=\(level)")
-        // TODO: Implement cmdline cursor position update
     }
 
     private func onCmdlineSpecialChar(c: UnsafePointer<UInt8>?, cLen: Int, shift: Bool, level: UInt32) {
@@ -7147,26 +7158,18 @@ final class ZonvieCore {
             charStr = ""
         }
         ZonvieCore.appLog("[cmdline_special_char] c='\(charStr)' shift=\(shift) level=\(level)")
-
-        // TODO: Handle special char display
     }
 
     private func onCmdlineBlockShow(lines: UnsafePointer<zonvie_cmdline_block_line>?, lineCount: Int) {
         ZonvieCore.appLog("[cmdline_block_show] lineCount=\(lineCount)")
-
-        // TODO: Implement cmdline block UI
     }
 
     private func onCmdlineBlockAppend(line: UnsafePointer<zonvie_cmdline_chunk>?, chunkCount: Int) {
         ZonvieCore.appLog("[cmdline_block_append] chunkCount=\(chunkCount)")
-
-        // TODO: Implement cmdline block append
     }
 
     private func onCmdlineBlockHide() {
         ZonvieCore.appLog("[cmdline_block_hide]")
-
-        // TODO: Hide cmdline block
     }
 
     // MARK: - ext_popupmenu callbacks
