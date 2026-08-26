@@ -271,6 +271,22 @@ pub fn build(b: *std.Build) !void {
         run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
         test_step.dependOn(&run_font_cell_fit_test.step);
 
+        // Which of an NSEvent's two character strings a modified key carries.
+        // The rule lived inline in both keyDown handlers and drifted; it is a
+        // pure pick, so it is pinned here rather than left to a GUI run.
+        const compile_key_chars_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_key_chars_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_key_chars_test.addFileArg(b.path("macos/Sources/Core/KeyCharacterSelection.swift"));
+        compile_key_chars_test.addFileArg(b.path("macos/Tests/KeyCharacterSelectionTests.swift"));
+        compile_key_chars_test.addArg("-o");
+        const key_chars_test_exe = compile_key_chars_test.addOutputFileArg("key-character-selection-tests");
+        const run_key_chars_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_key_chars_test.addFileArg(key_chars_test_exe);
+        test_step.dependOn(&run_key_chars_test.step);
+
         // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
         // where they must be drawn, and that staged rows reach the screen only
         // through their own bracket's commit.
