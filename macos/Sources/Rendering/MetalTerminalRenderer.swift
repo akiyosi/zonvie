@@ -3989,8 +3989,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 // [perf] gpu_pass_detail line with the full
                                 // vertex/gap/fragment/total breakdown.
                                 for slot in frameFullSlots {
-                                    let sV = ts[slot.startVIdx].timestamp
-                                    let eV = ts[slot.endVIdx].timestamp
                                     let sF = ts[slot.startFIdx].timestamp
                                     let eF = ts[slot.endFIdx].timestamp
                                     let fragTicks = (eF >= sF) ? Double(eF &- sF) : 0
