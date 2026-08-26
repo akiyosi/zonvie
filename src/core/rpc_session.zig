@@ -641,6 +641,15 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
 
     if (handleRedrawRecoveryResponse(self, id, has_err)) return;
 
+    // ext_images negotiation. An error means this Neovim has no such UI option,
+    // which is not a failure: the UI stays attached without image events.
+    if (self.ext_images_msgid != 0 and id == self.ext_images_msgid) {
+        self.ext_images_msgid = 0;
+        self.ext_images_active.store(!has_err, .release);
+        self.log.write("[images] ext_images active={any}\n", .{!has_err});
+        return;
+    }
+
     if (has_err) {
         self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
         // Clear quit_request_msgid if this was a failed quit request
@@ -1683,6 +1692,9 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             flush.FlushCtx.onDefaultColors,
             flush.FlushCtx.onRestart,
             flush.FlushCtx.onConnect,
+            flush.FlushCtx.onImageData,
+            flush.FlushCtx.onImageSet,
+            flush.FlushCtx.onImageDel,
         ) catch |re| {
             self.log.write("redraw err: {any}\n", .{re});
             redraw_error = re;

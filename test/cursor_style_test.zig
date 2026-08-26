@@ -27,6 +27,9 @@ const Stub = struct {
     fn onDefaultColors(_: *Stub, _: u32, _: u32) anyerror!void {}
     fn onRestart(_: *Stub, _: []const u8) anyerror!void {}
     fn onConnect(_: *Stub, _: []const u8) anyerror!void {}
+    fn onImageData(_: *Stub, _: i64, _: []const u8) anyerror!void {}
+    fn onImageSet(_: *Stub, _: i64, _: bool, _: i32, _: i32, _: i32, _: i32, _: i32) anyerror!void {}
+    fn onImageDel(_: *Stub, _: i64) anyerror!void {}
 };
 
 const World = struct {
@@ -70,6 +73,9 @@ const World = struct {
             Stub.onDefaultColors,
             Stub.onRestart,
             Stub.onConnect,
+            Stub.onImageData,
+            Stub.onImageSet,
+            Stub.onImageDel,
         );
     }
 };

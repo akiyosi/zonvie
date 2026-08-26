@@ -51,6 +51,10 @@ final class ZonvieCore {
     private static var instanceCounter = 0
     private static func nextInstanceId() -> Int { instanceCounter += 1; return instanceCounter }
 
+    /// Images transmitted by ext_images. Shared with the core thread, which
+    /// decodes into it and rasterizes virtual-placement tiles out of it.
+    let imageStore = ExtImageStore()
+
     // Wire this from ViewController.
     weak var terminalView: MetalTerminalView? {
         didSet {
@@ -1285,6 +1289,41 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onMainGridSize(rows: rows, cols: cols)
+            },
+            on_image_data: { ctx, id, bytes, len in
+                guard let ctx, let bytes else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Decode on the core thread: the same flush may rasterize a
+                // tile of this image before a main-thread hop would run.
+                me.imageStore.setImage(id: id, data: Data(bytes: bytes, count: Int(len)))
+                me.notifyImageOverlayChanged()
+            },
+            on_image_set: { ctx, id, virtualPlacement, row, col, width, height, zindex in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                if virtualPlacement != 0 {
+                    // Virtual placements are drawn by the core from the grid's
+                    // placeholder cells, so the overlay must forget this image.
+                    me.imageStore.clearDirectPlacement(id: id)
+                } else {
+                    me.imageStore.setDirectPlacement(id: id, row: row, col: col, width: width, height: height, zindex: zindex)
+                }
+                me.notifyImageOverlayChanged()
+            },
+            on_image_del: { ctx, id in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.imageStore.remove(id: id)
+                me.notifyImageOverlayChanged()
+            },
+            on_rasterize_image_tile: { ctx, id, tileRow, tileCol, tileRows, tileCols, pxW, pxH, outBitmap in
+                guard let ctx, let outBitmap else { return 0 }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                return me.imageStore.rasterizeTile(
+                    id: id, tileRow: tileRow, tileCol: tileCol,
+                    tileRows: tileRows, tileCols: tileCols,
+                    pxW: pxW, pxH: pxH, outBitmap: outBitmap
+                ) ? 1 : 0
             }
         )
 
@@ -1323,6 +1362,21 @@ final class ZonvieCore {
         guard let core else { return }
         zonvie_core_set_ext_popupmenu(core, enabled ? 1 : 0)
         ZonvieCore.appLog("[ZonvieCore] setExtPopupmenu(\(enabled))")
+    }
+
+    /// Drop ext_images state on a session swap. Neovim never retransmits image
+    /// data, so anything kept here would be drawn for a new session that has no
+    /// such image — and the core clears its own half in resetProtocolState.
+    func resetImagesForNewSession() {
+        imageStore.reset()
+        notifyImageOverlayChanged()
+    }
+
+    /// Repaint the direct-placement overlay after an image event.
+    func notifyImageOverlayChanged() {
+        DispatchQueue.main.async { [weak self] in
+            self?.terminalView?.imageOverlayNeedsDisplay()
+        }
     }
 
     /// Enable ext_messages UI extension. Must be called before start().
@@ -3787,6 +3841,7 @@ final class ZonvieCore {
     /// only signal a frontend gets that nvim swapped underneath.
     fileprivate func handleRestartEvent(listenAddr: String) {
         advanceExternalWindowSessionGeneration()
+        resetImagesForNewSession()
         ZonvieCore.appLog("restart: reconnecting to listen_addr=\(listenAddr)")
     }
 
@@ -3795,6 +3850,7 @@ final class ZonvieCore {
     /// server keeps running headless instead of dying.
     fileprivate func handleConnectEvent(serverAddr: String) {
         advanceExternalWindowSessionGeneration()
+        resetImagesForNewSession()
         ZonvieCore.appLog("connect: hot-swap to server_addr=\(serverAddr)")
     }
 

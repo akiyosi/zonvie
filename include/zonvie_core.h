@@ -839,6 +839,28 @@ typedef struct zonvie_callbacks {
        blocking window work inline (post/dispatch to the UI thread instead).
        Appended at the end for ABI compat. */
     void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
+
+    /* ext_images callbacks. Appended for ABI compatibility with callers that
+       pass a smaller callbacks_size. PNG bytes are valid only for the callback. */
+    void (*on_image_data)(void* ctx, int64_t id, const uint8_t* data, size_t data_len);
+    /* width/height are cell extents, or -1 when omitted for a direct placement. */
+    void (*on_image_set)(void* ctx, int64_t id, int virtual_placement,
+                         int32_t row, int32_t col, int32_t width, int32_t height,
+                         int32_t zindex);
+    void (*on_image_del)(void* ctx, int64_t id);
+    /* Rasterize one cell-sized tile of a virtual placement. The tile grid is
+       tile_rows x tile_cols cells; (tile_row, tile_col) is the 0-based tile to
+       draw, scaled into a px_w x px_h RGBA8 bitmap. Fill out_bitmap the same
+       way on_rasterize_glyph does. As there, the pixels stay owned by the
+       frontend and must remain valid until the NEXT on_rasterize_image_tile
+       call: the core reads them after this call returns, uploading them into
+       the atlas before it asks for another tile. Return 1 on success, 0 to
+       skip the tile. */
+    int (*on_rasterize_image_tile)(void* ctx, int64_t id,
+                                   uint16_t tile_row, uint16_t tile_col,
+                                   uint16_t tile_rows, uint16_t tile_cols,
+                                   uint32_t px_w, uint32_t px_h,
+                                   zonvie_glyph_bitmap* out_bitmap);
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -873,6 +895,13 @@ void zonvie_core_set_ext_cmdline(zonvie_core *core, int enabled);
 /* Enable ext_popupmenu UI extension (must call before zonvie_core_start).
  * When enabled, popup menu events are sent to frontend callbacks. */
 void zonvie_core_set_ext_popupmenu(zonvie_core *core, int enabled);
+
+/* ext_images is ENABLED by default whenever the frontend wired on_image_set or
+ * on_rasterize_image_tile: the core negotiates it with nvim_ui_set_option after
+ * attaching, so a Neovim without the option simply answers with an error and
+ * the UI stays attached. Call this with 0 to opt out. Must precede
+ * zonvie_core_start. */
+void zonvie_core_set_ext_images(zonvie_core *core, int enabled);
 
 /* Enable ext_messages UI extension (must call before zonvie_core_start).
  * When enabled, message events are sent to frontend callbacks instead of

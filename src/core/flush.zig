@@ -16,6 +16,7 @@ const Logger = @import("log.zig").Logger;
 const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const vertexgen = @import("vertexgen.zig");
+const image_placeholder = @import("image_placeholder.zig");
 const block_elements = @import("block_elements.zig");
 const shelf_packer = @import("shelf_packer.zig");
 
@@ -1861,6 +1862,95 @@ fn shapeClustersValid(clusters: []const u32, glyph_count: usize, scalar_count: u
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
+/// Emit one atlas-backed quad per virtual-image placeholder cell in this row,
+/// blanking each such cell so the glyph passes ignore it.
+///
+/// Only cells whose image has a known virtual placement are consumed; per the
+/// ui-images contract a UI ignores placements for ids it never received, and a
+/// placeholder for an unknown id then just renders as its (blank) cell.
+fn emitImagePlaceholderTiles(
+    core: *Core,
+    rc: *RenderCells,
+    p: RowGenParams,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+    r: u32,
+    cols: u32,
+    cellW: f32,
+    cellH: f32,
+    vw: f32,
+    vh: f32,
+) !void {
+    const px_w: u32 = @intFromFloat(@max(1.0, @round(cellW)));
+    const px_h: u32 = @intFromFloat(@max(1.0, @round(cellH)));
+    try core.ensureImageBlankCols(cols);
+
+    var col: u32 = 0;
+    while (col < cols) : (col += 1) {
+        if (rc.scalars.items[@intCast(col)] != image_placeholder.PLACEHOLDER_CP) continue;
+
+        const extras = getOverflowForCell(core, rc, r, col);
+
+        // The cell is a placeholder whatever happens next: blank it, and hide
+        // its diacritics, so a missing image never leaves a tofu box or stray
+        // combining marks behind.
+        rc.scalars.items[@intCast(col)] = 32;
+        core.image_blank_cols.set(col);
+
+        const tile_extras = extras orelse continue;
+        // Kitty allows a third diacritic carrying the image id's most
+        // significant byte; Neovim's ids are 24-bit (vim.ui.img._util
+        // generate_id), so the foreground colour always holds the whole id.
+        if (tile_extras.len < 2) continue;
+        const tile_row = image_placeholder.decode(tile_extras[0]) orelse continue;
+        const tile_col = image_placeholder.decode(tile_extras[1]) orelse continue;
+
+        // Neovim encodes the image id in the cell's foreground colour. A
+        // `reverse` attribute composed over the cell (incsearch, a reverse-styled
+        // Visual or CursorLine) is resolved into swapped fg/bg before row_cells,
+        // which would hide the id in bg. Both reads are safe here because the
+        // cell is already known to be a placeholder: for such a cell the id is
+        // in exactly one of the two, and only a registered placement is used.
+        var id: i64 = @intCast(rc.fg_rgbs.items[@intCast(col)] & 0xFFFFFF);
+        var extent = core.virtualImageGrid(id);
+        if (extent == null) {
+            id = @intCast(rc.bg_rgbs.items[@intCast(col)] & 0xFFFFFF);
+            extent = core.virtualImageGrid(id);
+        }
+        const grid_extent = extent orelse continue;
+        if (tile_row >= grid_extent.rows or tile_col >= grid_extent.cols) continue;
+
+        const entry = core.ensureImageTile(
+            id,
+            @intCast(tile_row),
+            @intCast(tile_col),
+            grid_extent,
+            px_w,
+            px_h,
+        ) orelse continue;
+
+        const x0: f32 = @as(f32, @floatFromInt(col)) * cellW;
+        const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
+        const deco: u32 = rc.deco_base_flags.items[@intCast(col)] | c_api.DECO_COLOR_EMOJI;
+        try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
+        VH.pushGlyphQuadAssumeCapacity(
+            out,
+            x0,
+            y0,
+            x0 + cellW,
+            y0 + cellH,
+            .{ entry.uv_min[0], entry.uv_min[1] },
+            .{ entry.uv_max[0], entry.uv_min[1] },
+            .{ entry.uv_min[0], entry.uv_max[1] },
+            .{ entry.uv_max[0], entry.uv_max[1] },
+            VH.rgb(rc.fg_rgbs.items[@intCast(col)]),
+            vw,
+            vh,
+            rc.grid_ids.items[@intCast(col)],
+            deco,
+        );
+    }
+}
+
 pub fn generateRowVertices(
     core: *Core,
     p: RowGenParams,
@@ -2047,6 +2137,23 @@ pub fn generateRowVertices(
     const glyph_keys_id = core.glyph_keys_by_id;
 
     const t_glyph_start: i128 = if (log_enabled) clock.nowNs() else 0;
+    // Virtual ext_images placements are carried by the grid itself: a cell whose
+    // text is U+10EEEE plus two diacritics displays one tile of an image. They
+    // are emitted here, inside the glyph pass, so tiles inherit the layer order,
+    // scroll shift, clipping and dirty-row handling that text already has. The
+    // cells are then blanked in `row_cells` (flush-local scratch) so the shaping
+    // runs below skip them instead of rendering .notdef boxes.
+    //
+    // The scan is gated on the negotiated capability rather than on a live
+    // placement, because a UI that attaches to a running Neovim receives the
+    // placeholder cells of images whose data it never got: those cells must
+    // still be consumed, not shaped.
+    if (core.ext_images_active.load(.acquire)) {
+        try emitImagePlaceholderTiles(core, rc, p, out, r, cols, cellW, cellH, vw, vh);
+    } else if (core.image_blank_cols.bit_length != 0) {
+        // ext_images went away with a restart: stop masking reused cells.
+        core.image_blank_cols.unsetAll();
+    }
     if (has_shaping or ensure_base != null or ensure_styled != null or core.isPhase2Atlas()) {
         var c: u32 = 0;
         while (c < cols) {
@@ -5568,7 +5675,9 @@ pub const FlushCtx = struct {
 
                         // Render cursor text (character under cursor) with inverted color
                         // Only for block cursor and non-space characters
-                        if (@intFromEnum(cursor_out.shape) == 0 and cursor_cp != 0 and cursor_cp != ' ') {
+                        if (@intFromEnum(cursor_out.shape) == 0 and cursor_cp != 0 and cursor_cp != ' ' and
+                            cursor_cp != image_placeholder.PLACEHOLDER_CP)
+                        {
                             // Block element under cursor: geometric rendering
                             if (block_elements.isBlockElement(cursor_cp)) {
                                 const blk_geo = block_elements.getBlockGeometry(cursor_cp);
@@ -5835,6 +5944,10 @@ pub const FlushCtx = struct {
         // of tightening rows under a font that reserves too much room between
         // lines; the frontend keeps the resulting row height positive.
         ctx.core.linespace_px = px;
+        // Image tiles are rasterized to fill the cell box and keyed by it, so a
+        // new row height simply misses. Drop them rather than leave a
+        // generation in the map and the atlas that nothing can hit again.
+        ctx.core.image_tiles.clearRetainingCapacity();
         ctx.core.emitLineSpace(px);
     }
 
@@ -5862,6 +5975,39 @@ pub const FlushCtx = struct {
 
     pub fn onConnect(ctx: *FlushCtx, server_addr: []const u8) !void {
         try ctx.core.handleConnectEvent(server_addr);
+    }
+
+    pub fn onImageData(ctx: *FlushCtx, id: i64, data: []const u8) !void {
+        // Re-transmitting an id replaces the image, so its tiles are stale.
+        ctx.core.purgeImageTiles(id);
+        // Neovim does not resend grid_line when only an image's DATA changed —
+        // the placeholder text is identical — so rows showing this image would
+        // keep their retained vertices and the old pixels. Repaint even when no
+        // tile is cached yet: placeholder cells may already be on screen (blank)
+        // from before the data arrived, and only this event makes them drawable.
+        // Sub_grids get the same treatment as every other full-invalidation
+        // site; markAllDirty alone covers only the main grid.
+        ctx.core.grid.markAllDirty();
+        var sg_it = ctx.core.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.markAllDirty();
+        if (ctx.core.cb.on_image_data) |cb| cb(ctx.core.ctx, id, data.ptr, data.len);
+    }
+
+    pub fn onImageSet(ctx: *FlushCtx, id: i64, virtual_placement: bool, row: i32, col: i32, width: i32, height: i32, zindex: i32) !void {
+        // A virtual placement is drawn from placeholder cells by the core; a
+        // direct one is drawn by the frontend, so it must not stay registered
+        // as virtual when an image switches between the two.
+        if (virtual_placement) {
+            ctx.core.setVirtualImage(id, width, height);
+        } else {
+            ctx.core.clearVirtualImage(id);
+        }
+        if (ctx.core.cb.on_image_set) |cb| cb(ctx.core.ctx, id, @intFromBool(virtual_placement), row, col, width, height, zindex);
+    }
+
+    pub fn onImageDel(ctx: *FlushCtx, id: i64) !void {
+        ctx.core.clearVirtualImage(id);
+        if (ctx.core.cb.on_image_del) |cb| cb(ctx.core.ctx, id);
     }
 };
 
@@ -7145,7 +7291,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
                         if (cell_idx < sg.cells.len) {
                             const cursor_cell = sg.cells[cell_idx];
-                            if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
+                            if (cursor_cell.cp != 0 and cursor_cell.cp != ' ' and
+                                cursor_cell.cp != image_placeholder.PLACEHOLDER_CP)
+                            {
                                 if (block_elements.isBlockElement(cursor_cell.cp)) {
                                     const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
                                     if (eblk_geo.count > 0) {
@@ -10056,6 +10204,10 @@ pub fn hideMsgHistory(self: *Core) void {
 /// First checks the ephemeral float overlay buffer (for ext grid composites),
 /// then falls back to the persistent overflow map.
 pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) ?[]const u32 {
+    // A virtual-image placeholder cell was consumed by the image pass: its
+    // extras are the tile's row/column diacritics, which must never reach the
+    // glyph passes as combining marks over the tile.
+    if (comp_col < core.image_blank_cols.bit_length and core.image_blank_cols.isSet(comp_col)) return null;
     // Check ephemeral float overlay map first (set during ext grid flush).
     // A hit means a float occupies this cell: value non-null = float has overflow,
     // value null = float shadows base (no overflow). Either way, do NOT fall back.
@@ -14480,4 +14632,122 @@ test "a tail longer than the cluster buffer truncates instead of overrunning" {
     const len = buildEmojiCluster(&buf, WOMAN, &long);
     try std.testing.expectEqual(@as(u8, 4), len);
     try std.testing.expectEqualSlices(u32, &.{ WOMAN, ZWJ, LAPTOP, ZWJ }, buf[0..len]);
+}
+
+test "a virtual image placeholder cell renders its tile and no glyph" {
+    const State = struct {
+        var calls: u32 = 0;
+        var tile_row: u16 = 0xFFFF;
+        var tile_col: u16 = 0xFFFF;
+        var pixels = [_]u8{ 255, 0, 0, 255 };
+
+        fn rasterize(
+            _: ?*anyopaque,
+            _: i64,
+            t_row: u16,
+            t_col: u16,
+            _: u16,
+            _: u16,
+            px_w: u32,
+            px_h: u32,
+            out: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            calls += 1;
+            tile_row = t_row;
+            tile_col = t_col;
+            out.* = .{
+                .pixels = &pixels,
+                .width = px_w,
+                .height = px_h,
+                .pitch = @intCast(px_w * 4),
+                .bearing_x = 0,
+                .bearing_y = 0,
+                .advance_26_6 = @intCast(px_w * 64),
+                .ascent_px = 0,
+                .descent_px = 0,
+                .bytes_per_pixel = 4,
+            };
+            return 1;
+        }
+    };
+    State.calls = 0;
+
+    const image_id: i64 = 0x123456;
+    // Row 1, column 0 of the tile grid, per kitty's rowcolumn-diacritics table.
+    const row_diacritic: u32 = 0x030D;
+    const col_diacritic: u32 = 0x0305;
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(1, 1);
+    try core.grid.putCellGridCluster(
+        1,
+        0,
+        0,
+        image_placeholder.PLACEHOLDER_CP,
+        0,
+        &.{ row_diacritic, col_diacritic },
+    );
+    core.cb.on_rasterize_image_tile = State.rasterize;
+    core.ext_images_active.store(true, .release);
+    core.setVirtualImage(image_id, 1, 2);
+    try std.testing.expect(core.virtualImageGrid(image_id) != null);
+
+    try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+    core.row_cells.setLen(1);
+    core.row_cells.set(
+        0,
+        image_placeholder.PLACEHOLDER_CP,
+        @intCast(image_id),
+        0x000000,
+        highlight.Highlights.SP_NOT_SET,
+        1,
+        0,
+        0,
+    );
+    core.row_cells.glow_arr.items[0] = 0;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const stats = try generateRowVertices(&core, .{
+        .row = 0,
+        .cols = 1,
+        .vw = 1,
+        .vh = 1,
+        .cell_w = 1,
+        .cell_h = 1,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+    }, &out);
+
+    try std.testing.expectEqual(@as(u32, 1), State.calls);
+    try std.testing.expectEqual(@as(u16, 1), State.tile_row);
+    try std.testing.expectEqual(@as(u16, 0), State.tile_col);
+    // The glyph pass holds exactly the tile quad: the placeholder scalar and
+    // its diacritics must not have produced a glyph of their own.
+    try std.testing.expectEqual(@as(usize, 6), stats.pass_ends[2] - stats.pass_ends[1]);
+    const quad = out.items[stats.pass_ends[1]..stats.pass_ends[2]];
+    for (quad) |vertex| {
+        try std.testing.expect(vertex.deco_flags & c_api.DECO_COLOR_EMOJI != 0);
+    }
+    // The quad's texture mapping must stay axis-aligned and monotonic: u rises
+    // with x and v falls with y (NDC y points up while v points down). Swapping
+    // two UV corners keeps every corner value present but shears the tile, which
+    // is invisible in a count-only assertion.
+    for (quad) |a| {
+        for (quad) |b| {
+            if (a.position[0] < b.position[0]) try std.testing.expect(a.texCoord[0] <= b.texCoord[0]);
+            if (a.position[1] < b.position[1]) try std.testing.expect(a.texCoord[1] >= b.texCoord[1]);
+        }
+    }
+    // The cell is consumed for the rest of the row's passes.
+    try std.testing.expectEqual(@as(u32, 32), core.row_cells.scalars.items[0]);
+
+    core.clearVirtualImage(image_id);
+    try std.testing.expect(core.virtualImageGrid(image_id) == null);
+    try std.testing.expectEqual(@as(usize, 0), core.image_tiles.count());
 }

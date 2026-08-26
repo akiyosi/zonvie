@@ -52,6 +52,9 @@ const Stub = struct {
     default_colors_calls: u32 = 0,
     restart_calls: u32 = 0,
     connect_calls: u32 = 0,
+    img_data_calls: u32 = 0,
+    img_set_calls: u32 = 0,
+    img_del_calls: u32 = 0,
 
     fn onPreFlush(ctx: *Stub) anyerror!void {
         ctx.pre_flush_calls += 1;
@@ -80,6 +83,15 @@ const Stub = struct {
     }
     fn onConnect(ctx: *Stub, _: []const u8) anyerror!void {
         ctx.connect_calls += 1;
+    }
+    fn onImageData(ctx: *Stub, _: i64, _: []const u8) anyerror!void {
+        ctx.img_data_calls += 1;
+    }
+    fn onImageSet(ctx: *Stub, _: i64, _: bool, _: i32, _: i32, _: i32, _: i32, _: i32) anyerror!void {
+        ctx.img_set_calls += 1;
+    }
+    fn onImageDel(ctx: *Stub, _: i64) anyerror!void {
+        ctx.img_del_calls += 1;
     }
 };
 
@@ -158,6 +170,9 @@ fn runValueTreePath(frame_bytes: []const u8, w: *World) !void {
         Stub.onDefaultColors,
         Stub.onRestart,
         Stub.onConnect,
+        Stub.onImageData,
+        Stub.onImageSet,
+        Stub.onImageDel,
     );
 }
 
@@ -188,6 +203,9 @@ fn runStreamingPath(frame_bytes: []const u8, w: *World) !void {
         Stub.onDefaultColors,
         Stub.onRestart,
         Stub.onConnect,
+        Stub.onImageData,
+        Stub.onImageSet,
+        Stub.onImageDel,
     );
 }
 

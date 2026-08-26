@@ -546,6 +546,11 @@ pub const Callbacks = extern struct {
     // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
     // Appended at the end for ABI compat (see on_restart note).
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    on_image_data: ?*const fn (ctx: ?*anyopaque, id: i64, data: [*]const u8, data_len: usize) callconv(.c) void = null,
+    on_image_set: ?*const fn (ctx: ?*anyopaque, id: i64, virtual_placement: c_int, row: i32, col: i32, width: i32, height: i32, zindex: i32) callconv(.c) void = null,
+    on_image_del: ?*const fn (ctx: ?*anyopaque, id: i64) callconv(.c) void = null,
+    on_rasterize_image_tile: ?*const fn (ctx: ?*anyopaque, id: i64, tile_row: u16, tile_col: u16, tile_rows: u16, tile_cols: u16, px_w: u32, px_h: u32, out_bitmap: *GlyphBitmap) callconv(.c) c_int = null,
 };
 
 pub const zonvie_core = opaque {};
@@ -664,6 +669,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
         // Neovim-initiated main grid resize
         .on_main_grid_size = box.cb.on_main_grid_size,
+        .on_image_data = box.cb.on_image_data,
+        .on_image_set = box.cb.on_image_set,
+        .on_image_del = box.cb.on_image_del,
+        .on_rasterize_image_tile = box.cb.on_rasterize_image_tile,
 
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
@@ -1205,6 +1214,14 @@ pub export fn zonvie_core_set_ext_popupmenu(p: ?*zonvie_core, enabled: i32) call
     const was_enabled = box.core.ext_popupmenu_enabled;
     box.core.ext_popupmenu_enabled = (enabled != 0);
     box.core.log.write("[c_api] zonvie_core_set_ext_popupmenu called: enabled={d} -> ext_popupmenu_enabled={any} (was {any})\n", .{ enabled, box.core.ext_popupmenu_enabled, was_enabled });
+}
+
+/// Enable experimental ext_images UI events. Must be called before start.
+pub export fn zonvie_core_set_ext_images(p: ?*zonvie_core, enabled: i32) callconv(.c) void {
+    if (p == null) return;
+    const box = asBox(p.?);
+    box.core.ext_images_enabled = (enabled != 0);
+    box.core.log.write("[c_api] zonvie_core_set_ext_images: enabled={any}\n", .{box.core.ext_images_enabled});
 }
 
 /// Set glyph cache sizes for performance tuning.
