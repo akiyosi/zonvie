@@ -5575,11 +5575,10 @@ pub const Core = struct {
         rpc_session.handleRpcNotification(self, arena, top);
     }
 
-    /// Compare current external_grids with known_external_grids and notify frontend.
-    /// Returns true if new external grids were added (need forced render).
-
     // --- Forwarding stubs for flush.zig ---
 
+    /// Compare current external_grids with known_external_grids and notify frontend.
+    /// Returns true if new external grids were added (need forced render).
     pub fn notifyExternalWindowChanges(self: *Core) bool {
         return flush.notifyExternalWindowChanges(self);
     }
@@ -5712,10 +5711,9 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
     }
 
-    /// Count UTF-8 codepoints in a string.
-
     // --- Utility forwarding stubs ---
 
+    /// Count UTF-8 codepoints in a string.
     pub fn countUtf8Codepoints(s: []const u8) u32 {
         return flush.countUtf8Codepoints(s);
     }
