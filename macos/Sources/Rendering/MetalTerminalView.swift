@@ -1530,49 +1530,6 @@ final class MetalTerminalView: MTKView {
         // grid_mu acquisition (see its computation before that call).
     }
 
-    // Called from C-ABI callback: ensure glyph exists and return uv/metrics.
-    func atlasEnsureGlyph(scalar: UInt32, out: UnsafeMutablePointer<zonvie_glyph_entry>) -> Bool {
-        guard let e = renderer.atlasEnsureGlyphEntry(scalar: scalar) else { return false }
-
-        out.pointee.uv_min.0 = e.uvMin.x
-        out.pointee.uv_min.1 = e.uvMin.y
-        out.pointee.uv_max.0 = e.uvMax.x
-        out.pointee.uv_max.1 = e.uvMax.y
-
-        out.pointee.bbox_origin_px.0 = e.bboxOriginPx.x
-        out.pointee.bbox_origin_px.1 = e.bboxOriginPx.y
-        out.pointee.bbox_size_px.0 = e.bboxSizePx.x
-        out.pointee.bbox_size_px.1 = e.bboxSizePx.y
-
-        out.pointee.advance_px = e.advancePx
-
-        out.pointee.ascent_px = renderer.ascentPx
-        out.pointee.descent_px = renderer.descentPx
-
-        return true
-    }
-
-    func atlasEnsureGlyphStyled(scalar: UInt32, styleFlags: UInt32, out: UnsafeMutablePointer<zonvie_glyph_entry>) -> Bool {
-        guard let e = renderer.atlasEnsureGlyphEntryStyled(scalar: scalar, styleFlags: styleFlags) else { return false }
-
-        out.pointee.uv_min.0 = e.uvMin.x
-        out.pointee.uv_min.1 = e.uvMin.y
-        out.pointee.uv_max.0 = e.uvMax.x
-        out.pointee.uv_max.1 = e.uvMax.y
-
-        out.pointee.bbox_origin_px.0 = e.bboxOriginPx.x
-        out.pointee.bbox_origin_px.1 = e.bboxOriginPx.y
-        out.pointee.bbox_size_px.0 = e.bboxSizePx.x
-        out.pointee.bbox_size_px.1 = e.bboxSizePx.y
-
-        out.pointee.advance_px = e.advancePx
-
-        out.pointee.ascent_px = renderer.ascentPx
-        out.pointee.descent_px = renderer.descentPx
-
-        return true
-    }
-
     func submitVerticesRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
         cursorPtr: UnsafeRawPointer?, cursorCount: Int

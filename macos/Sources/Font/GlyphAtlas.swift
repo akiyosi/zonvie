@@ -15,22 +15,6 @@ final class GlyphAtlas {
     // across Metal allocation/replace calls.
     private var textureCreateLock = os_unfair_lock()
 
-    struct Entry {
-        let uvMin: SIMD2<Float>
-        let uvMax: SIMD2<Float>
-
-        /// Bounding box of the rendered line in CoreText coordinates (pixels, y-up),
-        /// relative to the baseline at (0, 0). Does NOT include padding.
-        let bboxOriginPx: SIMD2<Float>
-        let bboxSizePx: SIMD2<Float>
-
-        /// Padding applied around bbox in the bitmap.
-        let padPx: Float
-
-        /// Typographic advance in pixels (best-effort; renderer currently uses cell width).
-        let advancePx: Float
-    }
-
     private let device: MTLDevice
     private var font: CTFont
     private var fontName: String
@@ -103,20 +87,11 @@ final class GlyphAtlas {
     private var hbftItalicData: NSData?
     private var hbftBoldItalicData: NSData?
 
-    // --- Fallback font support ---
-    // We must avoid collisions: same glyphID can exist across different fonts.
-    // Key = (fontKey, glyphID)
-    private struct GlyphKey: Hashable {
-        let fontKey: UInt64     // stable ID per hbft font handle (pointer address)
-        let glyphID: UInt32
-    }
-
     private struct HbFtFace {
         let ctFont: CTFont
         let url: URL
         let fontData: NSData
         let hbft: OpaquePointer
-        let key: UInt64
         var accessOrder: UInt64 = 0  // LRU tracking: higher = more recent
     }
 
@@ -150,7 +125,7 @@ final class GlyphAtlas {
     // would silently truncate the pointer's high 32 bits, risking a collision between
     // two concurrently-live CTFont objects (base/bold/italic/fallback all coexist) whose
     // addresses share the same low 32 bits. A struct with Swift's synthesized Hashable
-    // combines both fields without truncation -- same pattern as GlyphKey/FallbackCacheKey above.
+    // combines both fields without truncation -- same pattern as FallbackCacheKey above.
     private struct GlyphIDCacheKey: Hashable {
         let fontKey: UInt64   // pointer address of the CTFont (full 64 bits, not truncated)
         let scalar: UInt32
@@ -173,18 +148,9 @@ final class GlyphAtlas {
         failedScalarCache.insert(key)
     }
 
-    private var nextX: Int = 1
-    private var nextY: Int = 1
-    private var rowH: Int = 0
-
-    // NOTE: cache entries by (font, glyphID), not glyphID only.
-    private var map: [GlyphKey: GlyphAtlas.Entry] = [:]
 
 
 
-
-
-    private var scratch: [UInt8] = []
 
     private struct AtlasDirtyRect {
         var x: Int
@@ -213,15 +179,12 @@ final class GlyphAtlas {
     /// from atlasH to atlasH/zeroClearChunkRows.
     private let zeroClearChunkRows = 128
 
-    /// Separate scratch buffer for rasterizeOnly (Phase 2).
-    /// Must not share with `scratch` which is used by uploadRegion.
+    /// Scratch buffer for rasterizeOnly (Phase 2).
     private var rasterizeScratch: [UInt8] = []
 
     /// Persistent y-advance buffer for shapeTextRun (avoids per-call heap allocation).
     private var shapeYAdvBuf: [Int32] = []
 
-    /// Maximum scratch buffer size (64KB - sufficient for large glyphs/emoji)
-    private let maxScratchSize: Int = 64 * 1024
 
     /// Cell metrics (in drawable pixel coordinates) referenced by the renderer.
     private(set) var cellWidthPx: Float = 9
@@ -903,8 +866,7 @@ final class GlyphAtlas {
     }
 
     /// Evict the least recently used fallback font face to free its font_bytes_owned memory.
-    /// Already-rasterized glyphs in `map` remain valid; only new rasterizations for the
-    /// evicted font will trigger a reload from disk.
+    /// Only new rasterizations for the evicted font will trigger a reload from disk.
     private func evictLRUFallbackFace_locked() {
         guard !fallbackFacesByURL.isEmpty else { return }
         var lruKey: String?
@@ -916,10 +878,6 @@ final class GlyphAtlas {
             }
         }
         if let evictKey = lruKey, let evicted = fallbackFacesByURL.removeValue(forKey: evictKey) {
-            // Remove all map entries referencing the evicted font's key to prevent
-            // stale hits if malloc reuses the same pointer address for a new hbft.
-            let evictedFontKey = evicted.key
-            map = map.filter { $0.key.fontKey != evictedFontKey }
             zonvie_ft_hb_font_destroy(evicted.hbft)
             ZonvieCore.appLog("[Atlas] LRU evict fallback font: \(evicted.url.lastPathComponent) (count=\(fallbackFacesByURL.count))")
         }
@@ -1166,149 +1124,14 @@ final class GlyphAtlas {
         }
 
         fallbackAccessCounter += 1
-        let key = UInt64(UInt(bitPattern: hbft))
         guard let fontData = data else {
             zonvie_ft_hb_font_destroy(hbft)
             failedHbftURLs.insert(urlKey)
             return nil
         }
-        let face = HbFtFace(ctFont: ctFont, url: url, fontData: fontData, hbft: hbft, key: key, accessOrder: fallbackAccessCounter)
+        let face = HbFtFace(ctFont: ctFont, url: url, fontData: fontData, hbft: hbft, accessOrder: fallbackAccessCounter)
         fallbackFacesByURL[urlKey] = face
         return face
-    }
-
-    func entry(for scalar: UInt32) -> GlyphAtlas.Entry? {
-        os_unfair_lock_lock(&mu)
-        defer { os_unfair_lock_unlock(&mu) }
-
-        // Check if this scalar already failed (avoid repeated expensive lookups)
-        let failKey = UInt64(scalar) // styleFlags=0 for base entry
-        if failedScalarCache.contains(failKey) {
-            return nil
-        }
-
-        let scalarChar = ZonvieCore.appLogEnabled ? (UnicodeScalar(scalar).map { String($0) } ?? "?") : ""
-
-        // 1) Try base font first
-        if let gid = glyphID(in: font, scalar: scalar) {
-            guard let baseHbft = hbftFont else {
-                ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): base hbft is nil")
-                insertFailedScalar_locked(failKey)
-                return nil
-            }
-            let k = GlyphKey(fontKey: UInt64(UInt(bitPattern: baseHbft)), glyphID: gid)
-            let e = entry_forKey_locked(k, hbft: baseHbft, glyphID: gid)
-            return e
-        }
-
-        // 2) Fallback via CoreText
-        guard let fbCT = ctFontForScalarFallback(base: font, scalar: scalar) else {
-            ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): no fallback font")
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-        guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
-            ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): fallback font has no glyph")
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-        guard let face = ensureHbFtFace_locked(for: fbCT) else {
-            ZonvieCore.appLog("[Atlas] entry(scalar=\(scalar) '\(scalarChar)'): failed to create hbft face")
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-
-        let k = GlyphKey(fontKey: face.key, glyphID: fbGid)
-        let e = entry_forKey_locked(k, hbft: face.hbft, glyphID: fbGid)
-        return e
-    }
-
-    /// Get glyph entry with style flags (bold/italic).
-    /// styleFlags: ZONVIE_STYLE_BOLD (1 << 0), ZONVIE_STYLE_ITALIC (1 << 1)
-    func entry(for scalar: UInt32, styleFlags: UInt32) -> GlyphAtlas.Entry? {
-        // If no style flags, use base font
-        if styleFlags == 0 {
-            return entry(for: scalar)
-        }
-
-        os_unfair_lock_lock(&mu)
-        defer { os_unfair_lock_unlock(&mu) }
-
-        // Check if this scalar+style already failed (avoid repeated expensive lookups)
-        let failKey = (UInt64(styleFlags) << 32) | UInt64(scalar)
-        if failedScalarCache.contains(failKey) {
-            return nil
-        }
-
-        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
-        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
-
-        // Select appropriate font variant and hbft handle
-        let (selectedFont, selectedHbft): (CTFont?, OpaquePointer?) = {
-            if isBold && isItalic {
-                return (boldItalicFont ?? boldFont ?? italicFont, hbftBoldItalic ?? hbftBold ?? hbftItalic)
-            } else if isBold {
-                return (boldFont, hbftBold)
-            } else if isItalic {
-                return (italicFont, hbftItalic)
-            } else {
-                return (font, hbftFont)
-            }
-        }()
-
-        // Fall back to base font if variant is not available
-        let fontToUse = selectedFont ?? font
-        let hbftToUse = selectedHbft ?? hbftFont
-
-        guard let hbft = hbftToUse else {
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-
-        // Try to get glyph from selected font
-        if let gid = glyphID(in: fontToUse, scalar: scalar) {
-            let k = GlyphKey(fontKey: UInt64(UInt(bitPattern: hbft)), glyphID: gid)
-            return entry_forKey_locked(k, hbft: hbft, glyphID: gid)
-        }
-
-        // Fall back to base font if glyph not found in variant
-        if fontToUse !== font, let baseHbft = hbftFont, let gid = glyphID(in: font, scalar: scalar) {
-            let k = GlyphKey(fontKey: UInt64(UInt(bitPattern: baseHbft)), glyphID: gid)
-            return entry_forKey_locked(k, hbft: baseHbft, glyphID: gid)
-        }
-
-        // Try fallback fonts
-        guard let fbCT = ctFontForScalarFallback(base: fontToUse, scalar: scalar) else {
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-        guard let fbGid = glyphID(in: fbCT, scalar: scalar) else {
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-        guard let face = ensureHbFtFace_locked(for: fbCT) else {
-            insertFailedScalar_locked(failKey)
-            return nil
-        }
-
-        let k = GlyphKey(fontKey: face.key, glyphID: fbGid)
-        return entry_forKey_locked(k, hbft: face.hbft, glyphID: fbGid)
-    }
-
-    func entry(forGlyphID glyphID: UInt32) -> GlyphAtlas.Entry? {
-        os_unfair_lock_lock(&mu)
-        defer { os_unfair_lock_unlock(&mu) }
-    
-        guard let baseHbft = hbftFont else { return nil }
-        let k = GlyphKey(fontKey: UInt64(UInt(bitPattern: baseHbft)), glyphID: glyphID)
-        return entry_forKey_locked(k, hbft: baseHbft, glyphID: glyphID)
-    }
-    
-    private func entry_forKey_locked(_ key: GlyphKey, hbft: OpaquePointer, glyphID: UInt32) -> GlyphAtlas.Entry? {
-        if let e = map[key] { return e }
-        guard let e = rasterizeAndPack(hbft: hbft, glyphID: glyphID) else { return nil }
-        map[key] = e
-        return e
     }
 
     // Convert a Unicode scalar to UTF-16 code units (1 or 2 units).
@@ -1430,11 +1253,7 @@ final class GlyphAtlas {
 
     private func resetAtlas_locked() {
         let bi = 1 - frontIndex
-        ZonvieCore.appLog("[Atlas] RESET! map.count=\(map.count) nextY=\(nextY)/\(atlasH)")
-        map.removeAll(keepingCapacity: true)
-        nextX = 1
-        nextY = 1
-        rowH = 0
+        ZonvieCore.appLog("[Atlas] RESET!")
         textures[bi] = nil
         pendingTextureRecreate = (index: bi, width: atlasW, height: atlasH)
         needsAtlasRebuild = true
@@ -1484,152 +1303,6 @@ final class GlyphAtlas {
             }
         }
         return tex
-    }
-
-    private func rasterizeAndPack(hbft: OpaquePointer, glyphID: UInt32) -> Entry? {
-        guard let tex = textures[1 - frontIndex] else { return nil }
-
-        var bufPtr: UnsafePointer<UInt8>?
-        var w: Int32 = 0
-        var h: Int32 = 0
-        var pitch: Int32 = 0
-        var left: Int32 = 0
-        var top: Int32 = 0
-        var adv26_6: Int32 = 0
-        var bpp: Int32 = 1
-
-        let r = zonvie_ft_render_glyph_color(
-            hbft,
-            glyphID,
-            &bufPtr,
-            &w,
-            &h,
-            &pitch,
-            &left,
-            &top,
-            &adv26_6,
-            &bpp
-        )
-
-        let advancePx = Float(adv26_6) / 64.0
-
-        // Whitespace etc: nothing to pack/upload.
-        if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
-            return Entry(
-                uvMin: .zero,
-                uvMax: .zero,
-                bboxOriginPx: SIMD2<Float>(Float(left), Float(top - h)),
-                bboxSizePx: SIMD2<Float>(Float(max(Int32(0), w)), Float(max(Int32(0), h))),
-                padPx: 0,
-                advancePx: advancePx
-            )
-        }
-
-        let pad: Int = 1
-        let iw = Int(w)
-        let ih = Int(h)
-        let ipitch = Int(pitch)
-        let ibpp = Int(bpp)
-
-        let packedW = iw + pad * 2
-        let packedH = ih + pad * 2
-
-        // Allocate atlas rect (simple shelf packer).
-        if nextX + packedW > atlasW {
-            nextX = 1
-            nextY += rowH
-            rowH = 0
-        }
-        if nextY + packedH > atlasH {
-            // Atlas full: reset once and continue packing into a fresh atlas.
-            resetAtlas_locked()
-        }
-
-        let rectX = nextX
-        let rectY = nextY
-        nextX += packedW
-        rowH = max(rowH, packedH)
-
-        // Copy FT bitmap into a padded RGBA buffer (top-left origin for texture upload).
-        let neededCount = packedW * packedH * 4  // RGBA = 4 bytes per pixel
-
-        // Guard against extremely large glyphs that would exhaust memory
-        if neededCount > maxScratchSize {
-            ZonvieCore.appLog("[GlyphAtlas] Glyph too large: \(packedW)x\(packedH) = \(neededCount) bytes (max \(maxScratchSize))")
-            return nil
-        }
-
-        // Shrink buffer if it's grown too large (> 4x needed and > half max)
-        let shouldShrink = scratch.count > neededCount * 4 && scratch.count > maxScratchSize / 2
-        if scratch.count < neededCount || shouldShrink {
-            scratch = Array<UInt8>(repeating: 0, count: neededCount)
-        } else {
-            scratch.withUnsafeMutableBufferPointer { buf in
-                guard let base = buf.baseAddress else { return }
-                memset(base, 0, neededCount)
-            }
-        }
-
-        scratch.withUnsafeMutableBufferPointer { dst in
-            guard let dstBase = dst.baseAddress else { return }
-            guard let srcBase = bufPtr else { return }  // Safe unwrap
-
-            if ibpp == 4 {
-                // BGRA color bitmap (emoji) → convert to RGBA
-                for row in 0..<ih {
-                    let src = srcBase.advanced(by: row * ipitch)
-                    let dstRow = dstBase.advanced(by: (row + pad) * packedW * 4 + pad * 4)
-                    for col in 0..<iw {
-                        let si = col * 4
-                        let di = col * 4
-                        dstRow[di + 0] = src[si + 2]  // R ← B
-                        dstRow[di + 1] = src[si + 1]  // G ← G
-                        dstRow[di + 2] = src[si + 0]  // B ← R
-                        dstRow[di + 3] = src[si + 3]  // A ← A
-                    }
-                }
-            } else {
-                // Grayscale → expand to RGBA (coverage in all channels)
-                for row in 0..<ih {
-                    let src = srcBase.advanced(by: row * ipitch)
-                    let dstRow = dstBase.advanced(by: (row + pad) * packedW * 4 + pad * 4)
-                    for col in 0..<iw {
-                        let gray = src[col]
-                        let di = col * 4
-                        dstRow[di + 0] = gray  // R
-                        dstRow[di + 1] = gray  // G
-                        dstRow[di + 2] = gray  // B
-                        dstRow[di + 3] = gray  // A (coverage)
-                    }
-                }
-            }
-        }
-
-        // Upload to RGBA texture.
-        scratch.withUnsafeBytes { raw in
-            guard let baseAddr = raw.baseAddress else { return }
-            let region = MTLRegionMake2D(rectX, rectY, packedW, packedH)
-            tex.replace(region: region, mipmapLevel: 0, withBytes: baseAddr, bytesPerRow: packedW * 4)
-        }
-    
-        // UV excludes padding.
-        let u0 = Float(rectX + pad) / Float(atlasW)
-        let v0 = Float(rectY + pad) / Float(atlasH)
-        let u1 = Float(rectX + pad + iw) / Float(atlasW)
-        let v1 = Float(rectY + pad + ih) / Float(atlasH)
-    
-        // bbox in CoreText coords (pixels, y-up) relative to baseline at (0,0)
-        let bboxOrigin = SIMD2<Float>(Float(left), Float(top - h))
-        let bboxSize = SIMD2<Float>(Float(w), Float(h))
-    
-        return Entry(
-            uvMin: SIMD2<Float>(u0, v0),
-            uvMax: SIMD2<Float>(u1, v1),
-            bboxOriginPx: bboxOrigin,
-            bboxSizePx: bboxSize,
-            padPx: Float(pad),
-            advancePx: advancePx
-        )
     }
 
     // MARK: - Phase 2: Core-managed atlas
@@ -2428,11 +2101,6 @@ final class GlyphAtlas {
                 if let base = raw.baseAddress { memset(base, 0, raw.count) }
             }
         }
-        // Reset local packer state (core manages packing in Phase 2)
-        nextX = 1
-        nextY = 1
-        rowH = 0
-        map.removeAll(keepingCapacity: true)
         failedScalarCache.removeAll(keepingCapacity: true)
         atlasModified = true
         flushHadRecreate = true
