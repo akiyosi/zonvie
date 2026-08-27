@@ -13,9 +13,13 @@ using namespace metal;
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
+// Block elements the core fills geometrically. They are foreground text, so
+// they belong in the glyph pass at full alpha like any other glyph, not in
+// the background pass where backgroundAlpha would fade them.
+#define DECO_SOLID_GLYPH   (1u << 11)
 
 // Mask for visual decoration flags (excludes transport-only flags like SCROLLABLE)
-#define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE)
+#define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE | DECO_SOLID_GLYPH)
 
 struct VertexIn {
     float2 position [[attribute(0)]];

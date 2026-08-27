@@ -2533,7 +2533,7 @@ pub fn generateRowVertices(
                                         const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                         try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                         for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                            VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                            VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                         }
                                     }
                                     penX += blk_w;
@@ -2653,7 +2653,7 @@ pub fn generateRowVertices(
                                     const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                     try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                        VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                     }
                                 }
                                 penX += blk_w;
@@ -2940,7 +2940,7 @@ pub fn generateRowVertices(
                                 const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                 try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                 for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
+                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                 }
                             }
                             penX += cellW;
@@ -14476,4 +14476,77 @@ test "a tail longer than the cluster buffer truncates instead of overrunning" {
     const len = buildEmojiCluster(&buf, WOMAN, &long);
     try std.testing.expectEqual(@as(u8, 4), len);
     try std.testing.expectEqualSlices(u32, &.{ WOMAN, ZWJ, LAPTOP, ZWJ }, buf[0..len]);
+}
+
+test "a block element in normal text is marked as foreground, not background" {
+    // U+2588 FULL BLOCK is filled geometrically rather than rasterized, so it
+    // reaches the frontend as a solid quad. Without a flag saying it is text,
+    // the shader takes it for a background cell and fades it to the window's
+    // background alpha under blur, while the glyphs beside it stay opaque.
+    const State = struct {
+        solid_glyph_quads: u32 = 0,
+        unflagged_solid_quads: u32 = 0,
+
+        // The glyph pass only runs when the frontend offers some way to
+        // resolve a glyph. Block elements never reach it, but the gate is
+        // upstream of them.
+        fn ensure(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            out_entry: ?*c_api.GlyphEntry,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = out_entry;
+            return 0;
+        }
+
+        fn onVertices(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const verts = main_verts orelse return;
+            for (verts[0..main_count]) |v| {
+                // texCoord.x < 0 marks a solid quad; an atlas glyph carries a UV.
+                if (v.texCoord[0] >= 0) continue;
+                if ((v.deco_flags & c_api.DECO_SOLID_GLYPH) != 0) {
+                    self.solid_glyph_quads += 1;
+                } else {
+                    self.unflagged_solid_quads += 1;
+                }
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 2);
+    core.grid.putCell(0, 0, 0x2588, 0); // FULL BLOCK
+    core.grid.putCell(0, 1, ' ', 0); // plain background cell, for contrast
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_atlas_ensure_glyph = State.ensure;
+    core.cb.on_vertices_partial = State.onVertices;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 2);
+
+    // The block element produced solid quads and every one of them is flagged.
+    try std.testing.expect(state.solid_glyph_quads > 0);
+    // The blank cell's background quad must NOT be flagged, or the frontend
+    // would stop fading real backgrounds under a translucent window.
+    try std.testing.expect(state.unflagged_solid_quads > 0);
 }
