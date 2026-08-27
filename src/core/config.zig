@@ -45,6 +45,19 @@ pub const atlas_size_min: u32 = 1024;
 pub const atlas_size_max: u32 = 4096;
 pub const atlas_size_default: u32 = 2048;
 
+// Glyph cache size limits, shared by the TOML parser and Core.setGlyphCacheSize
+// so both entry points agree. Upper bounds matter as much as lower ones here:
+// these sizes reach a u32 -> i32 cast on the way out over the C ABI, and they
+// size two heap tables each, so an unclamped value from config.toml is a
+// startup crash or a multi-gigabyte allocation rather than a bad setting.
+pub const glyph_cache_ascii_min: u32 = 128;
+// 128 ASCII codepoints x 4 style combinations. Entries past that are
+// allocated but never addressed -- see the cache_key bound in flush.zig.
+pub const glyph_cache_ascii_max: u32 = 512;
+pub const glyph_cache_non_ascii_min: u32 = 64;
+// 16x the default, ~29MB across this and the same-sized by-ID table.
+pub const glyph_cache_non_ascii_max: u32 = 262144;
+
 /// Post-process insertion point for user-supplied custom shaders.
 pub const ShaderPostProcess = enum(u8) {
     after_bloom = 0, // custom shader runs after bloom composite (default)
@@ -513,8 +526,8 @@ pub const Config = struct {
         }
 
         if (cfg.performance) |p| {
-            if (p.glyph_cache_ascii_size) |s| self.performance.glyph_cache_ascii_size = @max(128, s);
-            if (p.glyph_cache_non_ascii_size) |s| self.performance.glyph_cache_non_ascii_size = @max(64, s);
+            if (p.glyph_cache_ascii_size) |s| self.performance.glyph_cache_ascii_size = @max(glyph_cache_ascii_min, @min(glyph_cache_ascii_max, s));
+            if (p.glyph_cache_non_ascii_size) |s| self.performance.glyph_cache_non_ascii_size = @max(glyph_cache_non_ascii_min, @min(glyph_cache_non_ascii_max, s));
             if (p.hl_cache_size) |s| self.performance.hl_cache_size = @max(64, @min(2048, s));
             if (p.shape_cache_size) |s| self.performance.shape_cache_size = @max(512, @min(65536, s));
             if (p.atlas_size) |s| self.performance.atlas_size = @max(atlas_size_min, @min(atlas_size_max, s));
@@ -993,4 +1006,33 @@ test "no messages config at all yields the defaults" {
     try std.testing.expectEqual(MsgViewType.ext_float, cfg.routeMessage(.msg_show, "echo", 1).view);
     try std.testing.expectEqual(MsgViewType.split, cfg.routeMessage(.msg_history_show, "", 1).view);
     try std.testing.expectEqual(MsgViewType.confirm, cfg.routeMessage(.msg_show, "confirm", 1).view);
+}
+
+test "an absurd glyph cache size is clamped instead of reaching the i32 cast" {
+    // Unclamped, a value in this range crossed the u32 -> i32 conversion the
+    // C ABI does on the way out and took the process down at startup.
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[performance]
+        \\glyph_cache_ascii_size = 4000000000
+        \\glyph_cache_non_ascii_size = 4000000000
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(glyph_cache_ascii_max, cfg.performance.glyph_cache_ascii_size);
+    try std.testing.expectEqual(glyph_cache_non_ascii_max, cfg.performance.glyph_cache_non_ascii_size);
+    // The point of the clamp: both now survive the cast the ABI performs.
+    try std.testing.expect(cfg.performance.glyph_cache_ascii_size <= std.math.maxInt(i32));
+    try std.testing.expect(cfg.performance.glyph_cache_non_ascii_size <= std.math.maxInt(i32));
+}
+
+test "a glyph cache size below the floor is raised, and a sane one is kept" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[performance]
+        \\glyph_cache_ascii_size = 1
+        \\glyph_cache_non_ascii_size = 32768
+    );
+    defer cfg.deinit();
+
+    try std.testing.expectEqual(glyph_cache_ascii_min, cfg.performance.glyph_cache_ascii_size);
+    try std.testing.expectEqual(@as(u32, 32768), cfg.performance.glyph_cache_non_ascii_size);
 }

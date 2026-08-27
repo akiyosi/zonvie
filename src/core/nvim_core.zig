@@ -3175,9 +3175,11 @@ pub const Core = struct {
 
     /// Set glyph cache sizes (must be called before start or during stop)
     pub fn setGlyphCacheSize(self: *Core, ascii_size: u32, non_ascii_size: u32) void {
-        // Ensure minimum sizes
-        self.glyph_cache_ascii_size = @max(128, ascii_size);
-        self.glyph_cache_non_ascii_size = @max(64, non_ascii_size);
+        // Same bounds the TOML parser applies. This is a separate ABI entry
+        // point, so a frontend reaching it directly must not be able to ask
+        // for a size the config file could not.
+        self.glyph_cache_ascii_size = @max(config.glyph_cache_ascii_min, @min(config.glyph_cache_ascii_max, ascii_size));
+        self.glyph_cache_non_ascii_size = @max(config.glyph_cache_non_ascii_min, @min(config.glyph_cache_non_ascii_max, non_ascii_size));
 
         // If already initialized, need to reinitialize
         if (self.glyph_cache_initialized) {
