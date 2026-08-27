@@ -808,6 +808,11 @@ pub const GridBuf = struct {
         // Keep row metadata lazy for every zero-cell shape. Allocate a fresh
         // bitset before publishing any part of the resize so OOM preserves the
         // previous GridBuf in full.
+        //
+        // Note this leaves `bit_length` at 0 while `rows` is whatever was
+        // asked for, so `bit_length >= rows` is NOT an invariant here the way
+        // it is on Grid (see Grid.ensureDirtyCapacity). Anything reading
+        // `dirty_rows` off a GridBuf has to check `bit_length` first.
         var new_dirty_rows: std.DynamicBitSetUnmanaged = .{};
         errdefer new_dirty_rows.deinit(alloc);
         if (new_len != 0) try new_dirty_rows.resize(alloc, rows, true);
@@ -2050,8 +2055,17 @@ pub const Grid = struct {
         return .{ .cp = 0, .hl = 0 };
     }
 
+    /// Grow `dirty_rows` to cover `rows`, leaving new bits clean.
+    ///
+    /// `Grid.resize` calls this unconditionally, which is what lets readers
+    /// index `dirty_rows` by row without a length check first:
+    /// `bit_length >= rows` holds for the global grid at all times. `GridBuf`
+    /// gives no such guarantee — it skips the bitset entirely for a zero-cell
+    /// shape while still updating `rows` — so its readers do have to test
+    /// `bit_length` before `isSet`.
     pub fn ensureDirtyCapacity(self: *Grid, rows: u32) !void {
-        // Keep bitset length == rows. Initialize new bits as "clean" (false).
+        // Grow only: a shrink leaves the bitset longer than `rows`, which the
+        // `>=` invariant above allows. Initialize new bits as "clean" (false).
         const r: usize = @as(usize, rows);
         if (self.dirty_rows.bit_length >= r) return;
         try self.dirty_rows.resize(self.alloc, r, false);
@@ -4391,6 +4405,38 @@ pub const Grid = struct {
         self.message_state.ruler_dirty = false;
     }
 };
+
+test "the global grid always has a dirty bit per row, a sub-grid may not" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    // Grid.resize goes through ensureDirtyCapacity every time, so readers can
+    // index dirty_rows by row with no length check. Callers in flush.zig rely
+    // on this; if it ever stops holding they index past the bitset.
+    try grid.resize(24, 80);
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    try grid.resize(50, 80); // grow
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    try grid.resize(10, 80); // shrink: the bitset is allowed to stay long
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+
+    // The zero-cell shape needs its own grid. Reaching it after a larger
+    // resize proves nothing: the bitset only ever grows, so a stale length
+    // from an earlier shape would satisfy the assertion on its own.
+    var zero_cols = Grid.init(std.testing.allocator);
+    defer zero_cols.deinit();
+    try zero_cols.resize(30, 0);
+    try std.testing.expectEqual(@as(u32, 30), zero_cols.rows);
+    try std.testing.expect(zero_cols.dirty_rows.bit_length >= zero_cols.rows);
+
+    // GridBuf makes no such promise: a zero-cell shape skips the bitset while
+    // rows keeps the requested value. This is why the sub-grid paths in
+    // flush.zig test bit_length before isSet.
+    try grid.resizeGrid(2, 8, 0);
+    const sub = grid.sub_grids.getPtr(2).?;
+    try std.testing.expectEqual(@as(u32, 8), sub.rows);
+    try std.testing.expectEqual(@as(usize, 0), sub.dirty_rows.bit_length);
+}
 
 test "reopening a clean external grid regenerates every row" {
     var grid = Grid.init(std.testing.allocator);
