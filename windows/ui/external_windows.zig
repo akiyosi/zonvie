@@ -15,6 +15,7 @@ const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const core = @import("zonvie_core");
 const scroll_types = @import("../scroll/types.zig");
 const smooth_session = @import("../scroll/session.zig");
+const external_contract_b = @import("../renderer/external_contract_b.zig");
 
 fn setExternalTransition(app: *App, hwnd: c.HWND, dpi: bool, value: bool) void {
     app.mu.lockUncancelable(core.clock.io());
@@ -44,7 +45,7 @@ fn externalWakeCookie(hwnd: c.HWND) usize {
     return window_mod.windowWakeCookie(hwnd);
 }
 
-fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
+pub fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
     return switch (grid_id) {
         app_mod.CMDLINE_GRID_ID => .cmdline,
         app_mod.POPUPMENU_GRID_ID => .popupmenu,
@@ -480,6 +481,7 @@ fn drawNormalExternalSurface(
     glow_intensity: f32,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
+    contract_b_offset_active: bool,
 ) !bool {
     const log_enabled = applog.isEnabled();
     ext_win.paint_present_rects.clearRetainingCapacity();
@@ -505,6 +507,7 @@ fn drawNormalExternalSurface(
             glow_intensity,
             tbs_snap,
             row_h_px_snapshot,
+            contract_b_offset_active,
             restored_scrollbar_rect,
         );
     }
@@ -547,7 +550,9 @@ fn drawNormalExternalSurface(
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
                 if (try g.captureScrollbarUnderlay(track_rect)) |_| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                    if (!contract_b_offset_active) {
+                        try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                    }
                 }
             }
         }
@@ -574,6 +579,7 @@ fn drawNormalExternalSurfaceRowMode(
     glow_intensity: f32,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
+    contract_b_offset_active: bool,
     restored_scrollbar_rect: ?c.RECT,
 ) !bool {
     const log_enabled = applog.isEnabled();
@@ -609,7 +615,7 @@ fn drawNormalExternalSurfaceRowMode(
     const has_scrollbar_work = scrollbar_alpha > 0.001 or
         restored_scrollbar_rect != null or
         g.hasScrollbarUnderlay();
-    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and !has_scrollbar_work) {
+    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and !has_scrollbar_work and !contract_b_offset_active) {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
         ext_win.paint_present_rects.clearRetainingCapacity();
         return false;
@@ -806,7 +812,9 @@ fn drawNormalExternalSurfaceRowMode(
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
                 if (try g.captureScrollbarUnderlay(track_rect)) |captured_rect| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                    if (!contract_b_offset_active) {
+                        try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                    }
                     present_rects.appendAssumeCapacity(captured_rect);
                 }
             }
@@ -1285,6 +1293,22 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const is_popupmenu = (req.grid_id == app_mod.POPUPMENU_GRID_ID);
     const is_msg_show = (req.grid_id == app_mod.MESSAGE_GRID_ID);
     const is_msg_history = (req.grid_id == app_mod.MSG_HISTORY_GRID_ID);
+    const is_float = if (app.corep) |cp| core.zonvie_core_is_float_external(cp, req.grid_id) != 0 else false;
+    var initial_default_bg: u32 = undefined;
+    const initial_external_bg = blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        const fallback = app.colorscheme_bg;
+        const cached = switch (classifyExternalSurface(req.grid_id)) {
+            .normal => if (is_float) app.cached_normal_float_bg else 0xFFFFFFFF,
+            .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
+            .popupmenu => app.cached_pmenu_bg,
+        };
+        app.mu.unlock(core.clock.io());
+        // Snapshot the default bg under the same lock so fill eligibility at
+        // graph build agrees with the effective color chosen here.
+        initial_default_bg = fallback;
+        break :blk if (cached != 0xFFFFFFFF) cached else fallback;
+    };
 
     // For cmdline: add margin and icon area
     // Total width = icon_margin_left + icon_size + icon_margin_right + content + padding*2
@@ -1588,8 +1612,8 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     _ = c.ShowWindow(hwnd, 8);
 
     // Initialize D3D11 renderer for external window (with transparency if enabled)
-    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
+    var renderer = d3d11.Renderer.initExternal(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, initial_default_bg, initial_external_bg, is_cmdline) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initExternal failed for external window: {any}\n", .{e});
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
@@ -1614,10 +1638,6 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     };
     var deferred_setpos: ?DeferredSetWindowPos = null;
     var deferred_setpos_cmdline: ?DeferredSetWindowPos = null;
-
-    // Determine if this is a float-origin external window (nvim_open_win external=true)
-    // vs a regular split externalized by ext_windows. Query core before acquiring app.mu.
-    const is_float = if (app.corep) |cp| core.zonvie_core_is_float_external(cp, req.grid_id) != 0 else false;
 
     app.mu.lockUncancelable(core.clock.io());
 
@@ -1676,7 +1696,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Store external window. Heap-allocate the ExternalWindow so its address
     // never moves when external_windows (AutoHashMapUnmanaged(i64,
     // *ExternalWindow)) rehashes -- rehashing only relocates the stored
-    // pointer, never the pointee. See W-H2 in the fix-plan doc.
+    // pointer, never the pointee.
     const ext_window_ptr = app.alloc.create(app_mod.ExternalWindow) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to allocate external window: {any}\n", .{e});
         app.mu.unlock(core.clock.io());
@@ -2178,7 +2198,7 @@ pub export fn ExternalWndProc(
                         // DPI. Do NOT call atlas.updateDpi()/
                         // invalidate_glyph_cache here: app.atlas is a single
                         // instance shared by the main window and every
-                        // external window (see MED-5 in the fix-plan doc)
+                        // external window
                         // -- rescaling it here based on one external
                         // window's monitor would corrupt every other
                         // window's glyph rendering on their next repaint.
@@ -3088,6 +3108,7 @@ fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurf
     app.mu.unlock(core.clock.io());
 
     const bg_rgb = if (cached_bg != 0xFFFFFFFF) cached_bg else fallback_bg;
+    g.setExternalDefaultBgColor(fallback_bg);
     if (bg_rgb != 0xFFFFFFFF) {
         g.setDefaultBgColor(bg_rgb);
     }
@@ -3278,18 +3299,37 @@ pub fn updateExternalWindowColors(app: *App) void {
         if (found[4] != 0) pmenu_bg = bg[4];
     }
 
+    var changed_hwnds: [64]c.HWND = undefined;
+    var changed_hwnd_count: usize = 0;
     app.mu.lockUncancelable(core.clock.io());
+    const highlights_changed = app.cached_normal_float_bg != normal_float_bg or app.cached_msg_area_bg != msg_area_bg or app.cached_pmenu_bg != pmenu_bg;
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
     app.cached_normal_float_bg = normal_float_bg;
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
+    if (highlights_changed) {
+        var it = app.external_windows.valueIterator();
+        while (it.next()) |ext_win| {
+            if (changed_hwnd_count < changed_hwnds.len) {
+                changed_hwnds[changed_hwnd_count] = ext_win.*.hwnd;
+                changed_hwnd_count += 1;
+            } else {
+                _ = c.InvalidateRect(ext_win.*.hwnd, null, c.FALSE);
+            }
+        }
+    }
     app.mu.unlock(core.clock.io());
+    for (changed_hwnds[0..changed_hwnd_count]) |external_hwnd| _ = c.InvalidateRect(external_hwnd, null, c.FALSE);
 }
 
 /// Paint an external window (simpler rendering path than main window)
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow start hwnd={*}\n", .{hwnd});
+    // Consume the flush-driven highlight poll here, on the UI thread, before
+    // any app.mu scope; posting it as a message would outrank WM_PAINT and
+    // starve paints during continuous flushes.
+    if (app.external_colors_dirty.swap(false, .acq_rel)) updateExternalWindowColors(app);
     var ps: c.PAINTSTRUCT = undefined;
     _ = c.BeginPaint(hwnd, &ps);
     defer _ = c.EndPaint(hwnd, &ps);
@@ -3603,13 +3643,147 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
 
-    // A2 records force a Present even when there is no retained back-buffer
-    // damage. They are retired only after that Present succeeds.
-    const a2_due = tbs_snapshot.outermost_paint and ext_win.tbs.hasSettleCommitsUpTo(tbs_snapshot.commit_rev);
+    var contract_b_frozen_offset_px: f64 = 0.0;
+    var contract_b_capture_rows: u32 = 0;
+    var contract_b_capture_edge: ?external_contract_b.BandEdge = null;
+    var contract_b_frozen_reset_serial: u64 = 0;
+    var contract_b_had_matching_record = false;
+    const contract_b_outermost = tbs_snapshot.outermost_paint and
+        surface_kind == .normal;
 
     if (is_row_mode_normal and tbs_committed.metrics_gen != shared_metrics_gen_snapshot) {
+        if (contract_b_outermost) {
+            ext_win.resetContractBEase("metrics_generation");
+        }
         requeueExternalFullPaint(app, grid_id, hwnd);
         return;
+    }
+
+    if (contract_b_outermost) {
+        if (ext_win.contract_b_ease.ensureIncarnation(ext_win.incarnation)) {
+            ext_win.renderer.resetContractBOffset();
+            ext_win.renderer.discardContractBRetention("incarnation");
+        }
+
+        var client_rect: c.RECT = undefined;
+        _ = c.GetClientRect(hwnd, &client_rect);
+        const client_width: u32 = @intCast(@max(1, client_rect.right - client_rect.left));
+        const client_height: u32 = @intCast(@max(1, client_rect.bottom - client_rect.top));
+        const size_mismatch_before_paint = needs_resize or
+            client_width != ext_win.renderer.width or client_height != ext_win.renderer.height;
+        const row_height_changed = ext_win.renderer.retention_row_height_px != 0 and
+            ext_win.renderer.retention_row_height_px != row_h_px_snapshot;
+        const mode_busy = smooth_session.modeBusy(app);
+        const can_seed = ext_win.renderer.has_presented_once and
+            !size_mismatch_before_paint and !row_height_changed and
+            !need_full_atlas_upload and !mode_busy;
+
+        if (!can_seed) {
+            const reason = if (size_mismatch_before_paint)
+                "resize"
+            else if (row_height_changed)
+                "row_height"
+            else if (need_full_atlas_upload)
+                "atlas_reset"
+            else if (mode_busy)
+                "mode_busy"
+            else
+                "first_frame";
+            ext_win.resetContractBEase(reason);
+        } else {
+            var now_qpc: c.LARGE_INTEGER = undefined;
+            _ = c.QueryPerformanceCounter(&now_qpc);
+            var frequency_qpc: f64 = @floatFromInt(app_mod.g_startup_freq.QuadPart);
+            if (frequency_qpc <= 0.0) {
+                var frequency: c.LARGE_INTEGER = undefined;
+                if (c.QueryPerformanceFrequency(&frequency) != 0) {
+                    frequency_qpc = @floatFromInt(frequency.QuadPart);
+                }
+            }
+            const offset_before_tick_px = ext_win.contract_b_ease.offset_px;
+            ext_win.contract_b_ease.tickAt(now_qpc.QuadPart, frequency_qpc);
+            if (offset_before_tick_px != 0.0 and ext_win.contract_b_ease.offset_px == 0.0) {
+                ext_win.renderer.discardContractBRetention("settled");
+            }
+        }
+
+        const offset_before_seeds_px = ext_win.contract_b_ease.offset_px;
+        var animated_seed_rows_i64: i64 = 0;
+        var drained_records: [scroll_types.MaxSemanticCommits]scroll_types.SemanticCommitRecord = undefined;
+        const drained_count = ext_win.tbs.takeSettleRecordsUpTo(tbs_snapshot.commit_rev, &drained_records);
+        for (drained_records[0..drained_count]) |record| {
+            var animated = false;
+            const record_matches_surface = record.surface.grid_id == grid_id and
+                record.surface.incarnation == ext_win.incarnation;
+            contract_b_had_matching_record = contract_b_had_matching_record or record_matches_surface;
+            if (can_seed and record_matches_surface) {
+                const live_ver: i32 = if (app.corep) |cp|
+                    @intCast(@min(app_mod.zonvie_core_get_mousescroll_ver(cp), @as(u32, 32)))
+                else
+                    0;
+                const seed = ext_win.contract_b_ease.seedArrivalWithPolicy(
+                    record.rows_delta,
+                    @floatFromInt(row_h_px_snapshot),
+                    live_ver,
+                    app.large_jump_behavior,
+                );
+                animated = seed.outcome == .animate;
+                if (animated) animated_seed_rows_i64 += @as(i64, record.rows_delta);
+            }
+            if (animated and applog.isEnabled()) {
+                applog.appLog(
+                    "[bext] seed outcome=animate rows={d} offset_px={d}\n",
+                    .{ record.rows_delta, ext_win.contract_b_ease.offset_px },
+                );
+            }
+        }
+
+        contract_b_frozen_offset_px = ext_win.contract_b_ease.offset_px;
+        contract_b_frozen_reset_serial = ext_win.contract_b_ease.reset_serial;
+        const snapshot_shift_rows_i64: i64 = tbs_snapshot.vb_shift;
+        const batch_rows_i64 = external_contract_b.plannedBatchRows(
+            snapshot_shift_rows_i64,
+            animated_seed_rows_i64,
+            offset_before_seeds_px,
+        );
+        const batch_magnitude_rows: u32 = @intCast(@min(
+            @as(i64, external_contract_b.RetentionDepth),
+            if (batch_rows_i64 < 0) -batch_rows_i64 else batch_rows_i64,
+        ));
+        if (can_seed and contract_b_frozen_offset_px == 0.0 and offset_before_seeds_px != 0.0) {
+            ext_win.renderer.discardContractBRetention("seeded_zero");
+        } else if (can_seed and contract_b_frozen_offset_px != 0.0) {
+            const offset_edge = external_contract_b.vacatedEdge(contract_b_frozen_offset_px).?;
+            const row_h_f64 = @as(f64, @floatFromInt(row_h_px_snapshot));
+            const frozen_band_rows = external_contract_b.bandRows(
+                contract_b_frozen_offset_px / row_h_f64,
+                external_contract_b.RetentionDepth,
+            );
+            // The edge decision compares the pre-seed and post-seed offsets:
+            // per-record flip tracking would discard the ring on a double
+            // reversal that lands back on the original sign, and the band
+            // would then be recaptured from in-view rows.
+            const final_flipped = offset_before_seeds_px != 0.0 and
+                (contract_b_frozen_offset_px > 0.0) != (offset_before_seeds_px > 0.0);
+            if (final_flipped) {
+                ext_win.renderer.discardContractBRetention("sign_flip");
+                contract_b_capture_rows = @max(batch_magnitude_rows, frozen_band_rows);
+            } else if (@abs(contract_b_frozen_offset_px) < @abs(offset_before_seeds_px)) {
+                const reduction_px = @abs(offset_before_seeds_px) - @abs(contract_b_frozen_offset_px);
+                const reduction_rows: u32 = @intFromFloat(@ceil(reduction_px / row_h_f64));
+                const trim_rows = external_contract_b.trimRowsPreservingMinimum(
+                    ext_win.renderer.retention_meta.rows_stored,
+                    reduction_rows,
+                    frozen_band_rows,
+                );
+                ext_win.renderer.trimContractBRetentionAdjacent(trim_rows);
+            } else {
+                contract_b_capture_rows = batch_magnitude_rows;
+            }
+            if (contract_b_capture_rows != 0) {
+                contract_b_capture_edge = offset_edge;
+            }
+        }
     }
 
     // Use the per-window scratch buffer (safe: each window has its own)
@@ -3618,6 +3792,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (gpu_ptr) |g| {
         g.lockContext();
         defer g.unlockContext();
+        var atlas_work_performed = false;
 
         // Resize this external window's own D3D atlas texture to match the
         // shared/configured atlas_size (mirrors the main window's WM_PAINT
@@ -3638,6 +3813,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             }
             g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: D3D atlas texture recreation failed: {any}\n", .{e});
+                if (contract_b_outermost) ext_win.resetContractBEase("atlas_recreate_failure");
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             };
@@ -3663,15 +3839,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         if (size_mismatch) {
             smooth_session.onSurfaceInvalidatedFromPaint(app, hwnd, .generation_mismatch);
             g.resize() catch |e| {
-                ext_win.a2_settle.drop(!g.device_lost);
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             };
-            // Renderer resize already snaps the permanent visual and commits;
-            // discard only the ended animation/state here, without a second
-            // DirectComposition Commit.
-            ext_win.a2_settle.drop(!g.device_lost);
             // back_tex was recreated — force full repaint so all rows are redrawn.
             ext_paint_full = true;
 
@@ -3696,11 +3867,13 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             }
             const upload = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
             if (upload.success) {
+                atlas_work_performed = need_full_atlas_upload or upload.cursor != ext_win.atlas_upload_cursor;
                 ext_win.atlas_upload_cursor = upload.cursor;
                 if (need_full_atlas_upload) {
                     ext_win.atlas_reset_generation = current_atlas_reset_generation;
                 }
             } else {
+                if (contract_b_outermost) ext_win.resetContractBEase("atlas_upload_failure");
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }
@@ -3709,6 +3882,29 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         // Set clear color from cached highlight group bg colors (no grid_mu acquisition).
         // NormalFloat for float-origin externals, MsgArea for cmdline/messages, Pmenu for popupmenu.
         setExternalWindowClearColor(g, app, surface_kind, ext_win);
+
+        if (contract_b_outermost) {
+            _ = g.restoreScrollbarUnderlay() catch |e| blk: {
+                if (applog.isEnabled()) applog.appLog("[bext] scrollbar underlay restore failed error={any}\n", .{e});
+                ext_win.resetContractBEase("scrollbar_underlay_restore_failure");
+                contract_b_frozen_offset_px = 0.0;
+                break :blk null;
+            };
+        }
+
+        if (contract_b_capture_edge) |capture_edge| {
+            if (contract_b_frozen_reset_serial != ext_win.contract_b_ease.reset_serial) {
+                contract_b_frozen_offset_px = 0.0;
+            } else {
+                g.captureRetentionBand(contract_b_capture_rows, row_h_px_snapshot, capture_edge) catch |e| {
+                    if (applog.isEnabled()) {
+                        applog.appLog("[bext] retention capture failed error={any}\n", .{e});
+                    }
+                    ext_win.resetContractBEase("capture_failure");
+                    contract_b_frozen_offset_px = 0.0;
+                };
+            }
+        }
 
         if (surface_kind != .normal) {
             // Decorated surfaces never consume row VBs. Release buffers left
@@ -3727,7 +3923,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // transient zero-dimension state there returns a plain success
             // (not an error), so without this check execution would fall
             // through to Present() below and show stale back-buffer content
-            // from the previous frame (see LOW-13 in the fix-plan doc).
+            // from the previous frame.
             if (surface_kind == .cmdline or surface_kind == .msg_show or surface_kind == .msg_history) {
                 app.mu.lockUncancelable(core.clock.io());
                 const content_rows = ext_win.surface.rows;
@@ -3745,7 +3941,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             };
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
-            g.presentOnlyFromBack(null) catch |e| {
+            const present_result = if (g.contractBPresentPending())
+                g.presentFromBackRectsWithCursorNoResize(&.{}, null, 0, null, true, null, null)
+            else
+                g.presentOnlyFromBack(null);
+            present_result catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
                 smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, false);
                 requeueExternalFullPaint(app, grid_id, hwnd);
@@ -3761,7 +3961,27 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         }
 
-        const force_full_present = drawNormalExternalSurface(
+        const cursor_visible = cursor_blink_visible and tbs_cursor.verts.items.len != 0;
+        const cursor_changed = if (cursor_visible)
+            tbs_cursor.last_cursor_row != ext_win.last_painted_cursor_row
+        else
+            ext_win.last_painted_cursor_row != null;
+        const physical_scroll_work = tbs_snapshot.scroll_rect != null or tbs_snapshot.vb_shift != 0;
+        const scrollbar_damage = !contract_b_outermost or contract_b_frozen_offset_px == 0.0;
+        const other_ease_damage = glow_enabled or cursor_changed or physical_scroll_work or
+            (scrollbar_damage and scrollbar_alpha > 0.001) or g.hasScrollbarUnderlay() or
+            g.custom_shader_pipelines.items.len != 0 or ext_paint_full;
+        const pure_ease_skip = contract_b_outermost and external_contract_b.shouldSkipPureEaseFrame(
+            contract_b_frozen_offset_px != 0.0,
+            contract_b_had_matching_record,
+            dirty_row_keys.items.len != 0,
+            need_full_atlas_upload or atlas_work_performed,
+            other_ease_damage,
+        );
+        const force_full_present = if (pure_ease_skip) blk: {
+            ext_win.paint_present_rects.clearRetainingCapacity();
+            break :blk true;
+        } else drawNormalExternalSurface(
             g,
             app,
             ext_win,
@@ -3778,6 +3998,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             glow_intensity,
             tbs_snapshot,
             row_h_px_snapshot,
+            contract_b_frozen_offset_px != 0.0,
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
@@ -3789,18 +4010,28 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         };
 
+        if (contract_b_outermost) {
+            if (contract_b_frozen_reset_serial != ext_win.contract_b_ease.reset_serial) {
+                contract_b_frozen_offset_px = 0.0;
+            }
+            g.setContractBOffset(contract_b_frozen_offset_px);
+        }
+
         if (is_row_mode_normal) {
             app.mu.lockUncancelable(core.clock.io());
             const metrics_still_current = app.shared_metrics_gen == shared_metrics_gen_snapshot;
             app.mu.unlock(core.clock.io());
             if (!metrics_still_current) {
+                if (contract_b_outermost) {
+                    ext_win.resetContractBEase("metrics_generation");
+                }
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }
         }
 
         const semantic_due = smooth_session.semanticDue(app, ext_win, tbs_snapshot);
-        if (!force_full_present and ext_win.paint_present_rects.items.len == 0 and !semantic_due and !a2_due) {
+        if (!force_full_present and ext_win.paint_present_rects.items.len == 0 and !semantic_due and !ext_win.renderer.contractBPresentPending()) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
             completeExternalPaintRetry(ext_win);
             return;
@@ -3822,13 +4053,16 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         };
         if (g.device_lost) {
-            ext_win.a2_settle.drop(false);
+            ext_win.resetContractBEase("device_loss");
             smooth_session.onSurfaceInvalidatedFromPaint(app, hwnd, .presentation_failure);
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         }
         smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, true);
         completeExternalPaintRetry(ext_win);
+        if (contract_b_outermost and ext_win.contract_b_ease.offset_px != 0.0) {
+            _ = c.InvalidateRect(hwnd, null, c.FALSE);
+        }
     } else {
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
         requeueExternalFullPaint(app, grid_id, hwnd);

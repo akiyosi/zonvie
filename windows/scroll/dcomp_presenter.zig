@@ -1,10 +1,10 @@
 //! DirectComposition epoch presenter for Contract A.
 //!
 //! The presenter owns the app-created epoch visual only.  The Direct
-//! Manipulation compositor inserts its visual below that epoch visual and
-//! above the existing content visual:
+//! Manipulation compositor inserts its visual below that epoch visual:
 //!
-//!   target -> epoch_visual -> DM visual -> content_visual -> swap chain
+//!   target -> static root(background content) -> settle -> optional A1 epoch
+//!   -> DM visual -> content_visual -> swap chain
 //!
 //! Runtime wiring is intentionally deferred to a later step.  The public API
 //! is nevertheless type-checked by windows/app.zig while the module remains

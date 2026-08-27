@@ -1,4 +1,4 @@
-//! UI-thread owner and live wiring for Contract A smooth scrolling.
+//! UI-thread owner and live wiring for smooth scrolling.
 //! Accounting remains in coordinator.zig; this module only observes the
 //! platform and executes coordinator effects.
 
@@ -12,24 +12,6 @@ const coordinator_mod = @import("coordinator.zig");
 const dm_mod = @import("direct_manipulation.zig");
 const presenter_mod = @import("dcomp_presenter.zig");
 const types = @import("types.zig");
-
-pub const EligibilityState = struct {
-    grid_id: i64,
-    is_external: bool,
-    is_whole_grid: bool,
-    is_regular: bool,
-    mousescroll_ver: u32,
-    busy: bool,
-    resizing: bool,
-    dpi_changing: bool,
-    device_lost: bool,
-};
-
-pub fn eligible(state: EligibilityState) bool {
-    return state.grid_id > 1 and state.is_external and state.is_whole_grid and
-        state.is_regular and state.mousescroll_ver > 0 and !state.busy and
-        !state.resizing and !state.dpi_changing and !state.device_lost;
-}
 
 /// Session state relevant to routing a wheel message. This deliberately
 /// excludes device classification: Direct Manipulation's handled result is
@@ -172,24 +154,10 @@ const CompositionTarget = extern struct {
     };
 };
 
-const Compositor = extern struct {
-    lpVtbl: *const Vtbl,
-    const Vtbl = extern struct {
-        QueryInterface: *const anyopaque,
-        AddRef: *const anyopaque,
-        Release: *const fn (*Compositor) callconv(.c) c_ulong,
-        AddContent: *const fn (*Compositor, *dm_mod.IDirectManipulationContent, ?*c.IUnknown, ?*c.IUnknown, ?*c.IUnknown) callconv(.c) c.HRESULT,
-        RemoveContent: *const fn (*Compositor, *dm_mod.IDirectManipulationContent) callconv(.c) c.HRESULT,
-        SetUpdateManager: *const anyopaque,
-        Flush: *const fn (*Compositor) callconv(.c) c.HRESULT,
-    };
-};
-
 const CompositionBinding = struct {
     // Non-owning aliases into the ExternalWindow renderer's permanent graph.
     // The session only owns the epoch visual held by DCompScrollPresenter.
     target: *CompositionTarget,
-    settle: *presenter_mod.IDCompositionVisual,
     content: *presenter_mod.IDCompositionVisual,
     device: *presenter_mod.IDCompositionDevice,
 };
@@ -329,7 +297,7 @@ fn findExternal(app: *App, hwnd: c.HWND) ?struct { grid_id: i64, ext: *app_mod.E
     return null;
 }
 
-fn modeBusy(app: *App) bool {
+pub fn modeBusy(app: *App) bool {
     const cp = app.corep orelse return true;
     var mode: [16]u8 = undefined;
     var visible = true;
@@ -339,22 +307,11 @@ fn modeBusy(app: *App) bool {
 }
 
 fn wheelTargetEligible(app: *App, hwnd: c.HWND, grid_id: i64) bool {
-    const ext = findExternal(app, hwnd) orelse return false;
-    const cp = app.corep orelse return false;
-    const state: EligibilityState = .{
-        .grid_id = grid_id,
-        .is_external = true,
-        .is_whole_grid = true,
-        .is_regular = grid_id != app_mod.MESSAGE_GRID_ID and
-            grid_id != app_mod.CMDLINE_GRID_ID and
-            grid_id != app_mod.POPUPMENU_GRID_ID,
-        .mousescroll_ver = app_mod.zonvie_core_get_mousescroll_ver(cp),
-        .busy = modeBusy(app),
-        .resizing = ext.ext.resizing or ext.ext.needs_renderer_resize or ext.ext.needs_window_resize,
-        .dpi_changing = ext.ext.dpi_changing,
-        .device_lost = ext.ext.renderer.device_lost or app.device_lost_recovering,
-    };
-    return eligible(state);
+    // External windows use the displacement presentation path exclusively.
+    _ = app;
+    _ = hwnd;
+    _ = grid_id;
+    return false;
 }
 
 fn pointerIsTouchContact(pointer_id: u32) bool {
@@ -363,36 +320,10 @@ fn pointerIsTouchContact(pointer_id: u32) bool {
         (pointer_type == c.PT_TOUCHPAD or pointer_type == c.PT_TOUCH);
 }
 
-fn attachComposition(owner: *ScrollSessionOwner, ext: *app_mod.ExternalWindow) !void {
-    const device_raw = @field(ext.renderer, "dcomp_device") orelse return error.DCompUnavailable;
-    const target_raw = @field(ext.renderer, "dcomp_target") orelse return error.DCompUnavailable;
-    const settle_raw = @field(ext.renderer, "dcomp_settle_visual") orelse return error.DCompUnavailable;
-    const content_raw = @field(ext.renderer, "dcomp_visual") orelse return error.DCompUnavailable;
-    const device: *presenter_mod.IDCompositionDevice = @ptrCast(device_raw);
-    const target: *CompositionTarget = @ptrCast(target_raw);
-    const settle: *presenter_mod.IDCompositionVisual = @ptrCast(settle_raw);
-    const content_visual: *presenter_mod.IDCompositionVisual = @ptrCast(content_raw);
-    // Mark A1 ownership before any topology mutation so an A2 publish
-    // cannot start a new retarget during the attach handoff.
-    ext.smooth_scroll_a1_active = true;
-    owner.composition = .{ .target = target, .settle = settle, .content = content_visual, .device = device };
-    const epoch = try owner.presenter.attach(owner.generation, device, settle, content_visual);
-    // The presenter changes the visual topology synchronously, but the
-    // Direct Manipulation compositor must observe that committed topology
-    // before AddContent moves content below its compositor-owned visual.
-    try presenter_mod.DCompScrollPresenter.commit(device);
-    var comp_obj: ?*anyopaque = null;
-    const hr = c.CoCreateInstance(&dm_mod.CLSID_DCompManipulationCompositor, null, 1, &dm_mod.IID_IDirectManipulationCompositor, &comp_obj);
-    if (c.FAILED(hr) or comp_obj == null) return error.DmCompositorUnavailable;
-    owner.compositor = @ptrCast(@alignCast(comp_obj.?));
-    owner.content = owner.dm.content;
-    const dm_content = owner.content orelse return error.DmContentMissing;
-    const comp = owner.compositor.?;
-    if (c.FAILED(comp.lpVtbl.AddContent(comp, dm_content, @ptrCast(device), @ptrCast(epoch), @ptrCast(content_visual)))) return error.DmCompositorAddFailed;
-    if (c.FAILED(comp.lpVtbl.Flush(comp))) return error.DmCompositorFlushFailed;
-    try presenter_mod.DCompScrollPresenter.commit(device);
-    // Handoff guard for A2: arming A1 never changes settle offset or any
-    // running animation. Step 4 will use this flag at its retarget point.
+fn rejectExternalComposition(owner: *ScrollSessionOwner, ext: *app_mod.ExternalWindow) !void {
+    _ = owner;
+    _ = ext;
+    return error.ExternalCompositionDisabled;
 }
 
 fn detachComposition(owner: *ScrollSessionOwner, defer_commit: bool) bool {
@@ -403,7 +334,6 @@ fn detachComposition(owner: *ScrollSessionOwner, defer_commit: bool) bool {
         owner.compositor = null;
         owner.content = null;
         owner.composition = null;
-        clearA1Active(owner);
         return true;
     }
     var succeeded = true;
@@ -448,15 +378,7 @@ fn detachComposition(owner: *ScrollSessionOwner, defer_commit: bool) bool {
     }
     owner.composition = null;
     owner.content = null;
-    clearA1Active(owner);
     return succeeded;
-}
-
-fn clearA1Active(owner: *const ScrollSessionOwner) void {
-    const app = owner.app orelse return;
-    const hwnd = owner.hwnd orelse return;
-    const found = findExternal(app, hwnd) orelse return;
-    found.ext.smooth_scroll_a1_active = false;
 }
 
 fn compositionGenerationDead(owner: *const ScrollSessionOwner, app: *App, hwnd: c.HWND) bool {
@@ -467,10 +389,8 @@ fn compositionGenerationDead(owner: *const ScrollSessionOwner, app: *App, hwnd: 
     const renderer_device = @field(found.ext.renderer, "dcomp_device") orelse return true;
     const renderer_target = @field(found.ext.renderer, "dcomp_target") orelse return true;
     const renderer_visual = @field(found.ext.renderer, "dcomp_visual") orelse return true;
-    const renderer_settle = @field(found.ext.renderer, "dcomp_settle_visual") orelse return true;
     return @intFromPtr(renderer_device) != @intFromPtr(composition.device) or
         @intFromPtr(renderer_target) != @intFromPtr(composition.target) or
-        @intFromPtr(renderer_settle) != @intFromPtr(composition.settle) or
         @intFromPtr(renderer_visual) != @intFromPtr(composition.content);
 }
 
@@ -771,7 +691,7 @@ fn finishStart(owner: *ScrollSessionOwner) void {
     owner.generation = generation;
     owner.coordinator.beginSession(.{ .session = owner.identity(), .row_height_px = @floatFromInt(app.cell_h_px + app.linespace_px), .quantum_rows = @intCast(@min(ver, std.math.maxInt(i32))), .output_origin_y_px = 0 });
     owner.coordinator.onBorrowResult(generation, true);
-    attachComposition(owner, ext.ext) catch {
+    rejectExternalComposition(owner, ext.ext) catch {
         reset(owner, .presentation_failure);
         return;
     };
@@ -1032,184 +952,11 @@ pub fn onDeadline(app: *App) void {
 }
 
 pub fn onPaintPresent(app: *App, ext: *app_mod.ExternalWindow, snapshot: app_mod.PaintSnapshot, present_succeeded: bool) void {
-    if (!snapshot.outermost_paint) return;
-    if (!present_succeeded) {
-        // Do not retire A2 records on a failed Present; the retry will publish
-        // the same committed snapshot and consume them at that boundary.
-        if (g_owner.app == app and activeIdentity() != null and g_owner.hwnd != null and g_owner.hwnd.? == ext.hwnd) {
-            if (compositionGenerationDead(&g_owner, app, ext.hwnd)) g_owner.dead_com = true;
-            reset(&g_owner, .presentation_failure);
-        }
-        return;
-    }
-
-    // A2 is independent of A1, so it must be consumed for every external
-    // window, including windows with no active Direct Manipulation session.
-    const a2_rows = ext.tbs.takeSettleRowsUpTo(snapshot.commit_rev);
-    var a2_changed = false;
-    if (ext.a2_zero_snap_pending) {
-        const pending_device = @field(ext.renderer, "dcomp_device");
-        const pending_visual = @field(ext.renderer, "dcomp_settle_visual");
-        if (pending_device != null) {
-            if (pending_visual) |visual_value| {
-                const visual: *presenter_mod.IDCompositionVisual = @ptrCast(visual_value);
-                if (!c.FAILED(visual.lpVtbl.SetOffsetY(visual, 0.0))) {
-                    ext.a2_settle.drop(true);
-                    ext.a2_zero_snap_pending = false;
-                    a2_changed = true;
-                } else if (applog.isEnabled()) {
-                    applog.appLog("[settle] pending zero-snap failed win_id={d}\n", .{ext.win_id});
-                }
-            }
-        }
-    }
-    if (a2_rows != 0) {
-        if (!a2RetargetAllowed(ext)) {
-            // A record committed before A1 attach may be drained during A1;
-            // the content is already correctly positioned, so only the
-            // cosmetic animation is skipped.
-            if (applog.isEnabled()) applog.appLog("[settle] suppression by A1 win_id={d} rows={d}\n", .{ ext.win_id, a2_rows });
-        } else {
-            const device_raw = @field(ext.renderer, "dcomp_device");
-            const visual_raw = @field(ext.renderer, "dcomp_settle_visual");
-            if (device_raw == null or visual_raw == null) {
-                // The rows have already been drained.  With no usable COM
-                // objects the only safe outcome is to discard both the
-                // cosmetic state and this delta.
-                ext.a2_settle.drop(false);
-                ext.a2_zero_snap_pending = false;
-                if (applog.isEnabled()) applog.appLog("[settle] trip win_id={d} reason=visual_unavailable rows={d}\n", .{ ext.win_id, a2_rows });
-            } else {
-                const device: *presenter_mod.IDCompositionDevice = @ptrCast(device_raw.?);
-                const visual: *presenter_mod.IDCompositionVisual = @ptrCast(visual_raw.?);
-                var now: c.LARGE_INTEGER = undefined;
-                _ = c.QueryPerformanceCounter(&now);
-                var frequency_qpc: f64 = @floatFromInt(app_mod.g_startup_freq.QuadPart);
-                if (frequency_qpc <= 0.0) {
-                    var frequency: c.LARGE_INTEGER = undefined;
-                    if (c.QueryPerformanceFrequency(&frequency) != 0) frequency_qpc = @floatFromInt(frequency.QuadPart);
-                }
-                const result = ext.a2_settle.install(
-                    visual,
-                    device,
-                    a2_rows,
-                    @floatFromInt(app.cell_h_px + app.linespace_px),
-                    now.QuadPart,
-                    frequency_qpc,
-                );
-                switch (result) {
-                    .bound => {
-                        a2_changed = true;
-                        if (applog.isEnabled()) applog.appLog("[settle] install win_id={d} delta_px={d} offset_px={d}\n", .{ ext.win_id, @as(f64, @floatFromInt(a2_rows)) * @as(f64, @floatFromInt(app.cell_h_px + app.linespace_px)), if (ext.a2_settle.state) |state| @as(f64, state.coeff_constant_f32) else 0.0 });
-                    },
-                    .trip => |reason| {
-                        a2_changed = true;
-                        if (applog.isEnabled()) applog.appLog("[settle] trip win_id={d} reason={s} rows={d}\n", .{ ext.win_id, @tagName(reason), a2_rows });
-                    },
-                    .failed => {
-                        // The drained rows were accepted as skipped; a failed
-                        // install must not force a no-op Commit.
-                        if (applog.isEnabled()) applog.appLog("[settle] skipped win_id={d} reason=com_failure rows={d}\n", .{ ext.win_id, a2_rows });
-                    },
-                }
-            }
-        }
-    }
-
-    var a1_active = g_owner.app == app and activeIdentity() != null and g_owner.hwnd != null and g_owner.hwnd.? == ext.hwnd;
-    var candidates: CandidateRows = .{};
-    var candidate_rows: i64 = 0;
-    var semantic_due = false;
-    var a1_failure = false;
-    var commit_device: ?*presenter_mod.IDCompositionDevice = null;
-    if (a1_active) {
-        if (!drainAcks(&g_owner) or g_owner.app != app or activeIdentity() == null) {
-            a1_active = false;
-        } else if (g_owner.reentrant_reset_pending) {
-            g_owner.reentrant_reset_pending = false;
-            reset(&g_owner, g_owner.reentrant_reset_reason);
-            a1_active = false;
-        } else {
-            ext.tbs.rotation_mu.lockUncancelable(core.clock.io());
-            candidates = candidateRows(&ext.tbs.semantic_commits, snapshot.commit_rev, g_owner.generation, g_owner.surface);
-            ext.tbs.rotation_mu.unlock(core.clock.io());
-            candidate_rows = candidates.rows;
-            semantic_due = semanticPresentRequired(candidates);
-            if (semantic_due) {
-                if (g_owner.presenter.generation) |gen| {
-                    g_owner.presenter.setPresentedDisplacement(gen, @as(f64, @floatFromInt(g_owner.coordinator.published_rows + candidate_rows)) * g_owner.coordinator.row_height_px) catch {
-                        a1_failure = true;
-                    };
-                    if (g_owner.composition) |composition| commit_device = composition.device;
-                } else {
-                    a1_failure = true;
-                }
-            }
-        }
-    }
-
-    // The Present gate is also the A2 publication boundary. Reach it whenever
-    // A2 bound or snapped work, even if A1's displacement update failed.
-    if (a2_changed and commit_device == null) {
-        if (@field(ext.renderer, "dcomp_device")) |device_value| commit_device = @ptrCast(device_value);
-    }
-
-    // If this publication would finish A1, do the detach surgery before the
-    // single gate Commit.  finishReady's deferred flag suppresses its
-    // standalone Commit; the gate below publishes both the detach and any A2
-    // scalar/animation work atomically.
-    var finished_before_gate = false;
-    if (a1_active and !a1_failure and semantic_due) {
-        const due_count = candidates.due_count;
-        const semantic_after = g_owner.coordinator.semanticCommitCount() -| due_count;
-        if (readyToFinish(g_owner.dm_ready, g_owner.coordinator.creditCount(), semantic_after)) {
-            finishReady(&g_owner, true);
-            a1_active = false;
-            finished_before_gate = true;
-        }
-    }
-    if (commit_device) |device| {
-        presenter_mod.DCompScrollPresenter.commit(device) catch {
-            if (a1_active and compositionGenerationDead(&g_owner, app, ext.hwnd)) g_owner.dead_com = true;
-            if (a2_changed) {
-                // The Commit failure may mean the device generation is dead;
-                // do not make another COM call here.  The rebuilt visual is
-                // explicitly zero-snapped on the next successful paint.
-                ext.a2_settle.drop(false);
-                ext.a2_zero_snap_pending = true;
-                if (applog.isEnabled()) applog.appLog("[settle] commit failed; dropped A2 state and deferred zero-snap win_id={d}\n", .{ext.win_id});
-            }
-            if (a1_active) reset(&g_owner, .presentation_failure);
-            return;
-        };
-    }
-
-    if (a1_failure) {
+    if (!snapshot.outermost_paint or present_succeeded) return;
+    if (g_owner.app == app and activeIdentity() != null and g_owner.hwnd != null and g_owner.hwnd.? == ext.hwnd) {
         if (compositionGenerationDead(&g_owner, app, ext.hwnd)) g_owner.dead_com = true;
         reset(&g_owner, .presentation_failure);
-        return;
     }
-
-    if (!a1_active or !semantic_due or finished_before_gate) return;
-    g_owner.coordinator.onPublished(.{ .generation = g_owner.generation, .surface = g_owner.surface, .commit_rev = snapshot.commit_rev, .present_succeeded = present_succeeded, .epoch_commit_succeeded = true, .outermost_paint = snapshot.outermost_paint });
-    if (g_owner.coordinator.session != null and candidates.acked_count != 0) {
-        ext.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        while (ext.tbs.semantic_commits.front()) |record| {
-            if (record.commit_rev > snapshot.commit_rev or !record.surface.eql(g_owner.surface) or record.session_generation != g_owner.generation) break;
-            if (!record.ack_delivered) break;
-            _ = ext.tbs.semantic_commits.popFront();
-        }
-        ext.tbs.rotation_mu.unlock(core.clock.io());
-        if (applog.isEnabled()) applog.appLog("[smooth] publish commit_rev={d} rows={d}\n", .{ snapshot.commit_rev, candidate_rows });
-    }
-    executeEffects(&g_owner, true);
-}
-
-/// Return whether a new A2 settle retarget may begin for this window.
-/// Existing settle state is retained while A1 is active; this hook only
-/// suppresses future retargets and deliberately does not modify the visual.
-pub fn a2RetargetAllowed(ext: *const app_mod.ExternalWindow) bool {
-    return !ext.smooth_scroll_a1_active;
 }
 
 pub fn semanticDue(app: *App, ext: *app_mod.ExternalWindow, snapshot: app_mod.PaintSnapshot) bool {
@@ -1227,7 +974,9 @@ pub fn semanticDue(app: *App, ext: *app_mod.ExternalWindow, snapshot: app_mod.Pa
 }
 
 pub fn onSurfaceInvalidated(app: *App, hwnd: c.HWND, reason: coordinator_mod.ResetReason) void {
-    if (reason == .generation_mismatch or reason == .presentation_failure) clearA2Settle(app, hwnd);
+    if (reason == .generation_mismatch or reason == .presentation_failure) {
+        if (findExternal(app, hwnd)) |external| external.ext.resetContractBEase(@tagName(reason));
+    }
     if (g_owner.resetting) return;
     if (g_owner.app == app and g_owner.hwnd != null and g_owner.hwnd.? == hwnd) {
         if (g_owner.ui_busy or app.wm_paint_in_progress) {
@@ -1243,7 +992,8 @@ pub fn onSurfaceInvalidated(app: *App, hwnd: c.HWND, reason: coordinator_mod.Res
 /// recreation or after device loss. The caller already excludes inner paint
 /// publication and must tear DM/DComp down before touching the swap chain.
 pub fn onSurfaceInvalidatedFromPaint(app: *App, hwnd: c.HWND, reason: coordinator_mod.ResetReason) void {
-    clearA2Settle(app, hwnd);
+    const found = findExternal(app, hwnd);
+    if (found) |external| external.ext.resetContractBEase(@tagName(reason));
     if (g_owner.resetting) return;
     if (g_owner.app == app and g_owner.hwnd != null and g_owner.hwnd.? == hwnd) {
         if (reason == .presentation_failure and compositionGenerationDead(&g_owner, app, hwnd)) g_owner.dead_com = true;
@@ -1257,7 +1007,12 @@ pub fn onSurfaceInvalidatedFromPaint(app: *App, hwnd: c.HWND, reason: coordinato
 }
 
 pub fn onDeviceLost(app: *App) void {
-    if (g_owner.hwnd) |hwnd| clearA2Settle(app, hwnd);
+    app.mu.lockUncancelable(core.clock.io());
+    var external_it = app.external_windows.valueIterator();
+    while (external_it.next()) |ext| {
+        ext.*.resetContractBEase("device_loss");
+    }
+    app.mu.unlock(core.clock.io());
     if (g_owner.resetting) return;
     if (g_owner.app != app) return;
     g_owner.dead_com = true;
@@ -1267,34 +1022,6 @@ pub fn onDeviceLost(app: *App) void {
         return;
     }
     reset(&g_owner, .presentation_failure);
-}
-
-fn clearA2Settle(app: *App, hwnd: c.HWND) void {
-    const found = findExternal(app, hwnd) orelse return;
-    const com_alive = !found.ext.renderer.device_lost and !app.device_lost_recovering;
-    if (!com_alive) {
-        found.ext.a2_settle.drop(false);
-        found.ext.a2_zero_snap_pending = false;
-        return;
-    }
-    const visual_raw = @field(found.ext.renderer, "dcomp_settle_visual");
-    const device_raw = @field(found.ext.renderer, "dcomp_device");
-    if (visual_raw != null and device_raw != null) {
-        const visual: *presenter_mod.IDCompositionVisual = @ptrCast(visual_raw.?);
-        const device: *presenter_mod.IDCompositionDevice = @ptrCast(device_raw.?);
-        if (!c.FAILED(visual.lpVtbl.SetOffsetY(visual, 0.0))) {
-            found.ext.a2_settle.drop(true);
-            found.ext.a2_zero_snap_pending = false;
-            presenter_mod.DCompScrollPresenter.commit(device) catch {
-                found.ext.a2_zero_snap_pending = true;
-            };
-            return;
-        }
-    }
-    // Keep a future paint responsible for the scalar snap when only one
-    // device/visual handle is available; no partial COM path is safe here.
-    found.ext.a2_settle.drop(false);
-    found.ext.a2_zero_snap_pending = visual_raw != null;
 }
 
 /// Resume UI messages that were delivered by a nested pump while an outer
@@ -1353,42 +1080,6 @@ pub fn shutdown(app: *App) void {
         g_owner.dm.deinit();
         g_controller_initialized = false;
     }
-}
-
-test "eligibility requires a regular external whole-grid surface" {
-    const base: EligibilityState = .{ .grid_id = 2, .is_external = true, .is_whole_grid = true, .is_regular = true, .mousescroll_ver = 3, .busy = false, .resizing = false, .dpi_changing = false, .device_lost = false };
-    try std.testing.expect(eligible(base));
-    var no_mouse = base;
-    no_mouse.mousescroll_ver = 0;
-    try std.testing.expect(!eligible(no_mouse));
-    var decorated = base;
-    decorated.is_regular = false;
-    try std.testing.expect(!eligible(decorated));
-    var busy = base;
-    busy.busy = true;
-    try std.testing.expect(!eligible(busy));
-}
-
-test "eligibility rejects every remaining conjunct independently" {
-    const base: EligibilityState = .{ .grid_id = 2, .is_external = true, .is_whole_grid = true, .is_regular = true, .mousescroll_ver = 1, .busy = false, .resizing = false, .dpi_changing = false, .device_lost = false };
-    var grid_zero = base;
-    grid_zero.grid_id = 1;
-    try std.testing.expect(!eligible(grid_zero));
-    var not_external = base;
-    not_external.is_external = false;
-    try std.testing.expect(!eligible(not_external));
-    var not_whole = base;
-    not_whole.is_whole_grid = false;
-    try std.testing.expect(!eligible(not_whole));
-    var resizing = base;
-    resizing.resizing = true;
-    try std.testing.expect(!eligible(resizing));
-    var dpi_changing = base;
-    dpi_changing.dpi_changing = true;
-    try std.testing.expect(!eligible(dpi_changing));
-    var device_lost = base;
-    device_lost.device_lost = true;
-    try std.testing.expect(!eligible(device_lost));
 }
 
 fn routingInput(

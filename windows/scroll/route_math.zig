@@ -1,8 +1,7 @@
-//! Pure helpers for the Contract B main semantic record.
+//! Pure helpers for the main semantic scroll record.
 //!
-//! Contract: .agents/docs/windows-smooth-scroll-b-main-region.md
-//! (「会計と照合」). One flush's staged non-A1 deltas route by grid ownership:
-//! a grid that currently has an external window keeps its Contract A2 settle
+//! One flush's staged non-A1 deltas route by grid ownership:
+//! a grid that currently has an external window keeps its displacement-seed
 //! routing (a2_settle_commits ring of that window's TBS), every other staged
 //! grid is a main-composite grid (>= 2) and publishes as a .b_ease record in
 //! the MAIN TBS's ring. Grid 1 and the reserved negative ids never reach the
@@ -15,6 +14,7 @@
 const std = @import("std");
 const stage_math = @import("stage_math.zig");
 const ease_math = @import("ease_math.zig");
+const scroll_policy = @import("settle_policy.zig");
 
 /// The non-A1 staged entries of one flush, in stage order. These are the
 /// routing candidates described above; the A1 session slot (entries[0] when
@@ -29,8 +29,8 @@ pub fn settleEntries(stage: *const stage_math.FlushStage) []const stage_math.Sta
 /// retained between paints without dropping.
 pub const max_ledger_grids = 16;
 
-/// Contract B step-5 per-grid ease OFFSET ledger (pixels, not rows).
-/// UI-thread confinement, no lock (contract 「Lock / thread 契約」). Fixed
+/// Per-grid ease offset ledger (pixels, not rows).
+/// UI-thread confinement keeps this lock-free. Fixed
 /// capacity, no allocation: safe to touch on the paint path. Drained b_ease
 /// records are converted here one event at a time at the paint barrier.
 pub const EaseOffsetLedger = struct {
@@ -40,12 +40,10 @@ pub const EaseOffsetLedger = struct {
     len: usize = 0,
 
     /// Set (or overwrite) one grid's offset, zeroing its velocity. Test
-    /// fixture only (no production caller since the ZONVIE_B_DEBUG_OFFSET
-    /// hook was removed after the 実機 gate): overwriting an in-flight entry
+    /// fixture only. Overwriting an in-flight entry
     /// breaks the v5 velocity continuity invariant, so production arrivals
     /// must go through seedArrival instead. Returns false when the ledger is
-    /// full and the grid is new: the seed is dropped (fail-closed, contract
-    /// 「無効化」 — full drop over partial apply).
+    /// full and the grid is new: the seed is dropped.
     pub fn seed(self: *EaseOffsetLedger, grid_id: i64, offset_px: f64) bool {
         var i: usize = 0;
         while (i < self.len) : (i += 1) {
@@ -73,12 +71,31 @@ pub const EaseOffsetLedger = struct {
         row_height_px: f64,
         external_grid: bool,
     ) ArrivalSeedOutcome {
+        return self.seedArrivalWithPolicy(grid_id, rows_delta, row_height_px, external_grid, 32, .partial);
+    }
+
+    /// Apply the shared large-jump policy before creating a main-window seed.
+    /// The policy acts only as a beyond-threshold gate in snap mode; any batch
+    /// that seeds at all must reach arrivalSeed's state-aware sum-then-clamp
+    /// unmodified, or a residual opposite-sign offset under-animates.
+    pub fn seedArrivalWithPolicy(
+        self: *EaseOffsetLedger,
+        grid_id: i64,
+        rows_delta: i32,
+        row_height_px: f64,
+        external_grid: bool,
+        live_ver: i32,
+        mode: scroll_policy.LargeJumpBehavior,
+    ) ArrivalSeedOutcome {
         if (!ease_math.shouldSeedGrid(grid_id, external_grid) or rows_delta == 0) {
             return .skipped;
         }
+        const decision = scroll_policy.limitRows(@as(i64, rows_delta), live_ver, ease_math.retention_depth_rows, mode);
+        if (mode == .snap and decision.animate_rows == 0) return .skipped;
+        const seed_rows: i32 = rows_delta;
         if (self.find(grid_id)) |i| {
             const prev = self.offsets_px[i];
-            const next = ease_math.arrivalSeed(prev, rows_delta, row_height_px, ease_math.retention_depth_rows);
+            const next = ease_math.arrivalSeed(prev, seed_rows, row_height_px, ease_math.retention_depth_rows);
             // v5.1: a seed that flips the offset's sign is a direction
             // reversal; velocity accumulated toward the old direction (worst
             // at the clamp) would lurch rows past the new target, so it
@@ -91,7 +108,7 @@ pub const EaseOffsetLedger = struct {
         }
         if (self.len == max_ledger_grids) return .capacity_drop;
         self.grid_ids[self.len] = grid_id;
-        self.offsets_px[self.len] = ease_math.arrivalSeed(0.0, rows_delta, row_height_px, ease_math.retention_depth_rows);
+        self.offsets_px[self.len] = ease_math.arrivalSeed(0.0, seed_rows, row_height_px, ease_math.retention_depth_rows);
         self.velocities_px_s[self.len] = 0.0;
         self.len += 1;
         return .seeded;
@@ -118,7 +135,9 @@ pub const EaseOffsetLedger = struct {
     }
 
     /// Returns true whenever an entry exists; springTick removes settled entries.
-    pub fn hasActive(self: *const EaseOffsetLedger) bool { return self.len > 0; }
+    pub fn hasActive(self: *const EaseOffsetLedger) bool {
+        return self.len > 0;
+    }
 
     /// Advance every entry with the closed-form critically damped spring.
     /// Settled entries are swap-removed; the returned flag carries the
@@ -147,11 +166,10 @@ pub const EaseOffsetLedger = struct {
         return reached_zero;
     }
 
-    /// Contract 「無効化」 forced drop (resize / DPI / device loss / …): drop
+    /// Forced drop on resize, DPI change, or device loss: drop
     /// every offset wholesale. Returns true when an active offset was dropped;
     /// the caller must then arm the final-zero pending flag so the drop still
-    /// produces exactly one final recompose frame (contract: 「drop による
-    /// 強制ゼロ化も…「最終 recompose frame」を 1 回発生させる」).
+    /// produces exactly one final recompose frame.
     pub fn dropAll(self: *EaseOffsetLedger) bool {
         const was_active = self.hasActive();
         self.len = 0;
@@ -191,7 +209,7 @@ pub fn shouldScheduleNextFrame(
 
 pub const should_schedule_next_frame = shouldScheduleNextFrame;
 
-/// Inputs of the per-paint recompose derivation (Frame 遷移規則 step 4).
+/// Inputs of the per-paint recompose derivation.
 /// All fields are produced by steps 1-3 of the same paint's tick order.
 pub const PaintTickInput = struct {
     /// Ledger holds an entry after this paint's spring tick (`active_now`).
@@ -201,7 +219,7 @@ pub const PaintTickInput = struct {
     /// This paint's spring tick just crossed an offset to zero (natural
     /// final-zero semantics).
     reached_zero_this_frame: bool,
-    /// A forced drop (無効化) happened since the previous paint.
+    /// A forced drop happened since the previous paint.
     forced_zero_pending: bool,
     /// `was_active_last_frame` persisted from the previous paint.
     was_active_last_frame: bool,
@@ -210,16 +228,14 @@ pub const PaintTickInput = struct {
 pub const PaintTickResult = struct {
     recompose: ease_math.RecomposeState,
     shader_recompose_frame: bool,
-    /// Persist as `was_active_last_frame` for the next paint
-    /// (Frame 遷移規則: 「was_active_last_frame := active_now を保存」).
+    /// Persist as `was_active_last_frame` for the next paint.
     was_active_next: bool,
 };
 
-/// Pure Frame 遷移規則 step 4 (contract 「Frame 遷移規則」):
-///   active_now = ledger に 1px 以上の offset がある
-///   seeded_now = 手順 2 で seed された
+/// Pure per-paint recompose derivation:
+///   active_now = ledger has any offset of at least 1 px
+///   seeded_now = a record seeded during this paint
 ///   final_zero = was_active_last_frame and !active_now
-///     (自然減衰・強制 drop のどちらでも成立)
 ///   recompose  = active_now or seeded_now or final_zero
 /// The caller must treat the result as frozen for the whole paint.
 pub fn deriveRecomposeForPaint(in: PaintTickInput) PaintTickResult {
@@ -358,7 +374,7 @@ test "forced drop arms exactly one final recompose frame" {
     });
     try std.testing.expect(active_paint.shader_recompose_frame);
 
-    // 無効化 between paints: the drop must arm the pending flag.
+    // Forced drops between paints must arm the pending flag.
     var forced_pending = false;
     if (ledger.dropAll()) forced_pending = true;
     try std.testing.expect(forced_pending);
@@ -490,6 +506,63 @@ test "arrival seed at clamp boundary drops only excess" {
     try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrival(2, 20, 20.0, false));
     try std.testing.expectEqual(@as(f64, 160.0), ledger.offsetForGrid(2).?);
     try std.testing.expectEqual(@as(usize, 1), ledger.count());
+}
+
+test "snap mode drops a batch beyond the live threshold" {
+    var ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.skipped, ledger.seedArrivalWithPolicy(2, 4, 20.0, false, 3, .snap));
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 3, 20.0, false, 3, .snap));
+    try std.testing.expectEqual(@as(f64, 60.0), ledger.offsetForGrid(2).?);
+}
+
+test "snap mode within threshold matches the state-aware partial clamp" {
+    // Residual opposite-sign offset: the raw delta must reach arrivalSeed so
+    // the sum-then-clamp pins the full cap, identical to partial mode.
+    var snap_ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, snap_ledger.seedArrivalWithPolicy(2, -3, 20.0, false, 32, .snap));
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, snap_ledger.seedArrivalWithPolicy(2, 20, 20.0, false, 32, .snap));
+    var partial_ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, partial_ledger.seedArrivalWithPolicy(2, -3, 20.0, false, 32, .partial));
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, partial_ledger.seedArrivalWithPolicy(2, 20, 20.0, false, 32, .partial));
+    try std.testing.expectEqual(partial_ledger.offsetForGrid(2).?, snap_ledger.offsetForGrid(2).?);
+}
+
+test "external spring seeding matches the main ledger rules" {
+    var ledger: EaseOffsetLedger = .{};
+    var external: ease_math.ExternalSpringState = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, -3, 20.0, false, 8, .partial));
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.animate, external.seedArrivalWithPolicy(-3, 20.0, 8, .partial).outcome);
+    ledger.velocities_px_s[ledger.find(2).?] = 250.0;
+    external.velocity_px_s = 250.0;
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 20, 20.0, false, 8, .partial));
+    const external_result = external.seedArrivalWithPolicy(20, 20.0, 8, .partial);
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.animate, external_result.outcome);
+    try std.testing.expect(external_result.sign_flipped);
+    try std.testing.expectEqual(ledger.offsetForGrid(2).?, external.offset_px);
+    try std.testing.expectEqual(ledger.velocities_px_s[ledger.find(2).?], external.velocity_px_s);
+
+    var snap_ledger: EaseOffsetLedger = .{};
+    var snap_external: ease_math.ExternalSpringState = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.skipped, snap_ledger.seedArrivalWithPolicy(2, 4, 20.0, false, 3, .snap));
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.skip, snap_external.seedArrivalWithPolicy(4, 20.0, 3, .snap).outcome);
+}
+
+test "external snap policy preserves FIFO record boundaries" {
+    var external: ease_math.ExternalSpringState = .{};
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.animate, external.seedArrivalWithPolicy(3, 20.0, 3, .snap).outcome);
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.animate, external.seedArrivalWithPolicy(3, 20.0, 3, .snap).outcome);
+    try std.testing.expectEqual(@as(f64, 60.0), external.offset_px);
+
+    var aggregated: ease_math.ExternalSpringState = .{};
+    try std.testing.expectEqual(ease_math.ExternalSeedOutcome.skip, aggregated.seedArrivalWithPolicy(6, 20.0, 3, .snap).outcome);
+    try std.testing.expectEqual(@as(f64, 0.0), aggregated.offset_px);
+}
+
+test "partial policy keeps the historical final-offset clamp" {
+    var ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 8, 20.0, false, 1, .partial));
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, -20, 20.0, false, 1, .partial));
+    try std.testing.expectEqual(@as(f64, -160.0), ledger.offsetForGrid(2).?);
 }
 
 test "frame driver schedules only active or final-zero outermost paints" {

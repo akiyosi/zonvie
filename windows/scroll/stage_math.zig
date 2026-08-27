@@ -1,12 +1,10 @@
 //! Pure flush-local stage accumulation for the smooth-scroll semantic bridge.
 //!
-//! Contract: .agents/docs/windows-smooth-scroll-a2-discrete-settle.md
-//! (「A0 拡張 — A2 publication」). One flush may carry per-grid deltas for
-//! several external grids: the grid owned by the active A1 session stages as
-//! an a1_session entry with the session's identity (exactly the previous
-//! single-slot behavior), while every other external grid stages as an
-//! a2_settle entry with session_generation 0. Non-external grids (main grid 1
-//! and the reserved negative ids) are ignored.
+//! One flush may carry per-grid deltas for several external grids: the grid
+//! owned by an active A1 session stages as an a1_session entry with the
+//! session's identity, while every other external grid stages an
+//! a2_settle-tagged displacement seed with session_generation 0.
+//! Non-external grids (main grid 1 and the reserved negative ids) are ignored.
 //!
 //! std-only: runs as a native unit test on any host. No allocation anywhere;
 //! callbacks.zig keeps one global instance touched only by the core thread
@@ -15,7 +13,7 @@
 const std = @import("std");
 const types = @import("types.zig");
 
-/// Distinct grids one flush can stage (A1 slot included). Excess A2 deltas
+/// Distinct grids one flush can stage (A1 slot included). Excess external deltas
 /// are counted in dropped_a2 and discarded; the A1 slot is staged at flush
 /// begin and can never be displaced by overflow.
 pub const stage_capacity = 8;
@@ -39,7 +37,7 @@ pub const FlushStage = struct {
     /// from flush begin even while its delta is still 0, preserving the
     /// original single-slot stage semantics.
     a1_active: bool = false,
-    /// A2 deltas dropped because the stage was full. Reported via applog by
+    /// External deltas dropped because the stage was full. Reported via applog by
     /// the consumer; never affects the A1 slot or the flush itself.
     dropped_a2: u32 = 0,
 
@@ -63,7 +61,8 @@ pub const FlushStage = struct {
     /// Accumulate one on_grid_scroll notification.
     /// The A1 session's grid keeps its original routing (checked first, before
     /// any other filter, exactly as the single-slot stage did). Everything
-    /// else stages as an A2 settle delta unless it is a non-external grid.
+    /// else stages as an external displacement delta unless it is a
+    /// non-external grid.
     pub fn addGridScroll(self: *FlushStage, grid_id: i64, rows_delta: i32) void {
         if (self.a1_active and grid_id == self.entries[0].grid_id) {
             self.entries[0].rows_delta +|= rows_delta;
@@ -103,7 +102,7 @@ pub const FlushStage = struct {
         return self.entries[0];
     }
 
-    /// The accumulated A2 settle delta staged for grid_id, or null when the
+    /// The accumulated external displacement delta staged for grid_id, or null when the
     /// grid staged nothing (or only owned the A1 slot).
     pub fn a2DeltaForGrid(self: *const FlushStage, grid_id: i64) ?i32 {
         var i: usize = if (self.a1_active) 1 else 0;

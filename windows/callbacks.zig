@@ -28,13 +28,11 @@ var log_styled_glyph_fail: u64 = 0;
 var log_styled_glyph_last_report_ns: i128 = 0;
 
 // =========================================================================
-// Smooth-scroll semantic bridge (Contract A, core thread only)
-// Design contract: .agents/docs/windows-smooth-scroll-design.md
+// Smooth-scroll semantic bridge (core thread only)
 // =========================================================================
 
-/// Flush-local stage for on_grid_scroll deltas (multi-slot, Contract A2's A0
-/// extension). Slot 0 holds the active A1 session's delta exactly as the old
-/// single-slot stage did; other external grids stage as A2 settle deltas.
+/// Flush-local stage for on_grid_scroll deltas. Slot 0 holds an active A1
+/// session's delta; other external grids stage displacement-seed deltas.
 /// Only the core thread touches it, and only between on_flush_begin and
 /// on_flush_end; no lock is needed and no allocation ever happens on this
 /// path (fixed-capacity array, pure logic in scroll/stage_math.zig).
@@ -2262,11 +2260,11 @@ pub fn onGridRowScroll(
 /// Publication happens with the target TBS commit in onFlushEnd.
 pub fn onGridScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
     _ = ctx;
-    // The active A1 session's grid keeps its original single-slot routing;
-    // every other external grid stages a Contract A2 settle delta. Main-grid
+    // An active A1 session's grid keeps its dedicated routing; every other
+    // external grid stages a displacement-seed delta. Main-grid
     // and reserved-id notifications are ignored; a flush where main and a
     // target both scroll is never mixed-fatal. Overflow beyond the fixed
-    // stage capacity drops only excess A2 deltas (reported in onFlushEnd).
+    // stage capacity drops only excess external deltas (reported in onFlushEnd).
     g_semantic_stage.addGridScroll(grid_id, rows_delta);
 }
 
@@ -2282,7 +2280,7 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     _ = app.core_flush_generation.fetchAdd(1, .acq_rel);
 
     // Snapshot the active smooth-scroll session into the flush-local stage
-    // (slot 0; other slots collect A2 settle deltas as they arrive).
+    // (slot 0; other slots collect external displacement deltas as they arrive).
     // onFlushEnd consumes and resets the stage on every path, including
     // aborted flushes (on_flush_end still runs via the core's defer).
     g_semantic_stage.beginFlush(activeScrollSessionForFlush(app));
@@ -2307,9 +2305,18 @@ pub fn onFlushBegin(ctx: ?*anyopaque) callconv(.c) void {
     app.mu.unlock(core.clock.io());
 }
 
+fn queueExternalColorsUpdate(app: *App) void {
+    if (app.external_colors_update_pending.cmpxchgStrong(false, true, .release, .monotonic) != null) return;
+    const hwnd = app.hwnd orelse {
+        app.external_colors_update_pending.store(false, .release);
+        return;
+    };
+    if (c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CMDLINE_COLORS, 0, 0) == 0) {
+        app.external_colors_update_pending.store(false, .release);
+    }
+}
+
 /// Called once per flush (from core thread via on_flush_end callback).
-/// Posts a single WM_APP_UPDATE_SCROLLBAR with atomic coalescing to avoid
-/// flooding the message queue when flushes are frequent.
 pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     const ctxp = ctx orelse return;
     const ctx_bits: usize = @intFromPtr(ctxp);
@@ -2328,8 +2335,8 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // Consume the flush-local semantic stage exactly once per flush. An A1
     // delta is never re-staged or back-dated onto an older commit revision;
     // every path that fails to commit it instead requests a durable session
-    // reset below (smooth_scroll_reset_pending). A2 settle deltas carry no
-    // fail-closed machinery: a delta that cannot commit is simply dropped
+    // reset below (smooth_scroll_reset_pending). External displacement deltas
+    // carry no fail-closed machinery: a delta that cannot commit is dropped
     // (the retried flush repaints cell-aligned, i.e. an accepted snap).
     const semantic_stage = g_semantic_stage;
     g_semantic_stage = .{};
@@ -2339,14 +2346,13 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         .surface = .{ .grid_id = a1.grid_id, .incarnation = a1.surface_incarnation },
     } else null;
     if (semantic_stage.dropped_a2 != 0 and applog.isEnabled()) {
-        applog.appLog("[smooth] a2 settle stage overflow: dropped {d} delta(s)\n", .{semantic_stage.dropped_a2});
+        applog.appLog("[smooth] external displacement stage overflow: dropped {d} delta(s)\n", .{semantic_stage.dropped_a2});
     }
     var semantic_committed = false;
     var semantic_reset_required = false;
     var semantic_reset_reason: scroll_coordinator.ResetReason = .protocol_mismatch;
 
-    // Contract B main routing (windows-smooth-scroll-b-main-region.md
-    // 「会計と照合」): staged non-A1 deltas whose grid has NO external window
+    // Staged non-A1 deltas whose grid has no external window
     // belong to the main composite (grid >= 2 splits / following floats) and
     // publish as .b_ease records with the main TBS commit below. Bounded by
     // the stage capacity, so a fixed array suffices (no allocation).
@@ -2410,7 +2416,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
                     };
                 }
             }
-            // Contract A2: a settle delta binds to the window's CURRENT
+            // An external displacement delta binds to the window's current
             // incarnation, resolved here under app.mu at commit time (the
             // stage never snapshots it). session_generation 0 marks the
             // record session-independent.
@@ -2428,8 +2434,8 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             }
             const commit_result = ext_win.tbs.commitFlushWithSemantic(app.alloc, a1_input, a2_input);
             // Result handling belongs exclusively to the A1 machinery; an
-            // A2-only commit never resets a session (a not_in_flush outcome
-            // just dropped the cosmetic settle delta inside the TBS).
+            // external-only commit never resets a session. A not_in_flush
+            // outcome only drops its cosmetic displacement record.
             if (a1_input != null) switch (commit_result) {
                 .committed => {
                     const current = scroll_session.activeIdentity();
@@ -2455,7 +2461,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
 
         // Route the remaining staged deltas to the main TBS ring. Grid
         // ownership is resolved here under app.mu at commit time, mirroring
-        // the A2 incarnation resolution above: a grid with an external window
+        // the external incarnation resolution above: a grid with an external window
         // was already delivered by the loop; everything else is a main
         // composite grid. Grid 1 and the reserved negative ids can never
         // appear here — stage_math.addGridScroll rejects grid_id <= 1 (seed
@@ -2483,7 +2489,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // are cleared on delivery), so the movement is unrecoverable — request a
     // durable session reset instead of silently diverging the accounting.
     // Runtime-inert today: the A1 slot is never staged while no session
-    // exists, and A2 settle deltas are exempt from this fail-closed check.
+    // exists, and external displacement deltas are exempt from this check.
     if (a1_stage != null and a1_stage.?.rows_delta != 0 and !semantic_committed) {
         semantic_reset_required = true;
     }
@@ -2632,6 +2638,8 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // A failed semantic wake is discovered after the earlier fail-closed
     // stage check. Publish the same durable reset request here as well.
     if (semantic_reset_required) requestSmoothScrollReset(app, a1_session, semantic_reset_reason);
+
+    app.external_colors_dirty.store(true, .release);
 
     // Coalesce: only post if not already pending (atomic CAS: false -> true)
     if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
@@ -3533,8 +3541,8 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     // update cached highlight group bg colors for external window clear color.
     if (app.hwnd) |hwnd| {
         _ = c.PostMessageW(hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
-        _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CMDLINE_COLORS, 0, 0);
     }
+    queueExternalColorsUpdate(app);
 }
 
 pub fn onSetTitle(ctx: ?*anyopaque, title_ptr: ?[*]const u8, title_len: usize) callconv(.c) void {
@@ -3606,9 +3614,7 @@ pub fn onCmdlineShow(
     // We can't call zonvie_core_get_hl_by_name here (callback context) because
     // core holds an internal lock during callbacks, causing deadlock.
     // Post message to UI thread which will call updateCmdlineColors().
-    if (app.hwnd) |hwnd| {
-        _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CMDLINE_COLORS, 0, 0);
-    }
+    queueExternalColorsUpdate(app);
 }
 
 pub fn onCmdlineHide(ctx: ?*anyopaque, _: u32) callconv(.c) void {

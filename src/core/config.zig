@@ -65,6 +65,7 @@ pub const Config = struct {
     font: FontConfig = .{},
     window: WindowConfig = .{},
     scrollbar: ScrollbarConfig = .{},
+    scroll: ScrollConfig = .{},
     cmdline: CmdlineConfig = .{},
     popup: PopupConfig = .{},
     messages: MessagesConfig = .{},
@@ -147,6 +148,12 @@ pub const Config = struct {
         pub fn isScroll(self: ScrollbarConfig) bool {
             return self.hasMode("scroll");
         }
+    };
+
+    pub const ScrollConfig = struct {
+        // Behavior for scroll batches beyond the animated limit:
+        // "partial" animates the clamped portion, "snap" snaps the whole batch.
+        large_jump_behavior: []const u8 = "partial",
     };
 
     pub const CmdlineConfig = struct {
@@ -364,6 +371,10 @@ pub const Config = struct {
             if (s.show_mode) |m| self.scrollbar.show_mode = alloc.dupe(u8, m) catch self.scrollbar.show_mode;
             if (s.opacity) |o| self.scrollbar.opacity = @max(0.0, @min(1.0, o));
             if (s.delay) |d| self.scrollbar.delay = @max(0.1, @min(10.0, d));
+        }
+
+        if (cfg.scroll) |s| {
+            if (s.large_jump_behavior) |b| self.scroll.large_jump_behavior = alloc.dupe(u8, b) catch self.scroll.large_jump_behavior;
         }
 
         if (cfg.cmdline) |cmd| {
@@ -632,6 +643,11 @@ pub const Config = struct {
             alloc.free(self.scrollbar.show_mode);
         }
 
+        // Free duplicated scroll.large_jump_behavior
+        if (self.scroll.large_jump_behavior.ptr != default.scroll.large_jump_behavior.ptr) {
+            alloc.free(self.scroll.large_jump_behavior);
+        }
+
         // Free duplicated tabline strings
         if (self.tabline.style.ptr != default.tabline.style.ptr) {
             alloc.free(self.tabline.style);
@@ -754,6 +770,7 @@ const TomlConfig = struct {
     font: ?TomlFont = null,
     window: ?TomlWindow = null,
     scrollbar: ?TomlScrollbar = null,
+    scroll: ?TomlScroll = null,
     cmdline: ?TomlCmdline = null,
     popup: ?TomlPopup = null,
     messages: ?TomlMessages = null,
@@ -793,6 +810,10 @@ const TomlScrollbar = struct {
     show_mode: ?[]const u8 = null,
     opacity: ?f32 = null,
     delay: ?f32 = null,
+};
+
+const TomlScroll = struct {
+    large_jump_behavior: ?[]const u8 = null,
 };
 
 const TomlCmdline = struct {
@@ -891,6 +912,19 @@ fn parseForTest(alloc: std.mem.Allocator, toml_src: []const u8) !Config {
     errdefer cfg.deinit();
     try cfg.parseToml(toml_src);
     return cfg;
+}
+
+test "scroll.large_jump_behavior round-trips through TOML and defaults when omitted" {
+    var cfg = try parseForTest(std.testing.allocator,
+        \\[scroll]
+        \\large_jump_behavior = "snap"
+    );
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("snap", cfg.scroll.large_jump_behavior);
+
+    var default_cfg = try parseForTest(std.testing.allocator, "");
+    defer default_cfg.deinit();
+    try std.testing.expectEqualStrings("partial", default_cfg.scroll.large_jump_behavior);
 }
 
 test "declaring one route keeps the defaults for other events" {

@@ -1,11 +1,4 @@
 //! Shared identity and record types for the Windows smooth-scroll pipeline.
-//!
-//! Contract: .agents/docs/windows-smooth-scroll-design.md (Contract A).
-//! This file is owned by the orchestrator and pins the types shared between
-//! the TBS semantic record (windows/app.zig), the flush-local stage
-//! (windows/callbacks.zig), and the accounting coordinator
-//! (windows/scroll/coordinator.zig). Implementation modules import it and
-//! must not redefine these types.
 
 const std = @import("std");
 
@@ -29,13 +22,13 @@ pub const ScrollSessionId = struct {
     surface: SurfaceToken,
 };
 
-/// Which contract owns a semantic record (Contract A2 design doc, A0 拡張).
+/// Which presentation path owns a semantic record.
 pub const RecordKind = enum {
     /// Contract A1: bound to a live Direct Manipulation scroll session.
     a1_session,
-    /// Contract A2: discrete settle compensation; session-independent, so
-    /// session_generation is 0 and consumption happens at the owning
-    /// window's outermost paint, never at the A1 drain points.
+    /// External displacement seed; session-independent, so
+    /// session_generation is 0 and FIFO consumption happens at the owning
+    /// window's outermost paint.
     a2_settle,
     /// Contract B: main-composite ease record (grid >= 2 inside the main
     /// window); session-independent (session_generation 0), drained at the

@@ -1,9 +1,10 @@
-//! Pure math and policy for Contract B's per-grid shader offset.
+//! Pure math and policy for per-grid shader offsets.
 //!
 //! This module deliberately has no platform imports.  It is used by the
 //! Windows renderer later, but its contract is native-testable on every host.
 
 const std = @import("std");
+const scroll_policy = @import("settle_policy.zig");
 
 pub const epsilon_px_default: f64 = 1.0;
 pub const offset_epsilon_px: f64 = epsilon_px_default;
@@ -51,6 +52,75 @@ pub fn arrivalSeed(current_offset_px: f64, rows_delta: i32, row_height_px: f64, 
     return next;
 }
 
+pub const ExternalSeedOutcome = enum { animate, skip };
+
+pub const ExternalSeedResult = struct {
+    outcome: ExternalSeedOutcome,
+    sign_flipped: bool = false,
+};
+
+/// One external surface's UI-thread-owned spring state.
+pub const ExternalSpringState = struct {
+    offset_px: f64 = 0.0,
+    velocity_px_s: f64 = 0.0,
+    last_tick_qpc: i64 = 0,
+    incarnation: u64 = 0,
+    reset_serial: u64 = 0,
+
+    pub fn ensureIncarnation(self: *ExternalSpringState, incarnation: u64) bool {
+        if (self.incarnation == incarnation) return false;
+        const next_reset_serial = self.reset_serial +% 1;
+        self.* = .{ .incarnation = incarnation, .reset_serial = next_reset_serial };
+        return true;
+    }
+
+    pub fn tickAt(self: *ExternalSpringState, now_qpc: i64, frequency_qpc: f64) void {
+        const dt_sec: f64 = if (self.last_tick_qpc <= 0 or frequency_qpc <= 0.0)
+            0.0
+        else
+            @as(f64, @floatFromInt(@max(now_qpc - self.last_tick_qpc, 0))) / frequency_qpc;
+        self.last_tick_qpc = now_qpc;
+        const tick = springTick(.{
+            .offset_px = self.offset_px,
+            .velocity_px_s = self.velocity_px_s,
+        }, dt_sec);
+        self.offset_px = tick.state.offset_px;
+        self.velocity_px_s = tick.state.velocity_px_s;
+    }
+
+    pub fn seedArrivalWithPolicy(
+        self: *ExternalSpringState,
+        rows_delta: i32,
+        row_height_px: f64,
+        live_ver: i32,
+        mode: scroll_policy.LargeJumpBehavior,
+    ) ExternalSeedResult {
+        const animated_cap_rows = @min(std.math.clamp(live_ver, 0, 32), retention_depth_rows);
+        if (rows_delta == 0 or row_height_px <= 0.0 or animated_cap_rows == 0) {
+            return .{ .outcome = .skip };
+        }
+        const decision = scroll_policy.limitRows(rows_delta, live_ver, animated_cap_rows, mode);
+        if (mode == .snap and decision.animate_rows == 0) return .{ .outcome = .skip };
+
+        const previous_offset_px = self.offset_px;
+        const next_offset_px = arrivalSeed(previous_offset_px, rows_delta, row_height_px, animated_cap_rows);
+        const sign_flipped = next_offset_px != 0.0 and previous_offset_px != 0.0 and
+            (next_offset_px < 0.0) != (previous_offset_px < 0.0);
+        if (sign_flipped) self.velocity_px_s = 0.0;
+        self.offset_px = next_offset_px;
+        return .{ .outcome = .animate, .sign_flipped = sign_flipped };
+    }
+
+    /// Returns whether a visible displacement was dropped.
+    pub fn reset(self: *ExternalSpringState) bool {
+        const was_active = self.offset_px != 0.0 or self.velocity_px_s != 0.0;
+        const current_incarnation = self.incarnation;
+        const next_reset_serial = self.reset_serial +% 1;
+        self.* = .{ .incarnation = current_incarnation, .reset_serial = next_reset_serial };
+        return was_active;
+    }
+};
+
 pub const retention_depth_rows: i32 = 8;
 
 pub const RecomposeState = struct {
@@ -60,7 +130,7 @@ pub const RecomposeState = struct {
     final_zero_frame: bool = false,
 };
 
-/// Contract B's `shader_recompose_frame` predicate.
+/// `shader_recompose_frame` predicate.
 pub fn shader_recompose_frame(state: RecomposeState) bool {
     return state.offset_active or state.seeded_this_frame or
         state.final_zero_frame_pending or state.final_zero_frame;
@@ -73,7 +143,7 @@ pub fn scrollBackTexAllowed(recompose_frame: bool) bool {
     return !recompose_frame;
 }
 
-/// Contract B v1 seed matrix: grid 1, reserved IDs, and external grids do not
+/// Seed matrix: grid 1, reserved IDs, and external grids do not
 /// seed; every other grid is admitted by this pure policy predicate.
 pub fn shouldSeedGrid(grid_id: i64, external_grid: bool) bool {
     const reserved = grid_id >= -103 and grid_id <= -100;
@@ -187,6 +257,60 @@ test "arrival seed changes offset without changing velocity" {
     const state = SpringState{ .offset_px = 4.0, .velocity_px_s = 17.0 };
     try expectNear(arrivalSeed(state.offset_px, 2, 20.0, retention_depth_rows), 44.0, 0.0);
     try expectNear(state.velocity_px_s, 17.0, 0.0);
+}
+
+test "external arrival uses raw-delta sum then live-cap clamp" {
+    var state: ExternalSpringState = .{ .offset_px = -60.0, .velocity_px_s = 17.0, .incarnation = 4 };
+    const result = state.seedArrivalWithPolicy(20, 20.0, 3, .partial);
+    try std.testing.expectEqual(ExternalSeedOutcome.animate, result.outcome);
+    try expectNear(state.offset_px, 60.0, 0.0);
+    try std.testing.expect(result.sign_flipped);
+    try expectNear(state.velocity_px_s, 0.0, 0.0);
+}
+
+test "external snap gate skips a record beyond the live threshold" {
+    var state: ExternalSpringState = .{ .offset_px = 20.0, .velocity_px_s = -30.0 };
+    const result = state.seedArrivalWithPolicy(4, 20.0, 3, .snap);
+    try std.testing.expectEqual(ExternalSeedOutcome.skip, result.outcome);
+    try expectNear(state.offset_px, 20.0, 0.0);
+    try expectNear(state.velocity_px_s, -30.0, 0.0);
+}
+
+test "external live version caps animated offset" {
+    var state: ExternalSpringState = .{};
+    const result = state.seedArrivalWithPolicy(9, 20.0, 3, .partial);
+    try std.testing.expectEqual(ExternalSeedOutcome.animate, result.outcome);
+    try std.testing.expectEqual(@as(f64, 60.0), state.offset_px);
+}
+
+test "external QPC tick uses monotonic elapsed time" {
+    var state: ExternalSpringState = .{ .offset_px = 80.0, .last_tick_qpc = 1_000 };
+    var expected = springTick(.{ .offset_px = 80.0, .velocity_px_s = 0.0 }, 0.25).state;
+    state.tickAt(1_250, 1_000.0);
+    try expectNear(state.offset_px, expected.offset_px, 1e-12);
+    try expectNear(state.velocity_px_s, expected.velocity_px_s, 1e-12);
+    expected = springTick(.{ .offset_px = state.offset_px, .velocity_px_s = state.velocity_px_s }, 0.0).state;
+    state.tickAt(1_200, 1_000.0);
+    try expectNear(state.offset_px, expected.offset_px, 1e-12);
+}
+
+test "external reset drops spring timing and preserves incarnation" {
+    var state: ExternalSpringState = .{
+        .offset_px = 42.0,
+        .velocity_px_s = -90.0,
+        .last_tick_qpc = 300,
+        .incarnation = 7,
+    };
+    try std.testing.expect(state.reset());
+    try expectNear(state.offset_px, 0.0, 0.0);
+    try expectNear(state.velocity_px_s, 0.0, 0.0);
+    try std.testing.expectEqual(@as(i64, 0), state.last_tick_qpc);
+    try std.testing.expectEqual(@as(u64, 7), state.incarnation);
+    try std.testing.expectEqual(@as(u64, 1), state.reset_serial);
+    try std.testing.expect(!state.reset());
+    try std.testing.expect(state.ensureIncarnation(8));
+    try std.testing.expectEqual(@as(u64, 8), state.incarnation);
+    try std.testing.expectEqual(@as(u64, 3), state.reset_serial);
 }
 
 test "spring is rate independent" {

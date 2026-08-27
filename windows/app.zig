@@ -13,18 +13,18 @@ const builtin = @import("builtin");
 pub const config_mod = @import("config.zig");
 const render_pipeline_helpers = @import("render_pipeline_helpers.zig");
 pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
-// Shared smooth-scroll identity/record types (orchestrator-owned; see
-// .agents/docs/windows-smooth-scroll-design.md, Contract A).
+// Shared smooth-scroll identity and record types.
 pub const scroll_types = @import("scroll/types.zig");
-// Contract B main-record routing/ledger helpers (std-only, natively tested).
+// Main-record routing and ledger helpers.
 pub const scroll_route = @import("scroll/route_math.zig");
+pub const ease_math = @import("scroll/ease_math.zig");
 pub const retention_ring = @import("scroll/retention_ring.zig");
 // Direct Manipulation COM plumbing and the DmSnapshot mailbox. Runtime-inert
 // until the input-eligibility wiring lands; imported here so the windows
 // build type-checks it (see the comptime coverage block in that file).
 pub const direct_manipulation = @import("scroll/direct_manipulation.zig");
 pub const dcomp_presenter = @import("scroll/dcomp_presenter.zig");
-pub const settle_presenter = @import("scroll/settle_presenter.zig");
+pub const scroll_policy = @import("scroll/settle_policy.zig");
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
@@ -961,7 +961,7 @@ pub const SemanticCommitInput = struct {
     rows_delta: i32,
 };
 
-/// Contract B main-composite ease delta staged for one flush, handed to
+/// Main-composite ease delta staged for one flush, handed to
 /// commitFlushWithBEase by the flush-local stage (callbacks.zig). Main-grid
 /// records are session-independent (session_generation 0) and the main
 /// surface has no incarnation counter, so grid identity alone suffices.
@@ -1015,11 +1015,11 @@ pub const TripleBufferedSurface = struct {
         scroll_types.MaxSemanticCommits,
     ) = .{},
 
-    // Contract A2 discrete-settle commit records (rotation_mu protected).
+    // External displacement-seed records (rotation_mu protected).
     // DEDICATED ring, never shared with semantic_commits: a foreign-kind
     // record at the FIFO head would wedge the pop-based A1 retirement in
     // scroll/session.zig (and vice versa). Overflow drops the OLDEST record —
-    // settle is cosmetic, so losing an old record only skips one animation —
+    // displacement is cosmetic, so losing an old record only skips one ease —
     // and never touches the A1 fail-closed machinery. The ring is embedded in
     // the TBS, so window destruction disposes of it automatically.
     a2_settle_commits: scroll_types.FixedRing(
@@ -1027,21 +1027,20 @@ pub const TripleBufferedSurface = struct {
         scroll_types.MaxSemanticCommits,
     ) = .{},
 
-    // Contract B main-composite ease records (rotation_mu protected).
+    // Main-composite ease records (rotation_mu protected).
     // Only the MAIN window's TBS ever populates this ring; it stays empty on
     // external TBSes. DEDICATED ring for the same reason as a2_settle_commits:
     // a foreign-kind record at a FIFO head would wedge kind-specific drains.
     // Records are cosmetic — overflow drops the OLDEST record. The core
     // thread appends inside commitFlushWithBEase's commit critical section;
     // the UI thread drains covered records at the main paint barrier
-    // (drainBEaseRecordsUpTo). Contract:
-    // .agents/docs/windows-smooth-scroll-b-main-region.md 「会計と照合」.
+    // (drainBEaseRecordsUpTo).
     b_ease_commits: scroll_types.FixedRing(
         scroll_types.SemanticCommitRecord,
         scroll_types.MaxSemanticCommits,
     ) = .{},
 
-    // Contract B1 CPU retention captures. Publication is bound to commit_rev
+    // CPU retention captures. Publication is bound to commit_rev
     // by commitFlushWithBEase while rotation_mu is held.
     retention_storage: RetentionStorage = .{},
 
@@ -1311,12 +1310,12 @@ pub const TripleBufferedSurface = struct {
     /// Commit the write set and append the flush's staged semantic scroll
     /// records in the SAME rotation_mu critical section, binding them to the
     /// commit_rev this commit publishes. This is the single publication
-    /// transaction required by the Contract A design doc: a paint entered
+    /// transaction required by the paint handoff: a paint entered
     /// after the lock is released can never Present the new content without
     /// the records already being visible in their rings.
     ///
     /// `a1` is the active session's staged delta (semantic_commits ring, all
-    /// fail-closed semantics unchanged). `a2` is a Contract A2 settle delta
+    /// fail-closed semantics unchanged). `a2` is an external displacement delta
     /// for this surface (session_generation 0), appended to the dedicated
     /// a2_settle_commits ring; its overflow policy and failures never affect
     /// the A1 machinery or the returned result.
@@ -1330,8 +1329,8 @@ pub const TripleBufferedSurface = struct {
             // No row write set joined this flush, so commit_rev does not
             // advance here. Commit whatever else is open (cursor transaction)
             // and report not_in_flush so the caller discards the A1 stage.
-            // An A2 delta has no revision to bind to either; it is dropped
-            // silently (settle is cosmetic, never fail-closed).
+            // An external displacement delta has no revision to bind to
+            // either; it is dropped silently because easing is cosmetic.
             self.commitFlush(alloc);
             return .not_in_flush;
         }
@@ -1342,8 +1341,8 @@ pub const TripleBufferedSurface = struct {
         self.retention_storage.publish(self.commit_rev);
         if (a2) |settle| {
             // Dedicated ring: on overflow drop the OLDEST record and keep the
-            // new one. An old settle record only represents a missed cosmetic
-            // animation; the newest record matches the content just committed.
+            // new one. An old record only represents a missed cosmetic ease;
+            // the newest record matches the content just committed.
             if (self.a2_settle_commits.isFull()) _ = self.a2_settle_commits.popFront();
             _ = self.a2_settle_commits.push(.{
                 .kind = .a2_settle,
@@ -1369,13 +1368,11 @@ pub const TripleBufferedSurface = struct {
         return .committed;
     }
 
-    /// Commit the write set and append the flush's staged Contract B
+    /// Commit the write set and append the flush's staged main-ease
     /// main-composite ease records in the SAME rotation_mu critical section,
-    /// binding them to the commit_rev this commit publishes — the same
+    /// binding them to the commit_rev this commit publishes, using the same
     /// single-transaction rule commitFlushWithSemantic implements for
-    /// external surfaces (contract: windows-smooth-scroll-b-main-region.md
-    /// 「会計と照合」: "publish は main TBS の set・pending scroll・commit_rev
-    /// と同一の rotation_mu transaction で行う"). A paint entered after the
+    /// external surfaces. A paint entered after the
     /// lock is released can never Present the new content without the records
     /// already being visible in the ring.
     ///
@@ -1550,25 +1547,30 @@ pub const TripleBufferedSurface = struct {
         self.retention_storage.pruneInactive(commit_rev, active_grid_ids);
     }
 
-    /// Drain the covered A2 prefix and return its aggregate row displacement.
-    /// The ring is per surface, so the caller can apply the sum without any
-    /// cross-window lookup or allocation.
-    pub fn takeSettleRowsUpTo(self: *TripleBufferedSurface, commit_rev: u64) i64 {
+    /// Drain all covered external displacement records while holding the lock once.
+    pub fn takeSettleRecordsUpTo(
+        self: *TripleBufferedSurface,
+        commit_rev: u64,
+        out: []scroll_types.SemanticCommitRecord,
+    ) usize {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
-        var total_rows: i64 = 0;
-        while (self.a2_settle_commits.front()) |record| {
+        var count: usize = 0;
+        while (count < out.len) {
+            const record = self.a2_settle_commits.front() orelse break;
             if (record.commit_rev > commit_rev) break;
-            total_rows += @as(i64, record.rows_delta);
-            _ = self.a2_settle_commits.popFront();
+            out[count] = self.a2_settle_commits.popFront().?;
+            count += 1;
         }
-        return total_rows;
+        return count;
     }
 
-    pub fn hasSettleCommitsUpTo(self: *TripleBufferedSurface, commit_rev: u64) bool {
+    /// Discard every queued displacement record when the target surface or
+    /// its ease state is invalidated.
+    pub fn clearSettleCommits(self: *TripleBufferedSurface) void {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
-        return self.a2_settle_commits.front() != null and self.a2_settle_commits.front().?.commit_rev <= commit_rev;
+        while (self.a2_settle_commits.front() != null) _ = self.a2_settle_commits.popFront();
     }
 
     /// Lock-held commit body shared by commitFlush and
@@ -2621,16 +2623,8 @@ pub const ExternalWindow = struct {
     win_id: i64 = 0, // Neovim window handle
     renderer: d3d11.Renderer,
 
-    // Contract A2/A1 handoff state. The embedded renderer is the per-window
-    // owner of the permanent settle visual; this flag is the single
-    // suppression query used by the A2 retarget path while A1 is attached.
-    smooth_scroll_a1_active: bool = false,
-    // UI-thread-only A2 settle state; the renderer owns the permanent visual.
-    a2_settle: settle_presenter.SettlePresenter = .{},
-    // Set when a failed A2 publication cannot safely touch the old COM
-    // generation.  The next successful paint snaps the rebuilt visual to zero
-    // and includes that scalar change in its publication Commit.
-    a2_zero_snap_pending: bool = false,
+    // UI-thread-owned present-time displacement for this surface.
+    contract_b_ease: ease_math.ExternalSpringState = .{},
 
     // Surface incarnation for smooth-scroll identity (SurfaceToken).
     // Assigned from App.external_incarnation_counter at creation so stale
@@ -2734,6 +2728,15 @@ pub const ExternalWindow = struct {
         self.vert_count = self.surface.recomputeVertCount();
     }
 
+    pub fn resetContractBEase(self: *ExternalWindow, reason: []const u8) void {
+        _ = self.contract_b_ease.reset();
+        self.tbs.clearSettleCommits();
+        self.renderer.resetContractBOffset();
+        self.renderer.discardContractBRetention(reason);
+        self.renderer.retention_row_height_px = 0;
+        self.renderer.has_presented_once = false;
+    }
+
     pub fn deinit(
         self: *ExternalWindow,
         alloc: std.mem.Allocator,
@@ -2779,9 +2782,6 @@ pub const ExternalWindow = struct {
         if (self.scrollbar_vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
         }
-        // The renderer is about to release the DirectComposition device. Reset
-        // and release the animation while its COM generation is still valid.
-        self.a2_settle.drop(!self.renderer.device_lost);
         self.renderer.deinit();
     }
 };
@@ -3242,10 +3242,10 @@ pub const ScrollShiftResult = struct {
 ///   effective_rows:      Total valid row count
 ///   y_offset:            Content Y offset in back_tex pixels (e.g. tabbar height). 0 for ext windows.
 ///   back_tex_blit_allowed: ease_math.scrollBackTexAllowed(shader_recompose_frame).
-///                        Contract B 描画フレーム契約 item 2: a recompose paint
-///                        applies the RowVB metadata shift but must suppress the
-///                        physical back_tex blit — otherwise the shader offset
-///                        moves already-blitted pixels a second time.
+///                        A recompose paint applies the RowVB metadata shift
+///                        but must suppress the physical back_tex blit so the
+///                        shader offset does not move already-blitted pixels a
+///                        second time.
 pub fn applyScrollShiftGated(
     g: *d3d11.Renderer,
     alloc: std.mem.Allocator,
@@ -3308,12 +3308,11 @@ pub fn applyScrollShiftGated(
     filled.top += y_offset;
     filled.bottom += y_offset;
 
-    // Contract B blit suppression (描画フレーム契約 item 2): the metadata
+    // Recompose blit suppression: the metadata
     // shift above always runs; the pixel copy runs only when the caller's
     // scrollBackTexAllowed(recompose) said so. A suppressed copy takes the
     // same "pixels were never shifted" recovery below, so every row of the
-    // scroll region joins rows_to_draw (a recompose paint redraws all rows
-    // anyway — 描画フレーム契約 item 1).
+    // scroll region joins rows_to_draw. A recompose paint redraws all rows.
     const scroll_copy_ok = back_tex_blit_allowed and g.scrollBackTex(filled, scroll_dy_px);
 
     // 4. When multiple scroll flushes accumulate before a paint, the back buffer
@@ -3381,8 +3380,8 @@ pub fn applyScrollShiftGated(
     return .{ .scroll_rect = filled };
 }
 
-/// Compatibility entry for callers outside Contract B's main-composite scope
-/// (external windows, Contract A2): the physical back_tex blit stays
+/// Compatibility entry for callers outside the main-composite path
+/// (external windows): the physical back_tex blit stays
 /// unconditionally allowed there. The main WM_PAINT path calls
 /// applyScrollShiftGated with ease_math.scrollBackTexAllowed(recompose).
 pub fn applyScrollShift(
@@ -3446,7 +3445,7 @@ pub fn drawSurfaceRowsVBFromSlots(
 ) !void {
     const row_count: usize = if (rows_to_draw) |rows| rows.len else row_map.len;
     var vp_dirty = false;
-    // Contract B row-translation separation (描画フレーム契約 item 4): the
+    // Recompose row-translation separation: the
     // ordinary path keeps DrawOpts.row_translation_ndc at its zero default and
     // uses the per-row viewport translation below. A recompose paint
     // (use_vs_row_translation) disables per-row scissor/viewport (the caller
@@ -3469,7 +3468,7 @@ pub fn drawSurfaceRowsVBFromSlots(
         if (mapping.slot == SLOT_NONE) {
             if (use_vs_row_translation) {
                 // Recompose paints cleared the whole content viewport to the
-                // background first (描画フレーム契約 item 1, 「空行含む」): a
+                // background first, including empty rows: a
                 // row with no slot is legitimately background, not a failure.
                 metrics.drawn_rows += 1;
                 continue;
@@ -3587,7 +3586,7 @@ pub fn drawSurfaceRowsVBFromSlots(
         }
 
         if (use_vs_row_translation and row_h_px > 0 and base_vp.h > 0) {
-            // Contract B recompose translation (描画フレーム契約 item 4): the
+            // Recompose translation: the
             // remapped logical-minus-origin delta rides the VS constant so the
             // draw needs no per-row viewport (and therefore no per-row
             // scissor). Viewport TopLeftY += delta_px is pixel-equivalent to
@@ -3620,8 +3619,7 @@ pub fn drawSurfaceRowsVBFromSlots(
     }
 
     // Recompose: the VS row translation is per-row state. Reset it before the
-    // later passes (cursor, bloom, scrollbar overlay) so the pass order of the
-    // 描画フレーム契約 draws them untranslated.
+    // later fixed-overlay passes so they draw untranslated.
     if (use_vs_row_translation) {
         g.setRowTranslationNdc(0.0) catch {
             metrics.failed_rows += 1;
@@ -3944,7 +3942,7 @@ pub const RowModeDrawParams = struct {
     tabbar_bg_color: ?[4]f32 = null,
     // Kept at zero while per-row viewport translation remains active.
     row_translation_ndc: f32 = 0.0,
-    // Contract B recompose paint (描画フレーム契約 item 4): per-row scissor
+    // Recompose paint: per-row scissor
     // is disabled (use_row_scissor=false) while row translation is expressed
     // per-row through the step-3 row_translation_ndc VS constant instead of
     // the viewport. Only WM_PAINT's shader_recompose_frame path sets this.
@@ -4544,6 +4542,7 @@ pub const App = struct {
 
     // Configuration loaded from config.toml
     config: config_mod.Config = .{},
+    large_jump_behavior: scroll_policy.LargeJumpBehavior = .partial,
 
     mu: std.Io.Mutex = .init,
 
@@ -4669,13 +4668,13 @@ pub const App = struct {
 
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
     tbs: TripleBufferedSurface = .{},
-    // Contract B step-5 recompose state (all UI thread confinement, no lock —
-    // 「Lock / thread 契約」). Main b_ease records are converted directly at
-    // the paint barrier so per-event caps remain observable.
+    // Main recompose state. UI-thread confinement keeps the offset ledger
+    // lock-free. Main b_ease records are converted directly at the paint
+    // barrier so per-event caps remain observable.
     b_offset_ledger: scroll_route.EaseOffsetLedger = .{},
-    // 「Frame 遷移規則」 step 4: was_active_last_frame persisted across paints.
+    // Persisted active state from the previous outermost paint.
     b_was_active_last_frame: bool = false,
-    // 「無効化」: a forced drop (WM_SIZE / device loss) between paints must
+    // A forced drop between paints must
     // still produce exactly one final recompose frame; the drop site arms
     // this and the next paint's derivation consumes it.
     b_forced_zero_pending: bool = false,
@@ -4687,7 +4686,7 @@ pub const App = struct {
     b_in_size_move: bool = false,
     // Whether the previous outermost paint ran the recompose path. The first
     // ordinary paint after a recompose run re-primes the scrollbar underlay
-    // (underlay 遷移規則) via a one-shot full-row redraw.
+    // via a one-shot full-row redraw.
     b_prev_paint_recompose: bool = false,
     // Timestamp of the previous ease decay tick (dt source; the decay itself
     // is rate independent via ease_math.elapsedFrames).
@@ -4782,6 +4781,11 @@ pub const App = struct {
 
     // Scrollbar update coalescing: set by on_flush_end (core thread), cleared by WM_APP_UPDATE_SCROLLBAR (UI thread).
     scrollbar_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    external_colors_update_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Flush-driven highlight polling must not post messages: posted messages
+    // outrank WM_PAINT, and a per-flush post starves paints during scrolling.
+    // The paint path consumes this flag instead.
+    external_colors_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     msg_throttle_arm_posted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // WM_APP_SMOOTH_SCROLL_COMMIT coalescing: set by onFlushEnd (core thread)
     // after a semantic commit, cleared by the UI-thread handler before it
@@ -4840,10 +4844,8 @@ pub const App = struct {
     // Otherwise the first present may clear to black and only the dirty row gets drawn.
     need_full_seed: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     // Set from WM_DPICHANGED (UI thread) when the DPI actually changed;
-    // consumed at the start of onFlushBegin (core thread) which is the only
-    // thread allowed to call zonvie_core_invalidate_glyph_cache — see MED-1
-    // in the fix-plan doc for why the call cannot be made directly from the
-    // wndproc.
+    // consumed at the start of onFlushBegin (core thread), which is the only
+    // thread allowed to call zonvie_core_invalidate_glyph_cache.
     pending_core_glyph_invalidate: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // After atlas reset, external window paints may consume shared pending_uploads.
     // This flag ensures the main window uploads the full atlas to cover any missed regions.

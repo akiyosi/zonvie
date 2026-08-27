@@ -705,6 +705,9 @@ pub fn main() u8 {
 
     // Log config info (after applog is enabled)
     if (applog.isEnabled()) {
+        if (config_result.large_jump_behavior_invalid) {
+            applog.appLog("[win] WARNING: invalid [scroll].large_jump_behavior; using partial\n", .{});
+        }
         applog.appLog("[TIMING] Config.load: {d}ms\n", .{config_ms});
         applog.appLog("[win] Config path: {s}\n", .{config_result.path orelse "(none)"});
         applog.appLog("[win] Config loaded: neovim.path={s}, font.family={s}, font.size={d}, cmdline.external={}, log.enabled={}, close_to_tray={}\n", .{
@@ -923,6 +926,7 @@ pub fn main() u8 {
         .alloc = alloc,
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .config = config,
+        .large_jump_behavior = config_result.large_jump_behavior,
         .ext_cmdline_enabled = ext_cmdline_enabled,
         .ext_messages_enabled = ext_messages_enabled,
         .ext_tabline_enabled = ext_tabline_enabled,

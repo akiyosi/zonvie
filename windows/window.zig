@@ -2157,27 +2157,22 @@ pub export fn WndProc(
                         }
                     }
                 }
-                // Contract B paint drain barrier (windows-smooth-scroll-b-main-
-                // region.md 「paint 側 drain barrier(順序固定)」 and 「Frame
-                // 遷移規則」 steps 1-2):
-                //   1. acquireForPaint(revision 束縛 snapshot、rotation_mu 下で
-                //      commit_rev コピー)  — done just above
-                //   2. main record を snapshot.commit_rev まで drain(ledger へ)
-                //      — HERE, before step 5 (pending scroll 消費: the
-                //      snapshot's scroll_rect is consumed by applyScrollShift
-                //      further below) and before step 6 (頂点消費).
+                // Main ease records are drained at the paint barrier:
+                //   1. acquireForPaint captures the commit revision under
+                //      rotation_mu.
+                //   2. covered main records are drained before pending scroll
+                //      and vertex consumption.
                 // Reentrant paints never consume pending scroll (their snapshot
                 // carries none), so the drain is gated on the outermost paint,
-                // matching the A2 consumption rule.
+                // matching the external FIFO consumption rule.
                 // Convert drained records at this barrier before any pending
                 // scroll or vertex consumption.
-                // Contract B step 5: shader_recompose_frame for this paint.
-                // Determined once at the barrier (「Frame 遷移規則」: 確定後、
-                // frame 内で不変); false for reentrant paints, whose snapshots
+                // Freeze shader_recompose_frame once at the barrier; false for
+                // reentrant paints, whose snapshots
                 // carry no pending scroll and which must not tick the ledger.
                 var b_recompose_frame = false;
                 var b_schedule_next_frame = false;
-                // First ordinary paint after a recompose run (underlay 遷移規則).
+                // First ordinary paint after a recompose run.
                 var b_leaving_recompose = false;
                 if (tbs_snapshot.outermost_paint) {
                     // Core-thread invalidation requests are consumed here, on
@@ -2186,7 +2181,7 @@ pub export fn WndProc(
                     // core-side clearBEaseCommits races the drain below under
                     // rotation_mu, and pre-change records that win the race
                     // must not re-seed onto the freshly dropped ledger with
-                    // stale geometry (TOCTOU found in review).
+                    // stale geometry.
                     var b_discard_seeds_this_paint = false;
                     if (app.b_drop_all_request.swap(false, .seq_cst)) {
                         if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
@@ -2201,8 +2196,7 @@ pub export fn WndProc(
                     if (dropped_active_grid and app.b_offset_ledger.count() == 0) {
                         app.b_forced_zero_pending = true;
                     }
-                    // Frame transition step 2: rate-independent spring tick,
-                    // BEFORE drain/seed (v5.1 causal-dt rule). Integrating a
+                    // Rate-independent spring tick before drain/seed. Integrating a
                     // just-arrived seed over the idle gap that preceded it
                     // would settle it instantly, reintroducing pause-dependent
                     // snap-vs-glide nondeterminism. Existing entries correctly
@@ -2237,7 +2231,11 @@ pub export fn WndProc(
                     var b_real_seeded = false;
                     if (!app.b_in_size_move and !b_discard_seeds_this_paint) {
                         for (drained_grid_ids[0..b_ease_drained], drained_rows[0..b_ease_drained]) |grid_id, rows_delta| {
-                            switch (app.b_offset_ledger.seedArrival(grid_id, rows_delta, row_height_px, false)) {
+                            const live_ver: i32 = if (app.corep) |cp|
+                                @intCast(@min(app_mod.zonvie_core_get_mousescroll_ver(cp), @as(u32, 32)))
+                            else
+                                0;
+                            switch (app.b_offset_ledger.seedArrivalWithPolicy(grid_id, rows_delta, row_height_px, false, live_ver, app.large_jump_behavior)) {
                                 .seeded => b_real_seeded = true,
                                 .capacity_drop => applog.appLog(
                                     "[smooth] b_ease drop grid={d} rows={d} reason=offset-ledger-capacity\n",
@@ -2248,9 +2246,9 @@ pub export fn WndProc(
                         }
                     }
 
-                    // 「Frame 遷移規則」 step 4: derive and freeze; persist
+                    // Derive and freeze the recompose state; persist
                     // was_active_last_frame := active_now; consume the forced
-                    // drop flag armed by the 無効化 sites (WM_SIZE/device loss).
+                    // drop flag armed by resize or device loss.
                     // Capture a pending final-zero wake before this paint
                     // consumes it.  A natural spring settling crossing is rendered by
                     // this paint itself; it must not schedule one extra idle
@@ -2272,7 +2270,7 @@ pub export fn WndProc(
                         tbs_snapshot.outermost_paint,
                     );
 
-                    // Underlay 遷移規則 transition edge. If this paint fails
+                    // Underlay transition edge. If this paint fails
                     // before drawing, its recovery path requeues a full paint
                     // (paint_full), which re-primes the underlay anyway.
                     b_leaving_recompose = app.b_prev_paint_recompose and !b_recompose_frame;
@@ -2369,7 +2367,7 @@ pub export fn WndProc(
                         app.paint_rects.clearRetainingCapacity();
                         // Retained captures carry pre-reset atlas UVs; live rows
                         // re-seed but the retention ring would keep drawing the
-                        // stale glyphs (無効化 contract: drop, never partial).
+                        // stale glyphs.
                         app.tbs.clearRetention();
                         // After atlas reset, external window paints may consume
                         // shared pending_uploads before the main window sees them.
@@ -2537,8 +2535,7 @@ pub export fn WndProc(
                     g.lockContext();
                     defer g.unlockContext();
 
-                    // Contract B: leaving recompose (描画フレーム契約 item 5 —
-                    // その後 blit / 部分 present / scissor 経路へ復帰) clears
+                    // Leaving recompose clears
                     // the per-grid offsets so the HLSL identity gate
                     // (count == 0) restores the exact pre-B pipeline. Guarded
                     // by the live count so a paint that failed on the
@@ -2732,13 +2729,12 @@ pub export fn WndProc(
                         // relying on those flags alone leaves a window where back_tex is
                         // cleared but only dirty rows are drawn — non-dirty rows show the
                         // clear color until Neovim re-sends grid_line.
-                        // Contract B additions:
-                        //   b_recompose_frame — 描画フレーム契約 item 1: full
-                        //   recomposition draws every row (空行含む).
-                        //   b_leaving_recompose — underlay 遷移規則: the first
-                        //   ordinary paint after a recompose run redraws every
-                        //   row once, erasing the scrollbar overlay that the
-                        //   recompose frames baked into back_tex without an
+                        // Recompose additions:
+                        //   b_recompose_frame: full recomposition draws every row.
+                        //   b_leaving_recompose: the first ordinary paint after a
+                        //   recompose run redraws every row once, erasing the
+                        //   scrollbar overlay that recompose frames baked into
+                        //   back_tex without an
                         //   underlay capture, so the capture below re-primes
                         //   from clean pixels.
                         const force_full_rows =
@@ -2960,12 +2956,11 @@ pub export fn WndProc(
                         // this frame's row/cursor updates; the returned strip is
                         // real back_tex damage and must reach every swapchain
                         // buffer through the per-buffer damage queue.
-                        // Contract B underlay 遷移規則: a recompose paint does
+                        // A recompose paint does
                         // not use underlay capture/restore at all — the full
                         // clear below repaints the strip, and drawEx's clear
                         // invalidates any saved underlay so a later ordinary
-                        // paint can never restore stale pre-recompose pixels
-                        // (古い underlay の restore 禁止).
+                        // paint can never restore stale pre-recompose pixels.
                         const restored_scrollbar_rect = if (b_recompose_frame)
                             null
                         else
@@ -3169,11 +3164,11 @@ pub export fn WndProc(
                         // alpha blending accumulates on retained back_tex, producing faint ghost
                         // text on rows that are drawn over without an intervening clear (matches
                         // external window logic in drawNormalExtRowMode).
-                        // Contract B 描画フレーム契約 item 1: a recompose paint
+                        // A recompose paint
                         // never preserves — the content viewport is cleared to
                         // the background color and fully recomposed. (drawEx's
                         // clear also invalidates the saved scrollbar underlay,
-                        // which the underlay 遷移規則 requires.)
+                        // which the underlay lifecycle requires.)
                         const preserve_back = !seed_clear and
                             !b_recompose_frame and
                             back_tex_valid_snapshot and
@@ -3200,7 +3195,7 @@ pub export fn WndProc(
                             // preserving a valid back_tex (incremental updates on top of
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
-                            // Contract B 描画フレーム契約 item 4: a recompose paint
+                            // A recompose paint
                             // disables per-row scissor while keeping row translation
                             // through the VS constant (use_vs_row_translation).
                             .use_row_scissor = (!seed_pending_snapshot or back_tex_valid_snapshot) and !b_recompose_frame,
@@ -3233,14 +3228,12 @@ pub export fn WndProc(
 
                         // Apply scroll pixel shift (row_vbs shift + cursor ghost + back_tex shift).
                         // Scroll state is bundled in PaintSnapshot, atomically consistent with committed set.
-                        // Contract B 「Frame 遷移規則」 step 5 / drain-barrier
-                        // order: pending scroll is consumed after the barrier
+                        // Drain-barrier order: pending scroll is consumed after the barrier
                         // above and before any vertex consumption below. The
                         // RowVB metadata shift is applied on every path; the
                         // back_tex blit runs only when
-                        // ease_math.scrollBackTexAllowed(recompose) (描画
-                        // フレーム契約 item 2 — a recompose paint that also
-                        // blitted would double-move the pixels).
+                        // ease_math.scrollBackTexAllowed(recompose). A recompose
+                        // paint that also blitted would double-move the pixels.
                         var scroll_shift_result = app_mod.ScrollShiftResult{};
                         if (tbs_snapshot.scroll_rect != null and (preserve_back or b_recompose_frame)) {
                             const sr = tbs_snapshot.scroll_rect.?;
@@ -3278,11 +3271,10 @@ pub export fn WndProc(
                             }
                         }
 
-                        // Contract B recompose: upload the offset ledger before
-                        // any vertex consumption (描画フレーム契約 item 1 pass
-                        // order — the offset buffer must be bound for the main
-                        // color, cursor, and bloom-extract passes; Shader ABI
-                        // section for the NDC formula). Fixed-size stack array:
+                        // Recompose path: upload the offset ledger before any
+                        // vertex consumption. The offset buffer must be bound
+                        // for the main color, cursor, and bloom-extract
+                        // passes. Fixed-size stack array:
                         // no allocation on the paint path.
                         if (b_recompose_frame) {
                             var b_offset_entries: [d3d11.max_scroll_offsets]d3d11.ScrollOffset = undefined;
@@ -3457,7 +3449,7 @@ pub export fn WndProc(
                                 }
                             }
                             if (b_offset_count == 0) {
-                                // Final-zero frame (描画フレーム契約 item 5): the
+                                // Final-zero frame: the
                                 // ledger is empty but the frame must still be a
                                 // full recomposition with row translation live.
                                 // The HLSL identity gate skips row_translation
@@ -3476,7 +3468,7 @@ pub export fn WndProc(
                                 b_offset_count = 1;
                             }
                             g.updateScrollOffsets(b_offset_entries[0..b_offset_count]) catch |e| {
-                                // Fail-closed (「無効化」): without the offsets
+                                // Fail closed: without the offsets
                                 // the full-row draw would land untranslated.
                                 if (log_enabled) applog.appLog("updateScrollOffsets failed: {any}\n", .{e});
                                 recoverMainPaintFailure(hwnd, app);
@@ -3509,7 +3501,7 @@ pub export fn WndProc(
                             return 0;
                         }
 
-                        // Contract B retention pass: retained captures are
+                        // Retention pass: retained captures are
                         // virtual rows and must follow the live remapped rows
                         // while the scroll-offset SRV is still bound. Their
                         // per-capture VS translation is reset before cursor,
@@ -3584,11 +3576,10 @@ pub export fn WndProc(
                             .content_height = content_height,
                             .row_h_px = row_h_px,
                             .ctx_ptr = ctx_ptr,
-                            // Contract B 描画フレーム契約 item 4: no per-row
-                            // scissor on a recompose paint — the cursor pass
-                            // draws under the full-content scissor set by the
-                            // row draw, so the shader offset cannot clip it
-                            // against its logical row band.
+                            // No per-row scissor on a recompose paint; the
+                            // cursor pass draws under the full-content scissor
+                            // set by the row draw, so the shader offset cannot
+                            // clip it against its logical row band.
                             .rs_set_sc_fn = if (b_recompose_frame) null else rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
                             .row_already_redrawn = force_full_rows,
@@ -3752,14 +3743,13 @@ pub export fn WndProc(
                                     const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
                                     if (scrollbar_vert_count != 0) {
                                         if (b_recompose_frame) {
-                                            // Contract B 描画フレーム契約 item 1
-                                            // (pass order): the scrollbar/fixed
+                                            // The scrollbar/fixed
                                             // overlay draws directly onto the
                                             // freshly recomposed back_tex —
                                             // underlay capture/restore is not
                                             // used. The first ordinary paint
                                             // after this run re-primes the
-                                            // capture (underlay 遷移規則) via
+                                            // capture via
                                             // b_leaving_recompose's full-row
                                             // redraw above.
                                             app_mod.drawScrollbarOverlay(
@@ -3801,8 +3791,7 @@ pub export fn WndProc(
                                 // back_tex_valid_snapshot is true the swapchain has already been
                                 // synced to a complete frame, and partial present rects keep
                                 // DXGI from copying unchanged regions every paint.
-                                // Contract B 描画フレーム契約 item 3: a recompose
-                                // paint registers full-viewport damage on every
+                                // A recompose paint registers full-viewport damage on every
                                 // swapchain buffer (a dirty-rect partial present
                                 // would leave old glyphs outside the moved
                                 // fragment clip). b_recompose_frame already
@@ -4141,17 +4130,15 @@ pub export fn WndProc(
                 updateRowsColsFromClientForce(hwnd, app);
                 app.mu.unlock(core.clock.io());
 
-                // Contract B fail-closed reset (「無効化」: resize drops the
-                // grid's transforms wholesale): undrained b_ease records and
-                // retained ledger rows were accounted against the pre-resize
-                // row geometry — clear both alongside the full-seed reset
+                // Resize drops the grid's transforms wholesale: undrained
+                // b_ease records and retained ledger rows were accounted
+                // against the pre-resize row geometry. Clear both alongside the full-seed reset
                 // above. UI thread, so the lock-free ledger clear is safe.
                 app.tbs.clearBEaseCommits();
                 app.tbs.clearRetention();
-                // 「無効化」: the forced zeroing of active px offsets must, like
-                // natural spring settling, still produce exactly one final recompose
-                // frame (Frame 遷移規則: 自然減衰・強制 drop のどちらでも成立)
-                // before the blit path resumes.
+                // The forced zeroing of active px offsets must, like natural
+                // spring settling, still produce exactly one final recompose
+                // frame before the blit path resumes.
                 if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
 
                 var rc: c.RECT = undefined;
@@ -4850,6 +4837,7 @@ pub export fn WndProc(
             // Called from UI thread (via PostMessage from onCmdlineShow) to avoid
             // deadlock when calling zonvie_core_get_hl_by_name from callback context.
             if (getApp(hwnd)) |app| {
+                app.external_colors_update_pending.store(false, .release);
                 external_windows.updateExternalWindowColors(app);
             }
             return 0;
@@ -5209,7 +5197,11 @@ pub export fn WndProc(
                         var i: usize = 0;
                         while (i < app.shader_anim_external_renderers.items.len) : (i += 1) {
                             const renderer = app.shader_anim_external_renderers.items[i];
-                            renderer.presentShaderAnimationFrame();
+                            if (renderer.contractBOffsetActive()) {
+                                _ = c.InvalidateRect(renderer.hwnd, null, c.FALSE);
+                            } else {
+                                renderer.presentShaderAnimationFrame();
+                            }
                             anim_dev_lost = anim_dev_lost or renderer.device_lost;
                         }
                         var j: usize = 0;
@@ -5487,16 +5479,13 @@ pub export fn WndProc(
                 }
 
                 smooth_session.onDeviceLost(app);
-                // Contract B fail-closed reset (「無効化」: device loss drops
-                // the transforms wholesale, mirroring the A1 session reset
-                // above): stale ease accounting must not survive into the
-                // rebuilt device generation. UI thread, so the lock-free
-                // ledger clear is safe.
+                // Device loss drops transforms wholesale; stale ease accounting
+                // must not survive into the rebuilt device generation. UI
+                // thread, so the lock-free ledger clear is safe.
                 app.tbs.clearBEaseCommits();
                 app.tbs.clearRetention();
-                // 「無効化」: a device-loss drop of active px offsets also owes
-                // one final recompose frame (Frame 遷移規則: 強制 drop でも
-                // final_zero が成立) on the rebuilt device before the blit
+                // A device-loss drop of active px offsets also owes one final
+                // recompose frame on the rebuilt device before the blit
                 // path resumes.
                 if (app.b_offset_ledger.dropAll()) app.b_forced_zero_pending = true;
 
@@ -5591,8 +5580,7 @@ pub export fn WndProc(
                 if (old_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
                 if (app.device_lost_recovery_cancelled) return 0;
 
-                // 3. Fresh device + D2D rebind + renderer (same order as
-                // WM_APP_DEFERRED_INIT phase 2) — unlocked, see above.
+                // 3. Fresh device + D2D rebind + renderer, unlocked as above.
                 var new_d3d_device: ?*c.ID3D11Device = null;
                 var new_d3d_ctx: ?*c.ID3D11DeviceContext = null;
                 if (d3d11.Renderer.createDeviceOnly() catch null) |result| {
@@ -5775,7 +5763,17 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity) catch {
+                    // Classify like the create path so decorated surfaces
+                    // (cmdline/msg/popupmenu) recover with their own cached
+                    // background instead of the colorscheme fallback.
+                    const recovery_cached: u32 = switch (external_windows.classifyExternalSurface(grid_id)) {
+                        .normal => if (ext_win.is_float_external) app.cached_normal_float_bg else 0xFFFFFFFF,
+                        .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
+                        .popupmenu => app.cached_pmenu_bg,
+                    };
+                    const recovery_bg = if (recovery_cached != 0xFFFFFFFF) recovery_cached else app.colorscheme_bg;
+                    const recovered_surface_kind = external_windows.classifyExternalSurface(grid_id);
+                    var new_renderer = d3d11.Renderer.initExternal(app.alloc, ext_win.hwnd, app.config.window.opacity, app.config.window.blur, app.colorscheme_bg, recovery_bg, recovered_surface_kind == .cmdline) catch {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
@@ -5844,12 +5842,8 @@ pub export fn WndProc(
                         continue;
                     }
                     // The old renderer belongs to the lost COM generation.
-                    // Drop A2 without Reset/Release, and discard records that
-                    // were bound to the old surface before publishing the
-                    // replacement renderer.  The fresh renderer recreates
-                    // the settle visual at offset zero.
-                    ext_win.a2_settle.drop(false);
-                    ext_win.a2_zero_snap_pending = false;
+                    // Discard records bound to the old surface before publishing
+                    // the replacement renderer.
                     ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
                     ext_win.tbs.a2_settle_commits.clear();
                     ext_win.tbs.rotation_mu.unlock(core.clock.io());

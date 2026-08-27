@@ -7,6 +7,7 @@ const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const compiled_shaders = @import("../shaders/compiled_shaders.zig");
 const custom_shader_mod = @import("custom_shader_pipeline.zig");
 const CustomShaderPipeline = custom_shader_mod.CustomShaderPipeline;
+const contract_b = @import("external_contract_b.zig");
 
 const MaxSwapchainBuffers: usize = 4;
 const MaxPendingBackDamageRects: usize = 64;
@@ -133,6 +134,25 @@ const IDCompositionDevice = extern struct {
         GetFrameStatistics: *const anyopaque,
         CreateTargetForHwnd: *const fn (*IDCompositionDevice, c.HWND, c.BOOL, *?*IDCompositionTarget) callconv(.c) HRESULT,
         CreateVisual: *const fn (*IDCompositionDevice, *?*IDCompositionVisual) callconv(.c) HRESULT,
+        CreateSurface: *const anyopaque,
+        CreateVirtualSurface: *const anyopaque,
+        CreateSurfaceFromHandle: *const anyopaque,
+        CreateSurfaceFromHwnd: *const anyopaque,
+        CreateTranslateTransform: *const anyopaque,
+        CreateScaleTransform: *const anyopaque,
+        CreateRotateTransform: *const anyopaque,
+        CreateSkewTransform: *const anyopaque,
+        CreateMatrixTransform: *const anyopaque,
+        CreateTransformGroup: *const anyopaque,
+        CreateTranslateTransform3D: *const anyopaque,
+        CreateScaleTransform3D: *const anyopaque,
+        CreateRotateTransform3D: *const anyopaque,
+        CreateMatrixTransform3D: *const anyopaque,
+        CreateTransform3DGroup: *const anyopaque,
+        CreateEffectGroup: *const anyopaque,
+        CreateRectangleClip: *const anyopaque,
+        CreateAnimation: *const anyopaque,
+        CheckDeviceState: *const anyopaque,
     };
 };
 
@@ -147,6 +167,20 @@ const IID_IDCompositionDevice = c.GUID{
     .Data2 = 0xE7AA,
     .Data3 = 0x450D,
     .Data4 = .{ 0xB1, 0x6F, 0x97, 0x46, 0xCB, 0x04, 0x07, 0xF3 },
+};
+
+const IID_IDXGISurface = c.GUID{
+    .Data1 = 0xCAFCB56C,
+    .Data2 = 0x6AC3,
+    .Data3 = 0x4889,
+    .Data4 = .{ 0xBF, 0x47, 0x9E, 0x23, 0xBB, 0xD2, 0x60, 0xEC },
+};
+
+const IID_ID3D11Resource = c.GUID{
+    .Data1 = 0xDC8E63F3,
+    .Data2 = 0xD12B,
+    .Data3 = 0x4952,
+    .Data4 = .{ 0xB4, 0x7B, 0x5E, 0x45, 0x02, 0x6A, 0x86, 0x2D },
 };
 
 fn blobRelease(b: ?*ID3DBlob) void {
@@ -213,6 +247,18 @@ pub const Renderer = struct {
     // Persistent back buffer (like macOS backBuffer)
     back_tex: ?*c.ID3D11Texture2D = null,
     back_rtv: ?*c.ID3D11RenderTargetView = null,
+    back_srv: ?*c.ID3D11ShaderResourceView = null,
+
+    // Eight-row retention storage is allocated only when displacement captures.
+    retention_tex: ?*c.ID3D11Texture2D = null,
+    retention_srv: ?*c.ID3D11ShaderResourceView = null,
+    retention_meta: contract_b.RingMetadata = .{},
+    retention_row_height_px: u32 = 0,
+
+    displace_vs: ?*c.ID3D11VertexShader = null,
+    displace_ps: ?*c.ID3D11PixelShader = null,
+    displace_cb: ?*c.ID3D11Buffer = null,
+    displace_prepare_attempted: bool = false,
 
     // Staging texture for back_tex scroll (same size/format, lazily created)
     scroll_staging_tex: ?*c.ID3D11Texture2D = null,
@@ -241,7 +287,7 @@ pub const Renderer = struct {
     // VS constant buffer (inv viewport)
     vs_cb: ?*c.ID3D11Buffer = null,
 
-    // Contract B shader ABI. The structured buffer is fixed-capacity and
+    // Scroll-offset shader ABI. The structured buffer is fixed-capacity and
     // dynamic so future frames can update it with WRITE_DISCARD without
     // reallocating. The count remains zero until smooth-scroll steps 5-6.
     scroll_offsets: ?*c.ID3D11Buffer = null,
@@ -377,6 +423,12 @@ pub const Renderer = struct {
 
     // Background transparency (0.0-1.0, 1.0 = opaque)
     opacity: f32 = 1.0,
+    is_external_renderer: bool = false,
+    contract_b_offset_px: f64 = 0,
+    contract_b_leaving: bool = false,
+    blur_enabled: bool = false,
+    cmdline_grid: bool = false,
+    external_default_bg_rgb: u32 = 0xFFFFFFFF,
 
     // Neovim default background color (0x00RRGGBB), used for the
     // ClearRenderTargetView color. Without this, the bottom/right
@@ -392,8 +444,9 @@ pub const Renderer = struct {
     dcomp_device: ?*IDCompositionDevice = null,
     dcomp_target: ?*IDCompositionTarget = null,
     dcomp_visual: ?*IDCompositionVisual = null,
-    // Permanent per-window A2 parent. The renderer owns this visual together
-    // with the target/content graph and recreates it with every DComp device.
+    // Static parent keeps the composition graph rooted without exposing the DWM backdrop.
+    dcomp_root_visual: ?*IDCompositionVisual = null,
+    // Main-window composition retains its settled visual for the vertex path.
     dcomp_settle_visual: ?*IDCompositionVisual = null,
 
     /// Create a D3D11 device without a swap chain. Returns the device and context.
@@ -511,10 +564,270 @@ pub const Renderer = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32) !Renderer {
+        return initInternal(alloc, hwnd, opacity, false, false, 0xFFFFFFFF, 0xFFFFFFFF, false);
+    }
+
+    pub fn initExternal(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur_enabled: bool, default_bg_rgb: u32, initial_bg_rgb: u32, cmdline_grid: bool) !Renderer {
+        return initInternal(alloc, hwnd, opacity, true, blur_enabled, default_bg_rgb, initial_bg_rgb, cmdline_grid);
+    }
+
+    pub fn contractBOffsetActive(self: *const Renderer) bool {
+        return self.is_external_renderer and self.contract_b_offset_px != 0.0;
+    }
+
+    pub fn contractBPresentPending(self: *const Renderer) bool {
+        return self.contractBOffsetActive() or (self.is_external_renderer and self.contract_b_leaving);
+    }
+
+    pub fn setContractBOffset(self: *Renderer, offset_px: f64) void {
+        if (!self.is_external_renderer) return;
+        if (offset_px != 0.0) {
+            self.contract_b_leaving = false;
+        } else if (self.contract_b_offset_px != 0.0) {
+            self.contract_b_leaving = true;
+        }
+        self.contract_b_offset_px = offset_px;
+    }
+
+    pub fn resetContractBOffset(self: *Renderer) void {
+        if (!self.is_external_renderer) return;
+        self.setContractBOffset(0.0);
+    }
+
+    pub fn discardContractBRetention(self: *Renderer, reason: []const u8) void {
+        if (!self.is_external_renderer) return;
+        if (self.retention_meta.rows_stored != 0 and applog.isEnabled()) {
+            applog.appLog("[bext] retention discard reason={s}\n", .{reason});
+        }
+        self.retention_meta.discardAll();
+    }
+
+    pub fn trimContractBRetentionAdjacent(self: *Renderer, rows: u32) void {
+        if (!self.is_external_renderer or rows == 0) return;
+        if (rows >= self.retention_meta.rows_stored) {
+            self.discardContractBRetention("direction_reduction");
+            return;
+        }
+        _ = self.retention_meta.trimAdjacent(rows);
+    }
+
+    fn invalidateContractB(self: *Renderer) void {
+        if (!self.is_external_renderer) return;
+        if (self.retention_meta.rows_stored != 0 and applog.isEnabled()) {
+            applog.appLog("[bext] retention discard reason=renderer_invalidation\n", .{});
+        }
+        self.contract_b_offset_px = 0.0;
+        self.contract_b_leaving = false;
+        self.retention_meta.discardAll();
+        self.retention_row_height_px = 0;
+        self.has_presented_once = false;
+    }
+
+    pub fn retentionMetadata(self: *const Renderer) contract_b.RingMetadata {
+        return self.retention_meta;
+    }
+
+    fn ensureRetentionTexture(self: *Renderer, row_height_px: u32) !void {
+        if (row_height_px == 0) return error.InvalidRetentionRowHeight;
+        if (self.retention_tex != null and self.retention_row_height_px == row_height_px) return;
+        safeRelease(&self.retention_srv);
+        safeRelease(&self.retention_tex);
+        self.discardContractBRetention("retention_texture_recreate");
+        self.retention_row_height_px = 0;
+        const dev = self.device orelse return error.NoDevice;
+        const back = self.back_tex orelse return error.NoBackTex;
+        var desc: c.D3D11_TEXTURE2D_DESC = undefined;
+        (back.*.lpVtbl.*.GetDesc orelse return error.RenderResourcesUnavailable)(back, &desc);
+        desc.Height = contract_b.RetentionDepth * row_height_px;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+        var tex: ?*c.ID3D11Texture2D = null;
+        const create = dev.*.lpVtbl.*.CreateTexture2D orelse return error.RenderResourcesUnavailable;
+        const hr = create(dev, &desc, null, @ptrCast(&tex));
+        if (c.FAILED(hr) or tex == null) return error.D3DCreateRetentionTextureFailed;
+        errdefer safeRelease(&tex);
+        var srv: ?*c.ID3D11ShaderResourceView = null;
+        const create_srv = dev.*.lpVtbl.*.CreateShaderResourceView orelse return error.RenderResourcesUnavailable;
+        const hr_srv = create_srv(dev, @ptrCast(tex.?), null, &srv);
+        if (c.FAILED(hr_srv) or srv == null) return error.D3DCreateRetentionSrvFailed;
+        self.retention_tex = tex;
+        self.retention_srv = srv;
+        self.retention_row_height_px = row_height_px;
+    }
+
+    fn ensureBackSrv(self: *Renderer) !void {
+        if (self.back_srv != null) return;
+        const dev = self.device orelse return error.NoDevice;
+        const back = self.back_tex orelse return error.NoBackTex;
+        const create_srv = dev.*.lpVtbl.*.CreateShaderResourceView orelse
+            return error.RenderResourcesUnavailable;
+        const hr = create_srv(dev, @ptrCast(back), null, @ptrCast(&self.back_srv));
+        if (c.FAILED(hr) or self.back_srv == null) return error.D3DCreateBackSrvFailed;
+    }
+
+    /// Copy a caller-selected edge from the current retained back buffer.
+    /// Storage only: callers decide when to capture and which edge to keep.
+    pub fn captureRetentionBand(
+        self: *Renderer,
+        band_row_count: u32,
+        row_height_px: u32,
+        source_edge: contract_b.BandEdge,
+    ) !void {
+        if (!self.is_external_renderer or band_row_count == 0) return;
+        const ctx = self.ctx orelse return error.NoContext;
+        const back = self.back_tex orelse return error.NoBackTex;
+        if (self.retention_meta.edge != null and self.retention_meta.edge.? != source_edge) {
+            self.discardContractBRetention("edge_change");
+        }
+        try self.ensureRetentionTexture(row_height_px);
+        const rows = @min(@min(band_row_count, contract_b.RetentionDepth), self.height / row_height_px);
+        if (rows == 0) return;
+        const height_px = rows * row_height_px;
+        const src_y_px: u32 = if (source_edge == .top) 0 else self.height - height_px;
+        const box: c.D3D11_BOX = .{ .left = 0, .top = src_y_px, .front = 0, .right = self.width, .bottom = src_y_px + height_px, .back = 1 };
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const copy = ctx_vtbl.*.CopySubresourceRegion orelse return error.RenderResourcesUnavailable;
+        const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return error.RenderResourcesUnavailable;
+        if (ctx_vtbl.*.PSSetShaderResources) |set_srvs| {
+            var null_srvs: [2]?*c.ID3D11ShaderResourceView = .{ null, null };
+            set_srvs(ctx, 0, 2, @ptrCast(&null_srvs));
+        }
+        set_rtvs(ctx, 0, null, null);
+        defer {
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.back_rtv};
+            set_rtvs(ctx, 1, @ptrCast(&rtvs), null);
+        }
+        _ = self.retention_meta.append(rows, source_edge);
+        const destination_row = if (source_edge == .top)
+            (self.retention_meta.physical_origin + self.retention_meta.rows_stored - rows) % contract_b.RetentionDepth
+        else
+            self.retention_meta.physical_origin;
+        const rows_before_wrap = @min(rows, contract_b.RetentionDepth - destination_row);
+        const first_height_px = rows_before_wrap * row_height_px;
+        const destination_y_px = destination_row * row_height_px;
+        if (rows_before_wrap == rows) {
+            copy(ctx, @ptrCast(self.retention_tex.?), 0, 0, destination_y_px, 0, @ptrCast(back), 0, &box);
+        } else {
+            var first_box = box;
+            first_box.bottom = first_box.top + first_height_px;
+            copy(ctx, @ptrCast(self.retention_tex.?), 0, 0, destination_y_px, 0, @ptrCast(back), 0, &first_box);
+            var second_box = box;
+            second_box.top += first_height_px;
+            copy(ctx, @ptrCast(self.retention_tex.?), 0, 0, 0, 0, @ptrCast(back), 0, &second_box);
+        }
+    }
+
+    const DisplaceParamsCpu = extern struct {
+        offset_px: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        retention_rows: f32,
+        retention_origin: f32,
+        retention_row_height_px: f32,
+        retention_depth: f32,
+        pad: f32,
+    };
+
+    comptime {
+        std.debug.assert(@sizeOf(DisplaceParamsCpu) == 32);
+    }
+
+    pub fn prepareDisplaceShaders(self: *Renderer) bool {
+        if (self.displace_prepare_attempted) return self.displace_vs != null and self.displace_ps != null and self.displace_cb != null;
+        self.displace_prepare_attempted = true;
+        const dev = self.device orelse return false;
+        const hlsl = @embedFile("../shaders/displace.hlsl");
+        var vs_blob: ?*ID3DBlob = null;
+        var ps_blob: ?*ID3DBlob = null;
+        var errors: ?*ID3DBlob = null;
+        const hv = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "VSFullscreen", "vs_5_0", 0, 0, &vs_blob, &errors);
+        if (c.FAILED(hv)) dumpBlobAsText("[D3DCompile displace VS] ", errors);
+        blobRelease(errors);
+        errors = null;
+        if (c.FAILED(hv) or vs_blob == null) return false;
+        defer blobRelease(vs_blob);
+        const hp = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, "PSDisplace", "ps_5_0", 0, 0, &ps_blob, &errors);
+        if (c.FAILED(hp)) dumpBlobAsText("[D3DCompile displace PS] ", errors);
+        blobRelease(errors);
+        if (c.FAILED(hp) or ps_blob == null) return false;
+        defer blobRelease(ps_blob);
+        const create_vs = dev.*.lpVtbl.*.CreateVertexShader orelse return false;
+        const create_ps = dev.*.lpVtbl.*.CreatePixelShader orelse return false;
+        const vptr = blobPtr(vs_blob) orelse return false;
+        const pptr = blobPtr(ps_blob) orelse return false;
+        const vn = blobSize(vs_blob);
+        const pn = blobSize(ps_blob);
+        if (c.FAILED(create_vs(dev, vptr, vn, null, @ptrCast(&self.displace_vs))) or self.displace_vs == null) return false;
+        if (c.FAILED(create_ps(dev, pptr, pn, null, @ptrCast(&self.displace_ps))) or self.displace_ps == null) {
+            safeRelease(&self.displace_vs);
+            return false;
+        }
+        const create_buf = dev.*.lpVtbl.*.CreateBuffer orelse {
+            safeRelease(&self.displace_ps);
+            safeRelease(&self.displace_vs);
+            return false;
+        };
+        const bd: c.D3D11_BUFFER_DESC = .{ .ByteWidth = @sizeOf(DisplaceParamsCpu), .Usage = c.D3D11_USAGE_DEFAULT, .BindFlags = c.D3D11_BIND_CONSTANT_BUFFER, .CPUAccessFlags = 0, .MiscFlags = 0, .StructureByteStride = 0 };
+        if (c.FAILED(create_buf(dev, &bd, null, @ptrCast(&self.displace_cb))) or self.displace_cb == null) {
+            safeRelease(&self.displace_ps);
+            safeRelease(&self.displace_vs);
+            return false;
+        }
+        return true;
+    }
+
+    fn drawDisplacePass(self: *Renderer, ctx: *c.ID3D11DeviceContext) !void {
+        if (!self.prepareDisplaceShaders()) return error.DisplacementShaderUnavailable;
+        const rtv = self.bb_rtvs[@intCast(self.currentSwapchainIndex())] orelse return error.RenderResourcesUnavailable;
+        try self.ensureBackSrv();
+        const srv = self.back_srv orelse return error.RenderResourcesUnavailable;
+        const params = DisplaceParamsCpu{ .offset_px = @floatCast(self.contract_b_offset_px), .viewport_width = @floatFromInt(self.width), .viewport_height = @floatFromInt(self.height), .retention_rows = @floatFromInt(self.retention_meta.rows_stored), .retention_origin = @floatFromInt(self.retention_meta.physical_origin), .retention_row_height_px = @floatFromInt(self.retention_row_height_px), .retention_depth = @floatFromInt(contract_b.RetentionDepth), .pad = 0.0 };
+        const update = ctx.*.lpVtbl.*.UpdateSubresource orelse return error.RenderResourcesUnavailable;
+        update(ctx, @ptrCast(self.displace_cb.?), 0, null, &params, 0, 0);
+        const v = ctx.*.lpVtbl;
+        if (v.*.OMSetRenderTargets) |f| {
+            var rtvs: [1]?*c.ID3D11RenderTargetView = .{rtv};
+            f(ctx, 1, @ptrCast(&rtvs), null);
+        }
+        if (v.*.IASetInputLayout) |f| f(ctx, null);
+        if (v.*.VSSetShader) |f| f(ctx, self.displace_vs, null, 0);
+        if (v.*.PSSetShader) |f| f(ctx, self.displace_ps, null, 0);
+        if (v.*.PSSetShaderResources) |f| {
+            var srvs: [2]?*c.ID3D11ShaderResourceView = .{ srv, self.retention_srv };
+            f(ctx, 0, 2, @ptrCast(&srvs));
+        }
+        if (v.*.PSSetConstantBuffers) |f| {
+            var cbs: [1]?*c.ID3D11Buffer = .{self.displace_cb};
+            f(ctx, 0, 1, @ptrCast(&cbs));
+        }
+        if (v.*.OMSetBlendState) |f| f(ctx, null, null, 0xFFFFFFFF);
+        if (v.*.RSSetViewports) |f| {
+            const vp: c.D3D11_VIEWPORT = .{ .TopLeftX = 0, .TopLeftY = 0, .Width = @floatFromInt(self.width), .Height = @floatFromInt(self.height), .MinDepth = 0, .MaxDepth = 1 };
+            f(ctx, 1, &vp);
+        }
+        if (v.*.RSSetScissorRects) |f| {
+            const rect: c.D3D11_RECT = .{ .left = 0, .top = 0, .right = @intCast(self.width), .bottom = @intCast(self.height) };
+            f(ctx, 1, &rect);
+        }
+        if (v.*.IASetPrimitiveTopology) |f| f(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (v.*.Draw) |f| f(ctx, 3, 0);
+        if (v.*.PSSetShaderResources) |f| {
+            var null_srvs: [2]?*c.ID3D11ShaderResourceView = .{ null, null };
+            f(ctx, 0, 2, @ptrCast(&null_srvs));
+        }
+    }
+
+    fn initInternal(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, is_external_renderer: bool, blur_enabled: bool, default_bg_rgb: u32, initial_bg_rgb: u32, cmdline_grid: bool) !Renderer {
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
             .opacity = opacity,
+            .is_external_renderer = is_external_renderer,
+            .blur_enabled = blur_enabled,
+            .cmdline_grid = cmdline_grid,
+            .external_default_bg_rgb = default_bg_rgb,
+            .default_bg_rgb = std.atomic.Value(u32).init(initial_bg_rgb),
         };
         // Five `try` fail points follow (createDeviceAndSwapchain/
         // createBackTargets/createPipeline/ensureVertexBuffer/
@@ -566,13 +879,17 @@ pub const Renderer = struct {
 
     /// Update the default background color used by ClearRenderTargetView.
     /// Pass 0x00RRGGBB; pass 0xFFFFFFFF to fall back to black.
-    /// Thread-safe: called from RPC thread, read by draw thread.
+    /// Thread-safe for the cached color.
     pub fn setDefaultBgColor(self: *Renderer, rgb: u32) void {
         self.default_bg_rgb.store(rgb, .release);
     }
 
+    pub fn setExternalDefaultBgColor(self: *Renderer, rgb: u32) void {
+        self.external_default_bg_rgb = rgb;
+    }
+
     /// Upload sorted per-grid offsets for one paint. Called by the main
-    /// WM_PAINT recompose path (Contract B 描画フレーム契約) with the offset
+    /// WM_PAINT recompose path with the offset
     /// ledger's entries before the full row draw; ordinary paints keep the
     /// count at zero (clearScrollOffsets) so the HLSL identity gate holds.
     pub fn updateScrollOffsets(self: *Renderer, entries: []const ScrollOffset) !void {
@@ -638,7 +955,7 @@ pub const Renderer = struct {
         unmap0(ctx, res);
     }
 
-    /// Bind the Contract B ABI for a main-color, cursor, or bloom-extract
+    /// Bind the scroll-offset ABI for a main-color, cursor, or bloom-extract
     /// draw. The structured SRV is VS-only; the cbuffer is consumed by both
     /// VS and PS for row translation and fragment clipping.
     fn bindScrollAbi(self: *Renderer, ctx: *c.ID3D11DeviceContext, ctx_vtbl: anytype) void {
@@ -683,6 +1000,9 @@ pub const Renderer = struct {
         for (&self.glow_mip_rtv) |*r| safeRelease(r);
         for (&self.glow_mip_tex) |*t| safeRelease(t);
         safeRelease(&self.vs_fullscreen);
+        safeRelease(&self.displace_vs);
+        safeRelease(&self.displace_ps);
+        safeRelease(&self.displace_cb);
         safeRelease(&self.vs_custom_post);
         safeRelease(&self.ps_glow_extract);
         safeRelease(&self.ps_kawase_down);
@@ -717,7 +1037,12 @@ pub const Renderer = struct {
         safeRelease(&self.vs_cb);
 
         safeRelease(&self.back_rtv);
+        safeRelease(&self.back_srv);
         safeRelease(&self.back_tex);
+        safeRelease(&self.retention_srv);
+        safeRelease(&self.retention_tex);
+        self.retention_meta = .{};
+        self.retention_row_height_px = 0;
         safeRelease(&self.scroll_staging_tex);
         safeRelease(&self.scrollbar_underlay_tex);
         safeRelease(&self.clear_row_vb);
@@ -747,11 +1072,13 @@ pub const Renderer = struct {
         // DComp aliases without calling through dead vtables.
         if (self.device_lost) {
             self.dcomp_settle_visual = null;
+            self.dcomp_root_visual = null;
             self.dcomp_visual = null;
             self.dcomp_target = null;
             self.dcomp_device = null;
         } else {
             if (self.dcomp_target) |target| _ = target.lpVtbl.SetRoot(target, null);
+            safeRelease(&self.dcomp_root_visual);
             safeRelease(&self.dcomp_settle_visual);
             safeRelease(&self.dcomp_visual);
             safeRelease(&self.dcomp_target);
@@ -923,18 +1250,6 @@ pub const Renderer = struct {
         return self.back_rtv != null and self.back_tex != null and self.bb_tex != null and !self.needs_resize_retry and !self.device_lost;
     }
 
-    fn resetDCompSettleOffset(self: *Renderer) void {
-        const settle = self.dcomp_settle_visual orelse return;
-        const device = self.dcomp_device orelse return;
-        if (c.FAILED(settle.lpVtbl.SetOffsetY_2(settle, 0.0))) {
-            if (applog.isEnabled()) applog.appLog("[d3d] resize: failed to reset settle offset\n", .{});
-            return;
-        }
-        if (c.FAILED(device.lpVtbl.Commit(device))) {
-            if (applog.isEnabled()) applog.appLog("[d3d] resize: failed to commit settle reset\n", .{});
-        }
-    }
-
     pub fn resize(self: *Renderer) !void {
         var rc: c.RECT = undefined;
         _ = c.GetClientRect(self.hwnd, &rc);
@@ -965,10 +1280,9 @@ pub const Renderer = struct {
         // write instead of duplicating the assignment in every failure branch —
         // cleared only once the whole sequence has fully succeeded, below.
         self.needs_resize_retry = true;
+        self.invalidateContractB();
 
-        // --- ADD: Unbind pipeline references before releasing resize-related resources ---
-        // If back buffer / RTV are still bound, releasing them can lead to use-after-release
-        // inside subsequent D3D calls during resize/draw.
+        // Bound resize resources must be unbound before release.
         if (self.ctx) |ctx| {
             const vtbl = ctx.*.lpVtbl;
 
@@ -1002,7 +1316,12 @@ pub const Renderer = struct {
             self.bb_tex = null;
         }
         safeRelease(&self.back_rtv);
+        safeRelease(&self.back_srv);
         safeRelease(&self.back_tex);
+        safeRelease(&self.retention_srv);
+        safeRelease(&self.retention_tex);
+        self.retention_meta = .{};
+        self.retention_row_height_px = 0;
         safeRelease(&self.scroll_staging_tex);
         safeRelease(&self.scrollbar_underlay_tex);
         self.scrollbar_underlay_state.resourceFailed();
@@ -1032,9 +1351,12 @@ pub const Renderer = struct {
 
         try self.createBackTargets();
         self.needs_resize_retry = false;
-        // A resize is a publication boundary: preserve the permanent settle
-        // edge but snap its offset to the rebuilt swap-chain origin.
-        self.resetDCompSettleOffset();
+        if (self.dcomp_device) |device| {
+            const commit_failed = c.FAILED(device.lpVtbl.Commit(device));
+            if (commit_failed) {
+                if (applog.isEnabled()) applog.appLog("[dcomp] resize commit failed; deferring composition publication\n", .{});
+            }
+        }
     }
 
     pub fn atlasUploadRect(self: *Renderer, x: u32, y: u32, w: u32, h: u32, data: [*]const u8, row_pitch: u32) bool {
@@ -1169,7 +1491,6 @@ pub const Renderer = struct {
         const back_tex = self.back_tex.?; // persistent back buffer texture
 
         const ctx_vtbl = ctx.*.lpVtbl;
-
         // ---- Bind persistent back buffer as render target ----
         {
             const om_set_rt = ctx_vtbl.*.OMSetRenderTargets orelse return;
@@ -1590,7 +1911,6 @@ pub const Renderer = struct {
         const back_tex = self.back_tex orelse return error.NoBackTex;
 
         const ctx_vtbl = ctx.*.lpVtbl;
-
         // Custom shader pass writes directly into the current bb; skip
         // the back→bb copy when it ran so terminal content isn't pasted
         // over the shader output.
@@ -1671,7 +1991,10 @@ pub const Renderer = struct {
         } else if (isDeviceLost(hrp)) {
             self.device_lost = true;
         }
-        if (c.FAILED(hrp)) return error.PresentFailed;
+        if (c.FAILED(hrp)) {
+            if (self.device_lost) self.invalidateContractB();
+            return error.PresentFailed;
+        }
         self.advanceSwapchainIndex();
     }
 
@@ -1918,6 +2241,8 @@ pub const Renderer = struct {
 
         const ctx_vtbl = ctx.*.lpVtbl;
         const log_enabled = applog.isEnabled();
+        const displacement_active = self.contractBOffsetActive();
+        const displacement_leaving = self.is_external_renderer and self.contract_b_leaving and !displacement_active;
         var did_full_copy: bool = false;
         var t0_ns: i128 = 0;
         var t_copy_ns: i128 = 0;
@@ -1934,11 +2259,25 @@ pub const Renderer = struct {
         // must be skipped — otherwise it would overwrite the shader's
         // output with raw terminal content.
         var shader_handled: bool = false;
-        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+        if (displacement_active) {
+            try self.drawDisplacePass(ctx);
+            shader_handled = true;
+            if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
+                const displaced_tex = self.currentBackBufferTex();
+                shader_handled = self.drawCustomShaderPassFrom(ctx, ctx_vtbl, displaced_tex);
+                if (!shader_handled) {
+                    try self.drawDisplacePass(ctx);
+                    shader_handled = true;
+                }
+            }
+            self.queueBackDamage(&.{}, true);
+        } else if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
             shader_handled = self.drawCustomShaderPass(ctx, ctx_vtbl);
         }
 
-        if (force_full_copy_effective or rects.len == 0) {
+        if (displacement_active) {
+            did_full_copy = true;
+        } else if (force_full_copy_effective or displacement_leaving or rects.len == 0) {
             self.queueBackDamage(&.{}, true);
         } else {
             self.queueBackDamage(rects, false);
@@ -1946,7 +2285,9 @@ pub const Renderer = struct {
 
         var copied_rects: [MaxPendingBackDamageRects]c.RECT = undefined;
         var copied_damage: BackCopyDamage = .{};
-        if (shader_handled) {
+        if (displacement_active) {
+            copied_damage = .{ .full = true };
+        } else if (shader_handled) {
             did_full_copy = true; // shader pass wrote the full frame to bb
         } else {
             copied_damage = try self.copyQueuedBackDamage(ctx, back_tex, &copied_rects);
@@ -1969,13 +2310,13 @@ pub const Renderer = struct {
         // backbuffer changed and could leave shader output on pixels
         // outside the dirty set stale. Treat shader-handled frames as
         // full-present (no dirty rects, no scroll hint).
-        const present_full_frame = force_full_copy_effective or shader_handled or copied_damage.full;
+        const present_full_frame = force_full_copy_effective or displacement_active or displacement_leaving or shader_handled or copied_damage.full;
         const present_dirty_rects = copied_rects[0..copied_damage.rect_count];
 
         // Validate everything Present1 will read BEFORE the call — an out-of-bounds
         // dirty rect or scroll rect/offset causes Present1 to return E_INVALIDARG,
-        // which today permanently disables the swapchain1 fast path for the rest of
-        // the Renderer's lifetime (see bug 2 below). On any invalid input, fall back
+        // which permanently disables the swapchain1 fast path for the rest of
+        // the Renderer's lifetime. On any invalid input, fall back
         // to a full-frame Present1 (no dirty rects, no scroll hint) instead of risking
         // that — the current buffer copy above is complete for all accumulated
         // damage, so a full-frame present is always safe.
@@ -2039,7 +2380,8 @@ pub const Renderer = struct {
                         params.pScrollOffset = @constCast(so);
                     }
                 }
-                hrp = present1(sc1p, 0, 0, &params);
+                const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
+                hrp = present1(sc1p, sync_interval, 0, &params);
                 if (c.FAILED(hrp)) {
                     if (isDeviceLost(hrp)) self.device_lost = true;
                     if (applog.isEnabled()) applog.appLog("[d3d] Present1 FAILED hr=0x{x}, disabling swapchain1\n", .{@as(u32, @bitCast(hrp))});
@@ -2048,18 +2390,21 @@ pub const Renderer = struct {
             } else {
                 const sc_vtbl = sc.*.lpVtbl;
                 const present = sc_vtbl.*.Present orelse return;
-                hrp = present(sc, 0, 0);
+                const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
+                hrp = present(sc, sync_interval, 0);
                 if (c.FAILED(hrp) and isDeviceLost(hrp)) self.device_lost = true;
             }
         } else {
             const sc_vtbl = sc.*.lpVtbl;
             const present = sc_vtbl.*.Present orelse return;
-            hrp = present(sc, 0, 0);
+            const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
+            hrp = present(sc, sync_interval, 0);
             if (c.FAILED(hrp) and isDeviceLost(hrp)) self.device_lost = true;
         }
 
         if (!c.FAILED(hrp)) {
             self.has_presented_once = true;
+            if (displacement_leaving) self.contract_b_leaving = false;
         }
 
         if (log_enabled and did_full_copy) {
@@ -2076,7 +2421,10 @@ pub const Renderer = struct {
                 .{ rects.len, copy_us, cursor_us, present_us, total_us },
             );
         }
-        if (c.FAILED(hrp)) return error.PresentFailed;
+        if (c.FAILED(hrp)) {
+            if (self.device_lost) self.invalidateContractB();
+            return error.PresentFailed;
+        }
         self.advanceSwapchainIndex();
     }
 
@@ -2190,7 +2538,7 @@ pub const Renderer = struct {
             // Defensive unbind: tabline_srv may still be bound at PS slot 0
             // from a prior drawTablineTexture call within the same frame.
             // UpdateSubresource on a texture that's an active SRV is an
-            // undefined-per-spec hazard (theoretical — see LOW-6).
+            // undefined per the D3D11 resource binding rules.
             if (ctx_vtbl.*.PSSetShaderResources) |ps_set_srv| {
                 var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
                 ps_set_srv(ctx, 0, 1, @ptrCast(&null_srvs));
@@ -2336,7 +2684,7 @@ pub const Renderer = struct {
             // Defensive unbind: sidebar_srv may still be bound at PS slot 0
             // from a prior drawSidebarTexture call within the same frame.
             // UpdateSubresource on a texture that's an active SRV is an
-            // undefined-per-spec hazard (theoretical — see LOW-6).
+            // undefined per the D3D11 resource binding rules.
             if (ctx_vtbl.*.PSSetShaderResources) |ps_set_srv| {
                 var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
                 ps_set_srv(ctx, 0, 1, @ptrCast(&null_srvs));
@@ -2765,49 +3113,55 @@ pub const Renderer = struct {
     /// Build the permanent per-window DirectComposition graph and publish it
     /// only after every HRESULT succeeds. The HWNDs use
     /// WS_EX_NOREDIRECTIONBITMAP, so accepting a composition swapchain without
-    /// a committed target -> settle -> content edge would create a permanently
-    /// blank renderer that otherwise looks initialized.
+    /// a committed target -> static root -> content edge would create a permanently
+    /// blank renderer that otherwise looks initialized. Main windows retain their
+    /// settle visual; external windows use the static root directly.
     fn createDirectComposition(self: *Renderer, sc1: *c.IDXGISwapChain1, dxgi_dev: *c.IDXGIDevice) !void {
         var dcomp_dev: ?*IDCompositionDevice = null;
         errdefer safeRelease(&dcomp_dev);
         const dcomp_hr = DCompositionCreateDevice(dxgi_dev, &IID_IDCompositionDevice, &dcomp_dev);
         if (c.FAILED(dcomp_hr) or dcomp_dev == null) return error.DCompositionCreateDeviceFailed;
-
         const vtbl = dcomp_dev.?.lpVtbl;
         var dcomp_target: ?*IDCompositionTarget = null;
         errdefer safeRelease(&dcomp_target);
-        const target_hr = vtbl.CreateTargetForHwnd(dcomp_dev.?, self.hwnd, c.TRUE, &dcomp_target);
-        if (c.FAILED(target_hr) or dcomp_target == null) return error.DCompositionCreateTargetFailed;
-
+        if (c.FAILED(vtbl.CreateTargetForHwnd(dcomp_dev.?, self.hwnd, c.TRUE, &dcomp_target)) or dcomp_target == null)
+            return error.DCompositionCreateTargetFailed;
         var dcomp_visual: ?*IDCompositionVisual = null;
         errdefer safeRelease(&dcomp_visual);
-        const visual_hr = vtbl.CreateVisual(dcomp_dev.?, &dcomp_visual);
-        if (c.FAILED(visual_hr) or dcomp_visual == null) return error.DCompositionCreateVisualFailed;
-
+        if (c.FAILED(vtbl.CreateVisual(dcomp_dev.?, &dcomp_visual)) or dcomp_visual == null)
+            return error.DCompositionCreateVisualFailed;
+        var root_visual: ?*IDCompositionVisual = null;
+        errdefer safeRelease(&root_visual);
+        if (c.FAILED(vtbl.CreateVisual(dcomp_dev.?, &root_visual)) or root_visual == null)
+            return error.DCompositionCreateVisualFailed;
         var settle_visual: ?*IDCompositionVisual = null;
         errdefer safeRelease(&settle_visual);
-        const settle_hr = vtbl.CreateVisual(dcomp_dev.?, &settle_visual);
-        if (c.FAILED(settle_hr) or settle_visual == null) return error.DCompositionCreateVisualFailed;
-
+        if (!self.is_external_renderer) {
+            if (c.FAILED(vtbl.CreateVisual(dcomp_dev.?, &settle_visual)) or settle_visual == null)
+                return error.DCompositionCreateVisualFailed;
+        }
         const sc_unk: *c.IUnknown = @ptrCast(sc1);
-        const content_hr = dcomp_visual.?.lpVtbl.SetContent(dcomp_visual.?, sc_unk);
-        if (c.FAILED(content_hr)) return error.DCompositionSetContentFailed;
-        const settle_offset_hr = settle_visual.?.lpVtbl.SetOffsetY_2(settle_visual.?, 0.0);
-        if (c.FAILED(settle_offset_hr)) return error.DCompositionSetRootFailed;
-        const edge_hr = settle_visual.?.lpVtbl.AddVisual(settle_visual.?, dcomp_visual.?, c.FALSE, null);
-        if (c.FAILED(edge_hr)) return error.DCompositionSetRootFailed;
-        const root_hr = dcomp_target.?.lpVtbl.SetRoot(dcomp_target.?, settle_visual);
-        if (c.FAILED(root_hr)) return error.DCompositionSetRootFailed;
-        const commit_hr = vtbl.Commit(dcomp_dev.?);
-        if (c.FAILED(commit_hr)) return error.DCompositionCommitFailed;
-
+        if (c.FAILED(dcomp_visual.?.lpVtbl.SetContent(dcomp_visual.?, sc_unk)))
+            return error.DCompositionSetContentFailed;
+        if (settle_visual) |settle| {
+            if (c.FAILED(settle.lpVtbl.SetOffsetY_2(settle, 0.0)) or
+                c.FAILED(settle.lpVtbl.AddVisual(settle, dcomp_visual.?, c.FALSE, null)) or
+                c.FAILED(root_visual.?.lpVtbl.AddVisual(root_visual.?, settle, c.FALSE, null)))
+                return error.DCompositionSetRootFailed;
+        } else if (c.FAILED(root_visual.?.lpVtbl.AddVisual(root_visual.?, dcomp_visual.?, c.FALSE, null)))
+            return error.DCompositionSetRootFailed;
+        if (c.FAILED(dcomp_target.?.lpVtbl.SetRoot(dcomp_target.?, root_visual)))
+            return error.DCompositionSetRootFailed;
+        if (c.FAILED(vtbl.Commit(dcomp_dev.?))) return error.DCompositionCommitFailed;
         self.dcomp_device = dcomp_dev;
         self.dcomp_target = dcomp_target;
         self.dcomp_visual = dcomp_visual;
+        self.dcomp_root_visual = root_visual;
         self.dcomp_settle_visual = settle_visual;
         dcomp_dev = null;
         dcomp_target = null;
         dcomp_visual = null;
+        root_visual = null;
         settle_visual = null;
     }
 
@@ -3233,7 +3587,7 @@ pub const Renderer = struct {
         // Reject a degenerate/negative rect BEFORE any @intCast to an
         // unsigned type below — @intCast of a negative i32 is a Zig
         // safety-checked panic, and the previous emptiness check ran too
-        // late to prevent it (see MED-5).
+        // late to prevent it.
         if (scroll_rect.right <= scroll_rect.left or scroll_rect.bottom <= scroll_rect.top) return false;
 
         // Clamp scroll_rect to texture bounds
@@ -4169,12 +4523,21 @@ pub const Renderer = struct {
         ctx: *c.ID3D11DeviceContext,
         ctx_vtbl: anytype,
     ) bool {
-        const pipelines = self.custom_shader_pipelines.items;
-        if (pipelines.len == 0) return false;
-        const back = self.back_tex orelse {
+        const source = self.back_tex orelse {
             if (applog.isEnabled()) applog.appLog("[CustomShader] skip: back_tex null\n", .{});
             return false;
         };
+        return self.drawCustomShaderPassFrom(ctx, ctx_vtbl, source);
+    }
+
+    fn drawCustomShaderPassFrom(
+        self: *Renderer,
+        ctx: *c.ID3D11DeviceContext,
+        ctx_vtbl: anytype,
+        source: *c.ID3D11Texture2D,
+    ) bool {
+        const pipelines = self.custom_shader_pipelines.items;
+        if (pipelines.len == 0) return false;
         // Write into whichever swapchain buffer DXGI says is current.
         // Hardcoding index 0 mismatches the "Present uses current bb"
         // semantics in flip-model configurations where
@@ -4220,7 +4583,7 @@ pub const Renderer = struct {
         }
 
         if (applog.isEnabled()) {
-            applog.appLog("[CustomShader] draw pass w={d} h={d} passes={d} back=0x{x} scratch=0x{x}\n", .{ self.width, self.height, pipelines.len, @intFromPtr(back), @intFromPtr(scratch) });
+            applog.appLog("[CustomShader] draw pass w={d} h={d} passes={d} source=0x{x} scratch=0x{x}\n", .{ self.width, self.height, pipelines.len, @intFromPtr(source), @intFromPtr(scratch) });
         }
 
         const set_rtvs = ctx_vtbl.*.OMSetRenderTargets orelse return false;
@@ -4235,12 +4598,9 @@ pub const Renderer = struct {
             set_srvs(ctx, 0, 1, &null_srv[0]);
         }
 
-        // Copy back -> scratch so the first pass has a stable read
-        // source. back_tex itself is never rebound as an RTV by this
-        // method, so the next frame's sample still reflects the real
-        // terminal content instead of our own output.
+        // Copy the selected canonical input into scratch before writing bb.
         if (ctx_vtbl.*.CopyResource) |copy_res| {
-            copy_res(ctx, @ptrCast(scratch), @ptrCast(back));
+            copy_res(ctx, @ptrCast(scratch), @ptrCast(source));
         } else return false;
 
         // Shared pipeline/state setup (shared by every pass).
@@ -4927,7 +5287,7 @@ pub const Renderer = struct {
             self.vs_cb = cb;
         }
 
-        // --- Contract B scroll offset ABI ---
+        // --- Scroll offset shader ABI ---
         // Structured SRV: 128 x 28-byte entries, dynamic WRITE_DISCARD.
         {
             const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateScrollOffsetBufferFailed;

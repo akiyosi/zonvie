@@ -1,6 +1,7 @@
 const std = @import("std");
 const shared_config = @import("zonvie_core").config;
 const clock = @import("zonvie_core").clock;
+const scroll_policy = @import("scroll/settle_policy.zig");
 
 // Re-export types from shared config
 pub const Config = shared_config.Config;
@@ -9,6 +10,7 @@ pub const MsgViewType = shared_config.MsgViewType;
 pub const MsgPosition = shared_config.MsgPosition;
 pub const MsgRoute = shared_config.MsgRoute;
 pub const RouteResult = shared_config.RouteResult;
+pub const LargeJumpBehavior = scroll_policy.LargeJumpBehavior;
 
 /// Windows-specific config loader that finds the config path and delegates to shared config
 pub fn load(alloc: std.mem.Allocator) Config {
@@ -18,12 +20,16 @@ pub fn load(alloc: std.mem.Allocator) Config {
 }
 
 /// Load config and return both config and path (caller must free path)
-pub fn loadWithPath(alloc: std.mem.Allocator) struct { config: Config, path: ?[]const u8 } {
-    const config_path = getConfigFilePath(alloc) catch return .{ .config = Config{ .alloc = alloc }, .path = null };
-    return .{
-        .config = Config.loadFromPath(alloc, config_path),
-        .path = config_path,
-    };
+pub fn loadWithPath(alloc: std.mem.Allocator) struct {
+    config: Config,
+    path: ?[]const u8,
+    large_jump_behavior: LargeJumpBehavior,
+    large_jump_behavior_invalid: bool,
+} {
+    const config_path = getConfigFilePath(alloc) catch return .{ .config = Config{ .alloc = alloc }, .path = null, .large_jump_behavior = .partial, .large_jump_behavior_invalid = false };
+    const config = Config.loadFromPath(alloc, config_path);
+    const behavior = scroll_policy.parseBehaviorString(config.scroll.large_jump_behavior);
+    return .{ .config = config, .path = config_path, .large_jump_behavior = behavior.behavior, .large_jump_behavior_invalid = behavior.invalid };
 }
 
 /// Get config file path: %APPDATA%\zonvie\config.toml or %USERPROFILE%\.config\zonvie\config.toml

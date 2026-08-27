@@ -291,19 +291,6 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(coordinator_tests).step);
 
-    // Contract A2 settle-animation math is std-only and must execute on the
-    // native host, including WSL/Linux builds.
-    const settle_math_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("windows/scroll/settle_math.zig"),
-    });
-    const settle_math_tests = b.addTest(.{
-        .name = "zonvie-settle-math-tests",
-        .root_module = settle_math_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(settle_math_tests).step);
-
     // Contract B grid-continuity ease math is std-only and executes natively.
     const ease_math_test_mod = b.createModule(.{
         .target = b.graph.host,
@@ -339,6 +326,19 @@ pub fn build(b: *std.Build) !void {
         .root_module = settle_policy_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(settle_policy_tests).step);
+
+    // External Contract B sign/band/ring math is std-only and must execute
+    // on the native host.
+    const external_contract_b_test_mod = b.createModule(.{
+        .target = b.graph.host,
+        .optimize = optimize,
+        .root_source_file = b.path("windows/renderer/external_contract_b.zig"),
+    });
+    const external_contract_b_tests = b.addTest(.{
+        .name = "zonvie-external-contract-b-tests",
+        .root_module = external_contract_b_test_mod,
+    });
+    test_step.dependOn(&b.addRunArtifact(external_contract_b_tests).step);
 
     // Contract A2 flush-stage accumulation (A0 extension) is std-only and
     // must execute on the native host, including WSL/Linux builds.
