@@ -1105,7 +1105,7 @@ final class ZonvieCore {
                 // Re-evaluate the msg throttle/auto-hide deadline after this
                 // flush armed/cleared it.  Dispatched async so grid_mu (held
                 // here on the core thread) is released before scheduleMsgTimer
-                // queries nextMsgTimeoutMs(), which re-acquires it.
+                // queries tryNextMsgTimeoutMs(), which re-acquires it.
                 DispatchQueue.main.async {
                     me.terminalView?.scheduleMsgTimer()
                 }
@@ -1388,16 +1388,10 @@ final class ZonvieCore {
     }
 
     /// Milliseconds until the core's earliest pending msg_show/msg_history
-    /// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
-    /// timeout is armed. Used to schedule a one-shot tick instead of polling.
-    func nextMsgTimeoutMs() -> Int64 {
-        guard let core else { return -1 }
-        return zonvie_core_next_msg_timeout_ms(core)
-    }
-
-    /// Non-blocking version of nextMsgTimeoutMs. Returns the same values on
-    /// success, or -2 if the core's grid lock was busy. Unlike the cache
-    /// pattern used elsewhere in this file, -2 must NOT be treated as
+    /// timeout (throttle or auto-hide), clamped to >= 0, without blocking:
+    /// returns -1 if no timeout is armed, or -2 if the core's grid lock was
+    /// busy. Used to schedule a one-shot tick instead of polling. Unlike the
+    /// cache pattern used elsewhere in this file, -2 must NOT be treated as
     /// "nothing pending" (that's -1, a real answer) -- the caller should
     /// retry shortly rather than skip arming its timer, or an
     /// already-armed auto-hide deadline could be missed.
@@ -1806,7 +1800,8 @@ final class ZonvieCore {
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
 
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
-        // here. The RPC thread blocks in waitForLayoutReady() until the actual
+        // here. The RPC thread blocks on the core's layout-ready wait
+        // (ui_attach_cond in rpc_session.zig) until the actual
         // post-layout drawable size is known. MetalTerminalView.maybeResizeCoreGrid()
         // calls notifyInitialLayout() with computed rows/cols on its first valid
         // drawable update, which is what unblocks ui_attach. This mirrors the
@@ -2642,14 +2637,6 @@ final class ZonvieCore {
         zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
     }
 
-    /// Drop all non-[perf...] log lines at the core boundary. Independent of
-    /// setLogEnabledViaCore — caller must still enable logging for any output.
-    func setLogPerfOnlyViaCore(_ enabled: Bool) {
-        guard let core else { return }
-        zonvie_core_set_log_perf_only(core, enabled ? 1 : 0)
-        ZonvieCore.appLogPerfOnly = enabled
-    }
-
     // MARK: - Smooth Scrolling Support
 
     /// Grid info for hit-testing (Swift-friendly wrapper)
@@ -2697,25 +2684,6 @@ final class ZonvieCore {
         )
     }
 
-    /// Get visible grids for hit-testing (highest zindex wins)
-    func getVisibleGrids() -> [GridInfo] {
-        guard let core else { return [] }
-
-        // The legacy API does not report the total count. A full buffer may be
-        // truncated, so retry with geometric growth until the result fits.
-        var capacity = 16
-        while true {
-            var grids = [zonvie_grid_info](repeating: zonvie_grid_info(), count: capacity)
-            let count = grids.withUnsafeMutableBufferPointer { buffer in
-                zonvie_core_get_visible_grids(core, buffer.baseAddress, buffer.count)
-            }
-            if count < capacity {
-                return (0..<count).map { Self.gridInfo(from: grids[$0]) }
-            }
-            capacity *= 2
-        }
-    }
-
     /// Cached visible grids for non-blocking UI queries (main thread only).
     /// Pre-reserved to 16 elements to avoid reallocation in steady state.
     private var cachedVisibleGrids: [GridInfo] = {
@@ -2731,7 +2699,7 @@ final class ZonvieCore {
         count: 16
     )
 
-    /// Non-blocking version of getVisibleGrids with cache fallback.
+    /// Visible grids for hit-testing (highest zindex wins), without blocking.
     /// Attempts tryLock on grid_mu; on success updates cache in-place.
     /// On failure returns previously cached data to avoid blocking the UI thread.
     /// Allocation-free in steady state (after query/cache high-water marks).
@@ -3174,19 +3142,10 @@ final class ZonvieCore {
         var col: Int32
     }
 
-    /// Get current cursor position
-    func getCursorPosition() -> CursorPosition {
-        guard let core else { return CursorPosition(gridId: -1, row: -1, col: -1) }
-        var row: Int32 = 0
-        var col: Int32 = 0
-        let gridId = zonvie_core_get_cursor_position(core, &row, &col)
-        return CursorPosition(gridId: gridId, row: row, col: col)
-    }
-
     /// Cached cursor position for the non-blocking query below (main thread only).
     private var cachedCursorPos: CursorPosition?
 
-    /// Non-blocking version of getCursorPosition with cache fallback.
+    /// Current cursor position, without blocking.
     /// Attempts tryLock on grid_mu; on success updates the cache. On lock
     /// contention returns the previously cached position (at most one
     /// flush stale) so IME composition never blocks on the core thread's
@@ -7946,14 +7905,6 @@ final class ZonvieCore {
             window.setFrame(newFrame, display: true)
 
             stackedHeight_pt += windowHeight
-        }
-    }
-
-    /// Hide all mini windows
-    private func hideAllMinis() {
-        for miniId in MiniWindowId.allCases {
-            miniWindows[miniId]?.window?.orderOut(nil)
-            miniWindows[miniId]?.content = ""
         }
     }
 
