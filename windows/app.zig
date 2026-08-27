@@ -132,7 +132,6 @@ pub fn baseName(name: []const u8) []const u8 {
 // Custom window messages (WM_APP + N)
 // =========================================================================
 
-pub const WM_APP_ATLAS_ENSURE_GLYPH: c.UINT = c.WM_APP + 1;
 pub const WM_APP_CREATE_EXTERNAL_WINDOW: c.UINT = c.WM_APP + 2;
 pub const WM_APP_CURSOR_GRID_CHANGED: c.UINT = c.WM_APP + 3;
 pub const WM_APP_CLOSE_EXTERNAL_WINDOW: c.UINT = c.WM_APP + 4;
@@ -3454,13 +3453,6 @@ pub fn drawBloomRowsOverlay(
     g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
 }
 
-/// Pending glyph entry for deferred atlas population
-/// (used when glyph is requested before atlas is ready)
-pub const PendingGlyph = struct {
-    scalar: u32,
-    style_flags: u32, // 0 for unstyled
-};
-
 /// Scrollbar geometry result type
 pub const ScrollbarGeometry = struct {
     track_left: f32,
@@ -4034,10 +4026,6 @@ pub const App = struct {
     // SSH auth prompt state (owned copy - core frees original after callback)
     ssh_prompt_owned: ?[]u8 = null,
 
-    // Pending glyphs queue: glyphs requested before atlas was ready
-    // (for parallel nvim spawn + renderer init)
-    pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .empty,
-
     // Persistent query/cache storage for non-blocking visible-grid queries
     // (UI thread only). Capacity grows only when the core reports that the
     // current query buffer cannot hold a complete snapshot; steady-state
@@ -4430,7 +4418,6 @@ pub const App = struct {
         // Free remaining ArrayListUnmanaged backing buffers
         self.paint_rects.deinit(self.alloc);
         self.nvim_extra_args.deinit(self.alloc);
-        self.pending_glyphs.deinit(self.alloc);
         self.viewport_cache.deinit(self.alloc);
         self.visible_grids_query.deinit(self.alloc);
         self.cached_visible_grids.deinit(self.alloc);
