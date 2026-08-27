@@ -1494,7 +1494,8 @@ final class MetalTerminalView: MTKView {
             }
         }
 
-        // Unblock the RPC thread's waitForLayoutReady() once we know real
+        // Unblock the RPC thread's layout-ready wait (ui_attach_cond in
+        // rpc_session.zig) once we know real
         // dimensions, so nvim_ui_attach is sent with the correct rows/cols
         // on the first try (mirrors Windows' WM_SIZE → notify_layout_ready
         // path). The Zig core treats notifyLayoutReady as idempotent, so any
@@ -2218,15 +2219,6 @@ final class MetalTerminalView: MTKView {
         if !scrollOffsetInfoScratch.isEmpty {
             renderer.markAllRowsDirty()
         }
-    }
-
-    /// Clear scroll offset for a specific grid (called when Neovim updates content)
-    private func clearScrollOffset(gridId: Int64) {
-        scrollOffsetLock.lock()
-        scrollOffsetPx.removeValue(forKey: gridId)
-        scrollEdgeBlocked.removeValue(forKey: gridId)
-        scrollOffsetLock.unlock()
-        updateScrollShaderOffset()
     }
 
     /// Clear all scroll offsets.

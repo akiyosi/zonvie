@@ -131,8 +131,9 @@ final class ViewController: NSViewController {
         // work (NSWindow, osascript) inside start(). SSH detection mirrors
         // ZonvieCore.start()'s combined CLI flag / config.toml check.
         //
-        // rows/cols here are placeholders (1×1). The RPC thread blocks in
-        // waitForLayoutReady() until MetalTerminalView signals
+        // rows/cols here are placeholders (1×1). The RPC thread blocks on the
+        // core's layout-ready wait (ui_attach_cond in rpc_session.zig) until
+        // MetalTerminalView signals
         // notifyInitialLayout() with the actual rows/cols computed from
         // the post-layout drawable size, so nvim_ui_attach is sent with the
         // correct dimensions on the first try.
