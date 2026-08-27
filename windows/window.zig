@@ -662,7 +662,6 @@ const ExternalWindow = app_mod.ExternalWindow;
 const RowVerts = app_mod.RowVerts;
 const PendingExternalWindow = app_mod.PendingExternalWindow;
 const PendingExternalVertices = app_mod.PendingExternalVertices;
-const PendingGlyph = app_mod.PendingGlyph;
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 const BufferEntry = app_mod.BufferEntry;
@@ -679,7 +678,6 @@ const getApp = app_mod.getApp;
 const setApp = app_mod.setApp;
 
 // WM_APP_* message constants
-const WM_APP_ATLAS_ENSURE_GLYPH = app_mod.WM_APP_ATLAS_ENSURE_GLYPH;
 const WM_APP_CREATE_EXTERNAL_WINDOW = app_mod.WM_APP_CREATE_EXTERNAL_WINDOW;
 const WM_APP_CURSOR_GRID_CHANGED = app_mod.WM_APP_CURSOR_GRID_CHANGED;
 const WM_APP_CLOSE_EXTERNAL_WINDOW = app_mod.WM_APP_CLOSE_EXTERNAL_WINDOW;
@@ -1472,8 +1470,11 @@ fn makeCoreCbs() core.Callbacks {
     return .{
         .on_vertices_partial = callbacks.onVerticesPartial,
         .on_vertices_row = callbacks.onVerticesRow,
-        .on_atlas_ensure_glyph = callbacks.onAtlasEnsureGlyph,
-        .on_atlas_ensure_glyph_styled = callbacks.onAtlasEnsureGlyphStyled,
+        // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
+        // purpose. They are the Phase 1 (frontend-managed atlas) entry points,
+        // and the core skips them entirely whenever the three Phase 2
+        // callbacks below are set - which this frontend always does. Same
+        // arrangement as the macOS frontend.
         .on_log = callbacks.onLog,
         .on_guifont = callbacks.onGuiFont,
         .on_linespace = callbacks.onLineSpace,
@@ -3727,41 +3728,6 @@ pub export fn WndProc(
             return 0;
         },
 
-        WM_APP_ATLAS_ENSURE_GLYPH => {
-            if (getApp(hwnd)) |app| {
-                const scalar: u32 = @intCast(wParam);
-
-                // lParam is signed (isize). Preserve bits when converting to pointer.
-                const out_entry_ptr_bits: usize = @as(usize, @bitCast(lParam));
-                const out_entry: *core.GlyphEntry = @ptrFromInt(out_entry_ptr_bits);
-
-                // This handler is always executed on UI thread.
-                // Do NOT take app.mu here: SendMessageW can re-enter while WM_PAINT holds app.mu.
-                if (app.atlas) |*a| {
-                    const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
-                        if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: atlasEnsureGlyphEntry ERROR: {any}", .{err});
-                        return 0;
-                    };
-                    out_entry.* = e;
-
-                    if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: ok scalar={d} out_entry_ptr=0x{x} uv_min=({d:.6},{d:.6}) uv_max=({d:.6},{d:.6})", .{
-                        scalar,
-                        out_entry_ptr_bits,
-                        e.uv_min[0],
-                        e.uv_min[1],
-                        e.uv_max[0],
-                        e.uv_max[1],
-                    });
-
-                    return 1;
-                }
-
-                if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: renderer is null", .{});
-                return 0;
-            }
-            return 0;
-        },
-
         WM_APP_CREATE_EXTERNAL_WINDOW => {
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_CREATE_EXTERNAL_WINDOW received\n", .{});
             if (getApp(hwnd)) |app| {
@@ -5692,32 +5658,6 @@ pub export fn WndProc(
                         if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM SetTimer hwnd={*} interval={d}ms -> {d}\n", .{ hwnd, app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS, tr });
                     } else {
                         if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM not started (no animated shader)\n", .{});
-                    }
-                }
-
-                // Process pending glyphs
-                {
-                    app.mu.lockUncancelable(core.clock.io());
-                    var pending_glyphs = app.pending_glyphs;
-                    app.pending_glyphs = .empty;
-                    app.mu.unlock(core.clock.io());
-                    defer pending_glyphs.deinit(app.alloc);
-
-                    if (pending_glyphs.items.len > 0) {
-                        if (deferred_log_enabled) applog.appLog("  processing {d} pending glyphs", .{pending_glyphs.items.len});
-                        var atlas_ptr: ?*dwrite_d2d.Renderer = null;
-                        app.mu.lockUncancelable(core.clock.io());
-                        if (app.atlas) |*a| atlas_ptr = a;
-                        app.mu.unlock(core.clock.io());
-                        if (atlas_ptr) |a| {
-                            for (pending_glyphs.items) |pg| {
-                                if (pg.style_flags == 0) {
-                                    _ = a.atlasEnsureGlyphEntry(pg.scalar) catch {};
-                                } else {
-                                    _ = a.atlasEnsureGlyphEntryStyled(pg.scalar, pg.style_flags) catch {};
-                                }
-                            }
-                        }
                     }
                 }
 

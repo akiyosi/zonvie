@@ -65,7 +65,8 @@ pub const Renderer = struct {
     dwrite_factory: ?*c.IDWriteFactory = null,
     text_format: ?*c.IDWriteTextFormat = null,
 
-    // font + metrics needed by atlasEnsureGlyphEntry()
+    // font + metrics needed by glyph rasterization (rasterizeGlyph and
+    // the shaping paths)
     font_face: ?*c.IDWriteFontFace = null,
     // Font variants for bold/italic (lazy-initialized on first use)
     bold_font_face: ?*c.IDWriteFontFace = null,
@@ -94,9 +95,6 @@ pub const Renderer = struct {
 
     // atlas
     atlas_bitmap: ?*c.ID2D1Bitmap = null,
-    atlas_next_x: u32 = 1,
-    atlas_next_y: u32 = 1,
-    atlas_row_h: u32 = 0,
 
     // Pipeline
     vs: ?*c.ID3D11VertexShader = null,
@@ -109,10 +107,8 @@ pub const Renderer = struct {
     vs_cb: ?*c.ID3D11Buffer = null,
 
     // Glyph cache: scalar -> entry (aligned with core types)
-    glyph_map: std.AutoHashMap(u32, core.GlyphEntry),
     // Styled glyph cache: (scalar | (style_flags << 21)) -> entry
     // style_flags uses bits 21-22 since Unicode scalars only use bits 0-20
-    styled_glyph_map: std.AutoHashMap(u32, core.GlyphEntry),
 
     // Atlas dimensions (set by recreateAtlasTexture, default 2048x2048)
     atlas_w: u32 = 2048,
@@ -142,13 +138,6 @@ pub const Renderer = struct {
     glyph_rt: ?*c.ID2D1BitmapRenderTarget = null,
     glyph_rt_size: u32 = 0, // current size (square)
     glyph_rt_brush: ?*c.ID2D1SolidColorBrush = null,
-
-    // ---- add: profiling counters for atlasEnsureGlyphEntry ----
-    log_atlas_ensure_calls: u64 = 0,
-    log_atlas_ensure_hits: u64 = 0,
-    log_atlas_ensure_misses: u64 = 0,
-    log_atlas_ensure_last_report_ns: i128 = 0,
-    log_atlas_ensure_slowest_ns: u64 = 0,
 
     // Atlas version - incremented when new glyphs are added (for multi-context sync)
     atlas_version: u64 = 0,
@@ -205,8 +194,6 @@ pub const Renderer = struct {
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
-            .glyph_map = std.AutoHashMap(u32, core.GlyphEntry).init(alloc),
-            .styled_glyph_map = std.AutoHashMap(u32, core.GlyphEntry).init(alloc),
         };
         errdefer self.deinit();
 
@@ -306,7 +293,7 @@ pub const Renderer = struct {
     /// CreateDeviceContext are DXGI/D2D factory-level calls that can pump
     /// window messages, which can reenter WM_PAINT/WM_SIZE/close handlers
     /// (or this same recovery handler) on the UI thread — those handlers'
-    /// atlas callbacks (atlasEnsureGlyphEntry etc.) acquire self.mu, so
+    /// atlas callbacks (rasterizeGlyph etc.) acquire self.mu, so
     /// running this under self.mu would self-deadlock the same way holding
     /// app.mu across it used to (see window.zig's device-lost recovery).
     /// Self-contained errdefers: on error, nothing here has touched self,
@@ -360,11 +347,6 @@ pub const Renderer = struct {
         if (self.atlas_cpu.items.len != total) {
             try self.atlas_cpu.resize(self.alloc, total);
             @memset(self.atlas_cpu.items, 0);
-            self.glyph_map.clearRetainingCapacity();
-            self.styled_glyph_map.clearRetainingCapacity();
-            self.atlas_next_x = 1;
-            self.atlas_next_y = 1;
-            self.atlas_row_h = 0;
             self.pending_upload_base_seq += self.pending_uploads.items.len;
             self.pending_uploads.clearRetainingCapacity();
             self.atlas_content_generation +%= 1;
@@ -592,10 +574,6 @@ pub const Renderer = struct {
     }
 
     pub fn deinit(self: *Renderer) void {
-        // ★ Added: free containers
-        self.glyph_map.deinit();
-        self.styled_glyph_map.deinit();
-
         self.atlas_cpu.deinit(self.alloc);
         self.glyph_tmp.deinit(self.alloc);
         self.pending_uploads.deinit(self.alloc);
@@ -622,37 +600,6 @@ pub const Renderer = struct {
         safeRelease(self.dwrite_factory);
         safeRelease(self.d2d_factory);
         self.* = undefined;
-    }
-
-    /// Reset atlas when full - clears glyph caches and restarts packing
-    fn resetAtlas(self: *Renderer) void {
-        if (applog.isEnabled()) applog.appLog("[atlas] resetAtlas: clearing {d} glyphs + {d} styled glyphs\n", .{
-            self.glyph_map.count(),
-            self.styled_glyph_map.count(),
-        });
-
-        // Clear glyph caches (keep capacity for reuse)
-        self.glyph_map.clearRetainingCapacity();
-        self.styled_glyph_map.clearRetainingCapacity();
-
-        // Reset atlas placement cursors
-        self.atlas_next_x = 1;
-        self.atlas_next_y = 1;
-        self.atlas_row_h = 0;
-
-        // Clear pending uploads (they're now invalid); advance base_seq so
-        // per-window cursors that lag behind will detect the gap.
-        self.pending_upload_base_seq += self.pending_uploads.items.len;
-        self.pending_uploads.clearRetainingCapacity();
-
-        // Clear CPU atlas buffer to zero (optional but cleaner)
-        if (self.atlas_cpu.items.len > 0) {
-            @memset(self.atlas_cpu.items, 0);
-        }
-        self.atlas_content_generation +%= 1;
-
-        self.atlas_reset_pending = true;
-        self.atlas_reset_generation +%= 1;
     }
 
     pub const BgSpan = extern struct {
@@ -780,686 +727,9 @@ pub const Renderer = struct {
         return error.AtlasChangedDuringRebuild;
     }
 
-    pub fn atlasEnsureGlyphEntry(self: *Renderer, scalar: u32) !core.GlyphEntry {
-        // Guard shared atlas state (glyph_map/atlas_cpu/pending_uploads) against
-        // concurrent WM_PAINT uploads and other ensure calls.
-        self.mu.lockUncancelable(core.clock.io());
-        defer self.mu.unlock(core.clock.io());
-
-        // ---- log/profiling (aggregated) ----
-        const log_enabled = applog.isEnabled();
-        const log_start_ns: i128 = if (log_enabled) core.clock.nowNs() else 0;
-
-        self.log_atlas_ensure_calls += 1;
-
-        // cache hit
-        if (self.glyph_map.get(scalar)) |cached| {
-            self.log_atlas_ensure_hits += 1;
-
-            if (log_enabled) {
-                const log_now_ns: i128 = core.clock.nowNs();
-                if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
-
-                // once per second
-                if (log_now_ns - self.log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
-                    applog.appLog(
-                        "[atlas] ensureGlyph stats: calls/s={d} hits/s={d} misses/s={d} cache={d} slowest_ms={d}\n",
-                        .{
-                            self.log_atlas_ensure_calls,
-                            self.log_atlas_ensure_hits,
-                            self.log_atlas_ensure_misses,
-                            self.glyph_map.count(),
-                            @as(u64, self.log_atlas_ensure_slowest_ns / 1_000_000),
-                        },
-                    );
-                    self.log_atlas_ensure_calls = 0;
-                    self.log_atlas_ensure_hits = 0;
-                    self.log_atlas_ensure_misses = 0;
-                    self.log_atlas_ensure_slowest_ns = 0;
-                    self.log_atlas_ensure_last_report_ns = log_now_ns;
-                }
-            }
-
-            return cached;
-        }
-
-        self.log_atlas_ensure_misses += 1;
-
-        // miss-duration will be recorded on each miss-return path below
-        const face = self.font_face orelse return error.NoFont;
-
-        // --- 1) scalar -> glyph_index (with OpenType feature support) ---
-        const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[dwrite] getGlyphIndexForScalar FAILED scalar=0x{x}: {any}\n", .{
-                scalar, e,
-            });
-
-            if (log_enabled) {
-                const log_end_ns: i128 = core.clock.nowNs();
-                const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-                if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-                applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-            }
-
-            return error.DWriteGetGlyphIndicesFailed;
-        };
-
-        if (glyph_index == 0) {
-            // 0 is possibly .notdef; log only
-            if (applog.isEnabled()) applog.appLog("[dwrite] ensure WARNING: glyph_index==0 scalar=0x{x}\n", .{scalar});
-        } else {
-            if (applog.isEnabled()) applog.appLog("[dwrite] ensure scalar=0x{x} glyph_index={d}\n", .{ scalar, glyph_index });
-        }
-
-        // --- 2) glyph run analysis -> alpha texture bounds ---
-        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
-        glyph_run.fontFace = face;
-        glyph_run.fontEmSize = self.font_em_size; // assumed set in setFontUtf8
-        glyph_run.glyphCount = 1;
-
-        var gi_arr: [1]c.UINT16 = .{glyph_index};
-        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
-        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
-
-        glyph_run.glyphIndices = gi_arr[0..].ptr;
-        glyph_run.glyphAdvances = adv_arr[0..].ptr;
-        glyph_run.glyphOffsets = off_arr[0..].ptr;
-
-        // CreateGlyphRunAnalysis
-        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
-        const dwtbl = dw.lpVtbl.*;
-        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
-
-        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse
-            return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
-
-        // CreateGlyphRunAnalysis
-        //
-        // NOTE:
-        // We use NATURAL_SYMMETRIC for high-quality anti-aliased rendering.
-        // This produces ClearType 3x1 texture (3 bytes per pixel RGB).
-        // We average RGB to get grayscale alpha for our A8 atlas.
-        const hr_cgra = create_analysis_fn(
-            dw,
-            &glyph_run,
-            1.0,
-            null,
-            c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-            c.DWRITE_MEASURING_MODE_NATURAL,
-            0.0,
-            0.0,
-            &analysis,
-        );
-
-        if (c.FAILED(hr_cgra) or analysis == null) {
-            if (applog.isEnabled()) applog.appLog("[dwrite] CreateGlyphRunAnalysis FAILED hr=0x{x}\n", .{
-                @as(u32, @bitCast(hr_cgra)),
-            });
-
-            if (log_enabled) {
-                const log_end_ns: i128 = core.clock.nowNs();
-                const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-                if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-                applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-            }
-
-            return error.DWriteCreateGlyphRunAnalysisFailed;
-        }
-
-        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
-        defer _ = rel_fn(analysis.?);
-
-        var bounds: c.RECT = std.mem.zeroes(c.RECT);
-        const atbl = analysis.?.lpVtbl.*;
-
-        const get_bounds_fn = atbl.GetAlphaTextureBounds orelse
-            return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
-
-        const hr_bounds = get_bounds_fn(
-            analysis.?,
-            c.DWRITE_TEXTURE_CLEARTYPE_3x1,
-            &bounds,
-        );
-        if (c.FAILED(hr_bounds)) {
-            if (applog.isEnabled()) applog.appLog("[dwrite] GetAlphaTextureBounds FAILED hr=0x{x}\n", .{
-                @as(u32, @bitCast(hr_bounds)),
-            });
-
-            if (log_enabled) {
-                const log_end_ns: i128 = core.clock.nowNs();
-                const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-                if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-                applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-            }
-
-            return error.DWriteGetAlphaTextureBoundsFailed;
-        }
-
-        const bw_i32: i32 = bounds.right - bounds.left;
-        const bh_i32: i32 = bounds.bottom - bounds.top;
-        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-
-        if (applog.isEnabled()) {
-            applog.appLog("[dwrite] bounds scalar=0x{x} rect(l={d} t={d} r={d} b={d}) w={d} h={d}\n", .{
-                scalar, bounds.left, bounds.top, bounds.right, bounds.bottom, bw, bh,
-            });
-        }
-
-        if (bw == 0 or bh == 0) {
-            // Empty glyph (e.g. space)
-            const empty = core.GlyphEntry{
-                .uv_min = .{ -1, -1 },
-                .uv_max = .{ -1, -1 },
-                .bbox_origin_px = .{ 0, 0 },
-                .bbox_size_px = .{ 0, 0 },
-                .advance_px = @as(f32, @floatFromInt(self.cell_w_px)),
-                .ascent_px = self.ascent_px,
-                .descent_px = self.descent_px,
-            };
-            try self.glyph_map.put(scalar, empty);
-
-            if (log_enabled) {
-                const log_end_ns: i128 = core.clock.nowNs();
-                const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-                if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-                applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-
-                // also allow once-per-second summary emission on miss path
-                const log_now_ns: i128 = core.clock.nowNs();
-                if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
-                if (log_now_ns - self.log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
-                    applog.appLog(
-                        "[atlas] ensureGlyph stats: calls/s={d} hits/s={d} misses/s={d} cache={d} slowest_ms={d}\n",
-                        .{
-                            self.log_atlas_ensure_calls,
-                            self.log_atlas_ensure_hits,
-                            self.log_atlas_ensure_misses,
-                            self.glyph_map.count(),
-                            @as(u64, self.log_atlas_ensure_slowest_ns / 1_000_000),
-                        },
-                    );
-                    self.log_atlas_ensure_calls = 0;
-                    self.log_atlas_ensure_hits = 0;
-                    self.log_atlas_ensure_misses = 0;
-                    self.log_atlas_ensure_slowest_ns = 0;
-                    self.log_atlas_ensure_last_report_ns = log_now_ns;
-                }
-            }
-
-            return empty;
-        }
-
-        // --- 3) fetch ClearType 3x1 texture (RGB, 3 bytes per pixel) ---
-        const buf_size_rgb: usize = @as(usize, bw) * @as(usize, bh) * 3;
-        const tmp_rgb = try self.alloc.alloc(u8, buf_size_rgb);
-        defer self.alloc.free(tmp_rgb);
-
-        const create_alpha_fn = atbl.CreateAlphaTexture orelse
-            return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-
-        const hr_tex = create_alpha_fn(
-            analysis.?,
-            c.DWRITE_TEXTURE_CLEARTYPE_3x1,
-            &bounds,
-            tmp_rgb.ptr,
-            @as(c.UINT32, @intCast(tmp_rgb.len)),
-        );
-        if (c.FAILED(hr_tex)) {
-            if (applog.isEnabled()) applog.appLog("[dwrite] CreateAlphaTexture FAILED hr=0x{x}\n", .{
-                @as(u32, @bitCast(hr_tex)),
-            });
-
-            if (log_enabled) {
-                const log_end_ns: i128 = core.clock.nowNs();
-                const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-                if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-                applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-            }
-
-            return error.DWriteCreateAlphaTextureFailed;
-        }
-
-        // --- 4) pack into atlas CPU buffer (place_x/place_y unified) ---
-        const pad: u32 = 1;
-        const packed_w: u32 = bw + pad * 2;
-        const packed_h: u32 = bh + pad * 2;
-
-        // wrap to next row if needed
-        if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
-            self.atlas_next_x = 1;
-            self.atlas_next_y += self.atlas_row_h + 1;
-            self.atlas_row_h = 0;
-        }
-        // If atlas is full, reset and retry (simple eviction strategy)
-        if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
-            if (applog.isEnabled()) applog.appLog("[atlas] ensureGlyph scalar=0x{x}: atlas full, resetting\n", .{scalar});
-            self.resetAtlas();
-
-            // After reset, re-check row wrap (should start at x=1, y=1)
-            if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
-                self.atlas_next_x = 1;
-                self.atlas_next_y += self.atlas_row_h + 1;
-                self.atlas_row_h = 0;
-            }
-            // If still doesn't fit after reset, glyph is too large for atlas
-            if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
-                if (applog.isEnabled()) applog.appLog("[atlas] ensureGlyph scalar=0x{x}: glyph too large for atlas ({d}x{d})\n", .{ scalar, packed_w, packed_h });
-                return error.GlyphTooLarge;
-            }
-        }
-
-        // IMPORTANT: freeze placement before advancing the cursor
-        const place_x: u32 = self.atlas_next_x;
-        const place_y: u32 = self.atlas_next_y;
-
-        self.atlas_next_x += packed_w + 1;
-        self.atlas_row_h = @max(self.atlas_row_h, packed_h);
-
-        // Clear padded area to 0 (outline padding) - RGBA format (4 bytes per pixel)
-        {
-            var y: u32 = 0;
-            while (y < packed_h) : (y += 1) {
-                const row_off = ((@as(usize, place_y + y) * @as(usize, self.atlas_w)) + @as(usize, place_x)) * 4;
-                @memset(self.atlas_cpu.items[row_off .. row_off + packed_w * 4], 0);
-            }
-        }
-
-        // Copy glyph RGB directly for true ClearType subpixel rendering
-        // ClearType 3x1 format: 3 bytes per pixel (R, G, B)
-        // Atlas format: RGBA (4 bytes per pixel)
-        {
-            var y: u32 = 0;
-            while (y < bh) : (y += 1) {
-                var x: u32 = 0;
-                while (x < bw) : (x += 1) {
-                    const src_off = (@as(usize, y) * @as(usize, bw) + @as(usize, x)) * 3;
-                    const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, self.atlas_w)) + @as(usize, place_x + pad + x)) * 4;
-
-                    // Store RGB directly for subpixel blending
-                    const r = tmp_rgb[src_off];
-                    const g = tmp_rgb[src_off + 1];
-                    const b = tmp_rgb[src_off + 2];
-
-                    self.atlas_cpu.items[dst_off + 0] = r; // R
-                    self.atlas_cpu.items[dst_off + 1] = g; // G
-                    self.atlas_cpu.items[dst_off + 2] = b; // B
-                    // Alpha = max(R, G, B) for correct alpha blending with background
-                    self.atlas_cpu.items[dst_off + 3] = @max(r, @max(g, b));
-                }
-            }
-        }
-
-        self.atlas_content_generation +%= 1;
-
-        // Mark dirty rect for GPU upload (place_x/place_y)
-        try self.pending_uploads.append(self.alloc, c.D2D1_RECT_U{
-            .left = place_x,
-            .top = place_y,
-            .right = place_x + packed_w,
-            .bottom = place_y + packed_h,
-        });
-
-        // Increment atlas version for multi-context sync
-        self.atlas_version +%= 1;
-
-        // UV for *actual glyph area* excluding padding
-        const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(self.atlas_w));
-        const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(self.atlas_h));
-        const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(self.atlas_w));
-        const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(self.atlas_h));
-
-        const entry = core.GlyphEntry{
-            .uv_min = .{ uv_u0, uv_v0 },
-            .uv_max = .{ uv_u1, uv_v1 },
-
-            // bounds are relative to baseline; left can be negative, bottom can be positive
-            // vertexgen uses: y0 = baseline - (origin_y + h)
-            // Setting origin_y = -bounds.bottom makes y0 = baseline + bounds.top (since top = bottom - h)
-            .bbox_origin_px = .{
-                @as(f32, @floatFromInt(bounds.left)),
-                @as(f32, @floatFromInt(-bounds.bottom)),
-            },
-            .bbox_size_px = .{
-                @as(f32, @floatFromInt(bw)),
-                @as(f32, @floatFromInt(bh)),
-            },
-
-            .advance_px = @as(f32, @floatFromInt(self.cell_w_px)),
-            .ascent_px = self.ascent_px,
-            .descent_px = self.descent_px,
-        };
-
-        try self.glyph_map.put(scalar, entry);
-
-        if (log_enabled) {
-            const log_end_ns: i128 = core.clock.nowNs();
-            const log_dur_ns_u64: u64 = @intCast(@max(@as(i128, 0), log_end_ns - log_start_ns));
-            if (log_dur_ns_u64 > self.log_atlas_ensure_slowest_ns) self.log_atlas_ensure_slowest_ns = log_dur_ns_u64;
-
-            applog.appLog("[atlas] ensureGlyph MISS scalar=0x{x} dur_ms={d}\n", .{ scalar, log_dur_ns_u64 / 1_000_000 });
-
-            // allow once-per-second summary emission on miss path as well
-            const log_now_ns: i128 = core.clock.nowNs();
-            if (self.log_atlas_ensure_last_report_ns == 0) self.log_atlas_ensure_last_report_ns = log_now_ns;
-            if (log_now_ns - self.log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
-                applog.appLog(
-                    "[atlas] ensureGlyph stats: calls/s={d} hits/s={d} misses/s={d} cache={d} slowest_ms={d}\n",
-                    .{
-                        self.log_atlas_ensure_calls,
-                        self.log_atlas_ensure_hits,
-                        self.log_atlas_ensure_misses,
-                        self.glyph_map.count(),
-                        @as(u64, self.log_atlas_ensure_slowest_ns / 1_000_000),
-                    },
-                );
-                self.log_atlas_ensure_calls = 0;
-                self.log_atlas_ensure_hits = 0;
-                self.log_atlas_ensure_misses = 0;
-                self.log_atlas_ensure_slowest_ns = 0;
-                self.log_atlas_ensure_last_report_ns = log_now_ns;
-            }
-        }
-
-        return entry;
-    }
-
     // Style flags constants (match ZONVIE_STYLE_* in zonvie_core.h)
     const STYLE_BOLD: u32 = 1 << 0;
     const STYLE_ITALIC: u32 = 1 << 1;
-
-    /// Styled glyph lookup: selects bold/italic font variant based on style_flags
-    pub fn atlasEnsureGlyphEntryStyled(self: *Renderer, scalar: u32, style_flags: u32) !core.GlyphEntry {
-        // If no style flags or no variant faces available, fall back to regular
-        if (style_flags == 0) {
-            return self.atlasEnsureGlyphEntry(scalar);
-        }
-
-        // Guard shared atlas state against concurrent WM_PAINT uploads
-        self.mu.lockUncancelable(core.clock.io());
-
-        // Composite cache key: scalar in lower 21 bits, style_flags in upper bits
-        const cache_key: u32 = scalar | (style_flags << 21);
-
-        // Check styled glyph cache first
-        if (self.styled_glyph_map.get(cache_key)) |cached| {
-            g_log_styled_hits += 1;
-            self.mu.unlock(core.clock.io());
-            return cached;
-        }
-
-        g_log_styled_misses += 1;
-
-        // Lazy-load Bold/Italic/Bold+Italic font faces if not yet initialized
-        self.ensureStyledFontFaces();
-
-        // Select font face based on style flags
-        const is_bold = (style_flags & STYLE_BOLD) != 0;
-        const is_italic = (style_flags & STYLE_ITALIC) != 0;
-
-        const face: ?*c.IDWriteFontFace = blk: {
-            if (is_bold and is_italic) {
-                break :blk self.bold_italic_font_face orelse self.bold_font_face orelse self.italic_font_face orelse self.font_face;
-            } else if (is_bold) {
-                break :blk self.bold_font_face orelse self.font_face;
-            } else if (is_italic) {
-                break :blk self.italic_font_face orelse self.font_face;
-            } else {
-                break :blk self.font_face;
-            }
-        };
-
-        if (face == null) {
-            self.mu.unlock(core.clock.io());
-            return error.NoFont;
-        }
-
-        // Render glyph with the selected font face
-        // If variant font fails, fall back to regular atlasEnsureGlyphEntry (which handles edge cases better)
-        const entry = self.renderGlyphWithFace(scalar, face.?) catch |err| blk: {
-            g_log_styled_fallbacks += 1;
-            if (applog.isEnabled()) applog.appLog("[styled] fallback scalar=0x{x} style=0x{x} err={any}\n", .{ scalar, style_flags, err });
-            // Unlock before calling atlasEnsureGlyphEntry (which takes its own lock)
-            self.mu.unlock(core.clock.io());
-            const fallback_entry = self.atlasEnsureGlyphEntry(scalar) catch {
-                return err; // Both failed, return original error
-            };
-            // Re-lock to continue with caching
-            self.mu.lockUncancelable(core.clock.io());
-            break :blk fallback_entry;
-        };
-
-        // Log the entry details for debugging
-        if (applog.isEnabled() and g_log_styled_misses < 20) {
-            applog.appLog("[styled] MISS scalar=0x{x} ({c}) style=0x{x} bbox=({d:.1},{d:.1}) uv=({d:.3},{d:.3})\n", .{
-                scalar,
-                if (scalar >= 32 and scalar < 127) @as(u8, @intCast(scalar)) else '?',
-                style_flags,
-                entry.bbox_size_px[0],
-                entry.bbox_size_px[1],
-                entry.uv_min[0],
-                entry.uv_min[1],
-            });
-        }
-
-        // Periodic stats report
-        if (applog.isEnabled()) {
-            const now_ns: i128 = core.clock.nowNs();
-            if (g_log_styled_last_report_ns == 0) g_log_styled_last_report_ns = now_ns;
-            if (now_ns - g_log_styled_last_report_ns >= @as(i128, 1_000_000_000)) {
-                applog.appLog("[styled] stats: hits={d} misses={d} fallbacks={d}\n", .{ g_log_styled_hits, g_log_styled_misses, g_log_styled_fallbacks });
-                g_log_styled_hits = 0;
-                g_log_styled_misses = 0;
-                g_log_styled_fallbacks = 0;
-                g_log_styled_last_report_ns = now_ns;
-            }
-        }
-
-        self.styled_glyph_map.put(cache_key, entry) catch {
-            self.mu.unlock(core.clock.io());
-            return error.OutOfMemory;
-        };
-        self.mu.unlock(core.clock.io());
-        return entry;
-    }
-
-    /// Internal helper: render glyph with a specific font face
-    fn renderGlyphWithFace(self: *Renderer, scalar: u32, face: *c.IDWriteFontFace) !core.GlyphEntry {
-        // --- 1) scalar -> glyph_index (with OpenType feature support) ---
-        const glyph_index = try self.getGlyphIndexForScalar(face, scalar);
-
-        // glyph_index == 0 means .notdef (font doesn't have this glyph)
-        // Return error so caller can fall back to regular font
-        if (glyph_index == 0) {
-            return error.GlyphNotFound;
-        }
-
-        // --- 2) glyph run analysis -> alpha texture bounds ---
-        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
-        glyph_run.fontFace = face;
-        glyph_run.fontEmSize = self.font_em_size;
-        glyph_run.glyphCount = 1;
-
-        var gi_arr: [1]c.UINT16 = .{glyph_index};
-        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
-        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
-
-        glyph_run.glyphIndices = gi_arr[0..].ptr;
-        glyph_run.glyphAdvances = adv_arr[0..].ptr;
-        glyph_run.glyphOffsets = off_arr[0..].ptr;
-
-        // CreateGlyphRunAnalysis
-        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
-        const dwtbl = dw.lpVtbl.*;
-        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
-
-        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse
-            return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
-
-        const hr_cgra = create_analysis_fn(
-            dw,
-            &glyph_run,
-            1.0,
-            null,
-            c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC,
-            c.DWRITE_MEASURING_MODE_NATURAL,
-            0.0,
-            0.0,
-            &analysis,
-        );
-
-        if (c.FAILED(hr_cgra) or analysis == null) {
-            return error.DWriteCreateGlyphRunAnalysisFailed;
-        }
-
-        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
-        defer _ = rel_fn(analysis.?);
-
-        var bounds: c.RECT = std.mem.zeroes(c.RECT);
-        const atbl = analysis.?.lpVtbl.*;
-
-        const get_bounds_fn = atbl.GetAlphaTextureBounds orelse
-            return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
-
-        const hr_bounds = get_bounds_fn(
-            analysis.?,
-            c.DWRITE_TEXTURE_CLEARTYPE_3x1,
-            &bounds,
-        );
-        if (c.FAILED(hr_bounds)) {
-            return error.DWriteGetAlphaTextureBoundsFailed;
-        }
-
-        const bw_i32: i32 = bounds.right - bounds.left;
-        const bh_i32: i32 = bounds.bottom - bounds.top;
-        const bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        const bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-
-        if (bw == 0 or bh == 0) {
-            // Empty glyph bounds - return error to trigger fallback to regular font
-            // (Spaces are already skipped in nvim_core.zig before reaching here)
-            return error.EmptyGlyphBounds;
-        }
-
-        // --- 3) fetch ClearType 3x1 texture (RGB, 3 bytes per pixel) ---
-        const buf_size_rgb: usize = @as(usize, bw) * @as(usize, bh) * 3;
-        const tmp_rgb = try self.alloc.alloc(u8, buf_size_rgb);
-        defer self.alloc.free(tmp_rgb);
-
-        const create_alpha_fn = atbl.CreateAlphaTexture orelse
-            return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-
-        const hr_tex = create_alpha_fn(
-            analysis.?,
-            c.DWRITE_TEXTURE_CLEARTYPE_3x1,
-            &bounds,
-            tmp_rgb.ptr,
-            @as(c.UINT32, @intCast(tmp_rgb.len)),
-        );
-        if (c.FAILED(hr_tex)) {
-            return error.DWriteCreateAlphaTextureFailed;
-        }
-
-        // --- 4) pack into atlas CPU buffer ---
-        const pad: u32 = 1;
-        const packed_w: u32 = bw + pad * 2;
-        const packed_h: u32 = bh + pad * 2;
-
-        // wrap to next row if needed
-        if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
-            self.atlas_next_x = 1;
-            self.atlas_next_y += self.atlas_row_h + 1;
-            self.atlas_row_h = 0;
-        }
-        // If atlas is full, reset and retry (simple eviction strategy)
-        if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
-            if (applog.isEnabled()) applog.appLog("[atlas] renderGlyphWithFace scalar=0x{x}: atlas full, resetting\n", .{scalar});
-            self.resetAtlas();
-
-            // After reset, re-check row wrap
-            if (self.atlas_next_x + packed_w + 1 >= self.atlas_w) {
-                self.atlas_next_x = 1;
-                self.atlas_next_y += self.atlas_row_h + 1;
-                self.atlas_row_h = 0;
-            }
-            // If still doesn't fit after reset, glyph is too large
-            if (self.atlas_next_y + packed_h + 1 >= self.atlas_h) {
-                if (applog.isEnabled()) applog.appLog("[atlas] renderGlyphWithFace scalar=0x{x}: glyph too large ({d}x{d})\n", .{ scalar, packed_w, packed_h });
-                return error.GlyphTooLarge;
-            }
-        }
-
-        const place_x: u32 = self.atlas_next_x;
-        const place_y: u32 = self.atlas_next_y;
-
-        self.atlas_next_x += packed_w + 1;
-        self.atlas_row_h = @max(self.atlas_row_h, packed_h);
-
-        // Clear padded area to 0 - RGBA format (4 bytes per pixel)
-        {
-            var y: u32 = 0;
-            while (y < packed_h) : (y += 1) {
-                const row_off = ((@as(usize, place_y + y) * @as(usize, self.atlas_w)) + @as(usize, place_x)) * 4;
-                @memset(self.atlas_cpu.items[row_off .. row_off + packed_w * 4], 0);
-            }
-        }
-
-        // Copy glyph RGB directly for true ClearType subpixel rendering
-        {
-            var y: u32 = 0;
-            while (y < bh) : (y += 1) {
-                var x: u32 = 0;
-                while (x < bw) : (x += 1) {
-                    const src_off = (@as(usize, y) * @as(usize, bw) + @as(usize, x)) * 3;
-                    const dst_off = ((@as(usize, place_y + pad + y) * @as(usize, self.atlas_w)) + @as(usize, place_x + pad + x)) * 4;
-
-                    const r = tmp_rgb[src_off];
-                    const g = tmp_rgb[src_off + 1];
-                    const b = tmp_rgb[src_off + 2];
-
-                    self.atlas_cpu.items[dst_off + 0] = r; // R
-                    self.atlas_cpu.items[dst_off + 1] = g; // G
-                    self.atlas_cpu.items[dst_off + 2] = b; // B
-                    self.atlas_cpu.items[dst_off + 3] = @max(r, @max(g, b)); // A
-                }
-            }
-        }
-
-        self.atlas_content_generation +%= 1;
-
-        // Mark dirty rect for GPU upload
-        try self.pending_uploads.append(self.alloc, c.D2D1_RECT_U{
-            .left = place_x,
-            .top = place_y,
-            .right = place_x + packed_w,
-            .bottom = place_y + packed_h,
-        });
-
-        // Increment atlas version for multi-context sync (styled glyphs)
-        self.atlas_version +%= 1;
-
-        // UV for actual glyph area excluding padding
-        const uv_u0 = @as(f32, @floatFromInt(place_x + pad)) / @as(f32, @floatFromInt(self.atlas_w));
-        const uv_v0 = @as(f32, @floatFromInt(place_y + pad)) / @as(f32, @floatFromInt(self.atlas_h));
-        const uv_u1 = @as(f32, @floatFromInt(place_x + pad + bw)) / @as(f32, @floatFromInt(self.atlas_w));
-        const uv_v1 = @as(f32, @floatFromInt(place_y + pad + bh)) / @as(f32, @floatFromInt(self.atlas_h));
-
-        return core.GlyphEntry{
-            .uv_min = .{ uv_u0, uv_v0 },
-            .uv_max = .{ uv_u1, uv_v1 },
-            .bbox_origin_px = .{
-                @as(f32, @floatFromInt(bounds.left)),
-                @as(f32, @floatFromInt(-bounds.bottom)),
-            },
-            .bbox_size_px = .{
-                @as(f32, @floatFromInt(bw)),
-                @as(f32, @floatFromInt(bh)),
-            },
-            .advance_px = @as(f32, @floatFromInt(self.cell_w_px)),
-            .ascent_px = self.ascent_px,
-            .descent_px = self.descent_px,
-        };
-    }
 
     // --- Phase 2: Core-managed atlas ---
 
@@ -2116,15 +1386,6 @@ pub const Renderer = struct {
         // Resize succeeded (or same size): commit new dimensions
         self.atlas_w = atlas_w;
         self.atlas_h = atlas_h;
-
-        // Clear caches
-        self.glyph_map.clearRetainingCapacity();
-        self.styled_glyph_map.clearRetainingCapacity();
-
-        // Reset packer
-        self.atlas_next_x = 1;
-        self.atlas_next_y = 1;
-        self.atlas_row_h = 0;
 
         // Clear pending uploads
         self.pending_upload_base_seq += self.pending_uploads.items.len;
@@ -2793,13 +2054,6 @@ pub const Renderer = struct {
 
         try self.recomputeCellMetrics();
 
-        // Clear glyph cache - old glyphs have wrong metrics/UVs for new font.
-        self.glyph_map.clearRetainingCapacity();
-        self.styled_glyph_map.clearRetainingCapacity();
-        self.atlas_next_x = 1;
-        self.atlas_next_y = 1;
-        self.atlas_row_h = 0;
-
         // Invalidate GSUB lig trigger cache (font faces changed).
         self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
 
@@ -3146,13 +2400,6 @@ pub const Renderer = struct {
 
         // Re-compute cell metrics with new TextFormat
         self.recomputeCellMetrics() catch {};
-
-        // Clear glyph cache (old glyphs rasterized at wrong DPI)
-        self.glyph_map.clearRetainingCapacity();
-        self.styled_glyph_map.clearRetainingCapacity();
-        self.atlas_next_x = 1;
-        self.atlas_next_y = 1;
-        self.atlas_row_h = 0;
 
         // Reset styled font faces (will be lazy-reloaded)
         safeRelease(self.bold_font_face);

@@ -777,7 +777,10 @@ typedef struct zonvie_callbacks {
     /* Phase 2: Core-managed atlas callbacks.
        When all three are non-NULL, core owns shelf packing and UV computation.
        The old on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled are not called.
-       When any is NULL, falls back to Phase 1 (frontend-managed atlas). */
+       When any is NULL, falls back to Phase 1 (frontend-managed atlas). The
+       core keeps that fallback implemented and test-covered, but both bundled
+       frontends register all three and no longer ship a Phase 1 atlas of
+       their own -- Phase 1 exists for embedders and older callers. */
     zonvie_rasterize_glyph_fn on_rasterize_glyph;
     zonvie_atlas_upload_fn on_atlas_upload;
     zonvie_atlas_create_fn on_atlas_create;
