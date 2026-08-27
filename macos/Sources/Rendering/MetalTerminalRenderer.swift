@@ -648,12 +648,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
 
-    /// Font ascent in drawable pixel coordinates.
-    var ascentPx: Float { atlas.fontMetricsSnapshot().ascent }
-
-    /// Font descent in drawable pixel coordinates.
-    var descentPx: Float { atlas.fontMetricsSnapshot().descent }
-
     /// Current font name.
     var currentFontName: String { atlas.currentFontName }
 
@@ -673,18 +667,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     /// Expose sampler for external grid views.
     var sharedSampler: MTLSamplerState? { sampler }
-
-    func atlasEnsureGlyphEntry(scalar: UInt32) -> GlyphAtlas.Entry? {
-        // No lock needed here - GlyphAtlas.entry() has its own mu.lock() internally
-        // Removing the double-lock significantly improves performance
-        return atlas.entry(for: scalar)
-    }
-
-    func atlasEnsureGlyphEntryStyled(scalar: UInt32, styleFlags: UInt32) -> GlyphAtlas.Entry? {
-        // No lock needed here - GlyphAtlas.entry() has its own mu.lock() internally
-        // Removing the double-lock significantly improves performance
-        return atlas.entry(for: scalar, styleFlags: styleFlags)
-    }
 
     // Phase 2: Core-managed atlas pass-through
 

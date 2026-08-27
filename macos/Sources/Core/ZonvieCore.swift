@@ -730,13 +730,11 @@ final class ZonvieCore {
                 }
             },
 
-            on_atlas_ensure_glyph: { ctx, scalar, outEntry in
-                return zonvie_macos_atlas_ensure_glyph(ctx, scalar, outEntry)
-            },
-
-            on_atlas_ensure_glyph_styled: { ctx, scalar, styleFlags, outEntry in
-                return zonvie_macos_atlas_ensure_glyph_styled(ctx, scalar, styleFlags, outEntry)
-            },
+            // NULL on purpose. These are the Phase 1 (frontend-managed atlas)
+            // entry points, and the core skips them entirely whenever the three
+            // Phase 2 callbacks below are set — which this frontend always does.
+            on_atlas_ensure_glyph: nil,
+            on_atlas_ensure_glyph_styled: nil,
 
             on_log: { ctx, bytes, len in
                 guard let ctx, let bytes else { return }
