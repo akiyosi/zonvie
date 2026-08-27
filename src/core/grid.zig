@@ -2081,12 +2081,12 @@ pub const Grid = struct {
     pub fn markDirtyRect(self: *Grid, top: u32, bot: u32) void {
         if (self.dirty_all) return;
         const start: usize = @as(usize, top);
+        // Clamping to `rows` is enough: `bit_length >= rows` holds for the
+        // global grid at all times (see Grid.ensureDirtyCapacity), which is
+        // the same invariant markDirtyRow relies on to set a bit unguarded.
         const end: usize = @as(usize, @min(bot, self.rows));
         if (start >= end) return;
-        const clamped_end: usize = @min(end, self.dirty_rows.bit_length);
-        if (start < clamped_end) {
-            self.dirty_rows.setRangeValue(.{ .start = start, .end = clamped_end }, true);
-        }
+        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
     }
 
     pub fn markAllDirty(self: *Grid) void {
