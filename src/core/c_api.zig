@@ -52,6 +52,10 @@ pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area
 pub const DECO_OVERLINE: u32 = 1 << 8;
 pub const DECO_GLOW: u32 = 1 << 9;
 pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, not coverage
+// Solid-color quad that is foreground text: block elements filled
+// geometrically rather than rasterized. Tells the frontend not to treat them
+// as background, which would fade them under a translucent/blurred window.
+pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
 
 pub const Vertex = extern struct {
     position: [2]f32,
