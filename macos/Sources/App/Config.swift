@@ -33,7 +33,7 @@ struct ZonvieConfig {
     }
 
     struct NeovimConfig {
-        var path: String = "/usr/local/bin/nvim"
+        var path: String = "nvim"
         var ssh: Bool = false
         var sshHost: String? = nil      // user@host
         var sshPort: Int? = nil         // デフォルト22, nil means default
@@ -138,19 +138,19 @@ struct ZonvieConfig {
 
     struct PerformanceConfig {
         /// Glyph cache size for ASCII characters (0-127) × 4 style combinations
-        /// Default: 512 (128 ASCII × 4 styles), Minimum: 128
+        /// Default: 512 (128 ASCII × 4 styles), Range: 128-512
         var glyphCacheAsciiSize: Int = 512
 
         /// Glyph cache size for non-ASCII characters (hash table)
-        /// Default: 512, Minimum: 64
+        /// Default: 16384, Range: 64-262144
         // Must match the core default (src/core/config.zig): a screenful of
         // distinct CJK does not fit in a smaller table, and a table that
         // cannot hold the working set makes every regeneration re-rasterize.
         var glyphCacheNonAsciiSize: Int = 16384
 
         /// Highlight attribute cache size for flush vertex generation
-        /// Default: 512, Range: 64-2048
-        var hlCacheSize: Int = 512
+        /// Default: 2048, Range: 64-2048
+        var hlCacheSize: Int = 2048
 
         /// Shape cache size for HarfBuzz text-run shaping results (2-way set associative)
         /// Default: 4096, Range: 512-65536
