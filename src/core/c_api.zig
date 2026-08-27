@@ -1983,19 +1983,28 @@ pub export fn zonvie_core_route_message(
 
 pub const zonvie_config = opaque {};
 
+/// Source for the `font.*`, `window.*` and `performance.*` defaults below,
+/// so `zonvie_config_get_values(NULL)` reports what a config-less run really
+/// uses. Those groups are the ones that had gone wrong: the two cache sizes
+/// each diverged in a separate commit, and the macOS-only window translucency
+/// and font size were written out with the non-macOS values from the start.
+/// The remaining fields are still hand-copied; the test at the end of this
+/// file is what keeps every one of them honest.
+const cfg_defaults: config.Config = .{};
+
 pub const zonvie_config_values = extern struct {
     // font
     font_family: [*:0]const u8 = "",
-    font_size: f32 = 14.0,
-    font_linespace: i32 = 0,
+    font_size: f32 = cfg_defaults.font.size,
+    font_linespace: i32 = cfg_defaults.font.linespace,
     // True when the user explicitly set [font] family / size in config.toml.
     // Frontends should prefer config over nvim's default `guifont`.
     font_family_explicit: bool = false,
     font_size_explicit: bool = false,
     // window
-    window_blur: bool = false,
-    window_opacity: f32 = 1.0,
-    window_blur_radius: i32 = 20,
+    window_blur: bool = cfg_defaults.window.blur,
+    window_opacity: f32 = cfg_defaults.window.opacity,
+    window_blur_radius: i32 = cfg_defaults.window.blur_radius,
     // scrollbar
     scrollbar_enabled: bool = true,
     scrollbar_show_mode: [*:0]const u8 = "scroll",
@@ -2029,11 +2038,11 @@ pub const zonvie_config_values = extern struct {
     log_scroll_only: bool = false,
     log_verbose: bool = false,
     // performance
-    perf_glyph_cache_ascii: i32 = 512,
-    perf_glyph_cache_non_ascii: i32 = 256,
-    perf_hl_cache_size: i32 = 512,
-    perf_shape_cache_size: i32 = 4096,
-    perf_atlas_size: i32 = 2048,
+    perf_glyph_cache_ascii: i32 = @intCast(cfg_defaults.performance.glyph_cache_ascii_size),
+    perf_glyph_cache_non_ascii: i32 = @intCast(cfg_defaults.performance.glyph_cache_non_ascii_size),
+    perf_hl_cache_size: i32 = @intCast(cfg_defaults.performance.hl_cache_size),
+    perf_shape_cache_size: i32 = @intCast(cfg_defaults.performance.shape_cache_size),
+    perf_atlas_size: i32 = @intCast(cfg_defaults.performance.atlas_size),
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
@@ -2799,4 +2808,31 @@ pub export fn zonvie_shader_result_destroy(result: ?*zonvie_shader_result) callc
     r.data = null;
     r.data_len = 0;
     r.error_msg = null;
+}
+
+test "the null-handle config values match what a default config would build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const built = buildConfigValues(arena.allocator(), &cfg_defaults);
+    const declared: zonvie_config_values = .{};
+
+    inline for (@typeInfo(zonvie_config_values).@"struct".fields) |f| {
+        // font_family is the one field the null path cannot reproduce: the
+        // candidate list is formatted into allocated memory, and there is no
+        // allocator to format it into when the handle is NULL.
+        if (comptime std.mem.eql(u8, f.name, "font_family")) continue;
+
+        const built_v = @field(built, f.name);
+        const declared_v = @field(declared, f.name);
+        switch (@typeInfo(f.type)) {
+            .pointer => try std.testing.expectEqualStrings(std.mem.span(built_v), std.mem.span(declared_v)),
+            .optional => {
+                try std.testing.expectEqual(built_v == null, declared_v == null);
+                if (built_v != null) {
+                    try std.testing.expectEqualStrings(std.mem.span(built_v.?), std.mem.span(declared_v.?));
+                }
+            },
+            else => try std.testing.expectEqual(built_v, declared_v),
+        }
+    }
 }
