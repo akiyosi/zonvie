@@ -8634,15 +8634,18 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     const msg_dirty = self.grid.message_state.msg_dirty;
     const confirm_dirty = self.grid.message_state.confirm_dirty;
-    const showmode_dirty = self.grid.message_state.showmode_dirty;
-    const showcmd_dirty = self.grid.message_state.showcmd_dirty;
-    const ruler_dirty = self.grid.message_state.ruler_dirty;
+    const status_dirty = self.grid.message_state.status_dirty;
     const history_dirty = self.grid.msg_history_state.dirty;
 
     // Also check if there's a pending throttle timeout to handle
     const has_pending_throttle = self.msg_show_pending_since != null;
 
-    if (!msg_dirty and !confirm_dirty and !showmode_dirty and !showcmd_dirty and !ruler_dirty and !history_dirty and !has_pending_throttle) return;
+    var any_status_dirty = false;
+    for (status_dirty) |d| {
+        if (d) any_status_dirty = true;
+    }
+
+    if (!msg_dirty and !confirm_dirty and !any_status_dirty and !history_dirty and !has_pending_throttle) return;
 
     // Guard: at most one on_msg_clear per flush cycle
     var sent_msg_clear = false;
@@ -8758,19 +8761,11 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     self.grid.message_state.msg_dirty = msg_retry_needed;
     self.grid.message_state.confirm_dirty = false;
-    self.grid.message_state.showmode_dirty = false;
-    self.grid.message_state.showcmd_dirty = false;
-    self.grid.message_state.ruler_dirty = false;
+    self.grid.message_state.status_dirty = @splat(false);
 
     // Handle showmode/showcmd/ruler changes only when their respective dirty flag is set
-    if (showmode_dirty) {
-        sendMsgShowmode(self);
-    }
-    if (showcmd_dirty) {
-        sendMsgShowcmd(self);
-    }
-    if (ruler_dirty) {
-        sendMsgRuler(self);
+    for (grid_mod.StatusChannel.all) |channel| {
+        if (status_dirty[channel.index()]) sendMsgStatus(self, channel);
     }
 
     // Handle msg_history_show
@@ -9807,89 +9802,29 @@ pub fn closeMessageSplit(self: *Core) void {
     };
 }
 
-/// Send msg_showmode callback to frontend.
-pub fn sendMsgShowmode(self: *Core) void {
-    const chunks = self.grid.message_state.showmode_content.items;
+/// Send one status channel (showmode / showcmd / ruler) to the frontend.
+/// The three differ only in which slot they read, which route they consult,
+/// and which callback they reach; the rest of the send path is identical.
+pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
+    const chunks = self.grid.message_state.status_content[channel.index()].items;
 
-    // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_showmode, "", 1);
-    self.log.write("[msg] sendMsgShowmode chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
-
-    if (route_result.view == .none) return; // Don't show anything
-
-    const cb = self.cb.on_msg_showmode orelse return;
-
-    var c_chunks: [64]c_api.MsgChunk = undefined;
-    const chunk_count = @min(chunks.len, c_chunks.len);
-
-    for (chunks[0..chunk_count], 0..) |chunk, i| {
-        c_chunks[i] = .{
-            .hl_id = chunk.hl_id,
-            .text = chunk.text.ptr,
-            .text_len = chunk.text.len,
-        };
-    }
-
-    // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
+    const event: config.MsgEvent = switch (channel) {
+        .showmode => .msg_showmode,
+        .showcmd => .msg_showcmd,
+        .ruler => .msg_ruler,
     };
 
-    cb(self.ctx, c_view, &c_chunks, chunk_count);
-}
-
-/// Send msg_showcmd callback to frontend.
-pub fn sendMsgShowcmd(self: *Core) void {
-    const chunks = self.grid.message_state.showcmd_content.items;
-
     // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_showcmd, "", 1);
-    self.log.write("[msg] sendMsgShowcmd chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
+    const route_result = self.msg_config.routeMessage(event, "", 1);
+    self.log.write("[msg] sendMsgStatus({s}) chunks={d} routed to view={s}\n", .{ @tagName(channel), chunks.len, @tagName(route_result.view) });
 
     if (route_result.view == .none) return; // Don't show anything
 
-    const cb = self.cb.on_msg_showcmd orelse return;
-
-    var c_chunks: [64]c_api.MsgChunk = undefined;
-    const chunk_count = @min(chunks.len, c_chunks.len);
-
-    for (chunks[0..chunk_count], 0..) |chunk, i| {
-        c_chunks[i] = .{
-            .hl_id = chunk.hl_id,
-            .text = chunk.text.ptr,
-            .text_len = chunk.text.len,
-        };
-    }
-
-    // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
-
-    cb(self.ctx, c_view, &c_chunks, chunk_count);
-}
-
-/// Send msg_ruler callback to frontend.
-pub fn sendMsgRuler(self: *Core) void {
-    const chunks = self.grid.message_state.ruler_content.items;
-
-    // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_ruler, "", 1);
-    self.log.write("[msg] sendMsgRuler chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
-
-    if (route_result.view == .none) return; // Don't show anything
-
-    const cb = self.cb.on_msg_ruler orelse return;
+    const cb = switch (channel) {
+        .showmode => self.cb.on_msg_showmode,
+        .showcmd => self.cb.on_msg_showcmd,
+        .ruler => self.cb.on_msg_ruler,
+    } orelse return;
 
     var c_chunks: [64]c_api.MsgChunk = undefined;
     const chunk_count = @min(chunks.len, c_chunks.len);
@@ -14549,4 +14484,80 @@ test "a block element in normal text is marked as foreground, not background" {
     // The blank cell's background quad must NOT be flagged, or the frontend
     // would stop fading real backgrounds under a translucent window.
     try std.testing.expect(state.unflagged_solid_quads > 0);
+}
+
+test "each status channel reaches its own route and its own callback" {
+    // The three senders used to be three separately-named functions, so
+    // crossing a channel's route or callback meant visibly editing the wrong
+    // one. Merging them turned that into two hand-written switch tables, and
+    // a swap there is silent -- the ruler would render as the mode indicator.
+    // Give each channel a distinct route and a distinct callback so a crossed
+    // mapping shows up as the wrong callback firing, or none at all.
+    const State = struct {
+        showmode_calls: u32 = 0,
+        showcmd_calls: u32 = 0,
+        ruler_calls: u32 = 0,
+        showmode_view: c_api.zonvie_msg_view_type = .none,
+        showcmd_view: c_api.zonvie_msg_view_type = .none,
+
+        fn onShowmode(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.showmode_calls += 1;
+            self.showmode_view = view;
+        }
+        fn onShowcmd(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.showcmd_calls += 1;
+            self.showcmd_view = view;
+        }
+        fn onRuler(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = view;
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ruler_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    // Distinct per-event routing: showmode -> mini, showcmd -> ext_float,
+    // ruler -> none (suppressed). Crossing the MsgEvent mapping therefore
+    // changes which view a callback reports, or suppresses the wrong channel.
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_showmode }, .view = .mini, .opts = .{ .timeout = 0 } },
+        .{ .filter = .{ .event = .msg_showcmd }, .view = .ext_float, .opts = .{ .timeout = 0 } },
+        .{ .filter = .{ .event = .msg_ruler }, .view = .none, .opts = .{ .timeout = 0 } },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_msg_showmode = State.onShowmode;
+    core.cb.on_msg_showcmd = State.onShowcmd;
+    core.cb.on_msg_ruler = State.onRuler;
+
+    try core.grid.setMsgStatus(.showmode, &.{.{ .hl_id = 0, .text = "-- INSERT --" }});
+    try core.grid.setMsgStatus(.showcmd, &.{.{ .hl_id = 0, .text = "3d" }});
+    try core.grid.setMsgStatus(.ruler, &.{.{ .hl_id = 0, .text = "1,1" }});
+    notifyMessageChanges(&core);
+
+    // Each channel used its OWN route: showmode was shown as mini, showcmd as
+    // ext_float, and ruler was suppressed before reaching its callback.
+    try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
+    try std.testing.expectEqual(c_api.zonvie_msg_view_type.mini, state.showmode_view);
+    try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+    try std.testing.expectEqual(c_api.zonvie_msg_view_type.ext_float, state.showcmd_view);
+    try std.testing.expectEqual(@as(u32, 0), state.ruler_calls);
+
+    // A channel with nothing dirty must not be sent again on the next flush.
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
 }

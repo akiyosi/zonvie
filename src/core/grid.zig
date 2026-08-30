@@ -487,11 +487,26 @@ pub const ConfirmMessage = struct {
     }
 };
 
+/// The three single-line status messages nvim maintains alongside the message
+/// stream. Every layer treats them identically -- same storage shape, same
+/// redraw decoding, same send path -- so they are indexed rather than spelled
+/// out three times. What differs is only which callback each one reaches.
+pub const StatusChannel = enum(u2) {
+    showmode,
+    showcmd,
+    ruler,
+
+    pub const all = [_]StatusChannel{ .showmode, .showcmd, .ruler };
+
+    pub fn index(self: StatusChannel) usize {
+        return @intFromEnum(self);
+    }
+};
+
 pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .empty,
-    showmode_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
-    showcmd_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
-    ruler_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
+    /// Indexed by StatusChannel.
+    status_content: [StatusChannel.all.len]std.ArrayListUnmanaged(MsgChunk) = @splat(.empty),
     visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
@@ -503,12 +518,8 @@ pub const MessageState = struct {
     /// frontend even when new msg_show events follow in the same batch.
     /// Reset by notifyMessageChanges after processing.
     msg_cleared_in_batch: bool = false,
-    /// Dirty flag for showmode changes
-    showmode_dirty: bool = false,
-    /// Dirty flag for showcmd changes
-    showcmd_dirty: bool = false,
-    /// Dirty flag for ruler changes
-    ruler_dirty: bool = false,
+    /// Dirty flags for the status channels, indexed by StatusChannel.
+    status_dirty: [StatusChannel.all.len]bool = @splat(false),
     /// Pending msg_show events that need to be sent to frontend.
     /// These survive msg_clear within the same redraw frame.
     pending_messages: [8]PendingMessage = undefined,
@@ -521,23 +532,13 @@ pub const MessageState = struct {
         self.messages.deinit(alloc);
         self.messages = .empty;
 
-        // Free showmode chunks
-        for (self.showmode_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
+        // Free the status channels' chunks
+        for (&self.status_content) |*content| {
+            for (content.items) |chunk| {
+                if (chunk.text.len > 0) alloc.free(chunk.text);
+            }
+            content.deinit(alloc);
         }
-        self.showmode_content.deinit(alloc);
-
-        // Free showcmd chunks
-        for (self.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.showcmd_content.deinit(alloc);
-
-        // Free ruler chunks
-        for (self.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.ruler_content.deinit(alloc);
     }
 
     /// Clear msg_show messages only. Does NOT clear showmode/showcmd/ruler
@@ -570,30 +571,18 @@ pub const MessageState = struct {
         }
         self.messages.clearRetainingCapacity();
 
-        // Free showmode chunks
-        for (self.showmode_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
+        // Free the status channels' chunks
+        for (&self.status_content) |*content| {
+            for (content.items) |chunk| {
+                if (chunk.text.len > 0) alloc.free(chunk.text);
+            }
+            content.clearRetainingCapacity();
         }
-        self.showmode_content.clearRetainingCapacity();
-
-        // Free showcmd chunks
-        for (self.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.showcmd_content.clearRetainingCapacity();
-
-        // Free ruler chunks
-        for (self.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.ruler_content.clearRetainingCapacity();
 
         self.confirm_msg.clear();
         self.visible = false;
         self.msg_dirty = false;
-        self.showmode_dirty = false;
-        self.showcmd_dirty = false;
-        self.ruler_dirty = false;
+        self.status_dirty = @splat(false);
     }
 };
 
@@ -4298,64 +4287,28 @@ pub const Grid = struct {
         // Note: Do NOT clear pending_show here - it should survive msg_clear
     }
 
-    /// Handle msg_showmode event.
-    pub fn setMsgShowmode(self: *Grid, content: []const MsgChunk) !void {
+    /// Replace a status channel's content. Showmode, showcmd and ruler are
+    /// stored and refreshed identically; only the slot differs.
+    pub fn setMsgStatus(self: *Grid, channel: StatusChannel, content: []const MsgChunk) !void {
+        const slot = &self.message_state.status_content[channel.index()];
+
         // Clear existing content
-        for (self.message_state.showmode_content.items) |chunk| {
+        for (slot.items) |chunk| {
             if (chunk.text.len > 0) self.alloc.free(chunk.text);
         }
-        self.message_state.showmode_content.clearRetainingCapacity();
+        slot.clearRetainingCapacity();
 
         // Copy new content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
             errdefer self.alloc.free(duped_text);
-            try self.message_state.showmode_content.append(self.alloc, MsgChunk{
+            try slot.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
             });
         }
-        self.message_state.showmode_dirty = true;
-    }
 
-    /// Handle msg_showcmd event.
-    pub fn setMsgShowcmd(self: *Grid, content: []const MsgChunk) !void {
-        // Clear existing content
-        for (self.message_state.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) self.alloc.free(chunk.text);
-        }
-        self.message_state.showcmd_content.clearRetainingCapacity();
-
-        // Copy new content
-        for (content) |chunk| {
-            const duped_text = try self.alloc.dupe(u8, chunk.text);
-            errdefer self.alloc.free(duped_text);
-            try self.message_state.showcmd_content.append(self.alloc, MsgChunk{
-                .hl_id = chunk.hl_id,
-                .text = duped_text,
-            });
-        }
-        self.message_state.showcmd_dirty = true;
-    }
-
-    /// Handle msg_ruler event.
-    pub fn setMsgRuler(self: *Grid, content: []const MsgChunk) !void {
-        // Clear existing content
-        for (self.message_state.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) self.alloc.free(chunk.text);
-        }
-        self.message_state.ruler_content.clearRetainingCapacity();
-
-        // Copy new content
-        for (content) |chunk| {
-            const duped_text = try self.alloc.dupe(u8, chunk.text);
-            errdefer self.alloc.free(duped_text);
-            try self.message_state.ruler_content.append(self.alloc, MsgChunk{
-                .hl_id = chunk.hl_id,
-                .text = duped_text,
-            });
-        }
-        self.message_state.ruler_dirty = true;
+        self.message_state.status_dirty[channel.index()] = true;
     }
 
     /// Handle msg_history_show event.
@@ -4400,9 +4353,7 @@ pub const Grid = struct {
     pub fn clearMessageDirty(self: *Grid) void {
         self.message_state.msg_dirty = false;
         self.message_state.confirm_dirty = false;
-        self.message_state.showmode_dirty = false;
-        self.message_state.showcmd_dirty = false;
-        self.message_state.ruler_dirty = false;
+        self.message_state.status_dirty = @splat(false);
     }
 };
 
@@ -5160,4 +5111,46 @@ test "scroll notification overflow retains main provenance across pending overwr
     grid.clearScrolledGrids();
     try std.testing.expect(!grid.main_scroll_notify_pending);
     try std.testing.expect(!grid.sub_grids.get(18).?.scroll_notify_pending);
+}
+
+test "every status channel stores, replaces and dirties independently" {
+    // showmode, showcmd and ruler used to be three copies of the same code.
+    // Now they share one path indexed by channel, so the thing worth pinning
+    // is that they still do not bleed into each other.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    for (StatusChannel.all) |channel| {
+        try std.testing.expect(!grid.message_state.status_dirty[channel.index()]);
+        try std.testing.expectEqual(@as(usize, 0), grid.message_state.status_content[channel.index()].items.len);
+    }
+
+    try grid.setMsgStatus(.showcmd, &.{.{ .hl_id = 7, .text = "3d" }});
+
+    // Only the written channel is touched.
+    for (StatusChannel.all) |channel| {
+        const expected_len: usize = if (channel == .showcmd) 1 else 0;
+        try std.testing.expectEqual(expected_len, grid.message_state.status_content[channel.index()].items.len);
+        try std.testing.expectEqual(channel == .showcmd, grid.message_state.status_dirty[channel.index()]);
+    }
+    const stored = grid.message_state.status_content[StatusChannel.showcmd.index()].items[0];
+    try std.testing.expectEqual(@as(u32, 7), stored.hl_id);
+    try std.testing.expectEqualStrings("3d", stored.text);
+
+    // The text is owned, not borrowed: a second write must free the first.
+    try grid.setMsgStatus(.showcmd, &.{ .{ .hl_id = 1, .text = "-- INSERT --" }, .{ .hl_id = 2, .text = "!" } });
+    try std.testing.expectEqual(@as(usize, 2), grid.message_state.status_content[StatusChannel.showcmd.index()].items.len);
+    try std.testing.expectEqualStrings("-- INSERT --", grid.message_state.status_content[StatusChannel.showcmd.index()].items[0].text);
+
+    // An empty write clears the channel, which is how mode-exit blanks showmode.
+    try grid.setMsgStatus(.showcmd, &.{});
+    try std.testing.expectEqual(@as(usize, 0), grid.message_state.status_content[StatusChannel.showcmd.index()].items.len);
+
+    // Every channel is reachable and lands in its own slot.
+    for (StatusChannel.all) |channel| {
+        try grid.setMsgStatus(channel, &.{.{ .hl_id = 0, .text = @tagName(channel) }});
+    }
+    for (StatusChannel.all) |channel| {
+        try std.testing.expectEqualStrings(@tagName(channel), grid.message_state.status_content[channel.index()].items[0].text);
+    }
 }

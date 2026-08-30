@@ -2048,13 +2048,10 @@ pub fn handleRedraw(
                         // Check if mode is NOT insert-related (i, R, Rv, etc.)
                         const is_insert_mode = mode_str.len > 0 and
                             (mode_str[0] == 'i' or mode_str[0] == 'R');
-                        if (!is_insert_mode and grid.message_state.showmode_content.items.len > 0) {
+                        const showmode = &grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+                        if (!is_insert_mode and showmode.items.len > 0) {
                             // Clear showmode content
-                            for (grid.message_state.showmode_content.items) |chunk| {
-                                if (chunk.text.len > 0) grid.alloc.free(chunk.text);
-                            }
-                            grid.message_state.showmode_content.clearRetainingCapacity();
-                            grid.message_state.showmode_dirty = true;
+                            try grid.setMsgStatus(.showmode, &.{});
                             if (log.cb != null) log.write("mode_change: cleared showmode (mode={s})\n", .{mode_str});
                         }
                     }
@@ -2522,8 +2519,17 @@ pub fn handleRedraw(
                 grid.setMsgClear();
                 if (log.cb != null) log.write("msg_clear\n", .{});
             },
-            .msg_showmode => {
-                // msg_showmode: [[content], ...]
+            .msg_showmode, .msg_showcmd, .msg_ruler => {
+                // All three carry the same payload shape: [[content], ...]
+                // Spelled out rather than defaulting the last one: a silent
+                // misroute here would render the ruler as the mode indicator,
+                // and nothing downstream could tell.
+                const channel: grid_mod.StatusChannel = switch (ev_tag) {
+                    .msg_showmode => .showmode,
+                    .msg_showcmd => .showcmd,
+                    .msg_ruler => .ruler,
+                    else => unreachable, // the arm above admits only these three
+                };
                 for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
@@ -2538,48 +2544,8 @@ pub fn handleRedraw(
                             try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
                         }
                     }
-                    try grid.setMsgShowmode(chunks.items);
-                    if (log.cb != null) log.write("msg_showmode chunks={d}\n", .{chunks.items.len});
-                }
-            },
-            .msg_showcmd => {
-                // msg_showcmd: [[content], ...]
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-
-                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                    if (t.len > 0 and t[0] == .arr) {
-                        for (t[0].arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                        }
-                    }
-                    try grid.setMsgShowcmd(chunks.items);
-                    if (log.cb != null) log.write("msg_showcmd chunks={d}\n", .{chunks.items.len});
-                }
-            },
-            .msg_ruler => {
-                // msg_ruler: [[content], ...]
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-
-                    var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
-                    if (t.len > 0 and t[0] == .arr) {
-                        for (t[0].arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                        }
-                    }
-                    try grid.setMsgRuler(chunks.items);
-                    if (log.cb != null) log.write("msg_ruler chunks={d}\n", .{chunks.items.len});
+                    try grid.setMsgStatus(channel, chunks.items);
+                    if (log.cb != null) log.write("{s} chunks={d}\n", .{ @tagName(ev_tag), chunks.items.len });
                 }
             },
             .msg_history_show => {
@@ -2721,5 +2687,49 @@ pub fn handleRedraw(
                 // preserved for the next flush attempt.
             },
         }
+    }
+}
+
+test "each status event decodes into its own channel slot" {
+    // The three arms were merged into one, so which slot an event lands in is
+    // now decided by a switch instead of by which arm the compiler picked.
+    // Drive all three through the real decoder and check they do not cross.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const cases = [_]struct { name: []const u8, text: []const u8, channel: grid_mod.StatusChannel }{
+        .{ .name = "msg_showmode", .text = "-- INSERT --", .channel = .showmode },
+        .{ .name = "msg_showcmd", .text = "3d", .channel = .showcmd },
+        .{ .name = "msg_ruler", .text = "1,1 All", .channel = .ruler },
+    };
+
+    for (cases) |case| {
+        // [[hl_id, text]] -> one content array -> one tuple -> one event
+        const chunk = try arena.alloc(mp.Value, 2);
+        chunk[0] = .{ .int = 0 };
+        chunk[1] = .{ .str = case.text };
+        const content = try arena.alloc(mp.Value, 1);
+        content[0] = .{ .arr = chunk };
+        const tuple = try arena.alloc(mp.Value, 1);
+        tuple[0] = .{ .arr = content };
+        const ev = try arena.alloc(mp.Value, 2);
+        ev[0] = .{ .str = case.name };
+        ev[1] = .{ .arr = tuple };
+        var events = [_]mp.Value{.{ .arr = ev }};
+        try runRedrawEvents(&grid, &hl, arena, &events);
+    }
+
+    // Every channel holds exactly its own text, and nothing bled across.
+    for (cases) |case| {
+        const slot = grid.message_state.status_content[case.channel.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqualStrings(case.text, slot.items[0].text);
+        try std.testing.expect(grid.message_state.status_dirty[case.channel.index()]);
     }
 }
