@@ -1046,6 +1046,88 @@ pub inline fn simdFillSequentialFrom(out: [*]u32, count: usize, start: u32) void
     }
 }
 
+/// Compose one main-grid row into `dst`, run-length batched by hl_id.
+///
+/// The row-mode and whole-screen paths differ only in where the row lands:
+/// row-mode fills a row-local buffer starting at 0, the whole-screen path
+/// fills the shared buffer at `dst_offset = row_start`. Both read the same
+/// source cells and produce the same bytes, so they share this body rather
+/// than two copies that drift apart one fix at a time.
+///
+/// `inline` on purpose: this is per-row on the flush path, and inlining
+/// keeps the generated code identical to the two hand-written loops -- the
+/// slice bases and the comptime `count_hl_cache` branch fold away.
+inline fn composeMainRowRuns(
+    core: *Core,
+    dst: *RenderCells,
+    dst_offset: usize,
+    row_start: usize,
+    cols: u32,
+    hl_cache: []highlight.ResolvedAttrWithStyles,
+    hl_valid: []bool,
+    hl_cache_limit: u32,
+    glow_enabled: bool,
+    glow_all: bool,
+    glow_hl_ids: ?*std.AutoHashMap(u32, void),
+    comptime count_hl_cache: bool,
+    hl_hits: *u32,
+    hl_misses: *u32,
+) void {
+    const grid_cells = core.grid.cells;
+    var c: u32 = 0;
+    while (c < cols) {
+        const run_hl = grid_cells[row_start + @as(usize, c)].hl;
+
+        // Find run of consecutive cells with same hl_id.
+        // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids).
+        var run_end: u32 = c + 1;
+        while (run_end < cols) : (run_end += 1) {
+            if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
+        }
+
+        // Get resolved attributes once for the entire run
+        const a = blk: {
+            if (run_hl < hl_cache_limit) {
+                if (hl_valid[run_hl]) {
+                    if (count_hl_cache) hl_hits.* += 1;
+                    break :blk hl_cache[run_hl];
+                }
+                if (count_hl_cache) hl_misses.* += 1;
+                const resolved = core.hl.getWithStyles(run_hl);
+                hl_cache[run_hl] = resolved;
+                hl_valid[run_hl] = true;
+                break :blk resolved;
+            }
+            // Fallback for hl_id >= hl_cache_limit
+            if (count_hl_cache) hl_misses.* += 1;
+            break :blk core.hl.getWithStyles(run_hl);
+        };
+
+        // Batch write all cells in the run with same fg/bg/sp/style_flags.
+        // Only the scalar differs per cell.
+        const ds: usize = dst_offset + @as(usize, c);
+        const de: usize = dst_offset + @as(usize, run_end);
+        @memset(dst.fg_rgbs.items[ds..de], a.fg);
+        @memset(dst.bg_rgbs.items[ds..de], a.bg);
+        @memset(dst.sp_rgbs.items[ds..de], a.sp);
+        @memset(dst.grid_ids.items[ds..de], 1);
+        @memset(dst.style_flags_arr.items[ds..de], a.style_flags);
+        @memset(dst.overline_arr.items[ds..de], @intFromBool(a.overline));
+        if (glow_enabled) {
+            const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+            @memset(dst.glow_arr.items[ds..de], has_glow);
+        }
+        // SIMD stride-2 extraction: Cell{cp,hl} -> cp only
+        simdExtractCp(
+            grid_cells.ptr + row_start + @as(usize, c),
+            dst.scalars.items.ptr + ds,
+            @as(usize, run_end - c),
+        );
+
+        c = run_end;
+    }
+}
+
 /// SIMD extract cp fields from Cell array (stride-2 u32 extraction).
 /// Cell = struct { cp: u32, hl: u32 } → extracts every other u32.
 pub inline fn simdExtractCp(cells: [*]const grid_mod.Cell, out: [*]u32, count: usize) void {
@@ -4729,7 +4811,6 @@ pub const FlushCtx = struct {
                             // SIMD-optimized: batch process consecutive cells with same hl_id
                             {
                                 const row_start: usize = @as(usize, r) * @as(usize, cols);
-                                const grid_cells = ctx.core.grid.cells;
                                 setViewportRowDecoFlags(
                                     row_cells.deco_base_flags.items[0..cols],
                                     r,
@@ -4737,63 +4818,22 @@ pub const FlushCtx = struct {
                                     cols,
                                     main_margins,
                                 );
-                                var c: u32 = 0;
-
-                                while (c < cols) {
-                                    const first_cell = grid_cells[row_start + @as(usize, c)];
-                                    const run_hl = first_cell.hl;
-
-                                    // Find run of consecutive cells with same hl_id
-                                    // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids)
-                                    var run_end: u32 = c + 1;
-                                    while (run_end < cols) : (run_end += 1) {
-                                        if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
-                                    }
-
-                                    // Get resolved attributes once for the entire run
-                                    const a = blk: {
-                                        if (run_hl < hl_cache_limit) {
-                                            if (hl_valid[run_hl]) {
-                                                perf_hl_cache_hits += 1;
-                                                break :blk hl_cache[run_hl];
-                                            }
-                                            perf_hl_cache_misses += 1;
-                                            const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                            hl_cache[run_hl] = resolved;
-                                            hl_valid[run_hl] = true;
-                                            break :blk resolved;
-                                        }
-                                        // Fallback for hl_id >= hl_cache_limit
-                                        perf_hl_cache_misses += 1;
-                                        break :blk ctx.core.hl.getWithStyles(run_hl);
-                                    };
-
-                                    // Batch write all cells in the run with same fg/bg/sp/style_flags
-                                    // Only scalar differs per cell
-                                    const fg = a.fg;
-                                    const bg = a.bg;
-                                    const sp = a.sp;
-                                    const flags = a.style_flags;
-
-                                    // Batch fill constant fields with @memset (compiles to SIMD)
-                                    const rs: usize = @intCast(c);
-                                    const re: usize = @intCast(run_end);
-                                    @memset(row_cells.fg_rgbs.items[rs..re], fg);
-                                    @memset(row_cells.bg_rgbs.items[rs..re], bg);
-                                    @memset(row_cells.sp_rgbs.items[rs..re], sp);
-                                    @memset(row_cells.grid_ids.items[rs..re], 1);
-                                    @memset(row_cells.style_flags_arr.items[rs..re], flags);
-                                    @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
-                                    if (glow_enabled) {
-                                        const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
-                                        @memset(row_cells.glow_arr.items[rs..re], has_glow);
-                                    }
-                                    // Only scalars (codepoints) differ per cell
-                                    // SIMD stride-2 extraction: Cell{cp,hl} → cp only
-                                    simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
-
-                                    c = run_end;
-                                }
+                                composeMainRowRuns(
+                                    ctx.core,
+                                    row_cells,
+                                    0,
+                                    row_start,
+                                    cols,
+                                    hl_cache,
+                                    hl_valid,
+                                    hl_cache_limit,
+                                    glow_enabled,
+                                    glow_all,
+                                    glow_hl_ids,
+                                    true,
+                                    &perf_hl_cache_hits,
+                                    &perf_hl_cache_misses,
+                                );
 
                                 // Overlay sub-grids using pre-cached info (avoids per-row hash map lookups).
                                 // Write each overlay's scroll flag while its CachedSubgrid is already
@@ -5205,7 +5245,6 @@ pub const FlushCtx = struct {
                     @memset(tmp.deco_base_flags.items, 0);
 
                     // 1) draw global grid(1) with RLE batching + hl_cache
-                    const grid_cells = ctx.core.grid.cells;
                     var row_i: u32 = 0;
                     while (row_i < rows) : (row_i += 1) {
                         const row_start: usize = @as(usize, row_i) * @as(usize, cols);
@@ -5216,56 +5255,24 @@ pub const FlushCtx = struct {
                             cols,
                             nr_main_margins,
                         );
-                        var c: u32 = 0;
-
-                        while (c < cols) {
-                            const first_cell = grid_cells[row_start + @as(usize, c)];
-                            const run_hl = first_cell.hl;
-
-                            // Find run of consecutive cells with same hl_id
-                            var run_end: u32 = c + 1;
-                            while (run_end < cols) : (run_end += 1) {
-                                if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
-                            }
-
-                            // Get resolved attributes with cache
-                            const a = blk: {
-                                if (run_hl < nr_hl_cache_limit) {
-                                    if (nr_hl_valid[run_hl]) {
-                                        break :blk nr_hl_cache[run_hl];
-                                    }
-                                    const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                    nr_hl_cache[run_hl] = resolved;
-                                    nr_hl_valid[run_hl] = true;
-                                    break :blk resolved;
-                                }
-                                break :blk ctx.core.hl.getWithStyles(run_hl);
-                            };
-
-                            const fg = a.fg;
-                            const bg = a.bg;
-                            const sp = a.sp;
-                            const flags = a.style_flags;
-
-                            // Batch fill constant fields with @memset
-                            const fill_start: usize = row_start + @as(usize, c);
-                            const fill_end: usize = row_start + @as(usize, run_end);
-                            @memset(tmp.fg_rgbs.items[fill_start..fill_end], fg);
-                            @memset(tmp.bg_rgbs.items[fill_start..fill_end], bg);
-                            @memset(tmp.sp_rgbs.items[fill_start..fill_end], sp);
-                            @memset(tmp.grid_ids.items[fill_start..fill_end], 1);
-                            @memset(tmp.style_flags_arr.items[fill_start..fill_end], flags);
-                            @memset(tmp.overline_arr.items[fill_start..fill_end], @intFromBool(a.overline));
-                            if (glow_enabled) {
-                                const has_glow_nr: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
-                                @memset(tmp.glow_arr.items[fill_start..fill_end], has_glow_nr);
-                            }
-                            for (fill_start..fill_end) |i| {
-                                tmp.scalars.items[i] = grid_cells[i].cp;
-                            }
-
-                            c = run_end;
-                        }
+                        var nr_unused_hits: u32 = 0;
+                        var nr_unused_misses: u32 = 0;
+                        composeMainRowRuns(
+                            ctx.core,
+                            tmp,
+                            row_start,
+                            row_start,
+                            cols,
+                            nr_hl_cache,
+                            nr_hl_valid,
+                            nr_hl_cache_limit,
+                            glow_enabled,
+                            glow_all,
+                            glow_hl_ids,
+                            false,
+                            &nr_unused_hits,
+                            &nr_unused_misses,
+                        );
                     }
 
                     // Then overlay subgrids (with hl_cache)
@@ -14560,4 +14567,184 @@ test "each status channel reaches its own route and its own callback" {
     notifyMessageChanges(&core);
     try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
     try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+}
+
+test "row-mode and whole-screen composition produce the same main-grid vertices" {
+    // The two paths used to carry separate copies of the run-length
+    // composition loop, so a fix to one could silently miss the other. They
+    // share one body now; this pins that they still agree cell for cell.
+    const Collector = struct {
+        verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
+        alloc: std.mem.Allocator,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const v = verts orelse return;
+            self.verts.appendSlice(self.alloc, v[0..vert_count]) catch {};
+        }
+
+        fn onPartial(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const v = main_verts orelse return;
+            self.verts.appendSlice(self.alloc, v[0..main_count]) catch {};
+        }
+    };
+
+    // Same grid contents for both runs: several distinct hl runs so the
+    // run-length batching, the hl cache and the scalar extraction all engage.
+    const seed_text = "abcABC  ..";
+    const seed_hls = [_]u32{ 0, 0, 1, 1, 1, 2, 2, 0, 3, 3 };
+
+    const Runner = struct {
+        fn collect(alloc: std.mem.Allocator, row_mode: bool, out: *std.ArrayListUnmanaged(c_api.Vertex)) !void {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+            try core.grid.resize(2, 10);
+            for (0..2) |r| {
+                for (seed_text, seed_hls, 0..) |ch, hl, c| {
+                    core.grid.putCell(@intCast(r), @intCast(c), ch, hl);
+                }
+            }
+            core.drawable_w_px = 10;
+            core.drawable_h_px = 2;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+
+            var collector = Collector{ .alloc = alloc };
+            defer collector.verts.deinit(alloc);
+            core.ctx = &collector;
+            if (row_mode) {
+                core.cb.on_vertices_row = Collector.onRow;
+            } else {
+                core.cb.on_vertices_partial = Collector.onPartial;
+            }
+
+            var flush_ctx = FlushCtx{ .core = &core };
+            try flush_ctx.onFlush(2, 10);
+            try out.appendSlice(alloc, collector.verts.items);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer row_verts.deinit(alloc);
+    var screen_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer screen_verts.deinit(alloc);
+
+    try Runner.collect(alloc, true, &row_verts);
+    try Runner.collect(alloc, false, &screen_verts);
+
+    // Both paths must have actually produced something, or the comparison
+    // below would pass on two empty lists.
+    try std.testing.expect(row_verts.items.len > 0);
+    try std.testing.expectEqual(row_verts.items.len, screen_verts.items.len);
+
+    for (row_verts.items, screen_verts.items) |a, b| {
+        try std.testing.expectEqual(a.position, b.position);
+        try std.testing.expectEqual(a.color, b.color);
+        try std.testing.expectEqual(a.grid_id, b.grid_id);
+        try std.testing.expectEqual(a.deco_flags, b.deco_flags);
+    }
+}
+
+test "composeMainRowRuns writes one row's attributes, scalars and glow" {
+    // The differential test above can only catch a disagreement BETWEEN the
+    // two call sites, so it cannot see a fault inside the shared body - both
+    // sides would break identically. This drives the body directly.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    // Distinct attributes per hl id, or every run would produce identical
+    // bytes and the assertions below could not tell the runs apart.
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    try core.hl.define(7, 0xAA0000, 0xBB0000, 0xCC0000, false, 0, .{ .bold = true }, false);
+    try core.hl.define(9, 0x00AA00, 0x00BB00, null, false, 0, .{}, false);
+
+    // Row of 12: a run of 6 (exercises simdExtractCp's 4-wide body plus its
+    // tail), then 4, then 2. hl 7 recurs so the cache hit path runs too.
+    const cols: u32 = 12;
+    try core.grid.resize(1, cols);
+    const text = "AAAAAABBBBCC";
+    const hls = [_]u32{ 7, 7, 7, 7, 7, 7, 9, 9, 9, 9, 7, 7 };
+    for (text, hls, 0..) |ch, hl, c| core.grid.putCell(0, @intCast(c), ch, hl);
+
+    try core.initHlCache();
+    const hl_cache: []highlight.ResolvedAttrWithStyles = core.hl_cache_buf orelse &.{};
+    const hl_valid: []bool = core.hl_valid_buf orelse &.{};
+    @memset(hl_valid, false);
+
+    var dst: RenderCells = .{};
+    defer dst.deinit(core.alloc);
+    try dst.ensureTotalCapacity(core.alloc, cols);
+    dst.setLen(cols);
+
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+    composeMainRowRuns(
+        &core,
+        &dst,
+        0,
+        0,
+        cols,
+        hl_cache,
+        hl_valid,
+        @intCast(hl_valid.len),
+        false,
+        false,
+        null,
+        true,
+        &hits,
+        &misses,
+    );
+
+    const a7 = core.hl.getWithStyles(7);
+    const a9 = core.hl.getWithStyles(9);
+    for (0..cols) |i| {
+        const expected = if (hls[i] == 7) a7 else a9;
+        try std.testing.expectEqual(expected.fg, dst.fg_rgbs.items[i]);
+        try std.testing.expectEqual(expected.bg, dst.bg_rgbs.items[i]);
+        try std.testing.expectEqual(expected.sp, dst.sp_rgbs.items[i]);
+        try std.testing.expectEqual(expected.style_flags, dst.style_flags_arr.items[i]);
+        try std.testing.expectEqual(@as(i64, 1), dst.grid_ids.items[i]);
+        // Every cell's codepoint must survive the stride-2 extraction.
+        try std.testing.expectEqual(@as(u32, text[i]), dst.scalars.items[i]);
+    }
+    // The two hl ids really do differ, or the loop above proves nothing.
+    try std.testing.expect(a7.fg != a9.fg and a7.bg != a9.bg);
+
+    // Three runs: first is a miss, the 6 cells after it hit, hl 9 misses,
+    // then hl 7 recurs as a hit. Counted only because count_hl_cache is true.
+    try std.testing.expectEqual(@as(u32, 2), misses);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+
+    // Glow is opt-in: left alone when disabled, filled when enabled.
+    @memset(dst.glow_arr.items[0..cols], 0);
+    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
+    for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
 }
