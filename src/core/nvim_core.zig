@@ -5678,16 +5678,8 @@ pub const Core = struct {
         flush.closeMessageSplit(self);
     }
 
-    pub fn sendMsgShowmode(self: *Core) void {
-        flush.sendMsgShowmode(self);
-    }
-
-    pub fn sendMsgShowcmd(self: *Core) void {
-        flush.sendMsgShowcmd(self);
-    }
-
-    pub fn sendMsgRuler(self: *Core) void {
-        flush.sendMsgRuler(self);
+    pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
+        flush.sendMsgStatus(self, channel);
     }
 
     pub fn sendMsgHistoryShow(self: *Core) void {
