@@ -471,21 +471,8 @@ final class ViewController: NSViewController {
 
     // MARK: - Public Tab Bar Control
 
-    /// Update tab bar with new tab list
-    func updateTabBar(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
-        self.currentTabs = tabs
-        tabBarView?.updateTabs(tabs, currentTab: currentTab)
-    }
 
-    /// Hide the tab bar (when ext_tabline is disabled or showtabline=0)
-    func hideTabBar() {
-        tabBarView?.isHidden = true
-    }
 
-    /// Show the tab bar
-    func showTabBar() {
-        tabBarView?.isHidden = false
-    }
 
     // MARK: - Tab Actions
 

@@ -323,15 +323,6 @@ final class MetalTerminalView: MTKView {
         msgTimer = nil
     }
 
-    // Debug: call this from draw to test scrollbar update
-    func debugUpdateScrollbar() {
-        guard let core else {
-            ZonvieCore.appLog("[Scrollbar-debug] no core")
-            return
-        }
-        let vp = core.getViewport(gridId: -1)
-        ZonvieCore.appLog("[Scrollbar-debug] getViewport(1) = \(String(describing: vp))")
-    }
 
     /// Send committed text to Neovim immediately on the keyDown path.
     /// Why: a prior design buffered repeats in a single-slot `pendingInput`
@@ -1531,20 +1522,6 @@ final class MetalTerminalView: MTKView {
         // grid_mu acquisition (see its computation before that call).
     }
 
-    func submitVerticesRaw(
-        mainPtr: UnsafeRawPointer?, mainCount: Int,
-        cursorPtr: UnsafeRawPointer?, cursorCount: Int
-    ) {
-        // Process pending scroll clears BEFORE submitting new vertices.
-        processPendingScrollClears()
-
-        renderer.submitVerticesRaw(
-            mainPtr: mainPtr, mainCount: mainCount,
-            cursorPtr: cursorPtr, cursorCount: cursorCount
-        )
-        requestRedraw()
-    }
-
     func submitVerticesPartialRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
         cursorPtr: UnsafeRawPointer?, cursorCount: Int,
@@ -1757,16 +1734,6 @@ final class MetalTerminalView: MTKView {
         )
         requestRedrawDrawablePx(rectPx)
         return ok
-    }
-
-    func applyLineSpace(px: Int32) {
-        renderer.setLineSpace(px: px)
-
-        // cell metrics changed (height)
-        maybeResizeCoreGrid()
-
-        // Ensure a redraw even if no new vertices arrive immediately.
-        requestRedraw(nil)
     }
 
     override func keyDown(with event: NSEvent) {

@@ -2625,18 +2625,6 @@ final class ZonvieCore {
         }
     }
 
-    func setLogEnabledViaCore(_ enabled: Bool) {
-        guard let core else { return }
-        zonvie_core_set_log_enabled(core, enabled ? 1 : 0)
-        ZonvieCore.appLogEnabled = enabled
-        // Re-apply perf_only/scroll_only/verbose on each enable toggle so a
-        // runtime toggle of the log flag never resets them to their core
-        // defaults (off).
-        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
-        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
-        zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
-    }
-
     // MARK: - Smooth Scrolling Support
 
     /// Grid info for hit-testing (Swift-friendly wrapper)
@@ -4422,8 +4410,6 @@ final class ZonvieCore {
     /// Track last cursor grid to detect transitions from external windows
     private var lastCursorGrid: Int64 = 1
 
-    /// Timestamp when cursor left an external window (used to suppress main window activation briefly)
-    private var lastExternalWindowExitTime: Date? = nil
 
     private func onExternalWindow(
         gridId: Int64,

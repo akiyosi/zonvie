@@ -1033,34 +1033,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         stageFontChanged(generation: generation)
     }
 
-    /// Submit vertices for rendering. Called from the Zig core callback.
-    func submitVertices(ptr: UnsafeRawPointer?, count: Int, rows: UInt32, cols: UInt32) {
-        // Mark scroll offset for clearing when content changes (Neovim has processed scroll)
-        // The actual clearing happens in draw() via processPendingScrollClears() + updateScrollShaderOffset()
-        // to ensure proper synchronization with rendering
-        if let main = mainTerminalView, main.getScrollOffset(gridId: gridId) != 0 {
-            main.clearScrollOffsetForExternalGrid(gridId)
-        }
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        gridRows = rows
-        gridCols = cols
-
-        if count > 0, let ptr = ptr {
-            ensureVertexBufferCapacity(count, forceReplace: true)
-            if let vb = vertexBuffer {
-                memcpy(vb.contents(), ptr, count * MemoryLayout<Vertex>.stride)
-                pendingVertexCount = count
-            } else {
-                pendingVertexCount = 0
-            }
-        } else {
-            pendingVertexCount = 0
-        }
-    }
-
     /// Begin flush bracket — pick a free buffer set and copy committed buffer references.
     /// Called on main thread before vertex submission during a flush cycle.
     /// Returns false if the flush bracket could not be opened (no free buffer
