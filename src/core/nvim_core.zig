@@ -3687,10 +3687,6 @@ pub const Core = struct {
         self.requestInput(s) catch |e| self.log.write("emitInputString err: {any}\n", .{e});
     }
 
-    fn isAsciiControl(cp: u32) bool {
-        return cp < 0x20 or cp == 0x7F;
-    }
-
     fn firstCodepointUtf8(s: []const u8) ?u32 {
         if (s.len == 0) return null;
         var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
