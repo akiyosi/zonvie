@@ -88,24 +88,6 @@ fn parseExtHandle(ext: mp.Ext) i64 {
     return v;
 }
 
-fn firstCodepoint(utf8: []const u8) u32 {
-    // Return 0 for empty strings (continuation cell for wide characters)
-    if (utf8.len == 0) return 0;
-
-    var it = std.unicode.Utf8Iterator{ .bytes = utf8, .i = 0 };
-
-    // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid UTF-8
-    // (it uses utf8Decode(slice) catch unreachable).
-    const slice = it.nextCodepointSlice() orelse return ' ';
-
-    const cp = std.unicode.utf8Decode(slice) catch {
-        // Invalid UTF-8 (e.g., overlong encoding). Return replacement char.
-        return 0xFFFD;
-    };
-
-    return @as(u32, cp);
-}
-
 /// Extract all codepoints from a UTF-8 cell string into a stack buffer.
 /// Returns the number of codepoints written (including the first).
 /// If the string exceeds the lossless inline cell representation, fail before
@@ -576,37 +558,6 @@ pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]co
     return buf.items;
 }
 
-fn dumpValue(v: anytype, indent: usize) void {
-    const pad = "                                "[0..indent];
-
-    switch (v) {
-        .nil => std.log.debug("{s}nil", .{pad}),
-        .bool => |b| std.log.debug("{s}bool: {}", .{ pad, b }),
-        .int => |i| std.log.debug("{s}int: {}", .{ pad, i }),
-        .float => |f| std.log.debug("{s}float: {}", .{ pad, f }),
-        .str => |s| std.log.debug("{s}str: \"{s}\"", .{ pad, s }),
-        .arr => |a| {
-            std.log.debug("{s}arr(len={})", .{ pad, a.len });
-            for (a, 0..) |elem, i| {
-                std.log.debug("{s}  [{}]", .{ pad, i });
-                dumpValue(elem, indent + 4);
-            }
-        },
-        .map => |m| {
-            std.log.debug("{s}map(len={})", .{ pad, m.len });
-            // Can expand key/value if needed
-        },
-        .ext => |e| {
-            std.log.debug("{s}ext: type_code={} data_len={}", .{ pad, e.type_code, e.data.len });
-
-            // Optional: dump first few bytes (handy when ext is used for handles)
-            const n = @min(e.data.len, 16);
-            if (n > 0) {
-                std.log.debug("{s}  data[0..{}] = {any}", .{ pad, n, e.data[0..n] });
-            }
-        },
-    }
-}
 
 fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
     const max_depth: u32 = 4;
@@ -1538,8 +1489,7 @@ pub fn handleRedraw(
                 for (tuples) |tv| {
 
                     // log.write("win_float_pos:", .{});
-                    // dumpValue(tv, 2);
-                    if (tv != .arr) continue;
+                                if (tv != .arr) continue;
                     const t = tv.arr;
 
                     // Need at least: grid..zindex (len >= 8)

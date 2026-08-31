@@ -887,44 +887,6 @@ pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, ta
     return i;
 }
 
-/// Find end of run where (items[i] & mask) == val.
-/// Used to split glyph runs by bold/italic style so each sub-run is shaped
-/// with the correct font variant, preventing ligature rendering corruption.
-pub inline fn findStyleMaskEnd(items: []const u8, start: usize, limit: usize, mask: u8, val: u8) usize {
-    var i = start + 1;
-    while (i < limit) : (i += 1) {
-        if ((items[i] & mask) != val) return i;
-    }
-    return limit;
-}
-
-/// Find first index where a bit is NOT set: (items[i] & mask) == 0.
-/// Used for strikethrough run scans that check a specific bit rather than exact equality.
-pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usize, mask: u8) usize {
-    var i = start;
-    const V = @Vector(16, u8);
-    const m: V = @splat(mask);
-    const zeros: V = @splat(0);
-    while (i + 16 <= limit) {
-        const chunk: V = items[i..][0..16].*;
-        const masked = chunk & m;
-        if (!@reduce(.Or, masked == zeros)) {
-            // All 16 have the bit set, continue
-            i += 16;
-        } else {
-            // Scalar scan within chunk to find exact position
-            inline for (0..16) |k| {
-                if (items[i + k] & mask == 0) return i + k;
-            }
-            unreachable;
-        }
-    }
-    while (i < limit) : (i += 1) {
-        if (items[i] & mask == 0) return i;
-    }
-    return i;
-}
-
 /// Fused run-end scan over up to 6 SoA attribute arrays in a single pass.
 /// Returns the first index in [start, limit) where ANY of the enabled arrays
 /// differs from its target. Equivalent to:
@@ -933,7 +895,7 @@ pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usiz
 ///       simdFindRunEndU32(bg, ..., bg_t),
 ///       simdFindRunEndI64(grid, ..., grid_t),
 ///       simdFindRunEndU32(deco, ..., deco_t),
-///       has_style ? findStyleMaskEnd(style, ..., style_mask, style_val) : limit,
+///       has_style ? (first i where (style[i] & style_mask) != style_val)  : limit,
 ///       has_glow  ? simdFindRunEndU8(glow, ..., glow_t)                  : limit,
 ///     )
 /// but reads each cache line once instead of 4–6 separate passes.
@@ -2222,7 +2184,7 @@ pub fn generateRowVertices(
 
             // Fused run-end: single SIMD pass over fg/bg/grid + optional
             // style-mask (when shaping splits by bold/italic) + optional glow.
-            // Replaces 3–5 separate simdFindRunEnd*+findStyleMaskEnd calls.
+            // Replaces 3–5 separate per-attribute run-end scans.
             const shaping_style_mask: u8 = STYLE_BOLD | STYLE_ITALIC;
             const run_style_bi: u8 = rc.style_flags_arr.items[@intCast(c)] & shaping_style_mask;
             const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
@@ -10383,15 +10345,6 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
     };
 }
 
-pub fn countUtf8Codepoints(s: []const u8) u32 {
-    var count: u32 = 0;
-    var iter = std.unicode.Utf8View.initUnchecked(s).iterator();
-    while (iter.nextCodepoint()) |_| {
-        count += 1;
-    }
-    return count;
-}
-
 /// Check if a codepoint is a wide (double-width) character.
 /// Based on East Asian Width (simplified version for CJK).
 pub fn isWideChar(cp: u32) bool {
@@ -10437,17 +10390,6 @@ pub fn countDisplayWidth(s: []const u8) u32 {
     return count;
 }
 
-/// Check if a cluster contains VS16 (U+FE0F, emoji presentation selector).
-/// When VS16 is present, even text-default codepoints (e.g., ☀ U+2600)
-/// should be rendered as color emoji.
-fn clusterHasVS16(core: *Core, this_cluster: u32, next_cluster: u32) bool {
-    if (next_cluster <= this_cluster + 1) return false;
-    var ci: u32 = this_cluster;
-    while (ci < next_cluster) : (ci += 1) {
-        if (core.shaping_scalars.items[@intCast(ci)] == 0xFE0F) return true;
-    }
-    return false;
-}
 /// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
 /// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
 /// renderers display as color emoji without an explicit VS16 selector.
