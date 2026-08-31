@@ -2024,13 +2024,12 @@ pub const Core = struct {
         // Initialize valid flags to false
         @memset(self.glyph_valid_ascii.?, false);
         // Initialize keys to invalid sentinel
-        const INVALID_KEY = GLYPH_CACHE_INVALID_KEY;
-        @memset(self.glyph_keys_non_ascii.?, INVALID_KEY);
+        @memset(self.glyph_keys_non_ascii.?, GLYPH_CACHE_INVALID_KEY);
 
         // Phase B: glyph-ID cache (same size as non-ASCII cache)
         self.glyph_cache_by_id = try self.alloc.alloc(c_api.GlyphEntry, non_ascii_size);
         self.glyph_keys_by_id = try self.alloc.alloc(u64, non_ascii_size);
-        @memset(self.glyph_keys_by_id.?, INVALID_KEY);
+        @memset(self.glyph_keys_by_id.?, GLYPH_CACHE_INVALID_KEY);
 
         // Phase B: shaping result cache (4-way set associative)
         // Sets count derived from shape_cache_size / 2 (not / WAYS) to maintain
@@ -2052,13 +2051,11 @@ pub const Core = struct {
             @memset(buf, false);
         }
         if (self.glyph_keys_non_ascii) |buf| {
-            const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
-            @memset(buf, INVALID_KEY);
+            @memset(buf, GLYPH_CACHE_INVALID_KEY);
         }
         // Phase B: glyph-ID cache
         if (self.glyph_keys_by_id) |buf| {
-            const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
-            @memset(buf, INVALID_KEY);
+            @memset(buf, GLYPH_CACHE_INVALID_KEY);
         }
     }
 
