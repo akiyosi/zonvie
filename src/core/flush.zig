@@ -9663,14 +9663,7 @@ pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: con
     }
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(view);
 
     // Convert timeout from seconds to milliseconds.
     const timeout_ms = messageTimeoutMs(timeout_sec);
@@ -9751,14 +9744,7 @@ pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHisto
     }};
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(view);
 
     // Use special kind "_msg_history" to distinguish from regular msg_show
     const history_kind = "_msg_history";
@@ -9832,14 +9818,7 @@ pub fn sendPendingMsgShowCallback(self: *Core, pm: *const grid_mod.PendingMessag
     const route_result = self.msg_config.routeMessage(.msg_show, kind, 1);
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(route_result.view);
 
     cb(
         self.ctx,
@@ -9923,14 +9902,7 @@ pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
     }
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(route_result.view);
 
     cb(self.ctx, c_view, &c_chunks, chunk_count);
 }
@@ -14668,6 +14640,116 @@ test "each status channel reaches its own route and its own callback" {
     notifyMessageChanges(&core);
     try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
     try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+}
+
+test "the internal and ABI message view enums agree name for name and value for value" {
+    // The conversions between these two enums are written as identity
+    // switches, which is only correct because the two agree by NAME and by
+    // VALUE. Both pin 0..5 explicitly and include/zonvie_core.h pins the same
+    // six, so renumbering either side would silently put a different integer
+    // on the wire while every identity switch still compiled.
+    inline for (@typeInfo(config.MsgViewType).@"enum".fields) |field| {
+        const abi = @field(c_api.zonvie_msg_view_type, field.name);
+        try std.testing.expectEqual(@as(c_int, field.value), @intFromEnum(abi));
+    }
+
+    // Comparing the two enums only against each other would pass if both were
+    // renumbered together, or if a variant were added to both -- and either
+    // change silently breaks include/zonvie_core.h, the third copy of this
+    // numbering, which no test reads. Pin the wire values as literals so that
+    // adding or renumbering a view has to come here and say so.
+    const wire = [_]struct { name: []const u8, value: c_int }{
+        .{ .name = "mini", .value = 0 },
+        .{ .name = "ext_float", .value = 1 },
+        .{ .name = "confirm", .value = 2 },
+        .{ .name = "split", .value = 3 },
+        .{ .name = "none", .value = 4 },
+        .{ .name = "notification", .value = 5 },
+    };
+    inline for (wire) |w| {
+        try std.testing.expectEqual(w.value, @intFromEnum(@field(c_api.zonvie_msg_view_type, w.name)));
+        try std.testing.expectEqual(
+            @as(u8, @intCast(w.value)),
+            @intFromEnum(@field(config.MsgViewType, w.name)),
+        );
+    }
+    try std.testing.expectEqual(wire.len, @typeInfo(config.MsgViewType).@"enum".fields.len);
+    try std.testing.expectEqual(wire.len, @typeInfo(c_api.zonvie_msg_view_type).@"enum".fields.len);
+}
+
+test "every routed view reaches the msg_show callback as the matching ABI view" {
+    // Drives the msg_show conversion once per view type. A swapped or dropped
+    // arm shows up as the wrong ABI view arriving at the callback, which a
+    // single-view test could not see.
+    const State = struct {
+        calls: u32 = 0,
+        view: c_api.zonvie_msg_view_type = .none,
+
+        fn onMsgShow(
+            ctx: ?*anyopaque,
+            view: c_api.zonvie_msg_view_type,
+            kind: [*]const u8,
+            kind_len: usize,
+            chunks: [*]const c_api.MsgChunk,
+            chunk_count: usize,
+            replace_last: c_int,
+            history: c_int,
+            append: c_int,
+            msg_id: i64,
+            timeout_ms: u32,
+        ) callconv(.c) void {
+            _ = kind;
+            _ = kind_len;
+            _ = chunks;
+            _ = chunk_count;
+            _ = replace_last;
+            _ = history;
+            _ = append;
+            _ = msg_id;
+            _ = timeout_ms;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.view = view;
+        }
+    };
+
+    // Only the frontend-rendered views reach this callback (showChannelView
+    // routes .ext_float to the core's own external grid and .split back over
+    // RPC, and suppresses .none). The other three are checked by their
+    // absence, which also pins that this conversion is not on their path.
+    const cases = [_]struct { view: config.MsgViewType, expect_call: bool }{
+        .{ .view = .mini, .expect_call = true },
+        .{ .view = .confirm, .expect_call = true },
+        .{ .view = .notification, .expect_call = true },
+        .{ .view = .ext_float, .expect_call = false },
+        .{ .view = .split, .expect_call = false },
+        .{ .view = .none, .expect_call = false },
+    };
+
+    for (cases) |case| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        core.ext_messages_enabled = true;
+
+        var routes = [_]config.MsgRoute{
+            .{ .filter = .{ .event = .msg_show }, .view = case.view, .opts = .{ .timeout = 0 } },
+        };
+        core.msg_config.messages.routes = &routes;
+
+        var state = State{};
+        core.ctx = &state;
+        core.cb.on_msg_show = State.onMsgShow;
+
+        try appendTestMessage(&core, 1, "echo", "hello");
+        _ = sendMsgShow(&core);
+
+        if (case.expect_call) {
+            try std.testing.expectEqual(@as(u32, 1), state.calls);
+            try std.testing.expectEqualStrings(@tagName(case.view), @tagName(state.view));
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), state.calls);
+        }
+    }
 }
 
 test "row-mode and whole-screen composition produce the same main-grid vertices" {

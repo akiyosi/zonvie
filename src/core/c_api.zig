@@ -1871,6 +1871,29 @@ pub export fn zonvie_core_get_layout(
 // Message routing API
 // ========================================================================
 
+/// Convert an internal view type to the one the frontends receive.
+///
+/// The arms are written out rather than expressed as
+/// `@enumFromInt(@intFromEnum(view))`, and that is the whole point of this
+/// function. The exhaustive switch with no `else` is a compile-time guard:
+/// adding a variant to `config.MsgViewType` breaks the build here and forces
+/// a decision about what it means on the wire. A numeric cast would compile
+/// unchanged and ship an out-of-range `c_int` -- which neither frontend
+/// rejects, since macOS falls through to ext_float and Windows to mini.
+///
+/// Do not replace the arm list. The identity is only correct because both
+/// enums, and include/zonvie_core.h, pin the same six values.
+pub fn msgViewTypeToC(view: config.MsgViewType) zonvie_msg_view_type {
+    return switch (view) {
+        .mini => .mini,
+        .ext_float => .ext_float,
+        .confirm => .confirm,
+        .split => .split,
+        .none => .none,
+        .notification => .notification,
+    };
+}
+
 /// Message view type (C ABI compatible - must match C enum size)
 pub const zonvie_msg_view_type = enum(c_int) {
     mini = 0,
@@ -1966,14 +1989,7 @@ pub export fn zonvie_core_route_message(
     const route_result = box.msg_config.routeMessage(cfg_event, kind_str, line_count);
 
     // Convert config view type to C view type
-    const c_view: zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = msgViewTypeToC(route_result.view);
 
     return zonvie_route_result{
         .view = c_view,
@@ -2812,6 +2828,41 @@ pub export fn zonvie_shader_result_destroy(result: ?*zonvie_shader_result) callc
     r.data = null;
     r.data_len = 0;
     r.error_msg = null;
+}
+
+test "the exported route API reports every view as its matching ABI view" {
+    // This is the only conversion site reachable with every view: the two
+    // msg_show sites are called from one arm that only ever holds mini,
+    // confirm and notification, and the status site early-returns on none.
+    // Without this, the split and none arms are dead in every test and a
+    // shared helper could get them wrong unnoticed.
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+
+    // "confirm" and the interactive-prompt kinds are pinned to their own views
+    // upstream of the user routes, so the kinds here are deliberately inert.
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .kinds = &.{"k_mini"} }, .view = .mini },
+        .{ .filter = .{ .kinds = &.{"k_float"} }, .view = .ext_float },
+        .{ .filter = .{ .kinds = &.{"k_conf"} }, .view = .confirm },
+        .{ .filter = .{ .kinds = &.{"k_split"} }, .view = .split },
+        .{ .filter = .{ .kinds = &.{"k_none"} }, .view = .none },
+        .{ .filter = .{ .kinds = &.{"k_notify"} }, .view = .notification },
+    };
+    asBox(p).msg_config.messages.routes = &routes;
+
+    const cases = [_]struct { kind: [*:0]const u8, expect: zonvie_msg_view_type }{
+        .{ .kind = "k_mini", .expect = .mini },
+        .{ .kind = "k_float", .expect = .ext_float },
+        .{ .kind = "k_conf", .expect = .confirm },
+        .{ .kind = "k_split", .expect = .split },
+        .{ .kind = "k_none", .expect = .none },
+        .{ .kind = "k_notify", .expect = .notification },
+    };
+    for (cases) |case| {
+        const result = zonvie_core_route_message(p, .msg_show, case.kind, 1);
+        try std.testing.expectEqualStrings(@tagName(case.expect), @tagName(result.view));
+    }
 }
 
 test "the null-handle config values match what a default config would build" {
