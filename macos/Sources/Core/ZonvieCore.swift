@@ -850,17 +850,17 @@ final class ZonvieCore {
             on_msg_showmode: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgShowmode(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.showmode, label: "showmode", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_showcmd: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgShowcmd(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.showcmd, label: "showcmd", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_ruler: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgRuler(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.ruler, label: "ruler", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_history_show: { ctx, entries, entryCount, prevCmd in
                 guard let ctx else { return }
@@ -7386,23 +7386,21 @@ final class ZonvieCore {
         }
     }
 
-    private func onMsgShowmode(
+    /// showmode, showcmd and ruler are one status message under three
+    /// labels: the same chunk concatenation, the same ZONVIE_MSG_VIEW_NONE
+    /// early return and the same four-way view dispatch. All three are
+    /// state-driven, so the ext_float arm hides on empty content rather than
+    /// arming a timeout the way msg_show does.
+    private func onMsgStatus(
+        _ miniId: MiniWindowId,
+        label: String,
         view: zonvie_msg_view_type,
         chunks: UnsafePointer<zonvie_msg_chunk>?,
         chunkCount: Int
     ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
-            }
-        }
+        let contentStr = ZonvieCore.concatMsgChunks(chunks, chunkCount)
 
-        ZonvieCore.appLog("[msg_showmode] content='\(contentStr)' view=\(view.rawValue)")
+        ZonvieCore.appLog("[msg_\(label)] content='\(contentStr)' view=\(view.rawValue)")
 
         // Check if view is none
         if view == ZONVIE_MSG_VIEW_NONE {
@@ -7413,115 +7411,36 @@ final class ZonvieCore {
             guard let self = self else { return }
             switch view {
             case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.showmode, content: contentStr)
+                self.updateMini(miniId, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showmode: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content on mode exit)
+                // ext_float: state-driven (no timeout needed, cleared when
+                // Neovim sends empty content)
                 if contentStr.isEmpty {
                     self.hideMessageWindow()
                 } else {
-                    self.showMessageWindow(kind: "showmode", content: contentStr)
+                    self.showMessageWindow(kind: label, content: contentStr)
                 }
             case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for showmode
                 self.showOSNotification(title: "Neovim", body: contentStr)
             default:
                 // Fallback to mini for other views
-                self.updateMini(.showmode, content: contentStr)
+                self.updateMini(miniId, content: contentStr)
             }
         }
     }
 
-    private func onMsgShowcmd(
-        view: zonvie_msg_view_type,
-        chunks: UnsafePointer<zonvie_msg_chunk>?,
-        chunkCount: Int
-    ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
+    /// Concatenate a msg chunk array into one string. Chunks with a null
+    /// pointer or zero length contribute nothing.
+    private static func concatMsgChunks(_ chunks: UnsafePointer<zonvie_msg_chunk>?, _ chunkCount: Int) -> String {
+        guard let chunks = chunks, chunkCount > 0 else { return "" }
+        var out = ""
+        for i in 0..<chunkCount {
+            let chunk = chunks[i]
+            if let textPtr = chunk.text, chunk.text_len > 0 {
+                out += String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
             }
         }
-
-        ZonvieCore.appLog("[msg_showcmd] content='\(contentStr)' view=\(view.rawValue)")
-
-        // Check if view is none
-        if view == ZONVIE_MSG_VIEW_NONE {
-            return
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            switch view {
-            case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.showcmd, content: contentStr)
-            case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showcmd: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content)
-                if contentStr.isEmpty {
-                    self.hideMessageWindow()
-                } else {
-                    self.showMessageWindow(kind: "showcmd", content: contentStr)
-                }
-            case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for showcmd
-                self.showOSNotification(title: "Neovim", body: contentStr)
-            default:
-                // Fallback to mini for other views
-                self.updateMini(.showcmd, content: contentStr)
-            }
-        }
-    }
-
-    private func onMsgRuler(
-        view: zonvie_msg_view_type,
-        chunks: UnsafePointer<zonvie_msg_chunk>?,
-        chunkCount: Int
-    ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
-            }
-        }
-
-        ZonvieCore.appLog("[msg_ruler] content='\(contentStr)' view=\(view.rawValue)")
-
-        // Check if view is none
-        if view == ZONVIE_MSG_VIEW_NONE {
-            return
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            switch view {
-            case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.ruler, content: contentStr)
-            case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for ruler: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content)
-                if contentStr.isEmpty {
-                    self.hideMessageWindow()
-                } else {
-                    self.showMessageWindow(kind: "ruler", content: contentStr)
-                }
-            case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for ruler
-                self.showOSNotification(title: "Neovim", body: contentStr)
-            default:
-                // Fallback to mini for other views
-                self.updateMini(.ruler, content: contentStr)
-            }
-        }
+        return out
     }
 
     private func onMsgHistoryShow(
