@@ -455,6 +455,61 @@ pub const StderrPump = struct {
 };
 
 /// Check if data contains a password prompt (case-insensitive)
+/// Split a spawn command into argv slices borrowed from `cmd`, stopping when
+/// `out` is full. Returns how many slots were filled.
+///
+/// This was written out twice in runLoop, once per spawn branch. The two
+/// copies were byte-identical in the scanner and differed only in what each
+/// did with the result, so only the scanner moved here.
+///
+/// The rules are the ones those copies already implemented, quirks included,
+/// because a spawn command that worked before must keep working:
+///   - only ' ' separates; a tab or newline is part of the token
+///   - runs of separators collapse, leading and trailing ones are harmless
+///   - a quote groups until its unescaped partner; \" and \' are skipped but
+///     NOT unescaped, so the backslash reaches the child
+///   - an unterminated quote consumes to the end and is emitted, no error
+///   - an empty quoted token is dropped, so "" cannot pass an empty argument
+///   - there is no concatenation: a"b c" yields a"b and c"
+fn tokenizeCommand(cmd: []const u8, out: [][]const u8) usize {
+    var argc: usize = 0;
+    var i: usize = 0;
+    while (i < cmd.len and argc < out.len) {
+        while (i < cmd.len and cmd[i] == ' ') : (i += 1) {}
+        if (i >= cmd.len) break;
+
+        var arg_start = i;
+        var arg_end = i;
+
+        if (cmd[i] == '\'' or cmd[i] == '"') {
+            const quote_char = cmd[i];
+            i += 1;
+            arg_start = i;
+            while (i < cmd.len) {
+                if (cmd[i] == '\\' and i + 1 < cmd.len and cmd[i + 1] == quote_char) {
+                    // Skip escaped quote (e.g., \" inside "..." or \' inside '...')
+                    i += 2;
+                } else if (cmd[i] == quote_char) {
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            arg_end = i;
+            if (i < cmd.len) i += 1; // Skip closing quote
+        } else {
+            while (i < cmd.len and cmd[i] != ' ') : (i += 1) {}
+            arg_end = i;
+        }
+
+        if (arg_end > arg_start) {
+            out[argc] = cmd[arg_start..arg_end];
+            argc += 1;
+        }
+    }
+    return argc;
+}
+
 pub fn containsPasswordPrompt(data: []const u8) bool {
     // Convert to lowercase for comparison
     var i: usize = 0;
@@ -1975,48 +2030,18 @@ pub fn runLoop(self: *Core) void {
 
     if (is_wsl or is_ssh or is_ssh_askpass or is_cmd or is_devcontainer or is_shell) {
         // Parse command string into arguments (split by spaces, handle quotes and escapes)
-        var i: usize = 0;
-        while (i < nvim_path.len and argc < argv_buf.len) {
-            // Skip leading spaces
-            while (i < nvim_path.len and nvim_path[i] == ' ') : (i += 1) {}
-            if (i >= nvim_path.len) break;
-
-            var arg_start = i;
-            var arg_end = i;
-
-            if (nvim_path[i] == '\'' or nvim_path[i] == '"') {
-                // Quoted argument - find closing quote (handle escaped quotes)
-                const quote_char = nvim_path[i];
-                i += 1;
-                arg_start = i;
-                while (i < nvim_path.len) {
-                    if (nvim_path[i] == '\\' and i + 1 < nvim_path.len and nvim_path[i + 1] == quote_char) {
-                        // Skip escaped quote (e.g., \" inside "..." or \' inside '...')
-                        i += 2;
-                    } else if (nvim_path[i] == quote_char) {
-                        // Found unescaped closing quote
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                arg_end = i;
-                if (i < nvim_path.len) i += 1; // Skip closing quote
-            } else {
-                // Unquoted argument - find next space
-                while (i < nvim_path.len and nvim_path[i] != ' ') : (i += 1) {}
-                arg_end = i;
-            }
-
-            if (arg_end > arg_start) {
-                const part = nvim_path[arg_start..arg_end];
-                // Skip "ssh-askpass" prefix - actual ssh command is next argument
-                if (argc == 0 and is_ssh_askpass and std.mem.eql(u8, part, "ssh-askpass")) {
-                    // Don't add to argv, just continue to next argument
-                    continue;
-                }
-                argv_buf[argc] = part;
-                argc += 1;
+        argc = tokenizeCommand(nvim_path, &argv_buf);
+        if (is_ssh_askpass) {
+            // The wrapper name is not part of the command; the real ssh
+            // invocation follows it. The old inline form skipped it with a
+            // guard on argc == 0, which re-fired until something else was
+            // emitted -- so it dropped the whole leading run, not just one.
+            var drop: usize = 0;
+            while (drop < argc and std.mem.eql(u8, argv_buf[drop], "ssh-askpass")) : (drop += 1) {}
+            if (drop > 0) {
+                var k: usize = 0;
+                while (k + drop < argc) : (k += 1) argv_buf[k] = argv_buf[k + drop];
+                argc -= drop;
             }
         }
         if (is_wsl) {
@@ -2038,51 +2063,18 @@ pub fn runLoop(self: *Core) void {
         // Native: parse command string and insert --embed after first argument
         // e.g., "nvim file.txt" → ["nvim", "--embed", "file.txt"]
         // e.g., "nvim -u /tmp/init.lua +10 file.txt" → ["nvim", "--embed", "-u", "/tmp/init.lua", "+10", "file.txt"]
-        var i: usize = 0;
-        while (i < nvim_path.len and argc < argv_buf.len - 1) { // -1 to leave room for --embed
-            // Skip leading spaces
-            while (i < nvim_path.len and nvim_path[i] == ' ') : (i += 1) {}
-            if (i >= nvim_path.len) break;
-
-            var arg_start = i;
-            var arg_end = i;
-
-            if (nvim_path[i] == '\'' or nvim_path[i] == '"') {
-                // Quoted argument - find closing quote (handle escaped quotes)
-                const quote_char = nvim_path[i];
-                i += 1;
-                arg_start = i;
-                while (i < nvim_path.len) {
-                    if (nvim_path[i] == '\\' and i + 1 < nvim_path.len and nvim_path[i + 1] == quote_char) {
-                        // Skip escaped quote
-                        i += 2;
-                    } else if (nvim_path[i] == quote_char) {
-                        // Found unescaped closing quote
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                arg_end = i;
-                if (i < nvim_path.len) i += 1; // Skip closing quote
-            } else {
-                // Unquoted argument - find next space
-                while (i < nvim_path.len and nvim_path[i] != ' ') : (i += 1) {}
-                arg_end = i;
-            }
-
-            if (arg_end > arg_start) {
-                argv_buf[argc] = nvim_path[arg_start..arg_end];
-                argc += 1;
-
-                // Insert --embed after first argument (nvim executable)
-                if (argc == 1) {
-                    argv_buf[argc] = "--embed";
-                    argc += 1;
-                }
-            }
+        // Reserve the last slot for --embed, which is inserted after the
+        // executable below. Passing the shortened slice is what caps the user
+        // tokens at 14; today's argc counts the injected --embed, so the
+        // budget is one less than it looks.
+        argc = tokenizeCommand(nvim_path, argv_buf[0 .. argv_buf.len - 2]);
+        if (argc > 0) {
+            // Open a hole at index 1 for --embed.
+            var k: usize = argc;
+            while (k > 1) : (k -= 1) argv_buf[k] = argv_buf[k - 1];
+            argv_buf[1] = "--embed";
+            argc += 1;
         }
-
         // If no arguments parsed, fall back to simple path + --embed
         if (argc == 0) {
             argv_buf[0] = nvim_path;
@@ -3363,6 +3355,52 @@ const ClipboardSetProbe = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+test "the spawn command tokenizer keeps the quirks both copies had" {
+    // These are not desirable rules, they are the rules the two inline copies
+    // already implemented. A spawn command that worked before the extraction
+    // has to keep working, so each quirk is pinned deliberately rather than
+    // tidied up.
+    var buf: [16][]const u8 = undefined;
+
+    const expectTokens = struct {
+        fn f(out: [][]const u8, cmd: []const u8, want: []const []const u8) !void {
+            const n = tokenizeCommand(cmd, out);
+            try std.testing.expectEqual(want.len, n);
+            for (want, out[0..n]) |w, got| try std.testing.expectEqualStrings(w, got);
+        }
+    }.f;
+
+    // The ordinary case, and separator runs collapsing.
+    try expectTokens(&buf, "nvim file.txt", &.{ "nvim", "file.txt" });
+    try expectTokens(&buf, "  nvim   -u  init.lua  ", &.{ "nvim", "-u", "init.lua" });
+    try expectTokens(&buf, "", &.{});
+    try expectTokens(&buf, "   ", &.{});
+
+    // Only ' ' separates. A tab stays inside the token.
+    try expectTokens(&buf, "nvim\tfoo", &.{"nvim\tfoo"});
+
+    // Quotes group, and both kinds work.
+    try expectTokens(&buf, "ssh host \"nvim --embed\"", &.{ "ssh", "host", "nvim --embed" });
+    try expectTokens(&buf, "sh -c 'nvim -u x'", &.{ "sh", "-c", "nvim -u x" });
+
+    // An escaped quote is skipped but NOT unescaped: the backslash survives
+    // into the argument handed to the child.
+    try expectTokens(&buf, "nvim \"a\\\"b\" c", &.{ "nvim", "a\\\"b", "c" });
+
+    // An empty quoted token is dropped, so "" cannot pass an empty argument.
+    try expectTokens(&buf, "nvim \"\" x", &.{ "nvim", "x" });
+
+    // An unterminated quote consumes to the end and is emitted without error.
+    try expectTokens(&buf, "nvim \"unclosed", &.{ "nvim", "unclosed" });
+
+    // No concatenation: the quote starts a new token wherever it appears.
+    try expectTokens(&buf, "nvim a\"b c\"", &.{ "nvim", "a\"b", "c\"" });
+
+    // The output slice is the cap, and it truncates silently.
+    var small: [2][]const u8 = undefined;
+    try expectTokens(&small, "a b c d", &.{ "a", "b" });
+}
 
 test "every RPC response carries the same four-element type-1 header" {
     // Four senders each wrote the msgpack-RPC response frame by hand. The
