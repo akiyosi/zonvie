@@ -658,12 +658,10 @@ pub fn onVerticesPartial(
             };
         }
 
-        // Non-row-mode: main update implies screen update.
-        // Row-mode: main_verts is not used for drawing; do not force full paint here.
-        // InvalidateRect deferred to onFlushEnd for coalescing.
-        if (!row_mode) {
-            app.paint_rects.clearRetainingCapacity();
-        }
+        // A MAIN partial update turns row mode off above, so this path is
+        // always the non-row-mode one and a main update implies a screen
+        // update. InvalidateRect stays deferred to onFlushEnd for coalescing.
+        app.paint_rects.clearRetainingCapacity();
         app.flush_needs_invalidate = true;
     }
 
@@ -1027,31 +1025,24 @@ pub fn onVerticesRow(
                     return;
                 }
 
-                if (ext_win.surface.row_mode) {
-                    // Row-mode: store cursor verts separately (same pattern as main window).
-                    // Mark old cursor row dirty so it gets redrawn to erase the cursor overlay.
-                    ext_win.surface.cursor_verts.clearRetainingCapacity();
-                    if (cursor_slice.len != 0) {
-                        ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
-                        ext_win.surface.last_cursor_row = row_start;
-                    } else {
-                        ext_win.surface.last_cursor_row = null;
-                    }
+                // Store the cursor in the dedicated cursor_verts buffer
+                // (replace, not append). Appending into surface.verts
+                // accumulated stale cursor geometry across mode/shape changes
+                // — the old block stayed drawn under the new insert-bar shape.
+                // Keep the legacy surface mirror in sync for lifecycle and
+                // pending-capture bookkeeping; paint reads the committed
+                // independent TBS cursor snapshot.
+                //
+                // Row mode used to differ here, marking the old cursor row
+                // dirty. That moved into the TBS cursor transaction — the
+                // storeMainCursor call above records both the old and the new
+                // row — so the two modes now do the same thing.
+                ext_win.surface.cursor_verts.clearRetainingCapacity();
+                if (cursor_slice.len != 0) {
+                    ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
+                    ext_win.surface.last_cursor_row = row_start;
                 } else {
-                    // Flat-mode: store the cursor in the dedicated cursor_verts
-                    // buffer (replace, not append). Appending into surface.verts
-                    // accumulated stale cursor geometry across mode/shape changes
-                    // — the old block stayed drawn under the new insert-bar shape.
-                    // Keep the legacy surface mirror in sync for lifecycle and
-                    // pending-capture bookkeeping; paint reads the committed
-                    // independent TBS cursor snapshot.
-                    ext_win.surface.cursor_verts.clearRetainingCapacity();
-                    if (cursor_slice.len != 0) {
-                        ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
-                        ext_win.surface.last_cursor_row = row_start;
-                    } else {
-                        ext_win.surface.last_cursor_row = null;
-                    }
+                    ext_win.surface.last_cursor_row = null;
                 }
                 ext_win.needs_redraw = true;
                 // InvalidateRect deferred to onFlushEnd.
@@ -1481,8 +1472,6 @@ pub fn onVerticesRow(
             app.row_valid.resize(app.alloc, @intCast(app.surface.rows), false) catch {};
             app.row_valid.unsetAll();
         }
-    } else {
-        app.surface.row_mode = true;
     }
 
     if (layout_only) {
@@ -1507,11 +1496,6 @@ pub fn onVerticesRow(
     if (row_count == 1) {
         // Single-row path (normal case): store vertices for this row.
         const row: u32 = row_start;
-
-        // Extra safety: if rows is known, do not store beyond it.
-        if (max_rows != 0 and row >= max_rows) {
-            return;
-        }
 
         if (!storeSurfaceRowVerts(app.alloc, &app.surface.row_verts, row, verts_ptr, vert_count)) {
             // Row storage OOM: without an abort the core clears this row's
