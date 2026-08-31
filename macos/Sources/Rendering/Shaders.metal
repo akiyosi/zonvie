@@ -229,6 +229,35 @@ static inline bool insideFixedFloatAbove(float pixel_x, float pixel_y, float scr
     return false;
 }
 
+// Discard a scrolled-content fragment that has moved out of its grid's content
+// band, or under a fixed float stacked above it. ps_main, ps_background,
+// ps_glyph and ps_unified_blur each carried a verbatim copy of this block.
+// discard_fragment() does not return from the fragment function in MSL, so
+// hoisting the block into a helper leaves the callers' control flow unchanged.
+static inline void clipScrolledContent(VSOut in, constant DrawableSize& drawableSize,
+                                       constant FixedFloatBand* fixedFloatBands,
+                                       uint fixedFloatBandCount,
+                                       constant FixedFloatInterval* fixedFloatIntervals) {
+    if (in.was_content <= 0.5) {
+        return;
+    }
+    // Convert fragment position from screen coords to NDC: screen.y is in
+    // pixels from top, NDC.y goes from +1 (top) to -1 (bottom).
+    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
+    if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
+        discard_fragment();
+    }
+    // Scrolled content must not bleed over a fixed float stacked above it. The
+    // guard compares the scrolled grid's zindex (scroll_z, 0 for windows)
+    // against the mask segment's z, so a float scrolling above a lower fixed
+    // float (e.g. its own backdrop) keeps drawing.
+    if (fixedFloatBandCount > 0u) {
+        if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
+            discard_fragment();
+        }
+    }
+}
+
 fragment float4 ps_main(VSOut in [[stage_in]],
                         texture2d<float> tex [[texture(0)]],
                         sampler samp [[sampler(0)]],
@@ -245,25 +274,7 @@ fragment float4 ps_main(VSOut in [[stage_in]],
     }
 
     // Clip scrolled content that ends up in margin area
-    // Convert fragment position from screen coords to NDC
-    // screen.y is in pixels from top, NDC.y goes from +1 (top) to -1 (bottom)
-    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
-
-    // If this fragment came from content area and is now in margin area, discard
-    if (in.was_content > 0.5) {
-        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
-            discard_fragment();
-        }
-        // Scrolled content must not bleed over a fixed float stacked above
-        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
-        // windows) against the mask segment's z, so a float scrolling above
-        // a lower fixed float (e.g. its own backdrop) keeps drawing.
-        if (fixedFloatBandCount > 0u) {
-            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
-                discard_fragment();
-            }
-        }
-    }
+    clipScrolledContent(in, drawableSize, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals);
 
     // Background quad marker: uv.x < 0 means "solid color" or decoration
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
@@ -386,21 +397,7 @@ fragment float4 ps_background(VSOut in [[stage_in]],
                                constant FixedFloatInterval* fixedFloatIntervals [[buffer(5)]]) {
 
     // Clip scrolled content in margin area (same as ps_main)
-    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
-    if (in.was_content > 0.5) {
-        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
-            discard_fragment();
-        }
-        // Scrolled content must not bleed over a fixed float stacked above
-        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
-        // windows) against the mask segment's z, so a float scrolling above
-        // a lower fixed float (e.g. its own backdrop) keeps drawing.
-        if (fixedFloatBandCount > 0u) {
-            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
-                discard_fragment();
-            }
-        }
-    }
+    clipScrolledContent(in, drawableSize, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals);
 
     // Discard glow quads (rendered in glyph pass, not background pass)
     if (in.deco_flags & DECO_GLOW) {
@@ -447,21 +444,7 @@ fragment float4 ps_glyph(VSOut in [[stage_in]],
     }
 
     // Clip scrolled content in margin area (same as ps_main)
-    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
-    if (in.was_content > 0.5) {
-        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
-            discard_fragment();
-        }
-        // Scrolled content must not bleed over a fixed float stacked above
-        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
-        // windows) against the mask segment's z, so a float scrolling above
-        // a lower fixed float (e.g. its own backdrop) keeps drawing.
-        if (fixedFloatBandCount > 0u) {
-            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
-                discard_fragment();
-            }
-        }
-    }
+    clipScrolledContent(in, drawableSize, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals);
 
     // Handle decorations (underlines, undercurl, etc.)
     if (in.uv.x < 0.0 && (in.deco_flags & DECO_VISUAL_MASK) != 0) {
@@ -565,28 +548,19 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
     if ((in.deco_flags & DECO_CURSOR) && cursorBlinkVisible == 0) {
         discard_fragment();
     }
-    float ndc_y = 1.0 - (in.position.y / drawableSize.height) * 2.0;
-    if (in.was_content > 0.5) {
-        if (ndc_y > in.content_top_y || ndc_y < in.content_bottom_y) {
-            discard_fragment();
-        }
-        // Scrolled content must not bleed over a fixed float stacked above
-        // it. The guard compares the scrolled grid's zindex (scroll_z, 0 for
-        // windows) against the mask segment's z, so a float scrolling above
-        // a lower fixed float (e.g. its own backdrop) keeps drawing.
-        if (fixedFloatBandCount > 0u) {
-            if (insideFixedFloatAbove(in.position.x, in.position.y, in.scroll_z, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals)) {
-                discard_fragment();
-            }
-        }
-    }
+    clipScrolledContent(in, drawableSize, fixedFloatBands, fixedFloatBandCount, fixedFloatIntervals);
 
     // ── Branch by quad type ─────────────────────────────────────────────
     // - bg-only quad: uv.x < 0, no visual decoration, no glow flag
     // - decoration quad: uv.x < 0, visual decoration flag set
-    // - glyph quad: uv.x >= 0 (atlas sample) — also catches glow quads that
-    //   carry an atlas UV
-    // - solid-color glow quad: glow flag set, treated as alpha-blended layer
+    // - glyph quad: uv.x >= 0 (atlas sample) — this is where every glow quad
+    //   lands today, because the core only ever ORs DECO_GLOW into a glyph
+    //   deco (src/core/flush.zig:2565, 2755, 2930, 3021, 3181)
+    // The DECO_GLOW term below is therefore unreachable from the current core.
+    // It is kept as the guard for that invariant, which lives in another
+    // module: were a solid-colour glow quad ever emitted, without this term it
+    // would be painted as an opaque background instead of an alpha-blended
+    // layer.
     bool is_bg = (in.uv.x < 0.0)
                  && ((in.deco_flags & DECO_VISUAL_MASK) == 0)
                  && ((in.deco_flags & DECO_GLOW) == 0);
