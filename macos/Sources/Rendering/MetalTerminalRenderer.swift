@@ -5067,7 +5067,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         logEnabled: Bool
     ) -> (clearTopPx: Int, clearBottomPx: Int)? {
         let shift = abs(scroll.rowsDelta)
-        let regionHeightRows = scroll.rowEnd - scroll.rowStart
+        // Clamp rowEnd to the back buffer height, as the external-grid path
+        // already does. The row count the scroll callback reports can outlive
+        // the current drawable -- a window shrink is only protected on the
+        // first post-shrink frame, because ensureBackBuffer clears
+        // hasPresentedOnce -- and a guifont or linespace change grows the cell
+        // height before try_resize round-trips. Either way the blit would read
+        // past the texture.
+        let texMaxRows = rowHeightPx > 0 ? backTexture.height / rowHeightPx : 0
+        let clampedRowEnd = min(scroll.rowEnd, texMaxRows)
+        let regionHeightRows = clampedRowEnd - scroll.rowStart
         guard shift > 0, shift < regionHeightRows else { return nil }
         guard drawableWidthPx > 0, rowHeightPx > 0 else { return nil }
         ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
@@ -5085,9 +5094,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let srcY = (scroll.rowsDelta > 0 ? scroll.rowStart + shift : scroll.rowStart) * rowHeightPx
         let dstY = (scroll.rowsDelta > 0 ? scroll.rowStart : scroll.rowStart + shift) * rowHeightPx
 
+        // Second clamp: the region can start low enough that even a
+        // within-bounds row count runs off the end from srcY or dstY.
+        let maxCopyHeight = backTexture.height - max(srcY, dstY)
+        let safeCopyHeight = min(copyHeightPx, maxCopyHeight)
+        guard safeCopyHeight > 0 else {
+            blit.endEncoding()
+            return nil
+        }
+
         let t0 = logEnabled ? CFAbsoluteTimeGetCurrent() : 0
         let origin = MTLOrigin(x: 0, y: srcY, z: 0)
-        let size = MTLSize(width: drawableWidthPx, height: copyHeightPx, depth: 1)
+        let size = MTLSize(width: min(drawableWidthPx, backTexture.width), height: safeCopyHeight, depth: 1)
         blit.copy(from: backTexture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
                   to: scratch, destinationSlice: 0, destinationLevel: 0, destinationOrigin: origin)
         blit.copy(from: scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
@@ -5099,8 +5117,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLogPerf("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
         }
 
+        // The vacated band follows the CLAMPED end, not the reported one: if
+        // the blit was clamped, clearing to scroll.rowEnd would run past the
+        // texture the copy just stayed inside.
         if scroll.rowsDelta > 0 {
-            return ((scroll.rowEnd - shift) * rowHeightPx, scroll.rowEnd * rowHeightPx)
+            return ((clampedRowEnd - shift) * rowHeightPx, clampedRowEnd * rowHeightPx)
         } else {
             return (scroll.rowStart * rowHeightPx, (scroll.rowStart + shift) * rowHeightPx)
         }
