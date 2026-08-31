@@ -7282,19 +7282,23 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                             self.hl.default_bg;
                                         const text_col = Helpers.rgb(cursor_fg);
 
-                                        const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
-                                        const gtl = cg_pts[0];
-                                        const gtr = cg_pts[1];
-                                        const gbl = cg_pts[2];
-                                        const gbr = cg_pts[3];
-
                                         const cursor_glyph_flags = externalCursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        VH.pushGlyphQuadAssumeCapacity(
+                                            ext_verts,
+                                            gx0,
+                                            gy0,
+                                            gx1,
+                                            gy1,
+                                            .{ uv_x0, uv_y0 },
+                                            .{ uv_x1, uv_y0 },
+                                            .{ uv_x0, uv_y1 },
+                                            .{ uv_x1, uv_y1 },
+                                            text_col,
+                                            grid_w,
+                                            grid_h,
+                                            grid_id,
+                                            cursor_glyph_flags,
+                                        );
                                     }
                                 }
                             }
@@ -15469,6 +15473,76 @@ test "the external-grid cursor background uses the same corner order" {
         try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
         try std.testing.expectEqual(state.cursor[0].color, v.color);
     }
+}
+
+test "the external-grid cursor glyph uses the same corner order as every other quad" {
+    // The cursor background at this site was routed through pushSolidQuad in
+    // 86b453a, but the glyph quad directly below it stayed hand-expanded and
+    // kept the old winding: TL, TR, BL, TR, BR, BL against everything else's
+    // TL, BL, TR, TR, BL, BR. Both backends disable culling -- Windows sets
+    // D3D11_CULL_NONE explicitly (d3d11_renderer.zig) and Metal defaults to
+    // none -- so nothing rendered differently, which is why it survived. The
+    // defect is that one quad in the tree disagrees with the rest.
+    const State = struct {
+        verts: [12]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 12) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(&self.verts, v[0..12]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(2, 2, 2);
+    // The cell under the cursor must be in grid 2, not the main grid, or there
+    // is no glyph to draw and only the background quad is emitted.
+    core.grid.putCellGrid(2, 0, 0, 'B', 0);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    core.grid.setCursor(2, 0, 0);
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    // The glyph quad is only emitted once a glyph entry exists for the cell.
+    StubGlyphCallbacks.install(&core);
+
+    core.sendExternalGridVertices(true);
+
+    // Background quad first, then the glyph quad on top of it.
+    try std.testing.expect(state.count >= 12);
+    const background = state.verts[0..6];
+    const glyph = state.verts[6..12];
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(background));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(glyph));
+
+    // The two really are different quads, or the assertion above proved
+    // nothing about the glyph: the background carries the solid UV slot and
+    // the glyph does not.
+    try std.testing.expectEqual(VH.solid_uv, background[0].texCoord);
+    try std.testing.expect(!std.meta.eql(VH.solid_uv, glyph[0].texCoord));
 }
 
 test "VH's two solid-quad variants emit the same corner order" {
