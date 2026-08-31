@@ -5608,6 +5608,42 @@ final class ZonvieCore {
         }
     }
 
+    /// The floating-panel recipe shared by the ext-UI popupmenu/message
+    /// windows and the standalone short-message and prompt windows.
+    /// hidesOnDeactivate is the only setting the callers disagree on.
+    private static func applyFloatingPanelSettings(_ window: NSWindow, hidesOnDeactivate: Bool) {
+        window.hasShadow = true
+        window.level = .floating
+        window.isOpaque = false
+        window.backgroundColor = transparentShadowedWindowBackground
+        window.hidesOnDeactivate = hidesOnDeactivate
+        window.isReleasedWhenClosed = false
+    }
+
+    /// The rounded, optionally blur-tinted container the three standalone
+    /// panels put inside their borderless window.
+    private static func makeRoundedPanelContainer(
+        width: CGFloat,
+        height: CGFloat,
+        background: NSColor,
+        border: NSColor,
+        borderWidth: CGFloat
+    ) -> NSView {
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        containerView.wantsLayer = true
+        containerView.layer?.cornerRadius = 8.0
+        containerView.layer?.masksToBounds = true
+        if ZonvieConfig.shared.blurEnabled {
+            let opacity = ZonvieConfig.shared.backgroundAlpha
+            containerView.layer?.backgroundColor = background.withAlphaComponent(CGFloat(opacity)).cgColor
+        } else {
+            containerView.layer?.backgroundColor = background.cgColor
+        }
+        containerView.layer?.borderColor = border.cgColor
+        containerView.layer?.borderWidth = borderWidth
+        return containerView
+    }
+
     private func applyExternalWindowSettings(
         _ window: NSWindow,
         kind: ExternalGridKind,
@@ -5627,11 +5663,7 @@ final class ZonvieCore {
             window.level = NSApp.isActive ? .floating : .normal
 
         case .popupmenu, .msgShow, .msgHistory:
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.hidesOnDeactivate = true
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
         case .normal:
             window.title = "Window \(win)"
@@ -8230,28 +8262,11 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = bgColor.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = bgColor.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            // Thicker border for prompts
-            containerView.layer?.borderWidth = isPrompt ? 2.0 : 1.0
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: bgColor, border: borderColor, borderWidth: isPrompt ? 2.0 : 1.0)
 
             let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
             textField.stringValue = content
@@ -8337,27 +8352,11 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = bgColor.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = bgColor.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            containerView.layer?.borderWidth = 1.0
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: bgColor, border: borderColor, borderWidth: 1.0)
 
             // Create scroll view
             let scrollView = NSScrollView(frame: NSRect(x: padding, y: padding, width: windowWidth - padding * 2, height: windowHeight - padding * 2))
@@ -8534,27 +8533,12 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = true  // Hide when app loses focus (like ext-cmdline)
+            // Hide when app loses focus (like ext-cmdline)
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = adjustedBg.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            containerView.layer?.borderWidth = 2.0  // Thicker for prompts
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: adjustedBg, border: borderColor, borderWidth: 2.0)
 
             let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
             textField.stringValue = content
