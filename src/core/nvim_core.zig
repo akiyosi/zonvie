@@ -3722,8 +3722,8 @@ pub const Core = struct {
         if (s.len == 0) return null;
         var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
         // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
-        // UTF-8 (it uses utf8Decode(slice) catch unreachable) — see the same
-        // hazard documented in redraw_handler.zig's firstCodepoint().
+        // UTF-8: it decodes with `catch unreachable`, so an overlong or
+        // truncated sequence off the wire would abort the render thread.
         const slice = it.nextCodepointSlice() orelse return null;
         const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
         return @as(u32, cp);
@@ -5663,11 +5663,6 @@ pub const Core = struct {
     }
 
     // --- Utility forwarding stubs ---
-
-    /// Count UTF-8 codepoints in a string.
-    pub fn countUtf8Codepoints(s: []const u8) u32 {
-        return flush.countUtf8Codepoints(s);
-    }
 
     pub fn isWideChar(cp: u32) bool {
         return flush.isWideChar(cp);

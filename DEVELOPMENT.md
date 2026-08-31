@@ -150,13 +150,9 @@ Important files include:
 
 ### Text and glyph pipeline
 
-Text-related functionality is split between core and text helpers:
-
-- `src/text/shaping_harfbuzz.zig`
-- `src/text/rasterize_freetype.zig`
-- `src/text/gpu_atlas.zig`
-
-The glyph atlas uses a two-phase core-managed approach:
+Shaping and rasterization are driven from the core through the HarfBuzz/
+FreeType bridge (`include/zonvie_hbft.h`), with the frontends supplying the
+rasterizer. The glyph atlas uses a two-phase core-managed approach:
 - Core manages shelf packing and glyph cache (zero per-cell allocation)
 - Frontend handles rasterization (FreeType on macOS, DirectWrite on Windows) and texture upload
 - Atlas textures are double-buffered with COW detach for safe concurrent read/write
