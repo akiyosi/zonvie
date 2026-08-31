@@ -415,20 +415,12 @@ extension ZonvieConfig {
     /// Blur enabled (replaces BlurConfig.blurEnabled)
     var blurEnabled: Bool { window.blur }
 
-    /// Main window material - .hudWindow provides dark, highly transparent blur
-    var mainWindowMaterial: NSVisualEffectView.Material { .hudWindow }
 
-    /// Float window material - .hudWindow provides dark, highly transparent blur
-    var floatWindowMaterial: NSVisualEffectView.Material { .hudWindow }
 
-    /// Cmdline window material - .hudWindow provides dark, highly transparent blur
-    var cmdlineWindowMaterial: NSVisualEffectView.Material { .hudWindow }
 
     /// Background alpha - only applies opacity when blur is enabled
     var backgroundAlpha: Float { window.blur ? Float(window.opacity) : 1.0 }
 
-    /// Blending mode (fixed value)
-    var blendingMode: NSVisualEffectView.BlendingMode { .behindWindow }
 }
 
 // MARK: - Cmdline layout constants

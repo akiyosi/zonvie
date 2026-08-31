@@ -25,29 +25,8 @@ final class SurfaceRowBufferState {
     var dirtyRows: Set<Int> = []
     var usingRowBuffers: Bool = false
 
-    func resetCounts() {
-        for i in 0..<counts.count {
-            counts[i] = 0
-        }
-    }
 
-    func ensureRows(_ totalRows: Int) {
-        guard totalRows > 0 else { return }
-        while buffers.count < totalRows {
-            buffers.append(nil)
-            capacities.append(0)
-            counts.append(0)
-        }
-    }
 
-    func clearBeyond(_ totalRows: Int) {
-        guard totalRows >= 0 else { return }
-        if totalRows < counts.count {
-            for i in totalRows..<counts.count {
-                counts[i] = 0
-            }
-        }
-    }
 }
 
 final class SurfaceRedrawScheduler {
@@ -796,8 +775,6 @@ final class SurfaceBufferSet {
     var detachPoolRowCapacities: [Int] = []
     var detachPoolMainBuffer: MTLBuffer? = nil
     var detachPoolMainCap: Int = 0
-    var detachPoolCursorBuffer: MTLBuffer? = nil
-    var detachPoolCursorCap: Int = 0
 
     // Private per-row buffer pool, owned exclusively by this set.
     //

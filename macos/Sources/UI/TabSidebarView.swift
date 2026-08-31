@@ -91,7 +91,6 @@ final class TabSidebarView: NSView {
 
     // Blur configuration
     private var blurEnabled: Bool { ZonvieConfig.shared.blurEnabled }
-    private var bgAlpha: CGFloat { CGFloat(ZonvieConfig.shared.backgroundAlpha) }
 
     // MARK: - Colorscheme-derived colors
 

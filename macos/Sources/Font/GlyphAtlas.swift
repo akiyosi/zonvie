@@ -2416,12 +2416,5 @@ final class GlyphAtlas {
         return CommitResult(texture: tex, committed: blitOk)
     }
 
-    /// Returns the committed front texture under lock.
-    func snapshotFrontTexture() -> MTLTexture? {
-        os_unfair_lock_lock(&mu)
-        let tex = textures[frontIndex]
-        os_unfair_lock_unlock(&mu)
-        return tex
-    }
 
 }
