@@ -3364,6 +3364,87 @@ const ClipboardSetProbe = struct {
     }
 };
 
+test "every RPC response carries the same four-element type-1 header" {
+    // Four senders each wrote the msgpack-RPC response frame by hand. The
+    // header -- array of 4, type 1, msgid -- is what they share; the error and
+    // result slots are what they do not. Pin the shared half at every sender,
+    // and the differing half too, so a shared header cannot quietly change one
+    // caller's error slot into another's.
+    const alloc = std.testing.allocator;
+
+    const Case = struct {
+        name: []const u8,
+        msgid: i64,
+        send: *const fn (*Core, i64) anyerror!void,
+        err_is_nil: bool,
+    };
+
+    const senders = struct {
+        fn err(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcErrorResponse(core, msgid, "boom");
+        }
+        fn boolean(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcBoolResponse(core, msgid, true);
+        }
+        fn int(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcIntResponse(core, msgid, 1234);
+        }
+        fn clipboard(core: *Core, msgid: i64) anyerror!void {
+            try sendClipboardGetResponse(core, msgid, "one\ntwo");
+        }
+    };
+
+    const cases = [_]Case{
+        .{ .name = "error", .msgid = 11, .send = senders.err, .err_is_nil = false },
+        .{ .name = "bool", .msgid = 22, .send = senders.boolean, .err_is_nil = true },
+        .{ .name = "int", .msgid = 33, .send = senders.int, .err_is_nil = true },
+        .{ .name = "clipboard", .msgid = 44, .send = senders.clipboard, .err_is_nil = true },
+    };
+
+    for (cases) |case| {
+        var fds: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+
+        var core = Core.initForTest(alloc);
+        core.stdin_file = rpc_transport.Stream.fromFile(
+            .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        );
+        core.transport_kind = .pipes;
+        try std.testing.expect(core.startWriterThread());
+
+        try case.send(&core, case.msgid);
+
+        var rbuf: [4096]u8 = undefined;
+        const n = try rpc_transport.Stream.fromFile(read_file).read(&rbuf);
+        var reader = mp.SliceReader{ .data = rbuf[0..n] };
+        const decoded = try mp.decode(alloc, &reader);
+        defer mp.freeValue(alloc, decoded);
+
+        // The shared header, identical at all four senders.
+        try std.testing.expect(decoded == .arr);
+        try std.testing.expectEqual(@as(usize, 4), decoded.arr.len);
+        try std.testing.expectEqual(@as(i64, 1), decoded.arr[0].int);
+        try std.testing.expectEqual(case.msgid, decoded.arr[1].int);
+
+        // The per-sender half: only the error sender fills the error slot, and
+        // exactly one of the two payload slots is nil at each sender.
+        if (case.err_is_nil) {
+            try std.testing.expect(decoded.arr[2] == .nil);
+            try std.testing.expect(decoded.arr[3] != .nil);
+        } else {
+            try std.testing.expectEqualStrings("boom", decoded.arr[2].str);
+            try std.testing.expect(decoded.arr[3] == .nil);
+        }
+
+        core.stop();
+        read_file.close(clock.io());
+        // deinitForTest is intentionally omitted, as in the sibling
+        // writer-thread tests: iterating a never-populated std HashMap asserts
+        // on Zig 0.16.
+    }
+}
+
 test "clipboard set delivers every line when the register exceeds the staging buffer" {
     const alloc = std.testing.allocator;
 
