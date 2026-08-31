@@ -5430,32 +5430,13 @@ pub const Core = struct {
     }
 
     /// Send nvim_input_mouse RPC for scroll events.
-    /// nvim_input_mouse(button, action, modifier, grid, row, col)
+    ///
+    /// A scroll is a mouse input whose button is always "wheel" and whose
+    /// action is the direction, so it emitted the same six-element call as
+    /// requestMouseInput with one field pinned. The argument order differs
+    /// from that function's because the callers' does.
     fn requestMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8, modifier: []const u8) !void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_input_mouse");
-
-        // nvim_input_mouse takes 6 arguments:
-        // button: "wheel" for scroll
-        // action: "up" or "down"
-        // modifier: "" or combination like "SC" for shift+ctrl
-        // grid: grid_id
-        // row: row position
-        // col: column position
-        try rpc.packArray(&buf, self.alloc, 6);
-        try rpc.packStr(&buf, self.alloc, "wheel"); // button
-        try rpc.packStr(&buf, self.alloc, direction); // action (up/down)
-        try rpc.packStr(&buf, self.alloc, modifier); // modifier
-        try rpc.packInt(&buf, self.alloc, grid_id); // grid
-        try rpc.packInt(&buf, self.alloc, @as(i64, row)); // row
-        try rpc.packInt(&buf, self.alloc, @as(i64, col)); // col
-
-        try self.sendRaw(buf.items);
-
-        self.log.write("rpc send: nvim_input_mouse (id={d}) wheel {s} mod=\"{s}\" grid={d} row={d} col={d}\n", .{ id, direction, modifier, grid_id, row, col });
+        try self.requestMouseInput("wheel", direction, modifier, grid_id, row, col);
     }
 
     /// Send nvim_input_mouse RPC for button events (click, drag, release).
@@ -5492,7 +5473,9 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_input_mouse (id={d}) {s} {s} mod={s} grid={d} row={d} col={d}\n", .{ id, button, action, modifier, grid_id, row, col });
+        // The modifier is quoted so an empty one is visible; the scroll path
+        // logged it that way and folding into here must not lose it.
+        self.log.write("rpc send: nvim_input_mouse (id={d}) {s} {s} mod=\"{s}\" grid={d} row={d} col={d}\n", .{ id, button, action, modifier, grid_id, row, col });
     }
 
     const FlushCtx = flush.FlushCtx;
@@ -6940,6 +6923,73 @@ test "redraw post-processing failure poisons the attachment" {
     // same poisoned-session boundary instead of being logged and ignored.
     try std.testing.expect(core.redraw_recovery_failed.load(.seq_cst));
     try std.testing.expect(!core.ui_attached.load(.acquire));
+}
+
+test "a scroll and a button press differ only in the button and action fields" {
+    // requestMouseScroll and requestMouseInput emitted the same six-element
+    // nvim_input_mouse call, the scroll one with "wheel" hardcoded. Send one
+    // of each over the same transport and require the frames to match field
+    // for field apart from the two that are supposed to differ, so folding one
+    // into the other cannot quietly change the wire shape.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    const alloc = std.testing.allocator;
+
+    const Frame = struct {
+        /// Decode one nvim_input_mouse request: [0, id, method, [args...]].
+        fn read(a: std.mem.Allocator, file: std.Io.File) !mp.Value {
+            var rbuf: [512]u8 = undefined;
+            const n = try Stream.fromFile(file).read(&rbuf);
+            var reader = mp.SliceReader{ .data = rbuf[0..n] };
+            return try mp.decode(a, &reader);
+        }
+    };
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(alloc);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    // deinitForTest is intentionally omitted, as in the sibling writer-thread
+    // tests: iterating a never-populated std HashMap asserts on Zig 0.16.
+    defer core.stop();
+
+    try core.requestMouseScroll(3, 7, 11, "up", "S");
+    const scroll = try Frame.read(alloc, read_file);
+    defer mp.freeValue(alloc, scroll);
+
+    try core.requestMouseInput("left", "press", "S", 3, 7, 11);
+    const press = try Frame.read(alloc, read_file);
+    defer mp.freeValue(alloc, press);
+
+    // Same method, same argument arity.
+    try std.testing.expectEqualStrings("nvim_input_mouse", scroll.arr[2].str);
+    try std.testing.expectEqualStrings("nvim_input_mouse", press.arr[2].str);
+    const s = scroll.arr[3].arr;
+    const p = press.arr[3].arr;
+    try std.testing.expectEqual(@as(usize, 6), s.len);
+    try std.testing.expectEqual(@as(usize, 6), p.len);
+
+    // The two fields that are meant to differ.
+    try std.testing.expectEqualStrings("wheel", s[0].str);
+    try std.testing.expectEqualStrings("left", p[0].str);
+    try std.testing.expectEqualStrings("up", s[1].str);
+    try std.testing.expectEqualStrings("press", p[1].str);
+
+    // Everything else must match, in the same slots and the same order.
+    try std.testing.expectEqualStrings("S", s[2].str);
+    try std.testing.expectEqualStrings("S", p[2].str);
+    try std.testing.expectEqual(@as(i64, 3), s[3].int);
+    try std.testing.expectEqual(@as(i64, 3), p[3].int);
+    try std.testing.expectEqual(@as(i64, 7), s[4].int);
+    try std.testing.expectEqual(@as(i64, 7), p[4].int);
+    try std.testing.expectEqual(@as(i64, 11), s[5].int);
+    try std.testing.expectEqual(@as(i64, 11), p[5].int);
 }
 
 test "UI-state reserve preserves order across a full normal queue" {
