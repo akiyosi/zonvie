@@ -234,6 +234,43 @@ fn checkedU32(v: i64) ?u32 {
     return @as(u32, @intCast(v));
 }
 
+/// Decode a msgpack `[attr_id, text]` content array, appending one chunk per
+/// well-formed element.
+///
+/// `require_two` picks the guard dialect and must keep each call site's
+/// current value. True for the three cmdline events and for
+/// `msg_history_show`, which drop a chunk with fewer than two elements; false
+/// for the live message events (`msg_show` and the showmode/showcmd/ruler
+/// arm), which append it with the missing fields defaulted. The split is not
+/// cmdline-versus-msg — `msg_history_show` is on the dropping side. That
+/// difference is observable, not cosmetic: `Grid.setMsgShow` discards a
+/// message whose content array is empty, so dropping a malformed chunk rather
+/// than defaulting it decides whether a malformed `msg_show` becomes a
+/// visible message at all.
+///
+/// `hl_id` comes from `chunk[0]`, the attr_id — the same namespace
+/// `hl_attr_define` populates, which is what the highlight table is keyed by.
+/// `chunk[2]`, the raw syntax hl_id, is deliberately not read.
+///
+/// `text` is borrowed from `arena`. The grid dupes it into its own allocator
+/// when it stores it; duping here would put an allocation on a redraw path.
+fn appendContentChunks(
+    comptime T: type,
+    arena: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(T),
+    values: []const mp.Value,
+    comptime require_two: bool,
+) !void {
+    for (values) |chunk_v| {
+        if (chunk_v != .arr) continue;
+        const chunk = chunk_v.arr;
+        if (require_two and chunk.len < 2) continue;
+        const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
+        const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
+        try list.append(arena, T{ .hl_id = hl_id, .text = text });
+    }
+}
+
 /// Neovim allocates grid handles from a positive signed-int domain. Metal's
 /// vertex input and scroll-offset ABI consume the low signed 32 bits, so reject
 /// values outside that producer domain before they can enter shared grid state.
@@ -2212,17 +2249,7 @@ pub fn handleRedraw(
                     // Parse content (array of [attrs, text] or [attrs, text, hl_id])
                     var chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
                     if (t[0] == .arr) {
-                        for (t[0].arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            if (chunk.len < 2) continue;
-
-                            // chunk[0] is attrs (map or int for hl_id)
-                            // chunk[1] is text
-                            const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                            try chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
-                        }
+                        try appendContentChunks(CmdlineChunk, arena, &chunks, t[0].arr, true);
                     }
 
                     const pos: u32 = if (t[1] == .int) (checkedU32(t[1].int) orelse 0) else 0;
@@ -2301,15 +2328,7 @@ pub fn handleRedraw(
                     for (t[0].arr) |line_v| {
                         if (line_v != .arr) continue;
                         var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-                        for (line_v.arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            if (chunk.len < 2) continue;
-
-                            const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                            try line_chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
-                        }
+                        try appendContentChunks(CmdlineChunk, arena, &line_chunks, line_v.arr, true);
                         try lines.append(arena, line_chunks.items);
                     }
 
@@ -2326,15 +2345,7 @@ pub fn handleRedraw(
                     if (t[0] != .arr) continue;
 
                     var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-                    for (t[0].arr) |chunk_v| {
-                        if (chunk_v != .arr) continue;
-                        const chunk = chunk_v.arr;
-                        if (chunk.len < 2) continue;
-
-                        const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                        const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                        try line_chunks.append(arena, CmdlineChunk{ .hl_id = hl_id, .text = text });
-                    }
+                    try appendContentChunks(CmdlineChunk, arena, &line_chunks, t[0].arr, true);
 
                     try grid.appendCmdlineBlock(line_chunks.items);
                     if (log.cb != null) log.write("cmdline_block_append\n", .{});
@@ -2490,19 +2501,7 @@ pub fn handleRedraw(
                     // Parse content array
                     var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                     if (t[1] == .arr) {
-                        for (t[1].arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            // Each chunk is [attr_id, text_chunk] or [attr_id, text_chunk, hl_id]
-                            // attr_id is typically the highlight id
-                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-
-                            try chunks.append(arena, MsgChunk{
-                                .hl_id = hl_id,
-                                .text = text,
-                            });
-                        }
+                        try appendContentChunks(MsgChunk, arena, &chunks, t[1].arr, false);
                     }
 
                     const replace_last: bool = if (t.len > 2 and t[2] == .bool) t[2].bool else false;
@@ -2536,13 +2535,7 @@ pub fn handleRedraw(
 
                     var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                     if (t.len > 0 and t[0] == .arr) {
-                        for (t[0].arr) |chunk_v| {
-                            if (chunk_v != .arr) continue;
-                            const chunk = chunk_v.arr;
-                            const hl_id: u32 = if (chunk.len > 0 and chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                            const text: []const u8 = if (chunk.len > 1 and chunk[1] == .str) chunk[1].str else "";
-                            try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                        }
+                        try appendContentChunks(MsgChunk, arena, &chunks, t[0].arr, false);
                     }
                     try grid.setMsgStatus(channel, chunks.items);
                     if (log.cb != null) log.write("{s} chunks={d}\n", .{ @tagName(ev_tag), chunks.items.len });
@@ -2582,15 +2575,7 @@ pub fn handleRedraw(
                             // Parse content array [[hl_id, text], ...]
                             var chunks: std.ArrayListUnmanaged(MsgChunk) = .empty;
                             if (entry[1] == .arr) {
-                                for (entry[1].arr) |chunk_v| {
-                                    if (chunk_v != .arr) continue;
-                                    const chunk = chunk_v.arr;
-                                    if (chunk.len < 2) continue;
-
-                                    const hl_id: u32 = if (chunk[0] == .int) (checkedU32(chunk[0].int) orelse 0) else 0;
-                                    const text: []const u8 = if (chunk[1] == .str) chunk[1].str else "";
-                                    try chunks.append(arena, MsgChunk{ .hl_id = hl_id, .text = text });
-                                }
+                                try appendContentChunks(MsgChunk, arena, &chunks, entry[1].arr, true);
                             }
 
                             // append is optional (3rd element)
@@ -2688,6 +2673,591 @@ pub fn handleRedraw(
             },
         }
     }
+}
+
+/// One content chunk. `len` picks how many of [attr_id, text, hl_id] are
+/// present, so a caller can build the malformed short chunks the two guard
+/// dialects disagree about.
+fn testChunk(arena: std.mem.Allocator, attr_id: i64, text: []const u8, len: usize) !mp.Value {
+    const chunk = try arena.alloc(mp.Value, len);
+    if (len > 0) chunk[0] = .{ .int = attr_id };
+    if (len > 1) chunk[1] = .{ .str = text };
+    if (len > 2) chunk[2] = .{ .int = 999 }; // raw syntax hl_id; never read
+    return .{ .arr = chunk };
+}
+
+/// A redraw event is [name, tuple, ...]; the tuples sit directly in the
+/// event array, not inside a further array.
+fn testEvent(arena: std.mem.Allocator, name: []const u8, tuple: []mp.Value) ![]mp.Value {
+    const ev = try arena.alloc(mp.Value, 2);
+    ev[0] = .{ .str = name };
+    ev[1] = .{ .arr = tuple };
+    const events = try arena.alloc(mp.Value, 1);
+    events[0] = .{ .arr = ev };
+    return events;
+}
+
+/// cmdline_show tuple: [content, pos, firstc, prompt, indent]
+fn testCmdlineShowTuple(arena: std.mem.Allocator, content: []mp.Value) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 5);
+    t[0] = .{ .arr = content };
+    t[1] = .{ .int = 0 };
+    t[2] = .{ .str = ":" };
+    t[3] = .{ .str = "" };
+    t[4] = .{ .int = 0 };
+    return t;
+}
+
+/// msg_show tuple: [kind, content]
+fn testMsgShowTuple(arena: std.mem.Allocator, kind: []const u8, content: []mp.Value) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .str = kind };
+    t[1] = .{ .arr = content };
+    return t;
+}
+
+/// msg_history_show tuple: [[[kind, content]], prev_cmd]
+fn testHistoryTuple(arena: std.mem.Allocator, content: []mp.Value) ![]mp.Value {
+    const entry = try arena.alloc(mp.Value, 2);
+    entry[0] = .{ .str = "echo" };
+    entry[1] = .{ .arr = content };
+    const entries = try arena.alloc(mp.Value, 1);
+    entries[0] = .{ .arr = entry };
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .arr = entries };
+    t[1] = .{ .bool = false };
+    return t;
+}
+
+fn testContent(arena: std.mem.Allocator, chunk: mp.Value) ![]mp.Value {
+    const content = try arena.alloc(mp.Value, 1);
+    content[0] = chunk;
+    return content;
+}
+
+test "every content-chunk site reads attr_id and text and ignores the third element" {
+    // All six sites decode the same wire shape. The highlight comes from
+    // chunk[0] (attr_id, the namespace hl_attr_define populates), never from
+    // chunk[2] (the raw syntax hl_id), so a well-formed 3-element chunk must
+    // land as hl_id 7 and not 999.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const chunk = try testChunk(arena, 7, "hi", 3);
+
+    // A: cmdline_show
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, try testContent(arena, chunk))));
+    const cmdline = grid.cmdline_states.getPtr(1).?.content.items;
+    try std.testing.expectEqual(@as(usize, 1), cmdline.len);
+    try std.testing.expectEqual(@as(u32, 7), cmdline[0].hl_id);
+    try std.testing.expectEqualStrings("hi", cmdline[0].text);
+
+    // B: cmdline_block_show — content is one line inside a lines array
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = try testContent(arena, chunk) };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        const block = grid.cmdline_block.lines.items;
+        try std.testing.expectEqual(@as(usize, 1), block.len);
+        try std.testing.expectEqual(@as(usize, 1), block[0].items.len);
+        try std.testing.expectEqual(@as(u32, 7), block[0].items[0].hl_id);
+        try std.testing.expectEqualStrings("hi", block[0].items[0].text);
+    }
+
+    // C: cmdline_block_append appends a second line
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, chunk) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        const block = grid.cmdline_block.lines.items;
+        try std.testing.expectEqual(@as(usize, 2), block.len);
+        try std.testing.expectEqual(@as(u32, 7), block[1].items[0].hl_id);
+        try std.testing.expectEqualStrings("hi", block[1].items[0].text);
+    }
+
+    // D: msg_show
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, chunk))));
+    const messages = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(usize, 1), messages[0].content.items.len);
+    try std.testing.expectEqual(@as(u32, 7), messages[0].content.items[0].hl_id);
+    try std.testing.expectEqualStrings("hi", messages[0].content.items[0].text);
+
+    // E: the three status events share one arm
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, chunk) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_showcmd", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.showcmd.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqual(@as(u32, 7), slot.items[0].hl_id);
+        try std.testing.expectEqualStrings("hi", slot.items[0].text);
+    }
+
+    // F: msg_history_show
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, try testContent(arena, chunk))));
+    const entries = grid.msg_history_state.entries.items;
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(usize, 1), entries[0].content.items.len);
+    try std.testing.expectEqual(@as(u32, 7), entries[0].content.items[0].hl_id);
+    try std.testing.expectEqualStrings("hi", entries[0].content.items[0].text);
+}
+
+test "a one-element content chunk is dropped by the cmdline sites and kept by the msg sites" {
+    // The two guard dialects disagree only here, and the disagreement is
+    // observable: under the msg dialect a content array of one malformed chunk
+    // is length 1, so Grid.setMsgShow does not take its "discard empty
+    // message" early return and the message becomes visible. Under the cmdline
+    // dialect the same input yields length 0 and the event is discarded.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const short = try testChunk(arena, 5, "", 1);
+
+    // A: dropped
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, try testContent(arena, short))));
+    try std.testing.expectEqual(@as(usize, 0), grid.cmdline_states.getPtr(1).?.content.items.len);
+
+    // B: the line survives, its chunk does not
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = try testContent(arena, short) };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        try std.testing.expectEqual(@as(usize, 1), grid.cmdline_block.lines.items.len);
+        try std.testing.expectEqual(@as(usize, 0), grid.cmdline_block.lines.items[0].items.len);
+    }
+
+    // C: dropped
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, short) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        try std.testing.expectEqual(@as(usize, 0), grid.cmdline_block.lines.items[1].items.len);
+    }
+
+    // F: dropped, and the entry itself still lands
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, try testContent(arena, short))));
+    try std.testing.expectEqual(@as(usize, 1), grid.msg_history_state.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), grid.msg_history_state.entries.items[0].content.items.len);
+
+    // D: kept — and this is the observable half of the divergence. The chunk
+    // reaches setMsgShow as content.len 1, so its "discard empty message"
+    // early return does not fire: a Message is created and the panel becomes
+    // visible. The chunk itself is then dropped by collectMessageTailRef for
+    // having no text, so the message shows up empty rather than absent. Under
+    // the cmdline dialect the same input produces no message at all.
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, short))));
+    const messages = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    try std.testing.expectEqual(@as(usize, 0), messages[0].content.items.len);
+    try std.testing.expect(grid.message_state.visible);
+    try std.testing.expect(grid.message_state.msg_dirty);
+
+    // E: kept
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, short) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_ruler", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.ruler.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqual(@as(u32, 5), slot.items[0].hl_id);
+    }
+}
+
+test "a zero-element content chunk follows the same split" {
+    // Same divergence one step further down: with no elements at all the msg
+    // dialect still appends a fully defaulted chunk.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const empty = try testChunk(arena, 0, "", 0);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, try testContent(arena, empty))));
+    try std.testing.expectEqual(@as(usize, 0), grid.cmdline_states.getPtr(1).?.content.items.len);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, empty))));
+    try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
+    try std.testing.expect(grid.message_state.visible);
+
+    // B and C drop it too.
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = try testContent(arena, empty) };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        try std.testing.expectEqual(@as(usize, 0), grid.cmdline_block.lines.items[0].items.len);
+    }
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, empty) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        try std.testing.expectEqual(@as(usize, 0), grid.cmdline_block.lines.items[1].items.len);
+    }
+
+    // F drops it; E keeps it. This is the case where the msg dialect's second
+    // guard is the only thing standing between chunk[1] and an out-of-bounds
+    // index.
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, try testContent(arena, empty))));
+    try std.testing.expectEqual(@as(usize, 0), grid.msg_history_state.entries.items[0].content.items.len);
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, empty) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_ruler", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.ruler.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqual(@as(u32, 0), slot.items[0].hl_id);
+        try std.testing.expectEqualStrings("", slot.items[0].text);
+    }
+}
+
+test "a non-array entry in a content array is skipped at every site" {
+    // The `chunk_v != .arr` guard is common to all six sites and stays common.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    // [not-an-array, well-formed] must yield exactly the well-formed one.
+    const content = try arena.alloc(mp.Value, 2);
+    content[0] = .{ .bool = true };
+    content[1] = try testChunk(arena, 3, "ok", 2);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, content)));
+    const cmdline = grid.cmdline_states.getPtr(1).?.content.items;
+    try std.testing.expectEqual(@as(usize, 1), cmdline.len);
+    try std.testing.expectEqualStrings("ok", cmdline[0].text);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", content)));
+    const messages = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 1), messages[0].content.items.len);
+    try std.testing.expectEqualStrings("ok", messages[0].content.items[0].text);
+
+    // B: cmdline_block_show
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = content };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        const block = grid.cmdline_block.lines.items;
+        try std.testing.expectEqual(@as(usize, 1), block[0].items.len);
+        try std.testing.expectEqualStrings("ok", block[0].items[0].text);
+    }
+
+    // C: cmdline_block_append
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        const block = grid.cmdline_block.lines.items;
+        try std.testing.expectEqual(@as(usize, 1), block[1].items.len);
+        try std.testing.expectEqualStrings("ok", block[1].items[0].text);
+    }
+
+    // E: the status arm
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_showmode", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqualStrings("ok", slot.items[0].text);
+    }
+
+    // F: msg_history_show
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, content)));
+    const entries = grid.msg_history_state.entries.items;
+    try std.testing.expectEqual(@as(usize, 1), entries[0].content.items.len);
+    try std.testing.expectEqualStrings("ok", entries[0].content.items[0].text);
+}
+
+test "an out-of-range attr_id falls back to the default highlight at every site" {
+    // checkedU32's `orelse 0` is part of the shared idiom.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    // Not a round 2^32: truncating to u32 would yield 7 here, so a fallback
+    // that truncates instead of rejecting is distinguishable from `orelse 0`.
+    const huge = try testChunk(arena, (@as(i64, 1) << 32) + 7, "x", 2);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, try testContent(arena, huge))));
+    try std.testing.expectEqual(@as(u32, 0), grid.cmdline_states.getPtr(1).?.content.items[0].hl_id);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, huge))));
+    try std.testing.expectEqual(@as(u32, 0), grid.message_state.messages.items[0].content.items[0].hl_id);
+
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = try testContent(arena, huge) };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        try std.testing.expectEqual(@as(u32, 0), grid.cmdline_block.lines.items[0].items[0].hl_id);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, huge) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        try std.testing.expectEqual(@as(u32, 0), grid.cmdline_block.lines.items[1].items[0].hl_id);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, huge) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_showmode", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+        try std.testing.expectEqual(@as(u32, 0), slot.items[0].hl_id);
+    }
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, try testContent(arena, huge))));
+    try std.testing.expectEqual(@as(u32, 0), grid.msg_history_state.entries.items[0].content.items[0].hl_id);
+}
+
+/// A chunk whose attr_id is a map and whose text is an int — the shapes the
+/// two element-type guards exist to reject. Neovim's cmdline `attrs` really
+/// is a map in some payloads.
+fn testWrongTypeChunk(arena: std.mem.Allocator) !mp.Value {
+    const chunk = try arena.alloc(mp.Value, 2);
+    chunk[0] = .{ .map = &[_]mp.Pair{} };
+    chunk[1] = .{ .int = 1 };
+    return .{ .arr = chunk };
+}
+
+test "a short chunk is skipped without abandoning the rest of the content" {
+    // Every other short-chunk fixture is a lone chunk, which cannot tell
+    // `continue` from `break`. Put the short chunk first and require the
+    // well-formed one after it to survive.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const content = try arena.alloc(mp.Value, 2);
+    content[0] = try testChunk(arena, 5, "", 1);
+    content[1] = try testChunk(arena, 3, "ok", 2);
+
+    // A: the short chunk is dropped, the well-formed one is kept.
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, content)));
+    const cmdline = grid.cmdline_states.getPtr(1).?.content.items;
+    try std.testing.expectEqual(@as(usize, 1), cmdline.len);
+    try std.testing.expectEqualStrings("ok", cmdline[0].text);
+
+    // B
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = content };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        try std.testing.expectEqual(@as(usize, 1), grid.cmdline_block.lines.items[0].items.len);
+        try std.testing.expectEqualStrings("ok", grid.cmdline_block.lines.items[0].items[0].text);
+    }
+
+    // C
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        try std.testing.expectEqual(@as(usize, 1), grid.cmdline_block.lines.items[1].items.len);
+        try std.testing.expectEqualStrings("ok", grid.cmdline_block.lines.items[1].items[0].text);
+    }
+
+    // F
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, content)));
+    const entries = grid.msg_history_state.entries.items;
+    try std.testing.expectEqual(@as(usize, 1), entries[0].content.items.len);
+    try std.testing.expectEqualStrings("ok", entries[0].content.items[0].text);
+
+    // D keeps both, since the msg dialect defaults the short one instead of
+    // dropping it — and the well-formed chunk still comes through.
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", content)));
+    const messages = grid.message_state.messages.items;
+    try std.testing.expectEqual(@as(usize, 1), messages[0].content.items.len);
+    try std.testing.expectEqualStrings("ok", messages[0].content.items[0].text);
+
+    // E likewise keeps both; the empty-text chunk is stored here.
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_showcmd", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.showcmd.index()];
+        try std.testing.expectEqual(@as(usize, 2), slot.items.len);
+        try std.testing.expectEqualStrings("", slot.items[0].text);
+        try std.testing.expectEqualStrings("ok", slot.items[1].text);
+    }
+}
+
+test "a chunk with the wrong element types decodes to the defaults" {
+    // chunk[0] a map and chunk[1] an int: without the type guards these are
+    // safety-checked panics on a tagged union, not silent misreads.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const bad = try testWrongTypeChunk(arena);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, try testContent(arena, bad))));
+    const cmdline = grid.cmdline_states.getPtr(1).?.content.items;
+    try std.testing.expectEqual(@as(usize, 1), cmdline.len);
+    try std.testing.expectEqual(@as(u32, 0), cmdline[0].hl_id);
+    try std.testing.expectEqualStrings("", cmdline[0].text);
+
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = try testContent(arena, bad) };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        const line = grid.cmdline_block.lines.items[0].items;
+        try std.testing.expectEqual(@as(u32, 0), line[0].hl_id);
+        try std.testing.expectEqualStrings("", line[0].text);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, bad) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        const line = grid.cmdline_block.lines.items[1].items;
+        try std.testing.expectEqual(@as(u32, 0), line[0].hl_id);
+        try std.testing.expectEqualStrings("", line[0].text);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = try testContent(arena, bad) };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_ruler", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.ruler.index()];
+        try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+        try std.testing.expectEqual(@as(u32, 0), slot.items[0].hl_id);
+        try std.testing.expectEqualStrings("", slot.items[0].text);
+    }
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, try testContent(arena, bad))));
+    const entries = grid.msg_history_state.entries.items;
+    try std.testing.expectEqual(@as(usize, 1), entries[0].content.items.len);
+    try std.testing.expectEqual(@as(u32, 0), entries[0].content.items[0].hl_id);
+
+    // D: the message exists but stores nothing, the empty text being dropped
+    // downstream exactly as for a short chunk.
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, bad))));
+    try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
+    try std.testing.expectEqual(@as(usize, 0), grid.message_state.messages.items[0].content.items.len);
+}
+
+test "several chunks decode in order at every site" {
+    // Nothing else produces more than one surviving chunk, so an append that
+    // kept only the first, or reversed them, would pass the rest of the suite.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const content = try arena.alloc(mp.Value, 2);
+    content[0] = try testChunk(arena, 1, "a", 2);
+    content[1] = try testChunk(arena, 2, "b", 2);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", try testCmdlineShowTuple(arena, content)));
+    const cmdline = grid.cmdline_states.getPtr(1).?.content.items;
+    try std.testing.expectEqual(@as(usize, 2), cmdline.len);
+    try std.testing.expectEqual(@as(u32, 1), cmdline[0].hl_id);
+    try std.testing.expectEqualStrings("a", cmdline[0].text);
+    try std.testing.expectEqual(@as(u32, 2), cmdline[1].hl_id);
+    try std.testing.expectEqualStrings("b", cmdline[1].text);
+
+    {
+        const lines = try arena.alloc(mp.Value, 1);
+        lines[0] = .{ .arr = content };
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = lines };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_show", t));
+        const line = grid.cmdline_block.lines.items[0].items;
+        try std.testing.expectEqual(@as(usize, 2), line.len);
+        try std.testing.expectEqualStrings("a", line[0].text);
+        try std.testing.expectEqualStrings("b", line[1].text);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_block_append", t));
+        const line = grid.cmdline_block.lines.items[1].items;
+        try std.testing.expectEqual(@as(usize, 2), line.len);
+        try std.testing.expectEqualStrings("a", line[0].text);
+        try std.testing.expectEqualStrings("b", line[1].text);
+    }
+
+    {
+        const t = try arena.alloc(mp.Value, 1);
+        t[0] = .{ .arr = content };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_showmode", t));
+        const slot = grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+        try std.testing.expectEqual(@as(usize, 2), slot.items.len);
+        try std.testing.expectEqual(@as(u32, 1), slot.items[0].hl_id);
+        try std.testing.expectEqualStrings("a", slot.items[0].text);
+        try std.testing.expectEqual(@as(u32, 2), slot.items[1].hl_id);
+        try std.testing.expectEqualStrings("b", slot.items[1].text);
+    }
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_history_show", try testHistoryTuple(arena, content)));
+    const entries = grid.msg_history_state.entries.items[0].content.items;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("a", entries[0].text);
+    try std.testing.expectEqualStrings("b", entries[1].text);
+
+    try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", content)));
+    const msg = grid.message_state.messages.items[0].content.items;
+    try std.testing.expectEqual(@as(usize, 2), msg.len);
+    try std.testing.expectEqual(@as(u32, 1), msg[0].hl_id);
+    try std.testing.expectEqualStrings("a", msg[0].text);
+    try std.testing.expectEqual(@as(u32, 2), msg[1].hl_id);
+    try std.testing.expectEqualStrings("b", msg[1].text);
 }
 
 test "each status event decodes into its own channel slot" {
