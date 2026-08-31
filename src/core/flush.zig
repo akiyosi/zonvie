@@ -9273,6 +9273,61 @@ pub fn buildMsgLineCache(self: *Core) bool {
     return true;
 }
 
+/// Widest a message panel may grow, in cells.
+const msg_panel_max_width: u32 = 80;
+
+/// start_row/start_col both carry this value on a message panel's external
+/// grid entry. No frontend compares against it — both dispatch on the grid
+/// id — so its only functional effect is being negative, which routes the
+/// grid through the "no main-grid composite" guards.
+const msg_panel_top_right: i32 = -2;
+
+/// One padding column on each side of the content, then the cap. A content
+/// width of 0 yields a 2-column panel: both padding columns, no content
+/// column, since the write loop stops before the right one.
+fn msgPanelWidth(content_width: u32) u32 {
+    return @min(content_width + 2, msg_panel_max_width);
+}
+
+/// Size a message panel's grid and blank it. The clear is not optional:
+/// resizeGrid preserves the overlapping region, so a re-render at an
+/// unchanged shape would otherwise inherit the previous content's tail.
+fn beginMsgPanelGrid(self: *Core, grid_id: i64, height: u32, width: u32) !void {
+    try self.grid.resizeGrid(grid_id, height, width);
+    self.grid.clearGrid(grid_id);
+}
+
+/// Write one line of a message panel, starting after the left padding column
+/// and stopping before the right one. A wide codepoint takes two cells, the
+/// second written as cp 0; when only one cell is left the body is still
+/// written and the placeholder is dropped, so the glyph overhangs the right
+/// padding column.
+fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) void {
+    var col: u32 = 1; // Start with 1 cell padding
+    var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (col >= width - 1) break;
+        self.grid.putCellGrid(grid_id, row, col, cp, 0);
+        col += 1;
+        if (isWideChar(cp)) {
+            if (col >= width - 1) break;
+            self.grid.putCellGrid(grid_id, row, col, 0, 0);
+            col += 1;
+        }
+    }
+}
+
+/// Register a message panel as an external grid at the top-right sentinel
+/// position. Callers own the failure policy: whether the flush is aborted
+/// differs between the panels.
+fn registerMsgPanelExternal(self: *Core, grid_id: i64) !void {
+    try self.grid.putSyntheticExternal(grid_id, .{
+        .win = 1, // Global grid
+        .start_row = msg_panel_top_right,
+        .start_col = msg_panel_top_right,
+    });
+}
+
 /// Render msg_show grid from cache (fast path for scrolling).
 /// Returns false on allocation failure (resizeGrid/external_grids.put) —
 /// the message grid was NOT actually updated to reflect scroll_offset, so
@@ -9291,7 +9346,7 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
     const max_height: u32 = @min(self.grid.rows, 256);
     const visible_lines = lines.len - actual_scroll;
     const height: u32 = @intCast(@min(visible_lines, max_height));
-    const width: u32 = @min(self.msg_cached_max_width + 2, 80);
+    const width: u32 = msgPanelWidth(self.msg_cached_max_width);
 
     self.log.write("[msg] renderMsgGridFromCache: lines={d} scroll={d} visible={d} size={d}x{d}\n", .{
         lines.len,
@@ -9302,41 +9357,22 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
     });
 
     // Create or resize grid
-    self.grid.resizeGrid(msg_grid_id, height, width) catch |e| {
+    beginMsgPanelGrid(self, msg_grid_id, height, width) catch |e| {
         self.log.write("[msg] resizeGrid failed: {any}\n", .{e});
         return false;
     };
-    self.grid.clearGrid(msg_grid_id);
 
     // Write lines to grid from cache
     for (0..height) |row_idx| {
         const source_line_idx = actual_scroll + row_idx;
         if (source_line_idx >= lines.len) break;
 
-        const row: u32 = @intCast(row_idx);
         const cached_line = lines[source_line_idx];
-        const line = cached_line.data[0..cached_line.len];
-
-        var col: u32 = 1; // Start with 1 cell padding
-        var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col >= width - 1) break;
-            self.grid.putCellGrid(msg_grid_id, row, col, cp, 0);
-            col += 1;
-            if (isWideChar(cp)) {
-                if (col >= width - 1) break;
-                self.grid.putCellGrid(msg_grid_id, row, col, 0, 0);
-                col += 1;
-            }
-        }
+        writeMsgPanelRow(self, msg_grid_id, @intCast(row_idx), cached_line.data[0..cached_line.len], width);
     }
 
     // Register as external grid
-    self.grid.putSyntheticExternal(msg_grid_id, .{
-        .win = 1, // Global grid
-        .start_row = -2, // Special marker: position at top-right
-        .start_col = -2,
-    }) catch |e| {
+    registerMsgPanelExternal(self, msg_grid_id) catch |e| {
         self.log.write("[msg] external_grids.put failed: {any}\n", .{e});
         return false;
     };
@@ -9938,45 +9974,24 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
     // Calculate grid dimensions
     const max_height: u32 = 20;
     const height: u32 = @intCast(@min(line_count, max_height));
-    const width: u32 = @min(max_width + 2, 80); // +2 for padding, max 80
+    const width: u32 = msgPanelWidth(max_width);
 
     self.log.write("[msg_history] show: entries={d} size={d}x{d}\n", .{ entries.len, width, height });
 
     // Create or resize grid
-    self.grid.resizeGrid(history_grid_id, height, width) catch |e| {
+    beginMsgPanelGrid(self, history_grid_id, height, width) catch |e| {
         self.log.write("[msg_history] resizeGrid failed: {any}\n", .{e});
         self.flush_aborted = true;
         return false;
     };
-    self.grid.clearGrid(history_grid_id);
 
     // Write lines to grid
     for (0..height) |row_idx| {
-        const row: u32 = @intCast(row_idx);
-        const line = lines[row_idx][0..line_lens[row_idx]];
-
-        var col: u32 = 1; // Start with 1 cell padding
-        var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col >= width - 1) break;
-            self.grid.putCellGrid(history_grid_id, row, col, cp, 0);
-            col += 1;
-            if (isWideChar(cp)) {
-                if (col >= width - 1) break;
-                self.grid.putCellGrid(history_grid_id, row, col, 0, 0);
-                col += 1;
-            }
-        }
+        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[row_idx][0..line_lens[row_idx]], width);
     }
 
-    // Register as external grid
-    // Position: use special marker -2 to indicate "msg_show position" (top-right)
-    // Frontend will interpret this and position like msg_show
-    self.grid.putSyntheticExternal(history_grid_id, .{
-        .win = 1, // Global grid
-        .start_row = -2, // Special marker: position like msg_show (top-right)
-        .start_col = -2,
-    }) catch |e| {
+    // Register as external grid, positioned like msg_show.
+    registerMsgPanelExternal(self, history_grid_id) catch |e| {
         self.log.write("[msg_history] external_grids.put failed: {any}\n", .{e});
         self.flush_aborted = true;
         return false;
@@ -15209,5 +15224,302 @@ test "VH's two solid-quad variants emit the same corner order" {
         try std.testing.expectEqual(@as(i64, 1), v.grid_id);
         try std.testing.expectEqual(c_api.DECO_CURSOR, v.deco_flags);
         try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+    }
+}
+
+/// Append one line to the msg_show line cache, as buildMsgLineCache would.
+fn seedMsgCacheLine(core: *Core, text: []const u8) !void {
+    var cached: MsgCachedLine = .{};
+    @memcpy(cached.data[0..text.len], text);
+    cached.len = @intCast(text.len);
+    cached.display_width = @intCast(countDisplayWidth(text));
+    try core.msg_line_cache.append(core.alloc, cached);
+}
+
+/// One history entry holding a single chunk. The caller owns the entry and
+/// must deinit it with the same allocator.
+fn makeTestHistoryEntry(core: *Core, text: []const u8) !grid_mod.MsgHistoryEntry {
+    var entry: grid_mod.MsgHistoryEntry = .{};
+    const owned = try core.alloc.dupe(u8, text);
+    errdefer core.alloc.free(owned);
+    try entry.content.append(core.alloc, .{ .hl_id = 0, .text = owned });
+    return entry;
+}
+
+fn panelCols(core: *Core, grid_id: i64) u32 {
+    return core.grid.sub_grids.get(grid_id).?.cols;
+}
+
+fn panelRows(core: *Core, grid_id: i64) u32 {
+    return core.grid.sub_grids.get(grid_id).?.rows;
+}
+
+test "both message panels lay out text with one padding column and double-cell wide chars" {
+    // Both panels write the same way: column 0 is padding, content starts at
+    // column 1, and a wide codepoint consumes two cells so what follows it is
+    // pushed one column further right. clearGrid fills with ' ', so the
+    // placeholder's cp 0 is distinguishable from an untouched cell.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "aあb");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(mgid, 0, 2).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 'b'), core.grid.getCellGrid(mgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+    // Both the body and the placeholder are written with hl 0.
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 2).hl);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 3).hl);
+
+    // The history panel writes the identical layout. Its width differs only
+    // because its content-width floor is 20 rather than the cached max.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "aあb")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 22), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(hgid, 0, 2).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 'b'), core.grid.getCellGrid(hgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 2).hl);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 3).hl);
+}
+
+test "both message panels write each line to its own row" {
+    // Every other fixture here is single-row, which would let a shared
+    // per-line helper drop its row argument and collapse the whole panel
+    // onto row 0.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "ab");
+    try seedMsgCacheLine(&core, "cd");
+    core.msg_cached_max_width = 2;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'c'), core.grid.getCellGrid(mgid, 1, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 1, 2).cp);
+
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var entries = [_]grid_mod.MsgHistoryEntry{
+        try makeTestHistoryEntry(&core, "ab"),
+        try makeTestHistoryEntry(&core, "cd"),
+    };
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'c'), core.grid.getCellGrid(hgid, 1, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 1, 2).cp);
+}
+
+test "a message panel re-render clears what the previous render left behind" {
+    // resizeGrid keeps the overlapping region when the shape does not change,
+    // so the clear after it is what stops a shorter line from inheriting the
+    // tail of a longer one.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    core.msg_cached_max_width = 4;
+    try seedMsgCacheLine(&core, "abcd");
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 0, 4).cp);
+
+    // Same width, so the grid is not reshaped and nothing is memset for us.
+    core.msg_line_cache.clearRetainingCapacity();
+    try seedMsgCacheLine(&core, "a");
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    for (2..5) |col| {
+        try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, @intCast(col)).cp);
+    }
+
+    // The history panel's width is derived from its content, so both renders
+    // are kept under its floor of 20 to hold the shape constant.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "abcd")};
+    defer for (&long_entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &long_entries));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 0, 4).cp);
+
+    var short_entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "a")};
+    defer for (&short_entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &short_entries));
+
+    try std.testing.expectEqual(@as(u32, 22), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    for (2..5) |col| {
+        try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, @intCast(col)).cp);
+    }
+}
+
+test "only the history panel aborts the flush when registration fails" {
+    // The two panels share the registration call but not its failure policy:
+    // history marks the flush aborted, msg leaves that to its callers. A
+    // shared registration helper must not unify the two.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    // Saturate the placement budget so putSyntheticExternal fails for any new
+    // grid id, without depending on allocation-failure injection.
+    var filler_id: i64 = 1000;
+    while (core.grid.external_grids.count() < grid_mod.MAX_WINDOW_PLACEMENTS) : (filler_id += 1) {
+        try core.grid.external_grids.put(core.alloc, filler_id, .{ .win = 1, .start_row = 0, .start_col = 0 });
+    }
+
+    try seedMsgCacheLine(&core, "hello");
+    core.msg_cached_max_width = 5;
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try std.testing.expect(!renderMsgGridFromCache(&core, 0));
+    try std.testing.expect(!core.flush_aborted);
+    // The grid was resized and written before the failure, so what failed is
+    // the registration and nothing earlier.
+    try std.testing.expectEqual(@as(u32, 7), panelCols(&core, mgid));
+    try std.testing.expect(core.grid.external_grids.get(mgid) == null);
+
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "hello")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(!renderMsgHistoryGrid(&core, &entries));
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.grid.external_grids.get(grid_mod.MSG_HISTORY_GRID_ID) == null);
+}
+
+test "a wide char on the last usable column writes its body without the placeholder" {
+    // The inner guard breaks after the body cell, so the wide glyph overhangs
+    // the right padding column with no cell reserved for its second half, and
+    // everything after it is dropped.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "aaaあz");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(mgid, 0, 4).cp);
+    // Still the cleared space: no placeholder was written for the second half.
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+    // 'z' never fits, on any column.
+    for (0..6) |col| {
+        try std.testing.expect(core.grid.getCellGrid(mgid, 0, @intCast(col)).cp != 'z');
+    }
+
+    // Same edge on the history panel, reachable only at the 80-column cap:
+    // 77 narrow columns, then a wide char whose body lands on the last usable
+    // column. This is the guard that distinguishes the current loop from
+    // writeUtf8ToGrid, which would drop the whole cluster instead.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_line: [81]u8 = undefined;
+    @memset(long_line[0..77], 'a');
+    @memcpy(long_line[77..80], "あ");
+    long_line[80] = 'z';
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, &long_line)};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(hgid, 0, 78).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 79).cp);
+    for (0..80) |col| {
+        try std.testing.expect(core.grid.getCellGrid(hgid, 0, @intCast(col)).cp != 'z');
+    }
+}
+
+test "both message panels stop writing at the last usable column" {
+    // The right padding column is never written. Each panel is filled to its
+    // own edge, since their widths are derived differently, and the trailing
+    // 'z' must be dropped in both.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "abcdz");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+
+    // The history panel's floor is 20, so its edge is only reachable at the
+    // 80-column cap: 78 columns of content, then one codepoint too many.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_line: [79]u8 = undefined;
+    @memset(long_line[0..78], 'a');
+    long_line[78] = 'z';
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, &long_line)};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 78).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 79).cp);
+}
+
+test "the message panel width adds a padding column per side and caps at 80" {
+    // width is content + 2, capped at 80. A content width of 0 is not
+    // reachable through buildMsgLineCache, which floors the cached width at
+    // 10; it is set directly here to pin the formula's lower bound, which a
+    // shared helper could otherwise clamp differently.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "");
+    core.msg_cached_max_width = 0;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 2), panelCols(&core, mgid));
+
+    core.msg_cached_max_width = 200;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, mgid));
+}
+
+test "both message panels register with the top-right placement sentinel" {
+    // -2 in both position fields is what the core registers a message panel
+    // with. The frontends select top-right placement by grid id rather than
+    // by this value, but they do rely on it being negative.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    try seedMsgCacheLine(&core, "hello");
+    core.msg_cached_max_width = 5;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "hello")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    for ([_]i64{ grid_mod.MESSAGE_GRID_ID, grid_mod.MSG_HISTORY_GRID_ID }) |gid| {
+        const info = core.grid.external_grids.get(gid).?;
+        try std.testing.expectEqual(@as(i64, 1), info.win);
+        try std.testing.expectEqual(@as(i32, -2), info.start_row);
+        try std.testing.expectEqual(@as(i32, -2), info.start_col);
     }
 }
