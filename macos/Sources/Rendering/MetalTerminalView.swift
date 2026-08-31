@@ -1702,7 +1702,7 @@ final class MetalTerminalView: MTKView {
             return
         }
 
-        // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match vertexgen.ndc()).
+        // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match VH.ndc in flush.zig).
         let cellHpx = CGFloat(renderer.cellHeightPx)
     
         let yFromTopPx = CGFloat(rowStart) * cellHpx
