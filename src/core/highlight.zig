@@ -185,9 +185,19 @@ pub const Highlights = struct {
 
     // NOTE: get() remains unchanged (returns fg/bg only) because the current
     // binary frame format only transports fg/bg. This keeps unrelated parts intact.
-    pub fn get(self: *const Highlights, id: u32) ResolvedAttr {
-        const raw = self.map.get(id) orelse Attr{};
-
+    /// Resolve a raw attribute's foreground and background.
+    ///
+    /// Shared by get() and getWithStyles(), which carried byte-identical
+    /// copies of this. The order matters and is pinned by a test: blend mixes
+    /// the background toward the default first, and only then does reverse
+    /// swap the pair. Reversing first would blend the foreground instead.
+    ///
+    /// Blend applies only when bg was set explicitly -- blending the default
+    /// against itself is a no-op that would still cost the arithmetic.
+    ///
+    /// `inline` because getWithStyles is per-cell on the hl-cache overflow
+    /// path; the body is branch-and-shift with no allocation.
+    inline fn resolveFgBg(self: *const Highlights, raw: Attr) ResolvedAttr {
         var fg: u32 = raw.fg orelse self.default_fg;
         var bg: u32 = raw.bg orelse self.default_bg;
 
@@ -204,27 +214,21 @@ pub const Highlights = struct {
         return .{ .fg = fg, .bg = bg };
     }
 
+    pub fn get(self: *const Highlights, id: u32) ResolvedAttr {
+        return self.resolveFgBg(self.map.get(id) orelse Attr{});
+    }
+
     // Sentinel value indicating "special color not set" (0xFFFFFFFF is outside valid RGB range 0x000000-0xFFFFFF)
     pub const SP_NOT_SET: u32 = 0xFFFFFFFF;
 
     pub fn getWithStyles(self: *const Highlights, id: u32) ResolvedAttrWithStyles {
         const raw = self.map.get(id) orelse Attr{};
-
-        var fg: u32 = raw.fg orelse self.default_fg;
-        var bg: u32 = raw.bg orelse self.default_bg;
+        const base = self.resolveFgBg(raw);
+        const fg = base.fg;
+        const bg = base.bg;
         // Use SP_NOT_SET sentinel for "not set" - decoration code will fall back to fg
         // This correctly handles the case where special is explicitly set to black (0x000000)
         const sp: u32 = raw.sp orelse SP_NOT_SET;
-
-        if (raw.blend != 0 and raw.bg != null) {
-            bg = blendRgb(self.default_bg, bg, raw.blend);
-        }
-
-        if (raw.reverse) {
-            const tmp = fg;
-            fg = bg;
-            bg = tmp;
-        }
 
         // Pre-compute style_flags (matching STYLE_* constants in nvim_core.zig)
         var style_flags: u8 = 0;
@@ -254,3 +258,47 @@ pub const Highlights = struct {
         };
     }
 };
+
+test "colour resolution blends before it reverses, and both paths agree" {
+    // highlight.zig had no tests at all, and get() and getWithStyles()
+    // carried byte-identical copies of this arithmetic. Pin the order and the
+    // agreement before either is shared, because nothing else would catch a
+    // blend applied after the swap or a divergence between the two.
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    hl.setDefaults(0x111111, 0x222222, null);
+
+    // blend=50 mixes bg toward default_bg; reverse then swaps the result into
+    // fg. Applying reverse first would blend the FOREGROUND instead, so the
+    // two orders give different answers and this pins which one runs.
+    try hl.define(1, 0xFF0000, 0x00FF00, null, true, 50, .{}, false);
+    const blended_bg = blendRgb(0x222222, 0x00FF00, 50);
+
+    const a = hl.get(1);
+    try std.testing.expectEqual(blended_bg, a.fg);
+    try std.testing.expectEqual(@as(u32, 0xFF0000), a.bg);
+
+    // getWithStyles must resolve fg/bg identically -- that agreement is the
+    // whole reason the two bodies can share one implementation.
+    const b = hl.getWithStyles(1);
+    try std.testing.expectEqual(a.fg, b.fg);
+    try std.testing.expectEqual(a.bg, b.bg);
+
+    // blend applies only when bg was explicitly set: a null bg keeps the
+    // default untouched even with a non-zero blend.
+    //
+    // Note this assertion cannot distinguish the guard being present from it
+    // being absent, because blending the default against itself is the
+    // identity for any transparency. It pins the resulting value, not the
+    // guard. The guard's own effect is pinned by the explicit-bg case above,
+    // where blending moves the value away from what a missing blend would
+    // leave.
+    try hl.define(2, 0xFF0000, null, null, false, 50, .{}, false);
+    try std.testing.expectEqual(@as(u32, 0x222222), hl.get(2).bg);
+    try std.testing.expectEqual(hl.get(2).bg, hl.getWithStyles(2).bg);
+
+    // An unknown id resolves to the defaults through both entry points.
+    try std.testing.expectEqual(@as(u32, 0x111111), hl.get(999).fg);
+    try std.testing.expectEqual(@as(u32, 0x222222), hl.get(999).bg);
+    try std.testing.expectEqual(@as(u32, 0x111111), hl.getWithStyles(999).fg);
+}
