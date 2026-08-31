@@ -1975,10 +1975,13 @@ fn shapeClustersValid(clusters: []const u32, glyph_count: usize, scalar_count: u
     if (glyph_count == 0 or scalar_count == 0) return false;
     if (clusters[0] != 0) return false;
 
+    // clusters[0] is 0 (checked above) and previous starts at 0, so the
+    // monotonicity test is already vacuous on the first glyph -- it needs no
+    // index guard, and without one the loop needs no index.
     var previous: u32 = 0;
-    for (clusters[0..glyph_count], 0..) |cluster, i| {
+    for (clusters[0..glyph_count]) |cluster| {
         if (cluster >= scalar_count) return false;
-        if (i != 0 and cluster < previous) return false;
+        if (cluster < previous) return false;
         previous = cluster;
     }
     return true;
@@ -8292,7 +8295,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     // anchor_row/col are local to anchor_grid. Convert to global (grid 1)
     // coordinates using win_pos so the frontend can position the popup
     // relative to the terminal view without knowing about sub-grid offsets.
-    const is_cmdline_completion = (anchor_grid < 0 or anchor_grid == -1);
+    const is_cmdline_completion = anchor_grid < 0;
     var start_row: i32 = undefined;
     var start_col: i32 = undefined;
     if (is_cmdline_completion) {

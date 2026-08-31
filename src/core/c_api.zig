@@ -2808,7 +2808,6 @@ pub export fn zonvie_shader_compile_glsl(
             error.SpirvGenFailed => buildShaderError("SPIR-V generation failed"),
             error.CrossCompileFailed => buildShaderError("SPIR-V cross-compile failed"),
             error.OutOfMemory => buildShaderError("out of memory"),
-            error.NotImplemented => buildShaderError("shader compiler not implemented"),
         };
     };
     return buildShaderSuccess(gpa, compiled);

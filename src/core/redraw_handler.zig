@@ -132,10 +132,11 @@ fn extractAllCodepoints(utf8: []const u8, buf: *[16]u32) !u32 {
         return error.CellClusterTooLong;
     }
 
-    if (count == 0) {
-        buf[0] = ' ';
-        return 1;
-    }
+    // The empty-input case returned at the top, so the loop above ran at
+    // least once and every one of its paths increments count. Asserted rather
+    // than branched: callers read buf[0..count], and this is what says buf[0]
+    // is initialized.
+    std.debug.assert(count > 0);
     return count;
 }
 
