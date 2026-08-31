@@ -125,6 +125,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // consumeFlushFailed()), which cancels the bracket instead of
     // committing it and calls zonvie_core_force_resend + schedules a retry.
     private(set) var flushFailed: Bool = false // Core thread only
+    // ExternalGridView carries a deliberately parallel ledger and
+    // provisioning pass. The two are NOT unified: the pure parts already live
+    // as shared free functions in MetalTypes.swift
+    // (surfacePhysicalCapacityRow, surfaceRowCapacityIsPrepared,
+    // surfaceSafeNeededBytes, makeSurfaceRowProvisionPlan), and what is left
+    // is each class's own concurrency contract -- a different lock, a
+    // different source for the flush bracket, and here an extra lockHeld
+    // parameter for the re-entrant caller. Merging those into one ledger type
+    // would put both surfaces under a single lock discipline that neither one
+    // currently has, in the path that produced the scroll freeze fixed by
+    // de6c402 and the ext-grid capacity gate stall. Reviewed under the
+    // 2026-08-25 audit, observation 1, finding 037; left duplicated on
+    // purpose.
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
