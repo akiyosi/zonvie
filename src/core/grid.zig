@@ -503,6 +503,93 @@ pub const StatusChannel = enum(u2) {
     }
 };
 
+/// Shift a rectangle of cells vertically and blank the rows it vacates.
+///
+/// `cells` is row-major with stride `stride`; the rectangle is rows
+/// `[top, bot)` by columns `[left, right)`. Positive `rows` moves content up,
+/// negative moves it down, and a shift at or past the region height blanks the
+/// whole rectangle. Callers pre-clamp the bounds.
+///
+/// Only the cells are shared between GridBuf.scroll and Grid.scroll. Dirty
+/// marking stays with each caller: the main grid is excluded from the
+/// frontend's row-slot remap (see checkScrollFastPath) so it must repaint the
+/// whole region, while the sub-grid path gets that remap and repaints only the
+/// vacated band -- and, having done so, must shift its vertex-row ledger
+/// itself. Unifying either of those here would silently swap one contract for
+/// the other.
+fn scrollCells(
+    cells: []Cell,
+    stride: u32,
+    top: u32,
+    bot: u32,
+    left: u32,
+    right: u32,
+    rows: i32,
+    blank: Cell,
+) void {
+    const height: u32 = bot - top;
+    const width: u32 = right - left;
+    const shift: u32 = scrollShift(rows, height);
+
+    const rowSlice = struct {
+        fn f(buf: []Cell, s: u32, r: u32, l: u32, w: u32) []Cell {
+            const off: usize = @as(usize, r) * @as(usize, s) + @as(usize, l);
+            return buf[off .. off + @as(usize, w)];
+        }
+    }.f;
+
+    if (shift >= height) {
+        var rr: u32 = top;
+        while (rr < bot) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+        return;
+    }
+
+    if (rows > 0) {
+        // Move up by 'shift'
+        var r: u32 = 0;
+        while (r < height - shift) : (r += 1) {
+            std.mem.copyForwards(
+                Cell,
+                rowSlice(cells, stride, top + r, left, width),
+                rowSlice(cells, stride, top + shift + r, left, width),
+            );
+        }
+        var rr: u32 = bot - shift;
+        while (rr < bot) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+    } else {
+        // Move down by 'shift' (bottom-up so overlapping rows survive)
+        var r: u32 = height - shift;
+        while (r > 0) {
+            r -= 1;
+            std.mem.copyForwards(
+                Cell,
+                rowSlice(cells, stride, top + shift + r, left, width),
+                rowSlice(cells, stride, top + r, left, width),
+            );
+        }
+        var rr: u32 = top;
+        while (rr < top + shift) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+    }
+}
+
+/// Magnitude of a scroll, as the three shift sites need it.
+///
+/// `rows` is negated when negative, except that `minInt(i32)` has no positive
+/// counterpart -- negating it overflows -- so it reports `height`, the
+/// smallest value that still satisfies every caller's `shift >= height` test
+/// and sends them down the clear-the-whole-region path.
+fn scrollShift(rows: i32, height: u32) u32 {
+    if (rows == std.math.minInt(i32)) return height;
+    const a: i32 = if (rows < 0) -rows else rows;
+    return @as(u32, @intCast(a));
+}
+
 pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .empty,
     /// Indexed by StatusChannel.
@@ -897,13 +984,7 @@ pub const GridBuf = struct {
         if (top >= bot or left >= right) return;
 
         const height: u32 = bot - top;
-        const width: u32 = right - left;
-
-        const shift: u32 = blk: {
-            if (rows == std.math.minInt(i32)) break :blk height;
-            const a: i32 = if (rows < 0) -rows else rows;
-            break :blk @as(u32, @intCast(a));
-        };
+        const shift: u32 = scrollShift(rows, height);
 
         // Keep the last-submitted vertex ledger aligned with the frontend's
         // row-slot scroll. This is allocation-free and touches only the same
@@ -937,75 +1018,21 @@ pub const GridBuf = struct {
         }
 
         if (shift >= height) {
+            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+            // The entire scrolled region is vacated (no surviving shifted
+            // content), unlike the shift < height case below — mark every
+            // row dirty here too, or these blanked cells never reach the
+            // frontend and the GPU-side region keeps its stale pre-scroll
+            // content forever (core and GPU permanently disagree).
             var rr: u32 = top;
             while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-                // The entire scrolled region is vacated (no surviving shifted
-                // content), unlike the shift < height case below — mark every
-                // row dirty here too, or these blanked cells never reach the
-                // frontend and the GPU-side region keeps its stale pre-scroll
-                // content forever (core and GPU permanently disagree).
-                if (rr < self.dirty_rows.bit_length) {
-                    self.dirty_rows.set(rr);
-                }
+                if (rr < self.dirty_rows.bit_length) self.dirty_rows.set(rr);
             }
             self.dirty = true;
             return;
         }
 
-        if (rows > 0) {
-            // Move up by 'shift'
-            var r: u32 = 0;
-            while (r < height - shift) : (r += 1) {
-                const src_row = top + shift + r;
-                const dst_row = top + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // clear bottom
-            var rr: u32 = bot - shift;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        } else {
-            // Move down by 'shift' (bottom-up)
-            var r: u32 = height - shift;
-            while (r > 0) {
-                r -= 1;
-
-                const src_row = top + r;
-                const dst_row = top + shift + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // clear top
-            var rr: u32 = top;
-            while (rr < top + shift) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        }
+        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         // Mark only vacated rows as dirty — non-vacated rows are just shifted
         // and the frontend's row slot remapping handles the visual shift.
@@ -1905,12 +1932,8 @@ pub const Grid = struct {
         if (grid_overflow_count == 0) return;
         if (rows_delta == 0 or top >= bot or left >= right) return;
 
-        const shift: u32 = blk: {
-            if (rows_delta == std.math.minInt(i32)) break :blk bot - top;
-            const a: i32 = if (rows_delta < 0) -rows_delta else rows_delta;
-            break :blk @as(u32, @intCast(a));
-        };
         const height = bot - top;
+        const shift: u32 = scrollShift(rows_delta, height);
         if (shift >= height) {
             self.clearOverflowRect(grid_id, top, bot, left, right);
             return;
@@ -2280,25 +2303,14 @@ pub const Grid = struct {
         if (top >= bot or left >= right) return;
 
         const height: u32 = bot - top;
-        const width: u32 = right - left;
 
         if (rows == 0) return;
 
-        const shift: u32 = blk: {
-            // Handle minInt safely (treat as very large shift => clears region)
-            if (rows == std.math.minInt(i32)) break :blk height;
-            const a: i32 = if (rows < 0) -rows else rows;
-            break :blk @as(u32, @intCast(a));
-        };
+        const shift: u32 = scrollShift(rows, height);
 
         // If the shift exceeds region height, everything is scrolled out.
         if (shift >= height) {
-            var rr: u32 = top;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
+            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
             // Clear overflow for the entire scrolled-out region
             self.clearOverflowRect(1, top, bot, left, right);
             // Mark every row in the region dirty. The caller (scrollGrid)
@@ -2314,57 +2326,7 @@ pub const Grid = struct {
             return;
         }
 
-        if (rows > 0) {
-            // Move up by 'shift'.
-            var r: u32 = 0;
-            while (r < height - shift) : (r += 1) {
-                const src_row = top + shift + r;
-                const dst_row = top + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // Clear scrolled-in area at bottom (optional but safe).
-            var rr: u32 = bot - shift;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        } else {
-            // Move down by 'shift' (copy bottom-up to avoid overwriting).
-            var r: u32 = height - shift;
-            while (r > 0) {
-                r -= 1;
-
-                const src_row = top + r;
-                const dst_row = top + shift + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // Clear scrolled-in area at top (optional but safe).
-            var rr: u32 = top;
-            while (rr < top + shift) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        }
+        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         self.markDirtyRect(top, bot);
 
@@ -5153,4 +5115,103 @@ test "every status channel stores, replaces and dirties independently" {
     for (StatusChannel.all) |channel| {
         try std.testing.expectEqualStrings(@tagName(channel), grid.message_state.status_content[channel.index()].items[0].text);
     }
+}
+
+test "scrollShift takes the magnitude and treats minInt as clearing the region" {
+    // Written out three times before: GridBuf.scroll, Grid.scroll and
+    // Grid.scrollOverflow. The minInt arm is the reason it is not just @abs --
+    // negating minInt overflows, so it saturates to the region height, which
+    // every caller then reads as "shift >= height, clear the whole region".
+    const height: u32 = 10;
+
+    try std.testing.expectEqual(@as(u32, 3), scrollShift(3, height));
+    try std.testing.expectEqual(@as(u32, 3), scrollShift(-3, height));
+    try std.testing.expectEqual(@as(u32, 0), scrollShift(0, height));
+
+    // At and beyond the height the callers take their clear-everything branch;
+    // the magnitude is still reported faithfully rather than clamped.
+    try std.testing.expectEqual(height, scrollShift(10, height));
+    try std.testing.expectEqual(@as(u32, 11), scrollShift(11, height));
+    try std.testing.expectEqual(@as(u32, 11), scrollShift(-11, height));
+
+    // minInt cannot be negated, so it reports the height -- the smallest value
+    // that still trips every caller's `shift >= height` test.
+    try std.testing.expectEqual(height, scrollShift(std.math.minInt(i32), height));
+    // maxInt is representable and must come back unchanged, not saturated.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(i32)), scrollShift(std.math.maxInt(i32), height));
+    // minInt + 1 is the largest negative that CAN be negated: it must not be
+    // confused with minInt and collapsed to the height.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(i32)), scrollShift(std.math.minInt(i32) + 1, height));
+
+    // A zero-height region: minInt still reports the height, which is 0, and
+    // `shift >= height` holds, so callers clear nothing and return.
+    try std.testing.expectEqual(@as(u32, 0), scrollShift(std.math.minInt(i32), 0));
+}
+
+test "scrollCells shifts a rect and blanks what it vacates" {
+    // The cell-shifting core was written out twice, in GridBuf.scroll and
+    // Grid.scroll, character for character including the offset expression.
+    // Only the cells are shared: dirty marking and the vertex-row ledger stay
+    // with each caller because their contracts genuinely differ -- the main
+    // grid is excluded from the frontend's row-slot remap and must repaint the
+    // whole region, the sub-grid path is not and repaints only the vacated band.
+    const cols: u32 = 4;
+    const rows: u32 = 4;
+    const blank: Cell = .{ .cp = ' ', .hl = 0 };
+
+    // Distinct content per cell so a shifted row is traceable to its source.
+    var cells: [16]Cell = undefined;
+    const seed = struct {
+        fn f(buf: []Cell) void {
+            for (buf, 0..) |*c, i| c.* = .{ .cp = @intCast('a' + i), .hl = @intCast(i) };
+        }
+    }.f;
+
+    // Scroll up by one over the whole grid: row r takes row r+1, last is blank.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, 1, blank);
+    for (0..3) |r| {
+        for (0..cols) |c| {
+            try std.testing.expectEqual(@as(u32, @intCast('a' + (r + 1) * cols + c)), cells[r * cols + c].cp);
+        }
+    }
+    for (0..cols) |c| try std.testing.expectEqual(blank, cells[3 * cols + c]);
+
+    // Scroll down by one: row r takes row r-1, first is blank.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, -1, blank);
+    for (1..4) |r| {
+        for (0..cols) |c| {
+            try std.testing.expectEqual(@as(u32, @intCast('a' + (r - 1) * cols + c)), cells[r * cols + c].cp);
+        }
+    }
+    for (0..cols) |c| try std.testing.expectEqual(blank, cells[c]);
+
+    // A shift at or past the region height blanks the region outright.
+    seed(&cells);
+    scrollCells(&cells, cols, 1, 3, 0, cols, 2, blank);
+    for (0..cols) |c| {
+        // Rows outside [1,3) are untouched.
+        try std.testing.expectEqual(@as(u32, @intCast('a' + c)), cells[c].cp);
+        try std.testing.expectEqual(@as(u32, @intCast('a' + 3 * cols + c)), cells[3 * cols + c].cp);
+        try std.testing.expectEqual(blank, cells[1 * cols + c]);
+        try std.testing.expectEqual(blank, cells[2 * cols + c]);
+    }
+
+    // A column sub-range must leave the columns outside it alone -- this is
+    // what the `left`/`right` half of the offset expression is for.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 1, 3, 1, blank);
+    for (0..rows) |r| {
+        try std.testing.expectEqual(@as(u32, @intCast('a' + r * cols)), cells[r * cols].cp);
+        try std.testing.expectEqual(@as(u32, @intCast('a' + r * cols + 3)), cells[r * cols + 3].cp);
+    }
+    try std.testing.expectEqual(@as(u32, @intCast('a' + 1 * cols + 1)), cells[0 * cols + 1].cp);
+    try std.testing.expectEqual(blank, cells[3 * cols + 1]);
+    try std.testing.expectEqual(blank, cells[3 * cols + 2]);
+
+    // minInt is the caller's "clear everything" signal and must not be negated.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, std.math.minInt(i32), blank);
+    for (cells) |cell| try std.testing.expectEqual(blank, cell);
 }
