@@ -2908,8 +2908,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // reader-admission gate (every future beginAtlasWrite() would
             // time out waiting for a read that will never leave).
             let atlasReadRenderer = mainTerminalView?.renderer
-            let atlasTex = atlasReadRenderer?.beginAtlasExternalRead(commandBuffer: cmd, snapshot: { committed.atlasTextureSnapshot }) ?? nil
-            guard atlasTex != nil else {
+            // Bound with `guard let` rather than a plain guard so the ten
+            // downstream `if let tex = atlasTex` / `atlasTex != nil` gates
+            // become compile errors rather than dead conditionals. Those gates
+            // encode the begin/end pairing contract -- nil means no read was
+            // registered, so calling endAtlasExternalRead() anyway would
+            // over-release the DispatchGroup. Keeping the binding non-optional
+            // makes the compiler enforce what the comments used to.
+            guard let atlasTex = atlasReadRenderer?.beginAtlasExternalRead(commandBuffer: cmd, snapshot: { committed.atlasTextureSnapshot }) ?? nil else {
                 // A pending writer intentionally rejects new reader admission
                 // until already-in-flight readers drain. Commit the otherwise
                 // empty command buffer for prompt driver resource release, then
@@ -3013,9 +3019,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // The atlas texture is never sampled on this path, so the read
                 // registered above (if any) can be released immediately rather
                 // than waiting for this now-empty command buffer's completion.
-                if atlasTex != nil {
-                    atlasReadRenderer?.endAtlasExternalRead()
-                }
+                atlasReadRenderer?.endAtlasExternalRead()
                 hasPresentedOnce = false
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
@@ -3036,9 +3040,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // Bind atlas texture (also captured for bloom extract pass and
             // the cursor pass below — registered/snapshotted once above,
             // right after cmd was created).
-            if let tex = atlasTex {
-                enc.setFragmentTexture(tex, index: 0)
-            }
+            enc.setFragmentTexture(atlasTex, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
 
             // Bind scroll offset data via shared helper (no GPU/CPU race)
@@ -3326,9 +3328,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     ) { enc in
                     // Set up atlas and scroll offsets for extract pass
                     // NOTE: DrawableSize (fragment buffer 0) is already set by the shared helper
-                    if let tex = atlasTex {
-                        enc.setFragmentTexture(tex, index: 0)
-                    }
+                    enc.setFragmentTexture(atlasTex, index: 0)
                     enc.setFragmentSamplerState(self.sampler!, index: 0)
 
                     bindSingleSurfaceScrollOffset(encoder: enc, offset: scrollOffsetSnapshot)
@@ -3366,15 +3366,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             guard glowPassSucceeded else {
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3399,7 +3396,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // if the view is deallocated before the GPU finishes.
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
@@ -3411,9 +3407,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // hadAtlasRead: when atlasTex was nil, no read was ever
                     // registered — calling endAtlasExternalRead() anyway
                     // would over-release the DispatchGroup.
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3518,15 +3512,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // Keep the consumed rows/revision pending for another draw.
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3550,15 +3541,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 guard let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) else {
                     let sem = inflightSemaphore
                     let tbLock = tripleBufferLock
-                    let hadAtlasRead = atlasTex != nil
                     cmd.addCompletedHandler { [weak self] _ in
                         tbLock.lock()
                         self?.completeSurfaceGpuReadLocked(csi)
                         tbLock.unlock()
                         sem.signal()
-                        if hadAtlasRead {
-                            atlasReadRenderer?.endAtlasExternalRead()
-                        }
+                        atlasReadRenderer?.endAtlasExternalRead()
                     }
                     cmd.commit()
                     gpuSubmitted = true
@@ -3575,9 +3563,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // committed.atlasTextureSnapshot) instead of fetching
                 // fresh here — this cursor pass is still part of the
                 // same draw call/generation as the main pass.
-                if let tex = atlasTex {
-                    cursorEnc.setFragmentTexture(tex, index: 0)
-                }
+                cursorEnc.setFragmentTexture(atlasTex, index: 0)
                 cursorEnc.setFragmentSamplerState(sampler, index: 0)
 
                 bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: scrollOffsetSnapshot)
@@ -3611,9 +3597,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // on atlasTex != nil: when nil, no read was ever
                 // registered — calling endAtlasExternalRead() anyway would
                 // over-release the DispatchGroup.
-                if atlasTex != nil {
-                    atlasReadRenderer?.endAtlasExternalRead()
-                }
+                atlasReadRenderer?.endAtlasExternalRead()
                 if completed.status != .completed {
                     DispatchQueue.main.async { [weak self] in
                         self?.hasPresentedOnce = false
