@@ -431,6 +431,31 @@ comptime {
     );
 }
 
+const RowRange = struct {
+    start: usize,
+    end: usize,
+};
+
+/// The rows of `csg` that fall inside a `row_count`-row viewport, or null when
+/// it contributes none.
+///
+/// The main row index is built in five passes over the same slice, and each
+/// one used to carry its own copy of this predicate. Only one of the couplings
+/// between those passes is guarded by an assert; the rest would corrupt the
+/// index silently if the copies ever disagreed, so they share this one.
+///
+/// The returned rows are CLAMPED. Two of the five passes want the guard but
+/// then record or compare the subgrid's own unclamped row_start/row_end -- the
+/// layout snapshot describes the cache entry, not the part of it that happens
+/// to be on screen -- so they take the range and discard it.
+fn mainSubgridVisibleRowRange(csg: CachedSubgrid, row_count: usize) ?RowRange {
+    const start: usize = @min(@as(usize, csg.row_start), row_count);
+    const end: usize = @min(@as(usize, csg.row_end), row_count);
+    // The zero-size terms are defensive: the builder already drops those.
+    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) return null;
+    return .{ .start = start, .end = end };
+}
+
 /// Size a CSR buffer exactly and, for the counts array, zero it.
 ///
 /// `ensureTotalCapacityPrecise` never shrinks, so the explicit length
@@ -565,9 +590,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
                 var matches = true;
                 var old_index: usize = 0;
                 for (cached) |csg| {
-                    const start: usize = @min(@as(usize, csg.row_start), row_count);
-                    const end: usize = @min(@as(usize, csg.row_end), row_count);
-                    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+                    _ = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
                     if (old_index >= core.main_subgrid_row_layout.items.len) {
                         matches = false;
                         break;
@@ -590,11 +613,9 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     var ref_count: usize = 0;
     var layout_count: usize = 0;
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
         layout_count += 1;
-        const coverage = end - start;
+        const coverage = range.end - range.start;
         ref_count = std.math.add(usize, ref_count, coverage) catch return error.LayoutTooComplex;
     }
     const index_bytes = mainSubgridRowIndexByteSize(row_count, ref_count, layout_count) orelse return error.LayoutTooComplex;
@@ -611,10 +632,8 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     try csrResizeExact(core.alloc, &core.main_subgrid_row_offsets, offset_count, true);
 
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
-        for (start..end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
+        for (range.start..range.end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
     }
     csrOffsetsFromCounts(core.main_subgrid_row_offsets.items);
 
@@ -625,10 +644,8 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     // cached is already sorted back-to-front, so inserting each entry into
     // every covered row preserves composition order without per-row sorting.
     for (cached, 0..) |csg, csg_index| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
-        for (start..end) |row| {
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
+        for (range.start..range.end) |row| {
             const dst = core.main_subgrid_row_write_offsets.items[row];
             core.main_subgrid_row_indices.items[dst] = csg_index;
             core.main_subgrid_row_write_offsets.items[row] = dst + 1;
@@ -638,9 +655,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     try core.main_subgrid_row_layout.ensureTotalCapacityPrecise(core.alloc, layout_count);
     core.main_subgrid_row_layout.items.len = 0;
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        _ = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
         core.main_subgrid_row_layout.appendAssumeCapacity(.{
             .grid_id = csg.grid_id,
             .row_start = csg.row_start,
@@ -13184,6 +13199,50 @@ test "external float persistent scratch partitions share one 8 MiB cap" {
     );
 }
 
+test "the layout snapshot records unclamped rows even when the subgrid overhangs" {
+    // Two of the five passes use the visibility filter only as a guard and
+    // then read csg.row_start / csg.row_end UNCLAMPED -- pass 5 stores them,
+    // pass 1 compares against what pass 5 stored. Folding the filter into a
+    // helper that returns clamped rows must not tempt either into using the
+    // clamped value: the snapshot would then stop matching the cache entry it
+    // describes, and the structural fast path would answer wrongly.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
+    var cached = [_]CachedSubgrid{
+        // Overhangs the 4-row viewport by two rows.
+        .{ .grid_id = 10, .row_start = 2, .row_end = 6, .col_start = 0, .sg_cols = 1, .sg_rows = 4, .cells = cells[0..].ptr, .margin_top = 0, .margin_bottom = 0 },
+    };
+    try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
+
+    // Only the two visible rows are indexed...
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 0, 1, 2 }, core.main_subgrid_row_offsets.items);
+    // ...but the snapshot keeps the row span the entry actually declares.
+    try std.testing.expectEqual(@as(usize, 1), core.main_subgrid_row_layout.items.len);
+    try std.testing.expectEqual(@as(u32, 2), core.main_subgrid_row_layout.items[0].row_start);
+    try std.testing.expectEqual(@as(u32, 6), core.main_subgrid_row_layout.items[0].row_end);
+
+    // Pass 4 wrote the clamped rows' references, one per visible row.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.main_subgrid_row_indices.items);
+
+    // Pass 1 is reachable only through the limited entry point:
+    // ensureMainSubgridRowIndex deliberately clears main_subgrid_row_index_valid
+    // before delegating, and memoises above that, so it can never take the
+    // structural path. Poison a CSR slot to tell the fast path apart from an
+    // identical rebuild -- the fast path returns without touching it. Pass 1
+    // compares against the rows pass 5 stored, so comparing clamped rows on
+    // either side would mismatch and force the rebuild that overwrites this.
+    core.main_subgrid_row_offsets.items[3] = 99;
+    try std.testing.expect(try ensureMainSubgridRowIndexWithLimit(
+        &core,
+        &cached,
+        4,
+        MAX_MAIN_SUBGRID_ROW_INDEX_BYTES,
+    ));
+    try std.testing.expectEqual(@as(usize, 99), core.main_subgrid_row_offsets.items[3]);
+}
+
 test "main subgrid row index preserves layer order and updates on layout change" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -14911,4 +14970,69 @@ test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cur
     try std.testing.expectEqualSlices(usize, &.{0}, &empty_offsets);
     try csrSeedWriteOffsets(alloc, &write_offsets, &empty_offsets, 0);
     try std.testing.expectEqual(@as(usize, 0), write_offsets.items.len);
+}
+
+test "mainSubgridVisibleRowRange clamps to the viewport and rejects the invisible" {
+    // The main row-index builder walks `cached` five times and each pass
+    // repeated this filter by hand. Five copies of a three-term predicate is
+    // one edit away from the passes disagreeing, and only one of the four
+    // couplings between them is guarded by an explicit assert -- the rest
+    // corrupt the index silently. This is the single copy they all call now.
+    const row_count: usize = 10;
+    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
+    const mk = struct {
+        fn f(cp: [*]const grid_mod.Cell, row_start: u32, row_end: u32, sg_cols: u32, sg_rows: u32) CachedSubgrid {
+            return .{
+                .grid_id = 2,
+                .row_start = row_start,
+                .row_end = row_end,
+                .col_start = 0,
+                .sg_cols = sg_cols,
+                .sg_rows = sg_rows,
+                .cells = cp,
+                .margin_top = 0,
+                .margin_bottom = 0,
+            };
+        }
+    }.f;
+    const cp = cells[0..].ptr;
+
+    // Fully inside: the range is the subgrid's own rows.
+    const inside = mainSubgridVisibleRowRange(mk(cp, 2, 5, 4, 3), row_count).?;
+    try std.testing.expectEqual(@as(usize, 2), inside.start);
+    try std.testing.expectEqual(@as(usize, 5), inside.end);
+
+    // Straddling the bottom edge: the end clamps, the start does not move.
+    const straddle = mainSubgridVisibleRowRange(mk(cp, 8, 14, 4, 6), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), straddle.start);
+    try std.testing.expectEqual(row_count, straddle.end);
+
+    // Both sides of the bottom boundary.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 10, 12, 4, 2), row_count) == null);
+    const flush_bottom = mainSubgridVisibleRowRange(mk(cp, 8, 10, 4, 2), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), flush_bottom.start);
+    try std.testing.expectEqual(row_count, flush_bottom.end);
+
+    // row_end is built with a saturating add, so a hostile window position
+    // can present it already saturated. The clamp must absorb that.
+    const saturated = mainSubgridVisibleRowRange(mk(cp, 8, std.math.maxInt(u32), 4, 6), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), saturated.start);
+    try std.testing.expectEqual(row_count, saturated.end);
+
+    // Entirely below the viewport: both clamp to row_count, so start >= end.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 12, 16, 4, 4), row_count) == null);
+
+    // Zero-sized in either dimension. The production builder already filters
+    // these out, so both arms are defensive -- do not prune them as dead.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 0, 3), row_count) == null);
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 4, 0), row_count) == null);
+
+    // The `start >= end` arm on its own. The record is deliberately
+    // inconsistent with the production row_end = row_start + sg_rows
+    // invariant so that neither size term can carry this case.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 3, 3, 4, 3), row_count) == null);
+
+    // A zero-row viewport admits nothing, which is a real state: neither the
+    // caller nor onFlush guards rows == 0.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 0, 3, 4, 3), 0) == null);
 }
