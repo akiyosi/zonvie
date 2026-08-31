@@ -1046,6 +1046,42 @@ pub inline fn simdFillSequentialFrom(out: [*]u32, count: usize, start: u32) void
     }
 }
 
+/// Resolve one hl id through the per-flush memo array, filling it on a miss.
+///
+/// Written once and called from every composition path. The array is indexed
+/// directly by hl id, so ids at or past its length fall back to a live lookup
+/// and are not memoized -- that fallback is the reason the bound is checked
+/// here rather than by the caller.
+///
+/// `inline` because this sits inside per-cell and per-run loops on the flush
+/// path; the comptime `count` branch folds away where the caller does not
+/// keep hit/miss statistics.
+inline fn resolveHlCached(
+    core: *Core,
+    hl_id: u32,
+    hl_cache: []highlight.ResolvedAttrWithStyles,
+    hl_valid: []bool,
+    hl_cache_limit: u32,
+    comptime count: bool,
+    hits: *u32,
+    misses: *u32,
+) highlight.ResolvedAttrWithStyles {
+    if (hl_id < hl_cache_limit) {
+        if (hl_valid[hl_id]) {
+            if (count) hits.* += 1;
+            return hl_cache[hl_id];
+        }
+        if (count) misses.* += 1;
+        const resolved = core.hl.getWithStyles(hl_id);
+        hl_cache[hl_id] = resolved;
+        hl_valid[hl_id] = true;
+        return resolved;
+    }
+    // Beyond the memo array: resolve live, every time.
+    if (count) misses.* += 1;
+    return core.hl.getWithStyles(hl_id);
+}
+
 /// Compose one main-grid row into `dst`, run-length batched by hl_id.
 ///
 /// The row-mode and whole-screen paths differ only in where the row lands:
@@ -1086,22 +1122,7 @@ inline fn composeMainRowRuns(
         }
 
         // Get resolved attributes once for the entire run
-        const a = blk: {
-            if (run_hl < hl_cache_limit) {
-                if (hl_valid[run_hl]) {
-                    if (count_hl_cache) hl_hits.* += 1;
-                    break :blk hl_cache[run_hl];
-                }
-                if (count_hl_cache) hl_misses.* += 1;
-                const resolved = core.hl.getWithStyles(run_hl);
-                hl_cache[run_hl] = resolved;
-                hl_valid[run_hl] = true;
-                break :blk resolved;
-            }
-            // Fallback for hl_id >= hl_cache_limit
-            if (count_hl_cache) hl_misses.* += 1;
-            break :blk core.hl.getWithStyles(run_hl);
-        };
+        const a = resolveHlCached(core, run_hl, hl_cache, hl_valid, hl_cache_limit, count_hl_cache, hl_hits, hl_misses);
 
         // Batch write all cells in the run with same fg/bg/sp/style_flags.
         // Only the scalar differs per cell.
@@ -4862,22 +4883,7 @@ pub const FlushCtx = struct {
                                         const src_i: usize = @as(usize, r2) * @as(usize, csg.sg_cols) + @as(usize, c2);
                                         const cell = csg.cells[src_i];
                                         // Use HL cache with direct index for O(1) access
-                                        const a2 = blk2: {
-                                            if (cell.hl < hl_cache_limit) {
-                                                if (hl_valid[cell.hl]) {
-                                                    perf_hl_cache_hits += 1;
-                                                    break :blk2 hl_cache[cell.hl];
-                                                }
-                                                perf_hl_cache_misses += 1;
-                                                const resolved = ctx.core.hl.getWithStyles(cell.hl);
-                                                hl_cache[cell.hl] = resolved;
-                                                hl_valid[cell.hl] = true;
-                                                break :blk2 resolved;
-                                            }
-                                            // Fallback for hl_id >= hl_cache_limit
-                                            perf_hl_cache_misses += 1;
-                                            break :blk2 ctx.core.hl.getWithStyles(cell.hl);
-                                        };
+                                        const a2 = resolveHlCached(ctx.core, cell.hl, hl_cache, hl_valid, hl_cache_limit, true, &perf_hl_cache_hits, &perf_hl_cache_misses);
                                         row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
                                         row_cells.deco_base_flags.items[@intCast(tc)] = if (viewportCellScrollable(
                                             r2,
@@ -5311,18 +5317,9 @@ pub const FlushCtx = struct {
                                 }
 
                                 // Get resolved attributes with cache
-                                const a = blk: {
-                                    if (run_hl < nr_hl_cache_limit) {
-                                        if (nr_hl_valid[run_hl]) {
-                                            break :blk nr_hl_cache[run_hl];
-                                        }
-                                        const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                        nr_hl_cache[run_hl] = resolved;
-                                        nr_hl_valid[run_hl] = true;
-                                        break :blk resolved;
-                                    }
-                                    break :blk ctx.core.hl.getWithStyles(run_hl);
-                                };
+                                var sg_unused_hits: u32 = 0;
+                                var sg_unused_misses: u32 = 0;
+                                const a = resolveHlCached(ctx.core, run_hl, nr_hl_cache, nr_hl_valid, nr_hl_cache_limit, false, &sg_unused_hits, &sg_unused_misses);
 
                                 const fg = a.fg;
                                 const bg = a.bg;
@@ -14747,4 +14744,69 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
     @memset(dst.glow_arr.items[0..cols], 0);
     composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
     for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
+}
+
+test "resolveHlCached memoizes below the limit and resolves live above it" {
+    // This memo block used to be written out at four call sites, and two of
+    // them had already drifted: only the row-mode pair counted hits and
+    // misses. With one body the counters are a caller's choice rather than
+    // something a copy can forget, so pin both halves of that choice.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    try core.hl.define(3, 0xAB0000, 0xCD0000, null, false, 0, .{}, false);
+
+    var cache: [4]highlight.ResolvedAttrWithStyles = undefined;
+    var valid = [_]bool{false} ** 4;
+    const limit: u32 = 4;
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+
+    // First touch is a miss and fills the slot.
+    const first = resolveHlCached(&core, 3, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0xAB0000), first.fg);
+    try std.testing.expect(valid[3]);
+    try std.testing.expectEqual(@as(u32, 1), misses);
+    try std.testing.expectEqual(@as(u32, 0), hits);
+
+    // Second touch is served from the slot. Poison the live table first, so a
+    // hit is provably reading the memo rather than resolving again.
+    try core.hl.define(3, 0xFFFFFF, 0xFFFFFF, null, false, 0, .{}, false);
+    const second = resolveHlCached(&core, 3, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0xAB0000), second.fg);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+    try std.testing.expectEqual(@as(u32, 1), misses);
+
+    // Exactly at the limit is the off-by-one that would index one past the
+    // end of both arrays. It must take the live path, not the memo path.
+    try core.hl.define(limit, 0x00CC00, 0x00DD00, null, false, 0, .{}, false);
+    const at_limit = resolveHlCached(&core, limit, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x00CC00), at_limit.fg);
+    // A memoized id would have been recorded; this one must not be, so a
+    // second call resolves live again rather than reporting a hit.
+    const hits_before = hits;
+    try core.hl.define(limit, 0x00EE00, 0x00FF00, null, false, 0, .{}, false);
+    const at_limit_again = resolveHlCached(&core, limit, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x00EE00), at_limit_again.fg);
+    try std.testing.expectEqual(hits_before, hits);
+
+    // Well past the limit: resolve live every time, never index the arrays.
+    try core.hl.define(9, 0x0000EE, 0x0000FF, null, false, 0, .{}, false);
+    const beyond = resolveHlCached(&core, 9, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x0000EE), beyond.fg);
+    try std.testing.expectEqual(@as(u32, 4), misses);
+    _ = resolveHlCached(&core, 9, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 5), misses);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+
+    // count = false is the non-row-mode callers' choice: same answers, no
+    // statistics. Reuse a fresh memo so the miss path runs again.
+    var valid2 = [_]bool{false} ** 4;
+    var unused_hits: u32 = 0;
+    var unused_misses: u32 = 0;
+    const uncounted = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF), uncounted.fg);
+    _ = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
+    try std.testing.expectEqual(@as(u32, 0), unused_hits);
+    try std.testing.expectEqual(@as(u32, 0), unused_misses);
 }
