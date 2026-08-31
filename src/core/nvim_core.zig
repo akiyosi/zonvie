@@ -1213,9 +1213,28 @@ pub const Core = struct {
     }
 
     /// Cleanup for test-created Core instances (no threads/processes to join).
-    pub fn deinitForTest(self: *Core) void {
+    /// Release every heap allocation this Core owns, and reset the released
+    /// fields so the Core is safe to reuse for another session.
+    ///
+    /// Both teardown paths call this. They used to carry separate copies of
+    /// the list, and the copies had drifted: the session path also released
+    /// nvim_path_owned, restart_pending_addr, known_external_grids and
+    /// msg_config, while the test path did not. Nothing leaked, because each
+    /// test that populated one of those carried its own release -- fourteen
+    /// hand-written defers whose only job was to compensate for the drift.
+    ///
+    /// Every release here is safe on a Core that never populated the field:
+    /// the optional slices are guarded, HashMapUnmanaged.deinit on an empty
+    /// map is a no-op, and Config.deinit early-returns when its allocator is
+    /// null, which is the case for every test-built config.
+    ///
+    /// Does NOT take grid_mu. The session path holds it across this call; the
+    /// test path has no other threads and takes nothing.
+    fn releaseOwnedBuffers(self: *Core) void {
         self.hl.deinit();
         self.grid.deinit();
+
+        // Scratch buffers.
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
@@ -1248,21 +1267,61 @@ pub const Core = struct {
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
+
+        // Spawn command copy.
+        if (self.nvim_path_owned) |p| {
+            self.alloc.free(p);
+            self.nvim_path_owned = null;
+        }
+
+        // Any pending restart address (queued but never consumed because
+        // stop() raced ahead of the run loop's restart handling). Reset the
+        // companion hot-swap flag too — the run loop reads them as a pair.
+        if (self.restart_pending_addr) |a| {
+            self.alloc.free(a);
+            self.restart_pending_addr = null;
+        }
+        self.restart_pending_is_connect_hotswap = false;
+
+        // Shaping buffers.
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
         self.shaping_src_cols.deinit(self.alloc);
         self.flush_float_overlay_buf.deinit(self.alloc);
-        self.msg_views.deinit(self.alloc);
-        self.history_views.deinit(self.alloc);
-        self.msg_line_cache.deinit(self.alloc);
-        self.msg_line_cache_build.deinit(self.alloc);
-        self.msg_split_buf.deinit(self.alloc);
+
+        // Glow state.
         self.freeGlowGroupNames();
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
+        self.glow_hl_ids = null;
+
+        // Session state.
+        self.known_external_grids.deinit(self.alloc);
+        self.known_external_grids = .{};
+        self.msg_line_cache.deinit(self.alloc);
+        self.msg_line_cache = .empty;
+        self.msg_line_cache_build.deinit(self.alloc);
+        self.msg_line_cache_build = .empty;
+        self.msg_split_buf.deinit(self.alloc);
+        self.msg_split_buf = .empty;
+        // Full reset, not just deinit: ViewSet.deinit frees the assignment
+        // but keeps per-view state, and a stale `visible` flag would make the
+        // next session's first empty cycle issue a spurious hide.
+        self.msg_views.deinit(self.alloc);
+        self.msg_views = .{};
+        self.history_views.deinit(self.alloc);
+        self.history_views = .{};
+        self.msg_config.deinit();
+        self.msg_config = .{};
+
+        // Caches.
         self.deinitHlCache();
         self.deinitGlyphCache();
+    }
+
+    pub fn deinitForTest(self: *Core) void {
+        self.releaseOwnedBuffers();
     }
 
     pub fn start(self: *Core, nvim_path: []const u8, rows: u32, cols: u32) !void {
@@ -1833,92 +1892,7 @@ pub const Core = struct {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
 
-        self.hl.deinit();
-        self.grid.deinit();
-
-        // Clean up scratch buffers
-        self.main_verts.deinit(self.alloc);
-        self.cursor_verts.deinit(self.alloc);
-        self.row_verts.deinit(self.alloc);
-        self.flush_dirty_snapshot.deinit(self.alloc);
-        self.flush_row_counts_snapshot.deinit(self.alloc);
-        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
-        for (self.scroll_cache.items) |*row_cache| {
-            row_cache.deinit(self.alloc);
-        }
-        self.scroll_cache.deinit(self.alloc);
-        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
-        self.scroll_cache_valid.deinit(self.alloc);
-        self.main_vertex_row_counts.deinit(self.alloc);
-        self.tmp_cells.deinit(self.alloc);
-        self.row_cells.deinit(self.alloc);
-        self.grid_entries.deinit(self.alloc);
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.cached_subgrids_buf.deinit(self.alloc);
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.prev_subgrid_snapshots.deinit(self.alloc);
-        self.subgrid_diff_current.deinit(self.alloc);
-        self.subgrid_diff_row_marks.deinit(self.alloc);
-        self.key_buf.deinit(self.alloc);
-        self.write_queue.deinit(self.alloc);
-        self.write_spare_queue.deinit(self.alloc);
-
-        // Free nvim path copy
-        if (self.nvim_path_owned) |p| {
-            self.alloc.free(p);
-            self.nvim_path_owned = null;
-        }
-
-        // Free any pending restart address (queued but never consumed because
-        // stop() raced ahead of the run loop's restart handling). Reset the
-        // companion hot-swap flag too — the run loop reads them as a pair.
-        if (self.restart_pending_addr) |a| {
-            self.alloc.free(a);
-            self.restart_pending_addr = null;
-        }
-        self.restart_pending_is_connect_hotswap = false;
-
-        // Free shaping buffers (Phase B)
-        self.shaping_bufs.deinit(self.alloc);
-        self.shaping_scalars.deinit(self.alloc);
-        self.shaping_col_widths.deinit(self.alloc);
-        self.shaping_src_cols.deinit(self.alloc);
-        self.flush_float_overlay_buf.deinit(self.alloc);
-
-        // Free glow state
-        self.freeGlowGroupNames();
-        self.glow_group_names.deinit(self.alloc);
-        if (self.glow_hl_ids) |*m| m.deinit();
-
-        // Free session state that was previously leaked on stop.
-        self.known_external_grids.deinit(self.alloc);
-        self.known_external_grids = .{};
-        self.msg_line_cache.deinit(self.alloc);
-        self.msg_line_cache = .empty;
-        self.msg_line_cache_build.deinit(self.alloc);
-        self.msg_line_cache_build = .empty;
-        self.msg_split_buf.deinit(self.alloc);
-        self.msg_split_buf = .empty;
-        // Full reset, not just deinit: ViewSet.deinit frees the assignment
-        // but keeps per-view state, and a stale `visible` flag would make the
-        // next session's first empty cycle issue a spurious hide.
-        self.msg_views.deinit(self.alloc);
-        self.msg_views = .{};
-        self.history_views.deinit(self.alloc);
-        self.history_views = .{};
-        self.msg_config.deinit();
-        self.msg_config = .{};
-
-        // Free caches
-        self.deinitHlCache();
-        self.deinitGlyphCache();
+        self.releaseOwnedBuffers();
     }
 
     /// Wait until the single stop() owner has released every Core-owned
@@ -6412,7 +6386,6 @@ test "restart replaces connect cleanup policy before notifying observers" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
     var state = State{ .core = &core };
     core.ctx = &state;
     core.cb.on_restart = State.onRestart;
@@ -6431,7 +6404,6 @@ test "restart replaces connect cleanup policy before notifying observers" {
 fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
 
     try core.handleConnectEvent("old-connect");
     const old = core.restart_pending_addr.?;
@@ -6459,7 +6431,6 @@ test "restart replacement OOM preserves pending connect address and policy" {
 fn checkConnectReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
 
     try core.handleRestartEvent("old-restart");
     const old = core.restart_pending_addr.?;
@@ -7292,7 +7263,6 @@ fn recycledShelfCount(core: *Core) u32 {
 test "atlas reclamation runs when the frontend owns no surface" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     try std.testing.expect(core.collectAtlasGarbage());
@@ -7302,7 +7272,6 @@ test "atlas reclamation runs when the frontend owns no surface" {
 test "atlas reclamation stands down for a frontend-owned surface" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     // The ordinary shape of a float: cell storage, placement, and a frontend
@@ -7321,7 +7290,6 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
     // and reclaimed shelves the surface was still drawing from.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
