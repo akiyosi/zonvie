@@ -5,8 +5,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
-const grid_mod = @import("grid.zig");
-const highlight = @import("highlight.zig");
 const mp = @import("msgpack.zig");
 const rpc = @import("rpc_encode.zig");
 const redraw = @import("redraw_handler.zig");
@@ -18,55 +16,6 @@ const nvim_core = @import("nvim_core.zig");
 const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
 const rpc_transport = @import("rpc_transport.zig");
-
-pub const PipeReader = struct {
-    file: rpc_transport.Stream,
-    buf: [8192]u8 = undefined,
-    start: usize = 0,
-    end: usize = 0,
-
-    fn fill(self: *PipeReader) !void {
-        if (self.start < self.end) return;
-        const n = try self.file.read(&self.buf);
-        self.start = 0;
-        self.end = n;
-    }
-
-    pub fn read(self: *PipeReader, dest: []u8) !usize {
-        if (dest.len == 0) return 0;
-
-        var out_i: usize = 0;
-        while (out_i < dest.len) {
-            try self.fill();
-            if (self.end == 0) break; // EOF
-
-            const avail = self.end - self.start;
-            const take = @min(avail, dest.len - out_i);
-            std.mem.copyForwards(u8, dest[out_i .. out_i + take], self.buf[self.start .. self.start + take]);
-            self.start += take;
-            out_i += take;
-
-            if (take == 0) break;
-        }
-        return out_i;
-    }
-
-    pub fn readByte(self: *PipeReader) !u8 {
-        var one: [1]u8 = undefined;
-        const n = try self.read(one[0..]);
-        if (n != 1) return error.EndOfStream;
-        return one[0];
-    }
-
-    pub fn readNoEof(self: *PipeReader, dest: []u8) !void {
-        var off: usize = 0;
-        while (off < dest.len) {
-            const n = try self.read(dest[off..]);
-            if (n == 0) return error.EndOfStream;
-            off += n;
-        }
-    }
-};
 
 /// Contiguous buffered reader that hands the MessagePack decoder zero-copy
 /// slices of the pending frame.
@@ -115,18 +64,6 @@ pub const FrameReader = struct {
             self.pos = 0;
             self.end = 0;
         }
-    }
-
-    /// Commit an advance position expressed as the remaining (uneaten) slice
-    /// of the view, as a decoder that consumes from the front would leave it.
-    /// `remaining` must be a sub-slice of `view()`.
-    pub fn consumeTo(self: *FrameReader, remaining: []const u8) void {
-        const base_addr = @intFromPtr(self.buf.ptr) + self.pos;
-        const rem_addr = @intFromPtr(remaining.ptr);
-        std.debug.assert(rem_addr >= base_addr);
-        std.debug.assert(rem_addr <= base_addr + (self.end - self.pos));
-        const consumed_n = rem_addr - base_addr;
-        self.consume(consumed_n);
     }
 
     /// Pull more bytes from the pipe into `buf[end..]`. Compacts or grows

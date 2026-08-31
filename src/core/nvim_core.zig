@@ -373,24 +373,14 @@ pub const Callbacks = struct {
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
 
-const PipeReader = rpc_session.PipeReader;
-const CwdOwner = rpc_session.CwdOwner;
 
 const GridEntry = flush.GridEntry;
 const CachedSubgrid = flush.CachedSubgrid;
 const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
 const STYLE_ITALIC = flush.STYLE_ITALIC;
-const STYLE_STRIKETHROUGH = flush.STYLE_STRIKETHROUGH;
-const STYLE_UNDERLINE = flush.STYLE_UNDERLINE;
-const STYLE_UNDERCURL = flush.STYLE_UNDERCURL;
-const STYLE_UNDERDOUBLE = flush.STYLE_UNDERDOUBLE;
-const STYLE_UNDERDOTTED = flush.STYLE_UNDERDOTTED;
-const STYLE_UNDERDASHED = flush.STYLE_UNDERDASHED;
 const RenderCells = flush.RenderCells;
-const packStyleFlags = flush.packStyleFlags;
 const MsgCachedLine = flush.MsgCachedLine;
-pub const FlushCache = flush.FlushCache;
 
 // Phase B: Shaping result cache (4-way set associative)
 pub const SHAPE_CACHE_WAYS: usize = 4;
@@ -1103,9 +1093,6 @@ pub const Core = struct {
     preedit_setup_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // hl groups defined
     preedit_visible: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // an inline preedit extmark is set
 
-    // RPC channel ID (extracted from nvim_get_api_info response)
-    channel_id: ?i64 = null,
-    get_api_info_msgid: ?i64 = null,
 
     // Quit request msgid (for tracking nvim_exec_lua response)
     // Atomic to avoid data race between UI thread (requestQuit) and RPC thread (handleRpcResponse)
@@ -1460,7 +1447,6 @@ pub const Core = struct {
 
             // In-flight RPC IDs from the dead channel — drop tracking so any
             // stale response from the new server cannot match.
-            self.get_api_info_msgid = null;
             self.quit_request_msgid.store(0, .release);
             self.glow_request_msgid.store(0, .release);
 
@@ -2437,10 +2423,6 @@ pub const Core = struct {
         return true;
     }
 
-    pub fn prepareAtlasCapacityRetry(self: *Core) bool {
-        return self.prepareAtlasCapacityRetryAt(clock.nowNs());
-    }
-
     fn armTransientGlyphRetryAt(self: *Core, now: i128) bool {
         if (!self.transient_glyph_has_negative) return false;
         if (self.transient_glyph_retry_at == null and
@@ -2458,12 +2440,6 @@ pub const Core = struct {
         self.transient_glyph_retry_at = null;
         self.transient_glyph_recovery_armed = true;
         self.transient_glyph_has_negative = false;
-        return true;
-    }
-
-    pub fn prepareTransientGlyphRetryAt(self: *Core, now: i128) bool {
-        if (!self.armTransientGlyphRetryAt(now)) return false;
-        self.beginNegativeGlyphReprobe();
         return true;
     }
 
@@ -4426,19 +4402,6 @@ pub const Core = struct {
         try rpc.packStr(buf, self.alloc, method);
     }
 
-    pub fn requestGetApiInfo(self: *Core) !void {
-        const id = self.nextMsgId();
-        self.get_api_info_msgid = id; // Save msgid for response matching
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_get_api_info");
-        try rpc.packArray(&buf, self.alloc, 0);
-        try self.sendRaw(buf.items);
-
-        self.log.write("rpc send: nvim_get_api_info (id={d})\n", .{id});
-    }
-
     pub fn requestSetClientInfo(self: *Core) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
@@ -4672,33 +4635,6 @@ pub const Core = struct {
         self.log.write("rpc send: nvim_ui_try_resize_grid (id={d}, grid={d}, rows={d}, cols={d})\n", .{ id, grid_id, rows, cols });
     }
 
-    /// Sync Neovim's internal window height to match the grid height.
-    fn requestWinSetHeight(self: *Core, win_id: i64, height: u32) void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        self.sendRequestHeader(&buf, id, "nvim_win_set_height") catch return;
-        rpc.packArray(&buf, self.alloc, 2) catch return;
-        rpc.packInt(&buf, self.alloc, win_id) catch return;
-        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(height))) catch return;
-
-        self.sendRaw(buf.items) catch return;
-    }
-
-    /// Sync Neovim's internal window width to match the grid width.
-    fn requestWinSetWidth(self: *Core, win_id: i64, width: u32) void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        self.sendRequestHeader(&buf, id, "nvim_win_set_width") catch return;
-        rpc.packArray(&buf, self.alloc, 2) catch return;
-        rpc.packInt(&buf, self.alloc, win_id) catch return;
-        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(width))) catch return;
-
-        self.sendRaw(buf.items) catch return;
-    }
 
     pub fn requestInput(self: *Core, keys: []const u8) !void {
         const id = self.nextMsgId();
@@ -5645,21 +5581,6 @@ pub const Core = struct {
 
     pub fn hideMsgHistory(self: *Core) void {
         flush.hideMsgHistory(self);
-    }
-
-    /// Set a Neovim global variable via nvim_set_var
-    fn requestSetVar(self: *Core, name: []const u8, value: []const u8) !void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_set_var");
-
-        try rpc.packArray(&buf, self.alloc, 2);
-        try rpc.packStr(&buf, self.alloc, name);
-        try rpc.packStr(&buf, self.alloc, value);
-
-        try self.sendRaw(buf.items);
     }
 
     // --- Utility forwarding stubs ---
