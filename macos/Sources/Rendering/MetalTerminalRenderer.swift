@@ -3012,6 +3012,33 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
 
+            // The scissored single-pass dirty-row draw that both the
+            // GPU-scroll-copy arm and the plain partial-redraw arm below
+            // perform, verbatim: overwrite the dirty rows that carry no
+            // vertices, then draw the dirty rows one scissor rect each.
+            func drawScissoredDirtyRows() {
+                clearEmptyDirtyRowsNonBlur(dirtyRows)
+                _ = encodeSurfaceRowDraws(
+                    encoder: enc,
+                    rows: dirtyRows,
+                    resolve: resolvedRowState,
+                    scissor: { row in
+                        makeRowScissorRect(
+                            row: row,
+                            cellHeight_px: cellH,
+                            drawableWidth_px: drawableW,
+                            renderTargetWidth_px: backTex.width,
+                            renderTargetHeight_px: backTex.height
+                        )
+                    },
+                    pipeline: pipeline!,
+                    backgroundPipeline: nil,
+                    glyphPipeline: nil,
+                    useTwoPass: false
+                )
+            }
+
+
             // === PERF LOG: encode_setup → encode_rows boundary ===
             let t_encode_rows_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
             let encode_setup_us: Double = ZonvieCore.appLogEnabled ? (t_encode_rows_start - t_encode_start) * 1_000_000 : 0
@@ -3198,25 +3225,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             bgRGB: snappedBgRGB
                         )
                     }
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline!,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else if !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
                             && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
@@ -3224,25 +3233,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // Use this only when the render pass preserved clean rows.
                     // Resize and fail-closed blur-pipeline frames use .clear;
                     // drawing only dirty rows there would blank every other row.
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline!,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else {
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
                     _ = encodeSurfaceRowDraws(

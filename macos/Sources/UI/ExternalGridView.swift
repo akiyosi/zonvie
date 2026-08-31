@@ -3082,6 +3082,33 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     }
                 }
 
+                // The scissored single-pass dirty-row draw that both the
+                // GPU-scroll-copy arm and the plain partial-redraw arm below
+                // perform, verbatim: overwrite the dirty rows that carry no
+                // vertices, then draw the dirty rows one scissor rect each.
+                func drawScissoredDirtyRows() {
+                    clearEmptyDirtyRowsNonBlur(dirtyRows)
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: cellH,
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
+                        },
+                        pipeline: pipeline,
+                        backgroundPipeline: nil,
+                        glyphPipeline: nil,
+                        useTwoPass: false
+                    )
+                }
+
+
                 if use2Pass {
                     // 2-pass rendering (blur enabled)
                     if canBlinkFastPath {
@@ -3192,50 +3219,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             bgRGB: bgRGB
                         )
                     }
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else if !isDecoratedSurface && !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
                             && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row. A resized backbuffer
                     // is cleared, so partial redraw would leave every clean row
                     // blank; decorated surfaces have the same constraint on
                     // every frame because their loadAction is always .clear.
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else {
                     // Full redraw fallback
                     _ = encodeSurfaceRowDraws(
