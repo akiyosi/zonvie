@@ -431,6 +431,53 @@ comptime {
     );
 }
 
+/// Size a CSR buffer exactly and, for the counts array, zero it.
+///
+/// `ensureTotalCapacityPrecise` never shrinks, so the explicit length
+/// assignment is what keeps a shorter grid than the previous flush from
+/// leaving stale entries in the tail.
+fn csrResizeExact(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(usize),
+    len: usize,
+    comptime zero: bool,
+) !void {
+    try list.ensureTotalCapacityPrecise(alloc, len);
+    list.items.len = len;
+    if (zero) @memset(list.items, 0);
+}
+
+/// Turn per-row counts into CSR start offsets, in place.
+///
+/// The caller deposits each row's count at `offsets[row + 1]`, leaving
+/// `offsets[0]` zero; afterwards `offsets[row]` is that row's start and
+/// `offsets[offsets.len - 1]` is the total, which callers assert against
+/// their own count. Shared by the main-grid and external-float row indexes:
+/// only this middle of the CSR build is common to both, because their
+/// counting and filling ends iterate different collections and emit indices
+/// into different arrays.
+fn csrOffsetsFromCounts(offsets: []usize) void {
+    for (1..offsets.len) |i| {
+        offsets[i] += offsets[i - 1];
+    }
+}
+
+/// Seed per-row write cursors from CSR offsets.
+///
+/// `write_offsets` is sized to `row_count`, one shorter than `offsets` -- the
+/// trailing total is not a cursor. The explicit length assignment matters:
+/// `ensureTotalCapacityPrecise` never shrinks, so a shorter grid than the
+/// previous flush would otherwise keep stale cursors in the tail.
+fn csrSeedWriteOffsets(
+    alloc: std.mem.Allocator,
+    write_offsets: *std.ArrayListUnmanaged(usize),
+    offsets: []const usize,
+    row_count: usize,
+) !void {
+    try csrResizeExact(alloc, write_offsets, row_count, false);
+    @memcpy(write_offsets.items, offsets[0..row_count]);
+}
+
 fn mainSubgridRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize, layouts: usize) ?usize {
     const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
     const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
@@ -561,9 +608,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     ) orelse return error.LayoutTooComplex;
     if (retained_bytes > max_bytes) clearMainSubgridRowIndexStorage(core);
 
-    try core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
-    core.main_subgrid_row_offsets.items.len = offset_count;
-    @memset(core.main_subgrid_row_offsets.items, 0);
+    try csrResizeExact(core.alloc, &core.main_subgrid_row_offsets, offset_count, true);
 
     for (cached) |csg| {
         const start: usize = @min(@as(usize, csg.row_start), row_count);
@@ -571,19 +616,11 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
         if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
         for (start..end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
     }
-    for (1..core.main_subgrid_row_offsets.items.len) |i| {
-        core.main_subgrid_row_offsets.items[i] += core.main_subgrid_row_offsets.items[i - 1];
-    }
+    csrOffsetsFromCounts(core.main_subgrid_row_offsets.items);
 
     std.debug.assert(ref_count == core.main_subgrid_row_offsets.items[row_count]);
-    try core.main_subgrid_row_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
-    core.main_subgrid_row_indices.items.len = ref_count;
-    try core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
-    core.main_subgrid_row_write_offsets.items.len = row_count;
-    @memcpy(
-        core.main_subgrid_row_write_offsets.items,
-        core.main_subgrid_row_offsets.items[0..row_count],
-    );
+    try csrResizeExact(core.alloc, &core.main_subgrid_row_indices, ref_count, false);
+    try csrSeedWriteOffsets(core.alloc, &core.main_subgrid_row_write_offsets, core.main_subgrid_row_offsets.items, row_count);
 
     // cached is already sorted back-to-front, so inserting each entry into
     // every covered row preserves composition order without per-row sorting.
@@ -6085,10 +6122,12 @@ fn buildExternalFloatAnchorIndex(core: *Core) !void {
 /// Build a sorted, per-row index for floats visible in one external grid.
 /// The flattened row buckets preserve the global layer order because entries
 /// are inserted into every covered row in sorted order.
+/// The external-float index has no layout array, so its storage size is the
+/// main-grid formula with zero layouts -- with `layouts == 0` the layout term
+/// is 0 and the final add cannot overflow, so the two agree on every input
+/// including the ones that return null.
 fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
-    const row_usizes = std.math.add(usize, offsets, write_offsets) catch return null;
-    const total_usizes = std.math.add(usize, row_usizes, refs) catch return null;
-    return std.math.mul(usize, total_usizes, @sizeOf(usize)) catch null;
+    return mainSubgridRowIndexStorageByteSize(offsets, write_offsets, refs, 0);
 }
 
 fn externalFloatPersistentScratchCapacityByteSize(core: *const Core) ?usize {
@@ -6232,9 +6271,7 @@ fn buildExternalFloatRowIndexWithLimits(
     if (projected_retained_bytes > max_index_bytes) {
         clearExternalFloatRowIndexStorage(core);
     }
-    try core.ext_float_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
-    core.ext_float_row_offsets.items.len = offset_count;
-    @memset(core.ext_float_row_offsets.items, 0);
+    try csrResizeExact(core.alloc, &core.ext_float_row_offsets, offset_count, true);
 
     // Count references per visible row, then convert counts to offsets.
     for (core.ext_float_entries.items) |entry| {
@@ -6250,19 +6287,11 @@ fn buildExternalFloatRowIndexWithLimits(
             core.ext_float_row_offsets.items[row + 1] += 1;
         }
     }
-    for (1..core.ext_float_row_offsets.items.len) |i| {
-        core.ext_float_row_offsets.items[i] += core.ext_float_row_offsets.items[i - 1];
-    }
+    csrOffsetsFromCounts(core.ext_float_row_offsets.items);
 
     std.debug.assert(ref_count == core.ext_float_row_offsets.items[row_count]);
-    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
-    core.ext_float_row_entry_indices.items.len = ref_count;
-    try core.ext_float_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
-    core.ext_float_row_write_offsets.items.len = row_count;
-    @memcpy(
-        core.ext_float_row_write_offsets.items,
-        core.ext_float_row_offsets.items[0..row_count],
-    );
+    try csrResizeExact(core.alloc, &core.ext_float_row_entry_indices, ref_count, false);
+    try csrSeedWriteOffsets(core.alloc, &core.ext_float_row_write_offsets, core.ext_float_row_offsets.items, row_count);
 
     // Filling in global sorted order keeps every row bucket sorted without a
     // second per-row sort.
@@ -14809,4 +14838,77 @@ test "resolveHlCached memoizes below the limit and resolves live above it" {
     _ = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
     try std.testing.expectEqual(@as(u32, 0), unused_hits);
     try std.testing.expectEqual(@as(u32, 0), unused_misses);
+}
+
+test "the external-float storage size is the main formula with zero layouts" {
+    // Folding one into the other rests on the layout term vanishing at
+    // layouts == 0, including at the boundaries where either returns null.
+    const max = std.math.maxInt(usize);
+    const cases = [_][3]usize{
+        .{ 0, 0, 0 },
+        .{ 1, 2, 3 },
+        .{ 4, 4, 1024 },
+        // Each of the three checked operations at its overflow edge.
+        .{ max, 1, 0 },
+        .{ max / 2, max / 2, max },
+        .{ max / @sizeOf(usize), 1, 0 },
+        .{ max / @sizeOf(usize) + 1, 0, 0 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(
+            mainSubgridRowIndexStorageByteSize(c[0], c[1], c[2], 0),
+            externalFloatRowIndexStorageByteSize(c[0], c[1], c[2]),
+        );
+    }
+    // The equivalence is specific to zero layouts: a non-zero layout count
+    // must make the main formula larger, or folding would have lost a term.
+    const with_layouts = mainSubgridRowIndexStorageByteSize(4, 4, 8, 2).?;
+    const without = externalFloatRowIndexStorageByteSize(4, 4, 8).?;
+    try std.testing.expect(with_layouts > without);
+}
+
+test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
+    // The main-grid and external-float row indexes each build a CSR index the
+    // same way. Only the middle of that build is genuinely shared -- the
+    // counting and filling ends differ in what they iterate and in which
+    // array their emitted indices point into -- so this covers exactly the
+    // part both will call.
+    const alloc = std.testing.allocator;
+
+    var offsets: std.ArrayListUnmanaged(usize) = .empty;
+    defer offsets.deinit(alloc);
+    var write_offsets: std.ArrayListUnmanaged(usize) = .empty;
+    defer write_offsets.deinit(alloc);
+
+    // Counts land in offsets[row + 1], as both callers write them: row 0 has
+    // 2 references, row 1 none, row 2 three, row 3 one.
+    const row_count: usize = 4;
+    try offsets.ensureTotalCapacityPrecise(alloc, row_count + 1);
+    offsets.items.len = row_count + 1;
+    @memcpy(offsets.items, &[_]usize{ 0, 2, 0, 3, 1 });
+
+    csrOffsetsFromCounts(offsets.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5, 6 }, offsets.items);
+    // The last entry is the total, which is what both callers assert against.
+    try std.testing.expectEqual(@as(usize, 6), offsets.items[row_count]);
+
+    try csrSeedWriteOffsets(alloc, &write_offsets, offsets.items, row_count);
+    // Each row's cursor starts at that row's offset, and the total is NOT
+    // copied -- write_offsets is one shorter than offsets.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5 }, write_offsets.items);
+    try std.testing.expectEqual(row_count, write_offsets.items.len);
+
+    // Seeding again over a longer previous run must not leave stale tail
+    // entries behind: both callers reuse these buffers across flushes.
+    var short_offsets = [_]usize{ 0, 1, 1 };
+    csrOffsetsFromCounts(&short_offsets);
+    try csrSeedWriteOffsets(alloc, &write_offsets, &short_offsets, 2);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, write_offsets.items);
+
+    // A grid with no rows is legal and must not touch the buffer.
+    var empty_offsets = [_]usize{0};
+    csrOffsetsFromCounts(&empty_offsets);
+    try std.testing.expectEqualSlices(usize, &.{0}, &empty_offsets);
+    try csrSeedWriteOffsets(alloc, &write_offsets, &empty_offsets, 0);
+    try std.testing.expectEqual(@as(usize, 0), write_offsets.items.len);
 }
