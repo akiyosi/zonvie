@@ -238,32 +238,6 @@ pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) voi
     app.mini_windows[idx].text_len = copy_len;
 }
 
-/// Common handler for mini window updates from callbacks
-pub fn updateMiniFromCallback(app: *App, id: app_mod.MiniWindowId, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) void {
-    const idx = @intFromEnum(id);
-
-    // Build text from chunks
-    var text_buf: [256]u8 = undefined;
-    var text_len: usize = 0;
-    for (chunks[0..chunk_count]) |chunk| {
-        const text = chunk.text[0..chunk.text_len];
-        const copy_len = @min(text.len, text_buf.len - text_len);
-        @memcpy(text_buf[text_len..][0..copy_len], text[0..copy_len]);
-        text_len += copy_len;
-        if (text_len >= text_buf.len) break;
-    }
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\"\n", .{ @tagName(id), chunk_count, text_buf[0..text_len] });
-
-    // Update state and post to UI thread
-    app.mu.lockUncancelable(core.clock.io());
-    @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
-    app.mini_windows[idx].text_len = text_len;
-    app.mu.unlock(core.clock.io());
-
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
-    }
-}
 
 pub fn onMsgHistoryShow(
     ctx: ?*anyopaque,

@@ -504,25 +504,6 @@ pub fn setIMEOff(hwnd: c.HWND) void {
     }
 }
 
-/// Calculate cell width for a Unicode codepoint (1 for narrow, 2 for wide).
-pub fn imeCellWidth(codepoint: u21) u32 {
-    // East Asian Wide characters
-    if ((codepoint >= 0x1100 and codepoint <= 0x115F) or // Hangul Jamo
-        (codepoint >= 0x2E80 and codepoint <= 0x9FFF) or // CJK
-        (codepoint >= 0xAC00 and codepoint <= 0xD7AF) or // Hangul syllables
-        (codepoint >= 0xF900 and codepoint <= 0xFAFF) or // CJK compatibility
-        (codepoint >= 0xFE10 and codepoint <= 0xFE1F) or // Vertical forms
-        (codepoint >= 0xFE30 and codepoint <= 0xFE6F) or // CJK compatibility forms
-        (codepoint >= 0xFF00 and codepoint <= 0xFF60) or // Fullwidth forms
-        (codepoint >= 0xFFE0 and codepoint <= 0xFFE6) or // Fullwidth symbols
-        (codepoint >= 0x20000 and codepoint <= 0x2FFFF) or // CJK Extension B+
-        (codepoint >= 0x30000 and codepoint <= 0x3FFFF) or // CJK Extension G+
-        (codepoint >= 0x3040 and codepoint <= 0x30FF)) // Hiragana/Katakana
-    {
-        return 2;
-    }
-    return 1;
-}
 
 /// Wide string constant for "STATIC" window class
 const ime_overlay_class: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");

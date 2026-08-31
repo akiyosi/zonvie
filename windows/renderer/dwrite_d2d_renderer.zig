@@ -602,20 +602,6 @@ pub const Renderer = struct {
         self.* = undefined;
     }
 
-    pub const BgSpan = extern struct {
-        row: u32,
-        col_start: u32,
-        col_end: u32,
-        bgRGB: u32,
-    };
-    pub const TextRun = extern struct {
-        row: u32,
-        col_start: u32,
-        len: u32,
-        fgRGB: u32,
-        bgRGB: u32,
-        scalars: [*]const u32,
-    };
     pub const Cursor = extern struct {
         enabled: u32,
         row: u32,
@@ -1733,11 +1719,6 @@ pub const Renderer = struct {
         }
     }
 
-    fn flushPendingAtlasUploads(self: *Renderer) void {
-        self.mu.lockUncancelable(core.clock.io());
-        defer self.mu.unlock(core.clock.io());
-        self.flushPendingAtlasUploadsLocked();
-    }
 
     /// Upload atlas dirty rects added since `since_seq` to the given D3D context.
     /// Returns the new head sequence (caller should store this as its cursor).
@@ -3385,19 +3366,6 @@ fn utf8ToUtf16Alloc(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
     return try list.toOwnedSliceSentinel(alloc, 0);
 }
 
-fn rgbToD2DColor(rgb: u32) c.D2D1_COLOR_F {
-    // Assumes 0xRRGGBB (alpha is implicit 1.0)
-    const r8: u32 = (rgb >> 16) & 0xFF;
-    const g8: u32 = (rgb >> 8) & 0xFF;
-    const b8: u32 = rgb & 0xFF;
-
-    return c.D2D1_COLOR_F{
-        .r = @as(f32, @floatFromInt(r8)) / 255.0,
-        .g = @as(f32, @floatFromInt(g8)) / 255.0,
-        .b = @as(f32, @floatFromInt(b8)) / 255.0,
-        .a = 1.0,
-    };
-}
 
 fn L(comptime s: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(s);

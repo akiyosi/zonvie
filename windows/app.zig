@@ -317,9 +317,6 @@ pub fn scrollbarMargin(dpi_scale: f32) f32 {
 pub fn scrollbarMinKnobHeight(dpi_scale: f32) f32 {
     return SCROLLBAR_MIN_KNOB_HEIGHT * dpi_scale;
 }
-pub fn scrollbarCornerRadius(dpi_scale: f32) f32 {
-    return SCROLLBAR_CORNER_RADIUS * dpi_scale;
-}
 pub fn scrollbarReservedWidth(dpi_scale: f32) f32 {
     return scrollbarWidth(dpi_scale) + scrollbarMargin(dpi_scale) * 2;
 }
@@ -1640,20 +1637,6 @@ pub const TablineState = struct {
     }
 };
 
-/// CPU-side per-row vertex data. GPU VBs are stored separately in RowVB
-/// (owned by the UI thread) so that the core thread can write vertices
-/// without touching GPU resources.
-pub const RowVertsCPU = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .empty,
-
-    // CPU-side generation increments when verts are replaced by onVerticesRow().
-    gen: u64 = 0,
-
-    // Logical row index that vertices were generated for. Used to compute viewport
-    // Y translation at draw time when a row moves due to grid_scroll without
-    // vertex regeneration (same pattern as macOS rowSlotSourceRows).
-    origin_row: u32 = 0,
-};
 
 /// GPU-side per-row vertex buffer (D3D11). Owned exclusively by the UI thread.
 pub const RowVB = struct {
