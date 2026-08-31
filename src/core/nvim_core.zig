@@ -3700,7 +3700,10 @@ pub const Core = struct {
         // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
         // UTF-8: it decodes with `catch unreachable`, so an overlong or
         // truncated sequence off the wire would abort the render thread.
-        const slice = it.nextCodepointSlice() orelse return null;
+        // The empty case returned above, so the iterator has at least one
+        // slice. The optional return type stays: callers chain it with
+        // `orelse`, and it is the s.len == 0 branch they consume.
+        const slice = it.nextCodepointSlice().?;
         const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
         return @as(u32, cp);
     }
