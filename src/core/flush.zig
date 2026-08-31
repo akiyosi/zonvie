@@ -10702,7 +10702,6 @@ test "zero-sized main still commits external grid transaction" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resize(0, 0);
     try core.grid.resizeGrid(2, 1, 1);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
@@ -10990,7 +10989,6 @@ test "deferred external pass shares the main vertex budget transaction" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 1, 1);
     try core.grid.resizeGrid(2, 1, 1);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
@@ -11226,7 +11224,6 @@ test "external row scroll hint excludes composited grids and clamps target viewp
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 4, 4);
     try core.grid.resizeGrid(2, 4, 4);
     try core.grid.setWinPos(2, 42, 0, 0);
@@ -11722,7 +11719,6 @@ test "external scroll without row-shift callback regenerates every retained row"
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 4, 2);
     try core.grid.resizeGrid(2, 4, 2);
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
@@ -13452,7 +13448,6 @@ test "external close detection visits known grids once and removes in place" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     var closed: std.ArrayListUnmanaged(i64) = .empty;
     defer closed.deinit(std.testing.allocator);
     core.ctx = &closed;
@@ -13497,7 +13492,6 @@ test "external open abort stops later lifecycle callbacks until retry" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(10, 2, 2);
     try core.grid.resizeGrid(11, 2, 2);
     try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
@@ -15530,7 +15524,6 @@ test "the external-grid cursor background uses the same corner order" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(2, 2, 2);
     core.grid.putCell(0, 0, 'B', 0);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
@@ -15595,7 +15588,6 @@ test "the external-grid cursor glyph uses the same corner order as every other q
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(2, 2, 2);
     // The cell under the cursor must be in grid 2, not the main grid, or there
     // is no glyph to draw and only the background quad is emitted.
