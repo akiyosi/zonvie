@@ -5875,6 +5875,37 @@ final class ZonvieCore {
         ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(msgShowX),\(msgShowY))")
     }
 
+    /// Place the cmdline-completion popupmenu against the cmdline window:
+    /// just above it, or just below when there is no room above on that
+    /// screen. Returns nil when there is no cmdline window, which the two
+    /// call sites answer with different fallbacks -- the create path with a
+    /// screen-centred rect, the update path by leaving the frame alone.
+    ///
+    /// `direction` is returned rather than logged here so that only the
+    /// create path logs, as before; the update path runs per geometry update.
+    private func cmdlinePopupmenuPlacement(
+        startCol: Int32,
+        cellW: CGFloat,
+        scale: CGFloat,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat
+    ) -> (rect: NSRect, direction: String)? {
+        guard let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] else {
+            return nil
+        }
+        let cmdlineFrame = cmdlineWindow.frame
+        let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
+        let popupmenuPadding: CGFloat = 8.0
+        let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
+        let gap: CGFloat = 4.0
+        let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
+        let belowY = cmdlineFrame.origin.y - windowHeight - gap
+        let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+        let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
+        return (NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
+                y == aboveY ? "above" : "below")
+    }
+
     private func buildInitialDecoratedWindowRect(
         kind: ExternalGridKind,
         win: Int64,
@@ -5926,19 +5957,12 @@ final class ZonvieCore {
             // popupmenuAnchorGrid is used only for cmdline detection.
             let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
             if isCmdlineCompletion {
-                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                    let cmdlineFrame = cmdlineWindow.frame
-                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-                    let popupmenuPadding: CGFloat = 8.0
-                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
-                    let gap: CGFloat = 4.0
-                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
-                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
-                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
-                    let direction = (y == aboveY) ? "above" : "below"
-                    ZonvieCore.appLog("[external_window] popupmenu positioned \(direction) cmdline at (\(x),\(y))")
-                    return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                if let placement = cmdlinePopupmenuPlacement(
+                    startCol: startCol, cellW: cellW, scale: scale,
+                    windowWidth: windowWidth, windowHeight: windowHeight
+                ) {
+                    ZonvieCore.appLog("[external_window] popupmenu positioned \(placement.direction) cmdline at (\(placement.rect.origin.x),\(placement.rect.origin.y))")
+                    return placement.rect
                 }
 
                 if let screen = NSScreen.main {
@@ -6146,17 +6170,11 @@ final class ZonvieCore {
             let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
 
             if isCmdlineCompletion {
-                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                    let cmdlineFrame = cmdlineWindow.frame
-                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-                    let popupmenuPadding: CGFloat = 8.0
-                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
-                    let gap: CGFloat = 4.0
-                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
-                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
-                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
-                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                if let placement = cmdlinePopupmenuPlacement(
+                    startCol: startCol, cellW: cellW, scale: scale,
+                    windowWidth: windowWidth, windowHeight: windowHeight
+                ) {
+                    windowRect = placement.rect
                 }
                 return windowRect
             }
