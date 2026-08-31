@@ -5593,21 +5593,8 @@ pub const FlushCtx = struct {
                         // Push cursor background quad with DECO_CURSOR flag
                         // (so shader treats it as decoration, not background with transparency)
                         {
-                            const pts = Helpers.ndc4(rx0, ry0, rx1, ry1, dw, dh);
-                            const p0 = pts[0];
-                            const p1 = pts[1];
-                            const p2 = pts[2];
-                            const p3 = pts[3];
                             const col = Helpers.rgb(cursor_out.bgRGB);
-                            const solid_uv = Helpers.solid_uv;
-
-                            try cursor.ensureUnusedCapacity(ctx.core.alloc, 6);
-                            cursor.appendAssumeCapacity(.{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            try Helpers.pushSolidQuad(cursor, ctx.core.alloc, rx0, ry0, rx1, ry1, col, dw, dh, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                         }
 
                         // Render cursor text (character under cursor) with inverted color
@@ -7169,18 +7156,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         self.hl.default_fg;
                     const cursor_color = Helpers.rgb(cursor_bg);
 
-                    const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
-                    const ctl = c_pts[0];
-                    const ctr = c_pts[1];
-                    const cbl = c_pts[2];
-                    const cbr = c_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    Helpers.pushSolidQuadAssumeCapacity(ext_verts, crx0, cry0, crx1, cry1, cursor_color, grid_w, grid_h, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
 
                     // Cursor text for block cursor
                     if (self.grid.cursor_shape == .block) {
@@ -15035,4 +15011,203 @@ test "mainSubgridVisibleRowRange clamps to the viewport and rejects the invisibl
     // A zero-row viewport admits nothing, which is a real state: neither the
     // caller nor onFlush guards rows == 0.
     try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 0, 3, 4, 3), 0) == null);
+}
+
+/// Recover the emitted corner order of a six-vertex solid quad.
+///
+/// Returns the index each vertex takes in the quad's four distinct corners,
+/// ordered TL, TR, BL, BR. The expected pattern is 0,2,1,1,2,3 -- TL, BL, TR,
+/// TR, BL, BR -- which is what every pushSolidQuad body emits. Comparing the
+/// pattern rather than raw NDC keeps the assertion independent of cell
+/// geometry and line spacing.
+fn solidQuadCornerPattern(verts: []const c_api.Vertex) [6]u8 {
+    var xs: [2]f32 = .{ verts[0].position[0], verts[0].position[0] };
+    var ys: [2]f32 = .{ verts[0].position[1], verts[0].position[1] };
+    for (verts) |v| {
+        xs[0] = @min(xs[0], v.position[0]);
+        xs[1] = @max(xs[1], v.position[0]);
+        ys[0] = @min(ys[0], v.position[1]);
+        ys[1] = @max(ys[1], v.position[1]);
+    }
+    var out: [6]u8 = undefined;
+    for (verts, 0..) |v, i| {
+        // ndc4 flips y, so the larger y is the top edge.
+        const right: u8 = if (v.position[0] == xs[1]) 1 else 0;
+        const bottom: u8 = if (v.position[1] == ys[0]) 1 else 0;
+        out[i] = bottom * 2 + right;
+    }
+    return out;
+}
+
+test "the main-grid cursor background is emitted in the shared corner order" {
+    // The cursor background was the one solid quad still hand-expanded into
+    // six appends, at two sites, and the two had drifted apart. Drive the real
+    // main-grid cursor path and pin the order it emits.
+    const State = struct {
+        cursor: [6]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 6) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            // The background quad is the first push after the buffer is cleared.
+            @memcpy(&self.cursor, v[0..6]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.setCursor(1, 0, 0);
+    // Deliberately non-square, with a non-square cell: a transposed x/y or
+    // width/height argument would preserve the corner ordering and silently
+    // move the quad, so the fixture has to be able to tell them apart.
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
+    try std.testing.expect(state.count >= 6);
+
+    // TL, BL, TR, TR, BL, BR -- the order every pushSolidQuad body emits.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(&state.cursor));
+    // The pattern is blind to placement, so pin the geometry too: a
+    // transposed x/y or width/height argument keeps the ordering and moves
+    // the quad. Cursor at (0,0), 4x2 cell in an 8x4 drawable, double-width.
+    try std.testing.expectEqual([2]f32{ -1, 1 }, state.cursor[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.cursor[5].position);
+    for (state.cursor) |v| {
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+        try std.testing.expectEqual(state.cursor[0].color, v.color);
+    }
+}
+
+test "the external-grid cursor background uses the same corner order" {
+    // This is the site whose hand-expansion had drifted: it emitted the same
+    // two triangles wound the other way. Both backends disable culling, so
+    // nothing rendered differently and nothing caught it -- the defect was
+    // that the two sites disagreed at all.
+    const State = struct {
+        cursor: [6]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 6) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(&self.cursor, v[0..6]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    defer core.known_external_grids.deinit(core.alloc);
+    try core.grid.resizeGrid(2, 2, 2);
+    core.grid.putCell(0, 0, 'B', 0);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    core.grid.setCursor(2, 0, 0);
+    // Non-square cell, as in the main-grid test: the corner pattern alone
+    // cannot tell a transposed width/height argument from the right one.
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    core.sendExternalGridVertices(true);
+    try std.testing.expect(state.count >= 6);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(&state.cursor));
+    try std.testing.expectEqual([2]f32{ -1, 1 }, state.cursor[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.cursor[5].position);
+    for (state.cursor) |v| {
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+        try std.testing.expectEqual(state.cursor[0].color, v.color);
+    }
+}
+
+test "VH's two solid-quad variants emit the same corner order" {
+    // The file carries three copies of this helper -- VH and one per
+    // vertex-generating function -- but the other two are function-local and
+    // unreachable from a test. They are covered instead by the two cursor
+    // tests above, which drive the real paths. This one pins VH's own pair.
+    const alloc = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, 12);
+
+    try VH.pushSolidQuad(&out, alloc, 0, 0, 4, 2, .{ 1, 0, 0, 1 }, 8, 4, 1, c_api.DECO_CURSOR);
+    VH.pushSolidQuadAssumeCapacity(&out, 0, 0, 4, 2, .{ 1, 0, 0, 1 }, 8, 4, 1, c_api.DECO_CURSOR);
+    try std.testing.expectEqual(@as(usize, 12), out.items.len);
+
+    for (0..6) |i| {
+        try std.testing.expectEqual(out.items[i], out.items[i + 6]);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(out.items[0..6]));
+
+    // The pattern is deliberately blind to placement, so pin the geometry too:
+    // a transposed x/y or vw/vh argument would keep the ordering and move the
+    // quad. ndc = (x/vw*2-1, 1-y/vh*2), so (0,0)-(4,2) in an 8x4 viewport puts
+    // the top-left corner at (-1, 1) and the bottom-right at (0, 0).
+    try std.testing.expectEqual([2]f32{ -1, 1 }, out.items[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, out.items[5].position);
+
+    // The first triangle is wound counter-clockwise in NDC. Computed from the
+    // EMITTED vertices, not from ndc4's return, so it tests what was pushed.
+    const a = out.items[0].position;
+    const b = out.items[1].position;
+    const c = out.items[2].position;
+    const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    try std.testing.expect(cross > 0);
+
+    for (out.items) |v| {
+        try std.testing.expectEqual([4]f32{ 1, 0, 0, 1 }, v.color);
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(@as(i64, 1), v.grid_id);
+        try std.testing.expectEqual(c_api.DECO_CURSOR, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+    }
 }
