@@ -1134,6 +1134,27 @@ inline fn resolveHlCached(
     return core.hl.getWithStyles(hl_id);
 }
 
+/// Whether one cell glows: everything glows in `glow_all` mode, otherwise
+/// only the highlights in the resolved set do.
+///
+/// Five places made this decision -- the main-grid run composition, the
+/// subgrid overlay in each of the two composition modes, and the external
+/// grid's own rows plus the floats composited onto it. Callers keep their own
+/// snapshot of the two glow fields and their own `glow_enabled` guard; only
+/// the decision is shared.
+///
+/// `inline` matters only in Debug. Measured with `nm` on a ReleaseFast
+/// build: this, `resolveHlCached`, and the plain-`fn`
+/// `viewportCellScrollable` in the same per-cell position all emit zero
+/// symbols, so the optimizer inlines them alike. In Debug the plain `fn`
+/// emits a symbol and these do not. Keep the keyword for the Debug-build
+/// per-cell paths, not on a claim about shipped code.
+inline fn cellGlow(glow_all: bool, glow_hl_ids: ?*std.AutoHashMap(u32, void), hl: u32) u8 {
+    if (glow_all) return 1;
+    const ids = glow_hl_ids orelse return 0;
+    return @intFromBool(ids.contains(hl));
+}
+
 /// Compose one main-grid row into `dst`, run-length batched by hl_id.
 ///
 /// The row-mode and whole-screen paths differ only in where the row lands:
@@ -1187,7 +1208,7 @@ inline fn composeMainRowRuns(
         @memset(dst.style_flags_arr.items[ds..de], a.style_flags);
         @memset(dst.overline_arr.items[ds..de], @intFromBool(a.overline));
         if (glow_enabled) {
-            const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+            const has_glow: u8 = cellGlow(glow_all, glow_hl_ids, run_hl);
             @memset(dst.glow_arr.items[ds..de], has_glow);
         }
         // SIMD stride-2 extraction: Cell{cp,hl} -> cp only
@@ -4945,7 +4966,7 @@ pub const FlushCtx = struct {
                                             subgrid_margins,
                                         )) c_api.DECO_SCROLLABLE else 0;
                                         if (glow_enabled) {
-                                            row_cells.glow_arr.items[@intCast(tc)] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                            row_cells.glow_arr.items[@intCast(tc)] = cellGlow(glow_all, glow_hl_ids, cell.hl);
                                         }
                                     }
                                 }
@@ -5395,7 +5416,7 @@ pub const FlushCtx = struct {
                                         sg_margins,
                                     )) c_api.DECO_SCROLLABLE else 0;
                                     if (glow_enabled) {
-                                        tmp.glow_arr.items[dst_index] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                        tmp.glow_arr.items[dst_index] = cellGlow(glow_all, glow_hl_ids, run_hl);
                                     }
                                 }
 
@@ -6929,7 +6950,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         const attr = cache.getAttr(&self.hl, cell.hl);
                         self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
                         if (ext_glow_enabled) {
-                            self.row_cells.glow_arr.items[c] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                            self.row_cells.glow_arr.items[c] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
                         }
                     }
                     setViewportRowDecoFlags(
@@ -7000,7 +7021,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         float_margins,
                                     )) c_api.DECO_SCROLLABLE else 0;
                                     if (ext_glow_enabled) {
-                                        self.row_cells.glow_arr.items[target_col] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                        self.row_cells.glow_arr.items[target_col] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
                                     }
 
                                     // Every overlaid cell gets an entry, including
@@ -14823,6 +14844,272 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
     @memset(dst.glow_arr.items[0..cols], 0);
     composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
     for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
+
+    // The other glow branch: with glow_all off, only the runs whose hl is in
+    // the set light up. hl 7 is in, hl 9 is out, so the answer must differ
+    // per run rather than being uniform either way.
+    var ids = std.AutoHashMap(u32, void).init(core.alloc);
+    defer ids.deinit();
+    try ids.put(7, {});
+    @memset(dst.glow_arr.items[0..cols], 0xFF);
+    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
+    for (0..cols) |i| {
+        const expected: u8 = if (hls[i] == 7) 1 else 0;
+        try std.testing.expectEqual(expected, dst.glow_arr.items[i]);
+    }
+}
+
+/// Glyph callbacks that produce a 1x1 opaque glyph for anything asked for.
+/// Enough to make the vertex generator emit glyph vertices, which is where
+/// DECO_GLOW lands — background quads never carry it.
+const StubGlyphCallbacks = struct {
+    fn rasterize(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = ctx;
+        _ = scalar;
+        _ = style_flags;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        return 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = ctx;
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = ctx;
+        _ = atlas_w;
+        _ = atlas_h;
+    }
+
+    fn install(core: *Core) void {
+        core.cb.on_rasterize_glyph = rasterize;
+        core.cb.on_atlas_upload = upload;
+        core.cb.on_atlas_create = create;
+    }
+};
+
+/// Foreground colours of the two highlights the glow tests use, as they
+/// arrive in a vertex. Distinct so a glyph vertex identifies which cell it
+/// came from without decoding its position.
+const glow_in_set_fg: u32 = 0xFF0000;
+const glow_out_of_set_fg: u32 = 0x00FF00;
+const glow_in_set_color = [4]f32{ 1, 0, 0, 1 };
+const glow_out_of_set_color = [4]f32{ 0, 1, 0, 1 };
+
+/// Tallies one grid's glyph vertices by which cell they belong to AND whether
+/// they carry DECO_GLOW. Counting only "some glowed, some did not" would be
+/// symmetric under inversion, so a flipped decision or a swapped destination
+/// index would pass; keeping the two cells apart is what makes those fail.
+const GlowCounter = struct {
+    target_grid: i64,
+    in_set_glow: usize = 0,
+    in_set_plain: usize = 0,
+    out_of_set_glow: usize = 0,
+    out_of_set_plain: usize = 0,
+
+    fn count(self: *@This(), verts: ?[*]const c_api.Vertex, vert_count: usize) void {
+        const v = verts orelse return;
+        for (v[0..vert_count]) |vertex| {
+            if (vertex.grid_id != self.target_grid) continue;
+            // Background quads use the solid UV slot and never carry glow;
+            // counting them would drown the signal.
+            if (std.meta.eql(vertex.texCoord, VH.solid_uv)) continue;
+            const glowing = vertex.deco_flags & c_api.DECO_GLOW != 0;
+            if (std.meta.eql(vertex.color, glow_in_set_color)) {
+                if (glowing) self.in_set_glow += 1 else self.in_set_plain += 1;
+            } else if (std.meta.eql(vertex.color, glow_out_of_set_color)) {
+                if (glowing) self.out_of_set_glow += 1 else self.out_of_set_plain += 1;
+            }
+        }
+    }
+
+    /// With `glow_all` off only the cell whose highlight is in the set glows;
+    /// with it on both do. Either way both cells must have been seen, or the
+    /// fixture stopped emitting one of them and the rest proves nothing.
+    fn expect(self: @This(), glow_all: bool) !void {
+        try std.testing.expect(self.in_set_glow > 0);
+        try std.testing.expectEqual(@as(usize, 0), self.in_set_plain);
+        if (glow_all) {
+            try std.testing.expect(self.out_of_set_glow > 0);
+            try std.testing.expectEqual(@as(usize, 0), self.out_of_set_plain);
+        } else {
+            try std.testing.expect(self.out_of_set_plain > 0);
+            try std.testing.expectEqual(@as(usize, 0), self.out_of_set_glow);
+        }
+    }
+
+    fn onRow(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_count: u32,
+        verts: ?[*]const c_api.Vertex,
+        vert_count: usize,
+        flags: u32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = grid_id;
+        _ = row_start;
+        _ = row_count;
+        _ = flags;
+        _ = total_rows;
+        _ = total_cols;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.count(verts, vert_count);
+    }
+
+    fn onPartial(
+        ctx: ?*anyopaque,
+        main_verts: ?[*]const c_api.Vertex,
+        main_count: usize,
+        cursor_verts: ?[*]const c_api.Vertex,
+        cursor_count: usize,
+        flags: u32,
+    ) callconv(.c) void {
+        _ = cursor_verts;
+        _ = cursor_count;
+        _ = flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.count(main_verts, main_count);
+    }
+};
+
+/// Define the two glow-test highlights and arm glow. hl 42 is in the set,
+/// hl 7 is not; `glow_all` overrides the set and lights both.
+fn armGlowForTest(core: *Core, glow_all: bool) !void {
+    try core.hl.define(42, glow_in_set_fg, 0, null, false, 0, .{}, false);
+    try core.hl.define(7, glow_out_of_set_fg, 0, null, false, 0, .{}, false);
+    var ids = std.AutoHashMap(u32, void).init(core.alloc);
+    errdefer ids.deinit();
+    try ids.put(42, {});
+    core.glow_hl_ids = ids;
+    core.glow_all = glow_all;
+    core.glow_enabled.store(true, .release);
+}
+
+test "a main-grid subgrid overlay glows per cell in both composition modes" {
+    // The subgrid overlay decides glow per cell, separately from the
+    // main-grid run path, and it is written out once for row mode and once
+    // for whole-screen mode. Drive both and require the decision to follow
+    // the cell's own highlight rather than being uniform.
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, row_mode: bool, glow_all: bool) !GlowCounter {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+            try core.grid.resize(1, 4);
+            for (0..4) |c| core.grid.putCell(0, @intCast(c), '.', 0);
+
+            // A two-cell window over the main grid: one cell's highlight is in
+            // the glow set, the other's is not.
+            try core.grid.resizeGrid(2, 1, 2);
+            try core.grid.setWinPos(2, 40, 0, 0);
+            core.grid.putCellGrid(2, 0, 0, 'G', 42);
+            core.grid.putCellGrid(2, 0, 1, 'N', 7);
+
+            core.grid.cursor_visible = false;
+            core.drawable_w_px = 4;
+            core.drawable_h_px = 1;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+            try armGlowForTest(&core, glow_all);
+
+            var counter = GlowCounter{ .target_grid = 2 };
+            core.ctx = &counter;
+            if (row_mode) {
+                core.cb.on_vertices_row = GlowCounter.onRow;
+            } else {
+                core.cb.on_vertices_partial = GlowCounter.onPartial;
+            }
+            StubGlyphCallbacks.install(&core);
+
+            var flush_ctx = FlushCtx{ .core = &core };
+            try flush_ctx.onFlush(1, 4);
+            return counter;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |row_mode| {
+        for ([_]bool{ false, true }) |glow_all| {
+            const counter = try Runner.run(alloc, row_mode, glow_all);
+            try counter.expect(glow_all);
+        }
+    }
+}
+
+test "an external grid and its anchored float glow per cell" {
+    // The external-grid path carries its own copy of the decision, once for
+    // the grid's own rows and once for a float composited onto it.
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, target: i64, glow_all: bool) !GlowCounter {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+
+            // Four columns so the float can sit beside the grid's own cells
+            // rather than covering them.
+            try core.grid.resizeGrid(2, 1, 4);
+            try core.grid.putSyntheticExternal(2, .{ .win = 42, .start_row = 0, .start_col = 0 });
+            core.grid.putCellGrid(2, 0, 0, 'G', 42);
+            core.grid.putCellGrid(2, 0, 1, 'N', 7);
+
+            // A float anchored on the external grid, same split.
+            try core.grid.resizeGrid(3, 1, 2);
+            try core.grid.setWinFloatPos(3, 43, 0, 2, 10, 0, 2);
+            core.grid.putCellGrid(3, 0, 0, 'G', 42);
+            core.grid.putCellGrid(3, 0, 1, 'N', 7);
+
+            core.grid.cursor_visible = false;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+            try armGlowForTest(&core, glow_all);
+
+            var counter = GlowCounter{ .target_grid = target };
+            core.ctx = &counter;
+            core.cb.on_vertices_row = GlowCounter.onRow;
+            StubGlyphCallbacks.install(&core);
+
+            core.sendExternalGridVertices(true);
+            return counter;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    // grid 2 is the external grid's own rows; grid 3 is the float overlay.
+    for ([_]i64{ 2, 3 }) |target| {
+        for ([_]bool{ false, true }) |glow_all| {
+            const counter = try Runner.run(alloc, target, glow_all);
+            try counter.expect(glow_all);
+        }
+    }
 }
 
 test "resolveHlCached memoizes below the limit and resolves live above it" {
