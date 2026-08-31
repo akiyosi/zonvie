@@ -717,15 +717,17 @@ fn setViewportRowDecoFlags(
     if (start < end) @memset(flags[start..end], c_api.DECO_SCROLLABLE);
 }
 
-// Style flags for RenderCell (bit positions)
-pub const STYLE_BOLD: u8 = 1 << 0;
-pub const STYLE_ITALIC: u8 = 1 << 1;
-pub const STYLE_STRIKETHROUGH: u8 = 1 << 2;
-pub const STYLE_UNDERLINE: u8 = 1 << 3;
-pub const STYLE_UNDERCURL: u8 = 1 << 4;
-pub const STYLE_UNDERDOUBLE: u8 = 1 << 5;
-pub const STYLE_UNDERDOTTED: u8 = 1 << 6;
-pub const STYLE_UNDERDASHED: u8 = 1 << 7;
+// Style flags for RenderCell (bit positions). Declared in highlight.zig,
+// which is where getWithStyles packs them; re-exported here because every
+// existing call site says flush.STYLE_*.
+pub const STYLE_BOLD = highlight.STYLE_BOLD;
+pub const STYLE_ITALIC = highlight.STYLE_ITALIC;
+pub const STYLE_STRIKETHROUGH = highlight.STYLE_STRIKETHROUGH;
+pub const STYLE_UNDERLINE = highlight.STYLE_UNDERLINE;
+pub const STYLE_UNDERCURL = highlight.STYLE_UNDERCURL;
+pub const STYLE_UNDERDOUBLE = highlight.STYLE_UNDERDOUBLE;
+pub const STYLE_UNDERDOTTED = highlight.STYLE_UNDERDOTTED;
+pub const STYLE_UNDERDASHED = highlight.STYLE_UNDERDASHED;
 
 /// SoA (Struct of Arrays) cell buffer for cache-efficient RLE scanning.
 /// Each field is a separate contiguous array, improving cache utilization
@@ -803,20 +805,6 @@ pub const RenderCells = struct {
         self.overline_arr.items[i] = overline;
     }
 };
-
-/// Pack style flags from ResolvedAttrWithStyles into u8.
-pub fn packStyleFlags(a: ResolvedAttrWithStyles) u8 {
-    var flags: u8 = 0;
-    if (a.bold) flags |= STYLE_BOLD;
-    if (a.italic) flags |= STYLE_ITALIC;
-    if (a.strikethrough) flags |= STYLE_STRIKETHROUGH;
-    if (a.underline) flags |= STYLE_UNDERLINE;
-    if (a.undercurl) flags |= STYLE_UNDERCURL;
-    if (a.underdouble) flags |= STYLE_UNDERDOUBLE;
-    if (a.underdotted) flags |= STYLE_UNDERDOTTED;
-    if (a.underdashed) flags |= STYLE_UNDERDASHED;
-    return flags;
-}
 
 // --- SIMD-accelerated RLE scan helpers ---
 // These use Zig @Vector intrinsics for batch comparison of contiguous SoA arrays.
@@ -6913,7 +6901,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         else
                             .{ .cp = ' ', .hl = 0 };
                         const attr = cache.getAttr(&self.hl, cell.hl);
-                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, attr.style_flags, @intFromBool(attr.overline));
                         if (ext_glow_enabled) {
                             self.row_cells.glow_arr.items[c] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
                         }
@@ -6977,7 +6965,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     // boundary: base and float text must never
                                     // form one ligature/kerning run merely
                                     // because their resolved styles match.
-                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, attr.style_flags, @intFromBool(attr.overline));
                                     self.row_cells.deco_base_flags.items[target_col] = if (viewportCellScrollable(
                                         float_src_row,
                                         float_src_col,
