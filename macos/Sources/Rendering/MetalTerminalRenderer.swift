@@ -4951,103 +4951,95 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         if rowsDelta > 0 {
             for dstRow in rowStart..<(rowEnd - shift) {
-                let srcRow = dstRow + shift
-                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                guard srcRow < srcSet.rowLogicalToSlot.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-                guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcCount = srcSet.rowState.counts[srcSlot]
-                guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
-                    // Allocation failure with real content to preserve
-                    // (srcCount > 0, checked above) — not a safe row-empty
-                    // case, see this function's doc comment.
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    _ = requirePreparedRowCapacity(
-                        row: dstSlot,
-                        vertexCount: srcCount,
-                        totalRows: totalRows,
-                        rowIsPhysical: true
-                    )
+                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
+                                        srcRow: dstRow + shift, deltaY: deltaY, totalRows: totalRows) {
                     didFail = true
-                    continue
                 }
-                let byteCount = srcCount * MemoryLayout<Vertex>.stride
-                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
-                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
-                for i in 0..<srcCount {
-                    verts[i].position.y += deltaY
-                }
-                bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
-                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
             }
-            for vacatedRow in (rowEnd - shift)..<rowEnd {
-                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
-                ensureRowStorageInSet(setIdx, slot)
-                bufferSets[setIdx].rowState.counts[slot] = 0
-                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
-            }
+            clearVacatedMainRows(setIdx: setIdx, rows: (rowEnd - shift)..<rowEnd)
         } else {
             for dstRow in stride(from: rowEnd - 1, through: rowStart + shift, by: -1) {
-                let srcRow = dstRow - shift
-                guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
-                    let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcCount = srcSet.rowState.counts[srcSlot]
-                guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
-                    // Allocation failure with real content to preserve
-                    // (srcCount > 0, checked above) — not a safe row-empty
-                    // case, see this function's doc comment.
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    _ = requirePreparedRowCapacity(
-                        row: dstSlot,
-                        vertexCount: srcCount,
-                        totalRows: totalRows,
-                        rowIsPhysical: true
-                    )
+                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
+                                        srcRow: dstRow - shift, deltaY: deltaY, totalRows: totalRows) {
                     didFail = true
-                    continue
                 }
-                let byteCount = srcCount * MemoryLayout<Vertex>.stride
-                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
-                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
-                for i in 0..<srcCount {
-                    verts[i].position.y += deltaY
-                }
-                bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
-                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
             }
-            for vacatedRow in rowStart..<(rowStart + shift) {
-                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
-                ensureRowStorageInSet(setIdx, slot)
-                bufferSets[setIdx].rowState.counts[slot] = 0
-                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
-            }
+            clearVacatedMainRows(setIdx: setIdx, rows: rowStart..<(rowStart + shift))
         }
 
         markDirtyRows(rowStart: rowStart, rowCount: rowEnd - rowStart)
         return !didFail
+    }
+
+    /// Copy one logical row from the flush source set into the write set,
+    /// shifting its vertices by `deltaY`. The two arms of
+    /// cpuShiftMainRowBuffers were mirror images of this; they now differ only
+    /// in how srcRow is derived and in which direction they iterate.
+    ///
+    /// Returns false only when a row with real content could not be given a
+    /// destination buffer -- see cpuShiftMainRowBuffers' doc comment. A source
+    /// row that is out of range or empty leaves the destination row empty and
+    /// still returns true.
+    ///
+    /// The upward arm never produced a negative srcRow, so its bounds check
+    /// omitted the lower half; checking both here is a superset and changes
+    /// nothing for either caller.
+    private func copyScrolledMainRow(
+        setIdx: Int,
+        srcSet: SurfaceBufferSet,
+        dstRow: Int,
+        srcRow: Int,
+        deltaY: Float,
+        totalRows: Int
+    ) -> Bool {
+        let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+        guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        let srcSlot = srcSet.rowLogicalToSlot[srcRow]
+        guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        let srcCount = srcSet.rowState.counts[srcSlot]
+        guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+            // Allocation failure with real content to preserve
+            // (srcCount > 0, checked above) — not a safe row-empty
+            // case, see cpuShiftMainRowBuffers' doc comment.
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            _ = requirePreparedRowCapacity(
+                row: dstSlot,
+                vertexCount: srcCount,
+                totalRows: totalRows,
+                rowIsPhysical: true
+            )
+            return false
+        }
+        let byteCount = srcCount * MemoryLayout<Vertex>.stride
+        memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
+        let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
+        for i in 0..<srcCount {
+            verts[i].position.y += deltaY
+        }
+        bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
+        bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
+        return true
+    }
+
+    /// Empty the rows the scroll vacated, so nothing of the pre-scroll frame
+    /// survives in them.
+    private func clearVacatedMainRows(setIdx: Int, rows: Range<Int>) {
+        for vacatedRow in rows {
+            let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
+            ensureRowStorageInSet(setIdx, slot)
+            bufferSets[setIdx].rowState.counts[slot] = 0
+            bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
+        }
     }
 
     private func ndcX(_ xPx: Float, drawableWidth: Float) -> Float {
