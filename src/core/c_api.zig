@@ -1291,6 +1291,24 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     };
 }
 
+/// Milliseconds until the next armed message deadline, or -1 when none is
+/// armed and 0 when one is already due.
+///
+/// Rounds up: a deadline 1 ns away must report 1 ms, not 0, or a frontend
+/// that trusts the value schedules a timer that fires before the deadline and
+/// spins. Both exported entry points share this so the two cannot round
+/// differently.
+///
+/// The caller owns grid_mu; this only reads under it.
+fn nextMsgTimeoutMsLocked(box: *CoreBox) i64 {
+    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
+    const now = clock.nowNs();
+    if (deadline <= now) return 0;
+    const remaining_ns = deadline - now;
+    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
+    return @intCast(remaining_ms);
+}
+
 /// Returns milliseconds until the earliest pending message or render-
 /// maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
 /// Frontends use this to schedule one timer instead of polling every frame.
@@ -1299,12 +1317,7 @@ pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64
     const box = asBox(p.?);
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
-    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
-    const now = clock.nowNs();
-    if (deadline <= now) return 0;
-    const remaining_ns = deadline - now;
-    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
-    return @intCast(remaining_ms);
+    return nextMsgTimeoutMsLocked(box);
 }
 
 /// Non-blocking version of zonvie_core_next_msg_timeout_ms.
@@ -1321,12 +1334,7 @@ pub export fn zonvie_core_try_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c)
     box.core.perf_lock_msg_timeout.record(acquired);
     if (!acquired) return -2;
     defer box.core.grid_mu.unlock(clock.io());
-    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
-    const now = clock.nowNs();
-    if (deadline <= now) return 0;
-    const remaining_ns = deadline - now;
-    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
-    return @intCast(remaining_ms);
+    return nextMsgTimeoutMsLocked(box);
 }
 
 /// Report whether the pointer rests on a message ext_float window. While
@@ -1576,6 +1584,22 @@ pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callco
     box.core.option_as_meta.store(value, .release);
 }
 
+/// Write the three blink intervals into whichever out-pointers the caller
+/// supplied. Shared by the blocking and try variants so a future fourth
+/// interval cannot reach one and miss the other.
+///
+/// The caller owns grid_mu; this only reads under it.
+fn writeCursorBlinkLocked(
+    box: *CoreBox,
+    out_wait_ms: ?*u32,
+    out_on_ms: ?*u32,
+    out_off_ms: ?*u32,
+) void {
+    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
+    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
+    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+}
+
 /// Get current cursor blink parameters (in milliseconds).
 pub export fn zonvie_core_get_cursor_blink(
     p: ?*zonvie_core,
@@ -1592,9 +1616,7 @@ pub export fn zonvie_core_get_cursor_blink(
     const box = asBox(p.?);
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
-    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
-    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
-    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+    writeCursorBlinkLocked(box, out_wait_ms, out_on_ms, out_off_ms);
 }
 
 /// Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
@@ -1615,9 +1637,7 @@ pub export fn zonvie_core_try_get_cursor_blink(
     box.core.perf_lock_cursor_blink.record(acquired);
     if (!acquired) return false;
     defer box.core.grid_mu.unlock(clock.io());
-    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
-    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
-    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+    writeCursorBlinkLocked(box, out_wait_ms, out_on_ms, out_off_ms);
     return true;
 }
 
