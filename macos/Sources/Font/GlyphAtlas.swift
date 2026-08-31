@@ -1702,7 +1702,29 @@ final class GlyphAtlas {
         // Copy bitmap data to stable buffer while under lock.
         // This prevents use-after-free if main thread destroys FreeType font
         // (via setBackingScale/rebuildFont_locked) between rasterizeOnly and uploadRegion.
-        let ibpp = Int(bpp)
+                copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
+
+        return true
+    }
+
+    /// Copy a FreeType bitmap into rasterizeScratch and publish it through
+    /// outBitmap. Copying under the lock is what prevents a use-after-free if
+    /// the main thread destroys the FreeType font (via setBackingScale /
+    /// rebuildFont_locked) between rasterize and uploadRegion.
+    ///
+    /// A 4-byte-per-pixel source is BGRA and is swizzled to RGBA on the way
+    /// in; a negative pitch means FreeType handed back bottom-up rows.
+    /// The scratch buffer only ever grows, so a steady state does not
+    /// allocate. Must be called with mu locked.
+    private func copyFreeTypeBitmapToScratch_locked(
+        buf bufPtr: UnsafePointer<UInt8>,
+        width w: Int32,
+        height h: Int32,
+        pitch: Int32,
+        bytesPerPixel bpp: Int32,
+        outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+    ) {
+let ibpp = Int(bpp)
         let rowBytes = Int(w) * ibpp
         let needed = rowBytes * Int(h)
         if rasterizeScratch.count < needed {
@@ -1713,7 +1735,7 @@ final class GlyphAtlas {
             guard let base = dst.baseAddress else { return }
             for row in 0..<Int(h) {
                 let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
-                let src = bufPtr!.advanced(by: srcRow * absPitch)
+                let src = bufPtr.advanced(by: srcRow * absPitch)
                 if ibpp == 4 {
                     // BGRA → RGBA conversion
                     let dstRow = base.advanced(by: row * rowBytes)
@@ -1737,8 +1759,6 @@ final class GlyphAtlas {
         outBitmap.pointee.height = UInt32(h)
         outBitmap.pointee.pitch = Int32(rowBytes)
         outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
-
-        return true
     }
 
     /// Select the appropriate HBFT font handle for the given style flags.
@@ -1868,41 +1888,7 @@ final class GlyphAtlas {
             outBitmap.pointee.bytes_per_pixel = 1
         } else {
             // Copy bitmap data to stable buffer (same as rasterizeOnly)
-            let ibpp = Int(bpp)
-            let rowBytes = Int(w) * ibpp
-            let needed = rowBytes * Int(h)
-            if rasterizeScratch.count < needed {
-                rasterizeScratch = Array(repeating: 0, count: needed)
-            }
-            let absPitch = abs(Int(pitch))
-            rasterizeScratch.withUnsafeMutableBufferPointer { dst in
-                guard let base = dst.baseAddress else { return }
-                for row in 0..<Int(h) {
-                    let srcRow = pitch >= 0 ? row : (Int(h) - 1 - row)
-                    let src = bufPtr!.advanced(by: srcRow * absPitch)
-                    if ibpp == 4 {
-                        // BGRA → RGBA conversion
-                        let dstRow = base.advanced(by: row * rowBytes)
-                        for col in 0..<Int(w) {
-                            let si = col * 4
-                            let di = col * 4
-                            dstRow[di + 0] = src[si + 2]  // R ← B
-                            dstRow[di + 1] = src[si + 1]  // G ← G
-                            dstRow[di + 2] = src[si + 0]  // B ← R
-                            dstRow[di + 3] = src[si + 3]  // A ← A
-                        }
-                    } else {
-                        memcpy(base.advanced(by: row * rowBytes), src, rowBytes)
-                    }
-                }
-            }
-            rasterizeScratch.withUnsafeBufferPointer { buf in
-                outBitmap.pointee.pixels = buf.baseAddress
-            }
-            outBitmap.pointee.width = UInt32(w)
-            outBitmap.pointee.height = UInt32(h)
-            outBitmap.pointee.pitch = Int32(rowBytes)
-            outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
+                        copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
         }
 
         return true
