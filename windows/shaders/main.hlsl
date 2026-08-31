@@ -127,7 +127,7 @@ float4 PSMain(VSOut i) : SV_Target {
         return float4(tex.rgb * tex.a, tex.a);
     }
 
-    // Background quads use sentinel uv.x < 0 in current vertexgen.
+    // Background quads use sentinel uv.x < 0, set by VH.solid_uv in flush.zig.
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (i.uv.x < 0.0) {
         // Icon rendering with SDF (uv.x <= -1.9)
