@@ -744,6 +744,219 @@ fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, event
     );
 }
 
+/// Like runRedrawEvents, but counts the flush callbacks. The parity suite
+/// deleted in 14ca02f asserted on these counts; the tests below need them to
+/// pin that a poisoned batch never reaches flush.
+const FlushCounts = struct {
+    pre_flush: u32 = 0,
+    flush: u32 = 0,
+};
+
+fn runRedrawEventsCounting(
+    grid: *Grid,
+    hl: *Highlights,
+    arena: std.mem.Allocator,
+    events: []mp.Value,
+    counts: *FlushCounts,
+) !void {
+    var log = Logger{};
+    const cb = struct {
+        fn preFlush(c: *FlushCounts) anyerror!void {
+            c.pre_flush += 1;
+        }
+        fn flush(c: *FlushCounts, _: u32, _: u32) anyerror!void {
+            c.flush += 1;
+        }
+        fn guifont(_: *FlushCounts, _: []const u8) anyerror!void {}
+        fn linespace(_: *FlushCounts, _: i32) anyerror!void {}
+    };
+    try handleRedraw(
+        grid,
+        hl,
+        arena,
+        events,
+        &log,
+        counts,
+        cb.preFlush,
+        cb.flush,
+        counts,
+        cb.guifont,
+        counts,
+        cb.linespace,
+        null,
+        null,
+        null,
+        null,
+    );
+}
+
+
+// The three tests below restore assertions the parity suite carried before
+// 14ca02f removed it. They drove the same Value-tree path production uses, so
+// dropping the second decoder did not make them redundant.
+
+test "hostile redraw numerics normalize instead of trapping" {
+    // Values past u32 arrive from a hostile or buggy peer. Each must clamp or
+    // fall back, never trap, and a cursor row past the grid must not move the
+    // cursor off the last valid row.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const beyond_u32: i64 = @as(i64, std.math.maxInt(u32)) + 1;
+
+    // cmdline_show with every numeric field past u32: pos, indent and
+    // prompt_hl_id all normalize, and the content chunk's attr_id falls back
+    // to the default highlight.
+    {
+        const chunk = try arena.alloc(mp.Value, 2);
+        chunk[0] = .{ .int = beyond_u32 };
+        chunk[1] = .{ .str = "abc" };
+        const content = try arena.alloc(mp.Value, 1);
+        content[0] = .{ .arr = chunk };
+
+        const t = try arena.alloc(mp.Value, 7);
+        t[0] = .{ .arr = content };
+        t[1] = .{ .int = beyond_u32 }; // pos
+        t[2] = .{ .str = "" }; // firstc
+        t[3] = .{ .str = "" }; // prompt
+        t[4] = .{ .int = std.math.maxInt(u32) }; // indent
+        t[5] = .{ .int = beyond_u32 }; // level
+        t[6] = .{ .int = beyond_u32 }; // hl_id
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "cmdline_show", t));
+    }
+
+    const cmdline = grid.cmdline_states.getPtr(1).?;
+    try std.testing.expectEqual(@as(u32, 0), cmdline.pos);
+    try std.testing.expectEqual(@as(u32, 0), cmdline.prompt_hl_id);
+    try std.testing.expectEqual(@as(u32, 0), cmdline.content.items[0].hl_id);
+
+    // A valid cursor move, then one whose row is maxInt(u32): the second must
+    // be rejected outright rather than clamped onto a different row.
+    {
+        const t = try arena.alloc(mp.Value, 3);
+        t[0] = .{ .int = 1 };
+        t[1] = .{ .int = 1 };
+        t[2] = .{ .int = 1 };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "grid_cursor_goto", t));
+    }
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_row);
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_col);
+
+    {
+        const t = try arena.alloc(mp.Value, 3);
+        t[0] = .{ .int = 1 };
+        t[1] = .{ .int = std.math.maxInt(u32) };
+        t[2] = .{ .int = 0 };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "grid_cursor_goto", t));
+    }
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_row);
+    try std.testing.expectEqual(@as(u32, 1), grid.cursor_col);
+}
+
+test "hostile win_float_pos coordinates create no placement" {
+    // NaN and infinity in the anchor coordinates must leave the grid with no
+    // float placement rather than producing one at a garbage position.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(4, 4);
+
+    const bad = [_]f64{
+        std.math.nan(f64),
+        std.math.inf(f64),
+        -std.math.inf(f64),
+    };
+    for (bad) |v| {
+        const t = try arena.alloc(mp.Value, 8);
+        t[0] = .{ .int = 2 }; // grid
+        t[1] = .{ .int = 1 }; // win
+        t[2] = .{ .str = "NW" }; // anchor
+        t[3] = .{ .int = 1 }; // anchor_grid
+        t[4] = .{ .float = v }; // anchor_row
+        t[5] = .{ .float = v }; // anchor_col
+        t[6] = .{ .bool = true }; // focusable
+        t[7] = .{ .int = 50 }; // zindex
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        try std.testing.expect(grid.sub_grids.getPtr(2) == null);
+    }
+}
+
+test "an oversized grid_resize poisons its batch before the tail and never flushes" {
+    // The batch is abandoned at the bad resize: the grid_line and
+    // hl_attr_define behind it must not apply, and flush must not run --
+    // flush may only clear dirty state after a batch it actually delivered.
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try grid.resize(2, 4);
+
+    const events = try arena.alloc(mp.Value, 5);
+
+    // 1. A good cell that must survive.
+    events[0] = try testGridLineEvent(arena, 1, 0, 0, &.{try testCell(arena, "A", 1, null)});
+    // 2. The poison.
+    {
+        const t = try arena.alloc(mp.Value, 3);
+        t[0] = .{ .int = 1 };
+        t[1] = .{ .int = @as(i64, grid_mod.MAX_GRID_COLS) + 1 };
+        t[2] = .{ .int = 1 };
+        const ev = try arena.alloc(mp.Value, 2);
+        ev[0] = .{ .str = "grid_resize" };
+        ev[1] = .{ .arr = t };
+        events[1] = .{ .arr = ev };
+    }
+    // 3. A cell behind the poison that must NOT apply.
+    events[2] = try testGridLineEvent(arena, 1, 0, 1, &.{try testCell(arena, "B", 42, null)});
+    // 4. A highlight behind the poison that must NOT register.
+    {
+        const attrs = try arena.alloc(mp.Value, 0);
+        const t = try arena.alloc(mp.Value, 4);
+        t[0] = .{ .int = 42 };
+        t[1] = .{ .map = &[_]mp.Pair{} };
+        t[2] = .{ .map = &[_]mp.Pair{} };
+        t[3] = .{ .arr = attrs };
+        const ev = try arena.alloc(mp.Value, 2);
+        ev[0] = .{ .str = "hl_attr_define" };
+        ev[1] = .{ .arr = t };
+        events[3] = .{ .arr = ev };
+    }
+    // 5. The flush that must never run.
+    {
+        const ev = try arena.alloc(mp.Value, 2);
+        ev[0] = .{ .str = "flush" };
+        ev[1] = .{ .arr = try arena.alloc(mp.Value, 0) };
+        events[4] = .{ .arr = ev };
+    }
+
+    var counts = FlushCounts{};
+    try std.testing.expectError(
+        error.GridTooLarge,
+        runRedrawEventsCounting(&grid, &hl, arena, events, &counts),
+    );
+
+    try std.testing.expectEqual(@as(u32, 'A'), grid.getCell(0, 0).cp);
+    try std.testing.expectEqual(@as(u32, ' '), grid.getCell(0, 1).cp);
+    try std.testing.expect(!hl.map.contains(42));
+    try std.testing.expectEqual(@as(u32, 0), counts.flush);
+}
+
 test "grid_line keeps hl sticky across cells and inherits leftwards on -1" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
