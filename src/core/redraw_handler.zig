@@ -790,7 +790,6 @@ fn runRedrawEventsCounting(
     );
 }
 
-
 // The three tests below restore assertions the parity suite carried before
 // 14ca02f removed it. They drove the same Value-tree path production uses, so
 // dropping the second decoder did not make them redundant.
