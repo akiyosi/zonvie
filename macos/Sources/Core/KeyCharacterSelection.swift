@@ -70,6 +70,33 @@ enum KeyCharacterSelection {
         default: return false
         }
     }
+
+    /// Pack the four modifier bits Neovim is sent for a key event.
+    ///
+    /// The bit values are passed in rather than referenced here: this file is
+    /// compiled Foundation-only by its standalone test target, which has no
+    /// C header, so ZONVIE_MOD_* is not in scope. Callers pass the constants
+    /// from include/zonvie_core.h.
+    ///
+    /// Option is reported as Alt only when it is acting as Meta -- see
+    /// optionActsAsMeta. Both key paths composed these bits identically.
+    static func modifierMask(
+        control: Bool,
+        optionIsMeta: Bool,
+        shift: Bool,
+        command: Bool,
+        ctrlBit: UInt32,
+        altBit: UInt32,
+        shiftBit: UInt32,
+        superBit: UInt32
+    ) -> UInt32 {
+        var mods: UInt32 = 0
+        if control { mods |= ctrlBit }
+        if optionIsMeta { mods |= altBit }
+        if shift { mods |= shiftBit }
+        if command { mods |= superBit }
+        return mods
+    }
 }
 
 #if canImport(AppKit)
