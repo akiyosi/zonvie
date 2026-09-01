@@ -409,7 +409,19 @@ pub const StderrPump = struct {
 ///   - an empty quoted token is dropped, so "" cannot pass an empty argument
 ///   - there is no concatenation: a"b c" yields a"b and c"
 fn tokenizeCommand(cmd: []const u8, out: [][]const u8) usize {
+    return tokenizeCommandSkipping(cmd, out, null);
+}
+
+/// As tokenizeCommand, but a leading run of tokens equal to `skip_leading` is
+/// consumed without occupying an output slot.
+///
+/// Dropping the run after tokenizing is not equivalent: the wrapper tokens
+/// would take slots first, so a command long enough to fill `out` would lose
+/// its tail. Skipping here restores the pre-extraction behaviour, where the
+/// wrapper was stepped over inside the argc-bounded loop and cost nothing.
+fn tokenizeCommandSkipping(cmd: []const u8, out: [][]const u8, skip_leading: ?[]const u8) usize {
     var argc: usize = 0;
+    var skipping = skip_leading != null;
     var i: usize = 0;
     while (i < cmd.len and argc < out.len) {
         while (i < cmd.len and cmd[i] == ' ') : (i += 1) {}
@@ -440,7 +452,12 @@ fn tokenizeCommand(cmd: []const u8, out: [][]const u8) usize {
         }
 
         if (arg_end > arg_start) {
-            out[argc] = cmd[arg_start..arg_end];
+            const tok = cmd[arg_start..arg_end];
+            if (skipping) {
+                if (std.mem.eql(u8, tok, skip_leading.?)) continue;
+                skipping = false;
+            }
+            out[argc] = tok;
             argc += 1;
         }
     }
@@ -1967,20 +1984,16 @@ pub fn runLoop(self: *Core) void {
 
     if (is_wsl or is_ssh or is_ssh_askpass or is_cmd or is_devcontainer or is_shell) {
         // Parse command string into arguments (split by spaces, handle quotes and escapes)
-        argc = tokenizeCommand(nvim_path, &argv_buf);
-        if (is_ssh_askpass) {
-            // The wrapper name is not part of the command; the real ssh
-            // invocation follows it. The old inline form skipped it with a
-            // guard on argc == 0, which re-fired until something else was
-            // emitted -- so it dropped the whole leading run, not just one.
-            var drop: usize = 0;
-            while (drop < argc and std.mem.eql(u8, argv_buf[drop], "ssh-askpass")) : (drop += 1) {}
-            if (drop > 0) {
-                var k: usize = 0;
-                while (k + drop < argc) : (k += 1) argv_buf[k] = argv_buf[k + drop];
-                argc -= drop;
-            }
-        }
+        // The wrapper name is not part of the command; the real ssh invocation
+        // follows it. The whole leading RUN is skipped, matching the original
+        // inline form whose argc == 0 guard re-fired until something else was
+        // emitted -- and it is skipped during tokenization so the dropped
+        // tokens do not consume argv slots.
+        argc = tokenizeCommandSkipping(
+            nvim_path,
+            &argv_buf,
+            if (is_ssh_askpass) "ssh-askpass" else null,
+        );
         if (is_wsl) {
             self.log.write("WSL mode: parsed {d} arguments\n", .{argc});
         } else if (is_ssh_askpass) {
@@ -3292,6 +3305,54 @@ const ClipboardSetProbe = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+
+test "a skipped wrapper run costs no argv slot" {
+    // ab0974c moved the ssh-askpass skip after tokenization, so the wrapper
+    // tokens took output slots before being dropped. A command that filled the
+    // buffer then lost its tail: "ssh-askpass" + 16 tokens produced 15 args
+    // instead of 16, and a leading run of 16 wrappers produced none at all.
+    var buf: [16][]const u8 = undefined;
+
+    // Exactly the threshold: one wrapper plus a full buffer's worth of tokens.
+    {
+        var cmd: std.ArrayListUnmanaged(u8) = .empty;
+        defer cmd.deinit(std.testing.allocator);
+        try cmd.appendSlice(std.testing.allocator, "ssh-askpass");
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            try cmd.append(std.testing.allocator, ' ');
+            try cmd.append(std.testing.allocator, @intCast('a' + i));
+        }
+        const n = tokenizeCommandSkipping(cmd.items, &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 16), n);
+        try std.testing.expectEqualStrings("a", buf[0]);
+        try std.testing.expectEqualStrings("p", buf[15]);
+    }
+
+    // A doubled wrapper is still one run, and still costs nothing.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh-askpass ssh -t host nvim", &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 4), n);
+        try std.testing.expectEqualStrings("ssh", buf[0]);
+        try std.testing.expectEqualStrings("nvim", buf[3]);
+    }
+
+    // The run only counts at the front: a later occurrence is a real argument.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh ssh-askpass host", &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualStrings("ssh", buf[0]);
+        try std.testing.expectEqualStrings("ssh-askpass", buf[1]);
+    }
+
+    // Passing null skips nothing, so tokenizeCommand is unchanged.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh host", &buf, null);
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualStrings("ssh-askpass", buf[0]);
+    }
+}
 
 test "the spawn command tokenizer keeps the quirks both copies had" {
     // These are not desirable rules, they are the rules the two inline copies
