@@ -202,6 +202,54 @@ pub fn isSpecialVk(vk: u32) bool {
 /// Build a NUL-terminated mouse modifier string ('S'/'C'/'A'/'D') from a
 /// mouse message's wParam MK_* flags plus GetKeyState for Alt/Win.
 /// The returned buffer is zero-padded, so &result casts to [*:0]const u8.
+/// Client-pixel (x, y) to a grid cell. The main window's content is offset by
+/// its chrome -- a left sidebar tabline shifts X, a titlebar tabline shifts Y
+/// -- and external windows carry neither, which is what is_main_window
+/// selects.
+///
+/// That guard is the whole reason this is one function. The five copies in
+/// window.zig's mouse arms omitted it and were correct only because they sit
+/// inside the main window's procedure; the copy here needed it because
+/// handleMouseWheel runs for both window kinds. Sharing the version without
+/// the guard would have made every external-window wheel event land on the
+/// wrong cell.
+///
+/// cell_w and row_h are parameters rather than reads of app: every caller
+/// already has them in hand from the same locked read as the other metrics.
+pub const CellPos = struct { row: i32, col: i32 };
+
+pub fn clientPxToCell(
+    app: *App,
+    is_main_window: bool,
+    x: i32,
+    y: i32,
+    cell_w: u32,
+    row_h: u32,
+) CellPos {
+    // Single early return rather than an is_main_window term inside each
+    // offset: this way removing the guard makes the parameter unused, which
+    // Zig rejects. An external window silently taking the main window's
+    // chrome offsets is otherwise invisible until someone clicks.
+    if (!is_main_window) return cellAt(x, y, cell_w, row_h);
+
+    const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
+        x - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+    else
+        x;
+    const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+        y - @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
+    else
+        y;
+    return cellAt(content_x, content_y, cell_w, row_h);
+}
+
+fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32) CellPos {
+    return .{
+        .col = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0,
+        .row = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0,
+    };
+}
+
 pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
     var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
     var mod_len: usize = 0;
@@ -258,16 +306,9 @@ pub fn handleMouseWheel(
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const content_x: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-        pt.x - @as(c.LONG, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-    else
-        pt.x;
-    const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(c.LONG, @intCast(cell_w))) else 0;
-    const content_y: c.LONG = if (is_main_window and app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        pt.y - @as(c.LONG, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-    else
-        pt.y;
-    const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(c.LONG, @intCast(row_h))) else 0;
+    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h);
+    const col = cell.col;
+    const row = cell.row;
 
     // Resolve the scroll target on the main window: hit-test visible grids so
     // a wheel event over a composited grid (float/split) targets that grid
