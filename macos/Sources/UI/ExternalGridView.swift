@@ -3873,37 +3873,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         // Check if Option key should be treated as Meta (Alt) based on config.
         // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
-        let optionIsMeta: Bool = {
-            guard m.contains(.option) else { return false }
-            let val = core.getOptionAsMeta()
-            switch val {
-            case 0: return true                       // both
-            case 1: return false                      // none
-            case 2: return m.rawValue & 0x20 != 0     // only_left
-            case 3: return m.rawValue & 0x40 != 0     // only_right
-            default: return true
-            }
-        }()
+        let optionIsMeta = KeyCharacterSelection.optionActsAsMeta(
+            hasOption: m.contains(.option),
+            modifierRawValue: m.rawValue,
+            optionAsMeta: core.getOptionAsMeta()
+        )
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
-        if hasMarkedText() {
-            if event.keyCode == 0x35 {  // Escape: cancel composition
-                unmarkText()
-                inputContext?.discardMarkedText()
-                return
-            }
-            // Let IME handle the key (Enter commits, arrows navigate, etc.)
-            if let ctx = inputContext, ctx.handleEvent(event) {
-                return
-            }
-            interpretKeyEvents([event])
-            return
-        }
+        if consumeKeyDuringComposition(event) { return }
 
         // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = isSpecialKeyCode(event.keyCode)
+        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
 
         if hasControlOrCommand || isSpecialKey {
             // Use sendKeyEvent (same as MetalTerminalView) instead of sendInput
@@ -3946,22 +3928,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     /// Returns true for special keycodes that should bypass IME.
-    private func isSpecialKeyCode(_ keyCode: UInt16) -> Bool {
-        switch keyCode {
-        case 0x35: return true  // Escape
-        case 0x7B, 0x7C, 0x7D, 0x7E: return true  // Arrow keys
-        case 0x24: return true  // Return
-        case 0x30: return true  // Tab
-        case 0x33: return true  // Delete (Backspace)
-        case 0x75: return true  // Forward Delete
-        case 0x73, 0x77: return true  // Home, End
-        case 0x74, 0x79: return true  // Page Up, Page Down
-        case 0x7A, 0x78, 0x63, 0x76: return true  // F1-F4
-        case 0x60, 0x61, 0x62, 0x64: return true  // F5-F8
-        case 0x65, 0x6D, 0x67, 0x6F: return true  // F9-F12
-        default: return false
-        }
-    }
 
     override func keyUp(with event: NSEvent) {
         // Key up events typically not needed for terminal input

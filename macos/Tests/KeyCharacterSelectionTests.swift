@@ -65,6 +65,44 @@ private enum KeyCharacterSelectionTests {
             optionIsMeta: true, characters: "ƒ", ignoringModifiers: "",
             equals: "", "an empty untransformed key is still the chosen value")
 
+        // option_as_meta: 0 both, 1 none, 2 only_left, 3 only_right, else both.
+        // 0x20 is the left Option bit, 0x40 the right one.
+        func expectMeta(_ hasOption: Bool, _ raw: UInt, _ setting: UInt8,
+                        _ want: Bool, _ what: String) {
+            let got = KeyCharacterSelection.optionActsAsMeta(
+                hasOption: hasOption, modifierRawValue: raw, optionAsMeta: setting)
+            if got != want {
+                failures += 1
+                FileHandle.standardError.write(Data("FAIL: \(what): got \(got)\n".utf8))
+            }
+        }
+        expectMeta(false, 0x20, 0, false, "no Option held is never Meta, even in both mode")
+        expectMeta(true, 0x20, 0, true, "both mode treats left Option as Meta")
+        expectMeta(true, 0x40, 0, true, "both mode treats right Option as Meta")
+        expectMeta(true, 0x20, 1, false, "none mode never treats Option as Meta")
+        expectMeta(true, 0x20, 2, true, "only_left accepts the left Option bit")
+        expectMeta(true, 0x40, 2, false, "only_left rejects the right Option bit")
+        expectMeta(true, 0x40, 3, true, "only_right accepts the right Option bit")
+        expectMeta(true, 0x20, 3, false, "only_right rejects the left Option bit")
+        expectMeta(true, 0x20, 99, true, "an unknown setting falls back to both")
+
+        // Special key codes bypass the input context.
+        for code in [UInt16(0x35), 0x7B, 0x7C, 0x7D, 0x7E, 0x24, 0x30, 0x33,
+                     0x75, 0x73, 0x77, 0x74, 0x79, 0x7A, 0x6F] {
+            if !KeyCharacterSelection.isSpecialKeyCode(code) {
+                failures += 1
+                FileHandle.standardError.write(
+                    Data("FAIL: key code \(String(code, radix: 16)) should be special\n".utf8))
+            }
+        }
+        for code in [UInt16(0x00), 0x03, 0x31, 0x66, 0x68] {
+            if KeyCharacterSelection.isSpecialKeyCode(code) {
+                failures += 1
+                FileHandle.standardError.write(
+                    Data("FAIL: key code \(String(code, radix: 16)) should not be special\n".utf8))
+            }
+        }
+
         if failures == 0 {
             print("KeyCharacterSelectionTests: all checks passed")
         } else {
