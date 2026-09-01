@@ -114,6 +114,31 @@ fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
     return null;
 }
 
+/// Append the four edge rects that frame a decorated surface, in NDC. The
+/// cmdline and the popupmenu drew this identically; the border width is the
+/// same constant for both.
+///
+/// Returns the vertex index past the last one written.
+fn appendDecoratedBorderVerts(
+    verts: []app_mod.Vertex,
+    start_idx: usize,
+    window_w: f32,
+    window_h: f32,
+    border_color: [4]f32,
+    grid_id: i64,
+) usize {
+    const w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
+    const h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
+    const tex: [2]f32 = .{ -1.0, -1.0 };
+    var idx = start_idx;
+    // top, bottom, left, right
+    idx = app_mod.addRectVerts(verts, idx, -1.0, 1.0, 2.0, h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, -1.0, -1.0 + h_ndc, 2.0, h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, -1.0, 1.0 - h_ndc, w_ndc, 2.0 - 2.0 * h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, 1.0 - w_ndc, 1.0 - h_ndc, w_ndc, 2.0 - 2.0 * h_ndc, border_color, tex, grid_id);
+    return idx;
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -345,14 +370,7 @@ fn drawDecoratedExternalSurface(
             }
 
             var extra_idx: usize = bg_idx + vert_count;
-            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-            const border_tex: [2]f32 = .{ -1.0, -1.0 };
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = appendDecoratedBorderVerts(cmdline_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
             const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
             const icon_x_px: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT);
@@ -396,14 +414,7 @@ fn drawDecoratedExternalSurface(
             app.mu.unlock(core.clock.io());
 
             var extra_idx: usize = vert_count;
-            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-            const border_tex: [2]f32 = .{ -1.0, -1.0 };
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = appendDecoratedBorderVerts(pum_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
             try g.draw(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
