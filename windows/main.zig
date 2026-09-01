@@ -966,9 +966,12 @@ pub fn main() u8 {
         @ptrCast(class_name.ptr),
         @ptrCast(title.ptr),
         window_style,
-        c.CW_USEDEFAULT, c.CW_USEDEFAULT,
-        c.CW_USEDEFAULT, c.CW_USEDEFAULT,
-        null, null,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        c.CW_USEDEFAULT,
+        null,
+        null,
         wc.hInstance,
         app, // lpParam -> WM_NCCREATE
     );

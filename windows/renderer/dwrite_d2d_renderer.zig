@@ -1710,7 +1710,6 @@ pub const Renderer = struct {
         }
     }
 
-
     /// Upload atlas dirty rects added since `since_seq` to the given D3D context.
     /// Returns the new head sequence (caller should store this as its cursor).
     /// If `since_seq < pending_upload_base_seq`, entries were lost (atlas reset);
@@ -3273,7 +3272,6 @@ fn utf8ToUtf16Alloc(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
     // Sentinel-terminated slice for Win32 APIs
     return try list.toOwnedSliceSentinel(alloc, 0);
 }
-
 
 fn L(comptime s: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(s);

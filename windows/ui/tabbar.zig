@@ -231,14 +231,7 @@ fn calculateDropTarget(mouse_pos: c_int, item_count: usize, item_size: c_int) us
     return target_idx;
 }
 
-
-
-
-
 // Content child window for D3D11 rendering (when ext_tabline enabled)
-
-
-
 
 /// Width of one tab for a given client width and tab count. Every drawing and
 /// hit-testing path must agree on this; it used to be spelled out at each
@@ -1652,7 +1645,6 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
         _ = c.ShowWindow(tabline_hwnd, c.SW_HIDE);
     }
 }
-
 
 // =========================================================================
 // Sidebar mode rendering and mouse handling

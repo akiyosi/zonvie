@@ -714,7 +714,6 @@ pub fn setIMEOff(hwnd: c.HWND) void {
     }
 }
 
-
 /// Wide string constant for "STATIC" window class
 const ime_overlay_class: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("STATIC");
 
