@@ -1861,8 +1861,6 @@ final class MetalTerminalView: MTKView {
         interpretKeyEvents([event])
     }
 
-    /// Returns true for special keycodes that should bypass IME.
-
     // MARK: - Smooth Scrolling
 
     /// Scroll target locked at the start of a trackpad gesture. Subsequent
