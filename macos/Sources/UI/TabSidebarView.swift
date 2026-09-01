@@ -14,51 +14,18 @@ final class TabSidebarView: NSView {
     private var tabs: [Tab] = []
     private var currentTab: Int64 = 0
 
-    // AI-agent indicator (set via on_agent_status). Reuses TabBarView's glyph
-    // frame sets / baseLabel; 1=idle→🤖, 2=working/claude, 3=working/braille.
-    private var agentStates: [Int64: UInt8] = [:]
-    private var spinnerFrame = 0
-    private var spinnerTimer: Timer?
+    // AI-agent indicator (set via on_agent_status). Shared with TabBarView.
+    private let agentIndicator = AgentIndicator()
 
     func setAgentState(handle: Int64, state: UInt8) {
-        if state == 0 { agentStates.removeValue(forKey: handle) } else { agentStates[handle] = state }
-        let anyWorking = agentStates.values.contains { $0 == 2 || $0 == 3 }
-        if anyWorking, spinnerTimer == nil {
-            spinnerTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
-                self?.spinnerFrame &+= 1
-                self?.needsDisplay = true
-            }
-        } else if !anyWorking, let t = spinnerTimer {
-            t.invalidate()
-            spinnerTimer = nil
+        agentIndicator.set(handle: handle, state: state) { [weak self] in
+            self?.needsDisplay = true
         }
         needsDisplay = true
     }
 
-    /// Single agent indicator glyph for a tab (no trailing space), or nil.
-    private func agentGlyph(forHandle handle: Int64) -> String? {
-        switch agentStates[handle] {
-        case 1: return "🤖"
-        case 2: return TabBarView.claudeFrames[spinnerFrame % TabBarView.claudeFrames.count]
-        case 3: return TabBarView.brailleFrames[spinnerFrame % TabBarView.brailleFrames.count]
-        case 4: return "⏸️"
-        default: return nil
-        }
-    }
-
-    /// Draw the agent indicator centered in a fixed-width box at the left edge
-    /// of `rect`, and return the x-offset the title should start at (0 if none).
-    /// Centering in a fixed box keeps the title anchored across spinner frames.
     private func drawAgentIndicator(forHandle handle: Int64, in rect: NSRect, font: NSFont, color: NSColor) -> CGFloat {
-        guard let glyph = agentGlyph(forHandle: handle) else { return 0 }
-        let para = NSMutableParagraphStyle()
-        para.alignment = .center
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font, .foregroundColor: color, .paragraphStyle: para,
-        ]
-        let box = NSRect(x: rect.minX, y: rect.minY, width: TabBarView.agentIndicatorWidth, height: rect.height)
-        glyph.draw(in: box, withAttributes: attrs)
-        return TabBarView.agentIndicatorWidth
+        agentIndicator.draw(forHandle: handle, in: rect, font: font, color: color)
     }
 
     private var hoveredTabIndex: Int? = nil
@@ -238,7 +205,7 @@ final class TabSidebarView: NSView {
         if let observer = colorschemeObserver {
             NotificationCenter.default.removeObserver(observer)
         }
-        spinnerTimer?.invalidate()
+        agentIndicator.stop()
     }
 
     private func observeColorschemeChanges() {
