@@ -95,6 +95,25 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
     return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
 }
 
+/// Find the external window a message was delivered to. Caller must already
+/// hold app.mu -- this deliberately does not take it, because several window
+/// procedure arms keep the lock past the lookup to read further App state.
+///
+/// Eight arms of ExternalWndProc walked the map inline with the same
+/// predicate. The WM_DPICHANGED arm does not use this: it does its work
+/// inside the loop rather than extracting a match.
+const ExtWindowHit = struct { grid_id: i64, win: *app_mod.ExternalWindow };
+
+fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.hwnd == hwnd) {
+            return .{ .grid_id = entry.key_ptr.*, .win = entry.value_ptr.* };
+        }
+    }
+    return null;
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -2376,13 +2395,9 @@ pub export fn ExternalWndProc(
                 // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
                 var suppress = false;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        suppress = entry.value_ptr.*.suppress_resize_callback;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    suppress = hit.win.suppress_resize_callback;
                 }
 
                 const cell_w = app.cell_w_px;
@@ -2417,13 +2432,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2447,13 +2458,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2473,13 +2480,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2532,13 +2535,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2560,13 +2559,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2635,13 +2630,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2712,13 +2703,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
