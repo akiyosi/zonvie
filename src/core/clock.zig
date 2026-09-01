@@ -76,4 +76,3 @@ pub fn nowNs() i128 {
     ensureInit();
     return std.Io.Timestamp.now(g_io, .real).nanoseconds;
 }
-

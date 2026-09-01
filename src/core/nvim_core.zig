@@ -373,7 +373,6 @@ pub const Callbacks = struct {
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
 
-
 const GridEntry = flush.GridEntry;
 const CachedSubgrid = flush.CachedSubgrid;
 const SubgridSnapshot = flush.SubgridSnapshot;
@@ -1092,7 +1091,6 @@ pub const Core = struct {
     // on :restart/:connect), so these are atomic.
     preedit_setup_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // hl groups defined
     preedit_visible: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // an inline preedit extmark is set
-
 
     // Quit request msgid (for tracking nvim_exec_lua response)
     // Atomic to avoid data race between UI thread (requestQuit) and RPC thread (handleRpcResponse)
@@ -4630,7 +4628,6 @@ pub const Core = struct {
 
         self.log.write("rpc send: nvim_ui_try_resize_grid (id={d}, grid={d}, rows={d}, cols={d})\n", .{ id, grid_id, rows, cols });
     }
-
 
     pub fn requestInput(self: *Core, keys: []const u8) !void {
         const id = self.nextMsgId();

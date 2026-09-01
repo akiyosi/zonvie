@@ -559,7 +559,6 @@ pub fn formatResolvedGuiFont(arena: std.mem.Allocator, r: GuiFontResolved) ![]co
     return buf.items;
 }
 
-
 fn logValue(log: *Logger, v: mp.Value, indent: usize, depth: u32) void {
     const max_depth: u32 = 4;
     const max_items: usize = 8;
@@ -1490,7 +1489,7 @@ pub fn handleRedraw(
                 for (tuples) |tv| {
 
                     // log.write("win_float_pos:", .{});
-                                if (tv != .arr) continue;
+                    if (tv != .arr) continue;
                     const t = tv.arr;
 
                     // Need at least: grid..zindex (len >= 8)
