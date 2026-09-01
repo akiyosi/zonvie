@@ -1016,6 +1016,79 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
 /// Render tabline to D3D11 texture via offscreen GDI bitmap.
 /// This avoids DWM composition issues by keeping GDI rendering offscreen
 /// and only using D3D11 for final display.
+/// Which offscreen strip renderOffscreenToD3D is drawing.
+const OffscreenSurface = enum { tabline, sidebar };
+
+/// Draw one offscreen strip into a 32-bit top-down DIB and upload it to its
+/// D3D texture. Returns true only when the upload succeeded.
+///
+/// Both callers built the DIB identically and both must force the alpha
+/// channel opaque afterwards, because GDI leaves it untouched.
+///
+/// Dispatch is a switch rather than a pair of function pointers: the two
+/// content draws take different argument counts, and the two upload methods
+/// have independently inferred error sets, which a shared fn-pointer type
+/// would have to widen to anyerror on a WM_PAINT path.
+///
+/// The caller keeps its own preconditions -- the tabline's tab_count and
+/// change gates have no sidebar counterpart.
+fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height: u32) bool {
+    if (app.renderer == null) return false;
+    if (width == 0 or height == 0) return false;
+
+    const screen_dc = c.GetDC(null);
+    if (screen_dc == null) return false;
+    defer _ = c.ReleaseDC(null, screen_dc);
+
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    if (mem_dc == null) return false;
+    defer _ = c.DeleteDC(mem_dc);
+
+    // 32-bit BGRA, top-down
+    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(width);
+    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var pixels_ptr: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
+    if (dib == null or pixels_ptr == null) return false;
+    defer _ = c.DeleteObject(dib);
+
+    const old_bmp = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old_bmp);
+
+    switch (surface) {
+        .tabline => drawTablineContent(app, mem_dc, @intCast(width)),
+        .sidebar => drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height)),
+    }
+
+    // GDI does not set the alpha channel; force it opaque.
+    const pixels: [*]u8 = @ptrCast(pixels_ptr);
+    const pixel_count = width * height;
+    var i: u32 = 0;
+    while (i < pixel_count) : (i += 1) {
+        pixels[i * 4 + 3] = 255;
+    }
+
+    const pixel_data = pixels[0 .. width * height * 4];
+    const g = &(app.renderer.?);
+    switch (surface) {
+        .tabline => g.updateTablineTexture(width, height, pixel_data) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
+            return false;
+        },
+        .sidebar => g.updateSidebarTexture(width, height, pixel_data) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
+            return false;
+        },
+    }
+    return true;
+}
+
 pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer == null) return;
     if (app.tabline_state.tab_count == 0) return;
@@ -1030,54 +1103,15 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     const sig = tablineRenderSignature(app, width, height);
     if (sig == app.tabline_render_sig) return;
 
-    // Create memory DC and DIB section
-    const screen_dc = c.GetDC(null);
-    if (screen_dc == null) return;
-    defer _ = c.ReleaseDC(null, screen_dc);
-
-    const mem_dc = c.CreateCompatibleDC(screen_dc);
-    if (mem_dc == null) return;
-    defer _ = c.DeleteDC(mem_dc);
-
-    // Create DIB section (32-bit BGRA)
-    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
-    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = @intCast(width);
-    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height)); // Top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = c.BI_RGB;
-
-    var pixels_ptr: ?*anyopaque = null;
-    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
-    if (dib == null or pixels_ptr == null) return;
-    defer _ = c.DeleteObject(dib);
-
-    const old_bmp = c.SelectObject(mem_dc, dib);
-    defer _ = c.SelectObject(mem_dc, old_bmp);
-
-    // Draw tabline to the memory DC
-    drawTablineContent(app, mem_dc, @intCast(width));
-
-    // GDI doesn't set alpha channel, so we need to set it to 255 (opaque)
-    const pixels: [*]u8 = @ptrCast(pixels_ptr);
-    const pixel_count = width * height;
-    var i: u32 = 0;
-    while (i < pixel_count) : (i += 1) {
-        pixels[i * 4 + 3] = 255; // Set alpha to opaque
-    }
-
-    // Update D3D11 texture
-    const pixel_data = pixels[0 .. width * height * 4];
-    if (app.renderer) |*g| {
-        g.updateTablineTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
-            return;
-        };
-        // Only record the signature after a successful upload so a failed
-        // upload retries on the next paint.
+    // Only record the signature after a successful upload so a failed
+    // upload retries on the next paint.
+    if (renderOffscreenToD3D(app, .tabline, width, height)) {
         app.tabline_render_sig = sig;
     }
+}
+
+pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
+    _ = renderOffscreenToD3D(app, .sidebar, width, height);
 }
 
 /// Draw tabline content (called from offscreen DC or child window WM_PAINT)
@@ -1624,50 +1658,6 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 // =========================================================================
 
 /// Render sidebar to D3D11 texture via offscreen GDI bitmap.
-pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
-    if (app.renderer == null) return;
-    if (width == 0 or height == 0) return;
-    const screen_dc = c.GetDC(null);
-    if (screen_dc == null) return;
-    defer _ = c.ReleaseDC(null, screen_dc);
-
-    const mem_dc = c.CreateCompatibleDC(screen_dc);
-    if (mem_dc == null) return;
-    defer _ = c.DeleteDC(mem_dc);
-
-    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
-    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = @intCast(width);
-    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height));
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = c.BI_RGB;
-
-    var pixels_ptr: ?*anyopaque = null;
-    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
-    if (dib == null or pixels_ptr == null) return;
-    defer _ = c.DeleteObject(dib);
-
-    const old_bmp = c.SelectObject(mem_dc, dib);
-    defer _ = c.SelectObject(mem_dc, old_bmp);
-
-    drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height));
-
-    // Set alpha to opaque
-    const pixels: [*]u8 = @ptrCast(pixels_ptr);
-    const pixel_count = width * height;
-    var i: u32 = 0;
-    while (i < pixel_count) : (i += 1) {
-        pixels[i * 4 + 3] = 255;
-    }
-
-    const pixel_data = pixels[0 .. width * height * 4];
-    if (app.renderer) |*g| {
-        g.updateSidebarTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
-        };
-    }
-}
 
 /// Compute sidebar colors from the Neovim colorscheme.
 /// Returns (R, G, B) as 0-255 u8 values. Mirrors macOS TabSidebarView color logic (no blur).
