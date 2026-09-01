@@ -924,7 +924,6 @@ pub const Harness = struct {
         return 0;
     }
 
-
     /// Get the scroll_delta reported by the last win_viewport event for a grid.
     pub fn getViewportScrollDelta(h: *Harness, grid_id: i64) i64 {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
