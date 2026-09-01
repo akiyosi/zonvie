@@ -1098,29 +1098,108 @@ pub const Renderer = struct {
 
     /// Phase 2: Rasterize glyph via DWrite without atlas packing.
     /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
+    /// What a glyph-run rasterization produced. `.empty` means DWrite gave
+    /// back no coverage at all -- a space, or a colour glyph with no outline.
+    /// The two callers answer that differently, so the helper does not decide.
+    const GlyphRasterOutcome = enum { ok, empty };
+
+    /// Rasterize one glyph index through DWrite. Caller must already hold
+    /// self.mu.
+    ///
+    /// Writes bearing, advance, ascent and descent unconditionally -- both
+    /// callers set those before their own empty check -- and on `.empty`
+    /// leaves pixels, width, height, pitch and bytes_per_pixel untouched.
+    ///
+    /// `try_aliased_fallback` controls whether an empty ClearType bound is
+    /// retried as ALIASED_1x1. The by-scalar path always retries; the by-id
+    /// path skips it on a colour font, where the retry cannot succeed.
+    fn rasterizeGlyphIndex(
+        self: *Renderer,
+        face: *c.IDWriteFontFace,
+        glyph_index: c.UINT16,
+        try_aliased_fallback: bool,
+        out_bitmap: *core.GlyphBitmap,
+    ) !GlyphRasterOutcome {
+        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
+        glyph_run.fontFace = face;
+        glyph_run.fontEmSize = self.font_em_size;
+        glyph_run.glyphCount = 1;
+        var gi_arr: [1]c.UINT16 = .{glyph_index};
+        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
+        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
+        glyph_run.glyphIndices = gi_arr[0..].ptr;
+        glyph_run.glyphAdvances = adv_arr[0..].ptr;
+        glyph_run.glyphOffsets = off_arr[0..].ptr;
+
+        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
+        const dwtbl = dw.lpVtbl.*;
+        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
+        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
+        const hr_cgra = create_analysis_fn(dw, &glyph_run, 1.0, null, c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, c.DWRITE_MEASURING_MODE_NATURAL, 0.0, 0.0, &analysis);
+        if (c.FAILED(hr_cgra) or analysis == null) return error.DWriteCreateGlyphRunAnalysisFailed;
+
+        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
+        defer _ = rel_fn(analysis.?);
+
+        var bounds: c.RECT = std.mem.zeroes(c.RECT);
+        const atbl = analysis.?.lpVtbl.*;
+        const get_bounds_fn = atbl.GetAlphaTextureBounds orelse return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
+        const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
+        if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
+
+        var bw_i32: i32 = bounds.right - bounds.left;
+        var bh_i32: i32 = bounds.bottom - bounds.top;
+        var bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+        var bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+        var use_aliased: bool = false;
+
+        // ClearType returns empty bounds for color emoji (no outline).
+        // Fallback to aliased (1 bpp grayscale) for monochrome emoji rendering.
+        if (try_aliased_fallback and (bw == 0 or bh == 0)) {
+            var aliased_bounds: c.RECT = std.mem.zeroes(c.RECT);
+            const hr_aliased = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &aliased_bounds);
+            if (!c.FAILED(hr_aliased)) {
+                bw_i32 = aliased_bounds.right - aliased_bounds.left;
+                bh_i32 = aliased_bounds.bottom - aliased_bounds.top;
+                bw = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
+                bh = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
+                if (bw > 0 and bh > 0) {
+                    bounds = aliased_bounds;
+                    use_aliased = true;
+                }
+            }
+        }
+
+        // Fill common metrics
+        out_bitmap.bearing_x = bounds.left;
+        out_bitmap.bearing_y = @as(i32, -bounds.top); // DWrite top -> FreeType bearing_y
+        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
+        out_bitmap.ascent_px = self.ascent_px;
+        out_bitmap.descent_px = self.descent_px;
+
+        if (bw == 0 or bh == 0) return .empty;
+
+        const create_alpha_fn = atbl.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
+        const bpp: u32 = if (use_aliased) 1 else 3;
+        const tex_type: c.DWRITE_TEXTURE_TYPE = if (use_aliased) c.DWRITE_TEXTURE_ALIASED_1x1 else c.DWRITE_TEXTURE_CLEARTYPE_3x1;
+        const buf_size: usize = @as(usize, bw) * @as(usize, bh) * @as(usize, bpp);
+        try self.glyph_tmp.resize(self.alloc, buf_size);
+        const hr_tex = create_alpha_fn(analysis.?, tex_type, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
+        if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
+
+        out_bitmap.pixels = self.glyph_tmp.items.ptr;
+        out_bitmap.width = bw;
+        out_bitmap.height = bh;
+        out_bitmap.pitch = @as(i32, @intCast(bw * bpp));
+        out_bitmap.bytes_per_pixel = bpp;
+        return .ok;
+    }
+
     pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
 
-        // Select font face based on style_flags
-        const face: *c.IDWriteFontFace = blk: {
-            if (style_flags != 0) {
-                self.ensureStyledFontFaces();
-                const is_bold = (style_flags & STYLE_BOLD) != 0;
-                const is_italic = (style_flags & STYLE_ITALIC) != 0;
-                if (is_bold and is_italic) {
-                    break :blk self.bold_italic_font_face orelse self.bold_font_face orelse self.italic_font_face orelse self.font_face orelse return error.NoFont;
-                } else if (is_bold) {
-                    break :blk self.bold_font_face orelse self.font_face orelse return error.NoFont;
-                } else if (is_italic) {
-                    break :blk self.italic_font_face orelse self.font_face orelse return error.NoFont;
-                } else {
-                    break :blk self.font_face orelse return error.NoFont;
-                }
-            } else {
-                break :blk self.font_face orelse return error.NoFont;
-            }
-        };
+        const face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
 
         // scalar -> glyph_index (feature-aware via IDWriteTextAnalyzer when features set)
         const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
@@ -1147,73 +1226,14 @@ pub const Renderer = struct {
             }
         }
 
-        // glyph run analysis
-        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
-        glyph_run.fontFace = face;
-        glyph_run.fontEmSize = self.font_em_size;
-        glyph_run.glyphCount = 1;
-        var gi_arr: [1]c.UINT16 = .{glyph_index};
-        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
-        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
-        glyph_run.glyphIndices = gi_arr[0..].ptr;
-        glyph_run.glyphAdvances = adv_arr[0..].ptr;
-        glyph_run.glyphOffsets = off_arr[0..].ptr;
-
-        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
-        const dwtbl = dw.lpVtbl.*;
-        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
-        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
-        const hr_cgra = create_analysis_fn(dw, &glyph_run, 1.0, null, c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, c.DWRITE_MEASURING_MODE_NATURAL, 0.0, 0.0, &analysis);
-        if (c.FAILED(hr_cgra) or analysis == null) return error.DWriteCreateGlyphRunAnalysisFailed;
-
-        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
-        defer _ = rel_fn(analysis.?);
-
-        // Get alpha texture bounds
-        var bounds: c.RECT = std.mem.zeroes(c.RECT);
-        const atbl = analysis.?.lpVtbl.*;
-        const get_bounds_fn = atbl.GetAlphaTextureBounds orelse return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
-        const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
-        if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
-
-        var bw_i32: i32 = bounds.right - bounds.left;
-        var bh_i32: i32 = bounds.bottom - bounds.top;
-        var bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        var bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-        var use_aliased: bool = false;
-
-        // ClearType returns empty bounds for color emoji (no outline).
-        // Fallback to aliased (1 bpp grayscale) for monochrome emoji rendering.
-        if (bw == 0 or bh == 0) {
-            var aliased_bounds: c.RECT = std.mem.zeroes(c.RECT);
-            const hr_aliased = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &aliased_bounds);
-            if (!c.FAILED(hr_aliased)) {
-                bw_i32 = aliased_bounds.right - aliased_bounds.left;
-                bh_i32 = aliased_bounds.bottom - aliased_bounds.top;
-                bw = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-                bh = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-                if (bw > 0 and bh > 0) {
-                    bounds = aliased_bounds;
-                    use_aliased = true;
-                }
-            }
-        }
-
-        // Fill common metrics
-        out_bitmap.bearing_x = bounds.left;
-        out_bitmap.bearing_y = @as(i32, -bounds.top); // DWrite top -> FreeType bearing_y
-        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
-        out_bitmap.ascent_px = self.ascent_px;
-        out_bitmap.descent_px = self.descent_px;
-
-        if (bw == 0 or bh == 0) {
-            // DWrite produced empty bitmap. For non-ASCII scalars this may be a
-            // color emoji that DWrite ClearType/aliased can't render.
-            // Try GDI color emoji fallback before giving up.
+        // The by-scalar path always retries an empty ClearType bound as
+        // aliased, then falls back to GDI colour emoji before giving up.
+        const outcome = try self.rasterizeGlyphIndex(face, glyph_index, true, out_bitmap);
+        if (outcome == .empty) {
+            // DWrite produced an empty bitmap. For non-ASCII scalars this may
+            // be a colour emoji that DWrite ClearType/aliased cannot render.
             if (scalar > 0xFF) {
-                if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
-                    return;
-                }
+                if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
             }
             // Empty glyph (space etc.)
             out_bitmap.pixels = null;
@@ -1221,35 +1241,6 @@ pub const Renderer = struct {
             out_bitmap.height = 0;
             out_bitmap.pitch = 0;
             out_bitmap.bytes_per_pixel = 3;
-            return;
-        }
-
-        const create_alpha_fn = atbl.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-
-        if (use_aliased) {
-            // Aliased 1x1 texture (1 byte per pixel, grayscale)
-            const buf_size: usize = @as(usize, bw) * @as(usize, bh);
-            try self.glyph_tmp.resize(self.alloc, buf_size);
-            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
-
-            out_bitmap.pixels = self.glyph_tmp.items.ptr;
-            out_bitmap.width = bw;
-            out_bitmap.height = bh;
-            out_bitmap.pitch = @as(i32, @intCast(bw));
-            out_bitmap.bytes_per_pixel = 1; // grayscale aliased
-        } else {
-            // ClearType 3x1 texture (RGB, 3 bytes per pixel)
-            const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
-            try self.glyph_tmp.resize(self.alloc, buf_size);
-            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
-
-            out_bitmap.pixels = self.glyph_tmp.items.ptr;
-            out_bitmap.width = bw;
-            out_bitmap.height = bh;
-            out_bitmap.pitch = @as(i32, @intCast(bw * 3));
-            out_bitmap.bytes_per_pixel = 3; // ClearType RGB
         }
     }
 
@@ -2731,107 +2722,24 @@ pub const Renderer = struct {
 
         const face = self.selectFontFace(style_flags) orelse return error.NoFont;
 
-        // Use glyph_id directly (truncate u32 → u16 for DWrite)
-        var gi_arr: [1]c.UINT16 = .{@intCast(glyph_id & 0xFFFF)};
-        var adv_arr: [1]c.FLOAT = .{@as(c.FLOAT, @floatFromInt(self.cell_w_px))};
-        var off_arr: [1]c.DWRITE_GLYPH_OFFSET = .{.{ .advanceOffset = 0, .ascenderOffset = 0 }};
-
-        var glyph_run: c.DWRITE_GLYPH_RUN = std.mem.zeroes(c.DWRITE_GLYPH_RUN);
-        glyph_run.fontFace = face;
-        glyph_run.fontEmSize = self.font_em_size;
-        glyph_run.glyphCount = 1;
-        glyph_run.glyphIndices = gi_arr[0..].ptr;
-        glyph_run.glyphAdvances = adv_arr[0..].ptr;
-        glyph_run.glyphOffsets = off_arr[0..].ptr;
-
-        const dw = self.dwrite_factory orelse return error.DWriteFactoryNotReady;
-        const dwtbl = dw.lpVtbl.*;
-        var analysis: ?*c.IDWriteGlyphRunAnalysis = null;
-        const create_analysis_fn = dwtbl.CreateGlyphRunAnalysis orelse return error.DWriteFactoryMissingCreateGlyphRunAnalysis;
-        const hr_cgra = create_analysis_fn(dw, &glyph_run, 1.0, null, c.DWRITE_RENDERING_MODE_NATURAL_SYMMETRIC, c.DWRITE_MEASURING_MODE_NATURAL, 0.0, 0.0, &analysis);
-        if (c.FAILED(hr_cgra) or analysis == null) return error.DWriteCreateGlyphRunAnalysisFailed;
-
-        const rel_fn = analysis.?.lpVtbl.*.Release orelse return error.DWriteGlyphRunAnalysisMissingRelease;
-        defer _ = rel_fn(analysis.?);
-
-        var bounds: c.RECT = std.mem.zeroes(c.RECT);
-        const atbl_a = analysis.?.lpVtbl.*;
-        const get_bounds_fn = atbl_a.GetAlphaTextureBounds orelse return error.DWriteGlyphRunAnalysisMissingGetAlphaTextureBounds;
-        const hr_bounds = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds);
-        if (c.FAILED(hr_bounds)) return error.DWriteGetAlphaTextureBoundsFailed;
-
-        var bw_i32: i32 = bounds.right - bounds.left;
-        var bh_i32: i32 = bounds.bottom - bounds.top;
-        var bw: u32 = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-        var bh: u32 = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-        var use_aliased: bool = false;
-
-        // ClearType returns empty bounds for color glyphs (COLR/sbix/CBDT).
-        // If font has color tables, return empty bitmap so the caller
-        // (flush.zig) falls through to per-scalar fallback → GDI color emoji.
-        if (bw == 0 or bh == 0) {
-            if (self.hasColorTables()) {
-                out_bitmap.pixels = null;
-                out_bitmap.width = 0;
-                out_bitmap.height = 0;
-                out_bitmap.pitch = 0;
-                out_bitmap.bytes_per_pixel = 0;
-                return;
-            }
-            // Non-color font: fallback to aliased (1 bpp grayscale).
-            var aliased_bounds: c.RECT = std.mem.zeroes(c.RECT);
-            const hr_aliased = get_bounds_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &aliased_bounds);
-            if (!c.FAILED(hr_aliased)) {
-                bw_i32 = aliased_bounds.right - aliased_bounds.left;
-                bh_i32 = aliased_bounds.bottom - aliased_bounds.top;
-                bw = if (bw_i32 > 0) @as(u32, @intCast(bw_i32)) else 0;
-                bh = if (bh_i32 > 0) @as(u32, @intCast(bh_i32)) else 0;
-                if (bw > 0 and bh > 0) {
-                    bounds = aliased_bounds;
-                    use_aliased = true;
-                }
-            }
-        }
-
-        out_bitmap.bearing_x = bounds.left;
-        out_bitmap.bearing_y = @as(i32, -bounds.top);
-        out_bitmap.advance_26_6 = @as(i32, @intCast(self.cell_w_px)) * 64;
-        out_bitmap.ascent_px = self.ascent_px;
-        out_bitmap.descent_px = self.descent_px;
-
-        if (bw == 0 or bh == 0) {
+        // A colour font's empty ClearType bound cannot be rescued by the
+        // aliased retry, so skip it there and let the caller fall through to
+        // the per-scalar GDI path instead.
+        const has_color = self.hasColorTables();
+        const outcome = try self.rasterizeGlyphIndex(
+            face,
+            @intCast(glyph_id & 0xFFFF), // truncate u32 -> u16 for DWrite
+            !has_color,
+            out_bitmap,
+        );
+        if (outcome == .empty) {
             out_bitmap.pixels = null;
             out_bitmap.width = 0;
             out_bitmap.height = 0;
             out_bitmap.pitch = 0;
-            out_bitmap.bytes_per_pixel = 3;
-            return;
-        }
-
-        const create_alpha_fn = atbl_a.CreateAlphaTexture orelse return error.DWriteGlyphRunAnalysisMissingCreateAlphaTexture;
-
-        if (use_aliased) {
-            const buf_size: usize = @as(usize, bw) * @as(usize, bh);
-            try self.glyph_tmp.resize(self.alloc, buf_size);
-            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_ALIASED_1x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
-
-            out_bitmap.pixels = self.glyph_tmp.items.ptr;
-            out_bitmap.width = bw;
-            out_bitmap.height = bh;
-            out_bitmap.pitch = @as(i32, @intCast(bw));
-            out_bitmap.bytes_per_pixel = 1; // grayscale aliased
-        } else {
-            const buf_size: usize = @as(usize, bw) * @as(usize, bh) * 3;
-            try self.glyph_tmp.resize(self.alloc, buf_size);
-            const hr_tex = create_alpha_fn(analysis.?, c.DWRITE_TEXTURE_CLEARTYPE_3x1, &bounds, self.glyph_tmp.items.ptr, @as(c.UINT32, @intCast(buf_size)));
-            if (c.FAILED(hr_tex)) return error.DWriteCreateAlphaTextureFailed;
-
-            out_bitmap.pixels = self.glyph_tmp.items.ptr;
-            out_bitmap.width = bw;
-            out_bitmap.height = bh;
-            out_bitmap.pitch = @as(i32, @intCast(bw * 3));
-            out_bitmap.bytes_per_pixel = 3; // ClearType RGB
+            // 0 tells flush.zig to retry per-scalar (→ GDI colour emoji);
+            // 3 is a genuinely blank ClearType glyph.
+            out_bitmap.bytes_per_pixel = if (has_color) 0 else 3;
         }
     }
 
