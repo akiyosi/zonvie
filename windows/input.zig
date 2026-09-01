@@ -250,6 +250,175 @@ fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32) CellPos {
     };
 }
 
+/// Clear the shared IME composition state. `end` additionally lowers
+/// ime_composing and ime_extmark_active; WM_IME_STARTCOMPOSITION raises
+/// ime_composing instead.
+pub fn resetImeComposition(app: *App, end: bool) void {
+    app.mu.lockUncancelable(core.clock.io());
+    app.ime_composing = !end;
+    app.ime_composition_str.clearRetainingCapacity();
+    app.ime_composition_utf8.clearRetainingCapacity();
+    app.ime_clause_info.clearRetainingCapacity();
+    app.ime_cursor_pos = 0;
+    app.ime_target_start = 0;
+    app.ime_target_end = 0;
+    if (end) app.ime_extmark_active = false;
+    app.mu.unlock(core.clock.io());
+}
+
+/// Whether the shared WM_IME_COMPOSITION body ran to completion. On
+/// `.alloc_failed` the caller must bail out of the message; the two window
+/// procedures return different values there, so the helper does not.
+pub const ImeCompositionOutcome = enum { done, alloc_failed };
+
+/// The whole WM_IME_COMPOSITION body: read the composition string, clause
+/// info, cursor position and target clause out of the input context, then
+/// publish the preedit through the core's inline-extmark path or the overlay.
+///
+/// Everything here sits inside the ImmGetContext guard. The external-window
+/// copy this replaces ran its preedit half OUTSIDE that guard, so a
+/// composition message arriving with no input context would republish
+/// whatever stale text App still held and flip ime_extmark_active on it. Both
+/// windows now behave as the main window did.
+pub fn handleImeComposition(app: *App, hwnd: c.HWND, lParam: c.LPARAM) ImeCompositionOutcome {
+    const himc = c.ImmGetContext(hwnd);
+    if (himc == null) return .done;
+    defer _ = c.ImmReleaseContext(hwnd, himc);
+
+    // Get composition string
+    if ((lParam & c.GCS_COMPSTR) != 0) {
+        const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
+        if (byte_len > 0) {
+            const char_len: usize = @intCast(@divTrunc(byte_len, 2));
+            app.mu.lockUncancelable(core.clock.io());
+            app.ime_composition_str.resize(app.alloc, char_len) catch {
+                app.mu.unlock(core.clock.io());
+                return .alloc_failed;
+            };
+            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
+            // Convert to UTF-8 for display
+            updateImeCompositionUtf8(app);
+            app.mu.unlock(core.clock.io());
+        } else {
+            app.mu.lockUncancelable(core.clock.io());
+            app.ime_composition_str.clearRetainingCapacity();
+            app.ime_composition_utf8.clearRetainingCapacity();
+            app.mu.unlock(core.clock.io());
+        }
+    }
+
+    // Get clause info (for underline segments)
+    if ((lParam & c.GCS_COMPCLAUSE) != 0) {
+        const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
+        if (clause_byte_len > 0) {
+            const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
+            app.mu.lockUncancelable(core.clock.io());
+            app.ime_clause_info.resize(app.alloc, clause_count) catch {
+                app.mu.unlock(core.clock.io());
+                return .alloc_failed;
+            };
+            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
+            app.mu.unlock(core.clock.io());
+        }
+    }
+
+    // Get cursor position in composition
+    if ((lParam & c.GCS_CURSORPOS) != 0) {
+        const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
+        app.mu.lockUncancelable(core.clock.io());
+        app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
+        app.mu.unlock(core.clock.io());
+    }
+
+    // Get the target clause (the one being converted). Always read COMPATTR,
+    // not just when the flag is set.
+    {
+        const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
+        if (attr_len > 0) {
+            var attr_buf: [256]u8 = undefined;
+            const len: usize = @intCast(@min(@as(usize, @intCast(@max(0, attr_len))), 256));
+            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
+
+            // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
+            // ATTR_CONVERTED = 0x02, ATTR_TARGET_NOTCONVERTED = 0x03
+            app.mu.lockUncancelable(core.clock.io());
+            app.ime_target_start = 0;
+            app.ime_target_end = 0;
+            var found_start = false;
+            var i: u32 = 0;
+            while (i < len) : (i += 1) {
+                const attr = attr_buf[i];
+                if (attr == 0x01 or attr == 0x03) {
+                    if (!found_start) {
+                        app.ime_target_start = i;
+                        found_start = true;
+                    }
+                    app.ime_target_end = i + 1;
+                }
+            }
+            app.mu.unlock(core.clock.io());
+        }
+    }
+
+    // Display preedit: prefer the core's inline-extmark mode when it accepts
+    // it (extmark mode + insert/replace); otherwise fall back to the overlay.
+    var handled = false;
+    if (app.corep) |corep| {
+        app.mu.lockUncancelable(core.clock.io());
+        // ime_composition_utf8 is mutated only on this (UI) thread, and the
+        // core call below runs synchronously on it, so the backing buffer
+        // stays valid after unlock -- pass the full string directly.
+        const utf8_ptr = app.ime_composition_utf8.items.ptr;
+        const utf8_len = app.ime_composition_utf8.items.len;
+        // Map the target clause (UTF-16 unit indices) to UTF-8 byte offsets.
+        const units = app.ime_composition_str.items;
+        var ts: usize = 0;
+        var te: usize = 0;
+        if (app.ime_target_start < app.ime_target_end) {
+            ts = utf16PrefixUtf8Len(units, app.ime_target_start);
+            te = utf16PrefixUtf8Len(units, app.ime_target_end);
+        }
+        app.mu.unlock(core.clock.io());
+        if (utf8_len == 0) {
+            app_mod.zonvie_core_clear_preedit(corep);
+            handled = true; // nothing to display
+        } else {
+            handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
+        }
+    }
+    app.mu.lockUncancelable(core.clock.io());
+    app.ime_extmark_active = handled;
+    app.mu.unlock(core.clock.io());
+    if (handled) {
+        hideImePreeditOverlay(app);
+    } else {
+        // Must run WITHOUT app.mu held: updateImePreeditOverlay acquires it.
+        updateImePreeditOverlay(hwnd, app);
+    }
+    return .done;
+}
+
+/// The WM_IME_CHAR body. Non-BMP commits arrive as two consecutive messages
+/// (high then low surrogate), so a lone high surrogate is buffered.
+pub fn handleImeChar(app: *App, ch: u16) void {
+    var out: [8]u8 = undefined;
+    var s: ?[]const u8 = null;
+    if (ch >= 0xD800 and ch <= 0xDBFF) {
+        app.pending_high_surrogate_ime = ch;
+        return;
+    } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
+        const hi = app.pending_high_surrogate_ime;
+        app.pending_high_surrogate_ime = 0;
+        if (hi == 0) return;
+        s = utf16UnitsToUtf8(&out, hi, ch);
+    } else {
+        app.pending_high_surrogate_ime = 0;
+        s = utf16UnitsToUtf8(&out, ch, null);
+    }
+    const text = s orelse return;
+    sendKeyEventToCore(app, 0, 0, text, text);
+}
+
 pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
     var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
     var mod_len: usize = 0;

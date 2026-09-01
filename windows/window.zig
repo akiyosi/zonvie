@@ -5860,15 +5860,7 @@ pub export fn WndProc(
         c.WM_IME_STARTCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
             if (getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = true;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, false);
 
                 // Position IME candidate window at cursor
                 input.positionImeCandidateWindow(hwnd, app);
@@ -5879,145 +5871,7 @@ pub export fn WndProc(
         c.WM_IME_COMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
             if (getApp(hwnd)) |app| {
-                const himc = c.ImmGetContext(hwnd);
-                if (himc != null) {
-                    defer _ = c.ImmReleaseContext(hwnd, himc);
-
-                    const lparam_u: c.LPARAM = lParam;
-
-                    // Get composition string
-                    if ((lparam_u & c.GCS_COMPSTR) != 0) {
-                        const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
-                        if (byte_len > 0) {
-                            const char_len: usize = @intCast(@divTrunc(byte_len, 2));
-
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.resize(app.alloc, char_len) catch {
-                                app.mu.unlock(core.clock.io());
-                                return 0;
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
-
-                            // Convert to UTF-8 for display
-                            input.updateImeCompositionUtf8(app);
-                            if (applog.isEnabled()) applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
-                            app.mu.unlock(core.clock.io());
-                        } else {
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.clearRetainingCapacity();
-                            app.ime_composition_utf8.clearRetainingCapacity();
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get clause info (for underline segments)
-                    if ((lparam_u & c.GCS_COMPCLAUSE) != 0) {
-                        const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
-                        if (clause_byte_len > 0) {
-                            const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_clause_info.resize(app.alloc, clause_count) catch {
-                                app.mu.unlock(core.clock.io());
-                                return 0;
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get cursor position in composition
-                    if ((lparam_u & c.GCS_CURSORPOS) != 0) {
-                        const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        app.mu.lockUncancelable(core.clock.io());
-                        app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
-                        app.mu.unlock(core.clock.io());
-                    }
-
-                    // Get target clause (the clause being converted)
-                    // Always try to get COMPATTR, not just when flag is set
-                    {
-                        const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
-                        if (applog.isEnabled()) applog.appLog("[IME] GCS_COMPATTR attr_len={d} lparam_has_flag={d}\n", .{
-                            attr_len,
-                            @intFromBool((lparam_u & c.GCS_COMPATTR) != 0),
-                        });
-                        if (attr_len > 0) {
-                            var attr_buf: [256]u8 = undefined;
-                            const len: usize = @intCast(@min(@as(usize, @intCast(@max(0, attr_len))), 256));
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
-
-                            // Debug: log all attributes
-                            if (applog.isEnabled()) {
-                                applog.appLog("[IME] COMPATTR len={d} attrs=", .{len});
-                                for (0..len) |idx| {
-                                    applog.appLog("{x} ", .{attr_buf[idx]});
-                                }
-                                applog.appLog("\n", .{});
-                            }
-
-                            // Find target clause (ATTR_TARGET_CONVERTED or ATTR_TARGET_NOTCONVERTED)
-                            // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
-                            // ATTR_CONVERTED = 0x02, ATTR_TARGET_NOTCONVERTED = 0x03
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_target_start = 0;
-                            app.ime_target_end = 0;
-                            var found_start: bool = false;
-                            var i: u32 = 0;
-                            while (i < len) : (i += 1) {
-                                const attr = attr_buf[i];
-                                // ATTR_TARGET_CONVERTED = 0x01, ATTR_TARGET_NOTCONVERTED = 0x03
-                                if (attr == 0x01 or attr == 0x03) {
-                                    if (!found_start) {
-                                        app.ime_target_start = i;
-                                        found_start = true;
-                                    }
-                                    app.ime_target_end = i + 1;
-                                }
-                            }
-                            if (applog.isEnabled()) applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Display preedit: prefer the core's inline-extmark mode
-                    // when it accepts it (extmark mode + insert/replace);
-                    // otherwise fall back to the overlay. Copy the UTF-8 out
-                    // under the lock so the core call runs unlocked.
-                    var handled = false;
-                    if (app.corep) |corep| {
-                        app.mu.lockUncancelable(core.clock.io());
-                        // ime_composition_utf8 is mutated only on this (UI)
-                        // thread, and the core call below runs synchronously on
-                        // it, so the backing buffer stays valid after unlock —
-                        // pass the full string directly (no copy/truncation).
-                        const utf8_ptr = app.ime_composition_utf8.items.ptr;
-                        const utf8_len = app.ime_composition_utf8.items.len;
-                        // Map the target clause (UTF-16 unit indices) to UTF-8
-                        // byte offsets within the composition string.
-                        const units = app.ime_composition_str.items;
-                        var ts: usize = 0;
-                        var te: usize = 0;
-                        if (app.ime_target_start < app.ime_target_end) {
-                            ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
-                            te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
-                        }
-                        app.mu.unlock(core.clock.io());
-                        if (utf8_len == 0) {
-                            app_mod.zonvie_core_clear_preedit(corep);
-                            handled = true; // nothing to display
-                        } else {
-                            handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
-                        }
-                    }
-                    app.mu.lockUncancelable(core.clock.io());
-                    app.ime_extmark_active = handled;
-                    app.mu.unlock(core.clock.io());
-                    if (handled) {
-                        input.hideImePreeditOverlay(app);
-                    } else {
-                        input.updateImePreeditOverlay(hwnd, app);
-                    }
-                }
+                if (input.handleImeComposition(app, hwnd, lParam) == .alloc_failed) return 0;
             }
             // Let DefWindowProc handle for default IME processing
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -6025,16 +5879,7 @@ pub export fn WndProc(
 
         c.WM_IME_ENDCOMPOSITION => {
             if (getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = false;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.ime_extmark_active = false;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, true);
 
                 // Clear any inline preedit extmark and hide the overlay.
                 if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
@@ -6044,28 +5889,9 @@ pub export fn WndProc(
         },
 
         c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim. Non-BMP commits arrive
-            // as two consecutive WM_IME_CHAR messages (high then low surrogate).
+            // IME committed character - send to Neovim.
             if (getApp(hwnd)) |app| {
-                const ch: u16 = @intCast(wParam);
-
-                var out: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch >= 0xD800 and ch <= 0xDBFF) {
-                    app.pending_high_surrogate_ime = ch;
-                    return 0;
-                } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_ime;
-                    app.pending_high_surrogate_ime = 0;
-                    if (hi == 0) return 0;
-                    s = input.utf16UnitsToUtf8(&out, hi, ch);
-                } else {
-                    app.pending_high_surrogate_ime = 0;
-                    s = input.utf16UnitsToUtf8(&out, ch, null);
-                }
-
-                const text = s orelse return 0;
-                input.sendKeyEventToCore(app, 0, 0, text, text);
+                input.handleImeChar(app, @intCast(wParam));
                 return 0;
             }
         },
