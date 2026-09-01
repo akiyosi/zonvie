@@ -664,7 +664,6 @@ fn drawNormalExternalSurfaceRowMode(
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = !force_full_rows,
-        .glow_enabled = glow_enabled,
     };
 
     // Ensure row_vbs array covers committed set's row count.
