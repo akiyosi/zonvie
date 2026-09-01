@@ -4240,7 +4240,6 @@ pub const Renderer = struct {
         self.atlas_srv = built.srv;
     }
 
-
     /// Recreate atlas texture if dimensions changed. No-op for same-size resets.
     /// Returns error if D3D texture creation fails (caller should terminate).
     pub fn recreateAtlasTextureIfNeeded(self: *Renderer, w: u32, h: u32) !void {

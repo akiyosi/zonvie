@@ -96,8 +96,6 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     _ = c.FreeConsole();
 }
 
-
-
 /// Simple password input dialog without username field
 pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16) bool {
     const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonviePasswordDialog");

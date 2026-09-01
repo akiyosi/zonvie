@@ -245,7 +245,6 @@ pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) voi
     app.mini_windows[idx].text_len = copy_len;
 }
 
-
 pub fn onMsgHistoryShow(
     ctx: ?*anyopaque,
     entries: ?[*]const core.MsgHistoryEntry,

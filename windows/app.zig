@@ -1637,7 +1637,6 @@ pub const TablineState = struct {
     }
 };
 
-
 /// GPU-side per-row vertex buffer (D3D11). Owned exclusively by the UI thread.
 pub const RowVB = struct {
     vb: ?*c.ID3D11Buffer = null,
