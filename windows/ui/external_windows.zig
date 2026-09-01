@@ -779,6 +779,15 @@ fn drawNormalExternalSurfaceRowMode(
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
     // buffer, so a buffer not current this frame catches up when it rotates in.
+    // The main window builds the same row-run spans in window.zig. The two are
+    // NOT shared: this path reserves exactly rows + 5 up front and appends with
+    // appendAssumeCapacity, while the main path appends fallibly and swallows
+    // the error, backed by its force-full-present fallback. A shared helper
+    // returning Allocator.Error would force a `catch unreachable` here; one
+    // taking pre-reserved capacity would turn the main path's tolerant catch
+    // into a panic on a short reservation. Reviewed under the 2026-08-25 audit,
+    // observation 1, finding 332; left duplicated on purpose. The tail is
+    // already shared through compactDamageRects.
     const present_rects = &ext_win.paint_present_rects;
     present_rects.clearRetainingCapacity();
     present_rects.ensureTotalCapacity(app.alloc, rows_to_draw.items.len + 5) catch return error.OutOfMemory;

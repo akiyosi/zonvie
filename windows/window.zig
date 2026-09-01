@@ -2775,6 +2775,16 @@ pub export fn WndProc(
                         if (rows_to_draw.items.len != 0) {
                             // Build full-width row rects.
                             // rows_to_draw is already sorted+deduplicated from the normalize step above.
+                            // The external windows build the same spans in
+                            // external_windows.zig and are NOT shared with this:
+                            // they reserve exactly rows + 5 and append
+                            // infallibly, while this path appends fallibly and
+                            // swallows the error, covered by the force-full-
+                            // present fallback above. It also adds
+                            // present_y_offset for the ext_tabline strip, which
+                            // external windows have no equivalent of. Reviewed
+                            // under the 2026-08-25 audit, observation 1,
+                            // finding 332; left duplicated on purpose.
                             var span_start: u32 = rows_to_draw.items[0];
                             var span_end: u32 = span_start + 1;
 
