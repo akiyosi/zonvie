@@ -107,7 +107,6 @@ final class MetalTerminalView: MTKView {
     /// committed by that window's own renderer, so this view's commit cannot
     /// time them — and it reports a content change rather than a measured
     /// scroll, so the offset is simply dropped, as it always was.
-    private var pendingExternalScrollClear: [Int64] = []
     private let pendingScrollClearLock = NSLock()
 
     // Stale scroll detection: timestamp of the first unanswered tick per grid.
@@ -2679,14 +2678,6 @@ final class MetalTerminalView: MTKView {
         pendingScrollClearLock.unlock()
     }
 
-    /// An external window published new content for a grid whose scroll offset
-    /// this view holds. See pendingExternalScrollClear.
-    func clearScrollOffsetForExternalGrid(_ gridId: Int64) {
-        pendingScrollClearLock.lock()
-        pendingExternalScrollClear.append(gridId)
-        pendingScrollClearLock.unlock()
-    }
-
     /// Per-frame scroll edge tick. Called from onPreDraw and from external
     /// grid views; a time-based guard dedupes multiple callers per frame.
     ///
@@ -2843,11 +2834,9 @@ final class MetalTerminalView: MTKView {
         pendingScrollClearLock.lock()
         let pending = pendingScrollClear
         pendingScrollClear.removeAll(keepingCapacity: true)
-        let external = pendingExternalScrollClear
-        pendingExternalScrollClear.removeAll(keepingCapacity: true)
         pendingScrollClearLock.unlock()
 
-        guard !pending.isEmpty || !external.isEmpty else { return }
+        guard !pending.isEmpty else { return }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
         // One wheel event's worth of rows, the unit the lookahead books in and
@@ -2862,24 +2851,6 @@ final class MetalTerminalView: MTKView {
                 || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
 
         scrollOffsetLock.lock()
-        for gridId in external {
-            // A reconciliation in the same batch carries the distance the
-            // content actually moved and settles the offset itself; dropping
-            // it here first would leave that reconciliation adding a full row
-            // to zero and displace the grid.
-            //
-            // This only covers the co-drained case. An external window appends
-            // its clear during vertex generation, while a reconciliation is
-            // staged until this view's commit — so a drain landing between the
-            // two, or a flush that aborts before committing, still sees the
-            // clear alone. Pairing them properly needs the external clear to
-            // be timed against the external window's own commit, which this
-            // view cannot observe.
-            if pending.contains(where: { $0.gridId == gridId }) { continue }
-            smoothScrollGrids.remove(gridId)
-            gestureLookaheadGrids.remove(gridId)
-            scrollOffsetPx.removeValue(forKey: gridId)
-        }
         for (gridId, rowsDelta) in pending {
             // grid_scroll received — reset stale tracking for this grid.
             // A response also proves the grid is not blocked at a buffer edge.
