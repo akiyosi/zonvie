@@ -3379,10 +3379,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     sem.signal()
                     // Paired with beginAtlasExternalRead() above. Uses the
                     // strongly-captured atlasReadRenderer, not [weak self] —
-                    // see its declaration comment for why. Gated on
-                    // hadAtlasRead: when atlasTex was nil, no read was ever
-                    // registered — calling endAtlasExternalRead() anyway
-                    // would over-release the DispatchGroup.
+                    // see its declaration comment for why.
                     atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
@@ -3569,10 +3566,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 sem.signal()
                 // Paired with beginAtlasExternalRead() at atlas-bind time
                 // above. Uses the strongly-captured atlasReadRenderer, not
-                // [weak self] — see its declaration comment for why. Gated
-                // on atlasTex != nil: when nil, no read was ever
-                // registered — calling endAtlasExternalRead() anyway would
-                // over-release the DispatchGroup.
+                // [weak self] — see its declaration comment for why.
                 atlasReadRenderer?.endAtlasExternalRead()
                 if completed.status != .completed {
                     DispatchQueue.main.async { [weak self] in
@@ -3926,8 +3920,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
     }
-
-    /// Returns true for special keycodes that should bypass IME.
 
     override func keyUp(with event: NSEvent) {
         // Key up events typically not needed for terminal input

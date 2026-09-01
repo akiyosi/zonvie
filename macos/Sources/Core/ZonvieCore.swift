@@ -1084,7 +1084,7 @@ final class ZonvieCore {
                 }
                 // Coalesced scrollbar update: once per flush instead of once
                 // per submitted row (the per-row enqueues in
-                // submitVerticesRaw/submitVerticesRowRaw were removed).
+                // submitVerticesRowRaw were removed).
                 // Skip the dispatch entirely when the scrollbar is disabled —
                 // updateScrollbarIfNeeded's own guard would make it a no-op,
                 // but the main-queue hop per flush is not free during scroll

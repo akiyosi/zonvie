@@ -131,8 +131,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // (surfacePhysicalCapacityRow, surfaceRowCapacityIsPrepared,
     // surfaceSafeNeededBytes, makeSurfaceRowProvisionPlan), and what is left
     // is each class's own concurrency contract -- a different lock, a
-    // different source for the flush bracket, and here an extra lockHeld
-    // parameter for the re-entrant caller. Merging those into one ledger type
+    // different source for the flush bracket, and an extra parameter on each
+    // side's demand call (rowIsPhysical here, lockHeld on the view, for its
+    // re-entrant caller). Merging those into one ledger type
     // would put both surfaces under a single lock discipline that neither one
     // currently has, in the path that produced the scroll freeze fixed by
     // de6c402 and the ext-grid capacity gate stall. Reviewed under the

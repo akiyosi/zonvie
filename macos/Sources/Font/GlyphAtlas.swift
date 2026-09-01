@@ -1702,7 +1702,7 @@ final class GlyphAtlas {
         // Copy bitmap data to stable buffer while under lock.
         // This prevents use-after-free if main thread destroys FreeType font
         // (via setBackingScale/rebuildFont_locked) between rasterizeOnly and uploadRegion.
-                copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
+        copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
 
         return true
     }
@@ -1724,7 +1724,7 @@ final class GlyphAtlas {
         bytesPerPixel bpp: Int32,
         outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
     ) {
-let ibpp = Int(bpp)
+        let ibpp = Int(bpp)
         let rowBytes = Int(w) * ibpp
         let needed = rowBytes * Int(h)
         if rasterizeScratch.count < needed {
@@ -1888,7 +1888,7 @@ let ibpp = Int(bpp)
             outBitmap.pointee.bytes_per_pixel = 1
         } else {
             // Copy bitmap data to stable buffer (same as rasterizeOnly)
-                        copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
+            copyFreeTypeBitmapToScratch_locked(buf: bufPtr!, width: w, height: h, pitch: pitch, bytesPerPixel: bpp, outBitmap: outBitmap)
         }
 
         return true
