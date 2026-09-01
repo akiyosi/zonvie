@@ -3306,7 +3306,6 @@ const ClipboardSetProbe = struct {
     }
 };
 
-
 test "a skipped wrapper run costs no argv slot" {
     // ab0974c moved the ssh-askpass skip after tokenization, so the wrapper
     // tokens took output slots before being dropped. A command that filled the
