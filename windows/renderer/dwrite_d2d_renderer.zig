@@ -144,8 +144,8 @@ pub const Renderer = struct {
     // Set when atlas is reset; signals the UI thread to request a full re-seed
     // so stale UV coordinates in cached row vertices are refreshed.
     atlas_reset_pending: bool = false,
-    // Monotonic counter incremented ONLY on a true atlas reset (resetAtlas /
-    // recreateAtlasTexture), never on a normal per-glyph upload. Used by
+    // Monotonic counter incremented ONLY on a true atlas reset
+    // (recreateAtlasTexture), never on a normal per-glyph upload. Used by
     // external windows to detect "do I need a full re-upload", independently
     // of atlas_version (which bumps too often for that purpose — see
     // tmp/fixplan/06-windows-atlas.md finding 3).

@@ -2207,7 +2207,8 @@ pub export fn WndProc(
 
                 // If the glyph atlas was reset, all cached row vertex UVs are stale.
                 // Request a full re-seed so the core regenerates every row.
-                // Guard with renderer mutex (resetAtlas sets the flag under a.mu).
+                // Guard with renderer mutex (recreateAtlasTexture sets the flag
+                // under a.mu).
                 if (atlas_ptr) |a| {
                     var reset_pending = false;
                     var cur_atlas_w: u32 = 0;
