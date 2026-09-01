@@ -2976,7 +2976,6 @@ pub export fn WndProc(
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
                             .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
-                            .glow_enabled = glow_enabled,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
                             .content_x_offset = content_x_offset,
