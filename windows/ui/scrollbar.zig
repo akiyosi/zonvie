@@ -96,92 +96,18 @@ fn invalidateScrollbarTrackForExternal(hwnd: c.HWND, dpi_scale: f32) void {
     }
 }
 
-pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) struct {
-    track_left: f32,
-    track_top: f32,
-    track_right: f32,
-    track_bottom: f32,
-    knob_top: f32,
-    knob_bottom: f32,
-    is_scrollable: bool,
-} {
-    var vp: app_mod.ViewportInfo = undefined;
-    if (getViewportNonBlocking(app, -1, &vp) == .none) return .{
-        .track_left = 0,
-        .track_top = 0,
-        .track_right = 0,
-        .track_bottom = 0,
-        .knob_top = 0,
-        .knob_bottom = 0,
-        .is_scrollable = false,
-    };
-
-    const visible_lines = vp.botline - vp.topline;
-    const is_scrollable = vp.line_count > visible_lines and visible_lines > 0;
-
-    const cw: f32 = @floatFromInt(client_width);
-    const ch: f32 = @floatFromInt(client_height);
-
-    // Only titlebar mode occupies vertical space above the terminal; sidebar
-    // mode shifts content horizontally and must keep the track at the top.
-    const tabbar_offset: f32 = if (app.ext_tabline_enabled and
-        app.tabline_style == .titlebar and
-        app.content_hwnd == null)
-        @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-    else
-        0;
-
-    // DPI-scaled scrollbar dimensions
-    const dpi = app.dpi_scale;
-    const sb_width = app_mod.scrollbarWidth(dpi);
-    const sb_margin = app_mod.scrollbarMargin(dpi);
-    const sb_min_knob = app_mod.scrollbarMinKnobHeight(dpi);
-
-    // Track position (right edge)
-    const track_left = cw - sb_width - sb_margin;
-    const track_right = cw - sb_margin;
-    const track_top = sb_margin + tabbar_offset;
-    const track_bottom = ch - sb_margin;
-    const track_height = track_bottom - track_top;
-
-    if (!is_scrollable or track_height <= 0) {
-        return .{
-            .track_left = track_left,
-            .track_top = track_top,
-            .track_right = track_right,
-            .track_bottom = track_bottom,
-            .knob_top = track_top,
-            .knob_bottom = track_bottom,
-            .is_scrollable = false,
-        };
-    }
-
-    // Knob size proportional to visible portion
-    const visible_f: f32 = @floatFromInt(visible_lines);
-    const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
-    const knob_proportion = @min(1.0, visible_f / total_f);
-    var knob_height = track_height * knob_proportion;
-    knob_height = @max(sb_min_knob, knob_height);
-
-    // Knob position
-    const scroll_range = total_f - visible_f;
-    const scroll_pos: f32 = if (scroll_range > 0) @as(f32, @floatFromInt(vp.topline)) / scroll_range else 0;
-    const knob_travel = track_height - knob_height;
-    const knob_top = track_top + knob_travel * scroll_pos;
-    const knob_bottom = knob_top + knob_height;
-
-    return .{
-        .track_left = track_left,
-        .track_top = track_top,
-        .track_right = track_right,
-        .track_bottom = track_bottom,
-        .knob_top = knob_top,
-        .knob_bottom = knob_bottom,
-        .is_scrollable = true,
-    };
-}
-
-pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32, dpi_scale: f32) app_mod.ScrollbarGeometry {
+/// Scrollbar track and knob for one grid. The main window and the external
+/// windows differ only in the three parameters: which grid to read, how much
+/// vertical space the tabline takes above the track, and whose DPI scale
+/// applies (external windows may sit on a different monitor).
+fn scrollbarGeometryFor(
+    app: *App,
+    grid_id: i64,
+    client_width: i32,
+    client_height: i32,
+    dpi: f32,
+    top_offset_px: f32,
+) app_mod.ScrollbarGeometry {
     var vp: app_mod.ViewportInfo = undefined;
     if (getViewportNonBlocking(app, grid_id, &vp) == .none) return .{
         .track_left = 0,
@@ -199,19 +125,14 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
-    // DPI-scaled scrollbar dimensions. Use the caller-supplied per-window
-    // dpi_scale (this window's own monitor DPI, may differ from
-    // app.dpi_scale on a mixed-DPI multi-monitor setup — see MED-5 in the
-    // fix-plan doc) rather than the global app.dpi_scale.
-    const dpi = dpi_scale;
     const sb_width = app_mod.scrollbarWidth(dpi);
     const sb_margin = app_mod.scrollbarMargin(dpi);
     const sb_min_knob = app_mod.scrollbarMinKnobHeight(dpi);
 
-    // Track position (right edge) - no tabbar offset for external windows
+    // Track position (right edge)
     const track_left = cw - sb_width - sb_margin;
     const track_right = cw - sb_margin;
-    const track_top = sb_margin;
+    const track_top = sb_margin + top_offset_px;
     const track_bottom = ch - sb_margin;
     const track_height = track_bottom - track_top;
 
@@ -239,7 +160,6 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     const scroll_pos: f32 = if (scroll_range > 0) @as(f32, @floatFromInt(vp.topline)) / scroll_range else 0;
     const knob_travel = track_height - knob_height;
     const knob_top = track_top + knob_travel * scroll_pos;
-    const knob_bottom = knob_top + knob_height;
 
     return .{
         .track_left = track_left,
@@ -247,27 +167,50 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
         .track_right = track_right,
         .track_bottom = track_bottom,
         .knob_top = knob_top,
-        .knob_bottom = knob_bottom,
+        .knob_bottom = knob_top + knob_height,
         .is_scrollable = true,
     };
 }
 
+pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
+    // Only titlebar mode occupies vertical space above the terminal; sidebar
+    // mode shifts content horizontally and must keep the track at the top.
+    const tabbar_offset: f32 = if (app.ext_tabline_enabled and
+        app.tabline_style == .titlebar and
+        app.content_hwnd == null)
+        @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
+    else
+        0;
+    return scrollbarGeometryFor(app, -1, client_width, client_height, app.dpi_scale, tabbar_offset);
+}
+
+pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32, dpi_scale: f32) app_mod.ScrollbarGeometry {
+    // No tabline sits above an external window's content, so no top offset.
+    // dpi_scale is this window's own monitor DPI, which may differ from
+    // app.dpi_scale on a mixed-DPI multi-monitor setup.
+    return scrollbarGeometryFor(app, grid_id, client_width, client_height, dpi_scale, 0);
+}
+
 /// Generate scrollbar vertices for external window
-pub fn generateScrollbarVerticesForExternal(
-    app: *App,
+/// Emit the track and knob quads for a scrollbar whose geometry is already
+/// resolved. The main window and the external windows produced these twelve
+/// vertices identically apart from knob_inset_px.
+///
+/// That inset is a parameter, not a unified constant: external windows inset
+/// the knob 1px inside its track and the main window does not, so the two
+/// look different today. Passing it through keeps this refactor
+/// bit-identical for both; making them agree changes what the main window
+/// draws and is a decision for the user, not a side effect of sharing code.
+fn scrollbarVerticesFrom(
+    geom: app_mod.ScrollbarGeometry,
+    cfg_opacity: f32,
+    is_always_mode: bool,
     scrollbar_alpha: f32,
-    grid_id: i64,
     client_width: i32,
     client_height: i32,
+    knob_inset_px: f32,
     out_verts: *[12]app_mod.Vertex,
-    dpi_scale: f32,
 ) usize {
-    if (!app.config.scrollbar.enabled) return 0;
-    if (scrollbar_alpha <= 0.001) return 0;
-
-    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale);
-    if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
-
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
 
@@ -283,43 +226,31 @@ pub fn generateScrollbarVerticesForExternal(
         }
     }.f;
 
-    const alpha = scrollbar_alpha * app.config.scrollbar.opacity;
-
-    // Track color
-    const is_always_mode = app.config.scrollbar.isAlways();
+    const alpha = scrollbar_alpha * cfg_opacity;
     const track_alpha: f32 = if (is_always_mode) 1.0 else alpha * 0.5;
     const track_color = [4]f32{ 0.2, 0.2, 0.2, track_alpha };
-    // Knob color
     const knob_color = [4]f32{ 0.7, 0.7, 0.7, alpha };
 
-    // Track quad (background) - 6 vertices
     const tl = to_ndc_x(geom.track_left, cw);
     const tr = to_ndc_x(geom.track_right, cw);
     const tt = to_ndc_y(geom.track_top, ch);
     const tb = to_ndc_y(geom.track_bottom, ch);
 
-    // Track Triangle 1
     out_verts[0] = .{ .position = .{ tl, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[1] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[2] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    // Track Triangle 2
     out_verts[3] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[4] = .{ .position = .{ tr, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[5] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
 
-    // Knob quad - 6 vertices
-    const kl = to_ndc_x(geom.track_left + 1, cw); // Inset by 1px
-    const kr = to_ndc_x(geom.track_right - 1, cw);
+    const kl = to_ndc_x(geom.track_left + knob_inset_px, cw);
+    const kr = to_ndc_x(geom.track_right - knob_inset_px, cw);
     const kt = to_ndc_y(geom.knob_top, ch);
     const kb = to_ndc_y(geom.knob_bottom, ch);
 
-    // Knob Triangle 1
     out_verts[6] = .{ .position = .{ kl, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[7] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[8] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    // Knob Triangle 2
     out_verts[9] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[10] = .{ .position = .{ kr, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
     out_verts[11] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
@@ -327,7 +258,52 @@ pub fn generateScrollbarVerticesForExternal(
     return 12;
 }
 
+pub fn generateScrollbarVerticesForExternal(
+    app: *App,
+    scrollbar_alpha: f32,
+    grid_id: i64,
+    client_width: i32,
+    client_height: i32,
+    out_verts: *[12]app_mod.Vertex,
+    dpi_scale: f32,
+) usize {
+    if (!app.config.scrollbar.enabled) return 0;
+    if (scrollbar_alpha <= 0.001) return 0;
+
+    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale);
+    if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
+
+    return scrollbarVerticesFrom(
+        geom,
+        app.config.scrollbar.opacity,
+        app.config.scrollbar.isAlways(),
+        scrollbar_alpha,
+        client_width,
+        client_height,
+        1, // external windows inset the knob inside its track
+        out_verts,
+    );
+}
+
 /// Hit test scrollbar area for external window
+/// Which part of an already-resolved scrollbar a point falls on. Both hit
+/// tests were this, verbatim, around their own geometry call.
+pub const ScrollbarHit = enum { none, knob, track_above, track_below };
+
+fn scrollbarHitFrom(geom: app_mod.ScrollbarGeometry, mouse_x: i32, mouse_y: i32) ScrollbarHit {
+    if (!geom.is_scrollable) return .none;
+
+    const mx: f32 = @floatFromInt(mouse_x);
+    const my: f32 = @floatFromInt(mouse_y);
+
+    if (mx < geom.track_left or mx > geom.track_right) return .none;
+    if (my < geom.track_top or my > geom.track_bottom) return .none;
+
+    if (my >= geom.knob_top and my <= geom.knob_bottom) return .knob;
+    if (my < geom.knob_top) return .track_above;
+    return .track_below;
+}
+
 pub fn scrollbarHitTestForExternal(
     app: *App,
     grid_id: i64,
@@ -336,28 +312,13 @@ pub fn scrollbarHitTestForExternal(
     mouse_x: i32,
     mouse_y: i32,
     dpi_scale: f32,
-) enum { none, knob, track_above, track_below } {
+) ScrollbarHit {
     if (!app.config.scrollbar.enabled) return .none;
-
-    const geom = getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale);
-    if (!geom.is_scrollable) return .none;
-
-    const mx: f32 = @floatFromInt(mouse_x);
-    const my: f32 = @floatFromInt(mouse_y);
-
-    // Check if in track area horizontally
-    if (mx < geom.track_left or mx > geom.track_right) return .none;
-
-    // Check vertical position
-    if (my < geom.track_top or my > geom.track_bottom) return .none;
-
-    if (my >= geom.knob_top and my <= geom.knob_bottom) {
-        return .knob;
-    } else if (my < geom.knob_top) {
-        return .track_above;
-    } else {
-        return .track_below;
-    }
+    return scrollbarHitFrom(
+        getScrollbarGeometryForExternal(app, grid_id, client_width, client_height, dpi_scale),
+        mouse_x,
+        mouse_y,
+    );
 }
 
 /// Show scrollbar for external window
@@ -568,88 +529,26 @@ pub fn generateScrollbarVertices(app: *App, client_width: i32, client_height: i3
     const geom = getScrollbarGeometry(app, client_width, client_height);
     if (!geom.is_scrollable and !app.config.scrollbar.isAlways()) return 0;
 
-    const cw: f32 = @floatFromInt(client_width);
-    const ch: f32 = @floatFromInt(client_height);
-
-    // Convert to NDC (-1..1)
-    const to_ndc_x = struct {
-        fn f(px: f32, w: f32) f32 {
-            return (px / w) * 2.0 - 1.0;
-        }
-    }.f;
-    const to_ndc_y = struct {
-        fn f(py: f32, h: f32) f32 {
-            return 1.0 - (py / h) * 2.0; // Y flipped
-        }
-    }.f;
-
-    const alpha = app.scrollbar_alpha * app.config.scrollbar.opacity;
-
-    // Track color: fully opaque in "always" mode to prevent ghosting, semi-transparent otherwise
-    const is_always_mode = app.config.scrollbar.isAlways();
-    const track_alpha: f32 = if (is_always_mode) 1.0 else alpha * 0.5;
-    const track_color = [4]f32{ 0.2, 0.2, 0.2, track_alpha };
-    // Knob color (light gray with alpha)
-    const knob_color = [4]f32{ 0.7, 0.7, 0.7, alpha };
-
-    // Track quad (background) - 6 vertices
-    const tl = to_ndc_x(geom.track_left, cw);
-    const tr = to_ndc_x(geom.track_right, cw);
-    const tt = to_ndc_y(geom.track_top, ch);
-    const tb = to_ndc_y(geom.track_bottom, ch);
-
-    // Track Triangle 1
-    out_verts[0] = .{ .position = .{ tl, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[1] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[2] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    // Track Triangle 2
-    out_verts[3] = .{ .position = .{ tr, tt }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[4] = .{ .position = .{ tr, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[5] = .{ .position = .{ tl, tb }, .texCoord = .{ -1.0, 0 }, .color = track_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    // Knob quad (2 triangles = 6 vertices)
-    const kl = to_ndc_x(geom.track_left, cw);
-    const kr = to_ndc_x(geom.track_right, cw);
-    const kt = to_ndc_y(geom.knob_top, ch);
-    const kb = to_ndc_y(geom.knob_bottom, ch);
-
-    // Knob Triangle 1: top-left, top-right, bottom-left
-    out_verts[6] = .{ .position = .{ kl, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[7] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[8] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    // Knob Triangle 2: top-right, bottom-right, bottom-left
-    out_verts[9] = .{ .position = .{ kr, kt }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[10] = .{ .position = .{ kr, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-    out_verts[11] = .{ .position = .{ kl, kb }, .texCoord = .{ -1.0, 0 }, .color = knob_color, .grid_id = 1, .deco_flags = 0, .deco_phase = 0 };
-
-    return 12; // 6 for track + 6 for knob
+    return scrollbarVerticesFrom(
+        geom,
+        app.config.scrollbar.opacity,
+        app.config.scrollbar.isAlways(),
+        app.scrollbar_alpha,
+        client_width,
+        client_height,
+        0, // the main window's knob fills its track edge to edge
+        out_verts,
+    );
 }
 
 /// Hit test scrollbar area
-pub fn scrollbarHitTest(app: *App, client_width: i32, client_height: i32, mouse_x: i32, mouse_y: i32) enum { none, knob, track_above, track_below } {
+pub fn scrollbarHitTest(app: *App, client_width: i32, client_height: i32, mouse_x: i32, mouse_y: i32) ScrollbarHit {
     if (!app.config.scrollbar.enabled) return .none;
-
-    const geom = getScrollbarGeometry(app, client_width, client_height);
-    if (!geom.is_scrollable) return .none;
-
-    const mx: f32 = @floatFromInt(mouse_x);
-    const my: f32 = @floatFromInt(mouse_y);
-
-    // Check if in track area horizontally
-    if (mx < geom.track_left or mx > geom.track_right) return .none;
-
-    // Check vertical position
-    if (my < geom.track_top or my > geom.track_bottom) return .none;
-
-    if (my >= geom.knob_top and my <= geom.knob_bottom) {
-        return .knob;
-    } else if (my < geom.knob_top) {
-        return .track_above;
-    } else {
-        return .track_below;
-    }
+    return scrollbarHitFrom(
+        getScrollbarGeometry(app, client_width, client_height),
+        mouse_x,
+        mouse_y,
+    );
 }
 
 /// Handle scrollbar mouse down
