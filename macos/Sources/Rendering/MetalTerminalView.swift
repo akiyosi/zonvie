@@ -1780,11 +1780,16 @@ final class MetalTerminalView: MTKView {
         let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
 
         if hasControlOrCommand || isSpecialKey {
-            var mods: UInt32 = 0
-            if m.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
-            if optionIsMeta          { mods |= UInt32(ZONVIE_MOD_ALT) }
-            if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
-            if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
+            let mods = KeyCharacterSelection.modifierMask(
+                control: m.contains(.control),
+                optionIsMeta: optionIsMeta,
+                shift: m.contains(.shift),
+                command: m.contains(.command),
+                ctrlBit: UInt32(ZONVIE_MOD_CTRL),
+                altBit: UInt32(ZONVIE_MOD_ALT),
+                shiftBit: UInt32(ZONVIE_MOD_SHIFT),
+                superBit: UInt32(ZONVIE_MOD_SUPER)
+            )
 
             let chars = KeyCharacterSelection.primaryCharacters(
                 optionIsMeta: optionIsMeta,

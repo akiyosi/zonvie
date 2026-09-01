@@ -103,6 +103,27 @@ private enum KeyCharacterSelectionTests {
             }
         }
 
+        // modifierMask packs exactly the bits it is given, and reports Option
+        // as Alt only when it is acting as Meta. Bit values mirror
+        // include/zonvie_core.h: ctrl 1, alt 2, shift 4, super 8.
+        func expectMask(_ ctrl: Bool, _ meta: Bool, _ shift: Bool, _ cmd: Bool,
+                        _ want: UInt32, _ what: String) {
+            let got = KeyCharacterSelection.modifierMask(
+                control: ctrl, optionIsMeta: meta, shift: shift, command: cmd,
+                ctrlBit: 1, altBit: 2, shiftBit: 4, superBit: 8)
+            if got != want {
+                failures += 1
+                FileHandle.standardError.write(Data("FAIL: \(what): got \(got) want \(want)\n".utf8))
+            }
+        }
+        expectMask(false, false, false, false, 0, "no modifiers is zero")
+        expectMask(true, false, false, false, 1, "control alone")
+        expectMask(false, true, false, false, 2, "Option-as-Meta reports Alt")
+        expectMask(false, false, true, false, 4, "shift alone")
+        expectMask(false, false, false, true, 8, "command reports Super")
+        expectMask(true, true, true, true, 15, "all four combine")
+        expectMask(true, false, true, false, 5, "control and shift only")
+
         if failures == 0 {
             print("KeyCharacterSelectionTests: all checks passed")
         } else {
