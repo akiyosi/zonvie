@@ -99,9 +99,12 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
 /// hold app.mu -- this deliberately does not take it, because several window
 /// procedure arms keep the lock past the lookup to read further App state.
 ///
-/// Eight arms of ExternalWndProc walked the map inline with the same
-/// predicate. The WM_DPICHANGED arm does not use this: it does its work
-/// inside the loop rather than extracting a match.
+/// Eight arms of ExternalWndProc and paintExternalWindow walked the map
+/// inline with the same predicate. Four sites deliberately still do not use
+/// this: WM_DPICHANGED and the scrollbar-drag arm do their work inside the
+/// loop rather than extracting a match, the pending-close sweep keys on
+/// is_pending_close and paint_ref_count instead of hwnd, and
+/// collectWindowInfos enumerates rather than looks up.
 const ExtWindowHit = struct { grid_id: i64, win: *app_mod.ExternalWindow };
 
 fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
@@ -3089,14 +3092,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Find the external window for this hwnd (also get grid_id)
     var ext_win_ptr: ?*app_mod.ExternalWindow = null;
     var found_grid_id: i64 = 0;
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow checking entry hwnd={*} vs {*}\n", .{ entry.value_ptr.*.hwnd, hwnd });
-        if (entry.value_ptr.*.hwnd == hwnd) {
-            ext_win_ptr = entry.value_ptr.*;
-            found_grid_id = entry.key_ptr.*;
-            break;
-        }
+    if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+        ext_win_ptr = hit.win;
+        found_grid_id = hit.grid_id;
     }
 
     const ext_win = ext_win_ptr orelse {
