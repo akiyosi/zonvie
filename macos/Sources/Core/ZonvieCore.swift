@@ -5384,6 +5384,40 @@ final class ZonvieCore {
     }
 
     /// Called to update vertices for an external grid.
+    /// Repaint every non-cursor background vertex that currently carries `from`
+    /// with `to`. Decorated grids use this to swap the core's background colour
+    /// for the window-chrome-adjusted one without touching glyphs, decorations
+    /// or the cursor.
+    ///
+    /// Only background quads are considered (texCoord.0 < 0). The 0.005
+    /// tolerance absorbs the float round-trip through the vertex colours; cells
+    /// the core painted from a different highlight -- PmenuSel, for one -- miss
+    /// it and keep their own colour, which is what leaves the popupmenu
+    /// selection visible over a shader.
+    private static func replaceDecoratedBackgroundColor(
+        in adjustedVertices: inout [zonvie_vertex],
+        from: (r: CGFloat, g: CGFloat, b: CGFloat),
+        to: (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)
+    ) {
+        let (origR, origG, origB) = from
+        let (adjR, adjG, adjB, adjA) = to
+        for i in adjustedVertices.indices {
+            if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
+            if adjustedVertices[i].texCoord.0 < 0 {
+                let vr = CGFloat(adjustedVertices[i].color.0)
+                let vg = CGFloat(adjustedVertices[i].color.1)
+                let vb = CGFloat(adjustedVertices[i].color.2)
+                let tolerance: CGFloat = 0.005
+                if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
+                    adjustedVertices[i].color.0 = Float(adjR)
+                    adjustedVertices[i].color.1 = Float(adjG)
+                    adjustedVertices[i].color.2 = Float(adjB)
+                    adjustedVertices[i].color.3 = Float(adjA)
+                }
+            }
+        }
+    }
+
     private func prepareExternalVertexArray(
         gridId: Int64,
         vertices: [zonvie_vertex]
@@ -5445,21 +5479,11 @@ final class ZonvieCore {
             var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
             bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
 
-            for i in adjustedVertices.indices {
-                if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
-                if adjustedVertices[i].texCoord.0 < 0 {
-                    let vr = CGFloat(adjustedVertices[i].color.0)
-                    let vg = CGFloat(adjustedVertices[i].color.1)
-                    let vb = CGFloat(adjustedVertices[i].color.2)
-                    let tolerance: CGFloat = 0.005
-                    if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
-                        adjustedVertices[i].color.0 = Float(adjR)
-                        adjustedVertices[i].color.1 = Float(adjG)
-                        adjustedVertices[i].color.2 = Float(adjB)
-                        adjustedVertices[i].color.3 = Float(adjA)
-                    }
-                }
-            }
+            ZonvieCore.replaceDecoratedBackgroundColor(
+                in: &adjustedVertices,
+                from: (origR, origG, origB),
+                to: (adjR, adjG, adjB, adjA)
+            )
             return (adjustedVertices, bgColor)
         }
 
@@ -5488,21 +5512,11 @@ final class ZonvieCore {
         var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
         bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
 
-        for i in adjustedVertices.indices {
-            if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
-            if adjustedVertices[i].texCoord.0 < 0 {
-                let vr = CGFloat(adjustedVertices[i].color.0)
-                let vg = CGFloat(adjustedVertices[i].color.1)
-                let vb = CGFloat(adjustedVertices[i].color.2)
-                let tolerance: CGFloat = 0.005
-                if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
-                    adjustedVertices[i].color.0 = Float(adjR)
-                    adjustedVertices[i].color.1 = Float(adjG)
-                    adjustedVertices[i].color.2 = Float(adjB)
-                    adjustedVertices[i].color.3 = Float(adjA)
-                }
-            }
-        }
+        ZonvieCore.replaceDecoratedBackgroundColor(
+            in: &adjustedVertices,
+            from: (origR, origG, origB),
+            to: (adjR, adjG, adjB, adjA)
+        )
 
         return (adjustedVertices, bgColor)
     }
