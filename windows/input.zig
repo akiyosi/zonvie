@@ -298,6 +298,7 @@ pub fn handleImeComposition(app: *App, hwnd: c.HWND, lParam: c.LPARAM) ImeCompos
             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
             // Convert to UTF-8 for display
             updateImeCompositionUtf8(app);
+            if (applog.isEnabled()) applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
             app.mu.unlock(core.clock.io());
         } else {
             app.mu.lockUncancelable(core.clock.io());
@@ -334,10 +335,22 @@ pub fn handleImeComposition(app: *App, hwnd: c.HWND, lParam: c.LPARAM) ImeCompos
     // not just when the flag is set.
     {
         const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
+        if (applog.isEnabled()) applog.appLog("[IME] GCS_COMPATTR attr_len={d} lparam_has_flag={d}\n", .{
+            attr_len,
+            @intFromBool((lParam & c.GCS_COMPATTR) != 0),
+        });
         if (attr_len > 0) {
             var attr_buf: [256]u8 = undefined;
             const len: usize = @intCast(@min(@as(usize, @intCast(@max(0, attr_len))), 256));
             _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
+
+            if (applog.isEnabled()) {
+                applog.appLog("[IME] COMPATTR len={d} attrs=", .{len});
+                for (0..len) |idx| {
+                    applog.appLog("{x} ", .{attr_buf[idx]});
+                }
+                applog.appLog("\n", .{});
+            }
 
             // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
             // ATTR_CONVERTED = 0x02, ATTR_TARGET_NOTCONVERTED = 0x03
@@ -356,6 +369,7 @@ pub fn handleImeComposition(app: *App, hwnd: c.HWND, lParam: c.LPARAM) ImeCompos
                     app.ime_target_end = i + 1;
                 }
             }
+            if (applog.isEnabled()) applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
             app.mu.unlock(core.clock.io());
         }
     }
