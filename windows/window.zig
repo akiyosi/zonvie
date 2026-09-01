@@ -1574,6 +1574,28 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
 ///
 /// Returns void rather than an error: the only fallible call here already
 /// swallows its error, since a missing config file is the normal case.
+/// Build the `devcontainer exec ... nvim --embed` command line into `buf` and
+/// return the slice actually written. Both the early and deferred nvim launch
+/// paths built this identically.
+///
+/// Returns a plain slice, not an error union: a truncated command would be
+/// caught downstream when the spawn fails, and the writer's own errors were
+/// already swallowed at both call sites.
+fn buildDevcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]const u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    const writer = &w;
+    writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
+    writer.writeAll(workspace) catch {};
+    writer.writeAll("\"") catch {};
+    if (config_path) |cfg| {
+        writer.writeAll(" --config \"") catch {};
+        writer.writeAll(cfg) catch {};
+        writer.writeAll("\"") catch {};
+    }
+    writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
+    return buf[0..w.end];
+}
+
 fn loadConfigAndApplyCoreOptions(app: *App) void {
     if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
         defer app.alloc.free(config_path);
@@ -4681,18 +4703,7 @@ pub export fn WndProc(
                             var nvim_cmd_slice: []const u8 = undefined;
 
                             if (app.devcontainer_workspace) |workspace| {
-                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
-                                const writer = &w;
-                                writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-                                writer.writeAll(workspace) catch {};
-                                writer.writeAll("\"") catch {};
-                                if (app.devcontainer_config) |config_path| {
-                                    writer.writeAll(" --config \"") catch {};
-                                    writer.writeAll(config_path) catch {};
-                                    writer.writeAll("\"") catch {};
-                                }
-                                writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
+                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
                                 // Start nvim
@@ -5481,18 +5492,7 @@ pub export fn WndProc(
                                 break :devcontainer_block;
                             } else {
                                 dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
-                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
-                                const writer = &w;
-                                writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-                                writer.writeAll(workspace) catch {};
-                                writer.writeAll("\"") catch {};
-                                if (app.devcontainer_config) |config_path| {
-                                    writer.writeAll(" --config \"") catch {};
-                                    writer.writeAll(config_path) catch {};
-                                    writer.writeAll("\"") catch {};
-                                }
-                                writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
+                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                             }
                         } else {
                             nvim_cmd_slice = quoted_nvim;
