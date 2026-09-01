@@ -6162,17 +6162,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
@@ -6262,17 +6256,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
@@ -6313,16 +6301,11 @@ pub export fn WndProc(
                 const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 const mod_buf = input.buildMouseModifiers(wParam);
 
@@ -6360,16 +6343,11 @@ pub export fn WndProc(
                 const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 const mod_buf = input.buildMouseModifiers(wParam);
 
@@ -6589,17 +6567,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
