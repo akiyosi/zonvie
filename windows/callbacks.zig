@@ -8,19 +8,9 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("ui/external_windows.zig");
 
-// ---- Logging globals for atlas ensure callbacks ----
-var log_atlas_ensure_calls: u64 = 0;
-var log_atlas_ensure_suspicious: u64 = 0;
-var log_atlas_ensure_last_report_ns: i128 = 0;
-var log_atlas_zero_bbox_count: u32 = 0;
+// ---- Logging globals for row vertex callbacks ----
 var log_row_no_glyphs_count: u32 = 0;
 var log_row_bad_uv_count: u32 = 0;
-
-// Track styled glyph stats
-var log_styled_glyph_calls: u64 = 0;
-var log_styled_glyph_ok: u64 = 0;
-var log_styled_glyph_fail: u64 = 0;
-var log_styled_glyph_last_report_ns: i128 = 0;
 
 // =========================================================================
 // Helper functions used by callbacks

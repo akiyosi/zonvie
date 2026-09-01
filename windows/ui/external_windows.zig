@@ -3369,8 +3369,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Check if we need to upload the full atlas (a TRUE reset happened since
     // this window last fully re-uploaded — not just "some glyph was added").
-    // Guarded by a.mu: resetAtlas() bumps this field from ensureGlyph, which
-    // can run concurrently with this paint (same pattern as the
+    // Guarded by a.mu: recreateAtlasTexture() bumps this field from
+    // ensureGlyph, which can run concurrently with this paint (same pattern as the
     // atlas_reset_pending read elsewhere in this function).
     var current_atlas_reset_generation: u64 = 0;
     if (atlas_ptr) |a| {

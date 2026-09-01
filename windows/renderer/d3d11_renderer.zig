@@ -2404,7 +2404,6 @@ pub const Renderer = struct {
         dcomp_visual = null;
     }
 
-    /// Create swap chain and DirectComposition using the pre-set self.device/self.ctx.
     /// Create the flip-model composition swapchain for `dev` at the
     /// renderer's current size, bind it to a DirectComposition visual, and
     /// publish it on self along with the derived IDXGISwapChain3.
@@ -2586,10 +2585,6 @@ pub const Renderer = struct {
         // Build the swapchain before transferring the device, so the
         // errdefers above still own dev and ctx if this fails.
         try self.createCompositionSwapchain(dev.?);
-        errdefer {
-            safeRelease(&self.swapchain);
-            safeRelease(&self.swapchain1);
-        }
 
         self.device = dev;
         self.ctx = ctx;
