@@ -126,10 +126,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     private let lock = NSLock()
 
-    private var vertexBuffer: MTLBuffer?
-    private var vertexBufferCapacity: Int = 0
-    private var currentVertexCount: Int = 0
-    private var pendingVertexCount: Int? = nil
 
     // MARK: - Triple Buffering (same pattern as MetalTerminalRenderer)
     // Three buffer sets: one committed (being drawn), one write (being filled),
@@ -800,7 +796,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         // Release per-view Metal resources.
-        vertexBuffer = nil
         backBuffer = nil
         scrollScratchTexture = nil
         backgroundAlphaBuffer = nil
@@ -2641,27 +2636,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // automatically — the NDC mapping stays correct for visible rows.
             let snapGridRows = snappedGridRows > 0 ? snappedGridRows : gridRows
             let snapGridCols = snappedGridCols > 0 ? snappedGridCols : gridCols
-            let vertexCount: Int
-            let vertexBufferSnapshot: MTLBuffer?
-
+            // External grids are row-mode only: the core reaches them through
+            // on_vertices_row, and the ABI has no whole-surface callback.
             if !rowMode {
-                lock.lock()
-                if let pending = pendingVertexCount {
-                    currentVertexCount = pending
-                    pendingVertexCount = nil
-                }
-                lock.unlock()
-                vertexCount = currentVertexCount
-                vertexBufferSnapshot = vertexBuffer
-            } else {
-                vertexCount = 0
-                vertexBufferSnapshot = nil
-            }
-
-            if !rowMode && vertexCount <= 0 {
                 return
             }
-            if rowMode && committed.rowState.buffers.isEmpty {
+            if committed.rowState.buffers.isEmpty {
                 return
             }
 
@@ -3252,17 +3232,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         useTwoPass: false
                     )
                 }
-            } else {
-                // Non-row-mode: shared helper handles 2-pass vs single-pass dispatch
-                encodeSurfaceNonRowContent(
-                    encoder: enc,
-                    vertexBuffer: vertexBufferSnapshot,
-                    vertexCount: vertexCount,
-                    pipeline: pipeline,
-                    backgroundPipeline: backgroundPipeline,
-                    glyphPipeline: glyphPipeline,
-                    useTwoPass: use2Pass
-                )
             }
 
             // Cursor is NOT drawn into backbuffer — it is composited onto the
@@ -3320,9 +3289,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
                             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
                         }
-                    } else if vertexCount > 0, let vb = vertexBufferSnapshot {
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                     }
 
                     // Cursor vertices for cursor glow
@@ -3595,23 +3561,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     // MARK: - Private
 
-    private func ensureVertexBufferCapacity(_ count: Int, forceReplace: Bool = false) {
-        let needed = count * MemoryLayout<Vertex>.stride
-        if !forceReplace && needed <= vertexBufferCapacity { return }
-
-        let newCap = max(needed, vertexBufferCapacity * 2, 4096)
-        vertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
-        if vertexBuffer != nil {
-            vertexBufferCapacity = newCap
-        } else {
-            // Do NOT record newCap as satisfied capacity for a nil buffer —
-            // the next call would see needed <= vertexBufferCapacity and
-            // skip retrying the allocation entirely, permanently believing
-            // a nonexistent buffer covers this content.
-            vertexBufferCapacity = 0
-            flushFailed = true
-        }
-    }
 
     // MARK: - Smooth Scroll
 

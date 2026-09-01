@@ -2611,13 +2611,6 @@ final class MetalTerminalView: MTKView {
         pendingSentScrollLock.unlock()
     }
 
-    /// Get the current scroll offset for a grid.
-    func getScrollOffset(gridId: Int64) -> CGFloat {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(renderer.cellHeightPx))
-    }
-
     /// Record how far a grid's content just moved (thread-safe, callable from
     /// any thread). Called from ZonvieCore on grid_scroll. rowsDelta is signed
     /// and already summed over the scrolls the notification stands for, so it
