@@ -529,6 +529,93 @@ private enum SurfaceRowProvisionTests {
                 "equal-z content must not be masked")
     }
 
+    /// The three sites that decide whether a row is provisioned share one
+    /// demand computation and one slot predicate. These pin the three
+    /// dimensions the existing suite did not reach: an under-sized slot, a
+    /// demand basis that ignores what is already provisioned, and the
+    /// per-buffer budget ceiling.
+    private static func verifyRowCapacityDemandAndSlotPredicate(device: MTLDevice) {
+        // An under-sized slot is not ready, however small the shortfall.
+        guard let small = device.makeBuffer(length: 256, options: .storageModeShared) else {
+            require(false, "could not allocate the probe buffer")
+            return
+        }
+        require(
+            !surfaceRowSlotIsReady(buffer: small, capacity: 255, requiredCapacity: 256, neededBytes: 200),
+            "a slot one byte short of the requirement was accepted"
+        )
+        require(
+            surfaceRowSlotIsReady(buffer: small, capacity: 256, requiredCapacity: 256, neededBytes: 200),
+            "an exactly-sized slot was rejected"
+        )
+        require(
+            !surfaceRowSlotIsReady(buffer: nil, capacity: 4096, requiredCapacity: 256, neededBytes: 200),
+            "an absent slot with ample recorded capacity was accepted"
+        )
+
+        // The demand basis is taken over the capacities the sets already hold
+        // for that row, so a row that is already provisioned does not ask for a
+        // smaller buffer and thrash.
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet()]
+        for set in sets {
+            set.rowState.capacities = [0, 0]
+            set.rowState.buffers = [nil, nil]
+            set.rowState.counts = [0, 0]
+        }
+        guard let bare = surfaceRowCapacityDemand(bufferSets: sets, row: 0, vertexCount: 4) else {
+            require(false, "demand for a small row was reported unsizable")
+            return
+        }
+        require(bare.capacityBasis == 0, "an unprovisioned row reported a non-zero basis")
+
+        // A right-sized capacity is carried into the basis, so a row that is
+        // already provisioned is not asked to shrink and thrash.
+        sets[1].rowState.capacities[0] = bare.neededBytes + 1
+        guard let rightSized = surfaceRowCapacityDemand(bufferSets: sets, row: 0, vertexCount: 4) else {
+            require(false, "demand became unsizable once a set held capacity")
+            return
+        }
+        require(
+            rightSized.capacityBasis == bare.neededBytes + 1,
+            "demand basis ignored the right-sized capacity a set already holds"
+        )
+        require(
+            rightSized.neededBytes == bare.neededBytes,
+            "the same vertex count reported a different byte size"
+        )
+
+        // An oversized one is discarded instead, which is what lets a row that
+        // shrank get a right-sized buffer back rather than keeping the old one.
+        sets[1].rowState.capacities[0] = bare.neededBytes * 2 + 1
+        guard let oversized = surfaceRowCapacityDemand(bufferSets: sets, row: 0, vertexCount: 4) else {
+            require(false, "demand became unsizable with an oversized capacity")
+            return
+        }
+        require(
+            oversized.capacityBasis == 0,
+            "an oversized capacity was carried into the demand basis"
+        )
+
+        // A row past the per-buffer budget has no demand at all -- the callers
+        // read nil as "not prepared" / .overBudget rather than sizing a buffer
+        // that can never be allocated.
+        let overBudgetVertices = surfaceMaxVertexBufferCapacity / MemoryLayout<Vertex>.stride + 1
+        require(
+            surfaceRowCapacityDemand(bufferSets: sets, row: 0, vertexCount: overBudgetVertices) == nil,
+            "a row past the per-buffer budget still reported a demand"
+        )
+        require(
+            !surfaceRowCapacityIsPrepared(
+                bufferSets: sets,
+                row: 0,
+                vertexCount: overBudgetVertices,
+                totalRows: 2,
+                maxRowBuffers: 16
+            ),
+            "a row past the per-buffer budget was reported prepared"
+        )
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
@@ -536,6 +623,7 @@ private enum SurfaceRowProvisionTests {
         }
 
         verifyFixedFloatMaskZOrder()
+        verifyRowCapacityDemandAndSlotPredicate(device: device)
 
         // Both production owners call the same durable state transition from
         // commit and from every GPU completion path.
