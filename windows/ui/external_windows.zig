@@ -95,6 +95,31 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
     return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
 }
 
+/// Map a decorated surface's content rect to the NDC scale and offset the
+/// vertex shader applies. The cmdline and message paths differ only in where
+/// the content starts; the conversion itself was identical.
+const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
+
+fn decoratedContentNdcTransform(
+    content_left: f32,
+    content_top: f32,
+    content_w: f32,
+    content_h: f32,
+    window_w: f32,
+    window_h: f32,
+) ContentNdcTransform {
+    const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
+    const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
+    const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
+    const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+    return .{
+        .scale_x = (right_ndc - left_ndc) / 2.0,
+        .scale_y = (top_ndc - bottom_ndc) / 2.0,
+        .offset_x = (right_ndc + left_ndc) / 2.0,
+        .offset_y = (top_ndc + bottom_ndc) / 2.0,
+    };
+}
+
 /// Find the external window a message was delivered to. Caller must already
 /// hold app.mu -- this deliberately does not take it, because several window
 /// procedure arms keep the lock past the lookup to read further App state.
@@ -339,14 +364,11 @@ fn drawDecoratedExternalSurface(
 
             const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
             const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
-            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
+            const scale_x = ndc.scale_x;
+            const scale_y = ndc.scale_y;
+            const offset_x = ndc.offset_x;
+            const offset_y = ndc.offset_y;
 
             const extra_verts = 6 + 24 + 20 + app_mod.COPY_ICON_VERTS;
             scratch.clearRetainingCapacity();
@@ -461,14 +483,11 @@ fn drawDecoratedExternalSurface(
 
             const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
             const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
+            const scale_x = ndc.scale_x;
+            const scale_y = ndc.scale_y;
+            const offset_x = ndc.offset_x;
+            const offset_y = ndc.offset_y;
 
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + 6 + app_mod.COPY_ICON_VERTS);
