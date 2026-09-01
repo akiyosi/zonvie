@@ -103,19 +103,21 @@ pub fn captureMainWindow(alloc: std.mem.Allocator, pid: i32, crop: ?Crop) !Image
     if (win_w <= 0 or win_h <= 0) return error.EmptyWindow;
 
     // Top-down 32bpp DIB so the bits pointer is BGRA, row 0 first.
-    var bmi = BITMAPINFO{ .bmiHeader = .{
-        .biSize = @sizeOf(BITMAPINFOHEADER),
-        .biWidth = win_w,
-        .biHeight = -win_h, // negative => top-down
-        .biPlanes = 1,
-        .biBitCount = 32,
-        .biCompression = BI_RGB,
-        .biSizeImage = 0,
-        .biXPelsPerMeter = 0,
-        .biYPelsPerMeter = 0,
-        .biClrUsed = 0,
-        .biClrImportant = 0,
-    } };
+    var bmi = BITMAPINFO{
+        .bmiHeader = .{
+            .biSize = @sizeOf(BITMAPINFOHEADER),
+            .biWidth = win_w,
+            .biHeight = -win_h, // negative => top-down
+            .biPlanes = 1,
+            .biBitCount = 32,
+            .biCompression = BI_RGB,
+            .biSizeImage = 0,
+            .biXPelsPerMeter = 0,
+            .biYPelsPerMeter = 0,
+            .biClrUsed = 0,
+            .biClrImportant = 0,
+        },
+    };
 
     const screen_dc = GetDC(null) orelse return error.GetDCFailed;
     defer _ = ReleaseDC(null, screen_dc);

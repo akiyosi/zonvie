@@ -318,20 +318,23 @@ pub const Config = struct {
             if (parser.error_info) |info| {
                 switch (info) {
                     .parse => |pos| {
-                        self.parse_error = std.fmt.allocPrint(alloc,
+                        self.parse_error = std.fmt.allocPrint(
+                            alloc,
                             "config.toml: TOML syntax error at line {d}, column {d}",
                             .{ pos.line, pos.pos },
                         ) catch null;
                     },
                     .struct_mapping => {
-                        self.parse_error = std.fmt.allocPrint(alloc,
+                        self.parse_error = std.fmt.allocPrint(
+                            alloc,
                             "config.toml: unknown field in config",
                             .{},
                         ) catch null;
                     },
                 }
             } else {
-                self.parse_error = std.fmt.allocPrint(alloc,
+                self.parse_error = std.fmt.allocPrint(
+                    alloc,
                     "config.toml: parse error ({s})",
                     .{@errorName(err)},
                 ) catch null;
@@ -577,16 +580,24 @@ pub const Config = struct {
         if (cfg.input) |i| {
             if (i.swap_colon_semicolon) |v| self.input.swap_colon_semicolon = v;
             if (i.option_as_meta) |v| {
-                if (std.mem.eql(u8, v, "both")) { self.input.option_as_meta = .both; }
-                else if (std.mem.eql(u8, v, "none")) { self.input.option_as_meta = .none; }
-                else if (std.mem.eql(u8, v, "only_left")) { self.input.option_as_meta = .only_left; }
-                else if (std.mem.eql(u8, v, "only_right")) { self.input.option_as_meta = .only_right; }
+                if (std.mem.eql(u8, v, "both")) {
+                    self.input.option_as_meta = .both;
+                } else if (std.mem.eql(u8, v, "none")) {
+                    self.input.option_as_meta = .none;
+                } else if (std.mem.eql(u8, v, "only_left")) {
+                    self.input.option_as_meta = .only_left;
+                } else if (std.mem.eql(u8, v, "only_right")) {
+                    self.input.option_as_meta = .only_right;
+                }
             }
             if (i.ime_disable_on_activate) |v| self.input.ime_disable_on_activate = v;
             if (i.ime_disable_on_modechange) |v| self.input.ime_disable_on_modechange = v;
             if (i.ime_preedit_mode) |v| {
-                if (std.mem.eql(u8, v, "inline")) { self.input.ime_preedit_mode = .extmark; }
-                else if (std.mem.eql(u8, v, "overlay")) { self.input.ime_preedit_mode = .overlay; }
+                if (std.mem.eql(u8, v, "inline")) {
+                    self.input.ime_preedit_mode = .extmark;
+                } else if (std.mem.eql(u8, v, "overlay")) {
+                    self.input.ime_preedit_mode = .overlay;
+                }
             }
         }
 

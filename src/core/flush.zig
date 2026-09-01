@@ -4747,8 +4747,7 @@ pub const FlushCtx = struct {
 
                             // Record final fast path decision for perf logging
                             used_scroll_fast_path = use_scroll_fast_path and cache_ready;
-                            if (use_scroll_fast_path and !cache_ready) {
-                            }
+                            if (use_scroll_fast_path and !cache_ready) {}
 
                             // Frontends that support main-row scroll shifting can update their
                             // row storage in one callback and avoid per-row cached emission.
