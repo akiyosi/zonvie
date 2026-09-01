@@ -1814,10 +1814,9 @@ pub export fn WndProc(
                         app.mu.unlock(core.clock.io());
 
                         if (tab_count > 0) {
-                            // Calculate tab positions using same logic as drawTablineContent
-                            const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - app.scalePx(40) - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-                            const ideal_width = @divTrunc(available_width, @as(i32, @intCast(tab_count)));
-                            const tab_width = @min(app.scalePx(TablineState.TAB_MAX_WIDTH), @max(app.scalePx(TablineState.TAB_MIN_WIDTH), ideal_width));
+                            // Same geometry the tabline draws and hit-tests with.
+                            const tab_count_i: i32 = @intCast(tab_count);
+                            const tab_width = tabline_mod.tabWidthPx(app, client_width, tab_count_i);
 
                             var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
                             for (0..tab_count) |_| {
@@ -1828,9 +1827,9 @@ pub export fn WndProc(
                                 tab_x += tab_width + 1;
                             }
 
-                            // Check + button area
-                            const plus_x = tab_x + app.scalePx(8);
-                            if (client_x >= plus_x and client_x < plus_x + app.scalePx(24)) {
+                            const plus_x = tabline_mod.plusButtonXPx(app, tab_count_i, tab_width);
+                            const plus_size = tabline_mod.plusButtonSizePx(app);
+                            if (client_x >= plus_x and client_x < plus_x + plus_size) {
                                 return c.HTCLIENT;
                             }
                         }
