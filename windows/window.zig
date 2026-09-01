@@ -2451,7 +2451,9 @@ pub export fn WndProc(
                             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
                         } else if (app.tabline_style == .sidebar) {
-                            // Always call renderSidebarToD3D: it releases texture when tab_count == 0
+                            // Called unconditionally: unlike the tabline, the sidebar
+                            // has no tab_count gate, and it draws an empty strip rather
+                            // than releasing anything when there are no tabs.
                             const sw: u32 = @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))));
                             const sh: u32 = @intCast(@max(1, client_for_content.bottom));
                             tabline_mod.renderSidebarToD3D(app, sw, sh);
