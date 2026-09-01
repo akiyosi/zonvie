@@ -6,6 +6,7 @@ const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
+const external_windows = @import("ui/external_windows.zig");
 
 // ---- Logging globals for atlas ensure callbacks ----
 var log_atlas_ensure_calls: u64 = 0;
@@ -2702,62 +2703,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     // Calculate pending resize for all external windows (same as onLineSpace)
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        const grid_id = entry.key_ptr.*;
-        const ext_win = entry.value_ptr.*;
-
-        if (ext_win.is_pending_close) continue;
-
-        const rows = ext_win.surface.rows;
-        const cols = ext_win.surface.cols;
-
-        var content_w: c_int = @intCast(cols * cell_w);
-        var content_h: c_int = @intCast(rows * cell_h);
-
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
-        const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
-
-        if (is_cmdline) {
-            const cmdline_icon_total_width: u32 = app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
-            const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
-            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
-            content_h += @as(c_int, @intCast(cmdline_total_padding));
-        } else if (is_msg_show or is_msg_history) {
-            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
-            content_w += scaled_msg_pad;
-            content_h += scaled_msg_pad;
-        }
-
-        // Use this window's ACTUAL current style/exstyle (WS_POPUP for
-        // cmdline/popupmenu/msg_show/msg_history, WS_OVERLAPPEDWINDOW for
-        // regular float/split external windows) instead of assuming
-        // WS_POPUP unconditionally — WS_OVERLAPPEDWINDOW has caption+border
-        // non-client area that WS_POPUP does not, and using the wrong style
-        // here silently shrinks the computed client rect on every font/
-        // linespace change for normal (non-decorated-surface) windows.
-        // GetWindowLongW (not the Ptr variant) + @bitCast matches the
-        // existing GWL_STYLE read idiom at window.zig:201-202 — GWL_STYLE
-        // is a 32-bit value, and for WS_POPUP windows (bit 31 set) the
-        // LONG_PTR-returning GetWindowLongPtrW would sign-extend to a
-        // negative isize, making @intCast to u32/DWORD panic.
-        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
-        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-
-        ext_win.pending_window_w = rect.right - rect.left;
-        ext_win.pending_window_h = rect.bottom - rect.top;
-        ext_win.needs_window_resize = true;
-        ext_win.needs_renderer_resize = true;
-
-        if (applog.isEnabled()) applog.appLog("onGuiFont: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
-
-        if (hwnd) |mh| {
-            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
-        }
-    }
+    queueExternalWindowResizes(app, hwnd, cell_w, cell_h, "onGuiFont");
 
     // Invalidation flags must be co-set with the cell metrics update above (still
     // under app.mu): font change shifted cell_w_px/cell_h_px, so any WM_PAINT that
@@ -2837,54 +2783,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     // Calculate pending resize for all external windows
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        const grid_id = entry.key_ptr.*;
-        const ext_win = entry.value_ptr.*;
-
-        if (ext_win.is_pending_close) continue;
-
-        const rows = ext_win.surface.rows;
-        const cols = ext_win.surface.cols;
-
-        var content_w: c_int = @intCast(cols * cell_w);
-        var content_h: c_int = @intCast(rows * cell_h);
-
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
-        const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
-
-        if (is_cmdline) {
-            const cmdline_icon_total_width: u32 = app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
-            const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
-            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
-            content_h += @as(c_int, @intCast(cmdline_total_padding));
-        } else if (is_msg_show or is_msg_history) {
-            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
-            content_w += scaled_msg_pad;
-            content_h += scaled_msg_pad;
-        }
-
-        // See onGuiFont for why this must use the window's actual style
-        // (via GetWindowLongW + @bitCast, not GetWindowLongPtrW + @intCast)
-        // instead of hardcoding WS_POPUP.
-        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
-        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-
-        ext_win.pending_window_w = rect.right - rect.left;
-        ext_win.pending_window_h = rect.bottom - rect.top;
-        ext_win.needs_window_resize = true;
-        ext_win.needs_renderer_resize = true;
-
-        if (applog.isEnabled()) applog.appLog("[win] onLineSpace: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
-
-        // PostMessageW does not block, so it's safe to call while holding the lock.
-        if (hwnd) |mh| {
-            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
-        }
-    }
+    queueExternalWindowResizes(app, hwnd, cell_w, cell_h, "onLineSpace");
 
     // Co-set invalidation flags with the linespace update above (still under
     // app.mu) for the same race-avoidance reason as onGuiFont: a WM_PAINT that
@@ -3255,5 +3154,66 @@ pub fn onSSHAuthPrompt(
         // UI thread will never consume this prompt, free it now.
         app.alloc.free(owned);
         app.ssh_prompt_owned = null;
+    }
+}
+
+/// Recompute every open external window's outer size for the current cell
+/// metrics and queue the resize. onGuiFont and onLineSpace each ran this loop
+/// verbatim; the only difference was the tag in the log line.
+///
+/// Sizing goes through externalSurfaceInsetsPx and
+/// clampCmdlineWidthToWorkArea rather than re-deriving the padding here. The
+/// hand-rolled copies this replaces omitted the copy-button reservation and
+/// the cmdline's work-area clamp, so a guifont or linespace change while a
+/// cmdline or message window was open queued it one copy-button width too
+/// wide of its content -- and, on a narrow monitor, wider than the work area.
+///
+/// AdjustWindowRectEx stays here rather than moving into the shared helper:
+/// this path must read the window's actual style, while the creation path
+/// knows the style it is about to apply.
+fn queueExternalWindowResizes(
+    app: *App,
+    hwnd: ?c.HWND,
+    cell_w: u32,
+    cell_h: u32,
+    log_tag: []const u8,
+) void {
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr.*;
+
+        if (ext_win.is_pending_close) continue;
+
+        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id);
+        var content_w: c_int = @as(c_int, @intCast(ext_win.surface.cols * cell_w)) + insets.w;
+        const content_h: c_int = @as(c_int, @intCast(ext_win.surface.rows * cell_h)) + insets.h;
+        content_w = external_windows.clampCmdlineWidthToWorkArea(app, grid_id, content_w);
+
+        // This window's ACTUAL current style/exstyle: WS_OVERLAPPEDWINDOW has
+        // caption and border non-client area that WS_POPUP does not, and
+        // assuming the wrong one silently shrinks the computed client rect on
+        // every font or linespace change for normal external windows.
+        // GetWindowLongW (not the Ptr variant) + @bitCast matches the existing
+        // GWL_STYLE read idiom at window.zig:201-202 -- GWL_STYLE is a 32-bit
+        // value, and for WS_POPUP windows (bit 31 set) the LONG_PTR-returning
+        // GetWindowLongPtrW would sign-extend to a negative isize, making
+        // @intCast to u32/DWORD panic.
+        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
+        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
+        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
+
+        ext_win.pending_window_w = rect.right - rect.left;
+        ext_win.pending_window_h = rect.bottom - rect.top;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+
+        if (applog.isEnabled()) applog.appLog("{s}: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ log_tag, grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
+
+        // PostMessageW does not block, so it is safe to call under the lock.
+        if (hwnd) |mh| {
+            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
+        }
     }
 }

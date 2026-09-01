@@ -57,6 +57,44 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
     ext_win.msg_hover = hovered;
 }
 
+/// Client-pixel padding a decorated external surface adds around its grid:
+/// the cmdline's icon strip and padding, a message surface's padding, and the
+/// copy-content button's trailing reservation.
+///
+/// Every site that sizes an external window must go through this. The two
+/// resize paths in callbacks.zig used to re-derive the first two terms and
+/// omit the third, so a guifont or linespace change while a cmdline or
+/// message window was open sent it back one copy-button width too narrow.
+pub const ExternalSurfaceInsets = struct { w: c_int, h: c_int };
+
+pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
+    const kind = classifyExternalSurface(grid_id);
+    const is_cmdline = kind == .cmdline;
+    const is_msg = kind == .msg_show or kind == .msg_history;
+
+    const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT +
+        app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
+    const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
+    const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
+
+    return .{
+        .w = cmdline_icon_w + cmdline_padding + msg_padding + copyButtonReservedPx(app, kind),
+        .h = cmdline_padding + msg_padding,
+    };
+}
+
+/// The cmdline may not grow past the work area of the monitor the main window
+/// is on. Other surfaces are returned unchanged.
+pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_int {
+    if (classifyExternalSurface(grid_id) != .cmdline) return client_w;
+    const main_hwnd = app.hwnd orelse return client_w;
+    const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return client_w;
+    var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    mi.cbSize = @sizeOf(c.MONITORINFO);
+    if (c.GetMonitorInfoW(monitor, &mi) == 0) return client_w;
+    return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -1218,26 +1256,10 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
 
-    const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
-    const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
-    const msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
-    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
-    var client_w: c_int = @intCast(req.cols * cell_w);
-    client_w += cmdline_icon_w + cmdline_padding + msg_padding + copy_button_w;
-    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + cmdline_padding + msg_padding;
-
-    if (is_cmdline) {
-        if (app.hwnd) |main_hwnd| {
-            const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
-            if (monitor) |mon| {
-                var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-                mi.cbSize = @sizeOf(c.MONITORINFO);
-                if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                    client_w = @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
-                }
-            }
-        }
-    }
+    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
+    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
+    client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
 
     const style: c.DWORD = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW;
     const ex_style: c.DWORD = (if (is_special_window) @as(c.DWORD, @intCast(c.WS_EX_TOPMOST)) else 0) |
@@ -1325,36 +1347,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const is_msg_show = (req.grid_id == app_mod.MESSAGE_GRID_ID);
     const is_msg_history = (req.grid_id == app_mod.MSG_HISTORY_GRID_ID);
 
-    // For cmdline: add margin and icon area
-    // Total width = icon_margin_left + icon_size + icon_margin_right + content + padding*2
-    const cmdline_icon_total_width: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
-    const cmdline_total_padding: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_PADDING * 2) else 0;
-
-    // For msg_show/msg_history: add margin around content (DPI-scaled)
-    const scaled_msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
-
-    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
-    var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding + copy_button_w;
-    const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
-
-    // Clamp cmdline width to monitor work area minus margin (matching macOS cmdlineScreenMargin)
-    if (is_cmdline) {
-        if (app.hwnd) |main_hwnd| {
-            const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
-            if (monitor) |mon| {
-                var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-                mi.cbSize = @sizeOf(c.MONITORINFO);
-                if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                    const work_w: c_int = mi.rcWork.right - mi.rcWork.left;
-                    const screen_margin: c_int = @intCast(app_mod.CMDLINE_SCREEN_MARGIN);
-                    const max_w: c_int = work_w - screen_margin;
-                    if (client_w > max_w) {
-                        client_w = max_w;
-                    }
-                }
-            }
-        }
-    }
+    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    var client_w: c_int = content_w + insets.w;
+    const client_h: c_int = content_h + insets.h;
+    client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
 
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
