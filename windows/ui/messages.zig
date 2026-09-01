@@ -8,16 +8,6 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 
-/// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
-/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
-/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
-/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
-/// Append one chunk's text to `buf` at `len`, clamped to what is left, and
-/// return the new length. Three message paths concatenated chunks this way.
-///
-/// The caller decides what to do once the buffer is full: two of them break
-/// out of their loop, the history path keeps iterating and simply copies
-/// nothing more, since copy_len clamps to zero.
 /// Hand a prepared request to the UI thread and wake it. Caller must already
 /// hold app.mu.
 ///
@@ -50,6 +40,12 @@ fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) 
     }
 }
 
+/// Append one chunk's text to `buf` at `len`, clamped to what is left, and
+/// return the new length. Three message paths concatenated chunks this way.
+///
+/// The caller decides what to do once the buffer is full: two of them break
+/// out of their loop, the history path keeps iterating and simply copies
+/// nothing more, since copy_len clamps to zero.
 fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
     if (chunk.text_len == 0) return len;
     const text = chunk.text[0..chunk.text_len];
@@ -58,6 +54,10 @@ fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
     return len + copy_len;
 }
 
+/// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
+/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
+/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
+/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
 fn utf8ToUtf16Lossy(dst: []u16, src: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;

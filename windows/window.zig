@@ -1568,12 +1568,6 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
 // Creates core, loads config, inits DWrite metrics, spawns nvim, and
 // kicks off D3D11 device creation on a separate thread.
 // =========================================================================
-/// Read the user's config file into the core, then push every option the
-/// frontend owns. Both core-creation paths -- the early init and the
-/// WSL/SSH/devcontainer deferred init -- ran this identically.
-///
-/// Returns void rather than an error: the only fallible call here already
-/// swallows its error, since a missing config file is the normal case.
 /// Build the `devcontainer exec ... nvim --embed` command line into `buf` and
 /// return the slice actually written. Both the early and deferred nvim launch
 /// paths built this identically.
@@ -1596,6 +1590,12 @@ fn buildDevcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]co
     return buf[0..w.end];
 }
 
+/// Read the user's config file into the core, then push every option the
+/// frontend owns. Both core-creation paths -- the early init and the
+/// WSL/SSH/devcontainer deferred init -- ran this identically.
+///
+/// Returns void rather than an error: the only fallible call here already
+/// swallows its error, since a missing config file is the normal case.
 fn loadConfigAndApplyCoreOptions(app: *App) void {
     if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
         defer app.alloc.free(config_path);

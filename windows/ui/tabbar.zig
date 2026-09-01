@@ -1013,9 +1013,6 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     return h.final();
 }
 
-/// Render tabline to D3D11 texture via offscreen GDI bitmap.
-/// This avoids DWM composition issues by keeping GDI rendering offscreen
-/// and only using D3D11 for final display.
 /// Which offscreen strip renderOffscreenToD3D is drawing.
 const OffscreenSurface = enum { tabline, sidebar };
 
@@ -1089,6 +1086,9 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
     return true;
 }
 
+/// Render tabline to D3D11 texture via offscreen GDI bitmap.
+/// This avoids DWM composition issues by keeping GDI rendering offscreen
+/// and only using D3D11 for final display.
 pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer == null) return;
     if (app.tabline_state.tab_count == 0) return;
@@ -1110,6 +1110,7 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     }
 }
 
+/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
 pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
     _ = renderOffscreenToD3D(app, .sidebar, width, height);
 }
@@ -1656,8 +1657,6 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
 // =========================================================================
 // Sidebar mode rendering and mouse handling
 // =========================================================================
-
-/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
 
 /// Compute sidebar colors from the Neovim colorscheme.
 /// Returns (R, G, B) as 0-255 u8 values. Mirrors macOS TabSidebarView color logic (no blur).
