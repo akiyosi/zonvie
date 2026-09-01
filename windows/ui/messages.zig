@@ -18,6 +18,23 @@ const external_windows = @import("external_windows.zig");
 /// The caller decides what to do once the buffer is full: two of them break
 /// out of their loop, the history path keeps iterating and simply copies
 /// nothing more, since copy_len clamps to zero.
+/// Hand a prepared request to the UI thread and wake it. Caller must already
+/// hold app.mu.
+///
+/// A failed enqueue aborts the core's flush: the core must not go on treating
+/// the flush as delivered when the message never reached the UI thread. All
+/// three message paths carried their own copy of that contract.
+fn enqueuePendingMessage(app: *App, req: app_mod.PendingMessageRequest, what: []const u8) void {
+    app.pending_messages.append(app.alloc, req) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[win] failed to queue {s}: {any}\n", .{ what, e });
+        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
+        return;
+    };
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
+    }
+}
+
 /// Publish `text` to a mini message window and ask the main window to repaint
 /// it. The .mini route and the fallback route for the views with no dedicated
 /// display did this identically.
@@ -126,16 +143,7 @@ pub fn onMsgShow(
     req.view_type = view;
     req.timeout = timeout_sec;
 
-    app.pending_messages.append(app.alloc, req) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
-        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-        return;
-    };
-
-    // Post message to UI thread
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-    }
+    enqueuePendingMessage(app, req, "message");
 }
 
 pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
@@ -213,15 +221,7 @@ pub fn handleMsgMiniOrExtFloat(
             req.view_type = .ext_float;
             req.timeout = route_result.timeout;
 
-            app.pending_messages.append(app.alloc, req) catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
-                if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-                return;
-            };
-
-            if (app.hwnd) |main_hwnd| {
-                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-            }
+            enqueuePendingMessage(app, req, "message");
         },
         .notification => {
             // Show OS notification via balloon
@@ -292,16 +292,7 @@ pub fn onMsgHistoryShow(
     req.replace_last = 0;
     req.append = 0;
 
-    app.pending_messages.append(app.alloc, req) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] failed to queue history message: {any}\n", .{e});
-        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-        return;
-    };
-
-    // Post message to UI thread
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-    }
+    enqueuePendingMessage(app, req, "history message");
 }
 
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
