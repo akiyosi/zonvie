@@ -139,6 +139,42 @@ fn appendDecoratedBorderVerts(
     return idx;
 }
 
+/// The background colour a decorated surface should paint, taken from the
+/// first background quad the core sent. Both decorated draw paths -- the
+/// cmdline and the message surfaces -- resolved it this way.
+///
+/// A frame with no background quad at all reuses the last one seen for this
+/// grid; without that a transient all-glyph frame would flash the wrong
+/// colour. A frame that has one refreshes the cache.
+///
+/// `orig` is what the core sent, which the caller needs to recognise which
+/// vertices to make transparent; `adjusted` is what it should paint.
+const DecoratedBgColor = struct { orig: [3]f32, adjusted: [3]f32 };
+
+fn resolveDecoratedBgColor(app: *App, grid_id: i64, verts: []const app_mod.Vertex) DecoratedBgColor {
+    var orig: [3]f32 = .{ 0.0, 0.0, 0.0 };
+    var found = false;
+    for (verts) |v| {
+        if (v.texCoord[0] < 0) {
+            orig = .{ v.color[0], v.color[1], v.color[2] };
+            found = true;
+            break;
+        }
+    }
+
+    app.mu.lockUncancelable(core.clock.io());
+    if (app.external_windows.get(grid_id)) |ew| {
+        if (found) {
+            ew.cached_bg_color = orig;
+        } else if (ew.cached_bg_color) |cached| {
+            orig = cached;
+        }
+    }
+    app.mu.unlock(core.clock.io());
+
+    return .{ .orig = orig, .adjusted = app_mod.adjustBrightnessForCmdline(orig[0], orig[1], orig[2]) };
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -314,39 +350,11 @@ fn drawDecoratedExternalSurface(
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const cmdline_verts = scratch.items;
 
-            var orig_bg_r: f32 = 0.0;
-            var orig_bg_g: f32 = 0.0;
-            var orig_bg_b: f32 = 0.0;
-            var found_bg_vertex = false;
-            for (verts[0..vert_count]) |v| {
-                if (v.texCoord[0] < 0) {
-                    orig_bg_r = v.color[0];
-                    orig_bg_g = v.color[1];
-                    orig_bg_b = v.color[2];
-                    found_bg_vertex = true;
-                    break;
-                }
-            }
-            if (!found_bg_vertex) {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    if (ew.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                    }
-                }
-                app.mu.unlock(core.clock.io());
-            } else {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                }
-                app.mu.unlock(core.clock.io());
-            }
-
-            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
+            const orig_bg_r = bg.orig[0];
+            const orig_bg_g = bg.orig[1];
+            const orig_bg_b = bg.orig[2];
+            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
             const bg_tex: [2]f32 = .{ -1.0, -1.0 };
             var bg_idx: usize = 0;
             bg_idx = app_mod.addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
@@ -463,39 +471,11 @@ fn drawDecoratedExternalSurface(
             try scratch.resize(app.alloc, vert_count + 6 + app_mod.COPY_ICON_VERTS);
             const msg_verts = scratch.items;
 
-            var orig_bg_r: f32 = 0.0;
-            var orig_bg_g: f32 = 0.0;
-            var orig_bg_b: f32 = 0.0;
-            var found_bg_vertex = false;
-            for (verts[0..vert_count]) |v| {
-                if (v.texCoord[0] < 0) {
-                    orig_bg_r = v.color[0];
-                    orig_bg_g = v.color[1];
-                    orig_bg_b = v.color[2];
-                    found_bg_vertex = true;
-                    break;
-                }
-            }
-            if (!found_bg_vertex) {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    if (ew.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                    }
-                }
-                app.mu.unlock(core.clock.io());
-            } else {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                }
-                app.mu.unlock(core.clock.io());
-            }
-
-            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
+            const orig_bg_r = bg.orig[0];
+            const orig_bg_g = bg.orig[1];
+            const orig_bg_b = bg.orig[2];
+            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
             const bg_tex: [2]f32 = .{ -1.0, -1.0 };
             var bg_idx: usize = 0;
             bg_idx = app_mod.addRectVerts(msg_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
