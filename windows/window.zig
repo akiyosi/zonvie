@@ -1568,6 +1568,38 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
 // Creates core, loads config, inits DWrite metrics, spawns nvim, and
 // kicks off D3D11 device creation on a separate thread.
 // =========================================================================
+/// Read the user's config file into the core, then push every option the
+/// frontend owns. Both core-creation paths -- the early init and the
+/// WSL/SSH/devcontainer deferred init -- ran this identically.
+///
+/// Returns void rather than an error: the only fallible call here already
+/// swallows its error, since a missing config file is the normal case.
+fn loadConfigAndApplyCoreOptions(app: *App) void {
+    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
+        defer app.alloc.free(config_path);
+        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
+        if (config_path_z) |cpath| {
+            defer app.alloc.free(cpath);
+            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
+        }
+    } else |_| {}
+
+    setLogEnabledViaCore(app, app.config.log.enabled);
+    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
+    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
+    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
+    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
+    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
+    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
+    core.zonvie_core_set_glyph_cache_size(
+        app.corep,
+        app.config.performance.glyph_cache_ascii_size,
+        app.config.performance.glyph_cache_non_ascii_size,
+    );
+    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+}
+
 fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     const log_enabled = applog.isEnabled();
     var t1: c.LARGE_INTEGER = undefined;
@@ -1583,31 +1615,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         applog.appLog("[win] doEarlyCoreInit: core_create {d}ms\n", .{ms});
     }
 
-    // 2. Load config into core
-    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
-        defer app.alloc.free(config_path);
-        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
-        if (config_path_z) |cpath| {
-            defer app.alloc.free(cpath);
-            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
-        }
-    } else |_| {}
-
-    // 3. Set log/ext flags
-    setLogEnabledViaCore(app, app.config.log.enabled);
-    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
-    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
-    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
-    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
-    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
-    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
-    core.zonvie_core_set_glyph_cache_size(
-        app.corep,
-        app.config.performance.glyph_cache_ascii_size,
-        app.config.performance.glyph_cache_non_ascii_size,
-    );
-    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+    loadConfigAndApplyCoreOptions(app);
 
     // 4. DWrite metrics init (font metrics calculation) -> store in early_atlas.
     // Pass the raw config family string; initMetrics walks the
@@ -5345,31 +5353,7 @@ pub export fn WndProc(
                         applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
                     }
 
-                    // Load config into core for message routing
-                    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
-                        defer app.alloc.free(config_path);
-                        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
-                        if (config_path_z) |cpath| {
-                            defer app.alloc.free(cpath);
-                            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
-                        }
-                    } else |_| {}
-
-                    // Configure core settings
-                    setLogEnabledViaCore(app, app.config.log.enabled);
-                    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
-                    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
-                    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
-                    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
-                    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
-                    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-                    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
-                    core.zonvie_core_set_glyph_cache_size(
-                        app.corep,
-                        app.config.performance.glyph_cache_ascii_size,
-                        app.config.performance.glyph_cache_non_ascii_size,
-                    );
-                    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+                    loadConfigAndApplyCoreOptions(app);
 
                     // DWrite metrics init: walk the guifont-style candidate
                     // list from config and pick the first loadable font.
