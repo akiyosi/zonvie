@@ -248,40 +248,42 @@ fn hitTestCopyButton(hwnd: c.HWND, app: *App, grid_id: i64, x: i32, y: i32) bool
     return x >= rect.left and x < rect.right and y >= rect.top and y < rect.bottom;
 }
 
-/// Copy a decorated surface's rendered text to the clipboard.
+/// Copy a decorated surface's rendered text to the clipboard. Returns true
+/// when text actually reached the clipboard, so the caller can show the
+/// post-copy acknowledgement only for a copy that happened.
 ///
 /// The text comes straight from the core's grid, so what lands on the
 /// clipboard is exactly what the surface displays. The core holds its grid
 /// lock for the whole of handleRedraw, so the read is a try-lock and a
 /// contended click is simply dropped rather than stalling the UI thread.
-fn copyExternalSurfaceText(hwnd: c.HWND, app: *App, grid_id: i64) void {
+fn copyExternalSurfaceText(hwnd: c.HWND, app: *App, grid_id: i64) bool {
     // Sized for a cmdline / notification; a longer :messages history falls
     // back to a heap buffer of the exact size the core reports.
     var stack_buf: [4096]u8 = undefined;
     const needed = core.zonvie_core_try_get_grid_text(app.corep, grid_id, &stack_buf, stack_buf.len);
     if (needed < 0) {
         if (applog.isEnabled()) applog.appLog("[win] copy_button: grid lock unavailable grid_id={d}\n", .{grid_id});
-        return;
+        return false;
     }
-    if (needed == 0) return;
+    if (needed == 0) return false;
 
     const len: usize = @intCast(needed);
     if (len <= stack_buf.len) {
-        _ = dialogs.setClipboardTextUtf8(hwnd, stack_buf[0..len]);
-        return;
+        return dialogs.setClipboardTextUtf8(hwnd, stack_buf[0..len]);
     }
 
     const heap_buf = app.alloc.alloc(u8, len) catch {
         if (applog.isEnabled()) applog.appLog("[win] copy_button: allocation failed len={d}\n", .{len});
-        return;
+        return false;
     };
     defer app.alloc.free(heap_buf);
     const second = core.zonvie_core_try_get_grid_text(app.corep, grid_id, heap_buf.ptr, heap_buf.len);
-    if (second <= 0) return;
-    _ = dialogs.setClipboardTextUtf8(hwnd, heap_buf[0..@min(len, @as(usize, @intCast(second)))]);
+    if (second <= 0) return false;
+    return dialogs.setClipboardTextUtf8(hwnd, heap_buf[0..@min(len, @as(usize, @intCast(second)))]);
 }
 
-/// Append the copy-content icon at the surface's trailing edge. Returns the
+/// Append the copy-content icon (or, just after a copy, the acknowledgement
+/// checkmark) at the surface's trailing edge. Returns the
 /// new vertex index, unchanged when the surface has no button. Reserve
 /// app_mod.COPY_ICON_VERTS in the scratch buffer before calling.
 fn appendCopyIconVerts(
@@ -294,6 +296,7 @@ fn appendCopyIconVerts(
     window_h: f32,
     color: [4]f32,
     hovered: bool,
+    copied: bool,
 ) usize {
     const rect = copyButtonRectPx(
         app,
@@ -317,7 +320,7 @@ fn appendCopyIconVerts(
         const wash: [4]f32 = .{ color[0], color[1], color[2], 0.22 };
         next = app_mod.addRoundFillVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, wash, grid_id);
     }
-    return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id);
+    return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id, copied);
 }
 
 fn drawDecoratedExternalSurface(
@@ -342,6 +345,7 @@ fn drawDecoratedExternalSurface(
             const content_rows = if (ext_win_relookup) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
+            const copy_copied = if (ext_win_relookup) |ew| ew.copy_button_copied else false;
             const cell_w = app.cell_w_px;
             const cell_h = app.rowHeightPx();
             const hide_cursor_for_ime = app.ime_composing;
@@ -419,7 +423,7 @@ fn drawDecoratedExternalSurface(
                 extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
             }
 
-            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color, copy_hover);
+            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color, copy_hover, copy_copied);
 
             try g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
@@ -463,6 +467,7 @@ fn drawDecoratedExternalSurface(
             const content_rows = if (ext_win_relookup2) |ew| ew.surface.rows else 0;
             const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
             const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
+            const copy_copied = if (ext_win_relookup2) |ew| ew.copy_button_copied else false;
             const cell_w = app.cell_w_px;
             const cell_h = app.rowHeightPx();
             const icon_color: [4]f32 = .{
@@ -526,6 +531,7 @@ fn drawDecoratedExternalSurface(
                 window_h,
                 icon_color,
                 copy_hover,
+                copy_copied,
             );
             try g.draw(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
@@ -2565,7 +2571,20 @@ pub export fn ExternalWndProc(
 
                 if (grid_id != null and ext_window != null) {
                     if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
-                        copyExternalSurfaceText(hwnd, app, grid_id.?);
+                        if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
+                            // Brief acknowledgement so the click has visible
+                            // feedback even though the surface itself does not
+                            // change. A repeat click re-arms the same timer id,
+                            // which simply extends the checkmark.
+                            ext_window.?.copy_button_copied = true;
+                            _ = c.SetTimer(
+                                hwnd,
+                                app_mod.TIMER_COPY_BUTTON_REVERT,
+                                app_mod.COPY_BUTTON_REVERT_MS,
+                                null,
+                            );
+                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                        }
                         return 0;
                     }
                     scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
@@ -2743,6 +2762,13 @@ pub export fn ExternalWndProc(
                                 ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_INTERVAL, null);
                             }
                             scrollbar.scrollbarPageScrollForExternal(app, grid_id.?, ext_win.scrollbar_repeat_dir);
+                        }
+                        return 0;
+                    } else if (timer_id == app_mod.TIMER_COPY_BUTTON_REVERT) {
+                        _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_REVERT);
+                        if (ext_win.copy_button_copied) {
+                            ext_win.copy_button_copied = false;
+                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
                         return 0;
                     } else if (timer_id == app_mod.TIMER_SCROLLBAR_AUTOHIDE) {
