@@ -201,8 +201,6 @@ pub const Highlights = struct {
         }
     }
 
-    // NOTE: get() remains unchanged (returns fg/bg only) because the current
-    // binary frame format only transports fg/bg. This keeps unrelated parts intact.
     /// Resolve a raw attribute's foreground and background.
     ///
     /// Shared by get() and getWithStyles(), which carried byte-identical
@@ -232,6 +230,8 @@ pub const Highlights = struct {
         return .{ .fg = fg, .bg = bg };
     }
 
+    // NOTE: get() remains unchanged (returns fg/bg only) because the current
+    // binary frame format only transports fg/bg. This keeps unrelated parts intact.
     pub fn get(self: *const Highlights, id: u32) ResolvedAttr {
         return self.resolveFgBg(self.map.get(id) orelse Attr{});
     }

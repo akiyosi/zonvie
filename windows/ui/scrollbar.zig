@@ -191,7 +191,6 @@ pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i3
     return scrollbarGeometryFor(app, grid_id, client_width, client_height, dpi_scale, 0);
 }
 
-/// Generate scrollbar vertices for external window
 /// Emit the track and knob quads for a scrollbar whose geometry is already
 /// resolved. The main window and the external windows produced these twelve
 /// vertices identically apart from knob_inset_px.
@@ -258,6 +257,7 @@ fn scrollbarVerticesFrom(
     return 12;
 }
 
+/// Generate scrollbar vertices for external window
 pub fn generateScrollbarVerticesForExternal(
     app: *App,
     scrollbar_alpha: f32,
@@ -285,7 +285,6 @@ pub fn generateScrollbarVerticesForExternal(
     );
 }
 
-/// Hit test scrollbar area for external window
 /// Which part of an already-resolved scrollbar a point falls on. Both hit
 /// tests were this, verbatim, around their own geometry call.
 pub const ScrollbarHit = enum { none, knob, track_above, track_below };
@@ -304,6 +303,7 @@ fn scrollbarHitFrom(geom: app_mod.ScrollbarGeometry, mouse_x: i32, mouse_y: i32)
     return .track_below;
 }
 
+/// Hit test scrollbar area for external window
 pub fn scrollbarHitTestForExternal(
     app: *App,
     grid_id: i64,
