@@ -15483,9 +15483,10 @@ test "the external-grid cursor background uses the same corner order" {
 }
 
 test "the external-grid cursor glyph uses the same corner order as every other quad" {
-    // The cursor background at this site was routed through pushSolidQuad in
-    // 86b453a, but the glyph quad directly below it stayed hand-expanded and
-    // kept the old winding: TL, TR, BL, TR, BR, BL against everything else's
+    // The cursor background at this site was routed through pushSolidQuad
+    // in "refactor(core): route both cursor backgrounds through pushSolidQuad",
+    // but the glyph quad directly below it stayed hand-expanded and kept
+    // the old winding: TL, TR, BL, TR, BR, BL against everything else's
     // TL, BL, TR, TR, BL, BR. Both backends disable culling -- Windows sets
     // D3D11_CULL_NONE explicitly (d3d11_renderer.zig) and Metal defaults to
     // none -- so nothing rendered differently, which is why it survived. The

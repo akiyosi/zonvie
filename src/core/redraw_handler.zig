@@ -745,8 +745,9 @@ fn runRedrawEvents(grid: *Grid, hl: *Highlights, arena: std.mem.Allocator, event
 }
 
 /// Like runRedrawEvents, but counts the flush callbacks. The parity suite
-/// deleted in 14ca02f asserted on these counts; the tests below need them to
-/// pin that a poisoned batch never reaches flush.
+/// deleted in "chore(core): drop the unwired streaming redraw decoder"
+/// asserted on these counts; the tests below need them to pin that a
+/// poisoned batch never reaches flush.
 const FlushCounts = struct {
     pre_flush: u32 = 0,
     flush: u32 = 0,
@@ -791,8 +792,9 @@ fn runRedrawEventsCounting(
 }
 
 // The three tests below restore assertions the parity suite carried before
-// 14ca02f removed it. They drove the same Value-tree path production uses, so
-// dropping the second decoder did not make them redundant.
+// "chore(core): drop the unwired streaming redraw decoder" removed it. They
+// drove the same Value-tree path production uses, so dropping the second
+// decoder did not make them redundant.
 
 test "hostile redraw numerics normalize instead of trapping" {
     // Values past u32 arrive from a hostile or buggy peer. Each must clamp or

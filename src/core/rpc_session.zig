@@ -3307,10 +3307,12 @@ const ClipboardSetProbe = struct {
 };
 
 test "a skipped wrapper run costs no argv slot" {
-    // ab0974c moved the ssh-askpass skip after tokenization, so the wrapper
-    // tokens took output slots before being dropped. A command that filled the
-    // buffer then lost its tail: "ssh-askpass" + 16 tokens produced 15 args
-    // instead of 16, and a leading run of 16 wrappers produced none at all.
+    // "refactor(core): share the spawn command tokenizer between both
+    // branches" moved the ssh-askpass skip after tokenization, so the
+    // wrapper tokens took output slots before being dropped. A command
+    // that filled the buffer then lost its tail: "ssh-askpass" + 16
+    // tokens produced 15 args instead of 16, and a leading run of 16
+    // wrappers produced none at all.
     var buf: [16][]const u8 = undefined;
 
     // Exactly the threshold: one wrapper plus a full buffer's worth of tokens.
