@@ -289,6 +289,11 @@ pub const TIMER_MSG_THROTTLE: c.UINT_PTR = 19;
 /// Replays a main-window WM_SIZE suppressed during device recovery so the
 /// recovered HWND size is also propagated to Neovim rows/cols.
 pub const TIMER_MAIN_SIZE_REPLAY: c.UINT_PTR = 20;
+/// One-shot revert of the copy button's post-copy checkmark back to the copy
+/// icon. Re-armed on a repeat click, so the acknowledgement simply extends.
+pub const TIMER_COPY_BUTTON_REVERT: c.UINT_PTR = 21;
+/// How long the copy button shows its checkmark (matches macOS's 0.8s).
+pub const COPY_BUTTON_REVERT_MS: c.UINT = 800;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 pub const MSG_SCROLL_RETRY_INTERVAL_MS: c.UINT = 16;
@@ -1919,6 +1924,9 @@ pub const ExternalWindow = struct {
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // A copy just succeeded, so the button shows a checkmark instead of the
+    // copy icon until TIMER_COPY_BUTTON_REVERT fires.
+    copy_button_copied: bool = false,
     // Pointer is over a message surface, reported to the core so it holds the
     // view's auto-hide countdown. Tracked here so an ordinary mouse move does
     // not take the core's grid lock on every WM_MOUSEMOVE.
@@ -4459,7 +4467,9 @@ pub fn addRoundFillVerts(
     return idx;
 }
 
-/// Add a "copy" icon (two overlapping rounded squares) using SDF.
+/// Add the copy button's icon using SDF: two overlapping rounded squares, or
+/// the acknowledgement checkmark for a moment after a successful copy. Both
+/// share one inset box so they swap in place.
 /// Icon area: top-left (x, y), bottom-right (x + w, y - h). The icon is inset
 /// so the hover wash drawn across the same area has a margin around it.
 /// Returns 6 vertices (1 quad, rendered via shader SDF).
@@ -4472,6 +4482,7 @@ pub fn addCopyIconVerts(
     h: f32,
     color: [4]f32,
     grid_id: i64,
+    copied: bool,
 ) usize {
     // Same margin percentage for both axes -> visually square on screen
     const margin = 0.16;
@@ -4482,8 +4493,9 @@ pub fn addCopyIconVerts(
 
     var idx = start_idx;
 
-    // uv.x = -6.0 (ICON_COPY), uv.y = local_x, deco_phase = local_y
-    const copy_tex_x: f32 = -6.0;
+    // uv.x = -6.0 (ICON_COPY) or -8.0 (ICON_CHECK), uv.y = local_x,
+    // deco_phase = local_y
+    const tex_marker: f32 = if (copied) -8.0 else -6.0;
     const positions = [_][2]f32{
         .{ safe_x, safe_y }, // top-left
         .{ safe_x + safe_w, safe_y }, // top-right
@@ -4504,7 +4516,7 @@ pub fn addCopyIconVerts(
     for (positions, local_uvs) |pos, luv| {
         verts[idx] = .{
             .position = pos,
-            .texCoord = .{ copy_tex_x, luv[0] }, // uv.y = local_x
+            .texCoord = .{ tex_marker, luv[0] }, // uv.y = local_x
             .color = color,
             .grid_id = grid_id,
             .deco_flags = 0,
