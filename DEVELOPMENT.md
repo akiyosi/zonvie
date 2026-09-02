@@ -335,7 +335,7 @@ zero-copy streaming decoder (`mpack_stream.zig` + `handleRedrawStream` +
 before attempting it again.
 
 **Half of the benchmark that justified removing it was invalid.**
-`test/mpack_bench.zig` (recoverable via `git show 7c1c168:test/mpack_bench.zig`)
+`test/mpack_bench.zig` (recoverable from the parent of the commit that deleted it: `git log --diff-filter=D --format=%h -- test/mpack_bench.zig`)
 held two independent benches, and they are not equally trustworthy.
 
 * *"redraw grid_line decode paths"* compared `mp.decode` against
