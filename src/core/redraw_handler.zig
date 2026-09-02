@@ -862,8 +862,12 @@ test "hostile redraw numerics normalize instead of trapping" {
 }
 
 test "hostile win_float_pos coordinates create no placement" {
-    // NaN and infinity in the anchor coordinates must leave the grid with no
-    // float placement rather than producing one at a garbage position.
+    // NaN and infinity in the anchor coordinates, and an out-of-range screen
+    // coordinate in the 11-field form, must leave the grid with no float
+    // placement rather than producing one at a garbage position. Grid 2 is
+    // resized first so its sub-grid exists: setWinFloatPos never creates a
+    // sub-grid, it records the placement in win_pos / win_layer, so those
+    // are the maps that prove rejection.
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     const arena = arena_inst.allocator();
@@ -873,7 +877,10 @@ test "hostile win_float_pos coordinates create no placement" {
     var hl = Highlights.init(std.testing.allocator);
     defer hl.deinit();
     try grid.resize(4, 4);
+    try grid.resizeGrid(2, 2, 2);
+    try std.testing.expect(grid.sub_grids.contains(2));
 
+    // 8-field manual-anchor form with a hostile float anchor_row / anchor_col.
     const bad = [_]f64{
         std.math.nan(f64),
         std.math.inf(f64),
@@ -882,15 +889,52 @@ test "hostile win_float_pos coordinates create no placement" {
     for (bad) |v| {
         const t = try arena.alloc(mp.Value, 8);
         t[0] = .{ .int = 2 }; // grid
-        t[1] = .{ .int = 1 }; // win
+        t[1] = .{ .int = 42 }; // win
         t[2] = .{ .str = "NW" }; // anchor
         t[3] = .{ .int = 1 }; // anchor_grid
         t[4] = .{ .float = v }; // anchor_row
         t[5] = .{ .float = v }; // anchor_col
-        t[6] = .{ .bool = true }; // focusable
+        t[6] = .{ .bool = false }; // mouse_enabled
         t[7] = .{ .int = 50 }; // zindex
         try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
-        try std.testing.expect(grid.sub_grids.getPtr(2) == null);
+        try std.testing.expect(!grid.win_pos.contains(2));
+        try std.testing.expect(!grid.win_layer.contains(2));
+    }
+
+    // 11-field form with a screen_row past any grid coordinate.
+    {
+        const t = try arena.alloc(mp.Value, 11);
+        t[0] = .{ .int = 2 }; // grid
+        t[1] = .{ .int = 42 }; // win
+        t[2] = .{ .str = "NW" }; // anchor
+        t[3] = .{ .int = 1 }; // anchor_grid
+        t[4] = .{ .int = 0 }; // anchor_row
+        t[5] = .{ .int = 0 }; // anchor_col
+        t[6] = .{ .bool = false }; // mouse_enabled
+        t[7] = .{ .int = 50 }; // zindex
+        t[8] = .{ .int = 0 }; // compindex
+        t[9] = .{ .int = std.math.maxInt(i64) }; // screen_row
+        t[10] = .{ .int = 0 }; // screen_col
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        try std.testing.expect(!grid.win_pos.contains(2));
+        try std.testing.expect(!grid.win_layer.contains(2));
+    }
+
+    // Control: a sane placement on the same grid does register, so the
+    // negative assertions above are not passing for lack of any effect.
+    {
+        const t = try arena.alloc(mp.Value, 8);
+        t[0] = .{ .int = 2 }; // grid
+        t[1] = .{ .int = 42 }; // win
+        t[2] = .{ .str = "NW" }; // anchor
+        t[3] = .{ .int = 1 }; // anchor_grid
+        t[4] = .{ .int = 1 }; // anchor_row
+        t[5] = .{ .int = 1 }; // anchor_col
+        t[6] = .{ .bool = false }; // mouse_enabled
+        t[7] = .{ .int = 50 }; // zindex
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "win_float_pos", t));
+        try std.testing.expect(grid.win_pos.contains(2));
+        try std.testing.expect(grid.win_layer.contains(2));
     }
 }
 
