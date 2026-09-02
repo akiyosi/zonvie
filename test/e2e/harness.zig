@@ -356,7 +356,7 @@ pub const Harness = struct {
     }
 
     /// The core skips this callback entirely when the event routed to `none`
-    /// or was skipped (flush.zig sendMsgShowmode), so a recorded event is
+    /// or was skipped (flush.zig sendMsgStatus), so a recorded event is
     /// itself proof the default route survived.
     fn onMsgShowmode(
         ctx: ?*anyopaque,
@@ -923,7 +923,6 @@ pub const Harness = struct {
         }
         return 0;
     }
-
 
     /// Get the scroll_delta reported by the last win_viewport event for a grid.
     pub fn getViewportScrollDelta(h: *Harness, grid_id: i64) i64 {

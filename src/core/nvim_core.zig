@@ -373,24 +373,13 @@ pub const Callbacks = struct {
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
 };
 
-const PipeReader = rpc_session.PipeReader;
-const CwdOwner = rpc_session.CwdOwner;
-
 const GridEntry = flush.GridEntry;
 const CachedSubgrid = flush.CachedSubgrid;
 const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
 const STYLE_ITALIC = flush.STYLE_ITALIC;
-const STYLE_STRIKETHROUGH = flush.STYLE_STRIKETHROUGH;
-const STYLE_UNDERLINE = flush.STYLE_UNDERLINE;
-const STYLE_UNDERCURL = flush.STYLE_UNDERCURL;
-const STYLE_UNDERDOUBLE = flush.STYLE_UNDERDOUBLE;
-const STYLE_UNDERDOTTED = flush.STYLE_UNDERDOTTED;
-const STYLE_UNDERDASHED = flush.STYLE_UNDERDASHED;
 const RenderCells = flush.RenderCells;
-const packStyleFlags = flush.packStyleFlags;
 const MsgCachedLine = flush.MsgCachedLine;
-pub const FlushCache = flush.FlushCache;
 
 // Phase B: Shaping result cache (4-way set associative)
 pub const SHAPE_CACHE_WAYS: usize = 4;
@@ -1103,10 +1092,6 @@ pub const Core = struct {
     preedit_setup_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // hl groups defined
     preedit_visible: std.atomic.Value(bool) = std.atomic.Value(bool).init(false), // an inline preedit extmark is set
 
-    // RPC channel ID (extracted from nvim_get_api_info response)
-    channel_id: ?i64 = null,
-    get_api_info_msgid: ?i64 = null,
-
     // Quit request msgid (for tracking nvim_exec_lua response)
     // Atomic to avoid data race between UI thread (requestQuit) and RPC thread (handleRpcResponse)
     // 0 means no pending request
@@ -1213,9 +1198,28 @@ pub const Core = struct {
     }
 
     /// Cleanup for test-created Core instances (no threads/processes to join).
-    pub fn deinitForTest(self: *Core) void {
+    /// Release every heap allocation this Core owns, and reset the released
+    /// fields so the Core is safe to reuse for another session.
+    ///
+    /// Both teardown paths call this. They used to carry separate copies of
+    /// the list, and the copies had drifted: the session path also released
+    /// nvim_path_owned, restart_pending_addr, known_external_grids and
+    /// msg_config, while the test path did not. Nothing leaked, because each
+    /// test that populated one of those carried its own release -- fourteen
+    /// hand-written defers whose only job was to compensate for the drift.
+    ///
+    /// Every release here is safe on a Core that never populated the field:
+    /// the optional slices are guarded, HashMapUnmanaged.deinit on an empty
+    /// map is a no-op, and Config.deinit early-returns when its allocator is
+    /// null, which is the case for every test-built config.
+    ///
+    /// Does NOT take grid_mu. The session path holds it across this call; the
+    /// test path has no other threads and takes nothing.
+    fn releaseOwnedBuffers(self: *Core) void {
         self.hl.deinit();
         self.grid.deinit();
+
+        // Scratch buffers.
         self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
@@ -1248,21 +1252,61 @@ pub const Core = struct {
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
+
+        // Spawn command copy.
+        if (self.nvim_path_owned) |p| {
+            self.alloc.free(p);
+            self.nvim_path_owned = null;
+        }
+
+        // Any pending restart address (queued but never consumed because
+        // stop() raced ahead of the run loop's restart handling). Reset the
+        // companion hot-swap flag too — the run loop reads them as a pair.
+        if (self.restart_pending_addr) |a| {
+            self.alloc.free(a);
+            self.restart_pending_addr = null;
+        }
+        self.restart_pending_is_connect_hotswap = false;
+
+        // Shaping buffers.
         self.shaping_bufs.deinit(self.alloc);
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
         self.shaping_src_cols.deinit(self.alloc);
         self.flush_float_overlay_buf.deinit(self.alloc);
-        self.msg_views.deinit(self.alloc);
-        self.history_views.deinit(self.alloc);
-        self.msg_line_cache.deinit(self.alloc);
-        self.msg_line_cache_build.deinit(self.alloc);
-        self.msg_split_buf.deinit(self.alloc);
+
+        // Glow state.
         self.freeGlowGroupNames();
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
+        self.glow_hl_ids = null;
+
+        // Session state.
+        self.known_external_grids.deinit(self.alloc);
+        self.known_external_grids = .{};
+        self.msg_line_cache.deinit(self.alloc);
+        self.msg_line_cache = .empty;
+        self.msg_line_cache_build.deinit(self.alloc);
+        self.msg_line_cache_build = .empty;
+        self.msg_split_buf.deinit(self.alloc);
+        self.msg_split_buf = .empty;
+        // Full reset, not just deinit: ViewSet.deinit frees the assignment
+        // but keeps per-view state, and a stale `visible` flag would make the
+        // next session's first empty cycle issue a spurious hide.
+        self.msg_views.deinit(self.alloc);
+        self.msg_views = .{};
+        self.history_views.deinit(self.alloc);
+        self.history_views = .{};
+        self.msg_config.deinit();
+        self.msg_config = .{};
+
+        // Caches.
         self.deinitHlCache();
         self.deinitGlyphCache();
+    }
+
+    pub fn deinitForTest(self: *Core) void {
+        self.releaseOwnedBuffers();
     }
 
     pub fn start(self: *Core, nvim_path: []const u8, rows: u32, cols: u32) !void {
@@ -1401,7 +1445,6 @@ pub const Core = struct {
 
             // In-flight RPC IDs from the dead channel — drop tracking so any
             // stale response from the new server cannot match.
-            self.get_api_info_msgid = null;
             self.quit_request_msgid.store(0, .release);
             self.glow_request_msgid.store(0, .release);
 
@@ -1833,92 +1876,7 @@ pub const Core = struct {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
 
-        self.hl.deinit();
-        self.grid.deinit();
-
-        // Clean up scratch buffers
-        self.main_verts.deinit(self.alloc);
-        self.cursor_verts.deinit(self.alloc);
-        self.row_verts.deinit(self.alloc);
-        self.flush_dirty_snapshot.deinit(self.alloc);
-        self.flush_row_counts_snapshot.deinit(self.alloc);
-        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
-        for (self.scroll_cache.items) |*row_cache| {
-            row_cache.deinit(self.alloc);
-        }
-        self.scroll_cache.deinit(self.alloc);
-        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
-        self.scroll_cache_valid.deinit(self.alloc);
-        self.main_vertex_row_counts.deinit(self.alloc);
-        self.tmp_cells.deinit(self.alloc);
-        self.row_cells.deinit(self.alloc);
-        self.grid_entries.deinit(self.alloc);
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.cached_subgrids_buf.deinit(self.alloc);
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.prev_subgrid_snapshots.deinit(self.alloc);
-        self.subgrid_diff_current.deinit(self.alloc);
-        self.subgrid_diff_row_marks.deinit(self.alloc);
-        self.key_buf.deinit(self.alloc);
-        self.write_queue.deinit(self.alloc);
-        self.write_spare_queue.deinit(self.alloc);
-
-        // Free nvim path copy
-        if (self.nvim_path_owned) |p| {
-            self.alloc.free(p);
-            self.nvim_path_owned = null;
-        }
-
-        // Free any pending restart address (queued but never consumed because
-        // stop() raced ahead of the run loop's restart handling). Reset the
-        // companion hot-swap flag too — the run loop reads them as a pair.
-        if (self.restart_pending_addr) |a| {
-            self.alloc.free(a);
-            self.restart_pending_addr = null;
-        }
-        self.restart_pending_is_connect_hotswap = false;
-
-        // Free shaping buffers (Phase B)
-        self.shaping_bufs.deinit(self.alloc);
-        self.shaping_scalars.deinit(self.alloc);
-        self.shaping_col_widths.deinit(self.alloc);
-        self.shaping_src_cols.deinit(self.alloc);
-        self.flush_float_overlay_buf.deinit(self.alloc);
-
-        // Free glow state
-        self.freeGlowGroupNames();
-        self.glow_group_names.deinit(self.alloc);
-        if (self.glow_hl_ids) |*m| m.deinit();
-
-        // Free session state that was previously leaked on stop.
-        self.known_external_grids.deinit(self.alloc);
-        self.known_external_grids = .{};
-        self.msg_line_cache.deinit(self.alloc);
-        self.msg_line_cache = .empty;
-        self.msg_line_cache_build.deinit(self.alloc);
-        self.msg_line_cache_build = .empty;
-        self.msg_split_buf.deinit(self.alloc);
-        self.msg_split_buf = .empty;
-        // Full reset, not just deinit: ViewSet.deinit frees the assignment
-        // but keeps per-view state, and a stale `visible` flag would make the
-        // next session's first empty cycle issue a spurious hide.
-        self.msg_views.deinit(self.alloc);
-        self.msg_views = .{};
-        self.history_views.deinit(self.alloc);
-        self.history_views = .{};
-        self.msg_config.deinit();
-        self.msg_config = .{};
-
-        // Free caches
-        self.deinitHlCache();
-        self.deinitGlyphCache();
+        self.releaseOwnedBuffers();
     }
 
     /// Wait until the single stop() owner has released every Core-owned
@@ -2064,13 +2022,12 @@ pub const Core = struct {
         // Initialize valid flags to false
         @memset(self.glyph_valid_ascii.?, false);
         // Initialize keys to invalid sentinel
-        const INVALID_KEY = GLYPH_CACHE_INVALID_KEY;
-        @memset(self.glyph_keys_non_ascii.?, INVALID_KEY);
+        @memset(self.glyph_keys_non_ascii.?, GLYPH_CACHE_INVALID_KEY);
 
         // Phase B: glyph-ID cache (same size as non-ASCII cache)
         self.glyph_cache_by_id = try self.alloc.alloc(c_api.GlyphEntry, non_ascii_size);
         self.glyph_keys_by_id = try self.alloc.alloc(u64, non_ascii_size);
-        @memset(self.glyph_keys_by_id.?, INVALID_KEY);
+        @memset(self.glyph_keys_by_id.?, GLYPH_CACHE_INVALID_KEY);
 
         // Phase B: shaping result cache (4-way set associative)
         // Sets count derived from shape_cache_size / 2 (not / WAYS) to maintain
@@ -2092,13 +2049,11 @@ pub const Core = struct {
             @memset(buf, false);
         }
         if (self.glyph_keys_non_ascii) |buf| {
-            const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
-            @memset(buf, INVALID_KEY);
+            @memset(buf, GLYPH_CACHE_INVALID_KEY);
         }
         // Phase B: glyph-ID cache
         if (self.glyph_keys_by_id) |buf| {
-            const INVALID_KEY: u64 = 0xFFFFFFFFFFFFFFFF;
-            @memset(buf, INVALID_KEY);
+            @memset(buf, GLYPH_CACHE_INVALID_KEY);
         }
     }
 
@@ -2463,10 +2418,6 @@ pub const Core = struct {
         return true;
     }
 
-    pub fn prepareAtlasCapacityRetry(self: *Core) bool {
-        return self.prepareAtlasCapacityRetryAt(clock.nowNs());
-    }
-
     fn armTransientGlyphRetryAt(self: *Core, now: i128) bool {
         if (!self.transient_glyph_has_negative) return false;
         if (self.transient_glyph_retry_at == null and
@@ -2484,12 +2435,6 @@ pub const Core = struct {
         self.transient_glyph_retry_at = null;
         self.transient_glyph_recovery_armed = true;
         self.transient_glyph_has_negative = false;
-        return true;
-    }
-
-    pub fn prepareTransientGlyphRetryAt(self: *Core, now: i128) bool {
-        if (!self.armTransientGlyphRetryAt(now)) return false;
-        self.beginNegativeGlyphReprobe();
         return true;
     }
 
@@ -3175,9 +3120,11 @@ pub const Core = struct {
 
     /// Set glyph cache sizes (must be called before start or during stop)
     pub fn setGlyphCacheSize(self: *Core, ascii_size: u32, non_ascii_size: u32) void {
-        // Ensure minimum sizes
-        self.glyph_cache_ascii_size = @max(128, ascii_size);
-        self.glyph_cache_non_ascii_size = @max(64, non_ascii_size);
+        // Same bounds the TOML parser applies. This is a separate ABI entry
+        // point, so a frontend reaching it directly must not be able to ask
+        // for a size the config file could not.
+        self.glyph_cache_ascii_size = @max(config.glyph_cache_ascii_min, @min(config.glyph_cache_ascii_max, ascii_size));
+        self.glyph_cache_non_ascii_size = @max(config.glyph_cache_non_ascii_min, @min(config.glyph_cache_non_ascii_max, non_ascii_size));
 
         // If already initialized, need to reinitialize
         if (self.glyph_cache_initialized) {
@@ -3738,17 +3685,16 @@ pub const Core = struct {
         self.requestInput(s) catch |e| self.log.write("emitInputString err: {any}\n", .{e});
     }
 
-    fn isAsciiControl(cp: u32) bool {
-        return cp < 0x20 or cp == 0x7F;
-    }
-
     fn firstCodepointUtf8(s: []const u8) ?u32 {
         if (s.len == 0) return null;
         var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
         // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
-        // UTF-8 (it uses utf8Decode(slice) catch unreachable) — see the same
-        // hazard documented in redraw_handler.zig's firstCodepoint().
-        const slice = it.nextCodepointSlice() orelse return null;
+        // UTF-8: it decodes with `catch unreachable`, so an overlong or
+        // truncated sequence off the wire would abort the render thread.
+        // The empty case returned above, so the iterator has at least one
+        // slice. The optional return type stays: callers chain it with
+        // `orelse`, and it is the s.len == 0 branch they consume.
+        const slice = it.nextCodepointSlice().?;
         const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
         return @as(u32, cp);
     }
@@ -4450,19 +4396,6 @@ pub const Core = struct {
         try rpc.packStr(buf, self.alloc, method);
     }
 
-    pub fn requestGetApiInfo(self: *Core) !void {
-        const id = self.nextMsgId();
-        self.get_api_info_msgid = id; // Save msgid for response matching
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_get_api_info");
-        try rpc.packArray(&buf, self.alloc, 0);
-        try self.sendRaw(buf.items);
-
-        self.log.write("rpc send: nvim_get_api_info (id={d})\n", .{id});
-    }
-
     pub fn requestSetClientInfo(self: *Core) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
@@ -4694,34 +4627,6 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_ui_try_resize_grid (id={d}, grid={d}, rows={d}, cols={d})\n", .{ id, grid_id, rows, cols });
-    }
-
-    /// Sync Neovim's internal window height to match the grid height.
-    fn requestWinSetHeight(self: *Core, win_id: i64, height: u32) void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        self.sendRequestHeader(&buf, id, "nvim_win_set_height") catch return;
-        rpc.packArray(&buf, self.alloc, 2) catch return;
-        rpc.packInt(&buf, self.alloc, win_id) catch return;
-        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(height))) catch return;
-
-        self.sendRaw(buf.items) catch return;
-    }
-
-    /// Sync Neovim's internal window width to match the grid width.
-    fn requestWinSetWidth(self: *Core, win_id: i64, width: u32) void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        self.sendRequestHeader(&buf, id, "nvim_win_set_width") catch return;
-        rpc.packArray(&buf, self.alloc, 2) catch return;
-        rpc.packInt(&buf, self.alloc, win_id) catch return;
-        rpc.packInt(&buf, self.alloc, @as(i64, @intCast(width))) catch return;
-
-        self.sendRaw(buf.items) catch return;
     }
 
     pub fn requestInput(self: *Core, keys: []const u8) !void {
@@ -5454,32 +5359,13 @@ pub const Core = struct {
     }
 
     /// Send nvim_input_mouse RPC for scroll events.
-    /// nvim_input_mouse(button, action, modifier, grid, row, col)
+    ///
+    /// A scroll is a mouse input whose button is always "wheel" and whose
+    /// action is the direction, so it emitted the same six-element call as
+    /// requestMouseInput with one field pinned. The argument order differs
+    /// from that function's because the callers' does.
     fn requestMouseScroll(self: *Core, grid_id: i64, row: i32, col: i32, direction: []const u8, modifier: []const u8) !void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_input_mouse");
-
-        // nvim_input_mouse takes 6 arguments:
-        // button: "wheel" for scroll
-        // action: "up" or "down"
-        // modifier: "" or combination like "SC" for shift+ctrl
-        // grid: grid_id
-        // row: row position
-        // col: column position
-        try rpc.packArray(&buf, self.alloc, 6);
-        try rpc.packStr(&buf, self.alloc, "wheel"); // button
-        try rpc.packStr(&buf, self.alloc, direction); // action (up/down)
-        try rpc.packStr(&buf, self.alloc, modifier); // modifier
-        try rpc.packInt(&buf, self.alloc, grid_id); // grid
-        try rpc.packInt(&buf, self.alloc, @as(i64, row)); // row
-        try rpc.packInt(&buf, self.alloc, @as(i64, col)); // col
-
-        try self.sendRaw(buf.items);
-
-        self.log.write("rpc send: nvim_input_mouse (id={d}) wheel {s} mod=\"{s}\" grid={d} row={d} col={d}\n", .{ id, direction, modifier, grid_id, row, col });
+        try self.requestMouseInput("wheel", direction, modifier, grid_id, row, col);
     }
 
     /// Send nvim_input_mouse RPC for button events (click, drag, release).
@@ -5516,7 +5402,9 @@ pub const Core = struct {
 
         try self.sendRaw(buf.items);
 
-        self.log.write("rpc send: nvim_input_mouse (id={d}) {s} {s} mod={s} grid={d} row={d} col={d}\n", .{ id, button, action, modifier, grid_id, row, col });
+        // The modifier is quoted so an empty one is visible; the scroll path
+        // logged it that way and folding into here must not lose it.
+        self.log.write("rpc send: nvim_input_mouse (id={d}) {s} {s} mod=\"{s}\" grid={d} row={d} col={d}\n", .{ id, button, action, modifier, grid_id, row, col });
     }
 
     const FlushCtx = flush.FlushCtx;
@@ -5575,11 +5463,10 @@ pub const Core = struct {
         rpc_session.handleRpcNotification(self, arena, top);
     }
 
-    /// Compare current external_grids with known_external_grids and notify frontend.
-    /// Returns true if new external grids were added (need forced render).
-
     // --- Forwarding stubs for flush.zig ---
 
+    /// Compare current external_grids with known_external_grids and notify frontend.
+    /// Returns true if new external grids were added (need forced render).
     pub fn notifyExternalWindowChanges(self: *Core) bool {
         return flush.notifyExternalWindowChanges(self);
     }
@@ -5677,16 +5564,8 @@ pub const Core = struct {
         flush.closeMessageSplit(self);
     }
 
-    pub fn sendMsgShowmode(self: *Core) void {
-        flush.sendMsgShowmode(self);
-    }
-
-    pub fn sendMsgShowcmd(self: *Core) void {
-        flush.sendMsgShowcmd(self);
-    }
-
-    pub fn sendMsgRuler(self: *Core) void {
-        flush.sendMsgRuler(self);
+    pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
+        flush.sendMsgStatus(self, channel);
     }
 
     pub fn sendMsgHistoryShow(self: *Core) void {
@@ -5697,28 +5576,7 @@ pub const Core = struct {
         flush.hideMsgHistory(self);
     }
 
-    /// Set a Neovim global variable via nvim_set_var
-    fn requestSetVar(self: *Core, name: []const u8, value: []const u8) !void {
-        const id = self.nextMsgId();
-        var buf: rpc.Buf = .empty;
-        defer buf.deinit(self.alloc);
-
-        try self.sendRequestHeader(&buf, id, "nvim_set_var");
-
-        try rpc.packArray(&buf, self.alloc, 2);
-        try rpc.packStr(&buf, self.alloc, name);
-        try rpc.packStr(&buf, self.alloc, value);
-
-        try self.sendRaw(buf.items);
-    }
-
-    /// Count UTF-8 codepoints in a string.
-
     // --- Utility forwarding stubs ---
-
-    pub fn countUtf8Codepoints(s: []const u8) u32 {
-        return flush.countUtf8Codepoints(s);
-    }
 
     pub fn isWideChar(cp: u32) bool {
         return flush.isWideChar(cp);
@@ -6420,7 +6278,6 @@ test "restart replaces connect cleanup policy before notifying observers" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
     var state = State{ .core = &core };
     core.ctx = &state;
     core.cb.on_restart = State.onRestart;
@@ -6439,7 +6296,6 @@ test "restart replaces connect cleanup policy before notifying observers" {
 fn checkRestartReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
 
     try core.handleConnectEvent("old-connect");
     const old = core.restart_pending_addr.?;
@@ -6467,7 +6323,6 @@ test "restart replacement OOM preserves pending connect address and policy" {
 fn checkConnectReplacementAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
-    defer if (core.restart_pending_addr) |addr| core.alloc.free(addr);
 
     try core.handleRestartEvent("old-restart");
     const old = core.restart_pending_addr.?;
@@ -6979,6 +6834,73 @@ test "redraw post-processing failure poisons the attachment" {
     try std.testing.expect(!core.ui_attached.load(.acquire));
 }
 
+test "a scroll and a button press differ only in the button and action fields" {
+    // requestMouseScroll and requestMouseInput emitted the same six-element
+    // nvim_input_mouse call, the scroll one with "wheel" hardcoded. Send one
+    // of each over the same transport and require the frames to match field
+    // for field apart from the two that are supposed to differ, so folding one
+    // into the other cannot quietly change the wire shape.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    clock.init();
+
+    const alloc = std.testing.allocator;
+
+    const Frame = struct {
+        /// Decode one nvim_input_mouse request: [0, id, method, [args...]].
+        fn read(a: std.mem.Allocator, file: std.Io.File) !mp.Value {
+            var rbuf: [512]u8 = undefined;
+            const n = try Stream.fromFile(file).read(&rbuf);
+            var reader = mp.SliceReader{ .data = rbuf[0..n] };
+            return try mp.decode(a, &reader);
+        }
+    };
+
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+    defer read_file.close(clock.io());
+
+    var core = Core.initForTest(alloc);
+    core.stdin_file = Stream.fromFile(.{ .handle = fds[1], .flags = .{ .nonblocking = false } });
+    core.transport_kind = .pipes;
+    try std.testing.expect(core.startWriterThread());
+    // deinitForTest is intentionally omitted, as in the sibling writer-thread
+    // tests: iterating a never-populated std HashMap asserts on Zig 0.16.
+    defer core.stop();
+
+    try core.requestMouseScroll(3, 7, 11, "up", "S");
+    const scroll = try Frame.read(alloc, read_file);
+    defer mp.freeValue(alloc, scroll);
+
+    try core.requestMouseInput("left", "press", "S", 3, 7, 11);
+    const press = try Frame.read(alloc, read_file);
+    defer mp.freeValue(alloc, press);
+
+    // Same method, same argument arity.
+    try std.testing.expectEqualStrings("nvim_input_mouse", scroll.arr[2].str);
+    try std.testing.expectEqualStrings("nvim_input_mouse", press.arr[2].str);
+    const s = scroll.arr[3].arr;
+    const p = press.arr[3].arr;
+    try std.testing.expectEqual(@as(usize, 6), s.len);
+    try std.testing.expectEqual(@as(usize, 6), p.len);
+
+    // The two fields that are meant to differ.
+    try std.testing.expectEqualStrings("wheel", s[0].str);
+    try std.testing.expectEqualStrings("left", p[0].str);
+    try std.testing.expectEqualStrings("up", s[1].str);
+    try std.testing.expectEqualStrings("press", p[1].str);
+
+    // Everything else must match, in the same slots and the same order.
+    try std.testing.expectEqualStrings("S", s[2].str);
+    try std.testing.expectEqualStrings("S", p[2].str);
+    try std.testing.expectEqual(@as(i64, 3), s[3].int);
+    try std.testing.expectEqual(@as(i64, 3), p[3].int);
+    try std.testing.expectEqual(@as(i64, 7), s[4].int);
+    try std.testing.expectEqual(@as(i64, 7), p[4].int);
+    try std.testing.expectEqual(@as(i64, 11), s[5].int);
+    try std.testing.expectEqual(@as(i64, 11), p[5].int);
+}
+
 test "UI-state reserve preserves order across a full normal queue" {
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
     clock.init();
@@ -7300,7 +7222,6 @@ fn recycledShelfCount(core: *Core) u32 {
 test "atlas reclamation runs when the frontend owns no surface" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     try std.testing.expect(core.collectAtlasGarbage());
@@ -7310,7 +7231,6 @@ test "atlas reclamation runs when the frontend owns no surface" {
 test "atlas reclamation stands down for a frontend-owned surface" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     // The ordinary shape of a float: cell storage, placement, and a frontend
@@ -7329,7 +7249,6 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
     // and reclaimed shelves the surface was still drawing from.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try initCoreForAtlasGcTest(&core, 4);
 
     try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });

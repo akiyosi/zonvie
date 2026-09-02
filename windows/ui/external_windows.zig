@@ -57,6 +57,152 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
     ext_win.msg_hover = hovered;
 }
 
+/// Client-pixel padding a decorated external surface adds around its grid:
+/// the cmdline's icon strip and padding, a message surface's padding, and the
+/// copy-content button's trailing reservation.
+///
+/// Every site that sizes an external window must go through this. The two
+/// resize paths in callbacks.zig used to re-derive the first two terms and
+/// omit the third, so a guifont or linespace change while a cmdline or
+/// message window was open sent it back one copy-button width too narrow.
+pub const ExternalSurfaceInsets = struct { w: c_int, h: c_int };
+
+pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
+    const kind = classifyExternalSurface(grid_id);
+    const is_cmdline = kind == .cmdline;
+    const is_msg = kind == .msg_show or kind == .msg_history;
+
+    const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT +
+        app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
+    const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
+    const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
+
+    return .{
+        .w = cmdline_icon_w + cmdline_padding + msg_padding + copyButtonReservedPx(app, kind),
+        .h = cmdline_padding + msg_padding,
+    };
+}
+
+/// The cmdline may not grow past the work area of the monitor the main window
+/// is on. Other surfaces are returned unchanged.
+pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_int {
+    if (classifyExternalSurface(grid_id) != .cmdline) return client_w;
+    const main_hwnd = app.hwnd orelse return client_w;
+    const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST) orelse return client_w;
+    var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    mi.cbSize = @sizeOf(c.MONITORINFO);
+    if (c.GetMonitorInfoW(monitor, &mi) == 0) return client_w;
+    return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
+}
+
+/// Map a decorated surface's content rect to the NDC scale and offset the
+/// vertex shader applies. The cmdline and message paths differ only in where
+/// the content starts; the conversion itself was identical.
+const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
+
+fn decoratedContentNdcTransform(
+    content_left: f32,
+    content_top: f32,
+    content_w: f32,
+    content_h: f32,
+    window_w: f32,
+    window_h: f32,
+) ContentNdcTransform {
+    const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
+    const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
+    const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
+    const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+    return .{
+        .scale_x = (right_ndc - left_ndc) / 2.0,
+        .scale_y = (top_ndc - bottom_ndc) / 2.0,
+        .offset_x = (right_ndc + left_ndc) / 2.0,
+        .offset_y = (top_ndc + bottom_ndc) / 2.0,
+    };
+}
+
+/// Find the external window a message was delivered to. Caller must already
+/// hold app.mu -- this deliberately does not take it, because several window
+/// procedure arms keep the lock past the lookup to read further App state.
+///
+/// Eight arms of ExternalWndProc and paintExternalWindow walked the map
+/// inline with the same predicate. Four sites deliberately still do not use
+/// this: WM_DPICHANGED and the scrollbar-drag arm do their work inside the
+/// loop rather than extracting a match, the pending-close sweep keys on
+/// is_pending_close and paint_ref_count instead of hwnd, and
+/// collectWindowInfos enumerates rather than looks up.
+const ExtWindowHit = struct { grid_id: i64, win: *app_mod.ExternalWindow };
+
+fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
+    var it = app.external_windows.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.*.hwnd == hwnd) {
+            return .{ .grid_id = entry.key_ptr.*, .win = entry.value_ptr.* };
+        }
+    }
+    return null;
+}
+
+/// Append the four edge rects that frame a decorated surface, in NDC. The
+/// cmdline and the popupmenu drew this identically; the border width is the
+/// same constant for both.
+///
+/// Returns the vertex index past the last one written.
+fn appendDecoratedBorderVerts(
+    verts: []app_mod.Vertex,
+    start_idx: usize,
+    window_w: f32,
+    window_h: f32,
+    border_color: [4]f32,
+    grid_id: i64,
+) usize {
+    const w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
+    const h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
+    const tex: [2]f32 = .{ -1.0, -1.0 };
+    var idx = start_idx;
+    // top, bottom, left, right
+    idx = app_mod.addRectVerts(verts, idx, -1.0, 1.0, 2.0, h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, -1.0, -1.0 + h_ndc, 2.0, h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, -1.0, 1.0 - h_ndc, w_ndc, 2.0 - 2.0 * h_ndc, border_color, tex, grid_id);
+    idx = app_mod.addRectVerts(verts, idx, 1.0 - w_ndc, 1.0 - h_ndc, w_ndc, 2.0 - 2.0 * h_ndc, border_color, tex, grid_id);
+    return idx;
+}
+
+/// The background colour a decorated surface should paint, taken from the
+/// first background quad the core sent. Both decorated draw paths -- the
+/// cmdline and the message surfaces -- resolved it this way.
+///
+/// A frame with no background quad at all reuses the last one seen for this
+/// grid; without that a transient all-glyph frame would flash the wrong
+/// colour. A frame that has one refreshes the cache.
+///
+/// `orig` is what the core sent, which the caller needs to recognise which
+/// vertices to make transparent; `adjusted` is what it should paint.
+const DecoratedBgColor = struct { orig: [3]f32, adjusted: [3]f32 };
+
+fn resolveDecoratedBgColor(app: *App, grid_id: i64, verts: []const app_mod.Vertex) DecoratedBgColor {
+    var orig: [3]f32 = .{ 0.0, 0.0, 0.0 };
+    var found = false;
+    for (verts) |v| {
+        if (v.texCoord[0] < 0) {
+            orig = .{ v.color[0], v.color[1], v.color[2] };
+            found = true;
+            break;
+        }
+    }
+
+    app.mu.lockUncancelable(core.clock.io());
+    if (app.external_windows.get(grid_id)) |ew| {
+        if (found) {
+            ew.cached_bg_color = orig;
+        } else if (ew.cached_bg_color) |cached| {
+            orig = cached;
+        }
+    }
+    app.mu.unlock(core.clock.io());
+
+    return .{ .orig = orig, .adjusted = app_mod.adjustBrightnessForCmdline(orig[0], orig[1], orig[2]) };
+}
+
 /// Whether the decorated surface of `kind` shows a copy-content button.
 fn copyButtonEnabled(app: *App, kind: ExternalSurfaceKind) bool {
     return switch (kind) {
@@ -218,53 +364,22 @@ fn drawDecoratedExternalSurface(
 
             const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
             const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
-            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
+            const scale_x = ndc.scale_x;
+            const scale_y = ndc.scale_y;
+            const offset_x = ndc.offset_x;
+            const offset_y = ndc.offset_y;
 
             const extra_verts = 6 + 24 + 20 + app_mod.COPY_ICON_VERTS;
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const cmdline_verts = scratch.items;
 
-            var orig_bg_r: f32 = 0.0;
-            var orig_bg_g: f32 = 0.0;
-            var orig_bg_b: f32 = 0.0;
-            var found_bg_vertex = false;
-            for (verts[0..vert_count]) |v| {
-                if (v.texCoord[0] < 0) {
-                    orig_bg_r = v.color[0];
-                    orig_bg_g = v.color[1];
-                    orig_bg_b = v.color[2];
-                    found_bg_vertex = true;
-                    break;
-                }
-            }
-            if (!found_bg_vertex) {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    if (ew.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                    }
-                }
-                app.mu.unlock(core.clock.io());
-            } else {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                }
-                app.mu.unlock(core.clock.io());
-            }
-
-            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
+            const orig_bg_r = bg.orig[0];
+            const orig_bg_g = bg.orig[1];
+            const orig_bg_b = bg.orig[2];
+            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
             const bg_tex: [2]f32 = .{ -1.0, -1.0 };
             var bg_idx: usize = 0;
             bg_idx = app_mod.addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
@@ -288,14 +403,7 @@ fn drawDecoratedExternalSurface(
             }
 
             var extra_idx: usize = bg_idx + vert_count;
-            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-            const border_tex: [2]f32 = .{ -1.0, -1.0 };
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(cmdline_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = appendDecoratedBorderVerts(cmdline_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
             const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
             const icon_x_px: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT);
@@ -339,14 +447,7 @@ fn drawDecoratedExternalSurface(
             app.mu.unlock(core.clock.io());
 
             var extra_idx: usize = vert_count;
-            const border_w_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_w / 2.0);
-            const border_h_ndc: f32 = @as(f32, @floatFromInt(app_mod.CMDLINE_BORDER_WIDTH)) / (window_h / 2.0);
-            const border_color: [4]f32 = .{ border_r, border_g, border_b, 1.0 };
-            const border_tex: [2]f32 = .{ -1.0, -1.0 };
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, -1.0 + border_h_ndc, 2.0, border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, -1.0, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
-            extra_idx = app_mod.addRectVerts(pum_verts, extra_idx, 1.0 - border_w_ndc, 1.0 - border_h_ndc, border_w_ndc, 2.0 - 2.0 * border_h_ndc, border_color, border_tex, grid_id);
+            extra_idx = appendDecoratedBorderVerts(pum_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
             try g.draw(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
             if (glow_enabled) {
@@ -382,52 +483,21 @@ fn drawDecoratedExternalSurface(
 
             const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
             const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-            const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-            const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-            const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
-            const scale_x: f32 = (right_ndc - left_ndc) / 2.0;
-            const scale_y: f32 = (top_ndc - bottom_ndc) / 2.0;
-            const offset_x: f32 = (right_ndc + left_ndc) / 2.0;
-            const offset_y: f32 = (top_ndc + bottom_ndc) / 2.0;
+            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
+            const scale_x = ndc.scale_x;
+            const scale_y = ndc.scale_y;
+            const offset_x = ndc.offset_x;
+            const offset_y = ndc.offset_y;
 
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + 6 + app_mod.COPY_ICON_VERTS);
             const msg_verts = scratch.items;
 
-            var orig_bg_r: f32 = 0.0;
-            var orig_bg_g: f32 = 0.0;
-            var orig_bg_b: f32 = 0.0;
-            var found_bg_vertex = false;
-            for (verts[0..vert_count]) |v| {
-                if (v.texCoord[0] < 0) {
-                    orig_bg_r = v.color[0];
-                    orig_bg_g = v.color[1];
-                    orig_bg_b = v.color[2];
-                    found_bg_vertex = true;
-                    break;
-                }
-            }
-            if (!found_bg_vertex) {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    if (ew.cached_bg_color) |cached| {
-                        orig_bg_r = cached[0];
-                        orig_bg_g = cached[1];
-                        orig_bg_b = cached[2];
-                    }
-                }
-                app.mu.unlock(core.clock.io());
-            } else {
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.external_windows.get(grid_id)) |ew| {
-                    ew.cached_bg_color = .{ orig_bg_r, orig_bg_g, orig_bg_b };
-                }
-                app.mu.unlock(core.clock.io());
-            }
-
-            const adjusted = app_mod.adjustBrightnessForCmdline(orig_bg_r, orig_bg_g, orig_bg_b);
-            const bg_color: [4]f32 = .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity };
+            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
+            const orig_bg_r = bg.orig[0];
+            const orig_bg_g = bg.orig[1];
+            const orig_bg_b = bg.orig[2];
+            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
             const bg_tex: [2]f32 = .{ -1.0, -1.0 };
             var bg_idx: usize = 0;
             bg_idx = app_mod.addRectVerts(msg_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
@@ -626,7 +696,6 @@ fn drawNormalExternalSurfaceRowMode(
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = !force_full_rows,
-        .glow_enabled = glow_enabled,
     };
 
     // Ensure row_vbs array covers committed set's row count.
@@ -723,6 +792,15 @@ fn drawNormalExternalSurfaceRowMode(
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
     // buffer, so a buffer not current this frame catches up when it rotates in.
+    // The main window builds the same row-run spans in window.zig. The two are
+    // NOT shared: this path reserves exactly rows + 5 up front and appends with
+    // appendAssumeCapacity, while the main path appends fallibly and swallows
+    // the error, backed by its force-full-present fallback. A shared helper
+    // returning Allocator.Error would force a `catch unreachable` here; one
+    // taking pre-reserved capacity would turn the main path's tolerant catch
+    // into a panic on a short reservation. Reviewed under the 2026-08-25 audit,
+    // observation 1, finding 332; left duplicated on purpose. The tail is
+    // already shared through compactDamageRects.
     const present_rects = &ext_win.paint_present_rects;
     present_rects.clearRetainingCapacity();
     present_rects.ensureTotalCapacity(app.alloc, rows_to_draw.items.len + 5) catch return error.OutOfMemory;
@@ -1218,26 +1296,10 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
 
-    const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
-    const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
-    const msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
-    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
-    var client_w: c_int = @intCast(req.cols * cell_w);
-    client_w += cmdline_icon_w + cmdline_padding + msg_padding + copy_button_w;
-    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + cmdline_padding + msg_padding;
-
-    if (is_cmdline) {
-        if (app.hwnd) |main_hwnd| {
-            const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
-            if (monitor) |mon| {
-                var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-                mi.cbSize = @sizeOf(c.MONITORINFO);
-                if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                    client_w = @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
-                }
-            }
-        }
-    }
+    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
+    const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
+    client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
 
     const style: c.DWORD = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW;
     const ex_style: c.DWORD = (if (is_special_window) @as(c.DWORD, @intCast(c.WS_EX_TOPMOST)) else 0) |
@@ -1325,36 +1387,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const is_msg_show = (req.grid_id == app_mod.MESSAGE_GRID_ID);
     const is_msg_history = (req.grid_id == app_mod.MSG_HISTORY_GRID_ID);
 
-    // For cmdline: add margin and icon area
-    // Total width = icon_margin_left + icon_size + icon_margin_right + content + padding*2
-    const cmdline_icon_total_width: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
-    const cmdline_total_padding: c_int = if (is_cmdline) @as(c_int, app_mod.CMDLINE_PADDING * 2) else 0;
-
-    // For msg_show/msg_history: add margin around content (DPI-scaled)
-    const scaled_msg_padding: c_int = if (is_msg_show or is_msg_history) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
-
-    const copy_button_w = copyButtonReservedPx(app, classifyExternalSurface(req.grid_id));
-    var client_w: c_int = content_w + cmdline_icon_total_width + cmdline_total_padding + scaled_msg_padding + copy_button_w;
-    const client_h: c_int = content_h + cmdline_total_padding + scaled_msg_padding;
-
-    // Clamp cmdline width to monitor work area minus margin (matching macOS cmdlineScreenMargin)
-    if (is_cmdline) {
-        if (app.hwnd) |main_hwnd| {
-            const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
-            if (monitor) |mon| {
-                var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-                mi.cbSize = @sizeOf(c.MONITORINFO);
-                if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                    const work_w: c_int = mi.rcWork.right - mi.rcWork.left;
-                    const screen_margin: c_int = @intCast(app_mod.CMDLINE_SCREEN_MARGIN);
-                    const max_w: c_int = work_w - screen_margin;
-                    if (client_w > max_w) {
-                        client_w = max_w;
-                    }
-                }
-            }
-        }
-    }
+    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    var client_w: c_int = content_w + insets.w;
+    const client_h: c_int = content_h + insets.h;
+    client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
 
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
@@ -2381,13 +2417,9 @@ pub export fn ExternalWndProc(
                 // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
                 var suppress = false;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        suppress = entry.value_ptr.*.suppress_resize_callback;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    suppress = hit.win.suppress_resize_callback;
                 }
 
                 const cell_w = app.cell_w_px;
@@ -2422,13 +2454,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2452,13 +2480,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2478,13 +2502,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2537,13 +2557,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2565,13 +2581,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2640,13 +2652,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2717,13 +2725,9 @@ pub export fn ExternalWndProc(
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        grid_id = entry.key_ptr.*;
-                        ext_window = entry.value_ptr.*;
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    grid_id = hit.grid_id;
+                    ext_window = hit.win;
                 }
                 app.mu.unlock(core.clock.io());
 
@@ -2755,15 +2759,7 @@ pub export fn ExternalWndProc(
         c.WM_IME_STARTCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_STARTCOMPOSITION hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = true;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, false);
 
                 // Position IME candidate window at cursor (using this external window)
                 input.positionImeCandidateWindow(hwnd, app);
@@ -2777,123 +2773,7 @@ pub export fn ExternalWndProc(
         c.WM_IME_COMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
             if (app_mod.getApp(hwnd)) |app| {
-                const himc = c.ImmGetContext(hwnd);
-                if (himc != null) {
-                    defer _ = c.ImmReleaseContext(hwnd, himc);
-
-                    // Get composition string
-                    if ((lParam & c.GCS_COMPSTR) != 0) {
-                        const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
-                        if (byte_len > 0) {
-                            const char_len: usize = @intCast(@divTrunc(byte_len, 2));
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.resize(app.alloc, char_len) catch {
-                                app.mu.unlock(core.clock.io());
-                                return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
-                            input.updateImeCompositionUtf8(app);
-                            app.mu.unlock(core.clock.io());
-                        } else {
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.clearRetainingCapacity();
-                            app.ime_composition_utf8.clearRetainingCapacity();
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get clause info
-                    if ((lParam & c.GCS_COMPCLAUSE) != 0) {
-                        const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
-                        if (clause_byte_len > 0) {
-                            const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_clause_info.resize(app.alloc, clause_count) catch {
-                                app.mu.unlock(core.clock.io());
-                                return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get cursor position
-                    if ((lParam & c.GCS_CURSORPOS) != 0) {
-                        const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        app.mu.lockUncancelable(core.clock.io());
-                        app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
-                        app.mu.unlock(core.clock.io());
-                    }
-
-                    // Get target clause (same logic as main window)
-                    // Always try to get COMPATTR, not just when flag is set
-                    {
-                        const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
-                        if (attr_len > 0) {
-                            var attr_buf: [256]u8 = undefined;
-                            const len: usize = @intCast(@min(@as(usize, @intCast(@max(0, attr_len))), 256));
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
-
-                            // Find target clause (ATTR_TARGET_CONVERTED=0x01 or ATTR_TARGET_NOTCONVERTED=0x03)
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_target_start = 0;
-                            app.ime_target_end = 0;
-                            var found_start: bool = false;
-                            var i: u32 = 0;
-                            while (i < len) : (i += 1) {
-                                const attr = attr_buf[i];
-                                if (attr == 0x01 or attr == 0x03) {
-                                    if (!found_start) {
-                                        app.ime_target_start = i;
-                                        found_start = true;
-                                    }
-                                    app.ime_target_end = i + 1;
-                                }
-                            }
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-                }
-
-                // Display preedit: prefer the core's inline-extmark mode when
-                // it accepts it (extmark mode + insert/replace in the focused
-                // external window's buffer); otherwise fall back to the
-                // overlay. Mirrors the main window's WM_IME_COMPOSITION path so
-                // ime_preedit_mode behaves the same across window types.
-                var handled = false;
-                if (app.corep) |corep| {
-                    app.mu.lockUncancelable(core.clock.io());
-                    // ime_composition_utf8 is mutated only on this (UI) thread,
-                    // and the core call below runs synchronously on it, so the
-                    // backing buffer stays valid after unlock — pass the full
-                    // string directly (no copy/truncation).
-                    const utf8_ptr = app.ime_composition_utf8.items.ptr;
-                    const utf8_len = app.ime_composition_utf8.items.len;
-                    const units = app.ime_composition_str.items;
-                    var ts: usize = 0;
-                    var te: usize = 0;
-                    if (app.ime_target_start < app.ime_target_end) {
-                        ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
-                        te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
-                    }
-                    app.mu.unlock(core.clock.io());
-                    if (utf8_len == 0) {
-                        app_mod.zonvie_core_clear_preedit(corep);
-                        handled = true; // nothing to display
-                    } else {
-                        handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
-                    }
-                }
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_extmark_active = handled;
-                app.mu.unlock(core.clock.io());
-                if (handled) {
-                    input.hideImePreeditOverlay(app);
-                } else {
-                    // Update preedit overlay (must be called WITHOUT app.mu
-                    // held, because updateImePreeditOverlay acquires app.mu).
-                    input.updateImePreeditOverlay(hwnd, app);
-                }
+                if (input.handleImeComposition(app, hwnd, lParam) == .alloc_failed) return c.DefWindowProcW(hwnd, msg, wParam, lParam);
             }
             // Let DefWindowProc handle for default IME processing
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2902,16 +2782,7 @@ pub export fn ExternalWndProc(
         c.WM_IME_ENDCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_ENDCOMPOSITION hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = false;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.ime_extmark_active = false;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, true);
 
                 // Clear any inline preedit extmark and hide the overlay.
                 if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
@@ -2924,29 +2795,10 @@ pub export fn ExternalWndProc(
         },
 
         c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim. Non-BMP commits arrive
-            // as two consecutive WM_IME_CHAR messages (high then low surrogate).
+            // IME committed character - send to Neovim.
             if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_CHAR wParam=0x{x}\n", .{wParam});
             if (app_mod.getApp(hwnd)) |app| {
-                const ch: u16 = @intCast(wParam);
-
-                var out: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch >= 0xD800 and ch <= 0xDBFF) {
-                    app.pending_high_surrogate_ime = ch;
-                    return 0;
-                } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_ime;
-                    app.pending_high_surrogate_ime = 0;
-                    if (hi == 0) return 0;
-                    s = input.utf16UnitsToUtf8(&out, hi, ch);
-                } else {
-                    app.pending_high_surrogate_ime = 0;
-                    s = input.utf16UnitsToUtf8(&out, ch, null);
-                }
-
-                const text = s orelse return 0;
-                input.sendKeyEventToCore(app, 0, 0, text, text);
+                input.handleImeChar(app, @intCast(wParam));
                 return 0;
             }
         },
@@ -3259,14 +3111,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Find the external window for this hwnd (also get grid_id)
     var ext_win_ptr: ?*app_mod.ExternalWindow = null;
     var found_grid_id: i64 = 0;
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow checking entry hwnd={*} vs {*}\n", .{ entry.value_ptr.*.hwnd, hwnd });
-        if (entry.value_ptr.*.hwnd == hwnd) {
-            ext_win_ptr = entry.value_ptr.*;
-            found_grid_id = entry.key_ptr.*;
-            break;
-        }
+    if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+        ext_win_ptr = hit.win;
+        found_grid_id = hit.grid_id;
     }
 
     const ext_win = ext_win_ptr orelse {
@@ -3539,8 +3386,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Check if we need to upload the full atlas (a TRUE reset happened since
     // this window last fully re-uploaded — not just "some glyph was added").
-    // Guarded by a.mu: resetAtlas() bumps this field from ensureGlyph, which
-    // can run concurrently with this paint (same pattern as the
+    // Guarded by a.mu: recreateAtlasTexture() bumps this field from
+    // ensureGlyph, which can run concurrently with this paint (same pattern as the
     // atlas_reset_pending read elsewhere in this function).
     var current_atlas_reset_generation: u64 = 0;
     if (atlas_ptr) |a| {

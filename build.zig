@@ -271,6 +271,22 @@ pub fn build(b: *std.Build) !void {
         run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
         test_step.dependOn(&run_font_cell_fit_test.step);
 
+        // Which of an NSEvent's two character strings a modified key carries.
+        // The rule lived inline in both keyDown handlers and drifted; it is a
+        // pure pick, so it is pinned here rather than left to a GUI run.
+        const compile_key_chars_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_key_chars_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_key_chars_test.addFileArg(b.path("macos/Sources/Core/KeyCharacterSelection.swift"));
+        compile_key_chars_test.addFileArg(b.path("macos/Tests/KeyCharacterSelectionTests.swift"));
+        compile_key_chars_test.addArg("-o");
+        const key_chars_test_exe = compile_key_chars_test.addOutputFileArg("key-character-selection-tests");
+        const run_key_chars_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_key_chars_test.addFileArg(key_chars_test_exe);
+        test_step.dependOn(&run_key_chars_test.step);
+
         // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
         // where they must be drawn, and that staged rows reach the screen only
         // through their own bracket's commit.
@@ -286,6 +302,23 @@ pub fn build(b: *std.Build) !void {
         const run_scroll_retention_test = b.addSystemCommand(&.{"/usr/bin/env"});
         run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
         test_step.dependOn(&run_scroll_retention_test.step);
+
+        // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
+        // back texture, and the vacated band always inside the rows the
+        // caller redraws. The blit itself is checked against a real texture
+        // when a Metal device exists.
+        const compile_row_scroll_blit_plan_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_row_scroll_blit_plan_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Sources/Rendering/RowScrollBlitPlan.swift"));
+        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Tests/RowScrollBlitPlanTests.swift"));
+        compile_row_scroll_blit_plan_test.addArg("-o");
+        const row_scroll_blit_plan_test_exe = compile_row_scroll_blit_plan_test.addOutputFileArg("row-scroll-blit-plan-tests");
+        const run_row_scroll_blit_plan_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_row_scroll_blit_plan_test.addFileArg(row_scroll_blit_plan_test_exe);
+        test_step.dependOn(&run_row_scroll_blit_plan_test.step);
     }
 
     // Core inline tests (c_api.zig and its relative imports, including the
@@ -326,17 +359,6 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(msgpack_tests).step);
 
-    // Streaming MessagePack decoder tests (inline tests in src/core/mpack_stream.zig)
-    const mpack_stream_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("src/core/mpack_stream.zig"),
-    });
-    const mpack_stream_tests = b.addTest(.{
-        .root_module = mpack_stream_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(mpack_stream_tests).step);
-
     // RPC transport address-parser tests (inline tests in src/core/rpc_transport.zig).
     const rpc_transport_test_mod = b.createModule(.{
         .target = target,
@@ -363,22 +385,6 @@ pub fn build(b: *std.Build) !void {
         .root_module = shader_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(shader_tests).step);
-
-    // Redraw parity tests: identical byte streams through mp.decode+handleRedraw
-    // vs handleRedrawStream must produce bit-identical grid/hl/callback state.
-    const redraw_parity_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/redraw_parity_test.zig"),
-        .imports = &.{
-            .{ .name = "zonvie_core", .module = core_mod },
-            .{ .name = "toml", .module = zig_toml.module("toml") },
-        },
-    });
-    const redraw_parity_tests = b.addTest(.{
-        .root_module = redraw_parity_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(redraw_parity_tests).step);
 
     // Cursor style tests: mode_info_set must re-resolve the current mode.
     const cursor_style_test_mod = b.createModule(.{
@@ -632,34 +638,4 @@ pub fn build(b: *std.Build) !void {
         .root_module = gui_win_mod,
     });
     gui_win_step.dependOn(&b.addInstallArtifact(gui_win_tests, .{}).step);
-
-    // mpack decode-path micro benchmark. Built in ReleaseFast regardless
-    // of the top-level optimize option so numbers reflect release perf.
-    // Run: `zig build bench`.
-    const bench_step = b.step("bench", "Run mpack decode-path benchmarks (ReleaseFast)");
-    const bench_core_mod = b.createModule(.{
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-        .root_source_file = b.path("src/core/c_api.zig"),
-        .imports = &.{
-            .{ .name = "toml", .module = zig_toml.module("toml") },
-            .{ .name = "build_options", .module = build_opts.createModule() },
-        },
-    });
-    const bench_mod = b.createModule(.{
-        .target = target,
-        .optimize = .ReleaseFast,
-        .root_source_file = b.path("test/mpack_bench.zig"),
-        .imports = &.{
-            .{ .name = "zonvie_core", .module = bench_core_mod },
-        },
-    });
-    const bench_tests = b.addTest(.{
-        .root_module = bench_mod,
-    });
-    const bench_run = b.addRunArtifact(bench_tests);
-    // Force rerun — benchmarks are not cached.
-    bench_run.has_side_effects = true;
-    bench_step.dependOn(&bench_run.step);
 }

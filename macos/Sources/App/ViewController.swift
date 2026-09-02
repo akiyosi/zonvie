@@ -131,8 +131,9 @@ final class ViewController: NSViewController {
         // work (NSWindow, osascript) inside start(). SSH detection mirrors
         // ZonvieCore.start()'s combined CLI flag / config.toml check.
         //
-        // rows/cols here are placeholders (1×1). The RPC thread blocks in
-        // waitForLayoutReady() until MetalTerminalView signals
+        // rows/cols here are placeholders (1×1). The RPC thread blocks on the
+        // core's layout-ready wait (ui_attach_cond in rpc_session.zig) until
+        // MetalTerminalView signals
         // notifyInitialLayout() with the actual rows/cols computed from
         // the post-layout drawable size, so nvim_ui_attach is sent with the
         // correct dimensions on the first try.
@@ -470,21 +471,8 @@ final class ViewController: NSViewController {
 
     // MARK: - Public Tab Bar Control
 
-    /// Update tab bar with new tab list
-    func updateTabBar(tabs: [(handle: Int64, name: String)], currentTab: Int64) {
-        self.currentTabs = tabs
-        tabBarView?.updateTabs(tabs, currentTab: currentTab)
-    }
 
-    /// Hide the tab bar (when ext_tabline is disabled or showtabline=0)
-    func hideTabBar() {
-        tabBarView?.isHidden = true
-    }
 
-    /// Show the tab bar
-    func showTabBar() {
-        tabBarView?.isHidden = false
-    }
 
     // MARK: - Tab Actions
 

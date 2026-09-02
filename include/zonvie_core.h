@@ -159,6 +159,12 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_OVERLINE      (1u << 8)
 #define ZONVIE_DECO_GLOW          (1u << 9)  /* Neon glow halo around glyph */
 #define ZONVIE_DECO_COLOR_EMOJI   (1u << 10) /* Color glyph (emoji): sample RGBA, not coverage */
+/* Solid-color quad that is foreground text, not background: block elements
+   (U+2580..U+259F and friends) the core fills geometrically instead of
+   rasterizing. Without it a frontend cannot tell them from a background
+   cell, and fades them to the window's background alpha under blur while
+   the atlas glyphs beside them stay opaque. */
+#define ZONVIE_DECO_SOLID_GLYPH   (1u << 11)
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float position[2];
@@ -771,7 +777,10 @@ typedef struct zonvie_callbacks {
     /* Phase 2: Core-managed atlas callbacks.
        When all three are non-NULL, core owns shelf packing and UV computation.
        The old on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled are not called.
-       When any is NULL, falls back to Phase 1 (frontend-managed atlas). */
+       When any is NULL, falls back to Phase 1 (frontend-managed atlas). The
+       core keeps that fallback implemented and test-covered, but both bundled
+       frontends register all three and no longer ship a Phase 1 atlas of
+       their own -- Phase 1 exists for embedders and older callers. */
     zonvie_rasterize_glyph_fn on_rasterize_glyph;
     zonvie_atlas_upload_fn on_atlas_upload;
     zonvie_atlas_create_fn on_atlas_create;

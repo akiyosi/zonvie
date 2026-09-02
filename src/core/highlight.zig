@@ -52,6 +52,24 @@ pub const ResolvedAttrWithStyles = struct {
     style_flags: u8, // Pre-packed style flags for fast access
 };
 
+/// Style bit positions for the packed `style_flags` byte.
+///
+/// This is the wire encoding: getWithStyles packs it, flush.zig re-exports
+/// these names, and the frontends decode the same bits. Definitions live here
+/// because highlight.zig is the only module both the packer and flush.zig can
+/// import -- flush imports highlight, not the other way round.
+///
+/// Overline is deliberately absent. There are nine style booleans and eight
+/// bits; overline travels as its own byte in the SoA row buffer.
+pub const STYLE_BOLD: u8 = 1 << 0;
+pub const STYLE_ITALIC: u8 = 1 << 1;
+pub const STYLE_STRIKETHROUGH: u8 = 1 << 2;
+pub const STYLE_UNDERLINE: u8 = 1 << 3;
+pub const STYLE_UNDERCURL: u8 = 1 << 4;
+pub const STYLE_UNDERDOUBLE: u8 = 1 << 5;
+pub const STYLE_UNDERDOTTED: u8 = 1 << 6;
+pub const STYLE_UNDERDASHED: u8 = 1 << 7;
+
 fn blendRgb(base: u32, top: u32, transparency: u8) u32 {
     // transparency: 0 => opaque(top), 100 => fully transparent(use base)
     const t: u32 = @as(u32, transparency);
@@ -183,11 +201,19 @@ pub const Highlights = struct {
         }
     }
 
-    // NOTE: get() remains unchanged (returns fg/bg only) because the current
-    // binary frame format only transports fg/bg. This keeps unrelated parts intact.
-    pub fn get(self: *const Highlights, id: u32) ResolvedAttr {
-        const raw = self.map.get(id) orelse Attr{};
-
+    /// Resolve a raw attribute's foreground and background.
+    ///
+    /// Shared by get() and getWithStyles(), which carried byte-identical
+    /// copies of this. The order matters and is pinned by a test: blend mixes
+    /// the background toward the default first, and only then does reverse
+    /// swap the pair. Reversing first would blend the foreground instead.
+    ///
+    /// Blend applies only when bg was set explicitly -- blending the default
+    /// against itself is a no-op that would still cost the arithmetic.
+    ///
+    /// `inline` because getWithStyles is per-cell on the hl-cache overflow
+    /// path; the body is branch-and-shift with no allocation.
+    inline fn resolveFgBg(self: *const Highlights, raw: Attr) ResolvedAttr {
         var fg: u32 = raw.fg orelse self.default_fg;
         var bg: u32 = raw.bg orelse self.default_bg;
 
@@ -204,38 +230,36 @@ pub const Highlights = struct {
         return .{ .fg = fg, .bg = bg };
     }
 
+    // NOTE: get() remains unchanged (returns fg/bg only) because the current
+    // binary frame format only transports fg/bg. This keeps unrelated parts intact.
+    pub fn get(self: *const Highlights, id: u32) ResolvedAttr {
+        return self.resolveFgBg(self.map.get(id) orelse Attr{});
+    }
+
     // Sentinel value indicating "special color not set" (0xFFFFFFFF is outside valid RGB range 0x000000-0xFFFFFF)
     pub const SP_NOT_SET: u32 = 0xFFFFFFFF;
 
     pub fn getWithStyles(self: *const Highlights, id: u32) ResolvedAttrWithStyles {
         const raw = self.map.get(id) orelse Attr{};
-
-        var fg: u32 = raw.fg orelse self.default_fg;
-        var bg: u32 = raw.bg orelse self.default_bg;
+        const base = self.resolveFgBg(raw);
+        const fg = base.fg;
+        const bg = base.bg;
         // Use SP_NOT_SET sentinel for "not set" - decoration code will fall back to fg
         // This correctly handles the case where special is explicitly set to black (0x000000)
         const sp: u32 = raw.sp orelse SP_NOT_SET;
 
-        if (raw.blend != 0 and raw.bg != null) {
-            bg = blendRgb(self.default_bg, bg, raw.blend);
-        }
-
-        if (raw.reverse) {
-            const tmp = fg;
-            fg = bg;
-            bg = tmp;
-        }
-
-        // Pre-compute style_flags (matching STYLE_* constants in nvim_core.zig)
+        // Pre-compute style_flags. The constants are declared above; the
+        // comment here used to point at nvim_core.zig, which only aliases two
+        // of them.
         var style_flags: u8 = 0;
-        if (raw.bold) style_flags |= 0x01;
-        if (raw.italic) style_flags |= 0x02;
-        if (raw.strikethrough) style_flags |= 0x04;
-        if (raw.underline) style_flags |= 0x08;
-        if (raw.undercurl) style_flags |= 0x10;
-        if (raw.underdouble) style_flags |= 0x20;
-        if (raw.underdotted) style_flags |= 0x40;
-        if (raw.underdashed) style_flags |= 0x80;
+        if (raw.bold) style_flags |= STYLE_BOLD;
+        if (raw.italic) style_flags |= STYLE_ITALIC;
+        if (raw.strikethrough) style_flags |= STYLE_STRIKETHROUGH;
+        if (raw.underline) style_flags |= STYLE_UNDERLINE;
+        if (raw.undercurl) style_flags |= STYLE_UNDERCURL;
+        if (raw.underdouble) style_flags |= STYLE_UNDERDOUBLE;
+        if (raw.underdotted) style_flags |= STYLE_UNDERDOTTED;
+        if (raw.underdashed) style_flags |= STYLE_UNDERDASHED;
 
         return .{
             .fg = fg,
@@ -254,3 +278,81 @@ pub const Highlights = struct {
         };
     }
 };
+
+test "colour resolution blends before it reverses, and both paths agree" {
+    // highlight.zig had no tests at all, and get() and getWithStyles()
+    // carried byte-identical copies of this arithmetic. Pin the order and the
+    // agreement before either is shared, because nothing else would catch a
+    // blend applied after the swap or a divergence between the two.
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    hl.setDefaults(0x111111, 0x222222, null);
+
+    // blend=50 mixes bg toward default_bg; reverse then swaps the result into
+    // fg. Applying reverse first would blend the FOREGROUND instead, so the
+    // two orders give different answers and this pins which one runs.
+    try hl.define(1, 0xFF0000, 0x00FF00, null, true, 50, .{}, false);
+    const blended_bg = blendRgb(0x222222, 0x00FF00, 50);
+
+    const a = hl.get(1);
+    try std.testing.expectEqual(blended_bg, a.fg);
+    try std.testing.expectEqual(@as(u32, 0xFF0000), a.bg);
+
+    // getWithStyles must resolve fg/bg identically -- that agreement is the
+    // whole reason the two bodies can share one implementation.
+    const b = hl.getWithStyles(1);
+    try std.testing.expectEqual(a.fg, b.fg);
+    try std.testing.expectEqual(a.bg, b.bg);
+
+    // blend applies only when bg was explicitly set: a null bg keeps the
+    // default untouched even with a non-zero blend.
+    //
+    // Note this assertion cannot distinguish the guard being present from it
+    // being absent, because blending the default against itself is the
+    // identity for any transparency. It pins the resulting value, not the
+    // guard. The guard's own effect is pinned by the explicit-bg case above,
+    // where blending moves the value away from what a missing blend would
+    // leave.
+    try hl.define(2, 0xFF0000, null, null, false, 50, .{}, false);
+    try std.testing.expectEqual(@as(u32, 0x222222), hl.get(2).bg);
+    try std.testing.expectEqual(hl.get(2).bg, hl.getWithStyles(2).bg);
+
+    // An unknown id resolves to the defaults through both entry points.
+    try std.testing.expectEqual(@as(u32, 0x111111), hl.get(999).fg);
+    try std.testing.expectEqual(@as(u32, 0x222222), hl.get(999).bg);
+    try std.testing.expectEqual(@as(u32, 0x111111), hl.getWithStyles(999).fg);
+}
+
+test "the packed style byte keeps its wire values" {
+    // These bits cross the C ABI and are decoded by both frontends, one of
+    // which (dwrite_d2d_renderer.zig) keeps its own hand-written copy of the
+    // low two, held in sync by a comment. Pin the numbering as literals so
+    // moving the definitions cannot renumber them silently.
+    try std.testing.expectEqual(@as(u8, 0x01), STYLE_BOLD);
+    try std.testing.expectEqual(@as(u8, 0x02), STYLE_ITALIC);
+    try std.testing.expectEqual(@as(u8, 0x04), STYLE_STRIKETHROUGH);
+    try std.testing.expectEqual(@as(u8, 0x08), STYLE_UNDERLINE);
+    try std.testing.expectEqual(@as(u8, 0x10), STYLE_UNDERCURL);
+    try std.testing.expectEqual(@as(u8, 0x20), STYLE_UNDERDOUBLE);
+    try std.testing.expectEqual(@as(u8, 0x40), STYLE_UNDERDOTTED);
+    try std.testing.expectEqual(@as(u8, 0x80), STYLE_UNDERDASHED);
+
+    // And that getWithStyles actually packs them, rather than the constants
+    // merely existing with the right values.
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    try hl.define(1, null, null, null, false, 0, .{
+        .bold = true,
+        .strikethrough = true,
+        .underdashed = true,
+        .overline = true,
+    }, false);
+    const a = hl.getWithStyles(1);
+    try std.testing.expectEqual(
+        @as(u8, STYLE_BOLD | STYLE_STRIKETHROUGH | STYLE_UNDERDASHED),
+        a.style_flags,
+    );
+    // Overline has no bit -- nine booleans, eight bits -- and travels
+    // separately. Its presence must not have set one.
+    try std.testing.expect(a.overline);
+}

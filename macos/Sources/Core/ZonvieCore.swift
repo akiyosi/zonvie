@@ -730,13 +730,11 @@ final class ZonvieCore {
                 }
             },
 
-            on_atlas_ensure_glyph: { ctx, scalar, outEntry in
-                return zonvie_macos_atlas_ensure_glyph(ctx, scalar, outEntry)
-            },
-
-            on_atlas_ensure_glyph_styled: { ctx, scalar, styleFlags, outEntry in
-                return zonvie_macos_atlas_ensure_glyph_styled(ctx, scalar, styleFlags, outEntry)
-            },
+            // NULL on purpose. These are the Phase 1 (frontend-managed atlas)
+            // entry points, and the core skips them entirely whenever the three
+            // Phase 2 callbacks below are set — which this frontend always does.
+            on_atlas_ensure_glyph: nil,
+            on_atlas_ensure_glyph_styled: nil,
 
             on_log: { ctx, bytes, len in
                 guard let ctx, let bytes else { return }
@@ -852,17 +850,17 @@ final class ZonvieCore {
             on_msg_showmode: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgShowmode(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.showmode, label: "showmode", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_showcmd: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgShowcmd(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.showcmd, label: "showcmd", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_ruler: { ctx, view, chunks, chunkCount in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgRuler(view: view, chunks: chunks, chunkCount: chunkCount)
+                me.onMsgStatus(.ruler, label: "ruler", view: view, chunks: chunks, chunkCount: chunkCount)
             },
             on_msg_history_show: { ctx, entries, entryCount, prevCmd in
                 guard let ctx else { return }
@@ -1086,7 +1084,7 @@ final class ZonvieCore {
                 }
                 // Coalesced scrollbar update: once per flush instead of once
                 // per submitted row (the per-row enqueues in
-                // submitVerticesRaw/submitVerticesRowRaw were removed).
+                // submitVerticesRowRaw were removed).
                 // Skip the dispatch entirely when the scrollbar is disabled —
                 // updateScrollbarIfNeeded's own guard would make it a no-op,
                 // but the main-queue hop per flush is not free during scroll
@@ -1107,7 +1105,7 @@ final class ZonvieCore {
                 // Re-evaluate the msg throttle/auto-hide deadline after this
                 // flush armed/cleared it.  Dispatched async so grid_mu (held
                 // here on the core thread) is released before scheduleMsgTimer
-                // queries nextMsgTimeoutMs(), which re-acquires it.
+                // queries tryNextMsgTimeoutMs(), which re-acquires it.
                 DispatchQueue.main.async {
                     me.terminalView?.scheduleMsgTimer()
                 }
@@ -1390,16 +1388,10 @@ final class ZonvieCore {
     }
 
     /// Milliseconds until the core's earliest pending msg_show/msg_history
-    /// timeout (throttle or auto-hide), clamped to >= 0. Returns -1 if no
-    /// timeout is armed. Used to schedule a one-shot tick instead of polling.
-    func nextMsgTimeoutMs() -> Int64 {
-        guard let core else { return -1 }
-        return zonvie_core_next_msg_timeout_ms(core)
-    }
-
-    /// Non-blocking version of nextMsgTimeoutMs. Returns the same values on
-    /// success, or -2 if the core's grid lock was busy. Unlike the cache
-    /// pattern used elsewhere in this file, -2 must NOT be treated as
+    /// timeout (throttle or auto-hide), clamped to >= 0, without blocking:
+    /// returns -1 if no timeout is armed, or -2 if the core's grid lock was
+    /// busy. Used to schedule a one-shot tick instead of polling. Unlike the
+    /// cache pattern used elsewhere in this file, -2 must NOT be treated as
     /// "nothing pending" (that's -1, a real answer) -- the caller should
     /// retry shortly rather than skip arming its timer, or an
     /// already-armed auto-hide deadline could be missed.
@@ -1808,7 +1800,8 @@ final class ZonvieCore {
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
 
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
-        // here. The RPC thread blocks in waitForLayoutReady() until the actual
+        // here. The RPC thread blocks on the core's layout-ready wait
+        // (ui_attach_cond in rpc_session.zig) until the actual
         // post-layout drawable size is known. MetalTerminalView.maybeResizeCoreGrid()
         // calls notifyInitialLayout() with computed rows/cols on its first valid
         // drawable update, which is what unblocks ui_attach. This mirrors the
@@ -2632,26 +2625,6 @@ final class ZonvieCore {
         }
     }
 
-    func setLogEnabledViaCore(_ enabled: Bool) {
-        guard let core else { return }
-        zonvie_core_set_log_enabled(core, enabled ? 1 : 0)
-        ZonvieCore.appLogEnabled = enabled
-        // Re-apply perf_only/scroll_only/verbose on each enable toggle so a
-        // runtime toggle of the log flag never resets them to their core
-        // defaults (off).
-        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
-        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
-        zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
-    }
-
-    /// Drop all non-[perf...] log lines at the core boundary. Independent of
-    /// setLogEnabledViaCore — caller must still enable logging for any output.
-    func setLogPerfOnlyViaCore(_ enabled: Bool) {
-        guard let core else { return }
-        zonvie_core_set_log_perf_only(core, enabled ? 1 : 0)
-        ZonvieCore.appLogPerfOnly = enabled
-    }
-
     // MARK: - Smooth Scrolling Support
 
     /// Grid info for hit-testing (Swift-friendly wrapper)
@@ -2699,25 +2672,6 @@ final class ZonvieCore {
         )
     }
 
-    /// Get visible grids for hit-testing (highest zindex wins)
-    func getVisibleGrids() -> [GridInfo] {
-        guard let core else { return [] }
-
-        // The legacy API does not report the total count. A full buffer may be
-        // truncated, so retry with geometric growth until the result fits.
-        var capacity = 16
-        while true {
-            var grids = [zonvie_grid_info](repeating: zonvie_grid_info(), count: capacity)
-            let count = grids.withUnsafeMutableBufferPointer { buffer in
-                zonvie_core_get_visible_grids(core, buffer.baseAddress, buffer.count)
-            }
-            if count < capacity {
-                return (0..<count).map { Self.gridInfo(from: grids[$0]) }
-            }
-            capacity *= 2
-        }
-    }
-
     /// Cached visible grids for non-blocking UI queries (main thread only).
     /// Pre-reserved to 16 elements to avoid reallocation in steady state.
     private var cachedVisibleGrids: [GridInfo] = {
@@ -2733,7 +2687,7 @@ final class ZonvieCore {
         count: 16
     )
 
-    /// Non-blocking version of getVisibleGrids with cache fallback.
+    /// Visible grids for hit-testing (highest zindex wins), without blocking.
     /// Attempts tryLock on grid_mu; on success updates cache in-place.
     /// On failure returns previously cached data to avoid blocking the UI thread.
     /// Allocation-free in steady state (after query/cache high-water marks).
@@ -3176,19 +3130,10 @@ final class ZonvieCore {
         var col: Int32
     }
 
-    /// Get current cursor position
-    func getCursorPosition() -> CursorPosition {
-        guard let core else { return CursorPosition(gridId: -1, row: -1, col: -1) }
-        var row: Int32 = 0
-        var col: Int32 = 0
-        let gridId = zonvie_core_get_cursor_position(core, &row, &col)
-        return CursorPosition(gridId: gridId, row: row, col: col)
-    }
-
     /// Cached cursor position for the non-blocking query below (main thread only).
     private var cachedCursorPos: CursorPosition?
 
-    /// Non-blocking version of getCursorPosition with cache fallback.
+    /// Current cursor position, without blocking.
     /// Attempts tryLock on grid_mu; on success updates the cache. On lock
     /// contention returns the previously cached position (at most one
     /// flush stale) so IME composition never blocks on the core thread's
@@ -4465,8 +4410,6 @@ final class ZonvieCore {
     /// Track last cursor grid to detect transitions from external windows
     private var lastCursorGrid: Int64 = 1
 
-    /// Timestamp when cursor left an external window (used to suppress main window activation briefly)
-    private var lastExternalWindowExitTime: Date? = nil
 
     private func onExternalWindow(
         gridId: Int64,
@@ -5440,6 +5383,40 @@ final class ZonvieCore {
         return targetWin
     }
 
+    /// Repaint every non-cursor background vertex that currently carries `from`
+    /// with `to`. Decorated grids use this to swap the core's background colour
+    /// for the window-chrome-adjusted one without touching glyphs, decorations
+    /// or the cursor.
+    ///
+    /// Only background quads are considered (texCoord.0 < 0). The 0.005
+    /// tolerance absorbs the float round-trip through the vertex colours; cells
+    /// the core painted from a different highlight -- PmenuSel, for one -- miss
+    /// it and keep their own colour, which is what leaves the popupmenu
+    /// selection visible over a shader.
+    private static func replaceDecoratedBackgroundColor(
+        in adjustedVertices: inout [zonvie_vertex],
+        from: (r: CGFloat, g: CGFloat, b: CGFloat),
+        to: (r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)
+    ) {
+        let (origR, origG, origB) = from
+        let (adjR, adjG, adjB, adjA) = to
+        for i in adjustedVertices.indices {
+            if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
+            if adjustedVertices[i].texCoord.0 < 0 {
+                let vr = CGFloat(adjustedVertices[i].color.0)
+                let vg = CGFloat(adjustedVertices[i].color.1)
+                let vb = CGFloat(adjustedVertices[i].color.2)
+                let tolerance: CGFloat = 0.005
+                if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
+                    adjustedVertices[i].color.0 = Float(adjR)
+                    adjustedVertices[i].color.1 = Float(adjG)
+                    adjustedVertices[i].color.2 = Float(adjB)
+                    adjustedVertices[i].color.3 = Float(adjA)
+                }
+            }
+        }
+    }
+
     /// Called to update vertices for an external grid.
     private func prepareExternalVertexArray(
         gridId: Int64,
@@ -5502,21 +5479,11 @@ final class ZonvieCore {
             var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
             bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
 
-            for i in adjustedVertices.indices {
-                if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
-                if adjustedVertices[i].texCoord.0 < 0 {
-                    let vr = CGFloat(adjustedVertices[i].color.0)
-                    let vg = CGFloat(adjustedVertices[i].color.1)
-                    let vb = CGFloat(adjustedVertices[i].color.2)
-                    let tolerance: CGFloat = 0.005
-                    if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
-                        adjustedVertices[i].color.0 = Float(adjR)
-                        adjustedVertices[i].color.1 = Float(adjG)
-                        adjustedVertices[i].color.2 = Float(adjB)
-                        adjustedVertices[i].color.3 = Float(adjA)
-                    }
-                }
-            }
+            ZonvieCore.replaceDecoratedBackgroundColor(
+                in: &adjustedVertices,
+                from: (origR, origG, origB),
+                to: (adjR, adjG, adjB, adjA)
+            )
             return (adjustedVertices, bgColor)
         }
 
@@ -5545,21 +5512,11 @@ final class ZonvieCore {
         var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
         bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
 
-        for i in adjustedVertices.indices {
-            if (adjustedVertices[i].deco_flags & ZONVIE_DECO_CURSOR) != 0 { continue }
-            if adjustedVertices[i].texCoord.0 < 0 {
-                let vr = CGFloat(adjustedVertices[i].color.0)
-                let vg = CGFloat(adjustedVertices[i].color.1)
-                let vb = CGFloat(adjustedVertices[i].color.2)
-                let tolerance: CGFloat = 0.005
-                if abs(vr - origR) < tolerance && abs(vg - origG) < tolerance && abs(vb - origB) < tolerance {
-                    adjustedVertices[i].color.0 = Float(adjR)
-                    adjustedVertices[i].color.1 = Float(adjG)
-                    adjustedVertices[i].color.2 = Float(adjB)
-                    adjustedVertices[i].color.3 = Float(adjA)
-                }
-            }
-        }
+        ZonvieCore.replaceDecoratedBackgroundColor(
+            in: &adjustedVertices,
+            from: (origR, origG, origB),
+            to: (adjR, adjG, adjB, adjA)
+        )
 
         return (adjustedVertices, bgColor)
     }
@@ -5665,6 +5622,42 @@ final class ZonvieCore {
         }
     }
 
+    /// The floating-panel recipe shared by the ext-UI popupmenu/message
+    /// windows and the standalone short-message and prompt windows.
+    /// hidesOnDeactivate is the only setting the callers disagree on.
+    private static func applyFloatingPanelSettings(_ window: NSWindow, hidesOnDeactivate: Bool) {
+        window.hasShadow = true
+        window.level = .floating
+        window.isOpaque = false
+        window.backgroundColor = transparentShadowedWindowBackground
+        window.hidesOnDeactivate = hidesOnDeactivate
+        window.isReleasedWhenClosed = false
+    }
+
+    /// The rounded, optionally blur-tinted container the three standalone
+    /// panels put inside their borderless window.
+    private static func makeRoundedPanelContainer(
+        width: CGFloat,
+        height: CGFloat,
+        background: NSColor,
+        border: NSColor,
+        borderWidth: CGFloat
+    ) -> NSView {
+        let containerView = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        containerView.wantsLayer = true
+        containerView.layer?.cornerRadius = 8.0
+        containerView.layer?.masksToBounds = true
+        if ZonvieConfig.shared.blurEnabled {
+            let opacity = ZonvieConfig.shared.backgroundAlpha
+            containerView.layer?.backgroundColor = background.withAlphaComponent(CGFloat(opacity)).cgColor
+        } else {
+            containerView.layer?.backgroundColor = background.cgColor
+        }
+        containerView.layer?.borderColor = border.cgColor
+        containerView.layer?.borderWidth = borderWidth
+        return containerView
+    }
+
     private func applyExternalWindowSettings(
         _ window: NSWindow,
         kind: ExternalGridKind,
@@ -5684,11 +5677,7 @@ final class ZonvieCore {
             window.level = NSApp.isActive ? .floating : .normal
 
         case .popupmenu, .msgShow, .msgHistory:
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.hidesOnDeactivate = true
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
         case .normal:
             window.title = "Window \(win)"
@@ -5932,6 +5921,37 @@ final class ZonvieCore {
         ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(msgShowX),\(msgShowY))")
     }
 
+    /// Place the cmdline-completion popupmenu against the cmdline window:
+    /// just above it, or just below when there is no room above on that
+    /// screen. Returns nil when there is no cmdline window, which the two
+    /// call sites answer with different fallbacks -- the create path with a
+    /// screen-centred rect, the update path by leaving the frame alone.
+    ///
+    /// `direction` is returned rather than logged here so that only the
+    /// create path logs, as before; the update path runs per geometry update.
+    private func cmdlinePopupmenuPlacement(
+        startCol: Int32,
+        cellW: CGFloat,
+        scale: CGFloat,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat
+    ) -> (rect: NSRect, direction: String)? {
+        guard let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] else {
+            return nil
+        }
+        let cmdlineFrame = cmdlineWindow.frame
+        let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
+        let popupmenuPadding: CGFloat = 8.0
+        let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
+        let gap: CGFloat = 4.0
+        let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
+        let belowY = cmdlineFrame.origin.y - windowHeight - gap
+        let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+        let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
+        return (NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
+                y == aboveY ? "above" : "below")
+    }
+
     private func buildInitialDecoratedWindowRect(
         kind: ExternalGridKind,
         win: Int64,
@@ -5983,19 +6003,12 @@ final class ZonvieCore {
             // popupmenuAnchorGrid is used only for cmdline detection.
             let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
             if isCmdlineCompletion {
-                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                    let cmdlineFrame = cmdlineWindow.frame
-                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-                    let popupmenuPadding: CGFloat = 8.0
-                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
-                    let gap: CGFloat = 4.0
-                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
-                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
-                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
-                    let direction = (y == aboveY) ? "above" : "below"
-                    ZonvieCore.appLog("[external_window] popupmenu positioned \(direction) cmdline at (\(x),\(y))")
-                    return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                if let placement = cmdlinePopupmenuPlacement(
+                    startCol: startCol, cellW: cellW, scale: scale,
+                    windowWidth: windowWidth, windowHeight: windowHeight
+                ) {
+                    ZonvieCore.appLog("[external_window] popupmenu positioned \(placement.direction) cmdline at (\(placement.rect.origin.x),\(placement.rect.origin.y))")
+                    return placement.rect
                 }
 
                 if let screen = NSScreen.main {
@@ -6203,17 +6216,11 @@ final class ZonvieCore {
             let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
 
             if isCmdlineCompletion {
-                if let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] {
-                    let cmdlineFrame = cmdlineWindow.frame
-                    let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-                    let popupmenuPadding: CGFloat = 8.0
-                    let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
-                    let gap: CGFloat = 4.0
-                    let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
-                    let belowY = cmdlineFrame.origin.y - windowHeight - gap
-                    let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                    let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
-                    windowRect = NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+                if let placement = cmdlinePopupmenuPlacement(
+                    startCol: startCol, cellW: cellW, scale: scale,
+                    windowWidth: windowWidth, windowHeight: windowHeight
+                ) {
+                    windowRect = placement.rect
                 }
                 return windowRect
             }
@@ -7134,9 +7141,20 @@ final class ZonvieCore {
         }
     }
 
+    // Nothing below this line ever runs. Of the cmdline callbacks the core
+    // dispatches, only on_cmdline_show does; pos, special_char and the three
+    // block ones are never invoked, so these appLog lines have no output to
+    // produce. cmdline state goes into the grid instead (setCmdlinePos,
+    // setCmdlineBlockShow and friends), flush composes it into
+    // CMDLINE_GRID_ID, and it arrives here as an external window like any
+    // other grid — logged core-side on the way through.
+    //
+    // The C struct keeps the slots because removing them would shift every
+    // field after them in zonvie_callbacks; these stay pointed at them so an
+    // empty slot is not mistaken for a missing implementation.
+
     private func onCmdlinePos(pos: UInt32, level: UInt32) {
         ZonvieCore.appLog("[cmdline_pos] pos=\(pos) level=\(level)")
-        // TODO: Implement cmdline cursor position update
     }
 
     private func onCmdlineSpecialChar(c: UnsafePointer<UInt8>?, cLen: Int, shift: Bool, level: UInt32) {
@@ -7147,26 +7165,18 @@ final class ZonvieCore {
             charStr = ""
         }
         ZonvieCore.appLog("[cmdline_special_char] c='\(charStr)' shift=\(shift) level=\(level)")
-
-        // TODO: Handle special char display
     }
 
     private func onCmdlineBlockShow(lines: UnsafePointer<zonvie_cmdline_block_line>?, lineCount: Int) {
         ZonvieCore.appLog("[cmdline_block_show] lineCount=\(lineCount)")
-
-        // TODO: Implement cmdline block UI
     }
 
     private func onCmdlineBlockAppend(line: UnsafePointer<zonvie_cmdline_chunk>?, chunkCount: Int) {
         ZonvieCore.appLog("[cmdline_block_append] chunkCount=\(chunkCount)")
-
-        // TODO: Implement cmdline block append
     }
 
     private func onCmdlineBlockHide() {
         ZonvieCore.appLog("[cmdline_block_hide]")
-
-        // TODO: Hide cmdline block
     }
 
     // MARK: - ext_popupmenu callbacks
@@ -7390,23 +7400,21 @@ final class ZonvieCore {
         }
     }
 
-    private func onMsgShowmode(
+    /// showmode, showcmd and ruler are one status message under three
+    /// labels: the same chunk concatenation, the same ZONVIE_MSG_VIEW_NONE
+    /// early return and the same four-way view dispatch. All three are
+    /// state-driven, so the ext_float arm hides on empty content rather than
+    /// arming a timeout the way msg_show does.
+    private func onMsgStatus(
+        _ miniId: MiniWindowId,
+        label: String,
         view: zonvie_msg_view_type,
         chunks: UnsafePointer<zonvie_msg_chunk>?,
         chunkCount: Int
     ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
-            }
-        }
+        let contentStr = ZonvieCore.concatMsgChunks(chunks, chunkCount)
 
-        ZonvieCore.appLog("[msg_showmode] content='\(contentStr)' view=\(view.rawValue)")
+        ZonvieCore.appLog("[msg_\(label)] content='\(contentStr)' view=\(view.rawValue)")
 
         // Check if view is none
         if view == ZONVIE_MSG_VIEW_NONE {
@@ -7417,115 +7425,36 @@ final class ZonvieCore {
             guard let self = self else { return }
             switch view {
             case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.showmode, content: contentStr)
+                self.updateMini(miniId, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showmode: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content on mode exit)
+                // ext_float: state-driven (no timeout needed, cleared when
+                // Neovim sends empty content)
                 if contentStr.isEmpty {
                     self.hideMessageWindow()
                 } else {
-                    self.showMessageWindow(kind: "showmode", content: contentStr)
+                    self.showMessageWindow(kind: label, content: contentStr)
                 }
             case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for showmode
                 self.showOSNotification(title: "Neovim", body: contentStr)
             default:
                 // Fallback to mini for other views
-                self.updateMini(.showmode, content: contentStr)
+                self.updateMini(miniId, content: contentStr)
             }
         }
     }
 
-    private func onMsgShowcmd(
-        view: zonvie_msg_view_type,
-        chunks: UnsafePointer<zonvie_msg_chunk>?,
-        chunkCount: Int
-    ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
+    /// Concatenate a msg chunk array into one string. Chunks with a null
+    /// pointer or zero length contribute nothing.
+    private static func concatMsgChunks(_ chunks: UnsafePointer<zonvie_msg_chunk>?, _ chunkCount: Int) -> String {
+        guard let chunks = chunks, chunkCount > 0 else { return "" }
+        var out = ""
+        for i in 0..<chunkCount {
+            let chunk = chunks[i]
+            if let textPtr = chunk.text, chunk.text_len > 0 {
+                out += String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
             }
         }
-
-        ZonvieCore.appLog("[msg_showcmd] content='\(contentStr)' view=\(view.rawValue)")
-
-        // Check if view is none
-        if view == ZONVIE_MSG_VIEW_NONE {
-            return
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            switch view {
-            case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.showcmd, content: contentStr)
-            case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for showcmd: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content)
-                if contentStr.isEmpty {
-                    self.hideMessageWindow()
-                } else {
-                    self.showMessageWindow(kind: "showcmd", content: contentStr)
-                }
-            case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for showcmd
-                self.showOSNotification(title: "Neovim", body: contentStr)
-            default:
-                // Fallback to mini for other views
-                self.updateMini(.showcmd, content: contentStr)
-            }
-        }
-    }
-
-    private func onMsgRuler(
-        view: zonvie_msg_view_type,
-        chunks: UnsafePointer<zonvie_msg_chunk>?,
-        chunkCount: Int
-    ) {
-        var contentStr = ""
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
-            }
-        }
-
-        ZonvieCore.appLog("[msg_ruler] content='\(contentStr)' view=\(view.rawValue)")
-
-        // Check if view is none
-        if view == ZONVIE_MSG_VIEW_NONE {
-            return
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            switch view {
-            case ZONVIE_MSG_VIEW_MINI:
-                self.updateMini(.ruler, content: contentStr)
-            case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float for ruler: state-driven (no timeout needed,
-                // cleared when Neovim sends empty content)
-                if contentStr.isEmpty {
-                    self.hideMessageWindow()
-                } else {
-                    self.showMessageWindow(kind: "ruler", content: contentStr)
-                }
-            case ZONVIE_MSG_VIEW_NOTIFICATION:
-                // OS notification for ruler
-                self.showOSNotification(title: "Neovim", body: contentStr)
-            default:
-                // Fallback to mini for other views
-                self.updateMini(.ruler, content: contentStr)
-            }
-        }
+        return out
     }
 
     private func onMsgHistoryShow(
@@ -7948,14 +7877,6 @@ final class ZonvieCore {
         }
     }
 
-    /// Hide all mini windows
-    private func hideAllMinis() {
-        for miniId in MiniWindowId.allCases {
-            miniWindows[miniId]?.window?.orderOut(nil)
-            miniWindows[miniId]?.content = ""
-        }
-    }
-
     /// Creates or updates the ext-float window (msg_show) in the top-right corner of the screen
     // Store scroll view and text view for long messages
     private var messageScrollView: NSScrollView?
@@ -8274,28 +8195,11 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = bgColor.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = bgColor.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            // Thicker border for prompts
-            containerView.layer?.borderWidth = isPrompt ? 2.0 : 1.0
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: bgColor, border: borderColor, borderWidth: isPrompt ? 2.0 : 1.0)
 
             let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
             textField.stringValue = content
@@ -8381,27 +8285,11 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = false
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = bgColor.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = bgColor.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            containerView.layer?.borderWidth = 1.0
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: bgColor, border: borderColor, borderWidth: 1.0)
 
             // Create scroll view
             let scrollView = NSScrollView(frame: NSRect(x: padding, y: padding, width: windowWidth - padding * 2, height: windowHeight - padding * 2))
@@ -8578,27 +8466,12 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            window.hasShadow = true
-            window.level = .floating
-            window.isOpaque = false
-            window.backgroundColor = Self.transparentShadowedWindowBackground
-            window.isReleasedWhenClosed = false
-            window.hidesOnDeactivate = true  // Hide when app loses focus (like ext-cmdline)
+            // Hide when app loses focus (like ext-cmdline)
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
-            let containerView = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
-            containerView.wantsLayer = true
-            containerView.layer?.cornerRadius = 8.0
-            containerView.layer?.masksToBounds = true
-
-            if ZonvieConfig.shared.blurEnabled {
-                let opacity = ZonvieConfig.shared.backgroundAlpha
-                containerView.layer?.backgroundColor = adjustedBg.withAlphaComponent(CGFloat(opacity)).cgColor
-            } else {
-                containerView.layer?.backgroundColor = adjustedBg.cgColor
-            }
-
-            containerView.layer?.borderColor = borderColor.cgColor
-            containerView.layer?.borderWidth = 2.0  // Thicker for prompts
+            let containerView = Self.makeRoundedPanelContainer(
+                width: windowWidth, height: windowHeight,
+                background: adjustedBg, border: borderColor, borderWidth: 2.0)
 
             let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
             textField.stringValue = content

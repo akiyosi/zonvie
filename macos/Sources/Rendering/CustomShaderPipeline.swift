@@ -38,15 +38,6 @@ final class CustomShaderPipeline {
         return source.range(of: pattern, options: .regularExpression) != nil
     }
 
-    /// Errors surfaced to the renderer while building a custom pipeline.
-    enum LoadError: Error {
-        case fileRead(String, Error)
-        case emptySource(String)
-        case glslCompile(String, String)       // path, error message from glslang/SPIRV-Cross
-        case mslLibraryCompile(String, Error)
-        case missingFragmentFunction(String)
-        case pipelineStateCompile(String, Error)
-    }
 
     /// Load a single custom shader from disk, compile it, and build a
     /// render pipeline state. Returns nil on any failure after logging —

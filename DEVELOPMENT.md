@@ -150,13 +150,9 @@ Important files include:
 
 ### Text and glyph pipeline
 
-Text-related functionality is split between core and text helpers:
-
-- `src/text/shaping_harfbuzz.zig`
-- `src/text/rasterize_freetype.zig`
-- `src/text/gpu_atlas.zig`
-
-The glyph atlas uses a two-phase core-managed approach:
+Shaping and rasterization are driven from the core through the HarfBuzz/
+FreeType bridge (`include/zonvie_hbft.h`), with the frontends supplying the
+rasterizer. The glyph atlas uses a two-phase core-managed approach:
 - Core manages shelf packing and glyph cache (zero per-cell allocation)
 - Frontend handles rasterization (FreeType on macOS, DirectWrite on Windows) and texture upload
 - Atlas textures are double-buffered with COW detach for safe concurrent read/write
@@ -329,6 +325,71 @@ path = "/tmp/zonvie.log"
 - Prefer narrow builds/tests while iterating.
 - When touching shared ABI or redraw behavior, inspect both frontends before concluding a change is safe.
 - When touching performance-sensitive code, note whether allocations, lock contention, or flush behavior changed.
+
+### Speeding up `grid_line` decoding
+
+`grid_line` is the highest-volume redraw event, and decoding it currently
+materialises a full `mp.Value` tree before `handleRedraw` walks it. A
+zero-copy streaming decoder (`mpack_stream.zig` + `handleRedrawStream` +
+`streamGridLine`) was written to avoid that and later removed. Read this
+before attempting it again.
+
+**Half of the benchmark that justified removing it was invalid.**
+`test/mpack_bench.zig` (recover with `git show $(git log --diff-filter=D --format=%h -- test/mpack_bench.zig)~1:test/mpack_bench.zig`)
+held two independent benches, and they are not equally trustworthy.
+
+* *"redraw grid_line decode paths"* compared `mp.decode` against
+  `InnerDecoder + decodeFromStream`. Both build a full `Value` tree, so the
+  payload shape does not matter and the comparison is sound. This is where
+  the "Value tree is 1.24x–1.94x faster" figure came from. It says the
+  streaming decoder's machinery lost at building `Value` trees — it says
+  nothing about writing cells straight into the grid, which was the whole
+  point of the design.
+* *"redraw full-path"* is the one that was supposed to measure that, and it
+  did not. It built `grid_line` tuples with four fields, but both decode
+  paths discard tuples with fewer than five
+  (`[grid, row, col_start, cells, wrap]`), so no cell was ever written on
+  either side. Worse, the two sides were doing different amounts of work:
+  the Value side still decoded the entire frame into a tree (2.3 MiB of
+  arena at 10k cells) while the streaming side only skipped bytes — and the
+  streaming side still lost by 1.35x–1.42x. The recorded "new: 0 arena
+  bytes" reads as proof that `streamGridLine` does not allocate; it is
+  equally consistent with `streamGridLine` never having run.
+
+A replacement harness must assert that cells actually reached the grid before
+any of its numbers are quoted.
+
+**Where the cost might be.** The original author's stated root cause was that
+the generic `readHead -> ValueHead union -> switch` layer costs more per cell
+than `mp.decode`'s direct dispatch. That is a hypothesis, not a measurement:
+no bench ever isolated it, and `mp.decode` allocates per node while the
+streaming path does not. Treat it as the first thing to test, not as
+settled. The concrete structural cost that *is* visible in the removed code
+is the two passes over each frame (skip-validate, then decode) and the
+re-entry into `handleRedraw` once per non-`grid_line` event, which repeats
+that function's per-batch prologue every time.
+
+A serious attempt would bypass the generic decoder and read tag bytes
+directly for `grid_line` only, leaving every other event on the existing
+path — but note the constraint that made the removed version re-enter
+`handleRedraw` per event in the first place: `grid_line` and the events
+around it must still be applied in wire order, so a fast path cannot simply
+batch all `grid_line` events and run the rest afterwards. Little of the
+removed code would be reusable either way.
+
+**What a streaming decoder must carry that the removed one did not.**
+`mp.decode` enforces a recursion depth limit, a container-item limit, an
+allocation budget and a blob-size limit. The removed streaming bridge had
+none of them, so a crafted frame could exhaust the stack outright. Any
+replacement needs equivalent guards before it goes anywhere near the RPC
+loop, along with a decision about frame-buffer lifetime: zero-copy views
+point into the reader's backing store, which a later `fill()` can move
+while frontend callbacks are still running.
+
+The per-cell semantics that any implementation must reproduce (sticky `hl`,
+`-1` inheriting from the left except at column 0, `repeat == 0` writing
+nothing, multi-codepoint clusters going to the overflow map) are pinned by
+the `grid_line` tests in `src/core/redraw_handler.zig`.
 
 ## Validation Checklist
 

@@ -231,335 +231,36 @@ fn calculateDropTarget(mouse_pos: c_int, item_count: usize, item_size: c_int) us
     return target_idx;
 }
 
-const tabline_class_name: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieTablineClass");
-var tabline_class_registered: bool = false;
-
-pub fn registerTablineWindowClass() bool {
-    if (tabline_class_registered) return true;
-
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.style = c.CS_HREDRAW | c.CS_VREDRAW;
-    wc.lpfnWndProc = tablineWndProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
-    wc.hbrBackground = null;
-    wc.lpszClassName = @ptrCast(tabline_class_name.ptr);
-
-    if (c.RegisterClassExW(&wc) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] Failed to register tabline window class\n", .{});
-        return false;
-    }
-
-    tabline_class_registered = true;
-    if (applog.isEnabled()) applog.appLog("[win] Tabline window class registered\n", .{});
-    return true;
-}
-
-pub fn createTablineWindow(parent_hwnd: c.HWND, app: *App) ?c.HWND {
-    if (!registerTablineWindowClass()) return null;
-
-    var parent_rect: c.RECT = undefined;
-    _ = c.GetClientRect(parent_hwnd, &parent_rect);
-
-    const hwnd = c.CreateWindowExW(
-        0,
-        @ptrCast(tabline_class_name.ptr),
-        null,
-        c.WS_CHILD | c.WS_VISIBLE | c.WS_CLIPSIBLINGS,
-        0,
-        0,
-        parent_rect.right,
-        app.scalePx(TablineState.TAB_BAR_HEIGHT),
-        parent_hwnd,
-        null,
-        c.GetModuleHandleW(null),
-        @ptrCast(app),
-    );
-
-    if (hwnd == null) {
-        if (applog.isEnabled()) applog.appLog("[win] Failed to create tabline window\n", .{});
-        return null;
-    }
-
-    // Ensure tabline is on top of content window (in Z-order)
-    _ = c.SetWindowPos(hwnd, c.HWND_TOP, 0, 0, 0, 0, c.SWP_NOMOVE | c.SWP_NOSIZE);
-
-    return hwnd;
-}
-
-pub fn tablineWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
-    switch (msg) {
-        c.WM_NCHITTEST => {
-            // Hit test for tabline child window:
-            // - Return HTTRANSPARENT for empty areas (passes hit test to parent window for dragging)
-            // - Return HTCLIENT for interactive areas (tabs, +button, window buttons)
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-
-                // Get cursor position in screen coordinates
-                const screen_x = @as(i16, @truncate(lParam & 0xFFFF));
-                const screen_y = @as(i16, @truncate((lParam >> 16) & 0xFFFF));
-
-                // Convert to client coordinates
-                var pt: c.POINT = .{ .x = screen_x, .y = screen_y };
-                _ = c.ScreenToClient(hwnd, &pt);
-                const x = pt.x;
-                const y = pt.y;
-
-                // Get client rect
-                var rect: c.RECT = undefined;
-                _ = c.GetClientRect(hwnd, &rect);
-                const client_width = rect.right - rect.left;
-
-                // DPI-scaled constants
-                const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-                const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-                const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-                const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
-                const plus_space = app.scalePx(40);
-
-                // Check window control buttons (right side) - handle in this window
-                const btn_start_x = client_width - btns_total;
-                if (x >= btn_start_x) {
-                    return c.HTCLIENT;
-                }
-
-                // Check tabs and + button area
-                app.mu.lockUncancelable(core.clock.io());
-                const tab_count = app.tabline_state.tab_count;
-                app.mu.unlock(core.clock.io());
-
-                if (tab_count > 0) {
-                    // Calculate tab dimensions (same as handleTablineMouseDown)
-                    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
-                    const count_i32: i32 = @intCast(tab_count);
-                    const ideal_width = @divTrunc(available_width, count_i32);
-                    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
-
-                    // Check if on a tab
-                    var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-                    for (0..tab_count) |_| {
-                        if (x >= tab_x and x < tab_x + tab_width and y >= 0 and y < bar_height) {
-                            return c.HTCLIENT;
-                        }
-                        tab_x += tab_width + 1;
-                    }
-
-                    // Check + button (after last tab)
-                    const plus_x = tab_x + app.scalePx(8);
-                    const scaled_plus_size = app.scalePx(24);
-                    if (x >= plus_x and x < plus_x + scaled_plus_size) {
-                        return c.HTCLIENT;
-                    }
-                }
-
-                // Empty area - pass to parent window for caption dragging
-                return c.HTTRANSPARENT;
-            }
-            return c.HTTRANSPARENT;
-        },
-        c.WM_CREATE => {
-            const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
-            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(cs.lpCreateParams)));
-            return 0;
-        },
-        c.WM_PAINT => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-
-                // Use GetDC instead of BeginPaint to avoid clip region issues
-                // BeginPaint was returning NULLREGION clip, causing drawing to be invisible
-                const hdc = c.GetDC(hwnd);
-                if (hdc != null) {
-                    var rect: c.RECT = undefined;
-                    _ = c.GetClientRect(hwnd, &rect);
-                    drawTablineContent(app, hdc, rect.right);
-                    _ = c.ReleaseDC(hwnd, hdc);
-                }
-
-                // Still need to validate the region to stop WM_PAINT messages
-                var ps: c.PAINTSTRUCT = undefined;
-                _ = c.BeginPaint(hwnd, &ps);
-                _ = c.EndPaint(hwnd, &ps);
-            } else {
-                // Validate region even without app
-                var ps: c.PAINTSTRUCT = undefined;
-                _ = c.BeginPaint(hwnd, &ps);
-                _ = c.EndPaint(hwnd, &ps);
-            }
-            return 0;
-        },
-        c.WM_LBUTTONDOWN => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-                // Start potential drag - record position and capture mouse
-                handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
-            }
-            return 0;
-        },
-        c.WM_LBUTTONUP => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-                handleTablineMouseUp(app, hwnd, @as(c_int, x), @as(c_int, y));
-            }
-            return 0;
-        },
-        c.WM_MOUSEMOVE => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-                handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
-            }
-            return 0;
-        },
-        c.WM_CAPTURECHANGED => {
-            // Mouse capture lost - cancel any drag or button press
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED: dragging_tab={?} is_external_drag={} close_button_pressed={?} new_tab_button_pressed={} pressed_window_btn={?}\n", .{ app.tabline_state.dragging_tab, app.tabline_state.is_external_drag, app.tabline_state.close_button_pressed, app.tabline_state.new_tab_button_pressed, app.tabline_state.pressed_window_btn });
-                if (app.tabline_state.dragging_tab != null or app.tabline_state.close_button_pressed != null or app.tabline_state.new_tab_button_pressed or app.tabline_state.pressed_window_btn != null) {
-                    if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED: cancelling drag/button!\n", .{});
-                    destroyDragPreviewWindow(app);
-                    app.tabline_state.cancelDrag();
-                    _ = c.InvalidateRect(hwnd, null, 0);
-                }
-            }
-            return 0;
-        },
-        c.WM_MOUSELEAVE => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                // Don't clear hover if dragging
-                if (app.tabline_state.dragging_tab == null) {
-                    if (app.tabline_state.hovered_tab != null or
-                        app.tabline_state.hovered_close != null or
-                        app.tabline_state.hovered_window_btn != null or
-                        app.tabline_state.hovered_new_tab_btn)
-                    {
-                        app.tabline_state.hovered_tab = null;
-                        app.tabline_state.hovered_close = null;
-                        app.tabline_state.hovered_window_btn = null;
-                        app.tabline_state.hovered_new_tab_btn = false;
-                        _ = c.InvalidateRect(hwnd, null, 0);
-                    }
-                }
-            }
-            return 0;
-        },
-        else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
-    }
-}
-
 // Content child window for D3D11 rendering (when ext_tabline enabled)
-const content_class_name: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieContentClass");
-var content_class_registered: bool = false;
 
-pub fn registerContentWindowClass() bool {
-    if (content_class_registered) return true;
-
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.style = c.CS_HREDRAW | c.CS_VREDRAW;
-    wc.lpfnWndProc = contentWndProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
-    wc.hbrBackground = null;
-    wc.lpszClassName = @ptrCast(content_class_name.ptr);
-
-    if (c.RegisterClassExW(&wc) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] Failed to register content window class\n", .{});
-        return false;
-    }
-
-    content_class_registered = true;
-    if (applog.isEnabled()) applog.appLog("[win] Content window class registered\n", .{});
-    return true;
-}
-
-pub fn createContentWindow(parent_hwnd: c.HWND, app: *App) ?c.HWND {
-    if (!registerContentWindowClass()) return null;
-
-    var parent_rect: c.RECT = undefined;
-    _ = c.GetClientRect(parent_hwnd, &parent_rect);
-
-    const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const hwnd = c.CreateWindowExW(
-        0,
-        @ptrCast(content_class_name.ptr),
-        null,
-        c.WS_CHILD | c.WS_VISIBLE | c.WS_CLIPSIBLINGS,
-        0,
-        tabbar_height,
-        parent_rect.right,
-        @max(1, parent_rect.bottom - tabbar_height),
-        parent_hwnd,
-        null,
-        c.GetModuleHandleW(null),
-        @ptrCast(app),
+/// Width of one tab for a given client width and tab count. Every drawing and
+/// hit-testing path must agree on this; it used to be spelled out at each
+/// site, including one copy in window.zig's WM_NCHITTEST.
+///
+/// tab_count <= 0 returns 0. The inline copies divided without that guard and
+/// were safe only because their callers checked first.
+pub fn tabWidthPx(app: *App, client_width: c_int, tab_count: c_int) c_int {
+    if (tab_count <= 0) return 0;
+    const available = client_width -
+        app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) -
+        app.scalePx(40) -
+        app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    return @min(
+        app.scalePx(TablineState.TAB_MAX_WIDTH),
+        @max(app.scalePx(TablineState.TAB_MIN_WIDTH), @divTrunc(available, tab_count)),
     );
-
-    if (hwnd == null) {
-        if (applog.isEnabled()) applog.appLog("[win] Failed to create content window\n", .{});
-        return null;
-    }
-
-    if (applog.isEnabled()) applog.appLog("[win] Content child window created\n", .{});
-    return hwnd;
 }
 
-pub fn contentWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) callconv(.winapi) c.LRESULT {
-    switch (msg) {
-        c.WM_CREATE => {
-            const cs: *c.CREATESTRUCTW = @ptrFromInt(@as(usize, @bitCast(lParam)));
-            _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(cs.lpCreateParams)));
-            return 0;
-        },
-        c.WM_PAINT => {
-            // D3D11 rendering is triggered from main window's WM_PAINT.
-            // This child window just needs to validate its region to prevent
-            // continuous WM_PAINT messages.
-            var ps: c.PAINTSTRUCT = undefined;
-            _ = c.BeginPaint(hwnd, &ps);
-            _ = c.EndPaint(hwnd, &ps);
-            return 0;
-        },
-        // Forward mouse/keyboard events to parent window
-        c.WM_LBUTTONDOWN, c.WM_LBUTTONUP, c.WM_RBUTTONDOWN, c.WM_RBUTTONUP, c.WM_MBUTTONDOWN, c.WM_MBUTTONUP, c.WM_MOUSEMOVE, c.WM_MOUSEWHEEL, c.WM_KEYDOWN, c.WM_KEYUP, c.WM_SYSKEYDOWN, c.WM_SYSKEYUP, c.WM_CHAR => {
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                if (app.hwnd) |main_hwnd| {
-                    return c.SendMessageW(main_hwnd, msg, wParam, lParam);
-                }
-            }
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
-        c.WM_SETFOCUS => {
-            // Keep focus on parent
-            const v = c.GetWindowLongPtrW(hwnd, c.GWLP_USERDATA);
-            if (v != 0) {
-                const app: *App = @ptrFromInt(@as(usize, @bitCast(v)));
-                if (app.hwnd) |main_hwnd| {
-                    _ = c.SetFocus(main_hwnd);
-                }
-            }
-            return 0;
-        },
-        else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
-    }
+/// Left edge of the + button, which sits one gap past the last tab.
+pub fn plusButtonXPx(app: *App, tab_count: c_int, tab_width: c_int) c_int {
+    return app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) +
+        tab_count * (tab_width + 1) + app.scalePx(8);
+}
+
+/// Side of the square + button. Both the painted ellipse and every hit test
+/// use this.
+pub fn plusButtonSizePx(app: *App) c_int {
+    return app.scalePx(20);
 }
 
 pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
@@ -578,18 +279,15 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // DPI-scaled constants
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
     // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
     // threshold, which should be constant in physical pixels regardless of DPI.
     const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
-    const plus_space = app.scalePx(40);
     const close_margin = app.scalePx(6);
     const plus_offset = app.scalePx(8);
-    const plus_btn_size = app.scalePx(20);
+    const plus_btn_size = plusButtonSizePx(app);
 
     // Handle dragging
     if (app.tabline_state.dragging_tab) |drag_idx| {
@@ -637,11 +335,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
         // Normal in-window drag: calculate drop target
         if (!app.tabline_state.is_external_drag) {
-            const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
             const tab_count: c_int = @intCast(app.tabline_state.tab_count);
             if (tab_count > 0) {
-                const ideal_width = @divTrunc(available_width, tab_count);
-                const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+                const tab_width = tabWidthPx(app, client_width, tab_count);
 
                 // Find which slot the mouse is over
                 var target_idx: usize = 0;
@@ -675,11 +371,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle close button pressed state - track if mouse leaves the button
     if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
-        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0 and pressed_tab_idx < app.tabline_state.tab_count) {
-            const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+            const tab_width = tabWidthPx(app, client_width, tab_count);
 
             const tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(pressed_tab_idx)) * (tab_width + 1);
             const close_x = tab_x + tab_width - close_size - close_margin;
@@ -706,11 +400,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle new tab button pressed state - track if mouse leaves the button
     if (app.tabline_state.new_tab_button_pressed) {
-        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0) {
-            const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+            const tab_width = tabWidthPx(app, client_width, tab_count);
             const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count * (tab_width + 1) + plus_offset;
 
             const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
@@ -758,11 +450,9 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
         }
     } else {
         // Check tabs
-        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count > 0) {
-            const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+            const tab_width = tabWidthPx(app, client_width, tab_count);
 
             var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
             for (0..app.tabline_state.tab_count) |i| {
@@ -787,12 +477,10 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     // Check + button hover
     var new_hovered_new_tab_btn: bool = false;
     {
-        const available_width_for_plus = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
         const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
         if (tab_count_for_plus > 0) {
-            const ideal_width_for_plus = @divTrunc(available_width_for_plus, tab_count_for_plus);
-            const tab_width_for_plus = @min(tab_max_w, @max(tab_min_w, ideal_width_for_plus));
-            const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count_for_plus * (tab_width_for_plus + 1) + plus_offset;
+            const tab_width_for_plus = tabWidthPx(app, client_width, tab_count_for_plus);
+            const plus_x = plusButtonXPx(app, tab_count_for_plus, tab_width_for_plus);
 
             const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
             if (x >= plus_x and x < plus_x + plus_btn_size and y >= plus_top and y < plus_top + plus_btn_size) {
@@ -820,15 +508,11 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
     // DPI-scaled constants
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
-    const plus_space = app.scalePx(40);
     const close_margin = app.scalePx(6);
-    const plus_offset = app.scalePx(8);
-    const plus_btn_size = app.scalePx(20);
+    const plus_btn_size = plusButtonSizePx(app);
 
     var rect: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &rect);
@@ -849,11 +533,9 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     }
 
     // Check close button on tabs
-    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     if (tab_count > 0) {
-        const ideal_width = @divTrunc(available_width, tab_count);
-        const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+        const tab_width = tabWidthPx(app, client_width, tab_count);
 
         if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: tab_count={d} tab_width={d}\n", .{ tab_count, tab_width });
 
@@ -898,12 +580,10 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     }
 
     // Check + button
-    const available_width_for_plus = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
     if (tab_count_for_plus > 0) {
-        const ideal_width_for_plus = @divTrunc(available_width_for_plus, tab_count_for_plus);
-        const tab_width_for_plus = @min(tab_max_w, @max(tab_min_w, ideal_width_for_plus));
-        const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count_for_plus * (tab_width_for_plus + 1) + plus_offset;
+        const tab_width_for_plus = tabWidthPx(app, client_width, tab_count_for_plus);
+        const plus_x = plusButtonXPx(app, tab_count_for_plus, tab_width_for_plus);
 
         if (x >= plus_x and x < plus_x + plus_btn_size) {
             // New tab button pressed - record state, action on mouseUp
@@ -1053,7 +733,7 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     }
     // Note: No else branch needed here. Close buttons and window buttons are
     // handled on mouseDown. Tab selection is also done on mouseDown when
-    // starting a drag. Calling handleTablineClick here would cause double-action.
+    // starting a drag. Selecting the tab again here would double the action.
 }
 
 // ---- Tab Externalization Functions ----
@@ -1326,6 +1006,79 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
     return h.final();
 }
 
+/// Which offscreen strip renderOffscreenToD3D is drawing.
+const OffscreenSurface = enum { tabline, sidebar };
+
+/// Draw one offscreen strip into a 32-bit top-down DIB and upload it to its
+/// D3D texture. Returns true only when the upload succeeded.
+///
+/// Both callers built the DIB identically and both must force the alpha
+/// channel opaque afterwards, because GDI leaves it untouched.
+///
+/// Dispatch is a switch rather than a pair of function pointers: the two
+/// content draws take different argument counts, and the two upload methods
+/// have independently inferred error sets, which a shared fn-pointer type
+/// would have to widen to anyerror on a WM_PAINT path.
+///
+/// The caller keeps its own preconditions -- the tabline's tab_count and
+/// change gates have no sidebar counterpart.
+fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height: u32) bool {
+    if (app.renderer == null) return false;
+    if (width == 0 or height == 0) return false;
+
+    const screen_dc = c.GetDC(null);
+    if (screen_dc == null) return false;
+    defer _ = c.ReleaseDC(null, screen_dc);
+
+    const mem_dc = c.CreateCompatibleDC(screen_dc);
+    if (mem_dc == null) return false;
+    defer _ = c.DeleteDC(mem_dc);
+
+    // 32-bit BGRA, top-down
+    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = @intCast(width);
+    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height));
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = c.BI_RGB;
+
+    var pixels_ptr: ?*anyopaque = null;
+    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
+    if (dib == null or pixels_ptr == null) return false;
+    defer _ = c.DeleteObject(dib);
+
+    const old_bmp = c.SelectObject(mem_dc, dib);
+    defer _ = c.SelectObject(mem_dc, old_bmp);
+
+    switch (surface) {
+        .tabline => drawTablineContent(app, mem_dc, @intCast(width)),
+        .sidebar => drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height)),
+    }
+
+    // GDI does not set the alpha channel; force it opaque.
+    const pixels: [*]u8 = @ptrCast(pixels_ptr);
+    const pixel_count = width * height;
+    var i: u32 = 0;
+    while (i < pixel_count) : (i += 1) {
+        pixels[i * 4 + 3] = 255;
+    }
+
+    const pixel_data = pixels[0 .. width * height * 4];
+    const g = &(app.renderer.?);
+    switch (surface) {
+        .tabline => g.updateTablineTexture(width, height, pixel_data) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
+            return false;
+        },
+        .sidebar => g.updateSidebarTexture(width, height, pixel_data) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
+            return false;
+        },
+    }
+    return true;
+}
+
 /// Render tabline to D3D11 texture via offscreen GDI bitmap.
 /// This avoids DWM composition issues by keeping GDI rendering offscreen
 /// and only using D3D11 for final display.
@@ -1343,54 +1096,16 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     const sig = tablineRenderSignature(app, width, height);
     if (sig == app.tabline_render_sig) return;
 
-    // Create memory DC and DIB section
-    const screen_dc = c.GetDC(null);
-    if (screen_dc == null) return;
-    defer _ = c.ReleaseDC(null, screen_dc);
-
-    const mem_dc = c.CreateCompatibleDC(screen_dc);
-    if (mem_dc == null) return;
-    defer _ = c.DeleteDC(mem_dc);
-
-    // Create DIB section (32-bit BGRA)
-    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
-    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = @intCast(width);
-    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height)); // Top-down
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = c.BI_RGB;
-
-    var pixels_ptr: ?*anyopaque = null;
-    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
-    if (dib == null or pixels_ptr == null) return;
-    defer _ = c.DeleteObject(dib);
-
-    const old_bmp = c.SelectObject(mem_dc, dib);
-    defer _ = c.SelectObject(mem_dc, old_bmp);
-
-    // Draw tabline to the memory DC
-    drawTablineContent(app, mem_dc, @intCast(width));
-
-    // GDI doesn't set alpha channel, so we need to set it to 255 (opaque)
-    const pixels: [*]u8 = @ptrCast(pixels_ptr);
-    const pixel_count = width * height;
-    var i: u32 = 0;
-    while (i < pixel_count) : (i += 1) {
-        pixels[i * 4 + 3] = 255; // Set alpha to opaque
-    }
-
-    // Update D3D11 texture
-    const pixel_data = pixels[0 .. width * height * 4];
-    if (app.renderer) |*g| {
-        g.updateTablineTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
-            return;
-        };
-        // Only record the signature after a successful upload so a failed
-        // upload retries on the next paint.
+    // Only record the signature after a successful upload so a failed
+    // upload retries on the next paint.
+    if (renderOffscreenToD3D(app, .tabline, width, height)) {
         app.tabline_render_sig = sig;
     }
+}
+
+/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
+pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
+    _ = renderOffscreenToD3D(app, .sidebar, width, height);
 }
 
 /// Draw tabline content (called from offscreen DC or child window WM_PAINT)
@@ -1466,19 +1181,16 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     }
 
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
     const tab_padding = app.scalePx(TablineState.TAB_PADDING);
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
     const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
     const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
-    const plus_space = app.scalePx(40);
     const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
     const close_margin = app.scalePx(6);
     const close_inset = app.scalePx(3);
     const top_padding = app.scalePx(4);
     const plus_offset = app.scalePx(8);
-    const plus_btn_size = app.scalePx(20);
+    const plus_btn_size = plusButtonSizePx(app);
     const plus_icon_inset = app.scalePx(5);
     const is_dragging = app.tabline_state.dragging_tab != null;
 
@@ -1496,10 +1208,8 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     _ = c.FillRect(hdc, &bar_rect, bg_brush);
 
     // Calculate tab width
-    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-    const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
+    const tab_width = tabWidthPx(app, client_width, tab_count);
 
     // Brushes
     const selected_brush = c.CreateSolidBrush(pal.tab_selected);
@@ -1936,233 +1646,9 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
     }
 }
 
-/// Handle tabline mouse click
-pub fn handleTablineClick(app: *App, x: c_int, y: c_int) bool {
-    if (!app.ext_tabline_enabled or !app.tabline_state.visible) return false;
-
-    // DPI-scaled constants
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
-    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
-    const plus_space = app.scalePx(40);
-    const close_margin = app.scalePx(6);
-    const plus_offset = app.scalePx(8);
-    const plus_btn_size = app.scalePx(20);
-
-    if (y >= bar_height) return false; // Below tab bar
-
-    // Get client width
-    var rect: c.RECT = undefined;
-    const main_hwnd = app.hwnd orelse return false;
-    _ = c.GetClientRect(main_hwnd, &rect);
-    const client_width = rect.right;
-
-    // Check window control buttons first (right side)
-    const btn_start_x = client_width - btns_total;
-    if (x >= btn_start_x) {
-        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
-        if (btn_idx == 0) {
-            // Minimize
-            _ = c.ShowWindow(main_hwnd, c.SW_MINIMIZE);
-            return true;
-        } else if (btn_idx == 1) {
-            // Maximize/Restore
-            if (c.IsZoomed(main_hwnd) != 0) {
-                _ = c.ShowWindow(main_hwnd, c.SW_RESTORE);
-            } else {
-                _ = c.ShowWindow(main_hwnd, c.SW_MAXIMIZE);
-            }
-            return true;
-        } else if (btn_idx == 2) {
-            // Close
-            _ = c.PostMessageW(main_hwnd, c.WM_CLOSE, 0, 0);
-            return true;
-        }
-    }
-
-    // Calculate tab width
-    const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
-    const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-    if (tab_count == 0) return false;
-    const ideal_width = @divTrunc(available_width, tab_count);
-    const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
-
-    // Check + button
-    const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count * (tab_width + 1) + plus_offset;
-    if (x >= plus_x and x < plus_x + plus_btn_size) {
-        // New tab - use nvim_command API to avoid showing in cmdline
-        if (app.corep) |corep| {
-            const cmd = "tabnew";
-            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-        }
-        // Force immediate repaint
-        _ = c.InvalidateRect(main_hwnd, null, 0);
-        _ = c.UpdateWindow(main_hwnd);
-        return true;
-    }
-
-    // Check tabs
-    var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-    for (0..app.tabline_state.tab_count) |i| {
-        if (x >= tab_x and x < tab_x + tab_width) {
-            // Check close button
-            const close_x = tab_x + tab_width - close_size - close_margin;
-            const close_y = @divTrunc(bar_height - close_size, 2);
-
-            if (x >= close_x and x < close_x + close_size and
-                y >= close_y and y < close_y + close_size)
-            {
-                // Close this tab - use nvim_command API to avoid showing in cmdline
-                if (app.corep) |corep| {
-                    var cmd_buf: [48]u8 = undefined;
-                    const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{i + 1}) catch return true;
-                    app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-                }
-                // Force immediate repaint
-                _ = c.InvalidateRect(main_hwnd, null, 0);
-                _ = c.UpdateWindow(main_hwnd);
-                return true;
-            }
-
-            // Select this tab - use nvim_command API so it works even in terminal mode
-            if (app.corep) |corep| {
-                var cmd_buf: [16]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{i + 1}) catch return true;
-                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-            }
-            // Force immediate repaint
-            _ = c.InvalidateRect(main_hwnd, null, 0);
-            _ = c.UpdateWindow(main_hwnd);
-            return true;
-        }
-        tab_x += tab_width + 1;
-    }
-
-    return false;
-}
-
-/// Handle tabline mouse move (for hover)
-pub fn handleTablineMouseMove(app: *App, x: c_int, y: c_int) void {
-    if (!app.ext_tabline_enabled or !app.tabline_state.visible) return;
-
-    // DPI-scaled constants
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const tab_min_w = app.scalePx(TablineState.TAB_MIN_WIDTH);
-    const tab_max_w = app.scalePx(TablineState.TAB_MAX_WIDTH);
-    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const plus_space = app.scalePx(40);
-    const close_margin = app.scalePx(6);
-
-    var new_hovered_tab: ?usize = null;
-    var new_hovered_close: ?usize = null;
-
-    if (y < bar_height) {
-        var rect: c.RECT = undefined;
-        if (app.hwnd) |hwnd| {
-            _ = c.GetClientRect(hwnd, &rect);
-        } else {
-            return;
-        }
-        const client_width = rect.right;
-
-        const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - plus_space - btns_total;
-        const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-        if (tab_count > 0) {
-            const ideal_width = @divTrunc(available_width, tab_count);
-            const tab_width = @min(tab_max_w, @max(tab_min_w, ideal_width));
-
-            var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-            for (0..app.tabline_state.tab_count) |i| {
-                if (x >= tab_x and x < tab_x + tab_width) {
-                    new_hovered_tab = i;
-
-                    // Check close button
-                    const close_x = tab_x + tab_width - close_size - close_margin;
-                    const close_y = @divTrunc(bar_height - close_size, 2);
-                    if (x >= close_x and x < close_x + close_size and
-                        y >= close_y and y < close_y + close_size)
-                    {
-                        new_hovered_close = i;
-                    }
-                    break;
-                }
-                tab_x += tab_width + 1;
-            }
-        }
-    }
-
-    if (new_hovered_tab != app.tabline_state.hovered_tab or
-        new_hovered_close != app.tabline_state.hovered_close)
-    {
-        app.tabline_state.hovered_tab = new_hovered_tab;
-        app.tabline_state.hovered_close = new_hovered_close;
-        if (app.hwnd) |hwnd| {
-            var tab_rect = c.RECT{
-                .left = 0,
-                .top = 0,
-                .right = 0,
-                .bottom = bar_height,
-            };
-            _ = c.GetClientRect(hwnd, &tab_rect);
-            tab_rect.bottom = bar_height;
-            _ = c.InvalidateRect(hwnd, &tab_rect, 0);
-        }
-    }
-}
-
 // =========================================================================
 // Sidebar mode rendering and mouse handling
 // =========================================================================
-
-/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
-pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
-    if (app.renderer == null) return;
-    if (width == 0 or height == 0) return;
-    const screen_dc = c.GetDC(null);
-    if (screen_dc == null) return;
-    defer _ = c.ReleaseDC(null, screen_dc);
-
-    const mem_dc = c.CreateCompatibleDC(screen_dc);
-    if (mem_dc == null) return;
-    defer _ = c.DeleteDC(mem_dc);
-
-    var bmi: c.BITMAPINFO = std.mem.zeroes(c.BITMAPINFO);
-    bmi.bmiHeader.biSize = @sizeOf(c.BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth = @intCast(width);
-    bmi.bmiHeader.biHeight = -@as(c.LONG, @intCast(height));
-    bmi.bmiHeader.biPlanes = 1;
-    bmi.bmiHeader.biBitCount = 32;
-    bmi.bmiHeader.biCompression = c.BI_RGB;
-
-    var pixels_ptr: ?*anyopaque = null;
-    const dib = c.CreateDIBSection(mem_dc, &bmi, c.DIB_RGB_COLORS, &pixels_ptr, null, 0);
-    if (dib == null or pixels_ptr == null) return;
-    defer _ = c.DeleteObject(dib);
-
-    const old_bmp = c.SelectObject(mem_dc, dib);
-    defer _ = c.SelectObject(mem_dc, old_bmp);
-
-    drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height));
-
-    // Set alpha to opaque
-    const pixels: [*]u8 = @ptrCast(pixels_ptr);
-    const pixel_count = width * height;
-    var i: u32 = 0;
-    while (i < pixel_count) : (i += 1) {
-        pixels[i * 4 + 3] = 255;
-    }
-
-    const pixel_data = pixels[0 .. width * height * 4];
-    if (app.renderer) |*g| {
-        g.updateSidebarTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
-        };
-    }
-}
 
 /// Compute sidebar colors from the Neovim colorscheme.
 /// Returns (R, G, B) as 0-255 u8 values. Mirrors macOS TabSidebarView color logic (no blur).

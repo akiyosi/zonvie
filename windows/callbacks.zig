@@ -6,20 +6,11 @@ const applog = app_mod.applog;
 const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
+const external_windows = @import("ui/external_windows.zig");
 
-// ---- Logging globals for atlas ensure callbacks ----
-var log_atlas_ensure_calls: u64 = 0;
-var log_atlas_ensure_suspicious: u64 = 0;
-var log_atlas_ensure_last_report_ns: i128 = 0;
-var log_atlas_zero_bbox_count: u32 = 0;
+// ---- Logging globals for row vertex callbacks ----
 var log_row_no_glyphs_count: u32 = 0;
 var log_row_bad_uv_count: u32 = 0;
-
-// Track styled glyph stats
-var log_styled_glyph_calls: u64 = 0;
-var log_styled_glyph_ok: u64 = 0;
-var log_styled_glyph_fail: u64 = 0;
-var log_styled_glyph_last_report_ns: i128 = 0;
 
 // =========================================================================
 // Helper functions used by callbacks
@@ -658,12 +649,10 @@ pub fn onVerticesPartial(
             };
         }
 
-        // Non-row-mode: main update implies screen update.
-        // Row-mode: main_verts is not used for drawing; do not force full paint here.
-        // InvalidateRect deferred to onFlushEnd for coalescing.
-        if (!row_mode) {
-            app.paint_rects.clearRetainingCapacity();
-        }
+        // A MAIN partial update turns row mode off above, so this path is
+        // always the non-row-mode one and a main update implies a screen
+        // update. InvalidateRect stays deferred to onFlushEnd for coalescing.
+        app.paint_rects.clearRetainingCapacity();
         app.flush_needs_invalidate = true;
     }
 
@@ -1027,31 +1016,24 @@ pub fn onVerticesRow(
                     return;
                 }
 
-                if (ext_win.surface.row_mode) {
-                    // Row-mode: store cursor verts separately (same pattern as main window).
-                    // Mark old cursor row dirty so it gets redrawn to erase the cursor overlay.
-                    ext_win.surface.cursor_verts.clearRetainingCapacity();
-                    if (cursor_slice.len != 0) {
-                        ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
-                        ext_win.surface.last_cursor_row = row_start;
-                    } else {
-                        ext_win.surface.last_cursor_row = null;
-                    }
+                // Store the cursor in the dedicated cursor_verts buffer
+                // (replace, not append). Appending into surface.verts
+                // accumulated stale cursor geometry across mode/shape changes
+                // — the old block stayed drawn under the new insert-bar shape.
+                // Keep the legacy surface mirror in sync for lifecycle and
+                // pending-capture bookkeeping; paint reads the committed
+                // independent TBS cursor snapshot.
+                //
+                // Row mode used to differ here, marking the old cursor row
+                // dirty. That moved into the TBS cursor transaction — the
+                // storeMainCursor call above records both the old and the new
+                // row — so the two modes now do the same thing.
+                ext_win.surface.cursor_verts.clearRetainingCapacity();
+                if (cursor_slice.len != 0) {
+                    ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
+                    ext_win.surface.last_cursor_row = row_start;
                 } else {
-                    // Flat-mode: store the cursor in the dedicated cursor_verts
-                    // buffer (replace, not append). Appending into surface.verts
-                    // accumulated stale cursor geometry across mode/shape changes
-                    // — the old block stayed drawn under the new insert-bar shape.
-                    // Keep the legacy surface mirror in sync for lifecycle and
-                    // pending-capture bookkeeping; paint reads the committed
-                    // independent TBS cursor snapshot.
-                    ext_win.surface.cursor_verts.clearRetainingCapacity();
-                    if (cursor_slice.len != 0) {
-                        ext_win.surface.cursor_verts.appendSliceAssumeCapacity(cursor_slice);
-                        ext_win.surface.last_cursor_row = row_start;
-                    } else {
-                        ext_win.surface.last_cursor_row = null;
-                    }
+                    ext_win.surface.last_cursor_row = null;
                 }
                 ext_win.needs_redraw = true;
                 // InvalidateRect deferred to onFlushEnd.
@@ -1481,8 +1463,6 @@ pub fn onVerticesRow(
             app.row_valid.resize(app.alloc, @intCast(app.surface.rows), false) catch {};
             app.row_valid.unsetAll();
         }
-    } else {
-        app.surface.row_mode = true;
     }
 
     if (layout_only) {
@@ -1507,11 +1487,6 @@ pub fn onVerticesRow(
     if (row_count == 1) {
         // Single-row path (normal case): store vertices for this row.
         const row: u32 = row_start;
-
-        // Extra safety: if rows is known, do not store beyond it.
-        if (max_rows != 0 and row >= max_rows) {
-            return;
-        }
 
         if (!storeSurfaceRowVerts(app.alloc, &app.surface.row_verts, row, verts_ptr, vert_count)) {
             // Row storage OOM: without an abort the core clears this row's
@@ -2299,130 +2274,6 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     }
 }
 
-pub fn onAtlasEnsureGlyph(ctx: ?*anyopaque, scalar: u32, out_entry: *app_mod.GlyphEntry) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) {
-        if (applog.isEnabled()) applog.appLog("onAtlasEnsureGlyph: MISALIGNED ctx=0x{x} align={d} scalar=0x{x}", .{ ctx_bits, @alignOf(App), scalar });
-        return 0;
-    }
-    const app: *App = @ptrFromInt(ctx_bits);
-
-    // ---- aggregate stats (very low overhead) ----
-    log_atlas_ensure_calls += 1;
-    if (scalar > 0x10FFFF) {
-        log_atlas_ensure_suspicious += 1;
-    }
-
-    if (applog.isEnabled()) {
-        const now_ns: i128 = core.clock.nowNs();
-        if (log_atlas_ensure_last_report_ns == 0) log_atlas_ensure_last_report_ns = now_ns;
-
-        // report once per second
-        if (now_ns - log_atlas_ensure_last_report_ns >= @as(i128, 1_000_000_000)) {
-            applog.appLog(
-                "[atlas] ensureGlyph calls/s={d} suspicious/s={d}\n",
-                .{ log_atlas_ensure_calls, log_atlas_ensure_suspicious },
-            );
-            log_atlas_ensure_calls = 0;
-            log_atlas_ensure_suspicious = 0;
-            log_atlas_ensure_last_report_ns = now_ns;
-        }
-    }
-
-    if (atlasForCoreCallback(app)) |a| {
-        const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
-            if (applog.isEnabled()) applog.appLog("atlasEnsureGlyph: atlasEnsureGlyphEntry ERROR scalar=0x{x} err={any}", .{ scalar, err });
-            return 0;
-        };
-        if (applog.isEnabled() and log_atlas_zero_bbox_count < 16 and scalar != 0 and scalar != 32) {
-            if (e.bbox_size_px[0] <= 0 or e.bbox_size_px[1] <= 0) {
-                applog.appLog(
-                    "[atlas] ensureGlyph zero_bbox scalar=0x{x} bbox=({d:.3},{d:.3}) uv=({d:.4},{d:.4})-({d:.4},{d:.4}) adv={d:.3} asc={d:.3} desc={d:.3}\n",
-                    .{
-                        scalar,
-                        e.bbox_size_px[0],
-                        e.bbox_size_px[1],
-                        e.uv_min[0],
-                        e.uv_min[1],
-                        e.uv_max[0],
-                        e.uv_max[1],
-                        e.advance_px,
-                        e.ascent_px,
-                        e.descent_px,
-                    },
-                );
-                log_atlas_zero_bbox_count += 1;
-            } else if (e.uv_max[0] <= e.uv_min[0] or e.uv_max[1] <= e.uv_min[1]) {
-                applog.appLog(
-                    "[atlas] ensureGlyph invalid_uv scalar=0x{x} uv=({d:.4},{d:.4})-({d:.4},{d:.4}) bbox=({d:.3},{d:.3})\n",
-                    .{
-                        scalar,
-                        e.uv_min[0],
-                        e.uv_min[1],
-                        e.uv_max[0],
-                        e.uv_max[1],
-                        e.bbox_size_px[0],
-                        e.bbox_size_px[1],
-                    },
-                );
-                log_atlas_zero_bbox_count += 1;
-            }
-        }
-        out_entry.* = e;
-        return 1;
-    } else {
-        // Atlas not ready yet - queue for later processing
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        app.pending_glyphs.append(app.alloc, .{ .scalar = scalar, .style_flags = 0 }) catch {};
-        return 0;
-    }
-}
-
-pub fn onAtlasEnsureGlyphStyled(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_entry: *app_mod.GlyphEntry) callconv(.c) c_int {
-    const ctxp = ctx orelse return 0;
-    const ctx_bits: usize = @intFromPtr(ctxp);
-    if (ctx_bits % @alignOf(App) != 0) {
-        if (applog.isEnabled()) applog.appLog("onAtlasEnsureGlyphStyled: MISALIGNED ctx=0x{x} align={d} scalar=0x{x} style=0x{x}", .{ ctx_bits, @alignOf(App), scalar, style_flags });
-        return 0;
-    }
-    const app: *App = @ptrFromInt(ctx_bits);
-
-    log_styled_glyph_calls += 1;
-
-    if (atlasForCoreCallback(app)) |a| {
-        const e = a.atlasEnsureGlyphEntryStyled(scalar, style_flags) catch |err| {
-            log_styled_glyph_fail += 1;
-            if (applog.isEnabled()) applog.appLog("atlasEnsureGlyphStyled: ERROR scalar=0x{x} style=0x{x} err={any}", .{ scalar, style_flags, err });
-            return 0;
-        };
-        log_styled_glyph_ok += 1;
-
-        // Report stats once per second
-        if (applog.isEnabled()) {
-            const now_ns: i128 = core.clock.nowNs();
-            if (log_styled_glyph_last_report_ns == 0) log_styled_glyph_last_report_ns = now_ns;
-            if (now_ns - log_styled_glyph_last_report_ns >= @as(i128, 1_000_000_000)) {
-                applog.appLog("[styled] calls/s={d} ok/s={d} fail/s={d}\n", .{ log_styled_glyph_calls, log_styled_glyph_ok, log_styled_glyph_fail });
-                log_styled_glyph_calls = 0;
-                log_styled_glyph_ok = 0;
-                log_styled_glyph_fail = 0;
-                log_styled_glyph_last_report_ns = now_ns;
-            }
-        }
-
-        out_entry.* = e;
-        return 1;
-    } else {
-        // Atlas not ready yet - queue for later processing
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        app.pending_glyphs.append(app.alloc, .{ .scalar = scalar, .style_flags = style_flags }) catch {};
-        return 0;
-    }
-}
-
 // =========================================================================
 // Phase 2: Core-managed atlas callbacks
 // =========================================================================
@@ -2842,62 +2693,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     // Calculate pending resize for all external windows (same as onLineSpace)
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        const grid_id = entry.key_ptr.*;
-        const ext_win = entry.value_ptr.*;
-
-        if (ext_win.is_pending_close) continue;
-
-        const rows = ext_win.surface.rows;
-        const cols = ext_win.surface.cols;
-
-        var content_w: c_int = @intCast(cols * cell_w);
-        var content_h: c_int = @intCast(rows * cell_h);
-
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
-        const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
-
-        if (is_cmdline) {
-            const cmdline_icon_total_width: u32 = app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
-            const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
-            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
-            content_h += @as(c_int, @intCast(cmdline_total_padding));
-        } else if (is_msg_show or is_msg_history) {
-            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
-            content_w += scaled_msg_pad;
-            content_h += scaled_msg_pad;
-        }
-
-        // Use this window's ACTUAL current style/exstyle (WS_POPUP for
-        // cmdline/popupmenu/msg_show/msg_history, WS_OVERLAPPEDWINDOW for
-        // regular float/split external windows) instead of assuming
-        // WS_POPUP unconditionally — WS_OVERLAPPEDWINDOW has caption+border
-        // non-client area that WS_POPUP does not, and using the wrong style
-        // here silently shrinks the computed client rect on every font/
-        // linespace change for normal (non-decorated-surface) windows.
-        // GetWindowLongW (not the Ptr variant) + @bitCast matches the
-        // existing GWL_STYLE read idiom at window.zig:201-202 — GWL_STYLE
-        // is a 32-bit value, and for WS_POPUP windows (bit 31 set) the
-        // LONG_PTR-returning GetWindowLongPtrW would sign-extend to a
-        // negative isize, making @intCast to u32/DWORD panic.
-        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
-        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-
-        ext_win.pending_window_w = rect.right - rect.left;
-        ext_win.pending_window_h = rect.bottom - rect.top;
-        ext_win.needs_window_resize = true;
-        ext_win.needs_renderer_resize = true;
-
-        if (applog.isEnabled()) applog.appLog("onGuiFont: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
-
-        if (hwnd) |mh| {
-            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
-        }
-    }
+    queueExternalWindowResizes(app, hwnd, cell_w, cell_h, "onGuiFont");
 
     // Invalidation flags must be co-set with the cell metrics update above (still
     // under app.mu): font change shifted cell_w_px/cell_h_px, so any WM_PAINT that
@@ -2977,54 +2773,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     // Calculate pending resize for all external windows
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
-    var ext_it = app.external_windows.iterator();
-    while (ext_it.next()) |entry| {
-        const grid_id = entry.key_ptr.*;
-        const ext_win = entry.value_ptr.*;
-
-        if (ext_win.is_pending_close) continue;
-
-        const rows = ext_win.surface.rows;
-        const cols = ext_win.surface.cols;
-
-        var content_w: c_int = @intCast(cols * cell_w);
-        var content_h: c_int = @intCast(rows * cell_h);
-
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const is_msg_show = (grid_id == app_mod.MESSAGE_GRID_ID);
-        const is_msg_history = (grid_id == app_mod.MSG_HISTORY_GRID_ID);
-
-        if (is_cmdline) {
-            const cmdline_icon_total_width: u32 = app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT;
-            const cmdline_total_padding: u32 = app_mod.CMDLINE_PADDING * 2;
-            content_w += @as(c_int, @intCast(cmdline_icon_total_width + cmdline_total_padding));
-            content_h += @as(c_int, @intCast(cmdline_total_padding));
-        } else if (is_msg_show or is_msg_history) {
-            const scaled_msg_pad = app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2;
-            content_w += scaled_msg_pad;
-            content_h += scaled_msg_pad;
-        }
-
-        // See onGuiFont for why this must use the window's actual style
-        // (via GetWindowLongW + @bitCast, not GetWindowLongPtrW + @intCast)
-        // instead of hardcoding WS_POPUP.
-        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
-        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-
-        ext_win.pending_window_w = rect.right - rect.left;
-        ext_win.pending_window_h = rect.bottom - rect.top;
-        ext_win.needs_window_resize = true;
-        ext_win.needs_renderer_resize = true;
-
-        if (applog.isEnabled()) applog.appLog("[win] onLineSpace: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
-
-        // PostMessageW does not block, so it's safe to call while holding the lock.
-        if (hwnd) |mh| {
-            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
-        }
-    }
+    queueExternalWindowResizes(app, hwnd, cell_w, cell_h, "onLineSpace");
 
     // Co-set invalidation flags with the linespace update above (still under
     // app.mu) for the same race-avoidance reason as onGuiFont: a WM_PAINT that
@@ -3395,5 +3144,66 @@ pub fn onSSHAuthPrompt(
         // UI thread will never consume this prompt, free it now.
         app.alloc.free(owned);
         app.ssh_prompt_owned = null;
+    }
+}
+
+/// Recompute every open external window's outer size for the current cell
+/// metrics and queue the resize. onGuiFont and onLineSpace each ran this loop
+/// verbatim; the only difference was the tag in the log line.
+///
+/// Sizing goes through externalSurfaceInsetsPx and
+/// clampCmdlineWidthToWorkArea rather than re-deriving the padding here. The
+/// hand-rolled copies this replaces omitted the copy-button reservation and
+/// the cmdline's work-area clamp, so a guifont or linespace change while a
+/// cmdline or message window was open queued it one copy-button width too
+/// narrow for its content -- and, on a narrow monitor, wider than the work area.
+///
+/// AdjustWindowRectEx stays here rather than moving into the shared helper:
+/// this path must read the window's actual style, while the creation path
+/// knows the style it is about to apply.
+fn queueExternalWindowResizes(
+    app: *App,
+    hwnd: ?c.HWND,
+    cell_w: u32,
+    cell_h: u32,
+    log_tag: []const u8,
+) void {
+    var ext_it = app.external_windows.iterator();
+    while (ext_it.next()) |entry| {
+        const grid_id = entry.key_ptr.*;
+        const ext_win = entry.value_ptr.*;
+
+        if (ext_win.is_pending_close) continue;
+
+        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id);
+        var content_w: c_int = @as(c_int, @intCast(ext_win.surface.cols * cell_w)) + insets.w;
+        const content_h: c_int = @as(c_int, @intCast(ext_win.surface.rows * cell_h)) + insets.h;
+        content_w = external_windows.clampCmdlineWidthToWorkArea(app, grid_id, content_w);
+
+        // This window's ACTUAL current style/exstyle: WS_OVERLAPPEDWINDOW has
+        // caption and border non-client area that WS_POPUP does not, and
+        // assuming the wrong one silently shrinks the computed client rect on
+        // every font or linespace change for normal external windows.
+        // GetWindowLongW (not the Ptr variant) + @bitCast matches the existing
+        // GWL_STYLE read idiom at window.zig:201-202 -- GWL_STYLE is a 32-bit
+        // value, and for WS_POPUP windows (bit 31 set) the LONG_PTR-returning
+        // GetWindowLongPtrW would sign-extend to a negative isize, making
+        // @intCast to u32/DWORD panic.
+        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
+        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
+        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
+        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
+
+        ext_win.pending_window_w = rect.right - rect.left;
+        ext_win.pending_window_h = rect.bottom - rect.top;
+        ext_win.needs_window_resize = true;
+        ext_win.needs_renderer_resize = true;
+
+        if (applog.isEnabled()) applog.appLog("{s}: queued ext_win resize grid_id={d} to ({d},{d})\n", .{ log_tag, grid_id, ext_win.pending_window_w, ext_win.pending_window_h });
+
+        // PostMessageW does not block, so it is safe to call under the lock.
+        if (hwnd) |mh| {
+            _ = c.PostMessageW(mh, app_mod.WM_APP_RESIZE_POPUPMENU, @bitCast(grid_id), 0);
+        }
     }
 }

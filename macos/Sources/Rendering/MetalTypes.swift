@@ -25,29 +25,8 @@ final class SurfaceRowBufferState {
     var dirtyRows: Set<Int> = []
     var usingRowBuffers: Bool = false
 
-    func resetCounts() {
-        for i in 0..<counts.count {
-            counts[i] = 0
-        }
-    }
 
-    func ensureRows(_ totalRows: Int) {
-        guard totalRows > 0 else { return }
-        while buffers.count < totalRows {
-            buffers.append(nil)
-            capacities.append(0)
-            counts.append(0)
-        }
-    }
 
-    func clearBeyond(_ totalRows: Int) {
-        guard totalRows >= 0 else { return }
-        if totalRows < counts.count {
-            for i in totalRows..<counts.count {
-                counts[i] = 0
-            }
-        }
-    }
 }
 
 final class SurfaceRedrawScheduler {
@@ -796,8 +775,6 @@ final class SurfaceBufferSet {
     var detachPoolRowCapacities: [Int] = []
     var detachPoolMainBuffer: MTLBuffer? = nil
     var detachPoolMainCap: Int = 0
-    var detachPoolCursorBuffer: MTLBuffer? = nil
-    var detachPoolCursorCap: Int = 0
 
     // Private per-row buffer pool, owned exclusively by this set.
     //
@@ -879,7 +856,8 @@ func clampRowsDelta(_ value: Int) -> Int {
 /// not the binding per-row ceiling: surfaceMaxProvisionedRowBytes below is
 /// lower once spread across three sets with two private slots each (~42 MiB
 /// per row), and it is the limit the provisioning path actually enforces.
-private let surfaceMaxVertexBufferCapacity: Int = 256 * 1024 * 1024
+// Not private: SurfaceRowProvisionTests pins the budget ceiling against it.
+let surfaceMaxVertexBufferCapacity: Int = 256 * 1024 * 1024
 // Provisioning may hold two private row buffers in each of three sets. Bound
 // both the allocation peak and the IOAccelerator object count independently
 // from the core's logical vertex budget.
@@ -1176,6 +1154,53 @@ enum SurfaceRowProvisionStatus: Equatable {
 /// Return true only when a row submission can complete without growing Swift
 /// arrays or creating an MTLBuffer. Both private slots are required because a
 /// COW chain can make either one alias the committed or an in-flight set.
+/// The per-row capacity demand all three provisioning paths derive the same
+/// way: the bytes the row needs, and the largest capacity any set already has
+/// for that row, normalised by surfaceCapacityBasisForDemand so a stale
+/// oversized capacity does not keep the demand inflated.
+///
+/// Returns nil when the vertex count cannot be sized or exceeds the
+/// per-buffer budget -- surfaceRowCapacityIsPrepared reads that as "not
+/// prepared", the provisioning plan reads it as .overBudget.
+///
+/// This deliberately stops short of surfaceGrowCapacity. Only two of the
+/// three callers can hoist that out of their per-set loop:
+/// surfaceRowCapacityIsPrepared calls it inside the loop, so an empty
+/// bufferSets never reaches it, and moving it out would turn a vacuous true
+/// into false.
+func surfaceRowCapacityDemand(
+    bufferSets: [SurfaceBufferSet],
+    row: Int,
+    vertexCount: Int
+) -> (neededBytes: Int, capacityBasis: Int)? {
+    guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
+          neededBytes <= surfaceMaxVertexBufferCapacity
+    else { return nil }
+    var basis = 0
+    for set in bufferSets where row < set.rowState.capacities.count {
+        basis = max(basis, set.rowState.capacities[row])
+    }
+    return (neededBytes, surfaceCapacityBasisForDemand(basis, neededBytes: neededBytes))
+}
+
+/// Whether one private row slot already satisfies a row's demand: it exists,
+/// is at least requiredCapacity, and is not so much larger than the row needs
+/// that it should be replaced with a right-sized buffer.
+///
+/// Pass nil / 0 for a slot the arrays do not reach; an absent slot is never
+/// ready. That is what lets the three call sites -- which spelled this as a
+/// positive guard, a positive expression with its own bounds term, and a
+/// De Morgan-negated replace-if -- share one predicate.
+func surfaceRowSlotIsReady(
+    buffer: MTLBuffer?,
+    capacity: Int,
+    requiredCapacity: Int,
+    neededBytes: Int
+) -> Bool {
+    guard buffer != nil, capacity >= requiredCapacity else { return false }
+    return !surfaceCapacityIsOversized(capacity, neededBytes: neededBytes)
+}
+
 func surfaceRowCapacityIsPrepared(
     bufferSets: [SurfaceBufferSet],
     row: Int,
@@ -1185,19 +1210,15 @@ func surfaceRowCapacityIsPrepared(
 ) -> Bool {
     guard row >= 0, row < maxRowBuffers,
           totalRows >= 0, totalRows <= maxRowBuffers,
-          let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
-          neededBytes <= surfaceMaxVertexBufferCapacity
+          let demand = surfaceRowCapacityDemand(
+              bufferSets: bufferSets,
+              row: row,
+              vertexCount: vertexCount
+          )
     else { return false }
+    let neededBytes = demand.neededBytes
 
     let requiredRows = max(totalRows, row + 1)
-    var copiedActiveCapacity = 0
-    for set in bufferSets where row < set.rowState.capacities.count {
-        copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
-    }
-    copiedActiveCapacity = surfaceCapacityBasisForDemand(
-        copiedActiveCapacity,
-        neededBytes: neededBytes
-    )
     for set in bufferSets {
         guard set.rowState.buffers.count >= requiredRows,
               set.rowState.capacities.count >= requiredRows,
@@ -1215,19 +1236,19 @@ func surfaceRowCapacityIsPrepared(
 
         if neededBytes > 0 {
             guard let requiredCapacity = surfaceGrowCapacity(
-                current: copiedActiveCapacity,
+                current: demand.capacityBasis,
                 needed: max(1, neededBytes)
             ),
-            set.privateRowBuffers0[row] != nil,
-            set.privateRowCapacities0[row] >= requiredCapacity,
-            !surfaceCapacityIsOversized(
-                set.privateRowCapacities0[row],
+            surfaceRowSlotIsReady(
+                buffer: set.privateRowBuffers0[row],
+                capacity: set.privateRowCapacities0[row],
+                requiredCapacity: requiredCapacity,
                 neededBytes: neededBytes
             ),
-            set.privateRowBuffers1[row] != nil,
-            set.privateRowCapacities1[row] >= requiredCapacity,
-            !surfaceCapacityIsOversized(
-                set.privateRowCapacities1[row],
+            surfaceRowSlotIsReady(
+                buffer: set.privateRowBuffers1[row],
+                capacity: set.privateRowCapacities1[row],
+                requiredCapacity: requiredCapacity,
                 neededBytes: neededBytes
             )
             else { return false }
@@ -1342,39 +1363,31 @@ func makeSurfaceRowProvisionPlan(
     // buffers remain live in their sets until the completed plan is published.
     for row in 0..<requiredRowCount {
         let vertexCount = row < requiredVertexCounts.count ? requiredVertexCounts[row] : 0
-        guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
-              neededBytes <= surfaceMaxVertexBufferCapacity
-        else { return .overBudget }
+        guard let demand = surfaceRowCapacityDemand(
+            bufferSets: bufferSets,
+            row: row,
+            vertexCount: vertexCount
+        ) else { return .overBudget }
+        let neededBytes = demand.neededBytes
         guard neededBytes > 0 else { continue }
-
-        var copiedActiveCapacity = 0
-        for set in bufferSets where row < set.rowState.capacities.count {
-            copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
-        }
-        copiedActiveCapacity = surfaceCapacityBasisForDemand(
-            copiedActiveCapacity,
-            neededBytes: neededBytes
-        )
         guard let requiredCapacity = surfaceGrowCapacity(
-            current: copiedActiveCapacity,
+            current: demand.capacityBasis,
             needed: max(1, neededBytes)
         ) else { return .overBudget }
 
         for set in bufferSets {
-            let slot0Ready = row < set.privateRowBuffers0.count
-                && set.privateRowBuffers0[row] != nil
-                && set.privateRowCapacities0[row] >= requiredCapacity
-                && !surfaceCapacityIsOversized(
-                    set.privateRowCapacities0[row],
-                    neededBytes: neededBytes
-                )
-            let slot1Ready = row < set.privateRowBuffers1.count
-                && set.privateRowBuffers1[row] != nil
-                && set.privateRowCapacities1[row] >= requiredCapacity
-                && !surfaceCapacityIsOversized(
-                    set.privateRowCapacities1[row],
-                    neededBytes: neededBytes
-                )
+            let slot0Ready = surfaceRowSlotIsReady(
+                buffer: row < set.privateRowBuffers0.count ? set.privateRowBuffers0[row] : nil,
+                capacity: row < set.privateRowCapacities0.count ? set.privateRowCapacities0[row] : 0,
+                requiredCapacity: requiredCapacity,
+                neededBytes: neededBytes
+            )
+            let slot1Ready = surfaceRowSlotIsReady(
+                buffer: row < set.privateRowBuffers1.count ? set.privateRowBuffers1[row] : nil,
+                capacity: row < set.privateRowCapacities1.count ? set.privateRowCapacities1[row] : 0,
+                requiredCapacity: requiredCapacity,
+                neededBytes: neededBytes
+            )
             for ready in [slot0Ready, slot1Ready] where !ready {
                 let (nextBytes, overflow) = provisionedBytes.addingReportingOverflow(requiredCapacity)
                 if overflow { return .overBudget }
@@ -1407,23 +1420,17 @@ func makeSurfaceRowProvisionPlan(
 
     for row in 0..<requiredRowCount {
         let vertexCount = row < requiredVertexCounts.count ? requiredVertexCounts[row] : 0
-        guard let neededBytes = surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)),
-              neededBytes <= surfaceMaxVertexBufferCapacity
-        else { return .overBudget }
+        guard let demand = surfaceRowCapacityDemand(
+            bufferSets: bufferSets,
+            row: row,
+            vertexCount: vertexCount
+        ) else { return .overBudget }
+        let neededBytes = demand.neededBytes
         guard neededBytes > 0 else { continue }
-
-        var copiedActiveCapacity = 0
-        for set in bufferSets where row < set.rowState.capacities.count {
-            copiedActiveCapacity = max(copiedActiveCapacity, set.rowState.capacities[row])
-        }
-        copiedActiveCapacity = surfaceCapacityBasisForDemand(
-            copiedActiveCapacity,
-            neededBytes: neededBytes
-        )
 
         for (setIndex, set) in bufferSets.enumerated() {
             guard let requiredCapacity = surfaceGrowCapacity(
-                current: copiedActiveCapacity,
+                current: demand.capacityBasis,
                 needed: max(1, neededBytes)
             ) else { return .overBudget }
 
@@ -1442,9 +1449,12 @@ func makeSurfaceRowProvisionPlan(
 
             var slot0: MTLBuffer? = nil
             var slot1: MTLBuffer? = nil
-            if existingSlot0 == nil ||
-                existingSlot0Capacity < requiredCapacity ||
-                surfaceCapacityIsOversized(existingSlot0Capacity, neededBytes: neededBytes) {
+            if !surfaceRowSlotIsReady(
+                buffer: existingSlot0,
+                capacity: existingSlot0Capacity,
+                requiredCapacity: requiredCapacity,
+                neededBytes: neededBytes
+            ) {
                 allocationAttemptCount += 1
                 if shouldFailAllocationAtAttempt?(allocationAttemptCount) == true {
                     return allocationFailure()
@@ -1458,9 +1468,12 @@ func makeSurfaceRowProvisionPlan(
                 createdBufferCount += 1
                 createdBuffersForProcess.append(allocated)
             }
-            if existingSlot1 == nil ||
-                existingSlot1Capacity < requiredCapacity ||
-                surfaceCapacityIsOversized(existingSlot1Capacity, neededBytes: neededBytes) {
+            if !surfaceRowSlotIsReady(
+                buffer: existingSlot1,
+                capacity: existingSlot1Capacity,
+                requiredCapacity: requiredCapacity,
+                neededBytes: neededBytes
+            ) {
                 allocationAttemptCount += 1
                 if shouldFailAllocationAtAttempt?(allocationAttemptCount) == true {
                     appendProvisionEntry(

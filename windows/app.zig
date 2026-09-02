@@ -132,7 +132,6 @@ pub fn baseName(name: []const u8) []const u8 {
 // Custom window messages (WM_APP + N)
 // =========================================================================
 
-pub const WM_APP_ATLAS_ENSURE_GLYPH: c.UINT = c.WM_APP + 1;
 pub const WM_APP_CREATE_EXTERNAL_WINDOW: c.UINT = c.WM_APP + 2;
 pub const WM_APP_CURSOR_GRID_CHANGED: c.UINT = c.WM_APP + 3;
 pub const WM_APP_CLOSE_EXTERNAL_WINDOW: c.UINT = c.WM_APP + 4;
@@ -317,9 +316,6 @@ pub fn scrollbarMargin(dpi_scale: f32) f32 {
 }
 pub fn scrollbarMinKnobHeight(dpi_scale: f32) f32 {
     return SCROLLBAR_MIN_KNOB_HEIGHT * dpi_scale;
-}
-pub fn scrollbarCornerRadius(dpi_scale: f32) f32 {
-    return SCROLLBAR_CORNER_RADIUS * dpi_scale;
 }
 pub fn scrollbarReservedWidth(dpi_scale: f32) f32 {
     return scrollbarWidth(dpi_scale) + scrollbarMargin(dpi_scale) * 2;
@@ -1641,21 +1637,6 @@ pub const TablineState = struct {
     }
 };
 
-/// CPU-side per-row vertex data. GPU VBs are stored separately in RowVB
-/// (owned by the UI thread) so that the core thread can write vertices
-/// without touching GPU resources.
-pub const RowVertsCPU = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .empty,
-
-    // CPU-side generation increments when verts are replaced by onVerticesRow().
-    gen: u64 = 0,
-
-    // Logical row index that vertices were generated for. Used to compute viewport
-    // Y translation at draw time when a row moves due to grid_scroll without
-    // vertex regeneration (same pattern as macOS rowSlotSourceRows).
-    origin_row: u32 = 0,
-};
-
 /// GPU-side per-row vertex buffer (D3D11). Owned exclusively by the UI thread.
 pub const RowVB = struct {
     vb: ?*c.ID3D11Buffer = null,
@@ -2617,7 +2598,6 @@ pub fn drawSurfaceRowsVBFromSlots(
 }
 
 /// Shared row-mode rendering with TBS (slot-based COW + separate RowVB array).
-/// Same as drawRowModeSetupAndRows but uses slot indirection for zero-copy beginFlush.
 /// Does NOT hold app_mu during VB upload (lock-free via TBS refcount).
 pub fn drawRowModeSetupAndRowsFromSlots(
     g: *d3d11.Renderer,
@@ -2891,7 +2871,6 @@ pub const RowModeDrawParams = struct {
     content_right: i32,
     preserve_back: bool,
     use_row_scissor: bool = true,
-    glow_enabled: bool = false,
     // DrawEx viewport options (null = use full renderer dimensions)
     content_width: ?u32 = null,
     content_y_offset: ?u32 = null,
@@ -2918,131 +2897,6 @@ pub const RowModeDrawResult = struct {
     metrics: SurfaceRowDrawMetrics = .{},
 };
 
-/// Shared row-mode rendering: drawEx setup → drawSurfaceRowsVB → bloom verts collection.
-/// Caller must hold gpu.lockContext(). app_mu is locked internally during row VB draw.
-/// row_verts_list is accessed under app_mu to avoid use-after-free from concurrent reallocation.
-/// If params.glow_enabled, bloom_verts is populated with all row vertices (under lock).
-/// Caller is responsible for cursor overlay, scrollbar overlay, bloom post-process, and present.
-pub fn drawRowModeSetupAndRows(
-    g: *d3d11.Renderer,
-    alloc: std.mem.Allocator,
-    app_mu: *std.Io.Mutex,
-    row_verts_list: *std.ArrayListUnmanaged(RowVerts),
-    rows_to_draw: []const u32,
-    bloom_verts: *std.ArrayListUnmanaged(Vertex),
-    params: RowModeDrawParams,
-) !RowModeDrawResult {
-    const log_enabled = applog.isEnabled();
-
-    // 1. drawEx: bind RTV, clear if needed, set viewport to content_height.
-    try g.drawEx(
-        &[_]Vertex{},
-        &[_]Vertex{},
-        null,
-        .{
-            .present = false,
-            .preserve_on_null_dirty = params.preserve_back,
-            .content_height = params.content_height,
-            .content_width = params.content_width,
-            .content_y_offset = params.content_y_offset,
-            .content_x_offset = params.content_x_offset,
-            .sidebar_right_width = params.sidebar_right_width,
-            .tabbar_bg_color = params.tabbar_bg_color,
-        },
-    );
-
-    // 2. Get D3D context, RSSetScissorRects and RSSetViewports function pointers.
-    var result = RowModeDrawResult{};
-    var rs_set_vp_fn: ?RSSetViewportsFn = null;
-    if (g.ctx) |ctx_val| {
-        result.ctx_ptr = ctx_val;
-        result.rs_set_sc_fn = ctx_val.*.lpVtbl.*.RSSetScissorRects;
-        rs_set_vp_fn = ctx_val.*.lpVtbl.*.RSSetViewports;
-    }
-
-    // Compute base viewport matching what drawEx set (for per-row viewport Y translation).
-    const vp_x_offset = params.content_x_offset orelse 0;
-    const vp_y_offset = params.content_y_offset orelse 0;
-    const sidebar_r_w = params.sidebar_right_width orelse 0;
-    const base_w = params.content_width orelse g.width;
-    const vp_width = if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
-    const base_vp = BaseViewport{
-        .x = @floatFromInt(vp_x_offset),
-        .y = @floatFromInt(vp_y_offset),
-        .w = @floatFromInt(vp_width),
-        .h = @floatFromInt(params.content_height),
-    };
-
-    // 3. Lock, read row_verts slice, draw row VBs, collect bloom verts, unlock.
-    {
-        app_mu.lockUncancelable(core.clock.io());
-        defer app_mu.unlock(core.clock.io());
-
-        const row_verts = row_verts_list.items;
-
-        // When per-row scissor is disabled (e.g. seed mode), set a full-content scissor
-        // to prevent drawing outside the content area.
-        if (!params.use_row_scissor) {
-            if (log_enabled) applog.appLog("[row-mode] full scissor (no per-row)\n", .{});
-            if (result.rs_set_sc_fn) |f| {
-                var sc_full: c.D3D11_RECT = .{
-                    .left = params.x_offset,
-                    .top = params.y_offset,
-                    .right = params.content_right,
-                    .bottom = @intCast(g.height),
-                };
-                f(result.ctx_ptr, 1, &sc_full);
-            }
-        }
-
-        drawSurfaceRowsVB(
-            g,
-            row_verts,
-            rows_to_draw,
-            if (params.use_row_scissor) result.ctx_ptr else null,
-            if (params.use_row_scissor) result.rs_set_sc_fn else null,
-            if (params.use_row_scissor) rs_set_vp_fn else null,
-            base_vp,
-            params.x_offset,
-            params.y_offset,
-            params.content_right,
-            params.row_h_px,
-            log_enabled,
-            &result.metrics,
-        );
-
-        // Collect all row verts for bloom extract (under lock).
-        // When scroll reuse is active, origin_row may differ from the draw row.
-        // drawSurfaceRowsVB compensates via viewport Y offset, but bloom renders
-        // with a fixed viewport, so we must adjust NDC Y coordinates here.
-        if (params.glow_enabled) {
-            const vp_h: f32 = base_vp.h;
-            for (row_verts, 0..) |*rv, row_index| {
-                if (rv.verts.items.len == 0) continue;
-                const origin_i32: i32 = @intCast(rv.origin_row);
-                const row_i32: i32 = @intCast(row_index);
-                const row_delta = row_i32 - origin_i32;
-                if (row_delta == 0) {
-                    bloom_verts.appendSlice(alloc, rv.verts.items) catch {};
-                } else {
-                    // Shift NDC Y to match the viewport offset applied at draw time.
-                    // Viewport TopLeftY += delta_px moves content DOWN on screen.
-                    // Equivalent NDC adjustment: Y -= 2 * delta_px / viewport_height.
-                    const delta_px: f32 = @floatFromInt(row_delta * params.row_h_px);
-                    const ndc_shift: f32 = -2.0 * delta_px / vp_h;
-                    const base_len = bloom_verts.items.len;
-                    bloom_verts.appendSlice(alloc, rv.verts.items) catch continue;
-                    for (bloom_verts.items[base_len..]) |*v| {
-                        v.position[1] += ndc_shift;
-                    }
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
 pub const SurfaceRowDrawMetrics = struct {
     drawn_rows: u32 = 0,
     skipped_empty: u32 = 0,
@@ -3067,132 +2921,6 @@ pub const BaseViewport = struct {
     w: f32,
     h: f32,
 };
-
-pub fn drawSurfaceRowsVB(
-    g: *d3d11.Renderer,
-    row_verts: []RowVerts,
-    rows_to_draw: ?[]const u32,
-    ctx_ptr: ?*c.ID3D11DeviceContext,
-    rs_set_sc_fn: ?RSSetScissorRectsFn,
-    rs_set_vp_fn: ?RSSetViewportsFn,
-    base_vp: BaseViewport,
-    x_offset: i32,
-    y_offset: i32,
-    content_right: i32,
-    row_h_px: i32,
-    log_enabled: bool,
-    metrics: *SurfaceRowDrawMetrics,
-) void {
-    const row_count: usize = if (rows_to_draw) |rows| rows.len else row_verts.len;
-    var vp_dirty = false; // Track whether viewport was modified from base
-    var i: usize = 0;
-    while (i < row_count) : (i += 1) {
-        const row: u32 = if (rows_to_draw) |rows| rows[i] else @intCast(i);
-        if (row >= row_verts.len) {
-            metrics.skipped_empty += 1;
-            continue;
-        }
-
-        const rv = &row_verts[@intCast(row)];
-        const src = rv.verts.items;
-        if (src.len == 0) {
-            metrics.skipped_empty += 1;
-            if (metrics.first_empty_row == null) {
-                metrics.first_empty_row = row;
-            }
-            continue;
-        }
-
-        if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(Vertex)) {
-            const need_bytes = src.len * @sizeOf(Vertex);
-            const t_upload_start = if (log_enabled) core.clock.nowNs() else 0;
-            _ = ensureRowVBReady(g, rv, src) catch {
-                metrics.skipped_empty += 1;
-                continue;
-            };
-            if (log_enabled) {
-                metrics.vb_upload_ns += core.clock.nowNs() - t_upload_start;
-            }
-            metrics.vb_upload_rows += 1;
-            metrics.vb_upload_rows_bytes += @as(u64, @intCast(need_bytes));
-        }
-
-        if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
-            const top = y_offset + @as(i32, @intCast(row)) * row_h_px;
-            const bottom = top + row_h_px;
-            var sc: c.D3D11_RECT = .{
-                .left = x_offset,
-                .top = top,
-                .right = content_right,
-                .bottom = bottom,
-            };
-            rs_set_sc_fn.?(ctx_ptr, 1, &sc);
-
-            // Viewport Y translation: reuse VB from a different row position.
-            // origin_row records where the vertices were generated. If it differs
-            // from the current draw row, offset the viewport to compensate.
-            // Sign: row > origin_row means vertex was generated for a higher row
-            // (smaller Y in screen coords), so shift viewport UP (negative delta).
-            // D3D11 viewport: TopLeftY + delta moves rendered pixels DOWN when delta > 0.
-            // macOS equivalent: translationY = (sourceRow - logicalRow) * cellH / vpH * 2.0
-            if (rs_set_vp_fn) |vp_fn| {
-                const origin_i32: i32 = @intCast(rv.origin_row);
-                const row_i32: i32 = @intCast(row);
-                const row_delta = row_i32 - origin_i32;
-                if (row_delta != 0) {
-                    const delta_px: f32 = @floatFromInt(row_delta * row_h_px);
-                    var vp: c.D3D11_VIEWPORT = .{
-                        .TopLeftX = base_vp.x,
-                        .TopLeftY = base_vp.y + delta_px,
-                        .Width = base_vp.w,
-                        .Height = base_vp.h,
-                        .MinDepth = 0,
-                        .MaxDepth = 1,
-                    };
-                    vp_fn(ctx_ptr, 1, &vp);
-                    vp_dirty = true;
-                } else if (vp_dirty) {
-                    // Restore base viewport.
-                    var vp: c.D3D11_VIEWPORT = .{
-                        .TopLeftX = base_vp.x,
-                        .TopLeftY = base_vp.y,
-                        .Width = base_vp.w,
-                        .Height = base_vp.h,
-                        .MinDepth = 0,
-                        .MaxDepth = 1,
-                    };
-                    vp_fn(ctx_ptr, 1, &vp);
-                    vp_dirty = false;
-                }
-            }
-        }
-
-        const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
-        g.drawVB(rv.vb.?, src.len) catch {
-            metrics.skipped_empty += 1;
-            continue;
-        };
-        if (log_enabled) {
-            metrics.draw_vb_ns += core.clock.nowNs() - t_draw_start;
-        }
-        metrics.drawn_rows += 1;
-    }
-
-    // Restore base viewport if it was modified during the last row.
-    if (vp_dirty) {
-        if (rs_set_vp_fn) |vp_fn| {
-            var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = base_vp.x,
-                .TopLeftY = base_vp.y,
-                .Width = base_vp.w,
-                .Height = base_vp.h,
-                .MinDepth = 0,
-                .MaxDepth = 1,
-            };
-            vp_fn(ctx_ptr, 1, &vp);
-        }
-    }
-}
 
 /// Shared cursor overlay: upload cursor VB, draw cursor (blink on) or redraw row (blink off).
 /// Used by both main window and external window paint paths after row VB drawing.
@@ -3453,13 +3181,6 @@ pub fn drawBloomRowsOverlay(
     const bvp = draw_params.bloomViewport(g.width);
     g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
 }
-
-/// Pending glyph entry for deferred atlas population
-/// (used when glyph is requested before atlas is ready)
-pub const PendingGlyph = struct {
-    scalar: u32,
-    style_flags: u32, // 0 for unstyled
-};
 
 /// Scrollbar geometry result type
 pub const ScrollbarGeometry = struct {
@@ -4034,10 +3755,6 @@ pub const App = struct {
     // SSH auth prompt state (owned copy - core frees original after callback)
     ssh_prompt_owned: ?[]u8 = null,
 
-    // Pending glyphs queue: glyphs requested before atlas was ready
-    // (for parallel nvim spawn + renderer init)
-    pending_glyphs: std.ArrayListUnmanaged(PendingGlyph) = .empty,
-
     // Persistent query/cache storage for non-blocking visible-grid queries
     // (UI thread only). Capacity grows only when the core reports that the
     // current query buffer cannot hold a complete snapshot; steady-state
@@ -4430,7 +4147,6 @@ pub const App = struct {
         // Free remaining ArrayListUnmanaged backing buffers
         self.paint_rects.deinit(self.alloc);
         self.nvim_extra_args.deinit(self.alloc);
-        self.pending_glyphs.deinit(self.alloc);
         self.viewport_cache.deinit(self.alloc);
         self.visible_grids_query.deinit(self.alloc);
         self.cached_visible_grids.deinit(self.alloc);

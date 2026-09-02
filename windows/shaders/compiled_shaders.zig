@@ -1,10 +1,10 @@
 // Auto-generated shader bytecode - DO NOT EDIT
 // Generated from main.hlsl using compile.bat + generate_zig.py
-// main.hlsl SHA256 (LF-normalized): 8c7d24244f1d1d53b3d8d245d6814e9105b7059c50c08c9a7caea13c302f7656
+// main.hlsl SHA256 (LF-normalized): ce3c75fc2b98c82f47abf90f85962ab6e0ac3b6455503a8029d4bec94f9b5615
 
 // Hash constant for build-time staleness check.
 // The renderer compares this against the live SHA256 of @embedFile("../shaders/main.hlsl").
-pub const hlsl_sha256 = "8c7d24244f1d1d53b3d8d245d6814e9105b7059c50c08c9a7caea13c302f7656";
+pub const hlsl_sha256 = "ce3c75fc2b98c82f47abf90f85962ab6e0ac3b6455503a8029d4bec94f9b5615";
 
 pub const vs_bytecode = [_]u8{
     0x44, 0x58, 0x42, 0x43, 0x93, 0x56, 0xa9, 0xb0, 0x6d, 0x51, 0x8c, 0x8d, 0x74, 0x29, 0x35, 0xa5,

@@ -76,10 +76,3 @@ pub fn nowNs() i128 {
     ensureInit();
     return std.Io.Timestamp.now(g_io, .real).nanoseconds;
 }
-
-/// Monotonic nanoseconds (`Clock.awake`). Available for genuinely new timing
-/// needs; NOT used by the 0.16 migration, which preserves behavior via `nowNs`.
-pub fn monotonicNs() i128 {
-    ensureInit();
-    return std.Io.Timestamp.now(g_io, .awake).nanoseconds;
-}

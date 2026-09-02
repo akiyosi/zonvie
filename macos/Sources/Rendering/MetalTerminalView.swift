@@ -103,11 +103,6 @@ final class MetalTerminalView: MTKView {
     // retention is published: with the vertices it belongs to, never ahead.
     private var stagedScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
     private var pendingScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
-    /// Grids an external window reported new content for. Those vertices are
-    /// committed by that window's own renderer, so this view's commit cannot
-    /// time them — and it reports a content change rather than a measured
-    /// scroll, so the offset is simply dropped, as it always was.
-    private var pendingExternalScrollClear: [Int64] = []
     private let pendingScrollClearLock = NSLock()
 
     // Stale scroll detection: timestamp of the first unanswered tick per grid.
@@ -323,15 +318,6 @@ final class MetalTerminalView: MTKView {
         msgTimer = nil
     }
 
-    // Debug: call this from draw to test scrollbar update
-    func debugUpdateScrollbar() {
-        guard let core else {
-            ZonvieCore.appLog("[Scrollbar-debug] no core")
-            return
-        }
-        let vp = core.getViewport(gridId: -1)
-        ZonvieCore.appLog("[Scrollbar-debug] getViewport(1) = \(String(describing: vp))")
-    }
 
     /// Send committed text to Neovim immediately on the keyDown path.
     /// Why: a prior design buffered repeats in a single-slot `pendingInput`
@@ -1494,7 +1480,8 @@ final class MetalTerminalView: MTKView {
             }
         }
 
-        // Unblock the RPC thread's waitForLayoutReady() once we know real
+        // Unblock the RPC thread's layout-ready wait (ui_attach_cond in
+        // rpc_session.zig) once we know real
         // dimensions, so nvim_ui_attach is sent with the correct rows/cols
         // on the first try (mirrors Windows' WM_SIZE → notify_layout_ready
         // path). The Zig core treats notifyLayoutReady as idempotent, so any
@@ -1528,63 +1515,6 @@ final class MetalTerminalView: MTKView {
 
         // screenCols was applied above, inside tryUpdateLayoutPx's single
         // grid_mu acquisition (see its computation before that call).
-    }
-
-    // Called from C-ABI callback: ensure glyph exists and return uv/metrics.
-    func atlasEnsureGlyph(scalar: UInt32, out: UnsafeMutablePointer<zonvie_glyph_entry>) -> Bool {
-        guard let e = renderer.atlasEnsureGlyphEntry(scalar: scalar) else { return false }
-
-        out.pointee.uv_min.0 = e.uvMin.x
-        out.pointee.uv_min.1 = e.uvMin.y
-        out.pointee.uv_max.0 = e.uvMax.x
-        out.pointee.uv_max.1 = e.uvMax.y
-
-        out.pointee.bbox_origin_px.0 = e.bboxOriginPx.x
-        out.pointee.bbox_origin_px.1 = e.bboxOriginPx.y
-        out.pointee.bbox_size_px.0 = e.bboxSizePx.x
-        out.pointee.bbox_size_px.1 = e.bboxSizePx.y
-
-        out.pointee.advance_px = e.advancePx
-
-        out.pointee.ascent_px = renderer.ascentPx
-        out.pointee.descent_px = renderer.descentPx
-
-        return true
-    }
-
-    func atlasEnsureGlyphStyled(scalar: UInt32, styleFlags: UInt32, out: UnsafeMutablePointer<zonvie_glyph_entry>) -> Bool {
-        guard let e = renderer.atlasEnsureGlyphEntryStyled(scalar: scalar, styleFlags: styleFlags) else { return false }
-
-        out.pointee.uv_min.0 = e.uvMin.x
-        out.pointee.uv_min.1 = e.uvMin.y
-        out.pointee.uv_max.0 = e.uvMax.x
-        out.pointee.uv_max.1 = e.uvMax.y
-
-        out.pointee.bbox_origin_px.0 = e.bboxOriginPx.x
-        out.pointee.bbox_origin_px.1 = e.bboxOriginPx.y
-        out.pointee.bbox_size_px.0 = e.bboxSizePx.x
-        out.pointee.bbox_size_px.1 = e.bboxSizePx.y
-
-        out.pointee.advance_px = e.advancePx
-
-        out.pointee.ascent_px = renderer.ascentPx
-        out.pointee.descent_px = renderer.descentPx
-
-        return true
-    }
-
-    func submitVerticesRaw(
-        mainPtr: UnsafeRawPointer?, mainCount: Int,
-        cursorPtr: UnsafeRawPointer?, cursorCount: Int
-    ) {
-        // Process pending scroll clears BEFORE submitting new vertices.
-        processPendingScrollClears()
-
-        renderer.submitVerticesRaw(
-            mainPtr: mainPtr, mainCount: mainCount,
-            cursorPtr: cursorPtr, cursorCount: cursorCount
-        )
-        requestRedraw()
     }
 
     func submitVerticesPartialRaw(
@@ -1744,7 +1674,7 @@ final class MetalTerminalView: MTKView {
             return
         }
 
-        // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match vertexgen.ndc()).
+        // Compute dirty rect in drawable pixel coordinates (TOP-ORIGIN to match VH.ndc in flush.zig).
         let cellHpx = CGFloat(renderer.cellHeightPx)
     
         let yFromTopPx = CGFloat(rowStart) * cellHpx
@@ -1801,16 +1731,6 @@ final class MetalTerminalView: MTKView {
         return ok
     }
 
-    func applyLineSpace(px: Int32) {
-        renderer.setLineSpace(px: px)
-
-        // cell metrics changed (height)
-        maybeResizeCoreGrid()
-
-        // Ensure a redraw even if no new vertices arrive immediately.
-        requestRedraw(nil)
-    }
-
     override func keyDown(with event: NSEvent) {
         guard let core else { return }
 
@@ -1818,19 +1738,11 @@ final class MetalTerminalView: MTKView {
 
         // Check if Option key should be treated as Meta (Alt) based on config.
         // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
-        let optionIsMeta: Bool = {
-            guard m.contains(.option) else { return false }
-            // Read the runtime value from the core (atomic, lock-free).
-            // Settable via :call rpcnotify(0, 'zonvie_option_as_meta', 'both')
-            let val = core.getOptionAsMeta()
-            switch val {
-            case 0: return true                       // both
-            case 1: return false                      // none
-            case 2: return m.rawValue & 0x20 != 0     // only_left
-            case 3: return m.rawValue & 0x40 != 0     // only_right
-            default: return true
-            }
-        }()
+        let optionIsMeta = KeyCharacterSelection.optionActsAsMeta(
+            hasOption: m.contains(.option),
+            modifierRawValue: m.rawValue,
+            optionAsMeta: core.getOptionAsMeta()
+        )
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
         // evt_ts: NSEvent.timestamp (kernel event time, seconds since boot) in ms.
@@ -1858,34 +1770,28 @@ final class MetalTerminalView: MTKView {
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
-        if hasMarkedText() {
-            if event.keyCode == 0x35 {  // Escape: cancel composition
-                unmarkText()
-                inputContext?.discardMarkedText()
-                return
-            }
-            // Let IME handle the key (Enter commits, arrows navigate, etc.)
-            if let ctx = inputContext, ctx.handleEvent(event) {
-                return
-            }
-            interpretKeyEvents([event])
-            return
-        }
+        if consumeKeyDuringComposition(event) { return }
 
         // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = isSpecialKeyCode(event.keyCode)
+        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
 
         if hasControlOrCommand || isSpecialKey {
-            var mods: UInt32 = 0
-            if m.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
-            if optionIsMeta          { mods |= UInt32(ZONVIE_MOD_ALT) }
-            if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
-            if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
+            let mods = KeyCharacterSelection.modifierMask(
+                control: m.contains(.control),
+                optionIsMeta: optionIsMeta,
+                shift: m.contains(.shift),
+                command: m.contains(.command),
+                ctrlBit: UInt32(ZONVIE_MOD_CTRL),
+                altBit: UInt32(ZONVIE_MOD_ALT),
+                shiftBit: UInt32(ZONVIE_MOD_SHIFT),
+                superBit: UInt32(ZONVIE_MOD_SUPER)
+            )
 
-            // When Option is treated as Meta, use charactersIgnoringModifiers
-            // as the primary characters to avoid macOS Option-transformed chars
-            // (e.g. ƒ instead of f).  Neovim will see <A-f>, not <A-ƒ>.
-            let chars = optionIsMeta ? event.charactersIgnoringModifiers : event.characters
+            let chars = KeyCharacterSelection.primaryCharacters(
+                optionIsMeta: optionIsMeta,
+                characters: event.characters,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers
+            )
 
             ZonvieCore.appLogScrollMode("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
             core.sendKeyEvent(
@@ -1953,23 +1859,6 @@ final class MetalTerminalView: MTKView {
         ZonvieCore.appLogScrollMode("[keyDown] -> interpretKeyEvents fallback")
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
-    }
-
-    /// Returns true for special keycodes that should bypass IME.
-    private func isSpecialKeyCode(_ keyCode: UInt16) -> Bool {
-        switch keyCode {
-        case 0x35: return true  // Escape
-        case 0x7B, 0x7C, 0x7D, 0x7E: return true  // Arrow keys (left, right, down, up)
-        case 0x24: return true  // Return
-        case 0x30: return true  // Tab
-        case 0x33: return true  // Delete (Backspace)
-        case 0x75: return true  // Forward Delete
-        case 0x73, 0x77: return true  // Home, End
-        case 0x74, 0x79: return true  // Page Up, Page Down
-        case 0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64,
-             0x65, 0x6D, 0x67, 0x6F: return true  // F1-F12
-        default: return false
-        }
     }
 
     // MARK: - Smooth Scrolling
@@ -2260,15 +2149,6 @@ final class MetalTerminalView: MTKView {
         if !scrollOffsetInfoScratch.isEmpty {
             renderer.markAllRowsDirty()
         }
-    }
-
-    /// Clear scroll offset for a specific grid (called when Neovim updates content)
-    private func clearScrollOffset(gridId: Int64) {
-        scrollOffsetLock.lock()
-        scrollOffsetPx.removeValue(forKey: gridId)
-        scrollEdgeBlocked.removeValue(forKey: gridId)
-        scrollOffsetLock.unlock()
-        updateScrollShaderOffset()
     }
 
     /// Clear all scroll offsets.
@@ -2731,13 +2611,6 @@ final class MetalTerminalView: MTKView {
         pendingSentScrollLock.unlock()
     }
 
-    /// Get the current scroll offset for a grid.
-    func getScrollOffset(gridId: Int64) -> CGFloat {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(renderer.cellHeightPx))
-    }
-
     /// Record how far a grid's content just moved (thread-safe, callable from
     /// any thread). Called from ZonvieCore on grid_scroll. rowsDelta is signed
     /// and already summed over the scrolls the notification stands for, so it
@@ -2803,14 +2676,6 @@ final class MetalTerminalView: MTKView {
             pendingScrollClear.append(contentsOf: stagedScrollClear)
             stagedScrollClear.removeAll(keepingCapacity: true)
         }
-        pendingScrollClearLock.unlock()
-    }
-
-    /// An external window published new content for a grid whose scroll offset
-    /// this view holds. See pendingExternalScrollClear.
-    func clearScrollOffsetForExternalGrid(_ gridId: Int64) {
-        pendingScrollClearLock.lock()
-        pendingExternalScrollClear.append(gridId)
         pendingScrollClearLock.unlock()
     }
 
@@ -2970,11 +2835,9 @@ final class MetalTerminalView: MTKView {
         pendingScrollClearLock.lock()
         let pending = pendingScrollClear
         pendingScrollClear.removeAll(keepingCapacity: true)
-        let external = pendingExternalScrollClear
-        pendingExternalScrollClear.removeAll(keepingCapacity: true)
         pendingScrollClearLock.unlock()
 
-        guard !pending.isEmpty || !external.isEmpty else { return }
+        guard !pending.isEmpty else { return }
 
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
         // One wheel event's worth of rows, the unit the lookahead books in and
@@ -2989,24 +2852,6 @@ final class MetalTerminalView: MTKView {
                 || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
 
         scrollOffsetLock.lock()
-        for gridId in external {
-            // A reconciliation in the same batch carries the distance the
-            // content actually moved and settles the offset itself; dropping
-            // it here first would leave that reconciliation adding a full row
-            // to zero and displace the grid.
-            //
-            // This only covers the co-drained case. An external window appends
-            // its clear during vertex generation, while a reconciliation is
-            // staged until this view's commit — so a drain landing between the
-            // two, or a flush that aborts before committing, still sees the
-            // clear alone. Pairing them properly needs the external clear to
-            // be timed against the external window's own commit, which this
-            // view cannot observe.
-            if pending.contains(where: { $0.gridId == gridId }) { continue }
-            smoothScrollGrids.remove(gridId)
-            gestureLookaheadGrids.remove(gridId)
-            scrollOffsetPx.removeValue(forKey: gridId)
-        }
         for (gridId, rowsDelta) in pending {
             // grid_scroll received — reset stale tracking for this grid.
             // A response also proves the grid is not blocked at a buffer edge.

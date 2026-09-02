@@ -41,6 +41,11 @@ SamplerState samp0 : register(s0);
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
+// Block elements the core fills geometrically. Nothing here branches on it:
+// solid quads already return premultiply(i.col) at full vertex alpha, and
+// this frontend never fades foreground quads. Declared so the flag is not
+// mistaken for an unknown bit by the next reader.
+#define DECO_SOLID_GLYPH   (1u << 11)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -122,7 +127,7 @@ float4 PSMain(VSOut i) : SV_Target {
         return float4(tex.rgb * tex.a, tex.a);
     }
 
-    // Background quads use sentinel uv.x < 0 in current vertexgen.
+    // Background quads use sentinel uv.x < 0, set by VH.solid_uv in flush.zig.
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (i.uv.x < 0.0) {
         // Icon rendering with SDF (uv.x <= -1.9)
