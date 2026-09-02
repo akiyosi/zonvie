@@ -302,6 +302,23 @@ pub fn build(b: *std.Build) !void {
         const run_scroll_retention_test = b.addSystemCommand(&.{"/usr/bin/env"});
         run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
         test_step.dependOn(&run_scroll_retention_test.step);
+
+        // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
+        // back texture, and the vacated band always inside the rows the
+        // caller redraws. The blit itself is checked against a real texture
+        // when a Metal device exists.
+        const compile_row_scroll_blit_plan_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_row_scroll_blit_plan_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Sources/Rendering/RowScrollBlitPlan.swift"));
+        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Tests/RowScrollBlitPlanTests.swift"));
+        compile_row_scroll_blit_plan_test.addArg("-o");
+        const row_scroll_blit_plan_test_exe = compile_row_scroll_blit_plan_test.addOutputFileArg("row-scroll-blit-plan-tests");
+        const run_row_scroll_blit_plan_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_row_scroll_blit_plan_test.addFileArg(row_scroll_blit_plan_test_exe);
+        test_step.dependOn(&run_row_scroll_blit_plan_test.step);
     }
 
     // Core inline tests (c_api.zig and its relative imports, including the
