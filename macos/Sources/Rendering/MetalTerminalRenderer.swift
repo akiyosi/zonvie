@@ -2832,7 +2832,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // skip the blit and redraw all dirty rows from scratch.
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             if useGpuScrollCopy, let pendingScroll = pendingScroll {
-                scrollClearBand = encodePendingMainRowScrollCopy(
+                let scrollCopy = encodePendingMainRowScrollCopy(
                     commandBuffer: cmd,
                     backTexture: backTex,
                     drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
@@ -2841,7 +2841,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     logEnabled: ZonvieCore.appLogEnabled
                 )
 
-                if scrollClearBand == nil {
+                if let scrollCopy {
+                    scrollClearBand = (
+                        clearTopPx: scrollCopy.clearTopPx,
+                        clearBottomPx: scrollCopy.clearBottomPx
+                    )
+                    // When multiple flushes accumulate between draws, the blit shifts
+                    // by the total accumulated delta D.  The vacated region (D rows)
+                    // must be redrawn.  Additionally, intermediate scroll steps each
+                    // produced a new row whose vertex data was inherited via buffer-set
+                    // copy + slot remap, but the backbuffer still holds pre-scroll
+                    // pixels for those positions.  Expand dirty rows by 2*D to cover
+                    // both the vacated region and these intermediate rows.
+                    // Stop at the row the blit was clamped to, otherwise a
+                    // row count that outlives the drawable leaves part of the
+                    // vacated band undirtied and it stays blank until the
+                    // next full redraw.
+                    let rowEnd = scrollCopy.clampedRowEnd
+                    let shift = abs(pendingScroll.rowsDelta)
+                    if shift > 0 {
+                        let expandStart: Int
+                        let expandEnd: Int
+                        if pendingScroll.rowsDelta > 0 {
+                            // Scroll down: vacated at bottom, intermediate rows above
+                            expandEnd = rowEnd
+                            expandStart = max(pendingScroll.rowStart, rowEnd - 2 * shift)
+                        } else {
+                            // Scroll up: vacated at top, intermediate rows below
+                            expandStart = pendingScroll.rowStart
+                            expandEnd = min(rowEnd, pendingScroll.rowStart + 2 * shift)
+                        }
+                        dirtyRows.append(contentsOf: expandStart..<expandEnd)
+                    }
+                } else {
                     // The blit never ran (scratch texture or blit encoder
                     // creation failed — see encodePendingMainRowScrollCopy's
                     // guard clauses), so the back texture's pixels were NEVER
@@ -2860,29 +2892,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // combined rows are canonicalized below. This avoids the
                     // previous contains(row) scan that made a failed scroll
                     // blit O(R²) exactly when the fallback is hottest.
-                    dirtyRows.append(contentsOf: pendingScroll.rowStart..<pendingScroll.rowEnd)
-                } else {
-                    // When multiple flushes accumulate between draws, the blit shifts
-                    // by the total accumulated delta D.  The vacated region (D rows)
-                    // must be redrawn.  Additionally, intermediate scroll steps each
-                    // produced a new row whose vertex data was inherited via buffer-set
-                    // copy + slot remap, but the backbuffer still holds pre-scroll
-                    // pixels for those positions.  Expand dirty rows by 2*D to cover
-                    // both the vacated region and these intermediate rows.
-                    let shift = abs(pendingScroll.rowsDelta)
-                    if shift > 0 {
-                        let expandStart: Int
-                        let expandEnd: Int
-                        if pendingScroll.rowsDelta > 0 {
-                            // Scroll down: vacated at bottom, intermediate rows above
-                            expandEnd = pendingScroll.rowEnd
-                            expandStart = max(pendingScroll.rowStart, pendingScroll.rowEnd - 2 * shift)
-                        } else {
-                            // Scroll up: vacated at top, intermediate rows below
-                            expandStart = pendingScroll.rowStart
-                            expandEnd = min(pendingScroll.rowEnd, pendingScroll.rowStart + 2 * shift)
-                        }
-                        dirtyRows.append(contentsOf: expandStart..<expandEnd)
+                    let texMaxRows = cellHi > 0 ? Int(backTex.height) / Int(cellHi) : 0
+                    let clampedRowEnd = min(pendingScroll.rowEnd, texMaxRows)
+                    if clampedRowEnd > pendingScroll.rowStart {
+                        dirtyRows.append(contentsOf: pendingScroll.rowStart..<clampedRowEnd)
                     }
                 }
             }
@@ -5062,7 +5075,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowHeightPx: Int,
         scroll: SurfaceRowScroll,
         logEnabled: Bool
-    ) -> (clearTopPx: Int, clearBottomPx: Int)? {
+    ) -> (clearTopPx: Int, clearBottomPx: Int, clampedRowEnd: Int)? {
         let shift = abs(scroll.rowsDelta)
         // Clamp rowEnd to the back buffer height, as the external-grid path
         // already does. The row count the scroll callback reports can outlive
@@ -5116,11 +5129,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         // The vacated band follows the CLAMPED end, not the reported one: if
         // the blit was clamped, clearing to scroll.rowEnd would run past the
-        // texture the copy just stayed inside.
+        // texture the copy just stayed inside. The caller's dirty-row
+        // expansion has to stop at the same row for the same reason.
         if scroll.rowsDelta > 0 {
-            return ((clampedRowEnd - shift) * rowHeightPx, clampedRowEnd * rowHeightPx)
+            return ((clampedRowEnd - shift) * rowHeightPx, clampedRowEnd * rowHeightPx, clampedRowEnd)
         } else {
-            return (scroll.rowStart * rowHeightPx, (scroll.rowStart + shift) * rowHeightPx)
+            return (scroll.rowStart * rowHeightPx, (scroll.rowStart + shift) * rowHeightPx, clampedRowEnd)
         }
     }
 
