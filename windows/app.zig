@@ -2598,7 +2598,6 @@ pub fn drawSurfaceRowsVBFromSlots(
 }
 
 /// Shared row-mode rendering with TBS (slot-based COW + separate RowVB array).
-/// Same as drawRowModeSetupAndRows but uses slot indirection for zero-copy beginFlush.
 /// Does NOT hold app_mu during VB upload (lock-free via TBS refcount).
 pub fn drawRowModeSetupAndRowsFromSlots(
     g: *d3d11.Renderer,

@@ -3101,7 +3101,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     )
                 }
 
-
                 if use2Pass {
                     // 2-pass rendering (blur enabled)
                     if canBlinkFastPath {

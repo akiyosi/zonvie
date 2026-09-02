@@ -3027,7 +3027,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 )
             }
 
-
             // === PERF LOG: encode_setup → encode_rows boundary ===
             let t_encode_rows_start: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
             let encode_setup_us: Double = ZonvieCore.appLogEnabled ? (t_encode_rows_start - t_encode_start) * 1_000_000 : 0
