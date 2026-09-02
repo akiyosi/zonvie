@@ -5383,7 +5383,6 @@ final class ZonvieCore {
         return targetWin
     }
 
-    /// Called to update vertices for an external grid.
     /// Repaint every non-cursor background vertex that currently carries `from`
     /// with `to`. Decorated grids use this to swap the core's background colour
     /// for the window-chrome-adjusted one without touching glyphs, decorations
@@ -5418,6 +5417,7 @@ final class ZonvieCore {
         }
     }
 
+    /// Called to update vertices for an external grid.
     private func prepareExternalVertexArray(
         gridId: Int64,
         vertices: [zonvie_vertex]

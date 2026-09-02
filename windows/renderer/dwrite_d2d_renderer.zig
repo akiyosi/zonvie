@@ -1096,8 +1096,6 @@ pub const Renderer = struct {
         return true;
     }
 
-    /// Phase 2: Rasterize glyph via DWrite without atlas packing.
-    /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
     /// What a glyph-run rasterization produced. `.empty` means DWrite gave
     /// back no coverage at all -- a space, or a colour glyph with no outline.
     /// The two callers answer that differently, so the helper does not decide.
@@ -1195,6 +1193,8 @@ pub const Renderer = struct {
         return .ok;
     }
 
+    /// Phase 2: Rasterize glyph via DWrite without atlas packing.
+    /// Returns ClearType 3bpp bitmap data in self.glyph_tmp.
     pub fn rasterizeGlyphOnly(self: *Renderer, scalar: u32, style_flags: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) !void {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());

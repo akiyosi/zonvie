@@ -103,10 +103,6 @@ final class MetalTerminalView: MTKView {
     // retention is published: with the vertices it belongs to, never ahead.
     private var stagedScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
     private var pendingScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
-    /// Grids an external window reported new content for. Those vertices are
-    /// committed by that window's own renderer, so this view's commit cannot
-    /// time them — and it reports a content change rather than a measured
-    /// scroll, so the offset is simply dropped, as it always was.
     private let pendingScrollClearLock = NSLock()
 
     // Stale scroll detection: timestamp of the first unanswered tick per grid.

@@ -733,7 +733,7 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     }
     // Note: No else branch needed here. Close buttons and window buttons are
     // handled on mouseDown. Tab selection is also done on mouseDown when
-    // starting a drag. Calling handleTablineClick here would cause double-action.
+    // starting a drag. Selecting the tab again here would double the action.
 }
 
 // ---- Tab Externalization Functions ----
