@@ -285,10 +285,10 @@ pub fn generateScrollbarVerticesForExternal(
     );
 }
 
-/// Which part of an already-resolved scrollbar a point falls on. Both hit
-/// tests were this, verbatim, around their own geometry call.
+/// Which part of an already-resolved scrollbar a point falls on.
 pub const ScrollbarHit = enum { none, knob, track_above, track_below };
 
+/// Both hit tests were this, verbatim, around their own geometry call.
 fn scrollbarHitFrom(geom: app_mod.ScrollbarGeometry, mouse_x: i32, mouse_y: i32) ScrollbarHit {
     if (!geom.is_scrollable) return .none;
 
