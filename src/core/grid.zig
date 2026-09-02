@@ -487,11 +487,113 @@ pub const ConfirmMessage = struct {
     }
 };
 
+/// The three single-line status messages nvim maintains alongside the message
+/// stream. Every layer treats them identically -- same storage shape, same
+/// redraw decoding, same send path -- so they are indexed rather than spelled
+/// out three times. What differs is only which callback each one reaches.
+pub const StatusChannel = enum(u2) {
+    showmode,
+    showcmd,
+    ruler,
+
+    pub const all = [_]StatusChannel{ .showmode, .showcmd, .ruler };
+
+    pub fn index(self: StatusChannel) usize {
+        return @intFromEnum(self);
+    }
+};
+
+/// Shift a rectangle of cells vertically and blank the rows it vacates.
+///
+/// `cells` is row-major with stride `stride`; the rectangle is rows
+/// `[top, bot)` by columns `[left, right)`. Positive `rows` moves content up,
+/// negative moves it down, and a shift at or past the region height blanks the
+/// whole rectangle. Callers pre-clamp the bounds.
+///
+/// Only the cells are shared between GridBuf.scroll and Grid.scroll. Dirty
+/// marking stays with each caller: the main grid is excluded from the
+/// frontend's row-slot remap (see checkScrollFastPath) so it must repaint the
+/// whole region, while the sub-grid path gets that remap and repaints only the
+/// vacated band -- and, having done so, must shift its vertex-row ledger
+/// itself. Unifying either of those here would silently swap one contract for
+/// the other.
+fn scrollCells(
+    cells: []Cell,
+    stride: u32,
+    top: u32,
+    bot: u32,
+    left: u32,
+    right: u32,
+    rows: i32,
+    blank: Cell,
+) void {
+    const height: u32 = bot - top;
+    const width: u32 = right - left;
+    const shift: u32 = scrollShift(rows, height);
+
+    const rowSlice = struct {
+        fn f(buf: []Cell, s: u32, r: u32, l: u32, w: u32) []Cell {
+            const off: usize = @as(usize, r) * @as(usize, s) + @as(usize, l);
+            return buf[off .. off + @as(usize, w)];
+        }
+    }.f;
+
+    if (shift >= height) {
+        var rr: u32 = top;
+        while (rr < bot) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+        return;
+    }
+
+    if (rows > 0) {
+        // Move up by 'shift'
+        var r: u32 = 0;
+        while (r < height - shift) : (r += 1) {
+            std.mem.copyForwards(
+                Cell,
+                rowSlice(cells, stride, top + r, left, width),
+                rowSlice(cells, stride, top + shift + r, left, width),
+            );
+        }
+        var rr: u32 = bot - shift;
+        while (rr < bot) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+    } else {
+        // Move down by 'shift' (bottom-up so overlapping rows survive)
+        var r: u32 = height - shift;
+        while (r > 0) {
+            r -= 1;
+            std.mem.copyForwards(
+                Cell,
+                rowSlice(cells, stride, top + shift + r, left, width),
+                rowSlice(cells, stride, top + r, left, width),
+            );
+        }
+        var rr: u32 = top;
+        while (rr < top + shift) : (rr += 1) {
+            @memset(rowSlice(cells, stride, rr, left, width), blank);
+        }
+    }
+}
+
+/// Magnitude of a scroll, as the three shift sites need it.
+///
+/// `rows` is negated when negative, except that `minInt(i32)` has no positive
+/// counterpart -- negating it overflows -- so it reports `height`, the
+/// smallest value that still satisfies every caller's `shift >= height` test
+/// and sends them down the clear-the-whole-region path.
+fn scrollShift(rows: i32, height: u32) u32 {
+    if (rows == std.math.minInt(i32)) return height;
+    const a: i32 = if (rows < 0) -rows else rows;
+    return @as(u32, @intCast(a));
+}
+
 pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .empty,
-    showmode_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
-    showcmd_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
-    ruler_content: std.ArrayListUnmanaged(MsgChunk) = .empty,
+    /// Indexed by StatusChannel.
+    status_content: [StatusChannel.all.len]std.ArrayListUnmanaged(MsgChunk) = @splat(.empty),
     visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
@@ -503,12 +605,8 @@ pub const MessageState = struct {
     /// frontend even when new msg_show events follow in the same batch.
     /// Reset by notifyMessageChanges after processing.
     msg_cleared_in_batch: bool = false,
-    /// Dirty flag for showmode changes
-    showmode_dirty: bool = false,
-    /// Dirty flag for showcmd changes
-    showcmd_dirty: bool = false,
-    /// Dirty flag for ruler changes
-    ruler_dirty: bool = false,
+    /// Dirty flags for the status channels, indexed by StatusChannel.
+    status_dirty: [StatusChannel.all.len]bool = @splat(false),
     /// Pending msg_show events that need to be sent to frontend.
     /// These survive msg_clear within the same redraw frame.
     pending_messages: [8]PendingMessage = undefined,
@@ -521,23 +619,13 @@ pub const MessageState = struct {
         self.messages.deinit(alloc);
         self.messages = .empty;
 
-        // Free showmode chunks
-        for (self.showmode_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
+        // Free the status channels' chunks
+        for (&self.status_content) |*content| {
+            for (content.items) |chunk| {
+                if (chunk.text.len > 0) alloc.free(chunk.text);
+            }
+            content.deinit(alloc);
         }
-        self.showmode_content.deinit(alloc);
-
-        // Free showcmd chunks
-        for (self.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.showcmd_content.deinit(alloc);
-
-        // Free ruler chunks
-        for (self.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.ruler_content.deinit(alloc);
     }
 
     /// Clear msg_show messages only. Does NOT clear showmode/showcmd/ruler
@@ -570,30 +658,18 @@ pub const MessageState = struct {
         }
         self.messages.clearRetainingCapacity();
 
-        // Free showmode chunks
-        for (self.showmode_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
+        // Free the status channels' chunks
+        for (&self.status_content) |*content| {
+            for (content.items) |chunk| {
+                if (chunk.text.len > 0) alloc.free(chunk.text);
+            }
+            content.clearRetainingCapacity();
         }
-        self.showmode_content.clearRetainingCapacity();
-
-        // Free showcmd chunks
-        for (self.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.showcmd_content.clearRetainingCapacity();
-
-        // Free ruler chunks
-        for (self.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) alloc.free(chunk.text);
-        }
-        self.ruler_content.clearRetainingCapacity();
 
         self.confirm_msg.clear();
         self.visible = false;
         self.msg_dirty = false;
-        self.showmode_dirty = false;
-        self.showcmd_dirty = false;
-        self.ruler_dirty = false;
+        self.status_dirty = @splat(false);
     }
 };
 
@@ -808,6 +884,11 @@ pub const GridBuf = struct {
         // Keep row metadata lazy for every zero-cell shape. Allocate a fresh
         // bitset before publishing any part of the resize so OOM preserves the
         // previous GridBuf in full.
+        //
+        // Note this leaves `bit_length` at 0 while `rows` is whatever was
+        // asked for, so `bit_length >= rows` is NOT an invariant here the way
+        // it is on Grid (see Grid.ensureDirtyCapacity). Anything reading
+        // `dirty_rows` off a GridBuf has to check `bit_length` first.
         var new_dirty_rows: std.DynamicBitSetUnmanaged = .{};
         errdefer new_dirty_rows.deinit(alloc);
         if (new_len != 0) try new_dirty_rows.resize(alloc, rows, true);
@@ -903,13 +984,7 @@ pub const GridBuf = struct {
         if (top >= bot or left >= right) return;
 
         const height: u32 = bot - top;
-        const width: u32 = right - left;
-
-        const shift: u32 = blk: {
-            if (rows == std.math.minInt(i32)) break :blk height;
-            const a: i32 = if (rows < 0) -rows else rows;
-            break :blk @as(u32, @intCast(a));
-        };
+        const shift: u32 = scrollShift(rows, height);
 
         // Keep the last-submitted vertex ledger aligned with the frontend's
         // row-slot scroll. This is allocation-free and touches only the same
@@ -943,75 +1018,21 @@ pub const GridBuf = struct {
         }
 
         if (shift >= height) {
+            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+            // The entire scrolled region is vacated (no surviving shifted
+            // content), unlike the shift < height case below — mark every
+            // row dirty here too, or these blanked cells never reach the
+            // frontend and the GPU-side region keeps its stale pre-scroll
+            // content forever (core and GPU permanently disagree).
             var rr: u32 = top;
             while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-                // The entire scrolled region is vacated (no surviving shifted
-                // content), unlike the shift < height case below — mark every
-                // row dirty here too, or these blanked cells never reach the
-                // frontend and the GPU-side region keeps its stale pre-scroll
-                // content forever (core and GPU permanently disagree).
-                if (rr < self.dirty_rows.bit_length) {
-                    self.dirty_rows.set(rr);
-                }
+                if (rr < self.dirty_rows.bit_length) self.dirty_rows.set(rr);
             }
             self.dirty = true;
             return;
         }
 
-        if (rows > 0) {
-            // Move up by 'shift'
-            var r: u32 = 0;
-            while (r < height - shift) : (r += 1) {
-                const src_row = top + shift + r;
-                const dst_row = top + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // clear bottom
-            var rr: u32 = bot - shift;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        } else {
-            // Move down by 'shift' (bottom-up)
-            var r: u32 = height - shift;
-            while (r > 0) {
-                r -= 1;
-
-                const src_row = top + r;
-                const dst_row = top + shift + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // clear top
-            var rr: u32 = top;
-            while (rr < top + shift) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        }
+        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         // Mark only vacated rows as dirty — non-vacated rows are just shifted
         // and the frontend's row slot remapping handles the visual shift.
@@ -1911,12 +1932,8 @@ pub const Grid = struct {
         if (grid_overflow_count == 0) return;
         if (rows_delta == 0 or top >= bot or left >= right) return;
 
-        const shift: u32 = blk: {
-            if (rows_delta == std.math.minInt(i32)) break :blk bot - top;
-            const a: i32 = if (rows_delta < 0) -rows_delta else rows_delta;
-            break :blk @as(u32, @intCast(a));
-        };
         const height = bot - top;
+        const shift: u32 = scrollShift(rows_delta, height);
         if (shift >= height) {
             self.clearOverflowRect(grid_id, top, bot, left, right);
             return;
@@ -2050,8 +2067,17 @@ pub const Grid = struct {
         return .{ .cp = 0, .hl = 0 };
     }
 
+    /// Grow `dirty_rows` to cover `rows`, leaving new bits clean.
+    ///
+    /// `Grid.resize` calls this unconditionally, which is what lets readers
+    /// index `dirty_rows` by row without a length check first:
+    /// `bit_length >= rows` holds for the global grid at all times. `GridBuf`
+    /// gives no such guarantee — it skips the bitset entirely for a zero-cell
+    /// shape while still updating `rows` — so its readers do have to test
+    /// `bit_length` before `isSet`.
     pub fn ensureDirtyCapacity(self: *Grid, rows: u32) !void {
-        // Keep bitset length == rows. Initialize new bits as "clean" (false).
+        // Grow only: a shrink leaves the bitset longer than `rows`, which the
+        // `>=` invariant above allows. Initialize new bits as "clean" (false).
         const r: usize = @as(usize, rows);
         if (self.dirty_rows.bit_length >= r) return;
         try self.dirty_rows.resize(self.alloc, r, false);
@@ -2067,12 +2093,12 @@ pub const Grid = struct {
     pub fn markDirtyRect(self: *Grid, top: u32, bot: u32) void {
         if (self.dirty_all) return;
         const start: usize = @as(usize, top);
+        // Clamping to `rows` is enough: `bit_length >= rows` holds for the
+        // global grid at all times (see Grid.ensureDirtyCapacity), which is
+        // the same invariant markDirtyRow relies on to set a bit unguarded.
         const end: usize = @as(usize, @min(bot, self.rows));
         if (start >= end) return;
-        const clamped_end: usize = @min(end, self.dirty_rows.bit_length);
-        if (start < clamped_end) {
-            self.dirty_rows.setRangeValue(.{ .start = start, .end = clamped_end }, true);
-        }
+        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
     }
 
     pub fn markAllDirty(self: *Grid) void {
@@ -2277,25 +2303,14 @@ pub const Grid = struct {
         if (top >= bot or left >= right) return;
 
         const height: u32 = bot - top;
-        const width: u32 = right - left;
 
         if (rows == 0) return;
 
-        const shift: u32 = blk: {
-            // Handle minInt safely (treat as very large shift => clears region)
-            if (rows == std.math.minInt(i32)) break :blk height;
-            const a: i32 = if (rows < 0) -rows else rows;
-            break :blk @as(u32, @intCast(a));
-        };
+        const shift: u32 = scrollShift(rows, height);
 
         // If the shift exceeds region height, everything is scrolled out.
         if (shift >= height) {
-            var rr: u32 = top;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
+            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
             // Clear overflow for the entire scrolled-out region
             self.clearOverflowRect(1, top, bot, left, right);
             // Mark every row in the region dirty. The caller (scrollGrid)
@@ -2311,57 +2326,7 @@ pub const Grid = struct {
             return;
         }
 
-        if (rows > 0) {
-            // Move up by 'shift'.
-            var r: u32 = 0;
-            while (r < height - shift) : (r += 1) {
-                const src_row = top + shift + r;
-                const dst_row = top + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // Clear scrolled-in area at bottom (optional but safe).
-            var rr: u32 = bot - shift;
-            while (rr < bot) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        } else {
-            // Move down by 'shift' (copy bottom-up to avoid overwriting).
-            var r: u32 = height - shift;
-            while (r > 0) {
-                r -= 1;
-
-                const src_row = top + r;
-                const dst_row = top + shift + r;
-
-                const src_off: usize = @as(usize, src_row) * @as(usize, self.cols) + @as(usize, left);
-                const dst_off: usize = @as(usize, dst_row) * @as(usize, self.cols) + @as(usize, left);
-
-                std.mem.copyForwards(
-                    Cell,
-                    self.cells[dst_off .. dst_off + @as(usize, width)],
-                    self.cells[src_off .. src_off + @as(usize, width)],
-                );
-            }
-
-            // Clear scrolled-in area at top (optional but safe).
-            var rr: u32 = top;
-            while (rr < top + shift) : (rr += 1) {
-                const off: usize = @as(usize, rr) * @as(usize, self.cols) + @as(usize, left);
-                const slice = self.cells[off .. off + @as(usize, width)];
-                @memset(slice, .{ .cp = ' ', .hl = 0 });
-            }
-        }
+        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         self.markDirtyRect(top, bot);
 
@@ -4284,64 +4249,28 @@ pub const Grid = struct {
         // Note: Do NOT clear pending_show here - it should survive msg_clear
     }
 
-    /// Handle msg_showmode event.
-    pub fn setMsgShowmode(self: *Grid, content: []const MsgChunk) !void {
+    /// Replace a status channel's content. Showmode, showcmd and ruler are
+    /// stored and refreshed identically; only the slot differs.
+    pub fn setMsgStatus(self: *Grid, channel: StatusChannel, content: []const MsgChunk) !void {
+        const slot = &self.message_state.status_content[channel.index()];
+
         // Clear existing content
-        for (self.message_state.showmode_content.items) |chunk| {
+        for (slot.items) |chunk| {
             if (chunk.text.len > 0) self.alloc.free(chunk.text);
         }
-        self.message_state.showmode_content.clearRetainingCapacity();
+        slot.clearRetainingCapacity();
 
         // Copy new content
         for (content) |chunk| {
             const duped_text = try self.alloc.dupe(u8, chunk.text);
             errdefer self.alloc.free(duped_text);
-            try self.message_state.showmode_content.append(self.alloc, MsgChunk{
+            try slot.append(self.alloc, MsgChunk{
                 .hl_id = chunk.hl_id,
                 .text = duped_text,
             });
         }
-        self.message_state.showmode_dirty = true;
-    }
 
-    /// Handle msg_showcmd event.
-    pub fn setMsgShowcmd(self: *Grid, content: []const MsgChunk) !void {
-        // Clear existing content
-        for (self.message_state.showcmd_content.items) |chunk| {
-            if (chunk.text.len > 0) self.alloc.free(chunk.text);
-        }
-        self.message_state.showcmd_content.clearRetainingCapacity();
-
-        // Copy new content
-        for (content) |chunk| {
-            const duped_text = try self.alloc.dupe(u8, chunk.text);
-            errdefer self.alloc.free(duped_text);
-            try self.message_state.showcmd_content.append(self.alloc, MsgChunk{
-                .hl_id = chunk.hl_id,
-                .text = duped_text,
-            });
-        }
-        self.message_state.showcmd_dirty = true;
-    }
-
-    /// Handle msg_ruler event.
-    pub fn setMsgRuler(self: *Grid, content: []const MsgChunk) !void {
-        // Clear existing content
-        for (self.message_state.ruler_content.items) |chunk| {
-            if (chunk.text.len > 0) self.alloc.free(chunk.text);
-        }
-        self.message_state.ruler_content.clearRetainingCapacity();
-
-        // Copy new content
-        for (content) |chunk| {
-            const duped_text = try self.alloc.dupe(u8, chunk.text);
-            errdefer self.alloc.free(duped_text);
-            try self.message_state.ruler_content.append(self.alloc, MsgChunk{
-                .hl_id = chunk.hl_id,
-                .text = duped_text,
-            });
-        }
-        self.message_state.ruler_dirty = true;
+        self.message_state.status_dirty[channel.index()] = true;
     }
 
     /// Handle msg_history_show event.
@@ -4386,11 +4315,41 @@ pub const Grid = struct {
     pub fn clearMessageDirty(self: *Grid) void {
         self.message_state.msg_dirty = false;
         self.message_state.confirm_dirty = false;
-        self.message_state.showmode_dirty = false;
-        self.message_state.showcmd_dirty = false;
-        self.message_state.ruler_dirty = false;
+        self.message_state.status_dirty = @splat(false);
     }
 };
+
+test "the global grid always has a dirty bit per row, a sub-grid may not" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    // Grid.resize goes through ensureDirtyCapacity every time, so readers can
+    // index dirty_rows by row with no length check. Callers in flush.zig rely
+    // on this; if it ever stops holding they index past the bitset.
+    try grid.resize(24, 80);
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    try grid.resize(50, 80); // grow
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    try grid.resize(10, 80); // shrink: the bitset is allowed to stay long
+    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+
+    // The zero-cell shape needs its own grid. Reaching it after a larger
+    // resize proves nothing: the bitset only ever grows, so a stale length
+    // from an earlier shape would satisfy the assertion on its own.
+    var zero_cols = Grid.init(std.testing.allocator);
+    defer zero_cols.deinit();
+    try zero_cols.resize(30, 0);
+    try std.testing.expectEqual(@as(u32, 30), zero_cols.rows);
+    try std.testing.expect(zero_cols.dirty_rows.bit_length >= zero_cols.rows);
+
+    // GridBuf makes no such promise: a zero-cell shape skips the bitset while
+    // rows keeps the requested value. This is why the sub-grid paths in
+    // flush.zig test bit_length before isSet.
+    try grid.resizeGrid(2, 8, 0);
+    const sub = grid.sub_grids.getPtr(2).?;
+    try std.testing.expectEqual(@as(u32, 8), sub.rows);
+    try std.testing.expectEqual(@as(usize, 0), sub.dirty_rows.bit_length);
+}
 
 test "reopening a clean external grid regenerates every row" {
     var grid = Grid.init(std.testing.allocator);
@@ -5114,4 +5073,145 @@ test "scroll notification overflow retains main provenance across pending overwr
     grid.clearScrolledGrids();
     try std.testing.expect(!grid.main_scroll_notify_pending);
     try std.testing.expect(!grid.sub_grids.get(18).?.scroll_notify_pending);
+}
+
+test "every status channel stores, replaces and dirties independently" {
+    // showmode, showcmd and ruler used to be three copies of the same code.
+    // Now they share one path indexed by channel, so the thing worth pinning
+    // is that they still do not bleed into each other.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    for (StatusChannel.all) |channel| {
+        try std.testing.expect(!grid.message_state.status_dirty[channel.index()]);
+        try std.testing.expectEqual(@as(usize, 0), grid.message_state.status_content[channel.index()].items.len);
+    }
+
+    try grid.setMsgStatus(.showcmd, &.{.{ .hl_id = 7, .text = "3d" }});
+
+    // Only the written channel is touched.
+    for (StatusChannel.all) |channel| {
+        const expected_len: usize = if (channel == .showcmd) 1 else 0;
+        try std.testing.expectEqual(expected_len, grid.message_state.status_content[channel.index()].items.len);
+        try std.testing.expectEqual(channel == .showcmd, grid.message_state.status_dirty[channel.index()]);
+    }
+    const stored = grid.message_state.status_content[StatusChannel.showcmd.index()].items[0];
+    try std.testing.expectEqual(@as(u32, 7), stored.hl_id);
+    try std.testing.expectEqualStrings("3d", stored.text);
+
+    // The text is owned, not borrowed: a second write must free the first.
+    try grid.setMsgStatus(.showcmd, &.{ .{ .hl_id = 1, .text = "-- INSERT --" }, .{ .hl_id = 2, .text = "!" } });
+    try std.testing.expectEqual(@as(usize, 2), grid.message_state.status_content[StatusChannel.showcmd.index()].items.len);
+    try std.testing.expectEqualStrings("-- INSERT --", grid.message_state.status_content[StatusChannel.showcmd.index()].items[0].text);
+
+    // An empty write clears the channel, which is how mode-exit blanks showmode.
+    try grid.setMsgStatus(.showcmd, &.{});
+    try std.testing.expectEqual(@as(usize, 0), grid.message_state.status_content[StatusChannel.showcmd.index()].items.len);
+
+    // Every channel is reachable and lands in its own slot.
+    for (StatusChannel.all) |channel| {
+        try grid.setMsgStatus(channel, &.{.{ .hl_id = 0, .text = @tagName(channel) }});
+    }
+    for (StatusChannel.all) |channel| {
+        try std.testing.expectEqualStrings(@tagName(channel), grid.message_state.status_content[channel.index()].items[0].text);
+    }
+}
+
+test "scrollShift takes the magnitude and treats minInt as clearing the region" {
+    // Written out three times before: GridBuf.scroll, Grid.scroll and
+    // Grid.scrollOverflow. The minInt arm is the reason it is not just @abs --
+    // negating minInt overflows, so it saturates to the region height, which
+    // every caller then reads as "shift >= height, clear the whole region".
+    const height: u32 = 10;
+
+    try std.testing.expectEqual(@as(u32, 3), scrollShift(3, height));
+    try std.testing.expectEqual(@as(u32, 3), scrollShift(-3, height));
+    try std.testing.expectEqual(@as(u32, 0), scrollShift(0, height));
+
+    // At and beyond the height the callers take their clear-everything branch;
+    // the magnitude is still reported faithfully rather than clamped.
+    try std.testing.expectEqual(height, scrollShift(10, height));
+    try std.testing.expectEqual(@as(u32, 11), scrollShift(11, height));
+    try std.testing.expectEqual(@as(u32, 11), scrollShift(-11, height));
+
+    // minInt cannot be negated, so it reports the height -- the smallest value
+    // that still trips every caller's `shift >= height` test.
+    try std.testing.expectEqual(height, scrollShift(std.math.minInt(i32), height));
+    // maxInt is representable and must come back unchanged, not saturated.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(i32)), scrollShift(std.math.maxInt(i32), height));
+    // minInt + 1 is the largest negative that CAN be negated: it must not be
+    // confused with minInt and collapsed to the height.
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(i32)), scrollShift(std.math.minInt(i32) + 1, height));
+
+    // A zero-height region: minInt still reports the height, which is 0, and
+    // `shift >= height` holds, so callers clear nothing and return.
+    try std.testing.expectEqual(@as(u32, 0), scrollShift(std.math.minInt(i32), 0));
+}
+
+test "scrollCells shifts a rect and blanks what it vacates" {
+    // The cell-shifting core was written out twice, in GridBuf.scroll and
+    // Grid.scroll, character for character including the offset expression.
+    // Only the cells are shared: dirty marking and the vertex-row ledger stay
+    // with each caller because their contracts genuinely differ -- the main
+    // grid is excluded from the frontend's row-slot remap and must repaint the
+    // whole region, the sub-grid path is not and repaints only the vacated band.
+    const cols: u32 = 4;
+    const rows: u32 = 4;
+    const blank: Cell = .{ .cp = ' ', .hl = 0 };
+
+    // Distinct content per cell so a shifted row is traceable to its source.
+    var cells: [16]Cell = undefined;
+    const seed = struct {
+        fn f(buf: []Cell) void {
+            for (buf, 0..) |*c, i| c.* = .{ .cp = @intCast('a' + i), .hl = @intCast(i) };
+        }
+    }.f;
+
+    // Scroll up by one over the whole grid: row r takes row r+1, last is blank.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, 1, blank);
+    for (0..3) |r| {
+        for (0..cols) |c| {
+            try std.testing.expectEqual(@as(u32, @intCast('a' + (r + 1) * cols + c)), cells[r * cols + c].cp);
+        }
+    }
+    for (0..cols) |c| try std.testing.expectEqual(blank, cells[3 * cols + c]);
+
+    // Scroll down by one: row r takes row r-1, first is blank.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, -1, blank);
+    for (1..4) |r| {
+        for (0..cols) |c| {
+            try std.testing.expectEqual(@as(u32, @intCast('a' + (r - 1) * cols + c)), cells[r * cols + c].cp);
+        }
+    }
+    for (0..cols) |c| try std.testing.expectEqual(blank, cells[c]);
+
+    // A shift at or past the region height blanks the region outright.
+    seed(&cells);
+    scrollCells(&cells, cols, 1, 3, 0, cols, 2, blank);
+    for (0..cols) |c| {
+        // Rows outside [1,3) are untouched.
+        try std.testing.expectEqual(@as(u32, @intCast('a' + c)), cells[c].cp);
+        try std.testing.expectEqual(@as(u32, @intCast('a' + 3 * cols + c)), cells[3 * cols + c].cp);
+        try std.testing.expectEqual(blank, cells[1 * cols + c]);
+        try std.testing.expectEqual(blank, cells[2 * cols + c]);
+    }
+
+    // A column sub-range must leave the columns outside it alone -- this is
+    // what the `left`/`right` half of the offset expression is for.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 1, 3, 1, blank);
+    for (0..rows) |r| {
+        try std.testing.expectEqual(@as(u32, @intCast('a' + r * cols)), cells[r * cols].cp);
+        try std.testing.expectEqual(@as(u32, @intCast('a' + r * cols + 3)), cells[r * cols + 3].cp);
+    }
+    try std.testing.expectEqual(@as(u32, @intCast('a' + 1 * cols + 1)), cells[0 * cols + 1].cp);
+    try std.testing.expectEqual(blank, cells[3 * cols + 1]);
+    try std.testing.expectEqual(blank, cells[3 * cols + 2]);
+
+    // minInt is the caller's "clear everything" signal and must not be negated.
+    seed(&cells);
+    scrollCells(&cells, cols, 0, rows, 0, cols, std.math.minInt(i32), blank);
+    for (cells) |cell| try std.testing.expectEqual(blank, cell);
 }

@@ -8,6 +8,52 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 
+/// Hand a prepared request to the UI thread and wake it. Caller must already
+/// hold app.mu.
+///
+/// A failed enqueue aborts the core's flush: the core must not go on treating
+/// the flush as delivered when the message never reached the UI thread. All
+/// three message paths carried their own copy of that contract.
+fn enqueuePendingMessage(app: *App, req: app_mod.PendingMessageRequest, what: []const u8) void {
+    app.pending_messages.append(app.alloc, req) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[win] failed to queue {s}: {any}\n", .{ what, e });
+        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
+        return;
+    };
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
+    }
+}
+
+/// Publish `text` to a mini message window and ask the main window to repaint
+/// it. The .mini route and the fallback route for the views with no dedicated
+/// display did this identically.
+fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) void {
+    const idx = @intFromEnum(mini_id);
+    app.mu.lockUncancelable(core.clock.io());
+    @memcpy(app.mini_windows[idx].text[0..text.len], text);
+    app.mini_windows[idx].text_len = text.len;
+    app.mu.unlock(core.clock.io());
+
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
+    }
+}
+
+/// Append one chunk's text to `buf` at `len`, clamped to what is left, and
+/// return the new length. Three message paths concatenated chunks this way.
+///
+/// The caller decides what to do once the buffer is full: two of them break
+/// out of their loop, the history path keeps iterating and simply copies
+/// nothing more, since copy_len clamps to zero.
+fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
+    if (chunk.text_len == 0) return len;
+    const text = chunk.text[0..chunk.text_len];
+    const copy_len = @min(text.len, buf.len - len);
+    @memcpy(buf[len..][0..copy_len], text[0..copy_len]);
+    return len + copy_len;
+}
+
 /// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
 /// mid-codepoint-truncated tail. The message buffers are filled by byte-count
 /// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
@@ -65,10 +111,7 @@ pub fn onMsgShow(
     var primary_hl_id: u32 = 0;
     for (chunks[0..chunk_count]) |chunk| {
         if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-        const text = chunk.text[0..chunk.text_len];
-        const copy_len = @min(text.len, msg_text.len - msg_len);
-        @memcpy(msg_text[msg_len..][0..copy_len], text[0..copy_len]);
-        msg_len += copy_len;
+        msg_len = appendChunkText(&msg_text, msg_len, chunk);
         if (msg_len >= msg_text.len) break;
     }
 
@@ -100,16 +143,7 @@ pub fn onMsgShow(
     req.view_type = view;
     req.timeout = timeout_sec;
 
-    app.pending_messages.append(app.alloc, req) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
-        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-        return;
-    };
-
-    // Post message to UI thread
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-    }
+    enqueuePendingMessage(app, req, "message");
 }
 
 pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
@@ -151,10 +185,7 @@ pub fn handleMsgMiniOrExtFloat(
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
     for (chunks[0..chunk_count]) |chunk| {
-        const text = chunk.text[0..chunk.text_len];
-        const copy_len = @min(text.len, text_buf.len - text_len);
-        @memcpy(text_buf[text_len..][0..copy_len], text[0..copy_len]);
-        text_len += copy_len;
+        text_len = appendChunkText(&text_buf, text_len, chunk);
         if (text_len >= text_buf.len) break;
     }
 
@@ -171,15 +202,7 @@ pub fn handleMsgMiniOrExtFloat(
         },
         .mini => {
             // Update mini window
-            const idx = @intFromEnum(mini_id);
-            app.mu.lockUncancelable(core.clock.io());
-            @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
-            app.mini_windows[idx].text_len = text_len;
-            app.mu.unlock(core.clock.io());
-
-            if (app.hwnd) |main_hwnd| {
-                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
-            }
+            updateMiniWindow(app, mini_id, text_buf[0..text_len]);
         },
         .ext_float => {
             // Queue message for ext_float display
@@ -198,15 +221,7 @@ pub fn handleMsgMiniOrExtFloat(
             req.view_type = .ext_float;
             req.timeout = route_result.timeout;
 
-            app.pending_messages.append(app.alloc, req) catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] failed to queue message: {any}\n", .{e});
-                if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-                return;
-            };
-
-            if (app.hwnd) |main_hwnd| {
-                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-            }
+            enqueuePendingMessage(app, req, "message");
         },
         .notification => {
             // Show OS notification via balloon
@@ -217,15 +232,7 @@ pub fn handleMsgMiniOrExtFloat(
         },
         else => {
             // Fallback to mini for other views (confirm, split)
-            const idx = @intFromEnum(mini_id);
-            app.mu.lockUncancelable(core.clock.io());
-            @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
-            app.mini_windows[idx].text_len = text_len;
-            app.mu.unlock(core.clock.io());
-
-            if (app.hwnd) |main_hwnd| {
-                _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
-            }
+            updateMiniWindow(app, mini_id, text_buf[0..text_len]);
         },
     }
 }
@@ -236,33 +243,6 @@ pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) voi
     const copy_len = @min(text.len, app.mini_windows[idx].text.len);
     @memcpy(app.mini_windows[idx].text[0..copy_len], text[0..copy_len]);
     app.mini_windows[idx].text_len = copy_len;
-}
-
-/// Common handler for mini window updates from callbacks
-pub fn updateMiniFromCallback(app: *App, id: app_mod.MiniWindowId, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) void {
-    const idx = @intFromEnum(id);
-
-    // Build text from chunks
-    var text_buf: [256]u8 = undefined;
-    var text_len: usize = 0;
-    for (chunks[0..chunk_count]) |chunk| {
-        const text = chunk.text[0..chunk.text_len];
-        const copy_len = @min(text.len, text_buf.len - text_len);
-        @memcpy(text_buf[text_len..][0..copy_len], text[0..copy_len]);
-        text_len += copy_len;
-        if (text_len >= text_buf.len) break;
-    }
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\"\n", .{ @tagName(id), chunk_count, text_buf[0..text_len] });
-
-    // Update state and post to UI thread
-    app.mu.lockUncancelable(core.clock.io());
-    @memcpy(app.mini_windows[idx].text[0..text_len], text_buf[0..text_len]);
-    app.mini_windows[idx].text_len = text_len;
-    app.mu.unlock(core.clock.io());
-
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
-    }
 }
 
 pub fn onMsgHistoryShow(
@@ -286,13 +266,7 @@ pub fn onMsgHistoryShow(
         const entry = entries.?[i];
         if (entry.chunk_count > 0) {
             for (0..entry.chunk_count) |j| {
-                const chunk = entry.chunks[j];
-                if (chunk.text_len > 0) {
-                    const text = chunk.text[0..chunk.text_len];
-                    const copy_len = @min(text.len, content_buf.len - content_len);
-                    @memcpy(content_buf[content_len..][0..copy_len], text[0..copy_len]);
-                    content_len += copy_len;
-                }
+                content_len = appendChunkText(&content_buf, content_len, entry.chunks[j]);
             }
             // Add newline between entries
             if (content_len < content_buf.len - 1) {
@@ -317,16 +291,7 @@ pub fn onMsgHistoryShow(
     req.replace_last = 0;
     req.append = 0;
 
-    app.pending_messages.append(app.alloc, req) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] failed to queue history message: {any}\n", .{e});
-        if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
-        return;
-    };
-
-    // Post message to UI thread
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_SHOW, 0, 0);
-    }
+    enqueuePendingMessage(app, req, "history message");
 }
 
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {

@@ -92,141 +92,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return zonvieDir.appendingPathComponent("pipeline_cache.metallib")
     }
 
-    /// Ensure pipeline cache exists before fork.
-    /// Call this from main.swift BEFORE fork() to avoid XPC errors in child process.
-    /// XPC services (Metal shader compiler) don't survive fork(), so we must compile
-    /// and cache pipelines in the parent process before forking.
-    ///
-    /// IMPORTANT: This function must NOT use FileManager or other high-level APIs
-    /// that poison the fork() state. Using FileManager before fork() causes child
-    /// process to crash with "USING_FORK_WITHOUT_EXEC_IS_NOT_SUPPORTED_BY_FILE_MANAGER".
-    static func ensurePipelineCacheBeforeFork() {
-        // Build path manually without FileManager (POSIX-safe for fork)
-        // ~/Library/Application Support/zonvie/pipeline_cache.metallib
-        guard let home = getenv("HOME") else { return }
-        let homeStr = String(cString: home)
-        let zonvieDir = homeStr + "/Library/Application Support/zonvie"
-        let archivePathStr = zonvieDir + "/pipeline_cache.metallib"
-
-        // Check if cache already exists using POSIX (fork-safe)
-        var st = stat()
-        if stat(archivePathStr, &st) == 0 {
-            // File exists, skip
-            return
-        }
-
-        // Create directory using POSIX mkdir (fork-safe)
-        // Create parent directories as needed
-        mkdir((homeStr + "/Library/Application Support").cString(using: .utf8)!, 0o755)
-        mkdir(zonvieDir.cString(using: .utf8)!, 0o755)
-
-        // Get Metal device
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            return
-        }
-
-        // Get shader library
-        guard let lib = device.makeDefaultLibrary(),
-              let vs = lib.makeFunction(name: "vs_main"),
-              let fs = lib.makeFunction(name: "ps_main"),
-              let fsBg = lib.makeFunction(name: "ps_background"),
-              let fsGlyph = lib.makeFunction(name: "ps_glyph"),
-              let vsCopy = lib.makeFunction(name: "vs_copy"),
-              let fsCopy = lib.makeFunction(name: "ps_copy") else {
-            return
-        }
-
-        // Create vertex descriptor (must match MetalTerminalRenderer.makeVertexDescriptor)
-        guard let vertexDesc = makeVertexDescriptor() else {
-            return
-        }
-
-        // Create copy vertex descriptor (simple position + texcoord)
-        guard let copyVertexDesc = makeCopyVertexDescriptor() else {
-            return
-        }
-
-        // Use common pixel format (matches MTKView default)
-        let pixelFormat: MTLPixelFormat = .bgra8Unorm
-
-        // Main pipeline descriptor
-        let mainDesc = MTLRenderPipelineDescriptor()
-        mainDesc.vertexFunction = vs
-        mainDesc.fragmentFunction = fs
-        mainDesc.vertexDescriptor = vertexDesc
-        mainDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = mainDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.sourceRGBBlendFactor = .sourceAlpha
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.alphaBlendOperation = .add
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
-
-        // Background pipeline descriptor (for blur 2-pass)
-        let bgDesc = MTLRenderPipelineDescriptor()
-        bgDesc.vertexFunction = vs
-        bgDesc.fragmentFunction = fsBg
-        bgDesc.vertexDescriptor = vertexDesc
-        bgDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = bgDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
-            a.sourceRGBBlendFactor = .one
-            a.destinationRGBBlendFactor = .zero
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .zero
-        }
-
-        // Glyph pipeline descriptor (for blur 2-pass)
-        let glyphDesc = MTLRenderPipelineDescriptor()
-        glyphDesc.vertexFunction = vs
-        glyphDesc.fragmentFunction = fsGlyph
-        glyphDesc.vertexDescriptor = vertexDesc
-        glyphDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = glyphDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.sourceRGBBlendFactor = .sourceAlpha
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.alphaBlendOperation = .add
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
-
-        // Copy pipeline descriptor (for backBuffer -> drawable copy, replaces Blit)
-        let copyDesc = MTLRenderPipelineDescriptor()
-        copyDesc.vertexFunction = vsCopy
-        copyDesc.fragmentFunction = fsCopy
-        copyDesc.vertexDescriptor = copyVertexDesc
-        copyDesc.colorAttachments[0].pixelFormat = pixelFormat
-        // No blending needed for copy - just overwrite
-        if let a = copyDesc.colorAttachments[0] {
-            a.isBlendingEnabled = false
-        }
-
-        // Compile pipelines (this uses XPC - must happen before fork)
-        do {
-            _ = try device.makeRenderPipelineState(descriptor: mainDesc)
-            _ = try device.makeRenderPipelineState(descriptor: bgDesc)
-            _ = try device.makeRenderPipelineState(descriptor: glyphDesc)
-            _ = try device.makeRenderPipelineState(descriptor: copyDesc)
-
-            // Cache to binary archive
-            let archiveDesc = MTLBinaryArchiveDescriptor()
-            let archive = try device.makeBinaryArchive(descriptor: archiveDesc)
-            try archive.addRenderPipelineFunctions(descriptor: mainDesc)
-            try archive.addRenderPipelineFunctions(descriptor: bgDesc)
-            try archive.addRenderPipelineFunctions(descriptor: glyphDesc)
-            try archive.addRenderPipelineFunctions(descriptor: copyDesc)
-            try archive.serialize(to: URL(fileURLWithPath: archivePathStr))
-        } catch {
-            // Errors are ignored - child process will retry (though it may fail)
-        }
-    }
 
     private let lock = NSLock()
 
@@ -260,6 +125,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // consumeFlushFailed()), which cancels the bracket instead of
     // committing it and calls zonvie_core_force_resend + schedules a retry.
     private(set) var flushFailed: Bool = false // Core thread only
+    // ExternalGridView carries a deliberately parallel ledger and
+    // provisioning pass. The two are NOT unified: the pure parts already live
+    // as shared free functions in MetalTypes.swift
+    // (surfacePhysicalCapacityRow, surfaceRowCapacityIsPrepared,
+    // surfaceSafeNeededBytes, makeSurfaceRowProvisionPlan), and what is left
+    // is each class's own concurrency contract -- a different lock, a
+    // different source for the flush bracket, and an extra parameter on each
+    // side's demand call (rowIsPhysical here, lockHeld on the view, for its
+    // re-entrant caller). Merging those into one ledger type
+    // would put both surfaces under a single lock discipline that neither one
+    // currently has, in the path that produced the scroll freeze fixed by
+    // de6c402 and the ext-grid capacity gate stall. Reviewed under the
+    // 2026-08-25 audit, observation 1, finding 037; left duplicated on
+    // purpose.
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
@@ -648,12 +527,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
 
-    /// Font ascent in drawable pixel coordinates.
-    var ascentPx: Float { atlas.fontMetricsSnapshot().ascent }
-
-    /// Font descent in drawable pixel coordinates.
-    var descentPx: Float { atlas.fontMetricsSnapshot().descent }
-
     /// Current font name.
     var currentFontName: String { atlas.currentFontName }
 
@@ -673,18 +546,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     /// Expose sampler for external grid views.
     var sharedSampler: MTLSamplerState? { sampler }
-
-    func atlasEnsureGlyphEntry(scalar: UInt32) -> GlyphAtlas.Entry? {
-        // No lock needed here - GlyphAtlas.entry() has its own mu.lock() internally
-        // Removing the double-lock significantly improves performance
-        return atlas.entry(for: scalar)
-    }
-
-    func atlasEnsureGlyphEntryStyled(scalar: UInt32, styleFlags: UInt32) -> GlyphAtlas.Entry? {
-        // No lock needed here - GlyphAtlas.entry() has its own mu.lock() internally
-        // Removing the double-lock significantly improves performance
-        return atlas.entry(for: scalar, styleFlags: styleFlags)
-    }
 
     // Phase 2: Core-managed atlas pass-through
 
@@ -1978,59 +1839,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.unlock()
     }
 
-    func submitVerticesRaw(
-        mainPtr: UnsafeRawPointer?, mainCount: Int,
-        cursorPtr: UnsafeRawPointer?, cursorCount: Int
-    ) {
-        guard isInFlush else {
-            ZonvieCore.appLog("[WARNING] submitVerticesRaw called outside flush bracket")
-            return
-        }
-        guard prepareMainWriteState(), prepareCursorWriteState() else { return }
-        flushHasStructuralMainChange = true
-        // Write to write set (called during flush, no lock needed for vertex data)
-        let s = writeSetIndex
-        let cursorSet = cursorWriteSetIndex
-
-        bufferSets[s].rowState.usingRowBuffers = false
-
-        // Clear dirty tracking under lock (staged marks too — a full submit
-        // supersedes any row/rect marks made earlier in this flush, and
-        // commitFlush must not resurrect them as a scissor).
-        lock.lock()
-        pendingDirtyRows.removeAll()
-        pendingDirtyRectPx = nil
-        flushDirtyRows.removeAll()
-        flushDirtyRectPx = nil
-        lock.unlock()
-
-        // main (always updated)
-        if mainCount > 0, let mainPtr {
-            ensureMainBufferInSet(s, vertexCount: mainCount)
-            if let vb = bufferSets[s].mainVertexBuffer {
-                memcpy(vb.contents(), mainPtr, mainCount * MemoryLayout<Vertex>.stride)
-                bufferSets[s].mainVertexCount = mainCount
-            } else {
-                bufferSets[s].mainVertexCount = 0
-            }
-        } else {
-            bufferSets[s].mainVertexCount = 0
-        }
-
-        // cursor (always updated)
-        if cursorCount > 0, let cursorPtr {
-            ensureCursorBufferInSet(cursorSet, vertexCount: cursorCount)
-            if let cvb = bufferSets[cursorSet].cursorVertexBuffer {
-                memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                bufferSets[cursorSet].cursorVertexCount = cursorCount
-            } else {
-                bufferSets[cursorSet].cursorVertexCount = 0
-            }
-            updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
-        } else {
-            bufferSets[cursorSet].cursorVertexCount = 0
-        }
-    }
 
     func submitVerticesPartialRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
@@ -3024,7 +2832,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // skip the blit and redraw all dirty rows from scratch.
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             if useGpuScrollCopy, let pendingScroll = pendingScroll {
-                scrollClearBand = encodePendingMainRowScrollCopy(
+                let scrollCopy = encodePendingMainRowScrollCopy(
                     commandBuffer: cmd,
                     backTexture: backTex,
                     drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
@@ -3033,49 +2841,24 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     logEnabled: ZonvieCore.appLogEnabled
                 )
 
-                if scrollClearBand == nil {
-                    // The blit never ran (scratch texture or blit encoder
-                    // creation failed — see encodePendingMainRowScrollCopy's
-                    // guard clauses), so the back texture's pixels were NEVER
-                    // shifted for this scroll. The 2*shift expansion below
-                    // assumes a successful blit and only covers the vacated
-                    // band + intermediate rows; every OTHER row in the scroll
-                    // region still holds correct pre-scroll content only
-                    // where it happened to already sit, which after a failed
-                    // shift is nowhere. Mark the ENTIRE scroll region dirty so
-                    // the per-row scissor draw below (useGpuScrollCopy branch)
-                    // fully overwrites every affected row from scratch instead
-                    // of leaving most of it as stale, un-shifted pixels the
-                    // core will never re-send (it only marks the vacated band
-                    // dirty on the assumption the frontend shifts the rest).
-                    // Append the contiguous fallback region directly; the
-                    // combined rows are canonicalized below. This avoids the
-                    // previous contains(row) scan that made a failed scroll
-                    // blit O(R²) exactly when the fallback is hottest.
-                    dirtyRows.append(contentsOf: pendingScroll.rowStart..<pendingScroll.rowEnd)
-                } else {
-                    // When multiple flushes accumulate between draws, the blit shifts
-                    // by the total accumulated delta D.  The vacated region (D rows)
-                    // must be redrawn.  Additionally, intermediate scroll steps each
-                    // produced a new row whose vertex data was inherited via buffer-set
-                    // copy + slot remap, but the backbuffer still holds pre-scroll
-                    // pixels for those positions.  Expand dirty rows by 2*D to cover
-                    // both the vacated region and these intermediate rows.
-                    let shift = abs(pendingScroll.rowsDelta)
-                    if shift > 0 {
-                        let expandStart: Int
-                        let expandEnd: Int
-                        if pendingScroll.rowsDelta > 0 {
-                            // Scroll down: vacated at bottom, intermediate rows above
-                            expandEnd = pendingScroll.rowEnd
-                            expandStart = max(pendingScroll.rowStart, pendingScroll.rowEnd - 2 * shift)
-                        } else {
-                            // Scroll up: vacated at top, intermediate rows below
-                            expandStart = pendingScroll.rowStart
-                            expandEnd = min(pendingScroll.rowEnd, pendingScroll.rowStart + 2 * shift)
-                        }
-                        dirtyRows.append(contentsOf: expandStart..<expandEnd)
-                    }
+                if let plan = scrollCopy {
+                    scrollClearBand = (clearTopPx: plan.clearTopPx, clearBottomPx: plan.clearBottomPx)
+                    // The vacated band plus the intermediate rows accumulated
+                    // steps left stale, stopping at the row the blit was
+                    // clamped to; see RowScrollBlitPlan.dirtyRows.
+                    dirtyRows.append(contentsOf: plan.dirtyRows)
+                } else if let fallback = RowScrollBlitPlan.dirtyRowsWithoutBlit(
+                    rowStart: pendingScroll.rowStart,
+                    rowEnd: pendingScroll.rowEnd,
+                    textureHeightPx: backTex.height,
+                    rowHeightPx: Int(cellHi)
+                ) {
+                    // The blit never ran, so nothing was shifted: redraw the
+                    // whole region from scratch in the per-row scissor draw
+                    // below. Appended contiguously; the combined rows are
+                    // canonicalized below, which avoids the previous
+                    // contains(row) scan that made a failed blit O(R²).
+                    dirtyRows.append(contentsOf: fallback)
                 }
             }
             if useGpuScrollCopy {
@@ -3216,6 +2999,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         bgRGB: snappedBgRGB
                     )
                 }
+            }
+
+            // The scissored single-pass dirty-row draw that both the
+            // GPU-scroll-copy arm and the plain partial-redraw arm below
+            // perform, verbatim: overwrite the dirty rows that carry no
+            // vertices, then draw the dirty rows one scissor rect each.
+            func drawScissoredDirtyRows() {
+                clearEmptyDirtyRowsNonBlur(dirtyRows)
+                _ = encodeSurfaceRowDraws(
+                    encoder: enc,
+                    rows: dirtyRows,
+                    resolve: resolvedRowState,
+                    scissor: { row in
+                        makeRowScissorRect(
+                            row: row,
+                            cellHeight_px: cellH,
+                            drawableWidth_px: drawableW,
+                            renderTargetWidth_px: backTex.width,
+                            renderTargetHeight_px: backTex.height
+                        )
+                    },
+                    pipeline: pipeline!,
+                    backgroundPipeline: nil,
+                    glyphPipeline: nil,
+                    useTwoPass: false
+                )
             }
 
             // === PERF LOG: encode_setup → encode_rows boundary ===
@@ -3404,25 +3213,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             bgRGB: snappedBgRGB
                         )
                     }
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline!,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else if !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
                             && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
@@ -3430,25 +3221,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // Use this only when the render pass preserved clean rows.
                     // Resize and fail-closed blur-pipeline frames use .clear;
                     // drawing only dirty rows there would blank every other row.
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline!,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else {
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
                     _ = encodeSurfaceRowDraws(
@@ -3989,8 +3762,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                 // [perf] gpu_pass_detail line with the full
                                 // vertex/gap/fragment/total breakdown.
                                 for slot in frameFullSlots {
-                                    let sV = ts[slot.startVIdx].timestamp
-                                    let eV = ts[slot.endVIdx].timestamp
                                     let sF = ts[slot.startFIdx].timestamp
                                     let eF = ts[slot.endFIdx].timestamp
                                     let fragTicks = (eF >= sF) ? Double(eF &- sF) : 0
@@ -5159,103 +4930,95 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         if rowsDelta > 0 {
             for dstRow in rowStart..<(rowEnd - shift) {
-                let srcRow = dstRow + shift
-                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                guard srcRow < srcSet.rowLogicalToSlot.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-                guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcCount = srcSet.rowState.counts[srcSlot]
-                guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
-                    // Allocation failure with real content to preserve
-                    // (srcCount > 0, checked above) — not a safe row-empty
-                    // case, see this function's doc comment.
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    _ = requirePreparedRowCapacity(
-                        row: dstSlot,
-                        vertexCount: srcCount,
-                        totalRows: totalRows,
-                        rowIsPhysical: true
-                    )
+                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
+                                        srcRow: dstRow + shift, deltaY: deltaY, totalRows: totalRows) {
                     didFail = true
-                    continue
                 }
-                let byteCount = srcCount * MemoryLayout<Vertex>.stride
-                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
-                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
-                for i in 0..<srcCount {
-                    verts[i].position.y += deltaY
-                }
-                bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
-                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
             }
-            for vacatedRow in (rowEnd - shift)..<rowEnd {
-                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
-                ensureRowStorageInSet(setIdx, slot)
-                bufferSets[setIdx].rowState.counts[slot] = 0
-                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
-            }
+            clearVacatedMainRows(setIdx: setIdx, rows: (rowEnd - shift)..<rowEnd)
         } else {
             for dstRow in stride(from: rowEnd - 1, through: rowStart + shift, by: -1) {
-                let srcRow = dstRow - shift
-                guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
-                    let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-                let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-                guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                let srcCount = srcSet.rowState.counts[srcSlot]
-                guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    continue
-                }
-                guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
-                    // Allocation failure with real content to preserve
-                    // (srcCount > 0, checked above) — not a safe row-empty
-                    // case, see this function's doc comment.
-                    bufferSets[setIdx].rowState.counts[dstSlot] = 0
-                    _ = requirePreparedRowCapacity(
-                        row: dstSlot,
-                        vertexCount: srcCount,
-                        totalRows: totalRows,
-                        rowIsPhysical: true
-                    )
+                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
+                                        srcRow: dstRow - shift, deltaY: deltaY, totalRows: totalRows) {
                     didFail = true
-                    continue
                 }
-                let byteCount = srcCount * MemoryLayout<Vertex>.stride
-                memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
-                let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
-                for i in 0..<srcCount {
-                    verts[i].position.y += deltaY
-                }
-                bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
-                bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
             }
-            for vacatedRow in rowStart..<(rowStart + shift) {
-                let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
-                ensureRowStorageInSet(setIdx, slot)
-                bufferSets[setIdx].rowState.counts[slot] = 0
-                bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
-            }
+            clearVacatedMainRows(setIdx: setIdx, rows: rowStart..<(rowStart + shift))
         }
 
         markDirtyRows(rowStart: rowStart, rowCount: rowEnd - rowStart)
         return !didFail
+    }
+
+    /// Copy one logical row from the flush source set into the write set,
+    /// shifting its vertices by `deltaY`. The two arms of
+    /// cpuShiftMainRowBuffers were mirror images of this; they now differ only
+    /// in how srcRow is derived and in which direction they iterate.
+    ///
+    /// Returns false only when a row with real content could not be given a
+    /// destination buffer -- see cpuShiftMainRowBuffers' doc comment. A source
+    /// row that is out of range or empty leaves the destination row empty and
+    /// still returns true.
+    ///
+    /// The upward arm never produced a negative srcRow, so its bounds check
+    /// omitted the lower half; checking both here is a superset and changes
+    /// nothing for either caller.
+    private func copyScrolledMainRow(
+        setIdx: Int,
+        srcSet: SurfaceBufferSet,
+        dstRow: Int,
+        srcRow: Int,
+        deltaY: Float,
+        totalRows: Int
+    ) -> Bool {
+        let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
+        guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        let srcSlot = srcSet.rowLogicalToSlot[srcRow]
+        guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        let srcCount = srcSet.rowState.counts[srcSlot]
+        guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            return true
+        }
+        guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
+            // Allocation failure with real content to preserve
+            // (srcCount > 0, checked above) — not a safe row-empty
+            // case, see cpuShiftMainRowBuffers' doc comment.
+            bufferSets[setIdx].rowState.counts[dstSlot] = 0
+            _ = requirePreparedRowCapacity(
+                row: dstSlot,
+                vertexCount: srcCount,
+                totalRows: totalRows,
+                rowIsPhysical: true
+            )
+            return false
+        }
+        let byteCount = srcCount * MemoryLayout<Vertex>.stride
+        memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
+        let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
+        for i in 0..<srcCount {
+            verts[i].position.y += deltaY
+        }
+        bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
+        bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
+        return true
+    }
+
+    /// Empty the rows the scroll vacated, so nothing of the pre-scroll frame
+    /// survives in them.
+    private func clearVacatedMainRows(setIdx: Int, rows: Range<Int>) {
+        for vacatedRow in rows {
+            let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
+            ensureRowStorageInSet(setIdx, slot)
+            bufferSets[setIdx].rowState.counts[slot] = 0
+            bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
+        }
     }
 
     private func ndcX(_ xPx: Float, drawableWidth: Float) -> Float {
@@ -5273,45 +5036,33 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowHeightPx: Int,
         scroll: SurfaceRowScroll,
         logEnabled: Bool
-    ) -> (clearTopPx: Int, clearBottomPx: Int)? {
-        let shift = abs(scroll.rowsDelta)
-        let regionHeightRows = scroll.rowEnd - scroll.rowStart
-        guard shift > 0, shift < regionHeightRows else { return nil }
-        guard drawableWidthPx > 0, rowHeightPx > 0 else { return nil }
+    ) -> RowScrollBlitPlan? {
+        // The clamps live in RowScrollBlitPlan.make, which is what
+        // row-scroll-blit-plan-tests checks; nil means nothing was shifted.
+        guard let plan = RowScrollBlitPlan.make(
+            rowStart: scroll.rowStart,
+            rowEnd: scroll.rowEnd,
+            rowsDelta: scroll.rowsDelta,
+            textureWidthPx: backTexture.width,
+            textureHeightPx: backTexture.height,
+            drawableWidthPx: drawableWidthPx,
+            rowHeightPx: rowHeightPx
+        ) else { return nil }
         ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
         guard let scratch = scrollScratchTexture,
               let blit = commandBuffer.makeBlitCommandEncoder()
         else { return nil }
 
-        let copyRows = regionHeightRows - shift
-        let copyHeightPx = copyRows * rowHeightPx
-        if copyHeightPx <= 0 {
-            blit.endEncoding()
-            return nil
-        }
-
-        let srcY = (scroll.rowsDelta > 0 ? scroll.rowStart + shift : scroll.rowStart) * rowHeightPx
-        let dstY = (scroll.rowsDelta > 0 ? scroll.rowStart : scroll.rowStart + shift) * rowHeightPx
-
         let t0 = logEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        let origin = MTLOrigin(x: 0, y: srcY, z: 0)
-        let size = MTLSize(width: drawableWidthPx, height: copyHeightPx, depth: 1)
-        blit.copy(from: backTexture, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
-                  to: scratch, destinationSlice: 0, destinationLevel: 0, destinationOrigin: origin)
-        blit.copy(from: scratch, sourceSlice: 0, sourceLevel: 0, sourceOrigin: origin, sourceSize: size,
-                  to: backTexture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: dstY, z: 0))
+        encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratch, plan: plan)
         blit.endEncoding()
         if logEnabled {
             let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
             let usStr = String(format: "%.1f", us)
+            let regionHeightRows = plan.clampedRowEnd - scroll.rowStart
             ZonvieCore.appLogPerf("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
         }
-
-        if scroll.rowsDelta > 0 {
-            return ((scroll.rowEnd - shift) * rowHeightPx, scroll.rowEnd * rowHeightPx)
-        } else {
-            return (scroll.rowStart * rowHeightPx, (scroll.rowStart + shift) * rowHeightPx)
-        }
+        return plan
     }
 
     private func drawBackgroundClearBand(

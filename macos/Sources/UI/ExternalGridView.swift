@@ -126,10 +126,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     private let lock = NSLock()
 
-    private var vertexBuffer: MTLBuffer?
-    private var vertexBufferCapacity: Int = 0
-    private var currentVertexCount: Int = 0
-    private var pendingVertexCount: Int? = nil
 
     // MARK: - Triple Buffering (same pattern as MetalTerminalRenderer)
     // Three buffer sets: one committed (being drawn), one write (being filled),
@@ -175,6 +171,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var flushGeneratedTotalCols: Int = 0
     private var rowStateNeedsFullSync = [false, false, false]
     private var flushHasStructuralRowChange = false
+    // MetalTerminalRenderer carries a deliberately parallel ledger and
+    // provisioning pass. The two are NOT unified: the pure parts already live
+    // as shared free functions in MetalTypes.swift
+    // (surfacePhysicalCapacityRow, surfaceRowCapacityIsPrepared,
+    // surfaceSafeNeededBytes, makeSurfaceRowProvisionPlan), and what is left
+    // is each class's own concurrency contract -- a different lock, a
+    // different source for the flush bracket, and here an extra lockHeld
+    // parameter for the re-entrant caller. Merging those into one ledger type
+    // would put both surfaces under a single lock discipline that neither one
+    // currently has, in the path that produced the scroll freeze fixed by
+    // de6c402 and the ext-grid capacity gate stall. Reviewed under the
+    // 2026-08-25 audit, observation 1, finding 037; left duplicated on
+    // purpose.
     // Fixed-size capacity ledger. The core callback only raises entries;
     // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
     // bracket closes, before retrying the core flush.
@@ -787,7 +796,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         // Release per-view Metal resources.
-        vertexBuffer = nil
         backBuffer = nil
         scrollScratchTexture = nil
         backgroundAlphaBuffer = nil
@@ -1031,34 +1039,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         defer { lock.unlock() }
         hasPresentedOnce = false
         stageFontChanged(generation: generation)
-    }
-
-    /// Submit vertices for rendering. Called from the Zig core callback.
-    func submitVertices(ptr: UnsafeRawPointer?, count: Int, rows: UInt32, cols: UInt32) {
-        // Mark scroll offset for clearing when content changes (Neovim has processed scroll)
-        // The actual clearing happens in draw() via processPendingScrollClears() + updateScrollShaderOffset()
-        // to ensure proper synchronization with rendering
-        if let main = mainTerminalView, main.getScrollOffset(gridId: gridId) != 0 {
-            main.clearScrollOffsetForExternalGrid(gridId)
-        }
-
-        lock.lock()
-        defer { lock.unlock() }
-
-        gridRows = rows
-        gridCols = cols
-
-        if count > 0, let ptr = ptr {
-            ensureVertexBufferCapacity(count, forceReplace: true)
-            if let vb = vertexBuffer {
-                memcpy(vb.contents(), ptr, count * MemoryLayout<Vertex>.stride)
-                pendingVertexCount = count
-            } else {
-                pendingVertexCount = 0
-            }
-        } else {
-            pendingVertexCount = 0
-        }
     }
 
     /// Begin flush bracket — pick a free buffer set and copy committed buffer references.
@@ -2656,27 +2636,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // automatically — the NDC mapping stays correct for visible rows.
             let snapGridRows = snappedGridRows > 0 ? snappedGridRows : gridRows
             let snapGridCols = snappedGridCols > 0 ? snappedGridCols : gridCols
-            let vertexCount: Int
-            let vertexBufferSnapshot: MTLBuffer?
-
+            // External grids are row-mode only: the core reaches them through
+            // on_vertices_row, and the ABI has no whole-surface callback.
             if !rowMode {
-                lock.lock()
-                if let pending = pendingVertexCount {
-                    currentVertexCount = pending
-                    pendingVertexCount = nil
-                }
-                lock.unlock()
-                vertexCount = currentVertexCount
-                vertexBufferSnapshot = vertexBuffer
-            } else {
-                vertexCount = 0
-                vertexBufferSnapshot = nil
-            }
-
-            if !rowMode && vertexCount <= 0 {
                 return
             }
-            if rowMode && committed.rowState.buffers.isEmpty {
+            if committed.rowState.buffers.isEmpty {
                 return
             }
 
@@ -2908,8 +2873,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // reader-admission gate (every future beginAtlasWrite() would
             // time out waiting for a read that will never leave).
             let atlasReadRenderer = mainTerminalView?.renderer
-            let atlasTex = atlasReadRenderer?.beginAtlasExternalRead(commandBuffer: cmd, snapshot: { committed.atlasTextureSnapshot }) ?? nil
-            guard atlasTex != nil else {
+            // Bound with `guard let` rather than a plain guard so the ten
+            // downstream `if let tex = atlasTex` / `atlasTex != nil` gates
+            // become compile errors rather than dead conditionals. Those gates
+            // encode the begin/end pairing contract -- nil means no read was
+            // registered, so calling endAtlasExternalRead() anyway would
+            // over-release the DispatchGroup. Keeping the binding non-optional
+            // makes the compiler enforce what the comments used to.
+            guard let atlasTex = atlasReadRenderer?.beginAtlasExternalRead(commandBuffer: cmd, snapshot: { committed.atlasTextureSnapshot }) ?? nil else {
                 // A pending writer intentionally rejects new reader admission
                 // until already-in-flight readers drain. Commit the otherwise
                 // empty command buffer for prompt driver resource release, then
@@ -3013,9 +2984,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // The atlas texture is never sampled on this path, so the read
                 // registered above (if any) can be released immediately rather
                 // than waiting for this now-empty command buffer's completion.
-                if atlasTex != nil {
-                    atlasReadRenderer?.endAtlasExternalRead()
-                }
+                atlasReadRenderer?.endAtlasExternalRead()
                 hasPresentedOnce = false
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
@@ -3036,9 +3005,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // Bind atlas texture (also captured for bloom extract pass and
             // the cursor pass below — registered/snapshotted once above,
             // right after cmd was created).
-            if let tex = atlasTex {
-                enc.setFragmentTexture(tex, index: 0)
-            }
+            enc.setFragmentTexture(atlasTex, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
 
             // Bind scroll offset data via shared helper (no GPU/CPU race)
@@ -3106,6 +3073,32 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             bgRGB: bgRGB
                         )
                     }
+                }
+
+                // The scissored single-pass dirty-row draw that both the
+                // GPU-scroll-copy arm and the plain partial-redraw arm below
+                // perform, verbatim: overwrite the dirty rows that carry no
+                // vertices, then draw the dirty rows one scissor rect each.
+                func drawScissoredDirtyRows() {
+                    clearEmptyDirtyRowsNonBlur(dirtyRows)
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: cellH,
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
+                        },
+                        pipeline: pipeline,
+                        backgroundPipeline: nil,
+                        glyphPipeline: nil,
+                        useTwoPass: false
+                    )
                 }
 
                 if use2Pass {
@@ -3218,50 +3211,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             bgRGB: bgRGB
                         )
                     }
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else if !isDecoratedSurface && !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
                             && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row. A resized backbuffer
                     // is cleared, so partial redraw would leave every clean row
                     // blank; decorated surfaces have the same constraint on
                     // every frame because their loadAction is always .clear.
-                    clearEmptyDirtyRowsNonBlur(dirtyRows)
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: dirtyRows,
-                        resolve: resolvedRowState,
-                        scissor: { row in
-                            makeRowScissorRect(
-                                row: row,
-                                cellHeight_px: cellH,
-                                drawableWidth_px: drawableW,
-                                renderTargetWidth_px: backTex.width,
-                                renderTargetHeight_px: backTex.height
-                            )
-                        },
-                        pipeline: pipeline,
-                        backgroundPipeline: nil,
-                        glyphPipeline: nil,
-                        useTwoPass: false
-                    )
+                    drawScissoredDirtyRows()
                 } else {
                     // Full redraw fallback
                     _ = encodeSurfaceRowDraws(
@@ -3274,17 +3231,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         useTwoPass: false
                     )
                 }
-            } else {
-                // Non-row-mode: shared helper handles 2-pass vs single-pass dispatch
-                encodeSurfaceNonRowContent(
-                    encoder: enc,
-                    vertexBuffer: vertexBufferSnapshot,
-                    vertexCount: vertexCount,
-                    pipeline: pipeline,
-                    backgroundPipeline: backgroundPipeline,
-                    glyphPipeline: glyphPipeline,
-                    useTwoPass: use2Pass
-                )
             }
 
             // Cursor is NOT drawn into backbuffer — it is composited onto the
@@ -3326,9 +3272,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     ) { enc in
                     // Set up atlas and scroll offsets for extract pass
                     // NOTE: DrawableSize (fragment buffer 0) is already set by the shared helper
-                    if let tex = atlasTex {
-                        enc.setFragmentTexture(tex, index: 0)
-                    }
+                    enc.setFragmentTexture(atlasTex, index: 0)
                     enc.setFragmentSamplerState(self.sampler!, index: 0)
 
                     bindSingleSurfaceScrollOffset(encoder: enc, offset: scrollOffsetSnapshot)
@@ -3344,9 +3288,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
                             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
                         }
-                    } else if vertexCount > 0, let vb = vertexBufferSnapshot {
-                        enc.setVertexBuffer(vb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
                     }
 
                     // Cursor vertices for cursor glow
@@ -3366,15 +3307,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             guard glowPassSucceeded else {
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3399,7 +3337,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // if the view is deallocated before the GPU finishes.
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
@@ -3407,13 +3344,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     sem.signal()
                     // Paired with beginAtlasExternalRead() above. Uses the
                     // strongly-captured atlasReadRenderer, not [weak self] —
-                    // see its declaration comment for why. Gated on
-                    // hadAtlasRead: when atlasTex was nil, no read was ever
-                    // registered — calling endAtlasExternalRead() anyway
-                    // would over-release the DispatchGroup.
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    // see its declaration comment for why.
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3518,15 +3450,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // Keep the consumed rows/revision pending for another draw.
                 let sem = inflightSemaphore
                 let tbLock = tripleBufferLock
-                let hadAtlasRead = atlasTex != nil
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
                     self?.completeSurfaceGpuReadLocked(csi)
                     tbLock.unlock()
                     sem.signal()
-                    if hadAtlasRead {
-                        atlasReadRenderer?.endAtlasExternalRead()
-                    }
+                    atlasReadRenderer?.endAtlasExternalRead()
                 }
                 cmd.commit()
                 gpuSubmitted = true
@@ -3550,15 +3479,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 guard let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) else {
                     let sem = inflightSemaphore
                     let tbLock = tripleBufferLock
-                    let hadAtlasRead = atlasTex != nil
                     cmd.addCompletedHandler { [weak self] _ in
                         tbLock.lock()
                         self?.completeSurfaceGpuReadLocked(csi)
                         tbLock.unlock()
                         sem.signal()
-                        if hadAtlasRead {
-                            atlasReadRenderer?.endAtlasExternalRead()
-                        }
+                        atlasReadRenderer?.endAtlasExternalRead()
                     }
                     cmd.commit()
                     gpuSubmitted = true
@@ -3575,9 +3501,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // committed.atlasTextureSnapshot) instead of fetching
                 // fresh here — this cursor pass is still part of the
                 // same draw call/generation as the main pass.
-                if let tex = atlasTex {
-                    cursorEnc.setFragmentTexture(tex, index: 0)
-                }
+                cursorEnc.setFragmentTexture(atlasTex, index: 0)
                 cursorEnc.setFragmentSamplerState(sampler, index: 0)
 
                 bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: scrollOffsetSnapshot)
@@ -3607,13 +3531,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 sem.signal()
                 // Paired with beginAtlasExternalRead() at atlas-bind time
                 // above. Uses the strongly-captured atlasReadRenderer, not
-                // [weak self] — see its declaration comment for why. Gated
-                // on atlasTex != nil: when nil, no read was ever
-                // registered — calling endAtlasExternalRead() anyway would
-                // over-release the DispatchGroup.
-                if atlasTex != nil {
-                    atlasReadRenderer?.endAtlasExternalRead()
-                }
+                // [weak self] — see its declaration comment for why.
+                atlasReadRenderer?.endAtlasExternalRead()
                 if completed.status != .completed {
                     DispatchQueue.main.async { [weak self] in
                         self?.hasPresentedOnce = false
@@ -3641,23 +3560,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     // MARK: - Private
 
-    private func ensureVertexBufferCapacity(_ count: Int, forceReplace: Bool = false) {
-        let needed = count * MemoryLayout<Vertex>.stride
-        if !forceReplace && needed <= vertexBufferCapacity { return }
-
-        let newCap = max(needed, vertexBufferCapacity * 2, 4096)
-        vertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
-        if vertexBuffer != nil {
-            vertexBufferCapacity = newCap
-        } else {
-            // Do NOT record newCap as satisfied capacity for a nil buffer —
-            // the next call would see needed <= vertexBufferCapacity and
-            // skip retrying the allocation entirely, permanently believing
-            // a nonexistent buffer covers this content.
-            vertexBufferCapacity = 0
-            flushFailed = true
-        }
-    }
 
     // MARK: - Smooth Scroll
 
@@ -3913,50 +3815,43 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         // Check if Option key should be treated as Meta (Alt) based on config.
         // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
-        let optionIsMeta: Bool = {
-            guard m.contains(.option) else { return false }
-            let val = core.getOptionAsMeta()
-            switch val {
-            case 0: return true                       // both
-            case 1: return false                      // none
-            case 2: return m.rawValue & 0x20 != 0     // only_left
-            case 3: return m.rawValue & 0x40 != 0     // only_right
-            default: return true
-            }
-        }()
+        let optionIsMeta = KeyCharacterSelection.optionActsAsMeta(
+            hasOption: m.contains(.option),
+            modifierRawValue: m.rawValue,
+            optionAsMeta: core.getOptionAsMeta()
+        )
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
-        if hasMarkedText() {
-            if event.keyCode == 0x35 {  // Escape: cancel composition
-                unmarkText()
-                inputContext?.discardMarkedText()
-                return
-            }
-            // Let IME handle the key (Enter commits, arrows navigate, etc.)
-            if let ctx = inputContext, ctx.handleEvent(event) {
-                return
-            }
-            interpretKeyEvents([event])
-            return
-        }
+        if consumeKeyDuringComposition(event) { return }
 
         // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = isSpecialKeyCode(event.keyCode)
+        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
 
         if hasControlOrCommand || isSpecialKey {
             // Use sendKeyEvent (same as MetalTerminalView) instead of sendInput
-            var mods: UInt32 = 0
-            if m.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
-            if optionIsMeta          { mods |= UInt32(ZONVIE_MOD_ALT) }
-            if m.contains(.shift)   { mods |= UInt32(ZONVIE_MOD_SHIFT) }
-            if m.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
+            let mods = KeyCharacterSelection.modifierMask(
+                control: m.contains(.control),
+                optionIsMeta: optionIsMeta,
+                shift: m.contains(.shift),
+                command: m.contains(.command),
+                ctrlBit: UInt32(ZONVIE_MOD_CTRL),
+                altBit: UInt32(ZONVIE_MOD_ALT),
+                shiftBit: UInt32(ZONVIE_MOD_SHIFT),
+                superBit: UInt32(ZONVIE_MOD_SUPER)
+            )
+
+            let chars = KeyCharacterSelection.primaryCharacters(
+                optionIsMeta: optionIsMeta,
+                characters: event.characters,
+                charactersIgnoringModifiers: event.charactersIgnoringModifiers
+            )
 
             core.sendKeyEvent(
                 keyCode: UInt32(event.keyCode),
                 mods: mods,
-                characters: event.characters,
+                characters: chars,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers
             )
             return
@@ -3977,24 +3872,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
         // Fallback: interpret key events directly.
         interpretKeyEvents([event])
-    }
-
-    /// Returns true for special keycodes that should bypass IME.
-    private func isSpecialKeyCode(_ keyCode: UInt16) -> Bool {
-        switch keyCode {
-        case 0x35: return true  // Escape
-        case 0x7B, 0x7C, 0x7D, 0x7E: return true  // Arrow keys
-        case 0x24: return true  // Return
-        case 0x30: return true  // Tab
-        case 0x33: return true  // Delete (Backspace)
-        case 0x75: return true  // Forward Delete
-        case 0x73, 0x77: return true  // Home, End
-        case 0x74, 0x79: return true  // Page Up, Page Down
-        case 0x7A, 0x78, 0x63, 0x76: return true  // F1-F4
-        case 0x60, 0x61, 0x62, 0x64: return true  // F5-F8
-        case 0x65, 0x6D, 0x67, 0x6F: return true  // F9-F12
-        default: return false
-        }
     }
 
     override func keyUp(with event: NSEvent) {
