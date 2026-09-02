@@ -3156,7 +3156,7 @@ pub fn onSSHAuthPrompt(
 /// hand-rolled copies this replaces omitted the copy-button reservation and
 /// the cmdline's work-area clamp, so a guifont or linespace change while a
 /// cmdline or message window was open queued it one copy-button width too
-/// wide of its content -- and, on a narrow monitor, wider than the work area.
+/// narrow for its content -- and, on a narrow monitor, wider than the work area.
 ///
 /// AdjustWindowRectEx stays here rather than moving into the shared helper:
 /// this path must read the window's actual style, while the creation path
