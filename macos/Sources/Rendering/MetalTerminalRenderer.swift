@@ -127,13 +127,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// its write set.
     private var layerGridsPreparedThisFlush = false
 
+    /// Scratch for prepareLayerGridsForWrite; reused so the per-flush walk
+    /// does not allocate.
+    private var layerGridIdScratch: [Int64] = []
+
     /// Carry every non-root grid's rows from the committed set into this
     /// bracket's write set. The write set is two rotations old, so a grid the
     /// core does not resend this flush would otherwise draw stale rows.
     func prepareLayerGridsForWrite() {
         guard isInFlush, !layerGridsPreparedThisFlush else { return }
         layerGridsPreparedThisFlush = true
-        for gridId in gridBuffers.gridIds where gridId != 1 {
+        gridBuffers.copyGridIds(into: &layerGridIdScratch)
+        for gridId in layerGridIdScratch where gridId != 1 {
             let sets = gridBuffers.sets(for: gridId)
             copySurfaceBufferSetRowState(from: sets[flushSourceSetIndex], to: sets[writeSetIndex])
         }
@@ -190,6 +195,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         )
         // Every row in the shifted region shows different content now.
         markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: rowEnd - rowStart)
+        // Once per hint, not per row: the scroll scenarios assert the fast
+        // path actually ran, since regenerating everything looks identical on
+        // screen and would let them pass with the shift broken.
+        if ZonvieCore.appLogEnabled {
+            ZonvieCore.appLog(
+                "[layer_row_scroll] gridId=\(gridId) rowStart=\(rowStart) rowEnd=\(rowEnd) rowsDelta=\(rowsDelta)"
+            )
+        }
     }
 
     /// Mark the surface rows a layer's change lands on.
@@ -235,7 +248,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             count: count,
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
-            totalCols: totalCols
+            totalCols: totalCols,
+            inflightRowBuffers: { (self.inflightRowBuffer(gridId: gridId, atSlot: $0), nil) }
         )
         markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: 1)
     }
@@ -577,14 +591,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// slot remaps permute the logical->slot mapping, not the buffers array.
     /// Must be called from the core thread during flush (the in-flight set
     /// is never the write set, so its rowState is stable while we read it).
-    private func inflightRowBuffer(atSlot slot: Int) -> MTLBuffer? {
+    private func inflightRowBuffer(gridId: Int64, atSlot slot: Int) -> MTLBuffer? {
         lock.lock()
         defer { lock.unlock() }
+        guard let sets = gridBuffers.existingSets(for: gridId) else { return nil }
         for i in 0..<3 where gpuInFlightCount[i] > 0 {
-            let bufs = bufferSets[i].rowState.buffers
+            let bufs = sets[i].rowState.buffers
             return slot < bufs.count ? bufs[slot] : nil
         }
         return nil
+    }
+
+    /// The root grid's in-flight buffer at `slot`. Every grid rotates through
+    /// the same set indices, so `gpuInFlightCount` selects the in-flight set
+    /// for any of them.
+    private func inflightRowBuffer(atSlot slot: Int) -> MTLBuffer? {
+        inflightRowBuffer(gridId: 1, atSlot: slot)
     }
 
     /// Main vertex buffer of the set currently GPU in-flight (see
@@ -925,6 +947,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // and returned by defer, so appending/scroll expansion reuses capacity
     // without a live property alias that would trigger Array COW detaches.
     private var dirtyRowsScratch: [Int] = []
+    /// Per-frame snapshots taken under `lock`: the committed layer list and,
+    /// index-aligned, each layer's buffer sets. Reused across frames.
+    private var layerSnapshot: [SurfaceLayer] = []
+    private var layerSetsSnapshot: [[SurfaceBufferSet]] = []
+    /// Indices into `retainedSnapshot` belonging to the layer being drawn.
+    private var retainedIndexScratch: [Int] = []
     // Dirty marks staged during the current flush bracket (guarded by `lock`;
     // written only on the core thread while isInFlush). A draw() interleaving
     // with a flush consumes pendingDirtyRows BEFORE commitFlush publishes the
@@ -2515,6 +2543,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let pendingScroll: SurfaceRowScroll?
             let rowLogicalToSlotSnapshot: [Int]
             let rowSlotSourceRowsSnapshot: [Int]
+            // The committed layer list, each layer's buffer sets (index
+            // aligned), and the cursor's layer origin, all taken under `lock`:
+            // the core thread inserts into the registry and replaces the layer
+            // list while this frame is being encoded.
+            let cursorLayerOriginSnapshot: simd_float2
 
             let snappedBgRGB: UInt32
             let snappedCommittedDrawableW: UInt32
@@ -2572,6 +2605,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             pendingScrollAccum = nil
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
+            layerSnapshot.removeAll(keepingCapacity: true)
+            layerSetsSnapshot.removeAll(keepingCapacity: true)
+            for layer in committedSurfaceLayers {
+                layerSnapshot.append(layer)
+                layerSetsSnapshot.append(gridBuffers.existingSets(for: layer.gridId) ?? [])
+            }
+            cursorLayerOriginSnapshot = committedCursorLayerOriginPx
             snappedBgRGB = defaultBgRGB
             snappedCommittedDrawableW = committedDrawableW
             snappedCommittedDrawableH = committedDrawableH
@@ -3458,10 +3498,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // gets its own pixel space and is clipped to its own rect. A layer
             // whose grid has no rows yet draws nothing, which is what the
             // core's layout contract requires.
-            if committedSurfaceLayers.count > 1 {
+            if layerSnapshot.count > 1 {
                 enc.setRenderPipelineState(pipeline!)
-                for layer in committedSurfaceLayers.dropFirst() {
-                    guard let sets = gridBuffers.existingSets(for: layer.gridId) else { continue }
+                for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                    let sets = layerSetsSnapshot[li]
+                    guard sets.count == 3 else { continue }
                     let set = sets[csi]
                     let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
                     guard rowCount > 0 else { continue }
@@ -3486,13 +3527,37 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         continue
                     }
 
+                    // Rows the core emptied must overwrite their old pixels:
+                    // backTex is loaded, not cleared, on this path. The blur
+                    // arm's background pass already overwrites.
+                    if !use2Pass {
+                        for row in 0..<rowCount {
+                            let slot = set.rowLogicalToSlot[row]
+                            let empty = slot < 0 || slot >= set.rowState.buffers.count
+                                || set.rowState.buffers[slot] == nil || set.rowState.counts[slot] == 0
+                            guard empty else { continue }
+                            let topPx = row * Int(cellHi)
+                            drawBackgroundClearBand(
+                                enc,
+                                clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
+                                drawableWidth: Float(widthPx),
+                                drawableHeight: Float(rowCount * Int(cellHi)),
+                                bgRGB: snappedBgRGB
+                            )
+                        }
+                        enc.setRenderPipelineState(pipeline!)
+                    }
+
                     // This layer's rows, then the rows its own smooth scroll
                     // retained: both live in its grid-local space, which the
-                    // transform above places.
-                    let retainedForLayer = retainedSnapshot.enumerated().filter {
-                        $0.element.gridId == layer.gridId
-                            && $0.element.cellHeightPx == Float(cellHi)
+                    // transform above places. The index list is reused so a
+                    // layer costs no allocation per frame.
+                    retainedIndexScratch.removeAll(keepingCapacity: true)
+                    for (i, r) in retainedSnapshot.enumerated()
+                    where r.gridId == layer.gridId && r.cellHeightPx == Float(cellHi) {
+                        retainedIndexScratch.append(i)
                     }
+                    let retainedForLayerCount = retainedIndexScratch.count
                     let retainedBase = rowCount
 
                     // Same pipeline choice as the root grid: under blur the
@@ -3501,10 +3566,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // against whatever it covers.
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
-                        rows: 0..<(rowCount + retainedForLayer.count),
+                        rows: 0..<(rowCount + retainedForLayerCount),
                         resolve: { row in
                             if row >= retainedBase {
-                                let r = retainedForLayer[row - retainedBase].element
+                                let r = retainedSnapshot[self.retainedIndexScratch[row - retainedBase]]
                                 return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
                             }
                             guard row < set.rowLogicalToSlot.count else { return nil }
@@ -3611,6 +3676,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     var zeroTrans: Float = 0
                     enc.setVertexBytes(&zeroTrans, length: MemoryLayout<Float>.size, index: 3)
 
+                    // Root rows are in the surface's own pixel space. The
+                    // extract viewport is half-size, but NDC is viewport
+                    // relative, so the same transform maps correctly.
+                    bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
+
                     if rowMode {
                         for row in smoothRowRange {
                             guard let resolved = resolvedSmoothRowState(row) else { continue }
@@ -3624,6 +3694,40 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentMainCount)
                     }
 
+                    // Non-root layers glow too: under ext_multigrid every
+                    // editor row is one of these, so extracting only the root
+                    // grid leaves the whole screen unlit.
+                    if layerSnapshot.count > 1 {
+                        for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                            let sets = layerSetsSnapshot[li]
+                            guard sets.count == 3 else { continue }
+                            let set = sets[csi]
+                            let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
+                            guard rowCount > 0 else { continue }
+                            bindLayerTransform(
+                                encoder: enc,
+                                LayerTransform(
+                                    originPx: layer.originPx,
+                                    extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
+                                )
+                            )
+                            for row in 0..<rowCount {
+                                let slot = set.rowLogicalToSlot[row]
+                                guard slot >= 0, slot < set.rowState.buffers.count,
+                                      let vb = set.rowState.buffers[slot],
+                                      set.rowState.counts[slot] > 0
+                                else { continue }
+                                let sourceRow = slot < set.rowSlotSourceRows.count
+                                    ? set.rowSlotSourceRows[slot]
+                                    : row
+                                var rt = Float(row - sourceRow) * Float(cellHi)
+                                enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: set.rowState.counts[slot])
+                            }
+                        }
+                    }
+
                     // Cursor glow
                     if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
                         var ct: Float = 0
@@ -3631,7 +3735,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         bindLayerTransform(
                             encoder: enc,
                             LayerTransform(
-                                originPx: committedCursorLayerOriginPx,
+                                originPx: cursorLayerOriginSnapshot,
                                 extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
                             )
                         )
@@ -3913,7 +4017,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 bindLayerTransform(
                     encoder: cursorEnc,
                     LayerTransform(
-                        originPx: committedCursorLayerOriginPx,
+                        originPx: cursorLayerOriginSnapshot,
                         extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
                     )
                 )
@@ -4538,13 +4642,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // a new rect with a stale color/timestamp for one frame.
         // Already in screen space: evaluateCursorShaderChange folded each
         // endpoint's displacement in when it accepted that endpoint.
-        let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime): (
+        let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime, cursorGrid): (
             (Float, Float, Float, Float), (Float, Float, Float, Float),
-            (Float, Float, Float, Float), (Float, Float, Float, Float), Float
+            (Float, Float, Float, Float), (Float, Float, Float, Float), Float, Int64
         ) = {
             lock.lock()
             defer { lock.unlock() }
-            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime)
+            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime, shaderCursorGridId)
         }()
         // Log the value the shader actually receives, not the one some
         // upstream stage computed — the two came apart once already, when a
@@ -4553,7 +4657,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         if ZonvieCore.appLogEnabled, cursorCur != lastLoggedShaderCursor {
             lastLoggedShaderCursor = cursorCur
             ZonvieCore.appLog(
-                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3)"
+                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3) grid=\(cursorGrid)"
             )
         }
         uniforms.iCurrentCursor = cursorCur
