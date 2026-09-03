@@ -164,6 +164,36 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ got_dx, got_dy, expect_dx, expect_dy },
     );
 
+    // The delta alone passed while the absolute position was thousands of
+    // pixels off screen: the projection fed grid-local PIXELS into an NDC
+    // formula, and a translation survives that. A cursor shader draws from
+    // iPreviousCursor to iCurrentCursor, so an off-screen endpoint is what
+    // the user sees as a wild trail. Both rects must sit inside the main
+    // window's drawable.
+    const main_win = blk: {
+        var buf: [max_windows]platform.MainWindow = undefined;
+        const wins = buf[0..platform.windowsForPid(g.app_pid, &buf)];
+        for (wins) |wnd| {
+            if (wnd.number != float_win.number) break :blk wnd;
+        }
+        return error.MainWindowNotFound;
+    };
+    const main_w_px = main_win.bounds.w * scale;
+    const main_h_px = main_win.bounds.h * scale;
+    for ([_]struct { label: []const u8, x: f64, y: f64 }{
+        .{ .label = "before move", .x = first.x, .y = first.y },
+        .{ .label = "after move", .x = moved.x, .y = moved.y },
+    }) |r| {
+        if (r.x < 0 or r.y < 0 or r.x > main_w_px or r.y > main_h_px) {
+            std.debug.print(
+                "[gui] cursor shader rect {s} is outside the main drawable: " ++
+                    "({d:.0},{d:.0}) not in 0..{d:.0} x 0..{d:.0}\n",
+                .{ r.label, r.x, r.y, main_w_px, main_h_px },
+            );
+            return error.CursorShaderRectOffScreen;
+        }
+    }
+
     if (@abs(got_dx - expect_dx) > tolerance_px or @abs(got_dy - expect_dy) > tolerance_px) {
         std.debug.print(
             "[gui] the cursor shader rect did not follow the window: it is still projected " ++
