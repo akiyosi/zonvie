@@ -575,6 +575,18 @@ pub const Renderer = struct {
         return self.is_external_renderer and self.contract_b_offset_px != 0.0;
     }
 
+    fn displaceResourcesReady(self: *const Renderer) bool {
+        return self.displace_vs != null and self.displace_ps != null and self.displace_cb != null;
+    }
+
+    /// True once a displace-shader prepare attempt failed. The failure is
+    /// permanent for this Renderer (prepareDisplaceShaders never retries),
+    /// so callers use this to stop seeding displacement offsets and fall
+    /// back to plain presents.
+    pub fn displaceShadersUnavailable(self: *const Renderer) bool {
+        return self.displace_prepare_attempted and !self.displaceResourcesReady();
+    }
+
     pub fn contractBPresentPending(self: *const Renderer) bool {
         return self.contractBOffsetActive() or (self.is_external_renderer and self.contract_b_leaving);
     }
@@ -734,7 +746,7 @@ pub const Renderer = struct {
     }
 
     pub fn prepareDisplaceShaders(self: *Renderer) bool {
-        if (self.displace_prepare_attempted) return self.displace_vs != null and self.displace_ps != null and self.displace_cb != null;
+        if (self.displace_prepare_attempted) return self.displaceResourcesReady();
         self.displace_prepare_attempted = true;
         const dev = self.device orelse return false;
         const hlsl = @embedFile("../shaders/displace.hlsl");
@@ -2232,6 +2244,7 @@ pub const Renderer = struct {
         force_full_copy: bool,
         scroll_rect: ?*const c.RECT,
         scroll_offset: ?*const c.POINT,
+        ease_frame: bool,
     ) !void {
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
         const ctx = self.ctx orelse return error.NoContext;
@@ -2363,6 +2376,12 @@ pub const Renderer = struct {
             }
         }
 
+        // Ease-driven frames (external displacement and the main recompose
+        // path) present at sync interval one: the InvalidateRect frame driver
+        // self-paces to the display instead of spinning unthrottled on a
+        // non-blocking flip present. Ordinary damage presents stay at zero
+        // for input latency.
+        const sync_interval: u32 = if (displacement_active or displacement_leaving or ease_frame) 1 else 0;
         var hrp: c.HRESULT = 0;
         if (self.swapchain1) |sc1p| {
             const sc1_vtbl = sc1p.*.lpVtbl;
@@ -2380,7 +2399,6 @@ pub const Renderer = struct {
                         params.pScrollOffset = @constCast(so);
                     }
                 }
-                const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
                 hrp = present1(sc1p, sync_interval, 0, &params);
                 if (c.FAILED(hrp)) {
                     if (isDeviceLost(hrp)) self.device_lost = true;
@@ -2390,14 +2408,12 @@ pub const Renderer = struct {
             } else {
                 const sc_vtbl = sc.*.lpVtbl;
                 const present = sc_vtbl.*.Present orelse return;
-                const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
                 hrp = present(sc, sync_interval, 0);
                 if (c.FAILED(hrp) and isDeviceLost(hrp)) self.device_lost = true;
             }
         } else {
             const sc_vtbl = sc.*.lpVtbl;
             const present = sc_vtbl.*.Present orelse return;
-            const sync_interval: u32 = if (displacement_active or displacement_leaving) 1 else 0;
             hrp = present(sc, sync_interval, 0);
             if (c.FAILED(hrp) and isDeviceLost(hrp)) self.device_lost = true;
         }

@@ -3819,6 +3819,7 @@ pub export fn WndProc(
                                     force_full_present,
                                     null,
                                     null,
+                                    b_recompose_frame or b_leaving_recompose,
                                 )) {
                                     render_ok = true;
                                     // Assign back_tex_valid directly so it can also transition

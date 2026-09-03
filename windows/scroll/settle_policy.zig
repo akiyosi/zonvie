@@ -27,6 +27,14 @@ fn clampRows(value: i64, cap: i64) i64 {
     return @max(value, -cap);
 }
 
+/// Animated arrival clamp shared by the main ledger and the external spring:
+/// the live 'mousescroll' ver bounded below by zero and above by the
+/// retention depth. Distinct from limitRows' snap threshold, which follows
+/// ver beyond the depth.
+pub fn animatedCapRows(live_ver: i32, retention_depth_rows: i32) i32 {
+    return std.math.clamp(live_ver, 0, retention_depth_rows);
+}
+
 /// Split a flush-aggregated row batch into its animated and already-presented
 /// portions. Bounds are small signed values, so the negative minInt case never
 /// needs an overflowing absolute-value operation.

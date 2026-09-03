@@ -95,11 +95,16 @@ pub const ExternalSpringState = struct {
         live_ver: i32,
         mode: scroll_policy.LargeJumpBehavior,
     ) ExternalSeedResult {
-        const animated_cap_rows = @min(std.math.clamp(live_ver, 0, 32), retention_depth_rows);
+        const animated_cap_rows = scroll_policy.animatedCapRows(live_ver, retention_depth_rows);
         if (rows_delta == 0 or row_height_px <= 0.0 or animated_cap_rows == 0) {
             return .{ .outcome = .skip };
         }
         const decision = scroll_policy.limitRows(rows_delta, live_ver, animated_cap_rows, mode);
+        // A beyond-threshold batch in snap mode refuses only the new seed; an
+        // ease still in flight keeps decaying. Clearing it with the batch was
+        // tried and REJECTED on hardware: scrollbar drags mix deltas across
+        // the threshold, and each clear collapsed the in-flight offset in one
+        // frame, pulsing like the abolished trip rule.
         if (mode == .snap and decision.animate_rows == 0) return .{ .outcome = .skip };
 
         const previous_offset_px = self.offset_px;
@@ -268,12 +273,22 @@ test "external arrival uses raw-delta sum then live-cap clamp" {
     try expectNear(state.velocity_px_s, 0.0, 0.0);
 }
 
-test "external snap gate skips a record beyond the live threshold" {
+test "external snap gate preserves an in-flight ease" {
+    // Hardware-rejected alternative: clearing the spring with the refused
+    // batch pulsed like the abolished trip rule under scrollbar drags whose
+    // deltas straddle the threshold. The gate must refuse only the new seed.
     var state: ExternalSpringState = .{ .offset_px = 20.0, .velocity_px_s = -30.0 };
     const result = state.seedArrivalWithPolicy(4, 20.0, 3, .snap);
     try std.testing.expectEqual(ExternalSeedOutcome.skip, result.outcome);
     try expectNear(state.offset_px, 20.0, 0.0);
     try expectNear(state.velocity_px_s, -30.0, 0.0);
+}
+
+test "external snap at rest skips a record beyond the live threshold" {
+    var state: ExternalSpringState = .{};
+    const result = state.seedArrivalWithPolicy(4, 20.0, 3, .snap);
+    try std.testing.expectEqual(ExternalSeedOutcome.skip, result.outcome);
+    try expectNear(state.offset_px, 0.0, 0.0);
 }
 
 test "external live version caps animated offset" {

@@ -75,9 +75,11 @@ pub const EaseOffsetLedger = struct {
     }
 
     /// Apply the shared large-jump policy before creating a main-window seed.
-    /// The policy acts only as a beyond-threshold gate in snap mode; any batch
-    /// that seeds at all must reach arrivalSeed's state-aware sum-then-clamp
-    /// unmodified, or a residual opposite-sign offset under-animates.
+    /// The animated cap derives from the live 'mousescroll' ver, bounded by
+    /// the retention depth, mirroring the external spring. Any batch that
+    /// seeds at all must reach arrivalSeed's state-aware sum-then-clamp
+    /// unmodified, or a residual opposite-sign offset under-animates; only
+    /// the clamp bound follows ver.
     pub fn seedArrivalWithPolicy(
         self: *EaseOffsetLedger,
         grid_id: i64,
@@ -90,12 +92,17 @@ pub const EaseOffsetLedger = struct {
         if (!ease_math.shouldSeedGrid(grid_id, external_grid) or rows_delta == 0) {
             return .skipped;
         }
-        const decision = scroll_policy.limitRows(@as(i64, rows_delta), live_ver, ease_math.retention_depth_rows, mode);
+        const animated_cap_rows = scroll_policy.animatedCapRows(live_ver, ease_math.retention_depth_rows);
+        if (animated_cap_rows == 0) return .skipped;
+        const decision = scroll_policy.limitRows(@as(i64, rows_delta), live_ver, animated_cap_rows, mode);
+        // A beyond-threshold batch in snap mode refuses only the new seed; an
+        // ease still in flight keeps decaying (dropping it with the batch was
+        // rejected on hardware — see the external spring's note).
         if (mode == .snap and decision.animate_rows == 0) return .skipped;
         const seed_rows: i32 = rows_delta;
         if (self.find(grid_id)) |i| {
             const prev = self.offsets_px[i];
-            const next = ease_math.arrivalSeed(prev, seed_rows, row_height_px, ease_math.retention_depth_rows);
+            const next = ease_math.arrivalSeed(prev, seed_rows, row_height_px, animated_cap_rows);
             // v5.1: a seed that flips the offset's sign is a direction
             // reversal; velocity accumulated toward the old direction (worst
             // at the clamp) would lurch rows past the new target, so it
@@ -108,7 +115,7 @@ pub const EaseOffsetLedger = struct {
         }
         if (self.len == max_ledger_grids) return .capacity_drop;
         self.grid_ids[self.len] = grid_id;
-        self.offsets_px[self.len] = ease_math.arrivalSeed(0.0, seed_rows, row_height_px, ease_math.retention_depth_rows);
+        self.offsets_px[self.len] = ease_math.arrivalSeed(0.0, seed_rows, row_height_px, animated_cap_rows);
         self.velocities_px_s[self.len] = 0.0;
         self.len += 1;
         return .seeded;
@@ -515,6 +522,16 @@ test "snap mode drops a batch beyond the live threshold" {
     try std.testing.expectEqual(@as(f64, 60.0), ledger.offsetForGrid(2).?);
 }
 
+test "main snap gate preserves an in-flight ease" {
+    // Mirrors the external spring's hardware-rejected note: the refused
+    // batch must not drop the grid's in-flight entry (clearing it pulsed
+    // like the abolished trip rule under mixed-delta scrollbar drags).
+    var ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 2, 20.0, false, 3, .partial));
+    try std.testing.expectEqual(ArrivalSeedOutcome.skipped, ledger.seedArrivalWithPolicy(2, 4, 20.0, false, 3, .snap));
+    try std.testing.expectEqual(@as(f64, 40.0), ledger.offsetForGrid(2).?);
+}
+
 test "snap mode within threshold matches the state-aware partial clamp" {
     // Residual opposite-sign offset: the raw delta must reach arrivalSeed so
     // the sum-then-clamp pins the full cap, identical to partial mode.
@@ -558,11 +575,31 @@ test "external snap policy preserves FIFO record boundaries" {
     try std.testing.expectEqual(@as(f64, 0.0), aggregated.offset_px);
 }
 
-test "partial policy keeps the historical final-offset clamp" {
+test "partial policy clamps the final offset to the live ver cap" {
+    // Raw deltas still reach the state-aware sum-then-clamp; only the clamp
+    // bound follows min(ver, retention depth).
     var ledger: EaseOffsetLedger = .{};
     try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 8, 20.0, false, 1, .partial));
+    try std.testing.expectEqual(@as(f64, 20.0), ledger.offsetForGrid(2).?);
     try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, -20, 20.0, false, 1, .partial));
-    try std.testing.expectEqual(@as(f64, -160.0), ledger.offsetForGrid(2).?);
+    try std.testing.expectEqual(@as(f64, -20.0), ledger.offsetForGrid(2).?);
+}
+
+test "main partial mode obeys live mousescroll limit" {
+    var ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, ledger.seedArrivalWithPolicy(2, 4, 20.0, false, 3, .partial));
+    try std.testing.expectEqual(@as(f64, 60.0), ledger.offsetForGrid(2).?);
+    // ver beyond the retention depth still clamps at the depth.
+    var deep_ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.seeded, deep_ledger.seedArrivalWithPolicy(2, 20, 20.0, false, 32, .partial));
+    try std.testing.expectEqual(@as(f64, 160.0), deep_ledger.offsetForGrid(2).?);
+}
+
+test "main ver zero skips every new seed" {
+    var ledger: EaseOffsetLedger = .{};
+    try std.testing.expectEqual(ArrivalSeedOutcome.skipped, ledger.seedArrivalWithPolicy(2, 1, 20.0, false, 0, .partial));
+    try std.testing.expectEqual(ArrivalSeedOutcome.skipped, ledger.seedArrivalWithPolicy(2, -1, 20.0, false, 0, .snap));
+    try std.testing.expectEqual(@as(usize, 0), ledger.count());
 }
 
 test "frame driver schedules only active or final-zero outermost paints" {

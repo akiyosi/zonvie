@@ -3716,7 +3716,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             const record_matches_surface = record.surface.grid_id == grid_id and
                 record.surface.incarnation == ext_win.incarnation;
             contract_b_had_matching_record = contract_b_had_matching_record or record_matches_surface;
-            if (can_seed and record_matches_surface) {
+            if (can_seed and record_matches_surface and
+                !ext_win.renderer.displaceShadersUnavailable())
+            {
                 const live_ver: i32 = if (app.corep) |cp|
                     @intCast(@min(app_mod.zonvie_core_get_mousescroll_ver(cp), @as(u32, 32)))
                 else
@@ -3942,7 +3944,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             };
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
             const present_result = if (g.contractBPresentPending())
-                g.presentFromBackRectsWithCursorNoResize(&.{}, null, 0, null, true, null, null)
+                g.presentFromBackRectsWithCursorNoResize(&.{}, null, 0, null, true, null, null, false)
             else
                 g.presentOnlyFromBack(null);
             present_result catch |e| {
@@ -4046,7 +4048,26 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             force_full_present,
             null,
             null,
+            false,
         ) catch |e| {
+            if (e == error.DisplacementShaderUnavailable) {
+                // The displace shaders never become available again on this
+                // Renderer, so a displaced retry would fail identically every
+                // paint while the offset stays nonzero. Snap the ease away and
+                // publish this frame through the plain full-present path;
+                // future records skip seeding via displaceShadersUnavailable.
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow displace unavailable, snapping to plain present\n", .{});
+                ext_win.resetContractBEase("displace_shader_unavailable");
+                if (g.presentFromBackRectsWithCursorNoResize(&.{}, null, 0, null, true, null, null, false)) {
+                    smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, true);
+                    completeExternalPaintRetry(ext_win);
+                } else |fallback_err| {
+                    if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow displace fallback present failed: {any}\n", .{fallback_err});
+                    smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, false);
+                    requeueExternalFullPaint(app, grid_id, hwnd);
+                }
+                return;
+            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow partial present failed: {any}\n", .{e});
             smooth_session.onPaintPresent(app, ext_win, tbs_snapshot, false);
             requeueExternalFullPaint(app, grid_id, hwnd);
