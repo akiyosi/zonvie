@@ -17,6 +17,9 @@ const std = @import("std");
 const driver = @import("../../driver.zig");
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
+
+const log_path = "tmp/gui_shader_probe.log";
 
 /// Full-window capture, not a fixed crop: the cursor band can land anywhere
 /// across the window's width, and a crop narrower than the window would put
@@ -70,7 +73,7 @@ fn bandCentroidX(img: driver.capture.Image, y0: usize, y1: usize) struct { x: f6
 
 pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{
-        .app_args = &.{ "--log", "tmp/gui_shader_probe.log" },
+        .app_args = &.{ "--log", log_path },
         .config_dir = "test/gui/fixtures/config_cursor_shader",
     });
     defer g.deinit();
@@ -128,13 +131,25 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer right_img.deinit(alloc);
 
     const right_band = bandCentroidX(right_img, y0, y1);
+
+    // Where the cursor actually is on screen, so the check is exact rather
+    // than "somewhere in the right half": an origin error of a few cells, or
+    // one that used the anchor grid instead of the layer, stays in that half.
+    const win_col = try g.evalInt("win_screenpos(0)[1]");
+    const cell_w = blk: {
+        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+            return error.CellMetricsUnknown;
+        defer alloc.free(line);
+        break :blk app_log.field(line, "cellW") orelse return error.CellMetricsUnknown;
+    };
+    const expected_x = @as(f64, @floatFromInt(win_col - 1)) * cell_w;
     std.debug.print(
-        "[gui] cursor band with cursor in RIGHT split: x={d:.1} px={d}\n",
-        .{ right_band.x, right_band.n },
+        "[gui] cursor band with cursor in RIGHT split: x={d:.1} px={d}; expected {d:.1} (screen column {d}, cell {d:.1}px)\n",
+        .{ right_band.x, right_band.n, expected_x, win_col, cell_w },
     );
     if (right_band.n < min_band_px) return error.CursorBandNotRendered;
-    if (right_band.x < @as(f64, @floatFromInt(w)) * 0.5) {
-        std.debug.print("[gui] cursor band stayed in the left split\n", .{});
+    if (@abs(right_band.x - expected_x) > cell_w) {
+        std.debug.print("[gui] the cursor uniform is not where the cursor is\n", .{});
         return error.CursorUniformMisplaced;
     }
 }

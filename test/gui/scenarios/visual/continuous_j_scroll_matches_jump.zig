@@ -25,6 +25,10 @@ const std = @import("std");
 const driver = @import("../../driver.zig");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
+const app_log = @import("../../app_log.zig");
+
+/// The fixture launches the app with this log.
+const log_path = "tmp/gui_app.log";
 
 const content_band: visual.Region = .{};
 
@@ -72,6 +76,7 @@ fn runPhase(
 
     const topline_before = try g.evalInt("line('w0')");
 
+    const t_scroll = try app_log.nowMs(alloc, log_path);
     if (burst) {
         // One send, so Neovim coalesces the motions and the core publishes a
         // multi-row shift rather than `steps` single-row ones.
@@ -88,6 +93,35 @@ fn runPhase(
 
     var scrolled = try g.captureStable(crop, 8000);
     defer scrolled.deinit(alloc);
+
+    // A refused hint regenerates every row and reaches the same screen, so
+    // the pixel comparison alone cannot tell the shift path ran at all. The
+    // burst phase coalesces into fewer, larger shifts, so only require one.
+    const shifts = try app_log.countLinesSince(alloc, log_path, "[layer_row_scroll]", t_scroll);
+    const min_shifts: usize = if (burst) 1 else steps / 2;
+    std.debug.print(
+        "[gui] continuous_j_scroll_matches_jump[{s}]: row-shift hints applied {d} (need {d})\n",
+        .{ phase, shifts, min_shifts },
+    );
+    if (shifts < min_shifts) {
+        std.debug.print("[gui] the scroll fast path did not run; this comparison would guard nothing\n", .{});
+        return error.ScrollFastPathDidNotRun;
+    }
+    if (burst) {
+        // The burst phase exists for the COALESCED shift: one hint carrying
+        // many rows at once, which is the path that hid a defect a run of
+        // single-row shifts did not. A lone one-row hint would satisfy the
+        // count above and leave that path unexercised.
+        const line = (try app_log.lastLineSince(alloc, log_path, "[layer_row_scroll]", t_scroll)) orelse
+            return error.ScrollFastPathDidNotRun;
+        defer alloc.free(line);
+        const delta = app_log.field(line, "rowsDelta") orelse return error.ScrollHintUnparsable;
+        std.debug.print("[gui] continuous_j_scroll_matches_jump[burst]: last shift rowsDelta={d:.0}\n", .{delta});
+        if (@abs(delta) < 2) {
+            std.debug.print("[gui] the burst did not coalesce into a multi-row shift\n", .{});
+            return error.ScrollHintNotCoalesced;
+        }
+    }
 
     const topline_after = try g.evalInt("line('w0')");
     const cursor_after = try g.evalInt("line('.')");

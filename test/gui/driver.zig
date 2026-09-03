@@ -159,8 +159,15 @@ pub const Gui = struct {
         errdefer alloc.free(g.listen_addr);
 
         // 1. Shared nvim server (headless, clean).
+        //
+        // `-n` disables swap files ('noswapfile'), for the same reason
+        // test/e2e/harness.zig passes it: every scenario spawns an nvim and
+        // kills it, so each one leaves a swap file behind in the user's real
+        // state directory. They accumulate across runs until nvim answers
+        // E325 "swap file exists" with a |hit-enter| prompt — in the user's
+        // own editor, not just in the tests. A harness never needs swap.
         g.nvim_child = try std.process.spawn(gui_io.io(), .{
-            .argv = &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
+            .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,

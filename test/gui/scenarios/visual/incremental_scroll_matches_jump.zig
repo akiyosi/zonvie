@@ -18,6 +18,10 @@ const std = @import("std");
 const driver = @import("../../driver.zig");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
+const app_log = @import("../../app_log.zig");
+
+/// The fixture launches the app with this log.
+const log_path = "tmp/gui_app.log";
 
 // The whole text area. Drift moves everything, so nothing needs excluding
 // beyond what the fixture's own chrome settings already remove.
@@ -50,12 +54,27 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var before = try g.captureStable(crop, 8000);
     defer before.deinit(alloc);
 
+    const t_scroll = try app_log.nowMs(alloc, log_path);
     var i: usize = 0;
     while (i < steps) : (i += 1) {
         try g.remoteSend("<C-e>");
     }
     var incremental = try g.captureStable(crop, 8000);
     defer incremental.deinit(alloc);
+
+    // The pixel comparison below passes just as well when the core refuses
+    // the row-shift hint and regenerates every row: same screen, different
+    // path, and the defect this scenario exists for lives only on the shift
+    // path. Require that the shift actually ran.
+    const shifts = try app_log.countLinesSince(alloc, log_path, "[layer_row_scroll]", t_scroll);
+    std.debug.print(
+        "[gui] incremental_scroll_matches_jump: row-shift hints applied {d} of {d} steps\n",
+        .{ shifts, steps },
+    );
+    if (shifts < steps / 2) {
+        std.debug.print("[gui] the scroll fast path did not run; this comparison would guard nothing\n", .{});
+        return error.ScrollFastPathDidNotRun;
+    }
 
     // Guard against a vacuous pass: if the scrolling never rendered, the
     // comparison below would hold trivially and the test would guard nothing.

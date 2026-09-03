@@ -141,6 +141,24 @@ pub fn lastLineSince(alloc: std.mem.Allocator, path: []const u8, marker: []const
     return try alloc.dupe(u8, line);
 }
 
+/// How many lines containing `marker` are stamped at or after `since_ms`.
+/// Used to assert that a code path ran a given number of times, where the
+/// screen alone cannot distinguish it from a slower path with the same result.
+pub fn countLinesSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, since_ms: f64) !usize {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, marker) == null) continue;
+        const ts = lineTimestampMs(line) orelse continue;
+        if (ts < since_ms) continue;
+        n += 1;
+    }
+    return n;
+}
+
 /// Parse `<name>=<float>` out of a log line. Null when absent or malformed,
 /// so a scenario fails on a changed log format instead of on a zero.
 pub fn field(line: []const u8, name: []const u8) ?f64 {
