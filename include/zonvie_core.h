@@ -167,6 +167,12 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_SOLID_GLYPH   (1u << 11)
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
+    /* Grid-local pixels: the origin is the top-left of the grid this vertex
+       belongs to and +y points down. The frontend converts to clip space with
+       its own layer transform (scale 2/extent, -2/extent; offset -1, +1),
+       where extent is cols*cell_w_px by rows*cell_h_px. Frontend-authored
+       chrome may still be submitted in clip space under an identity layer
+       transform. */
     float position[2];
     float texCoord[2];
     float color[4] __attribute__((aligned(16)));  /* 16-byte aligned to match Swift simd_float4 */
@@ -175,7 +181,7 @@ typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float deco_phase;     /* phase offset for undercurl (cell column position) */
 } zonvie_vertex;
 
-/* Which buffers are included in on_vertices_partial */
+/* Which layer an on_vertices_row callback carries */
 enum {
     ZONVIE_VERT_UPDATE_MAIN   = 1u << 0,
     ZONVIE_VERT_UPDATE_CURSOR = 1u << 1,
@@ -193,7 +199,7 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
-/* on_vertices_row layers are independent, like on_vertices_partial:
+/* on_vertices_row layers are independent:
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
      clears it. A cursor-only callback must not replace row contents.
@@ -201,25 +207,6 @@ typedef void (*zonvie_on_vertices_row_fn)(
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
    treating a nonexistent row as row content. */
-
-/* Main row-buffer scroll fast path notification.
-   The core calls this when it can preserve previously submitted main-row content
-   by shifting existing row buffers instead of resubmitting every reused row.
-   row_start/row_end are global-grid row indices in [row_start, row_end), cols are
-   a column range in [col_start, col_end), and rows_delta follows Neovim grid_scroll
-   semantics (positive = content moves up, negative = content moves down).
-   After this callback, the frontend should expect on_vertices_row only for
-   vacated / regenerated rows within the scrolled region. */
-typedef void (*zonvie_on_main_row_scroll_fn)(
-    void* ctx,
-    uint32_t row_start,
-    uint32_t row_end,
-    uint32_t col_start,
-    uint32_t col_end,
-    int32_t rows_delta,
-    uint32_t total_rows,
-    uint32_t total_cols
-);
 
 /* External grid (sub-grid) row scroll notification.
    Notifies the frontend that a sub-grid received a grid_scroll event.
@@ -239,18 +226,6 @@ typedef void (*zonvie_on_grid_row_scroll_fn)(
     int32_t rows_delta,
     uint32_t total_rows,
     uint32_t total_cols
-);
-
-/*
-  Partial vertices update:
-  - If (flags & ZONVIE_VERT_UPDATE_MAIN) == 0, the frontend MUST keep previous main vertices.
-  - If (flags & ZONVIE_VERT_UPDATE_CURSOR) == 0, the frontend MUST keep previous cursor vertices.
-*/
-typedef void (*zonvie_on_vertices_partial_fn)(
-    void* ctx,
-    const zonvie_vertex* main_verts, size_t main_count,
-    const zonvie_vertex* cursor_verts, size_t cursor_count,
-    uint32_t flags
 );
 
 /* Modifier bitmask for zonvie_core_send_key_event.mods */
@@ -347,6 +322,43 @@ typedef void (*zonvie_on_external_window_fn)(
 /* Called when an external grid is closed (win_hide/win_close for external grid).
    Frontend should destroy the corresponding window. */
 typedef void (*zonvie_on_external_window_close_fn)(
+    void* ctx,
+    int64_t grid_id
+);
+
+/* One grid placed on one surface. A surface is a single drawable: the main
+   window, or one external window. Its surface_id is the id of its root grid
+   (1 for the main window). layers[0] is always the root grid at (0,0). */
+#define ZONVIE_LAYER_FOLLOWS_SCROLL (1u << 0)
+
+typedef struct zonvie_layer {
+    int64_t  grid_id;
+    int64_t  anchor_grid;  /* grid this float is anchored to; == surface_id for the root */
+    int32_t  x_px;         /* surface-local, top-left origin */
+    int32_t  y_px;
+    uint32_t rows;
+    uint32_t cols;
+    int32_t  z;            /* back-to-front index; 0 == root grid */
+    uint32_t flags;        /* ZONVIE_LAYER_* */
+} zonvie_layer;
+
+/* Full replacement of the layer list for one surface. Fired inside the flush
+   bracket, after on_external_window for a new surface and before that
+   surface's row vertices, and only when the list changed. A grid missing from
+   every surface keeps its buffers until on_grid_destroy; the frontend must
+   tolerate a layer whose grid has no committed rows yet, and rows arriving for
+   a grid that is in no layer. */
+typedef void (*zonvie_on_surface_layout_fn)(
+    void* ctx,
+    int64_t surface_id,
+    const zonvie_layer* layers,
+    size_t count,
+    uint32_t surface_rows,
+    uint32_t surface_cols
+);
+
+/* Neovim destroyed the grid; the frontend may release its buffers. */
+typedef void (*zonvie_on_grid_destroy_fn)(
     void* ctx,
     int64_t grid_id
 );
@@ -685,7 +697,6 @@ typedef int (*zonvie_on_clipboard_set_fn)(
 );
 
 typedef struct zonvie_callbacks {
-    zonvie_on_vertices_partial_fn on_vertices_partial;
     zonvie_on_vertices_row_fn on_vertices_row;
     zonvie_atlas_ensure_glyph_fn on_atlas_ensure_glyph;
     zonvie_atlas_ensure_glyph_styled_fn on_atlas_ensure_glyph_styled;
@@ -817,7 +828,6 @@ typedef struct zonvie_callbacks {
     /* Main row-buffer scroll fast path notification.
        Optional optimization used by row-mode frontends to shift existing main-row
        buffers instead of receiving cached rows one by one via on_vertices_row. */
-    zonvie_on_main_row_scroll_fn on_main_row_scroll;
 
     /* External grid (sub-grid) row scroll notification (best-effort hint).
        Suppressed when multiple scrolls occur in the same batch.
@@ -848,6 +858,11 @@ typedef struct zonvie_callbacks {
        blocking window work inline (post/dispatch to the UI thread instead).
        Appended at the end for ABI compat. */
     void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
+
+    /* Per-surface layer placement, and grid buffer lifetime. Appended at the
+       end for ABI compat. */
+    zonvie_on_surface_layout_fn on_surface_layout;
+    zonvie_on_grid_destroy_fn on_grid_destroy;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);

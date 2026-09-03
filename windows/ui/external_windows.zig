@@ -95,9 +95,13 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
     return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
 }
 
-/// Map a decorated surface's content rect to the NDC scale and offset the
-/// vertex shader applies. The cmdline and message paths differ only in where
-/// the content starts; the conversion itself was identical.
+/// Map a decorated surface's content rect to the scale and offset that take a
+/// core vertex from grid-local pixels to this window's clip space. The cmdline
+/// and message paths differ only in where the content starts.
+///
+/// A decorated surface mixes core content and frontend chrome in one vertex
+/// array and one draw, so the content is transformed on the CPU here and the
+/// whole array is submitted under the identity layer transform.
 const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
 
 fn decoratedContentNdcTransform(
@@ -108,15 +112,13 @@ fn decoratedContentNdcTransform(
     window_w: f32,
     window_h: f32,
 ) ContentNdcTransform {
-    const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-    const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-    const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-    const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+    _ = content_w;
+    _ = content_h;
     return .{
-        .scale_x = (right_ndc - left_ndc) / 2.0,
-        .scale_y = (top_ndc - bottom_ndc) / 2.0,
-        .offset_x = (right_ndc + left_ndc) / 2.0,
-        .offset_y = (top_ndc + bottom_ndc) / 2.0,
+        .scale_x = 2.0 / window_w,
+        .scale_y = -2.0 / window_h,
+        .offset_x = content_left / window_w * 2.0 - 1.0,
+        .offset_y = 1.0 - content_top / window_h * 2.0,
     };
 }
 
@@ -702,6 +704,9 @@ fn drawNormalExternalSurfaceRowMode(
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = !force_full_rows,
+        // The root layer drives the pixel space core vertices arrive in.
+        .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+        .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
     };
 
     // Ensure row_vbs array covers committed set's row count.
@@ -782,6 +787,7 @@ fn drawNormalExternalSurfaceRowMode(
         .pool = &ext_win.tbs.pool,
         .blink_visible = cursor_blink_visible,
         .content_right = content_right,
+        .content_width = app_mod.rowModeViewportWidth(g, draw_params),
         .content_height = draw_params.content_height,
         .row_h_px = row_h_px,
         .ctx_ptr = result.ctx_ptr,
@@ -3249,7 +3255,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 // forward its rect into the main renderer's shader
                 // cursor state so cursor shaders track the visible
                 // cursor instead of the main grid's stale cursor. The
-                // ext verts are in this view's local NDC; translate
+                // ext verts are this grid's local pixels; translate
                 // to main-window drawable px using the offset above.
                 const ext_cursor_verts = tbs_cursor.verts.items;
                 if (ext_cursor_verts.len != 0) {
@@ -3264,19 +3270,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                             if (v.position[1] < miny_c) miny_c = v.position[1];
                             if (v.position[1] > maxy_c) maxy_c = v.position[1];
                         }
-                        const ext_w_f: f32 = @floatFromInt(g_sh.width);
-                        const ext_h_f: f32 = @floatFromInt(g_sh.height);
-                        // Position the cursor at the NDC center, but
-                        // size it using main grid's cell metrics. ext
-                        // cmdline / popupmenu drawables are often
-                        // taller than a single cell (multi-row
-                        // prompt / padding) and cursor verts span the
-                        // full NDC y = -1..+1, so translating that
-                        // across the full ext drawable height makes
-                        // the cursor SDF render at the drawable's
-                        // height instead of the actual cell height.
-                        const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
-                        const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
+                        // Position the cursor at its centre, but size it
+                        // using the main grid's cell metrics. ext cmdline /
+                        // popupmenu drawables are often taller than a single
+                        // cell (multi-row prompt / padding), so sizing from
+                        // the drawable would render the cursor SDF at the
+                        // drawable's height instead of the cell height.
+                        // Core vertices are grid-local pixels, y down.
+                        const center_x = off_x + (minx_c + maxx_c) * 0.5;
+                        const center_y = off_y + (miny_c + maxy_c) * 0.5;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
                         const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;

@@ -131,7 +131,30 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Three buffer sets: one committed (being drawn), one write (being filled),
     // one free. gpuInFlightCount prevents beginFlush from picking a set that
     // the GPU is still reading.
-    private let bufferSets: [SurfaceBufferSet] = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+    /// Vertex storage for every grid this surface draws, keyed by grid id. An
+    /// external surface draws its root grid today and gains anchored floats
+    /// once the core emits multi-layer layouts.
+    let gridBuffers = GridBufferRegistry()
+    /// The root grid's sets. SurfaceBufferSet is a class, so mutating through
+    /// this computed property mutates the registry's own objects.
+    private var bufferSets: [SurfaceBufferSet] { gridBuffers.sets(for: gridId) }
+
+    /// Stage this surface's layer list; promoted when the flush commits.
+    func setPendingSurfaceLayers(_ layers: [SurfaceLayer]) {
+        tripleBufferLock.lock()
+        pendingSurfaceLayers = layers
+        tripleBufferLock.unlock()
+    }
+
+    /// Release a destroyed grid's vertex storage.
+    func releaseGridBuffers(gridId released: Int64) {
+        tripleBufferLock.lock()
+        gridBuffers.release(gridId: released)
+        tripleBufferLock.unlock()
+    }
+
+    private var pendingSurfaceLayers: [SurfaceLayer]?
+    private var committedSurfaceLayers: [SurfaceLayer] = []
     private var writeSetIndex: Int = 0            // Main thread only (during flush)
     private var flushSourceSetIndex: Int = 0      // Main thread only (during flush)
     private var committedSetIndex: Int = 0        // Protected by tripleBufferLock
@@ -395,9 +418,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var moveObservers: [NSObjectProtocol] = []
 
     /// Last cursor box this view forwarded to the shared shader cursor
-    /// state, in this view's local NDC, so a window move can re-project it.
-    /// Nil while the cursor is not on this view's grid.
-    private var lastForwardedCursorNdc: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
+    /// state, in this grid's own local pixels, so a window move can
+    /// re-project it. Nil while the cursor is not on this view's grid.
+    private var lastForwardedCursorPx: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
     private var lastForwardedCursorColor: (Float, Float, Float, Float)?
 
     // Active rendering mode: when new commits arrive, switch to isPaused=false
@@ -1298,6 +1321,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             committedSetIndex = writeSetIndex
             committedGridRows = gridRows
             committedGridCols = gridCols
+            // Layers and the vertices they place become visible together.
+            if let staged = pendingSurfaceLayers {
+                committedSurfaceLayers = staged
+                pendingSurfaceLayers = nil
+            }
             // Publish this bracket's retention together with the vertices it
             // belongs to: a retained row shown against pre-scroll content
             // would draw the same line twice. Same for the cursor rect the
@@ -1791,7 +1819,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // The cursor left this window: stop republishing its rect on
                 // window moves, or this view would keep overwriting whichever
                 // surface now owns the cursor.
-                lastForwardedCursorNdc = nil
+                lastForwardedCursorPx = nil
             }
             return
         }
@@ -2035,13 +2063,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if p.1 > maxY { maxY = p.1 }
         }
         let c = ptr[0].color
-        lastForwardedCursorNdc = (minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+        lastForwardedCursorPx = (minX: minX, maxX: maxX, minY: minY, maxY: maxY)
         lastForwardedCursorColor = (c.0, c.1, c.2, c.3)
         republishCursorShaderState()
     }
 
-    /// Project the last forwarded cursor NDC box into the main window's
-    /// drawable pixels and publish it as the shader cursor rect.
+    /// Project the last forwarded cursor box from this grid's local pixels
+    /// into the main window's drawable pixels and publish it as the shader
+    /// cursor rect.
     ///
     /// Split out from the forwarder because the projection depends on where
     /// the two windows are, not only on the verts: `screenSpaceParameters`
@@ -2050,7 +2079,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// cursor vertex, which used to leave the cursor shader burning at the
     /// float's pre-move position until the next cursor update.
     private func republishCursorShaderState(reanchor: Bool = false) {
-        guard let ndc = lastForwardedCursorNdc,
+        guard let local = lastForwardedCursorPx,
               let color = lastForwardedCursorColor else { return }
         guard let mainView = mainTerminalView,
               let renderer = mainView.renderer else { return }
@@ -2061,42 +2090,29 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             mainView: mainView,
             selfView: self
         )
-        let minX = ndc.minX
-        let maxX = ndc.maxX
-        let minY = ndc.minY
-        let maxY = ndc.maxY
-        // Convert NDC bounding box to main drawable pixels.
         let offX = Float(windowOffset.x)
         let offY = Float(windowOffset.y)
-        // Map the cursor's NDC center through the SAME viewport the grid is
-        // actually rendered into — MTLViewport(origin: viewportOriginPx*scale,
-        // size: gridCols*cell x gridRows*cell) — NOT across the full drawable.
-        // The viewport origin carries the ext-cmdline leading icon / padding
-        // shift (set from layout.gridFrame.origin); omitting it, and scaling by
-        // the full drawable instead of the grid viewport, lands iCurrentCursor
-        // to the left of the real cursor on decorated surfaces. Keeping the
-        // mapping identical to the render path preserves the Ghostty contract:
-        // iCurrentCursor == the cursor's true on-screen rect.
-        //
-        // The cursor SIZE still comes from the main grid's cell metrics, not
-        // the NDC span: cursor verts always cover NDC y = -1..+1, so stretching
-        // them across a tall ext drawable (multi-row prompt / padding) would
-        // render the cursor SDF at the drawable's height instead of one cell.
+        // Cursor verts are this grid's own local pixels, y down. The render
+        // path maps them through MTLViewport(origin: viewportOriginPx*scale,
+        // ...) on this view's drawable, and `windowOffset` places that
+        // drawable inside the main window's screen space — so the same two
+        // translations put the rect where the shader resolves it. The
+        // viewport origin carries the ext-cmdline leading icon / padding
+        // shift (set from layout.gridFrame.origin); omitting it lands
+        // iCurrentCursor to the left of the real cursor on decorated
+        // surfaces. Keeping the mapping identical to the render path
+        // preserves the Ghostty contract: iCurrentCursor == the cursor's
+        // true on-screen rect.
         let scale = Float(self.window?.backingScaleFactor ?? 2.0)
-        let cellWpx = max(1.0, renderer.cellWidthPx.rounded(.up))
-        let cellHpx = max(1.0, renderer.cellHeightPx.rounded(.up))
-        let vpW = Float(gridCols) * cellWpx
-        let vpH = Float(gridRows) * cellHpx
         let vpOriginX = Float(viewportOriginPx.x) * scale
         let vpOriginY = Float(viewportOriginPx.y) * scale
-        let centerPxX = offX + vpOriginX + (minX + maxX + 2.0) * 0.25 * vpW
-        let centerPxY = offY + vpOriginY + (2.0 - minY - maxY) * 0.25 * vpH
-        let cellW = renderer.cellWidthPx
-        let cellH = renderer.cellHeightPx
-        let leftPx = centerPxX - cellW * 0.5
-        let rightPx = centerPxX + cellW * 0.5
-        let topPx = centerPxY - cellH * 0.5
-        let botPx = centerPxY + cellH * 0.5
+        // Same root-layer origin the draw path feeds SurfaceViewportMetrics,
+        // so the two mappings cannot drift.
+        let rootOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
+        let leftPx = offX + vpOriginX + rootOrigin.x + local.minX
+        let rightPx = offX + vpOriginX + rootOrigin.x + local.maxX
+        let topPx = offY + vpOriginY + rootOrigin.y + local.minY
+        let botPx = offY + vpOriginY + rootOrigin.y + local.maxY
         // Ghostty's cursor shaders treat iCurrentCursor.y as the
         // BOTTOM edge of the cursor rect (rect spans y-h..y).
         // Tag the rect with this window's grid so the shader-cursor position
@@ -2225,13 +2241,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
     }
 
-    private func ndcX(_ xPx: Float, drawableWidth: Float) -> Float {
-        return (xPx / max(1.0, drawableWidth)) * 2.0 - 1.0
-    }
 
-    private func ndcY(_ yPx: Float, drawableHeight: Float) -> Float {
-        return 1.0 - (yPx / max(1.0, drawableHeight)) * 2.0
-    }
 
     private func drawBackgroundClearBand(
         _ encoder: MTLRenderCommandEncoder,
@@ -2247,13 +2257,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let g = Float((bgRGB >> 8) & 0xFF) / 255.0
         let b = Float(bgRGB & 0xFF) / 255.0
         let color = simd_float4(r, g, b, 1.0)
-        let tl = Vertex(position: simd_float2(ndcX(0, drawableWidth: drawableWidth), ndcY(Float(top), drawableHeight: drawableHeight)),
+        // Surface pixels: drawableWidth/Height are the viewport extent the
+        // layer transform divides by, so this band lands exactly where the
+        // NDC form used to.
+        _ = drawableHeight
+        let tl = Vertex(position: simd_float2(0, Float(top)),
                         texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let tr = Vertex(position: simd_float2(ndcX(drawableWidth, drawableWidth: drawableWidth), ndcY(Float(top), drawableHeight: drawableHeight)),
+        let tr = Vertex(position: simd_float2(drawableWidth, Float(top)),
                         texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let bl = Vertex(position: simd_float2(ndcX(0, drawableWidth: drawableWidth), ndcY(Float(bottom), drawableHeight: drawableHeight)),
+        let bl = Vertex(position: simd_float2(0, Float(bottom)),
                         texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let br = Vertex(position: simd_float2(ndcX(drawableWidth, drawableWidth: drawableWidth), ndcY(Float(bottom), drawableHeight: drawableHeight)),
+        let br = Vertex(position: simd_float2(drawableWidth, Float(bottom)),
                         texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
         // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
         // (no heap) instead of building a fresh [Vertex] array every scroll frame.
@@ -2743,12 +2757,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let scale = view.window?.backingScaleFactor ?? 2.0
             let vpOriginX = Double(viewportOriginPx.x) * Double(scale)
             let vpOriginY = Double(viewportOriginPx.y) * Double(scale)
+            // The root layer drives the pixel space core vertices arrive in.
+            let rootLayerOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
             let viewportMetrics = SurfaceViewportMetrics(
                 viewportWidth: vpWidth,
                 viewportHeight: vpHeight,
                 drawableSize: view.drawableSize,
                 originX: vpOriginX,
-                originY: vpOriginY
+                originY: vpOriginY,
+                layerOriginPx: rootLayerOrigin
             )
 
             // GPU scroll copy eligibility:
@@ -2784,7 +2801,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let safeRowCount = rowMode && committedFontIsCurrent
                 ? committed.rowLogicalToSlot.count
                 : 0
-            let rowTranslationDenom_px = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
 
             func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow >= 0, logicalRow < safeRowCount else { return nil }
@@ -2795,7 +2811,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 guard vc > 0, slot < committed.rowState.buffers.count,
                       let vb = committed.rowState.buffers[slot] else { return nil }
                 let sourceRow = slot < committed.rowSlotSourceRows.count ? committed.rowSlotSourceRows[slot] : logicalRow
-                let translationY = Float(sourceRow - logicalRow) * Float(cellHi) / max(1.0, rowTranslationDenom_px) * 2.0
+                // Pixels, y down: vertices live at sourceRow and must appear
+                // at logicalRow.
+                let translationY = Float(Int(logicalRow) - Int(sourceRow)) * Float(cellHi)
                 return (vc, vb, translationY)
             }
 
@@ -2827,7 +2845,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 guard r.cellHeightPx == Float(cellHi) else { return nil }
                 // Same relation resolvedRowState uses: the vertices live at
                 // sourceRow and have to appear at targetRow.
-                let translationY = Float(r.sourceRow - r.targetRow) * Float(cellHi) / max(1.0, rowTranslationDenom_px) * 2.0
+                let translationY = Float(r.targetRow - r.sourceRow) * Float(cellHi)
                 return (r.count, r.buffer, translationY)
             }
 

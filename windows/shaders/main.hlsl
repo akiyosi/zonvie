@@ -2,8 +2,20 @@
 // Compile with: fxc /T vs_5_0 /E VSMain /Fo vs_main.cso main.hlsl
 //               fxc /T ps_5_0 /E PSMain /Fo ps_main.cso main.hlsl
 
+// Maps one layer's incoming vertex space to clip space. The core emits row
+// vertices in grid-local pixels (origin top-left, +y down), so the surface
+// binds scale = (2/extent_w, -2/extent_h) and offset = (-1, +1). Chrome this
+// frontend builds itself is submitted in clip space under the identity
+// transform (scale 1, offset 0).
+cbuffer LayerTransform : register(b0) {
+    float2 layer_scale;
+    float2 layer_offset;
+    float2 layer_origin_px;   // layer top-left in surface pixels
+    float2 layer_pad;
+};
+
 struct VSIn {
-    float2 pos : POSITION;   // NDC (-1..1)
+    float2 pos : POSITION;   // grid-local pixels, or clip space under identity
     float2 uv  : TEXCOORD0;
     float4 col : COLOR0;
     int2 grid_id : BLENDINDICES0;  // i64 as int2
@@ -17,11 +29,15 @@ struct VSOut {
     float4 col : COLOR0;
     uint deco_flags : BLENDINDICES0;
     float deco_phase : TEXCOORD1;
+    // Layer origin in surface pixels, so pattern decorations can phase from
+    // the layer's own left edge instead of the window's.
+    float2 layer_origin : TEXCOORD2;
 };
 
 VSOut VSMain(VSIn i) {
     VSOut o;
-    o.pos = float4(i.pos.xy, 0.0, 1.0);
+    o.pos = float4(i.pos.xy * layer_scale + layer_offset, 0.0, 1.0);
+    o.layer_origin = layer_origin_px;
     o.uv  = i.uv;
     o.col = i.col;
     o.deco_flags = i.deco_flags;
@@ -203,7 +219,7 @@ float4 PSMain(VSOut i) : SV_Target {
                 float wave_freq = 3.14159265 * 2.0;
                 float wave_amp = 0.35;  // Normalized amplitude (0-1 range for quad height)
                 float cell_width = 8.0;
-                float wave_x = (i.pos.x / cell_width) + i.deco_phase;
+                float wave_x = ((i.pos.x - i.layer_origin.x) / cell_width) + i.deco_phase;
                 float wave_y = sin(wave_x * wave_freq) * wave_amp;
                 // Local Y from UV (0.0 at top, 1.0 at bottom), wave center at 0.5
                 float local_y = i.uv.y;
@@ -218,7 +234,7 @@ float4 PSMain(VSOut i) : SV_Target {
             }
             // Underdotted: dotted pattern
             if (i.deco_flags & DECO_UNDERDOTTED) {
-                float x_mod = fmod(i.pos.x, 4.0);
+                float x_mod = fmod(i.pos.x - i.layer_origin.x, 4.0);
                 if (x_mod >= 2.0) {
                     discard;
                 }
@@ -226,7 +242,7 @@ float4 PSMain(VSOut i) : SV_Target {
             }
             // Underdashed: dashed pattern
             if (i.deco_flags & DECO_UNDERDASHED) {
-                float x_mod = fmod(i.pos.x, 8.0);
+                float x_mod = fmod(i.pos.x - i.layer_origin.x, 8.0);
                 if (x_mod >= 5.0) {
                     discard;
                 }

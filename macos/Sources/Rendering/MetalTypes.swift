@@ -538,6 +538,37 @@ func copyRetainedScrollableRow(
     return (dstBuf, kept)
 }
 
+/// Maps a layer's vertex space to clip space, mirroring `LayerTransform` in
+/// Shaders.metal. Core row vertices arrive in grid-local pixels; the identity
+/// value (scale 1, offset 0) submits clip-space vertices unchanged.
+struct LayerTransform {
+    var scale: simd_float2
+    var offset: simd_float2
+
+    static let identity = LayerTransform(scale: simd_float2(1, 1), offset: simd_float2(0, 0))
+
+    /// Pixel-to-clip mapping for a layer whose top-left sits at `originPx`
+    /// within a surface of `extentPx`, with +y down in pixel space.
+    init(originPx: simd_float2 = simd_float2(0, 0), extentPx: simd_float2) {
+        let w = max(1, extentPx.x)
+        let h = max(1, extentPx.y)
+        self.scale = simd_float2(2 / w, -2 / h)
+        self.offset = simd_float2(originPx.x * 2 / w - 1, 1 - originPx.y * 2 / h)
+    }
+
+    init(scale: simd_float2, offset: simd_float2) {
+        self.scale = scale
+        self.offset = offset
+    }
+}
+
+/// Bind the vertex stage's layer transform (buffer index 4). Every draw on the
+/// encoder afterwards uses it until it is bound again.
+func bindLayerTransform(encoder: MTLRenderCommandEncoder, _ transform: LayerTransform) {
+    var t = transform
+    encoder.setVertexBytes(&t, length: MemoryLayout<LayerTransform>.stride, index: 4)
+}
+
 struct SurfaceViewportMetrics {
     let viewportWidth: Double
     let viewportHeight: Double
@@ -545,17 +576,39 @@ struct SurfaceViewportMetrics {
     let originY: Double
     let fragmentWidth: Float
     let fragmentHeight: Float
+    /// Where the layer being drawn sits inside the viewport. Zero for a
+    /// surface's root layer; an anchored float carries its own offset.
+    let layerOriginPx: simd_float2
 
-    init(viewportWidth: Double, viewportHeight: Double, drawableSize: CGSize, originX: Double = 0, originY: Double = 0) {
+    init(
+        viewportWidth: Double,
+        viewportHeight: Double,
+        drawableSize: CGSize,
+        originX: Double = 0,
+        originY: Double = 0,
+        layerOriginPx: simd_float2 = simd_float2(0, 0)
+    ) {
         self.viewportWidth = viewportWidth
         self.viewportHeight = viewportHeight
         self.originX = originX
         self.originY = originY
+        self.layerOriginPx = layerOriginPx
         self.fragmentWidth = Float(viewportWidth > 0 ? viewportWidth : Double(drawableSize.width))
         self.fragmentHeight = Float(viewportHeight > 0 ? viewportHeight : Double(drawableSize.height))
     }
 
+    /// The pixel space core vertices arrive in for a surface drawn as one
+    /// layer at the viewport origin.
+    var layerTransform: LayerTransform {
+        LayerTransform(originPx: layerOriginPx, extentPx: simd_float2(fragmentWidth, fragmentHeight))
+    }
+
+    /// Sets the Metal viewport AND the vertex stage's layer transform, so the
+    /// pixel space the core emits in can never drift from the viewport the
+    /// result is mapped onto. `originX`/`originY` are carried by the viewport,
+    /// so the transform itself maps from the layer's own top-left.
     func applyViewport(to encoder: MTLRenderCommandEncoder) {
+        bindLayerTransform(encoder: encoder, layerTransform)
         guard viewportWidth > 0, viewportHeight > 0 else { return }
         encoder.setViewport(MTLViewport(originX: originX, originY: originY, width: viewportWidth, height: viewportHeight, znear: 0, zfar: 1))
     }
@@ -721,6 +774,46 @@ func encodeSurfaceRowDraws<C: Collection>(
 /// Independent buffer set owning row vertex data for one frame.
 /// Used by both MetalTerminalRenderer (triple-buffered) and ExternalGridView (write/committed pair).
 /// Class (reference type) to allow sharing buffer references across sets (COW pattern).
+/// One grid's triple-buffered vertex storage, looked up by grid id so a
+/// surface can draw several grids as ordered layers. A grid's buffers are
+/// independent of which surface currently draws it, so a grid moving between
+/// the main window and an external window keeps its rows.
+final class GridBufferRegistry {
+    private var sets: [Int64: [SurfaceBufferSet]] = [:]
+
+    /// The three buffer sets for `gridId`, creating them on first use.
+    func sets(for gridId: Int64) -> [SurfaceBufferSet] {
+        if let existing = sets[gridId] { return existing }
+        let created = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+        sets[gridId] = created
+        return created
+    }
+
+    /// The buffer sets for `gridId` if it has any, without creating them.
+    func existingSets(for gridId: Int64) -> [SurfaceBufferSet]? {
+        sets[gridId]
+    }
+
+    /// Release a destroyed grid's buffers.
+    func release(gridId: Int64) {
+        sets.removeValue(forKey: gridId)
+    }
+
+    var gridIds: [Int64] { Array(sets.keys) }
+}
+
+/// One grid placed on one surface, mirroring `zonvie_layer` in
+/// include/zonvie_core.h.
+struct SurfaceLayer {
+    var gridId: Int64
+    var anchorGrid: Int64
+    var originPx: simd_float2
+    var rows: Int
+    var cols: Int
+    var z: Int
+    var followsScroll: Bool
+}
+
 final class SurfaceBufferSet {
     let rowState = SurfaceRowBufferState()
     var rowLogicalToSlot: [Int] = []        // logical row -> physical slot
@@ -2369,6 +2462,25 @@ func submitSurfaceRowVertices(
 }
 
 /// Compute a scissor rect for a single row in back-buffer pixel coordinates.
+/// Clip a layer rect to the render target. Returns nil when nothing of it is
+/// visible, so the caller can skip the draw entirely.
+func clampScissor(
+    x: Int,
+    y: Int,
+    width: Int,
+    height: Int,
+    targetWidth: Int,
+    targetHeight: Int
+) -> MTLScissorRect? {
+    guard targetWidth > 0, targetHeight > 0, width > 0, height > 0 else { return nil }
+    let left = max(0, x)
+    let top = max(0, y)
+    let right = min(targetWidth, x + width)
+    let bottom = min(targetHeight, y + height)
+    guard right > left, bottom > top else { return nil }
+    return MTLScissorRect(x: left, y: top, width: right - left, height: bottom - top)
+}
+
 func makeRowScissorRect(
     row: Int,
     cellHeight_px: Int,

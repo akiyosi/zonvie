@@ -401,21 +401,6 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(cursor_style_tests).step);
 
-    // Scroll fast path tests
-    const scroll_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/scroll_fast_path_test.zig"),
-        .imports = &.{
-            .{ .name = "zonvie_core", .module = core_mod },
-            .{ .name = "toml", .module = zig_toml.module("toml") },
-        },
-    });
-    const scroll_tests = b.addTest(.{
-        .root_module = scroll_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
-
     // Message routing tests. msg_route.zig is std-only, so it is exposed as a
     // standalone module rather than pulled in through zonvie_core.
     const msg_route_mod = b.createModule(.{

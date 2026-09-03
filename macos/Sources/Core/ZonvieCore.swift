@@ -506,37 +506,6 @@ final class ZonvieCore {
         self.ctxPtr = unmanaged.toOpaque()
 
         var cb = zonvie_callbacks(
-            on_vertices_partial: { ctx, mainVerts, mainCount, cursorVerts, cursorCount, flags in
-                guard let ctx else { return }
-                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                guard let view = core.terminalView else { return }
-
-                // ★ Added: completely ignore no-update notifications (without this, easily leads to requestRedraw(nil))
-                if flags == 0 { return }
-
-                let updateMain = (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
-                let updateCursor = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
-
-                // Safety: return if neither is updated
-                if !updateMain && !updateCursor { return }
-
-                // Update cursor blink timer when cursor is updated
-                if updateCursor {
-                    DispatchQueue.main.async {
-                        core.updateCursorBlinking()
-                    }
-                }
-
-                view.submitVerticesPartialRaw(
-                    mainPtr: updateMain ? mainVerts : nil,
-                    mainCount: updateMain ? Int(mainCount) : 0,
-                    cursorPtr: updateCursor ? cursorVerts : nil,
-                    cursorCount: updateCursor ? Int(cursorCount) : 0,
-                    updateMain: updateMain,
-                    updateCursor: updateCursor
-                )
-            },
-
             on_vertices_row: { ctx, gridId, rowStart, rowCount, verts, vertCount, flags, totalRows, totalCols in
                 guard let ctx else { return }
 
@@ -582,6 +551,36 @@ final class ZonvieCore {
                     core.externalGridViewsLock.lock()
                     let gridView = core.externalGridViews[gridId]
                     core.externalGridViewsLock.unlock()
+
+                    if gridView == nil,
+                       let renderer = core.terminalView?.renderer,
+                       renderer.ownsGrid(gridId) {
+                        // A grid the main surface places as a layer: a float or
+                        // split that lives in the main window, not its own.
+                        if (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
+                            // The surface draws one cursor; remember which
+                            // layer it belongs to so it is placed with that
+                            // layer's transform.
+                            renderer.submitLayerCursor(
+                                gridId: gridId,
+                                ptr: verts.map { UnsafeRawPointer($0) },
+                                count: Int(vertCount)
+                            )
+                            DispatchQueue.main.async {
+                                core.updateCursorBlinking()
+                            }
+                        } else {
+                            renderer.submitLayerRow(
+                                gridId: gridId,
+                                rowStart: rs,
+                                ptr: verts.map { UnsafeRawPointer($0) },
+                                count: Int(vertCount),
+                                totalRows: tr,
+                                totalCols: tc
+                            )
+                        }
+                        return
+                    }
 
                     if let gridView = gridView {
                         guard core.beginExternalFlushIfNeeded(gridView) else { return }
@@ -1205,29 +1204,6 @@ final class ZonvieCore {
                 )
             },
 
-            on_main_row_scroll: { ctx, rowStart, rowEnd, colStart, colEnd, rowsDelta, totalRows, totalCols in
-                guard let ctx else { return }
-                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                guard let view = core.terminalView else { return }
-                let ok = view.applyMainRowScrollRaw(
-                    rowStart: Int(rowStart),
-                    rowEnd: Int(rowEnd),
-                    colStart: Int(colStart),
-                    colEnd: Int(colEnd),
-                    rowsDelta: Int(rowsDelta),
-                    totalRows: Int(totalRows),
-                    totalCols: Int(totalCols)
-                )
-                if !ok, let corePtr = core.core {
-                    // CPU-shift fallback failed to allocate storage for a row
-                    // it needed to preserve — see applyMainRowScrollRaw's doc
-                    // comment. Abort so the core keeps its dirty state and
-                    // retries, instead of committing a frame with that row
-                    // silently blanked.
-                    zonvie_core_abort_flush(corePtr)
-                }
-            },
-
             on_grid_row_scroll: { ctx, gridId, rowStart, rowEnd, colStart, colEnd, rowsDelta, totalRows, totalCols in
                 guard let ctx else { return }
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
@@ -1237,7 +1213,17 @@ final class ZonvieCore {
                 core.externalGridViewsLock.lock()
                 let view = core.externalGridViews[gid]
                 core.externalGridViewsLock.unlock()
-                guard let view = view else { return }
+                guard let view = view else {
+                    // A grid the main surface places as a layer shifts its own
+                    // row slots in that surface's renderer.
+                    core.terminalView?.renderer?.applyLayerRowScroll(
+                        gridId: gid,
+                        rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        rowsDelta: Int(rowsDelta),
+                        totalRows: Int(totalRows), totalCols: Int(totalCols)
+                    )
+                    return
+                }
                 guard core.beginExternalFlushIfNeeded(view) else { return }
                 view.applyRowScroll(
                     rowStart: Int(rowStart), rowEnd: Int(rowEnd),
@@ -1283,6 +1269,35 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onMainGridSize(rows: rows, cols: cols)
+            },
+            on_surface_layout: { ctx, surfaceId, layers, count, surfaceRows, surfaceCols in
+                guard let ctx, let layers else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                var parsed: [SurfaceLayer] = []
+                parsed.reserveCapacity(count)
+                for i in 0..<count {
+                    let l = layers[i]
+                    parsed.append(SurfaceLayer(
+                        gridId: l.grid_id,
+                        anchorGrid: l.anchor_grid,
+                        originPx: SIMD2<Float>(Float(l.x_px), Float(l.y_px)),
+                        rows: Int(l.rows),
+                        cols: Int(l.cols),
+                        z: Int(l.z),
+                        followsScroll: (l.flags & UInt32(ZONVIE_LAYER_FOLLOWS_SCROLL)) != 0
+                    ))
+                }
+                me.onSurfaceLayout(
+                    surfaceId: surfaceId,
+                    layers: parsed,
+                    surfaceRows: surfaceRows,
+                    surfaceCols: surfaceCols
+                )
+            },
+            on_grid_destroy: { ctx, gridId in
+                guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                me.onGridDestroy(gridId: gridId)
             }
         )
 
@@ -6726,6 +6741,35 @@ final class ZonvieCore {
 
     /// Called when cursor moves to a different grid.
     /// Activates the window containing that grid.
+    /// A surface's layer list was replaced. Runs on the core thread inside the
+    /// flush bracket, so it stages the list; the surface promotes it when the
+    /// flush commits.
+    private func onSurfaceLayout(
+        surfaceId: Int64,
+        layers: [SurfaceLayer],
+        surfaceRows: UInt32,
+        surfaceCols: UInt32
+    ) {
+        if surfaceId == 1 {
+            terminalView?.renderer?.setPendingSurfaceLayers(layers)
+            return
+        }
+        externalGridViewsLock.lock()
+        let view = externalGridViews[surfaceId]
+        externalGridViewsLock.unlock()
+        view?.setPendingSurfaceLayers(layers)
+    }
+
+    /// Neovim destroyed the grid; release the vertex storage held for it.
+    private func onGridDestroy(gridId: Int64) {
+        guard gridId != 1 else { return }
+        terminalView?.renderer?.gridBuffers.release(gridId: gridId)
+        externalGridViewsLock.lock()
+        let view = externalGridViews[gridId]
+        externalGridViewsLock.unlock()
+        view?.releaseGridBuffers(gridId: gridId)
+    }
+
     /// With ext_multigrid, grid_id=1 is just a container - actual content is on sub-grids.
     /// So we check if the grid is in externalWindows; if not, it's in the main window.
     private func onCursorGridChanged(gridId: Int64) {

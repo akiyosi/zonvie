@@ -258,6 +258,12 @@ pub const Renderer = struct {
     additive_blend: ?*c.ID3D11BlendState = null,
     bilinear_sampler: ?*c.ID3D11SamplerState = null,
     glow_cb: ?*c.ID3D11Buffer = null,
+    /// Vertex-stage b0: maps a layer's vertex space to clip space. See
+    /// LayerTransform in windows/shaders/main.hlsl.
+    layer_cb: ?*c.ID3D11Buffer = null,
+    /// Last value written to layer_cb, so redundant updates are skipped.
+    layer_cb_value: [8]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+    layer_cb_valid: bool = false,
 
     // User-supplied custom post-process shaders (Phase 2 macOS parity).
     // Loaded from config `[shaders].paths` after renderer init. Empty when
@@ -562,6 +568,7 @@ pub const Renderer = struct {
         safeRelease(&self.additive_blend);
         safeRelease(&self.bilinear_sampler);
         safeRelease(&self.glow_cb);
+        safeRelease(&self.layer_cb);
 
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
@@ -981,6 +988,8 @@ pub const Renderer = struct {
 
         try self.resize();
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
 
         if (applog.isEnabled()) {
             applog.appLog(
@@ -1817,6 +1826,8 @@ pub const Renderer = struct {
     /// Draw tabline texture as a full-width quad at the top of the window.
     /// Call this after clearing but before drawing main content.
     pub fn drawTablineTexture(self: *Renderer) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const srv = self.tabline_srv orelse return;
         const ctx = self.ctx orelse return error.NoContext;
         const width = self.tabline_width;
@@ -1962,6 +1973,8 @@ pub const Renderer = struct {
 
     /// Draw sidebar texture as a vertical strip at left or right of window.
     pub fn drawSidebarTexture(self: *Renderer, is_right: bool) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const srv = self.sidebar_srv orelse return;
         const ctx = self.ctx orelse return error.NoContext;
         const sb_width = self.sidebar_width_tex;
@@ -2307,6 +2320,8 @@ pub const Renderer = struct {
     /// Used for rows with vert_count==0 ("clear row" per core contract).
     /// Lazily creates and caches a 6-vertex VB with the default bg color.
     pub fn drawClearRow(self: *Renderer) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const bg_rgb = self.default_bg_rgb.load(.acquire);
         const need_rebuild = (self.clear_row_vb == null or bg_rgb != self.clear_row_vb_bg);
 
@@ -4528,6 +4543,70 @@ pub const Renderer = struct {
             const hr_gcb = create_buf(dev, &cbd, null, &gcb);
             if (c.FAILED(hr_gcb) or gcb == null) return error.D3DCreateVSCBFailed;
             self.glow_cb = gcb;
+        }
+
+        // --- Layer transform constant buffer (32 bytes: 4 x float2) ---
+        {
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVSCBFailed;
+
+            var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            cbd.ByteWidth = 32;
+            cbd.Usage = c.D3D11_USAGE_DYNAMIC;
+            cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+            cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+
+            var lcb: ?*c.ID3D11Buffer = null;
+            const hr_lcb = create_buf(dev, &cbd, null, &lcb);
+            if (c.FAILED(hr_lcb) or lcb == null) return error.D3DCreateVSCBFailed;
+            self.layer_cb = lcb;
+            self.layer_cb_valid = false;
+        }
+    }
+
+    /// Bind the vertex stage's layer transform. Every draw afterwards uses it
+    /// until it is set again. `extent_px` is the pixel space incoming vertices
+    /// are expressed in; pass 0 for both to submit clip-space vertices under
+    /// the identity transform.
+    pub fn setLayerTransform(
+        self: *Renderer,
+        origin_x_px: f32,
+        origin_y_px: f32,
+        extent_w_px: f32,
+        extent_h_px: f32,
+    ) void {
+        const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
+            .{ 1, 1, 0, 0, 0, 0, 0, 0 }
+        else .{
+            2.0 / extent_w_px,
+            -2.0 / extent_h_px,
+            origin_x_px * 2.0 / extent_w_px - 1.0,
+            1.0 - origin_y_px * 2.0 / extent_h_px,
+            origin_x_px,
+            origin_y_px,
+            0,
+            0,
+        };
+        const ctx = self.ctx orelse return;
+        const ctx_vtbl = ctx.*.lpVtbl orelse return;
+        const cb = self.layer_cb orelse return;
+
+        if (self.layer_cb_valid and std.mem.eql(f32, &self.layer_cb_value, &value)) {
+            // Already resident; the binding below is idempotent but cheap.
+        } else {
+            const res: *c.ID3D11Resource = @ptrCast(cb);
+            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+            const hr = mapDiscard(ctx, res, &mapped);
+            if (c.FAILED(hr)) return;
+            const dst: *[8]f32 = @ptrCast(@alignCast(mapped.pData));
+            dst.* = value;
+            unmap0(ctx, res);
+            self.layer_cb_value = value;
+            self.layer_cb_valid = true;
+        }
+
+        if (ctx_vtbl.*.VSSetConstantBuffers) |set_cbs| {
+            var cbs: [1]?*c.ID3D11Buffer = .{cb};
+            set_cbs(ctx, 0, 1, @ptrCast(&cbs));
         }
     }
 
