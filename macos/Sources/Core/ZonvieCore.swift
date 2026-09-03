@@ -4961,8 +4961,12 @@ final class ZonvieCore {
         externalWindowInstalledLifecycleTokens.removeValue(forKey: gridId)
         externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
         externalGridViewsLock.lock()
-        externalGridViews.removeValue(forKey: gridId)
+        let removedView = externalGridViews.removeValue(forKey: gridId)
         externalGridViewsLock.unlock()
+        // The view's own vertex storage goes when the view does, not on
+        // on_grid_destroy: that fires while this close is still queued and
+        // would blank the window it is still drawing.
+        removedView?.releaseGridBuffers(gridId: gridId)
         externalWindowWinIds.removeValue(forKey: gridId)
         externalWindows.removeValue(forKey: gridId)
         cachedViewports.removeValue(forKey: gridId)
@@ -5014,8 +5018,11 @@ final class ZonvieCore {
             self.externalWindowInstalledLifecycleTokens.removeValue(forKey: gridId)
             self.externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
             self.externalGridViewsLock.lock()
-            self.externalGridViews.removeValue(forKey: gridId)
+            let removedView = self.externalGridViews.removeValue(forKey: gridId)
             self.externalGridViewsLock.unlock()
+            // See the sibling teardown above: the view owns its buffers until
+            // it is removed.
+            removedView?.releaseGridBuffers(gridId: gridId)
             self.externalWindowWinIds.removeValue(forKey: gridId)
 
             // Clean up pending vertex/config data for this grid.
@@ -6765,9 +6772,14 @@ final class ZonvieCore {
         guard gridId != 1 else { return }
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
         externalGridViewsLock.lock()
-        let view = externalGridViews[gridId]
+        let isOwnSurface = externalGridViews[gridId] != nil
+        let hosts = isOwnSurface ? [] : Array(externalGridViews.values)
         externalGridViewsLock.unlock()
-        view?.releaseGridBuffers(gridId: gridId)
+        // An external view's OWN grid is released by its teardown, which the
+        // close dispatches asynchronously AFTER this callback: releasing it
+        // here blanks a window that is still installed and drawing. Only
+        // grids a view hosts as a non-root layer are released on destroy.
+        for host in hosts { host.releaseGridBuffers(gridId: gridId) }
     }
 
     /// With ext_multigrid, grid_id=1 is just a container - actual content is on sub-grids.

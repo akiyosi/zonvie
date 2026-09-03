@@ -778,28 +778,50 @@ func encodeSurfaceRowDraws<C: Collection>(
 /// surface can draw several grids as ordered layers. A grid's buffers are
 /// independent of which surface currently draws it, so a grid moving between
 /// the main window and an external window keeps its rows.
+/// Vertex storage per grid. The core thread inserts (a new grid's first row)
+/// and releases (grid destroy) while the draw thread reads, so the dictionary
+/// carries its own lock: a Swift Dictionary rehashing under a concurrent read
+/// is a crash, not a stale value.
 final class GridBufferRegistry {
+    private let registryLock = NSLock()
     private var sets: [Int64: [SurfaceBufferSet]] = [:]
+    /// Insertion-ordered ids, maintained alongside `sets` so per-flush
+    /// iteration does not allocate a fresh key array.
+    private var ids: [Int64] = []
 
     /// The three buffer sets for `gridId`, creating them on first use.
     func sets(for gridId: Int64) -> [SurfaceBufferSet] {
+        registryLock.lock()
+        defer { registryLock.unlock() }
         if let existing = sets[gridId] { return existing }
         let created = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
         sets[gridId] = created
+        ids.append(gridId)
         return created
     }
 
     /// The buffer sets for `gridId` if it has any, without creating them.
     func existingSets(for gridId: Int64) -> [SurfaceBufferSet]? {
-        sets[gridId]
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        return sets[gridId]
     }
 
     /// Release a destroyed grid's buffers.
     func release(gridId: Int64) {
+        registryLock.lock()
+        defer { registryLock.unlock() }
         sets.removeValue(forKey: gridId)
+        if let i = ids.firstIndex(of: gridId) { ids.remove(at: i) }
     }
 
-    var gridIds: [Int64] { Array(sets.keys) }
+    /// Snapshot of the ids into the caller's array, which is reused.
+    func copyGridIds(into out: inout [Int64]) {
+        registryLock.lock()
+        defer { registryLock.unlock() }
+        out.removeAll(keepingCapacity: true)
+        out.append(contentsOf: ids)
+    }
 }
 
 /// One grid placed on one surface, mirroring `zonvie_layer` in
