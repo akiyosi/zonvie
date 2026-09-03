@@ -208,13 +208,16 @@ typedef void (*zonvie_on_vertices_row_fn)(
    and at least one is zero. It clears the logical MAIN surface without
    treating a nonexistent row as row content. */
 
-/* External grid (sub-grid) row scroll notification.
-   Notifies the frontend that a sub-grid received a grid_scroll event.
-   Fired once per grid per flush batch, only when a single scroll occurred
-   in that batch (multiple scrolls in one batch are suppressed).
-   This is a best-effort hint — the consumer MUST perform its own eligibility
-   checks (e.g. abs(rows_delta) == 1, full-width region, no horizontal scroll)
-   before applying any fast-path optimization such as row remapping or GPU blit.
+/* Grid row-shift notification.
+   Fired once per grid per flush batch when that grid's rows can be carried by
+   shifting them. The core then sends ONLY the rows the shift vacated through
+   on_vertices_row, so the consumer MUST apply the shift: rows_delta may be any
+   value up to half the region's height (same-region scrolls in one batch are
+   summed), and a consumer that cannot apply it must request a full resend
+   (zonvie_core_force_resend) rather than ignore the call.
+   The region is always full width; a partial-width scroll, two different
+   regions in one batch, or a shift past half the region is refused here and
+   the grid is regenerated instead.
    Fired after abort check, before clearDirty. */
 typedef void (*zonvie_on_grid_row_scroll_fn)(
     void* ctx,
@@ -343,11 +346,13 @@ typedef struct zonvie_layer {
 } zonvie_layer;
 
 /* Full replacement of the layer list for one surface. Fired inside the flush
-   bracket, after on_external_window for a new surface and before that
-   surface's row vertices, and only when the list changed. A grid missing from
-   every surface keeps its buffers until on_grid_destroy; the frontend must
-   tolerate a layer whose grid has no committed rows yet, and rows arriving for
-   a grid that is in no layer. */
+   bracket, after on_external_window for a new surface, and only when the list
+   changed. For the ROOT surface it may arrive after that flush's row vertices
+   and row-shift hints, so consumers must not depend on layout-before-rows
+   ordering — only on both being visible together at on_flush_end. A grid
+   missing from every surface keeps its buffers until on_grid_destroy; the
+   frontend must tolerate a layer whose grid has no committed rows yet, and
+   rows arriving for a grid that is in no layer. */
 typedef void (*zonvie_on_surface_layout_fn)(
     void* ctx,
     int64_t surface_id,
@@ -825,13 +830,8 @@ typedef struct zonvie_callbacks {
     /* ASCII fast path table callback (NULL = no fast path, always use shaping). */
     zonvie_get_ascii_table_fn on_get_ascii_table;
 
-    /* Main row-buffer scroll fast path notification.
-       Optional optimization used by row-mode frontends to shift existing main-row
-       buffers instead of receiving cached rows one by one via on_vertices_row. */
-
-    /* External grid (sub-grid) row scroll notification (best-effort hint).
-       Suppressed when multiple scrolls occur in the same batch.
-       Consumer must validate eligibility before applying optimizations. */
+    /* Grid row-shift notification: a mandatory shift, after which only the
+       vacated rows are sent. See zonvie_on_grid_row_scroll_fn. */
     zonvie_on_grid_row_scroll_fn on_grid_row_scroll;
 
     /* Restart UI event observer (informational; core handles reconnect).
@@ -859,8 +859,13 @@ typedef struct zonvie_callbacks {
        Appended at the end for ABI compat. */
     void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
 
-    /* Per-surface layer placement, and grid buffer lifetime. Appended at the
-       end for ABI compat. */
+    /* Per-surface layer placement, and grid buffer lifetime.
+       Added with per-grid rendering, which also REMOVED on_vertices_partial
+       and on_main_row_scroll from the front and middle of this struct. The
+       two removals and these two additions cancel out in sizeof, so
+       callbacks_size cannot detect the change: this struct is NOT layout
+       compatible with a consumer built before it, even though the size
+       matches. Both in-tree frontends were updated in the same commit. */
     zonvie_on_surface_layout_fn on_surface_layout;
     zonvie_on_grid_destroy_fn on_grid_destroy;
 } zonvie_callbacks;

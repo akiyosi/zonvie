@@ -181,8 +181,11 @@ Important contract areas:
 - exported C API functions
 - callback struct layout
 - vertex update modes:
-  - `on_vertices_partial`
   - `on_vertices_row`
+  - `on_grid_row_scroll`
+- per-surface layer placement:
+  - `on_surface_layout`
+  - `on_grid_destroy`
 - flush bracketing callbacks:
   - `on_flush_begin`
   - `on_flush_end`
