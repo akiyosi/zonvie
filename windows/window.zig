@@ -2902,6 +2902,30 @@ pub export fn WndProc(
                             present_rects.append(app.alloc, cr) catch {};
                         }
 
+                        // Layers paint whole; present each one that changed.
+                        // Their rows are not in rows_to_draw, which only
+                        // covers the root grid's own dirty rows.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                                if (!state.dirty) continue;
+                                const l: i32 = @max(0, content_x_offset_i32 + layer.x_px);
+                                const t: i32 = @max(0, content_y_offset_i32 + layer.y_px);
+                                const rc: c.RECT = .{
+                                    .left = l,
+                                    .top = t,
+                                    .right = @min(client.right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
+                                    .bottom = @min(client.bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
+                                };
+                                if (rc.right > rc.left and rc.bottom > rc.top) {
+                                    present_rects.append(app.alloc, rc) catch {};
+                                }
+                            }
+                        }
+
                         // Clamp first, then compact in place with O(n log n)
                         // sorting plus a linear safe-union pass. The previous
                         // all-pairs containment scan reached O(rows^2) for
@@ -3038,6 +3062,7 @@ pub export fn WndProc(
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
                             .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
+                            .root_rows_may_be_empty = tbs_snapshot.layers.len > 1,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
                             .content_x_offset = content_x_offset,
@@ -3164,11 +3189,10 @@ pub export fn WndProc(
 
                         // Where the cursor's own layer sits, so the overlay is
                         // placed with that layer's transform rather than the
-                        // root grid's.
+                        // root grid's. The grid id comes from the same
+                        // transaction as the cursor vertices.
+                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
                         const cursor_layer_origin: [2]f32 = blk: {
-                            app.mu.lockUncancelable(core.clock.io());
-                            defer app.mu.unlock(core.clock.io());
-                            const cursor_grid = app.cursor_layer_grid_id;
                             if (cursor_grid == 1) break :blk .{ 0, 0 };
                             for (tbs_snapshot.layers.slice()) |l| {
                                 if (l.grid_id == cursor_grid) {
@@ -3177,6 +3201,38 @@ pub export fn WndProc(
                             }
                             break :blk .{ 0, 0 };
                         };
+
+                        // The cursor's own row in its layer. Blink-off redraws
+                        // this instead of the root's row, which is empty under
+                        // ext_multigrid.
+                        var cursor_layer_row: ?*app_mod.RowVerts = null;
+                        var cursor_layer_row_dy_px: f32 = 0;
+                        if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            if (app.layer_grids.get(cursor_grid)) |state| {
+                                var min_y: f32 = cursor_verts_snapshot[0].position[1];
+                                var max_y: f32 = min_y;
+                                for (cursor_verts_snapshot[1..]) |v| {
+                                    if (v.position[1] < min_y) min_y = v.position[1];
+                                    if (v.position[1] > max_y) max_y = v.position[1];
+                                }
+                                const ri: i32 = @intFromFloat(@floor(
+                                    (min_y + max_y) * 0.5 / @as(f32, @floatFromInt(row_h_px)),
+                                ));
+                                const local_row: usize = @intCast(@max(0, ri));
+                                if (local_row < state.rows_buf.items.len) {
+                                    cursor_layer_row = &state.rows_buf.items[local_row];
+                                    const origin_row: u32 = if (local_row < state.origin_rows.items.len)
+                                        state.origin_rows.items[local_row]
+                                    else
+                                        @intCast(local_row);
+                                    cursor_layer_row_dy_px = @floatFromInt(
+                                        (@as(i32, @intCast(local_row)) - @as(i32, @intCast(origin_row))) * row_h_px,
+                                    );
+                                }
+                            }
+                        }
 
                         // Non-root layers on top of the root grid, before the
                         // cursor so the cursor stays on top of everything.
@@ -3199,11 +3255,20 @@ pub export fn WndProc(
                                 ctx_ptr,
                                 rs_set_sc_fn,
                             );
+                            // Their pixels are in back_tex now; the present
+                            // rects for this frame were already built above.
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                                if (app.layer_grids.get(layer.grid_id)) |state| state.dirty = false;
+                            }
                             app.mu.unlock(core.clock.io());
                         }
 
                         // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
                         var cursor_overlay_failed = false;
+                        // cursor_layer_row points into a layer's row storage,
+                        // which the core thread can resize; hold app.mu for as
+                        // long as the overlay dereferences it.
+                        if (cursor_layer_row != null) app.mu.lockUncancelable(core.clock.io());
                         app_mod.drawCursorOverlay(g, .{
                             .cursor_verts = cursor_verts_snapshot,
                             .cursor_row = committed_cursor.last_cursor_row,
@@ -3221,6 +3286,8 @@ pub export fn WndProc(
                             .row_h_px = row_h_px,
                             .cursor_layer_origin_x_px = cursor_layer_origin[0],
                             .cursor_layer_origin_y_px = cursor_layer_origin[1],
+                            .cursor_layer_row = cursor_layer_row,
+                            .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
                             .ctx_ptr = ctx_ptr,
                             .rs_set_sc_fn = rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
@@ -3229,6 +3296,7 @@ pub export fn WndProc(
                             cursor_overlay_failed = true;
                             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
                         };
+                        if (cursor_layer_row != null) app.mu.unlock(core.clock.io());
 
                         // Post-process bloom (neon glow) for row-mode
                         if (glow_enabled) {
@@ -3373,6 +3441,25 @@ pub export fn WndProc(
                         if (scroll_shift_result.scroll_rect) |sr| {
                             present_rects.append(app.alloc, sr) catch {};
                         }
+
+                        if (log_enabled) applog.appLog(
+                            "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
+                            .{
+                                allow_present,
+                                seed_pending_snapshot,
+                                preserve_back,
+                                back_tex_valid_snapshot,
+                                rows_mismatch,
+                                effective_rows,
+                                effective_row_valid_count,
+                                skipped_empty,
+                                failed_rows,
+                                row_draw_result.metrics.empty_rows,
+                                rows_to_draw.items.len,
+                                force_full_rows,
+                                tbs_snapshot.layers.len,
+                            },
+                        );
 
                         if (allow_present) {
                             present_frame: {
