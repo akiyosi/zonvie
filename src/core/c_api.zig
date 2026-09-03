@@ -57,6 +57,30 @@ pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, 
 // as background, which would fade them under a translucent/blurred window.
 pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
 
+/// One grid placed on one surface. Mirrors `zonvie_layer` in
+/// include/zonvie_core.h.
+pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
+
+pub const Layer = extern struct {
+    grid_id: i64,
+    /// Grid this float is anchored to; == surface_id for the root layer.
+    anchor_grid: i64,
+    /// Surface-local, top-left origin.
+    x_px: i32,
+    y_px: i32,
+    rows: u32,
+    cols: u32,
+    /// Back-to-front index; 0 == root grid.
+    z: i32,
+    flags: u32,
+
+    comptime {
+        if (@sizeOf(Layer) != 40) {
+            @compileError("Layer struct size mismatch! Expected 40 bytes.");
+        }
+    }
+};
+
 pub const Vertex = extern struct {
     position: [2]f32,
     texCoord: [2]f32,
@@ -313,7 +337,6 @@ pub const PopupmenuColors = extern struct {
 };
 
 pub const Callbacks = extern struct {
-    on_vertices_partial: ?OnVerticesPartialFn = null,
     on_vertices_row: ?OnVerticesRowFn = null,
 
     on_atlas_ensure_glyph: ?AtlasEnsureGlyphFn = null,
@@ -502,16 +525,6 @@ pub const Callbacks = extern struct {
     on_get_ascii_table: ?GetAsciiTableFn = null,
 
     // Main row-buffer scroll fast path notification (optional)
-    on_main_row_scroll: ?*const fn (
-        ctx: ?*anyopaque,
-        row_start: u32,
-        row_end: u32,
-        col_start: u32,
-        col_end: u32,
-        rows_delta: i32,
-        total_rows: u32,
-        total_cols: u32,
-    ) callconv(.c) void = null,
 
     // External grid (sub-grid) row-buffer scroll fast path notification (optional)
     on_grid_row_scroll: ?*const fn (
@@ -549,6 +562,18 @@ pub const Callbacks = extern struct {
     // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
     // Appended at the end for ABI compat (see on_restart note).
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    // Per-surface layer placement, and grid buffer lifetime.
+    // Appended at the end for ABI compat.
+    on_surface_layout: ?*const fn (
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void = null,
+    on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
 };
 
 pub const zonvie_core = opaque {};
@@ -610,7 +635,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
     // Build core.Callbacks from the C-facing callback struct.
     const cb_core: core.Callbacks = .{
-        .on_vertices_partial = box.cb.on_vertices_partial,
         .on_vertices_row = box.cb.on_vertices_row,
 
         .on_atlas_ensure_glyph = box.cb.on_atlas_ensure_glyph,
@@ -668,6 +692,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Neovim-initiated main grid resize
         .on_main_grid_size = box.cb.on_main_grid_size,
 
+        // Per-surface layer placement and grid buffer lifetime
+        .on_surface_layout = box.cb.on_surface_layout,
+        .on_grid_destroy = box.cb.on_grid_destroy,
+
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
 
@@ -704,7 +732,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_get_ascii_table = box.cb.on_get_ascii_table,
 
         // Main row-buffer scroll fast path notification
-        .on_main_row_scroll = box.cb.on_main_row_scroll,
 
         // External grid row-buffer scroll fast path notification
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
