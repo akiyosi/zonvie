@@ -28,7 +28,7 @@ const marker = "[shader_cursor]";
 const max_windows = 16;
 
 
-const Rect = struct { x: f64, y: f64, w: f64, h: f64 };
+const Rect = struct { x: f64, y: f64, w: f64, h: f64, grid: f64 };
 
 fn waitCursorRect(alloc: std.mem.Allocator, since_ms: f64, timeout_ms: u64) !Rect {
     var timer = gui_io.Timer.start();
@@ -40,6 +40,7 @@ fn waitCursorRect(alloc: std.mem.Allocator, since_ms: f64, timeout_ms: u64) !Rec
                 .y = app_log.field(line, "y") orelse return error.CursorRectUnparsable,
                 .w = app_log.field(line, "w") orelse return error.CursorRectUnparsable,
                 .h = app_log.field(line, "h") orelse return error.CursorRectUnparsable,
+                .grid = app_log.field(line, "grid") orelse return error.CursorRectUnparsable,
             };
         }
         if (timer.read() / std.time.ns_per_ms >= timeout_ms) return error.NoCursorRectPublished;
@@ -107,10 +108,18 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const win_w = cmdline_win.bounds.w * metrics.scale;
     const main_h = main_win.bounds.h * metrics.scale;
     std.debug.print(
-        "[gui] cmdline cursor shader rect: ({d:.0},{d:.0}) {d:.0}x{d:.0}; " ++
+        "[gui] cmdline cursor shader rect: ({d:.0},{d:.0}) {d:.0}x{d:.0} grid={d:.0}; " ++
             "cmdline x band {d:.0}..{d:.0}, main height {d:.0}px\n",
-        .{ rect.x, rect.y, rect.w, rect.h, rel_x, rel_x + win_w, main_h },
+        .{ rect.x, rect.y, rect.w, rect.h, rect.grid, rel_x, rel_x + win_w, main_h },
     );
+
+    // The rect must come from the cmdline's own surface. A stale main-window
+    // rect for a cursor at column 0 would otherwise satisfy every bound below
+    // whenever the cmdline window starts at or left of the main window.
+    if (rect.grid == 1) {
+        std.debug.print("[gui] the published rect still belongs to the main grid\n", .{});
+        return error.CursorRectFromMainGrid;
+    }
 
     // Feeding grid-local pixels through the old NDC formula multiplied them
     // by the viewport width, so x landed astronomically outside this band.
