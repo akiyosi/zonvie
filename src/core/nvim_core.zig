@@ -539,7 +539,10 @@ pub const Core = struct {
     /// ease a scroll sub-row, and keeps drawing them for a few frames after
     /// this core has already overwritten their cache slots. That ring is
     /// invisible here, so reclamation would see their glyphs as unreferenced.
-    retained_shadow: [2]std.ArrayListUnmanaged(c_api.Vertex) = .{ .empty, .empty },
+    /// UVs of rows a row-shift hint vacated. The frontend keeps drawing a
+    /// retained copy of such a row for the sub-row ease, so its shelves must
+    /// stay live for the same number of flushes.
+    retained_uv_shadow: [2]std.ArrayListUnmanaged(f32) = .{ .empty, .empty },
     retained_shadow_age: [2]u8 = .{ retained_shadow_expiry, retained_shadow_expiry },
     retained_shadow_next: usize = 0,
     flush_vertex_count_aggregate: usize = 0,
@@ -1244,7 +1247,7 @@ pub const Core = struct {
             row_cache.deinit(self.alloc);
         }
         self.scroll_cache.deinit(self.alloc);
-        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
+        for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.scroll_cache_valid.deinit(self.alloc);
         self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
@@ -1944,7 +1947,15 @@ pub const Core = struct {
         const m = gop.value_ptr;
         if (m.rows.items.len != rows_total) {
             for (m.rows.items) |*r| r.deinit(self.alloc);
-            m.rows.resize(self.alloc, rows_total) catch return;
+            // deinit leaves each list undefined; drop them before the resize
+            // so a failed grow cannot leave freed lists in the outer list for
+            // the next call (or deinit) to free a second time.
+            m.rows.clearRetainingCapacity();
+            m.rows.resize(self.alloc, rows_total) catch {
+                m.valid.deinit(self.alloc);
+                m.valid = .{};
+                return;
+            };
             for (m.rows.items) |*r| r.* = .empty;
             m.valid.deinit(self.alloc);
             m.valid = std.DynamicBitSetUnmanaged.initEmpty(self.alloc, rows_total) catch {
@@ -1988,6 +1999,7 @@ pub const Core = struct {
             }
             var v: u32 = bot - shift;
             while (v < bot) : (v += 1) {
+                self.shadowDepartedRow(&rows[v]);
                 rows[v].clearRetainingCapacity();
                 if (v < m.valid.bit_length) m.valid.unset(v);
             }
@@ -2000,6 +2012,7 @@ pub const Core = struct {
             }
             var v: u32 = top;
             while (v < top + shift) : (v += 1) {
+                self.shadowDepartedRow(&rows[v]);
                 rows[v].clearRetainingCapacity();
                 if (v < m.valid.bit_length) m.valid.unset(v);
             }
@@ -2017,6 +2030,17 @@ pub const Core = struct {
         const m = self.glyph_mirror.getPtr(grid_id) orelse return;
         for (m.rows.items) |*r| r.clearRetainingCapacity();
         if (m.valid.bit_length != 0) m.valid.unsetAll();
+    }
+
+    /// Free a destroyed grid's mirror outright. Neovim hands out increasing
+    /// grid ids, so a session that never removed them would keep every closed
+    /// split's and float's rows pinning atlas shelves forever.
+    pub fn removeGlyphMirror(self: *Core, grid_id: i64) void {
+        const kv = self.glyph_mirror.fetchRemove(grid_id) orelse return;
+        var m = kv.value;
+        for (m.rows.items) |*r| r.deinit(self.alloc);
+        m.rows.deinit(self.alloc);
+        m.valid.deinit(self.alloc);
     }
 
     pub fn invalidateAllGlyphMirrors(self: *Core) void {
@@ -2838,26 +2862,36 @@ pub const Core = struct {
     /// glyphs it had just packed looked unreferenced, were reclaimed, and had
     /// to be rasterized all over again on the next pass — the atlas never held
     /// a screenful for longer than one flush.
-    /// Keep a copy of a row the scroll fast path is about to drop from the
-    /// cache, so reclamation still counts the glyphs a frontend-retained copy
-    /// of that row may keep drawing. Failing to copy costs reclamation accuracy
-    /// only, never the scroll, so it is not reported to the caller.
-    pub fn captureRetainedShadow(self: *Core, verts: []const c_api.Vertex) void {
-        if (verts.len == 0) return;
-        const slot = self.retained_shadow_next % self.retained_shadow.len;
-        const buf = &self.retained_shadow[slot];
+    /// Keep the UVs of a row a row-shift hint just vacated, so reclamation
+    /// still counts the glyphs the frontend's retained copy of that row may
+    /// keep drawing during the sub-row ease. Failing to copy costs
+    /// reclamation accuracy only, so it is not reported to the caller.
+    fn shadowDepartedRow(self: *Core, row: *std.ArrayListUnmanaged(f32)) void {
+        if (row.items.len == 0) return;
+        const slot = self.retained_shadow_next % self.retained_uv_shadow.len;
+        const buf = &self.retained_uv_shadow[slot];
         buf.clearRetainingCapacity();
-        buf.ensureTotalCapacity(self.alloc, verts.len) catch {
+        buf.appendSlice(self.alloc, row.items) catch {
             self.retained_shadow_age[slot] = retained_shadow_expiry;
             return;
         };
-        buf.appendSliceAssumeCapacity(verts);
         self.retained_shadow_age[slot] = 0;
-        self.retained_shadow_next = (slot + 1) % self.retained_shadow.len;
+        self.retained_shadow_next = (slot + 1) % self.retained_uv_shadow.len;
+    }
+
+    /// Test seam: whether a departed row's UV is still counted live.
+    pub fn departedUvIsLive(self: *Core, uv_y: f32) bool {
+        for (self.retained_shadow_age, &self.retained_uv_shadow) |age, *buf| {
+            if (age >= retained_shadow_expiry) continue;
+            for (buf.items) |u| {
+                if (u == uv_y) return true;
+            }
+        }
+        return false;
     }
 
     fn ageRetainedShadows(self: *Core) void {
-        for (&self.retained_shadow_age, &self.retained_shadow) |*age, *buf| {
+        for (&self.retained_shadow_age, &self.retained_uv_shadow) |*age, *buf| {
             if (age.* >= retained_shadow_expiry) continue;
             age.* += 1;
             if (age.* >= retained_shadow_expiry) buf.clearRetainingCapacity();
@@ -2972,10 +3006,10 @@ pub const Core = struct {
         }
         // Rows the frontend may still be drawing out of its own retained copy,
         // whose cache slots this core has already reused.
-        for (self.retained_shadow_age, &self.retained_shadow) |age, *buf| {
+        for (self.retained_shadow_age, &self.retained_uv_shadow) |age, *buf| {
             if (age >= retained_shadow_expiry) continue;
-            for (buf.items) |v| {
-                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            for (buf.items) |uv_y| {
+                markShelfLiveForUv(packer, order, &live, uv_y);
             }
         }
 
@@ -7420,3 +7454,71 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
 }
 
+
+/// One glyph quad's worth of vertices carrying `uv_y`, for the mirror tests.
+fn mirrorGlyphVert(grid_id: i64, uv_y: f32) c_api.Vertex {
+    return .{
+        .position = .{ 0, 0 },
+        .texCoord = .{ 0.5, uv_y },
+        .color = .{ 0, 0, 0, 0 },
+        .grid_id = grid_id,
+        .deco_flags = 0,
+        .deco_phase = 0,
+    };
+}
+
+test "a destroyed grid's glyph mirror is freed, not merely emptied" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const v = [_]c_api.Vertex{mirrorGlyphVert(7, 0.25)};
+    core.recordGlyphMirrorRow(7, 0, 1, &v);
+    try std.testing.expect(core.glyph_mirror.contains(7));
+
+    core.removeGlyphMirror(7);
+    try std.testing.expect(!core.glyph_mirror.contains(7));
+    // Idempotent: destroy is drained once per flush but a grid id can be
+    // reported destroyed after its rows are already gone.
+    core.removeGlyphMirror(7);
+}
+
+test "shiftGlyphMirror moves rows the way the frontend's row-shift does" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var r: u32 = 0;
+    while (r < 4) : (r += 1) {
+        const uv: f32 = @as(f32, @floatFromInt(r)) * 0.1 + 0.1;
+        const v = [_]c_api.Vertex{mirrorGlyphVert(2, uv)};
+        core.recordGlyphMirrorRow(2, r, 4, &v);
+    }
+
+    core.shiftGlyphMirror(2, 0, 4, 1);
+    const m = core.glyph_mirror.getPtr(2).?;
+    // Content moved up: row 0 now shows what row 1 held.
+    try std.testing.expectEqual(@as(f32, 0.2), m.rows.items[0].items[0]);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.items[3].items.len);
+    try std.testing.expect(!m.valid.isSet(3));
+
+    core.shiftGlyphMirror(2, 0, 4, -1);
+    try std.testing.expectEqual(@as(f32, 0.2), m.rows.items[1].items[0]);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.items[0].items.len);
+    try std.testing.expect(!m.valid.isSet(0));
+}
+
+test "a row a shift vacated stays live while the frontend may still draw it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const v = [_]c_api.Vertex{mirrorGlyphVert(2, 0.75)};
+    core.recordGlyphMirrorRow(2, 0, 4, &v);
+
+    // Row 0 leaves through the top; the frontend keeps drawing its retained
+    // copy for the sub-row ease, so its shelf must not be reclaimed yet.
+    core.shiftGlyphMirror(2, 0, 4, 1);
+    try std.testing.expect(core.departedUvIsLive(0.75));
+
+    var i: u8 = 0;
+    while (i < retained_shadow_expiry) : (i += 1) core.ageRetainedShadows();
+    try std.testing.expect(!core.departedUvIsLive(0.75));
+}

@@ -1330,6 +1330,13 @@ pub const RowGenParams = struct {
     background_opacity: f32,
     is_cmdline: bool,
     glow_enabled: bool,
+    /// Skip runs whose background is the surface default. Set for the ROOT
+    /// grid of a surface that draws other grids as layers: the root is a
+    /// container there, its cells are blank, and every layer paints the same
+    /// default background over it. Painting it twice compounds alpha under
+    /// blur (each pass is a premultiplied `over`), which is what made the
+    /// main window opaque while the alpha-0 ext-cmdline stayed translucent.
+    skip_default_bg: bool = false,
     max_vertices: usize = MAX_VERTICES_PER_CALLBACK,
 };
 
@@ -1455,7 +1462,12 @@ pub fn generateRowVertices(
             const y0: f32 = @as(f32, @floatFromInt(r)) * cellH;
             const y1: f32 = y0 + cellH;
 
-            const bg_alpha: f32 = if (run_bg == p.default_bg)
+            const is_default_bg = run_bg == p.default_bg;
+            if (is_default_bg and p.skip_default_bg) {
+                c = end;
+                continue;
+            }
+            const bg_alpha: f32 = if (is_default_bg)
                 (if (p.blur_enabled) (if (p.is_cmdline) 0.0 else 0.5) else p.background_opacity)
             else
                 1.0;
@@ -3811,6 +3823,11 @@ pub const FlushCtx = struct {
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
 
+                    // Whether any window grid is drawn on this surface as its
+                    // own layer. Hoisted out of the row loop: it depends only
+                    // on placement, which cannot change mid-flush.
+                    const main_has_layers = mainSurfaceHasLayers(ctx.core);
+
                     // Ensure scroll cache is sized for row-mode flush.
                     // This prepares the cache so fallback path can populate it
                     // for future fast-path reuse.
@@ -3976,6 +3993,23 @@ pub const FlushCtx = struct {
                                 .background_opacity = ctx.core.background_opacity,
                                 .is_cmdline = false,
                                 .glow_enabled = glow_enabled,
+                                // The root grid is a container once its
+                                // windows draw as layers: every layer paints
+                                // the same default background over it, and a
+                                // second premultiplied `over` pass compounds
+                                // alpha (0.5 -> 0.75 -> 0.875), which is what
+                                // stopped the Windows main window being
+                                // translucent enough for blur to show.
+                                //
+                                // BLUR ONLY. Without blur the frontends do not
+                                // composite per-pixel alpha for the window at
+                                // all — macOS forces backgrounds opaque once
+                                // backgroundAlpha >= 1.0 and applies window
+                                // opacity at the layer level — so nothing
+                                // compounds, while dropping the run makes the
+                                // surface visibly thinner and can leave the
+                                // gaps between layers unpainted.
+                                .skip_default_bg = main_has_layers and ctx.core.blur_enabled,
                             }, out) catch |err| {
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
@@ -4744,6 +4778,23 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
 /// external grids, plus the composited grids the main surface or an external
 /// surface places as layers. Grid 1 is emitted by the main row loop and is
 /// deliberately absent.
+/// Whether the main surface draws any window grid as its own layer. Mirrors
+/// the acceptance test in `collectEmitGrids`: an entry there is a layer, so
+/// the root grid's cells beneath it are never what the user sees.
+fn mainSurfaceHasLayers(self: *Core) bool {
+    var it = self.grid.win_pos.iterator();
+    while (it.next()) |e| {
+        const grid_id = e.key_ptr.*;
+        if (grid_id == 1) continue;
+        if (self.grid.external_grids.contains(grid_id)) continue;
+        if (self.grid.external_grids.contains(e.value_ptr.anchor_grid)) continue;
+        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
+        if (sg.rows == 0 or sg.cols == 0) continue;
+        return true;
+    }
+    return false;
+}
+
 fn collectEmitGrids(self: *Core) void {
     self.emit_grid_ids.clearRetainingCapacity();
     var ext_it = self.grid.external_grids.keyIterator();
@@ -4814,6 +4865,12 @@ pub fn notifySurfaceLayouts(self: *Core) void {
     }
 
     if (self.grid.destroyed_pending.items.len != 0) {
+        // The mirror answers "what is on screen"; a destroyed grid shows
+        // nothing, and keeping its rows would pin their shelves for the rest
+        // of the session.
+        for (self.grid.destroyed_pending.items) |destroyed_id| {
+            self.removeGlyphMirror(destroyed_id);
+        }
         if (self.cb.on_grid_destroy) |cb| {
             for (self.grid.destroyed_pending.items) |grid_id| {
                 cb(self.ctx, grid_id);
@@ -15129,6 +15186,7 @@ test "a vertical split's scroll publishes a shift instead of regenerating the ba
         scroll_calls: u32 = 0,
         scrolled_grid: i64 = 0,
         rows_emitted: u32 = 0,
+        root_rows_emitted: u32 = 0,
 
         fn onRow(
             ctx: ?*anyopaque,
@@ -15147,8 +15205,13 @@ test "a vertical split's scroll publishes a shift instead of regenerating the ba
             _ = vert_count;
             _ = total_rows;
             _ = total_cols;
-            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) {
+                self.root_rows_emitted += 1;
+                return;
+            }
+            if (grid_id != 2) return;
             self.rows_emitted += 1;
         }
 
@@ -15205,14 +15268,227 @@ test "a vertical split's scroll publishes a shift instead of regenerating the ba
     try flush_ctx.onFlush(10, 40);
     state = .{};
 
-    // One line off the top of the left split.
+    // One line off the top of the left split. Nothing else is written: a cell
+    // write dirties the root row under it on purpose (a layer that clears or
+    // closes needs grid 1 to repaint underneath), which would mask what this
+    // asserts about the scroll itself.
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
-    core.grid.putCellGrid(2, 9, 0, 'Z', 0);
     try flush_ctx.onFlush(10, 40);
 
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
     try std.testing.expectEqual(@as(i64, 2), state.scrolled_grid);
     // Only the vacated row is regenerated; the other nine are carried by the
-    // shift. Regenerating the whole band would emit ten.
+    // shift. Both bounds: a run that emitted nothing would also satisfy
+    // "<= 2", so require that the vacated row did arrive.
+    try std.testing.expect(state.rows_emitted >= 1);
     try std.testing.expect(state.rows_emitted <= 2);
+    // The split owns its rows: grid 1's cells under it did not change, so the
+    // root must not be regenerated and resent for a scroll inside a window.
+    try std.testing.expectEqual(@as(u32, 0), state.root_rows_emitted);
+}
+
+/// Sink for the row-shift hint tests below: counts one window grid's MAIN
+/// rows and every hint, remembering the last hint's delta and last row sent.
+const RowShiftSink = struct {
+    scroll_calls: u32 = 0,
+    scrolled_grid: i64 = 0,
+    last_rows_delta: i32 = 0,
+    rows_emitted: u32 = 0,
+    last_row_start: u32 = 0,
+
+    fn onRow(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_count: u32,
+        verts: ?[*]const c_api.Vertex,
+        vert_count: usize,
+        flags: u32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = row_count;
+        _ = verts;
+        _ = vert_count;
+        _ = total_rows;
+        _ = total_cols;
+        if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.rows_emitted += 1;
+        self.last_row_start = row_start;
+    }
+
+    fn onRowScroll(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = row_start;
+        _ = row_end;
+        _ = col_start;
+        _ = col_end;
+        _ = total_rows;
+        _ = total_cols;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.scroll_calls += 1;
+        self.scrolled_grid = grid_id;
+        self.last_rows_delta = rows_delta;
+    }
+};
+
+/// One 10x20 window grid (id 2) at the surface origin, one glyph per row,
+/// flushed once so the next flush is incremental. Caller owns `core`.
+fn setUpRowShiftCore(core: *Core, state: *RowShiftSink) !void {
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 20;
+    core.drawable_h_px = 10;
+    try core.grid.resize(10, 20);
+    core.grid.cursor_visible = false;
+    try core.grid.resizeGrid(2, 10, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    for (0..10) |r| {
+        core.grid.putCellGrid(2, @intCast(r), 0, 'A' + @as(u32, @intCast(r)), 0);
+    }
+    core.ctx = state;
+    core.cb.on_vertices_row = RowShiftSink.onRow;
+    core.cb.on_grid_row_scroll = RowShiftSink.onRowScroll;
+    var flush_ctx = FlushCtx{ .core = core };
+    try flush_ctx.onFlush(10, 20);
+    state.* = .{};
+}
+
+test "the root grid stops painting the default background once windows are layers" {
+    // Under blur every default-background run carries alpha 0.5 and the
+    // frontends composite with a premultiplied `over`. The root grid painting
+    // the same background beneath each layer therefore compounds alpha
+    // (0.5 -> 0.75 -> 0.875) and the window stops being translucent.
+    const State = struct {
+        root_bg_quads: u32 = 0,
+        layer_bg_quads: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const vp = verts orelse return;
+            // A solid quad carries the (-1,-1) texCoord sentinel; count one
+            // per quad rather than per vertex.
+            var i: usize = 0;
+            while (i < vert_count) : (i += 6) {
+                if (vp[i].texCoord[0] >= 0) continue;
+                if (grid_id == 1) self.root_bg_quads += 1 else self.layer_bg_quads += 1;
+            }
+        }
+    };
+
+    var state = State{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 20;
+    core.drawable_h_px = 4;
+    core.blur_enabled = true;
+    try core.grid.resize(4, 20);
+    core.grid.cursor_visible = false;
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    // No windows placed yet: the root is the only thing on the surface and
+    // must paint its own background.
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.root_bg_quads > 0);
+
+    // Place a window grid. It draws as its own layer and paints the same
+    // default background, so the root must stop.
+    state = .{};
+    try core.grid.resizeGrid(2, 4, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    core.grid.markAllDirty();
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.layer_bg_quads > 0);
+    try std.testing.expectEqual(@as(u32, 0), state.root_bg_quads);
+
+    // Without blur nothing compounds: the frontends force backgrounds opaque
+    // and apply window opacity themselves. Dropping the root's run there only
+    // makes the surface thinner and leaves the gaps between layers unpainted,
+    // which is what it did to a blur=false, opacity=0.8 macOS window.
+    state = .{};
+    core.blur_enabled = false;
+    core.background_opacity = 0.8;
+    core.grid.markAllDirty();
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.root_bg_quads > 0);
+}
+
+test "two different-region scrolls of one grid in a batch refuse the shift" {
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+
+    // One shift cannot describe two regions, so the hint is refused and the
+    // whole grid is regenerated instead.
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    core.grid.scrollGrid(2, 2, 8, 0, 20, 1, 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
+    try std.testing.expectEqual(@as(u32, 10), state.rows_emitted);
+}
+
+test "same-region scrolls in one batch reach the frontend as one summed shift" {
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+    try std.testing.expectEqual(@as(i64, 2), state.scrolled_grid);
+    try std.testing.expectEqual(@as(i32, 2), state.last_rows_delta);
+    try std.testing.expectEqual(@as(u32, 2), state.rows_emitted);
+}
+
+test "a downward scroll publishes a negative shift and refills the top row" {
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+
+    core.grid.scrollGrid(2, 0, 10, 0, 20, -1, 0);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+    try std.testing.expectEqual(@as(i32, -1), state.last_rows_delta);
+    try std.testing.expectEqual(@as(u32, 1), state.rows_emitted);
+    try std.testing.expectEqual(@as(u32, 0), state.last_row_start);
 }

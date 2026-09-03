@@ -2543,6 +2543,12 @@ pub const Grid = struct {
         // Saturating: see shiftTouchedRows' guard above — markDirtyRow
         // clamps against self.rows, so a saturated value is simply ignored
         // instead of overflow-panicking or wrapping into an in-range row.
+        //
+        // A main-surface window grid draws as its own layer, so grid 1 holds
+        // none of its cells. The root row is still dirtied because a layer
+        // that shrinks, clears or closes leaves the frontend's back buffer
+        // holding its old pixels: grid 1 is what repaints underneath. See the
+        // "subgrid clear dirties every covered main row" tests.
         const tr = p.row +| row;
         self.markDirtyRow(tr);
         self.recordScrollTouchedRow(tr);
@@ -2824,45 +2830,11 @@ pub const Grid = struct {
                     self.recordScrolledGrid(grid_id, rows);
                     return;
                 }
-                self.content_rev +%= 1;
-                if (self.pending_scroll) |*ps| {
-                    if (ps.grid_id == grid_id and ps.top == top and ps.bot == bot and
-                        ps.left == left and ps.right == right and cols == 0)
-                    {
-                        // Same grid, same region: accumulate scroll delta.
-                        self.shiftTouchedRows(rows, top, bot, p.row);
-                        // Saturating: see shiftTouchedRows' guard above.
-                        self.markDirtyRect(p.row +| top, p.row +| bot);
-                        // Record here as well as on the fallthrough below: the
-                        // notification carries the distance the content moved,
-                        // and every accumulated scroll of this region moves it.
-                        self.recordScrolledGrid(grid_id, rows);
-                        ps.rows = std.math.add(i32, ps.rows, rows) catch {
-                            self.scroll_fast_path_blocked = true;
-                            self.scroll_touched_count = 0;
-                            return;
-                        };
-                        return;
-                    }
-                    // Different grid or region: block fast path.
-                    self.scroll_fast_path_blocked = true;
-                    self.scroll_touched_count = 0;
-                }
-                // Saturating: see shiftTouchedRows' guard above.
-                self.markDirtyRect(p.row +| top, p.row +| bot);
-                self.pending_scroll = .{
-                    .grid_id = grid_id,
-                    .top = top,
-                    .bot = bot,
-                    .left = left,
-                    .right = right,
-                    .rows = rows,
-                    .cols = cols,
-                    .target_rows = sg.rows,
-                    .target_cols = sg.cols,
-                    .win_pos_row = p.row,
-                };
-                self.scroll_touched_count = 0;
+                // A window grid on the main surface is its own layer: grid 1's
+                // cells under it are untouched by this scroll, so nothing on
+                // the root is revised, dirtied, or scheduled for a shift here.
+                // The grid's own scroll state (last_scroll_op, its dirty
+                // marks) was already updated by GridBuf.scroll.
             }
             // External grids (not in win_pos) do not affect global grid
             // content_rev, dirty state, or pending_scroll.
@@ -5155,7 +5127,9 @@ test "scroll notification overflow retains main provenance across pending overwr
     try std.testing.expect(grid.scrolled_grid_overflow);
     try std.testing.expect(grid.main_scroll_notify_pending);
     try std.testing.expect(grid.sub_grids.get(18).?.scroll_notify_pending);
-    try std.testing.expectEqual(@as(i64, 18), grid.pending_scroll.?.grid_id);
+    // Grid 1's own row-shift state survives: a window grid's scroll is its
+    // own layer's business and no longer overwrites main's pending_scroll.
+    try std.testing.expectEqual(@as(i64, 1), grid.pending_scroll.?.grid_id);
 
     // A pre-dispatch retry discards row-shift state but must retain offset
     // notification provenance independently.
