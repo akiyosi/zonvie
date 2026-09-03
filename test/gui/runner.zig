@@ -253,6 +253,24 @@ test "gui:visual_cmdline_cursor_animation" {
     }
 }
 
+test "gui:visual_continuous_j_scroll_matches_jump" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/continuous_j_scroll_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_incremental_scroll_matches_jump" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/incremental_scroll_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_scroll_then_cursor_move" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
@@ -266,6 +284,24 @@ test "gui:visual_proportional_font_support" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/proportional_font_support.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_shader_covers_all_grids" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/shader_covers_all_grids.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:cmdline_cursor_shader_rect" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/macos/cmdline_cursor_shader_rect.zig").run(testing.allocator);
     } else {
         return error.SkipZigTest;
     }
