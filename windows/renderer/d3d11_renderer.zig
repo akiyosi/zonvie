@@ -2355,6 +2355,22 @@ pub const Renderer = struct {
         try self.drawVB(self.clear_row_vb.?, 6);
     }
 
+    /// drawClearRow with blending OFF: the scissored band becomes exactly
+    /// (bg * opacity, opacity) instead of that blended over whatever the row
+    /// held before. On a translucent surface every redraw of a row would
+    /// otherwise compound its alpha toward opaque (0.5 -> 0.75 -> 0.875 ...),
+    /// which is what a layer redrawn every paint did — and a glyph that
+    /// vanished (a closed split's separator) would keep showing through.
+    pub fn drawClearRowOverwrite(self: *Renderer) !void {
+        const ctx = self.ctx orelse return error.NoContext;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const set_blend = ctx_vtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+        var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+        set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+        defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+        try self.drawClearRow();
+    }
+
     /// Set viewport and scissor to full window size.
     /// Use this before drawing overlay elements (e.g., scrollbar in "always" mode).
     pub fn setFullViewport(self: *Renderer) void {

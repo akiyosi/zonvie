@@ -444,7 +444,17 @@ fn drawDecoratedExternalSurface(
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const pum_verts = scratch.items;
-            @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
+            // Core vertices are grid-local pixels, and this draw path binds
+            // the identity transform for the frontend's own clip-space
+            // chrome (the border appended below). Map them here as the
+            // cmdline and message branches do; the popupmenu has no insets,
+            // so its content starts at the window's top-left.
+            const ndc = decoratedContentNdcTransform(0, 0, window_w, window_h, window_w, window_h);
+            for (verts[0..vert_count], 0..) |v, i| {
+                pum_verts[i] = v;
+                pum_verts[i].position[0] = v.position[0] * ndc.scale_x + ndc.offset_x;
+                pum_verts[i].position[1] = v.position[1] * ndc.scale_y + ndc.offset_y;
+            }
 
             app.mu.lockUncancelable(core.clock.io());
             const border_r = app.cmdline_border_color[0];

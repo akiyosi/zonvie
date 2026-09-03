@@ -705,13 +705,14 @@ pub fn onVerticesPartial(
                 // pixel space, so its rect sits at the layer's origin.
                 var cur_vp_x = vp_x;
                 var cur_vp_y = vp_y;
-                if (app.cursor_layer_grid_id != 1) {
+                const cursor_layer_grid = app.tbs.cursorLayerGridIdInFlush();
+                if (cursor_layer_grid != 1) {
                     const layers = if (app.tbs.flush_layers) |staged|
                         staged
                     else
                         app.tbs.committed_layers;
                     for (layers.slice()) |l| {
-                        if (l.grid_id != app.cursor_layer_grid_id) continue;
+                        if (l.grid_id != cursor_layer_grid) continue;
                         if (l.x_px > 0) cur_vp_x +|= @intCast(l.x_px);
                         if (l.y_px > 0) cur_vp_y +|= @intCast(l.y_px);
                         break;
@@ -837,7 +838,7 @@ pub fn onVerticesRow(
         (flags & app_mod.VERT_UPDATE_MAIN) == 0)
     {
         if (grid_id == 1) {
-            app.cursor_layer_grid_id = 1;
+            app.tbs.stageCursorLayerGrid(1);
             onVerticesPartial(ctx, null, 0, verts_ptr, vert_count, flags);
             return;
         }
@@ -851,7 +852,7 @@ pub fn onVerticesRow(
             break :blk mainSurfaceOwnsGridLocked(app, grid_id);
         };
         if (owns) {
-            app.cursor_layer_grid_id = grid_id;
+            app.tbs.stageCursorLayerGrid(grid_id);
             onVerticesPartial(ctx, null, 0, verts_ptr, vert_count, flags);
             return;
         }
@@ -986,7 +987,13 @@ pub fn onVerticesRow(
         if ((flags & 2) == 0 and app.external_windows.get(grid_id) == null) {
             const row_verts: []const app_mod.Vertex =
                 if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
-            if (storeMainSurfaceLayerRow(app, grid_id, row_start, row_verts, total_rows, total_cols)) {
+            if (storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols)) {
+                // Request a paint, but do NOT dirty the root rows underneath:
+                // grid 1 holds no cells under ext_multigrid, so the root row
+                // loop would draw its empty-row background fill over the whole
+                // window every frame — which is opaque and destroys blur.
+                // The layer's own dirty flag and present rect carry the frame.
+                app.flush_needs_invalidate = true;
                 return;
             }
         }
@@ -1652,6 +1659,8 @@ pub fn onGridRowScroll(
             if (!state.shiftRows(row_start, row_end, rows_delta)) {
                 core.zonvie_core_force_resend_locked(app.corep);
                 failFlush(app);
+            } else {
+                app.flush_needs_invalidate = true;
             }
         }
         return;
@@ -3098,6 +3107,9 @@ pub fn onSurfaceLayout(
 
     if (surface_id == 1) {
         app.tbs.stageLayers(staged);
+        // A layout change moves or resizes layers without producing a single
+        // row callback; without this the frame is never requested.
+        app.flush_needs_invalidate = true;
         return;
     }
 
@@ -3139,8 +3151,9 @@ fn mainSurfaceOwnsGridLocked(app: *App, grid_id: i64) bool {
 }
 
 /// Store one row for a grid the main surface draws as a non-root layer.
-/// Returns true when the row was consumed here.
-fn storeMainSurfaceLayerRow(
+/// Returns true when the row was consumed here. Caller must hold `app.mu`;
+/// onVerticesRow already does, and `std.Io.Mutex` is not reentrant.
+fn storeMainSurfaceLayerRowLocked(
     app: *App,
     grid_id: i64,
     row: u32,
@@ -3148,8 +3161,6 @@ fn storeMainSurfaceLayerRow(
     total_rows: u32,
     total_cols: u32,
 ) bool {
-    app.mu.lockUncancelable(core.clock.io());
-    defer app.mu.unlock(core.clock.io());
     if (!mainSurfaceOwnsGridLocked(app, grid_id)) return false;
 
     const gop = app.layer_grids.getOrPut(app.alloc, grid_id) catch return false;

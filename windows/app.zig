@@ -614,6 +614,9 @@ pub const PaintSnapshot = struct {
     /// Layer list bundled with this committed set, so a paint sees the layers
     /// and the vertices they place from the same transaction.
     layers: SurfaceLayers = .{},
+    /// Which grid owns the cursor in this committed set, from the same
+    /// transaction as the cursor vertices themselves.
+    cursor_layer_grid_id: i64 = 1,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -680,6 +683,10 @@ pub const TripleBufferedSurface = struct {
     // become visible in the same transaction.
     flush_layers: ?SurfaceLayers = null,
     committed_layers: SurfaceLayers = .{},
+    /// Which grid owns the surface's one cursor. Staged by the cursor
+    /// callback and promoted with the cursor set.
+    flush_cursor_layer_grid_id: ?i64 = null,
+    committed_cursor_layer_grid_id: i64 = 1,
 
     // Pending scroll state (rotation_mu protected).
     // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
@@ -883,6 +890,10 @@ pub const TripleBufferedSurface = struct {
     /// Cancel a flush (reset is_in_flush without committing).
     pub fn cancelFlush(self: *TripleBufferedSurface) void {
         if (self.is_in_flush) self.sparse_sync.row_sync_full[self.write_index] = true;
+        // An aborted flush's staged state must not be promoted by the next
+        // successful commit: the core re-sends everything after an abort.
+        self.flush_layers = null;
+        self.flush_cursor_layer_grid_id = null;
         self.is_in_flush = false;
         self.main_cursor_in_flush = false;
         self.main_cursor_flush_paint_full = false;
@@ -893,6 +904,19 @@ pub const TripleBufferedSurface = struct {
     /// Stage this surface's layer list. Core thread, inside the flush bracket.
     pub fn stageLayers(self: *TripleBufferedSurface, layers: SurfaceLayers) void {
         self.flush_layers = layers;
+    }
+
+    /// Stage which grid owns the surface's one cursor. Promoted with the
+    /// cursor set, so a paint never pairs one grid's origin with another
+    /// grid's cursor vertices.
+    pub fn stageCursorLayerGrid(self: *TripleBufferedSurface, grid_id: i64) void {
+        self.flush_cursor_layer_grid_id = grid_id;
+    }
+
+    /// The cursor's owning grid as this flush sees it: the value staged in
+    /// this bracket, else the committed one. Core thread, inside the bracket.
+    pub fn cursorLayerGridIdInFlush(self: *const TripleBufferedSurface) i64 {
+        return self.flush_cursor_layer_grid_id orelse self.committed_cursor_layer_grid_id;
     }
 
     /// Commit the write set as the new committed set.
@@ -906,6 +930,10 @@ pub const TripleBufferedSurface = struct {
         if (self.flush_layers) |staged| {
             self.committed_layers = staged;
             self.flush_layers = null;
+        }
+        if (self.flush_cursor_layer_grid_id) |staged_grid| {
+            self.committed_cursor_layer_grid_id = staged_grid;
+            self.flush_cursor_layer_grid_id = null;
         }
 
         // Cursor and rows publish while holding the same lock. A paint can
@@ -1136,6 +1164,7 @@ pub const TripleBufferedSurface = struct {
             .cursor_index = cursor_ci,
             .paint_full = paint_full,
             .layers = self.committed_layers,
+            .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -1889,6 +1918,9 @@ pub const LayerGridState = struct {
     /// moves arrays between rows without rewriting their pixels, so the draw
     /// has to offset them by the difference.
     origin_rows: std.ArrayListUnmanaged(u32) = .empty,
+    /// Set when rows changed since the last paint; the paint presents this
+    /// layer's rect and clears it.
+    dirty: bool = false,
 
     pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator, g: ?*d3d11.Renderer) void {
         for (self.rows_buf.items) |*rv| {
@@ -1950,6 +1982,7 @@ pub const LayerGridState = struct {
                 origins[v] = v;
             }
         }
+        self.dirty = true;
         return true;
     }
 
@@ -1982,6 +2015,7 @@ pub const LayerGridState = struct {
         rv.gen +%= 1;
         // Freshly generated vertices are built for the row they arrived at.
         self.origin_rows.items[@intCast(row)] = row;
+        self.dirty = true;
         return true;
     }
 };
@@ -2622,6 +2656,8 @@ pub fn drawSurfaceRowsVBFromSlots(
     /// surface's root layer; an anchored float carries its own offset.
     layer_origin_x_px: f32,
     layer_origin_y_px: f32,
+    /// See RowModeDrawParams.root_rows_may_be_empty.
+    root_rows_may_be_empty: bool,
     log_enabled: bool,
     metrics: *SurfaceRowDrawMetrics,
 ) !void {
@@ -2638,6 +2674,13 @@ pub fn drawSurfaceRowsVBFromSlots(
 
         const mapping = row_map[@intCast(row)];
         if (mapping.slot == SLOT_NONE) {
+            if (root_rows_may_be_empty) {
+                // Nothing was owed for this row: its content lives in a
+                // layer drawn on top. Counting it as failed or skipped would
+                // refuse the present and loop the paint forever.
+                metrics.empty_rows += 1;
+                continue;
+            }
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
             if (metrics.first_empty_row == null) {
@@ -2650,7 +2693,8 @@ pub fn drawSurfaceRowsVBFromSlots(
         const src = slot.verts.items;
         if (src.len == 0) {
             // Core sends vert_count==0 as "clear row" (flush.zig:2904).
-            // Draw a bg-fill quad to overwrite stale back_tex pixels.
+            // Overwrite the band with the background so stale pixels go and
+            // the row's alpha is reset rather than compounded.
             if (ctx_ptr != null and rs_set_sc_fn != null and row_h_px > 0) {
                 const clear_top = y_offset + @as(i32, @intCast(row)) * row_h_px;
                 const clear_bot = clear_top + row_h_px;
@@ -2663,12 +2707,18 @@ pub fn drawSurfaceRowsVBFromSlots(
                         vp_dirty = false;
                     }
                 }
-                g.drawClearRow() catch {
+                g.drawClearRowOverwrite() catch {
                     metrics.skipped_empty += 1;
                     metrics.failed_rows += 1;
                     continue;
                 };
                 metrics.drawn_rows += 1;
+            } else if (root_rows_may_be_empty) {
+                // The seed path draws under a full-area scissor, so a per-row
+                // clear is unavailable here; nothing was owed for this row
+                // anyway, its content lives in a layer. Counting it as failed
+                // refused every present and re-requested the seed forever.
+                metrics.empty_rows += 1;
             } else {
                 metrics.skipped_empty += 1;
                 metrics.failed_rows += 1;
@@ -2749,6 +2799,18 @@ pub fn drawSurfaceRowsVBFromSlots(
             continue;
         };
         const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
+        // A translucent surface must not blend this row over its own previous
+        // pixels: reset the band first so alpha does not compound across
+        // redraws. (Only when a scissor limits the band to this row; the
+        // seed path draws every row under a full-area scissor and a
+        // whole-surface overwrite there would erase rows already drawn.)
+        if (g.opacity < 1.0 and rs_set_sc_fn != null) {
+            g.drawClearRowOverwrite() catch {
+                metrics.skipped_empty += 1;
+                metrics.failed_rows += 1;
+                continue;
+            };
+        }
         // Core row vertices are grid-local pixels against this viewport,
         // offset by where the layer sits inside it.
         g.setLayerTransform(layer_origin_x_px, layer_origin_y_px, base_vp.w, base_vp.h);
@@ -2861,6 +2923,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         params.row_h_px,
         params.layer_origin_x_px,
         params.layer_origin_y_px,
+        params.root_rows_may_be_empty,
         log_enabled,
         &result.metrics,
     );
@@ -3059,6 +3122,11 @@ pub const RowModeDrawParams = struct {
     /// surface's root layer; an anchored float carries its own offset.
     layer_origin_x_px: f32 = 0,
     layer_origin_y_px: f32 = 0,
+    /// The surface draws other grids as layers on top of this root grid, so
+    /// a root row with no slot or no vertices is empty by design — the
+    /// layers hold its content — and must not be counted as a failed or
+    /// missing row by the present decision.
+    root_rows_may_be_empty: bool = false,
     content_y_offset: ?u32 = null,
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
@@ -3089,6 +3157,9 @@ pub const SurfaceRowDrawMetrics = struct {
     // Rows whose clear/upload/draw could not be submitted. Callers must not
     // consume the paint snapshot as a successful partial frame.
     failed_rows: u32 = 0,
+    /// Root rows that are empty by design under a layered surface. Neither
+    /// failed nor skipped: nothing was owed for them.
+    empty_rows: u32 = 0,
     first_empty_row: ?u32 = null,
     vb_upload_rows: u32 = 0,
     vb_upload_rows_bytes: u64 = 0,
@@ -3148,8 +3219,6 @@ pub fn drawSurfaceLayers(
 
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
         for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
-            if (rv.verts.items.len == 0) continue;
-
             if (rs_set_sc_fn) |f| {
                 const top = y_offset + layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
                 var sc: c.D3D11_RECT = .{
@@ -3161,6 +3230,17 @@ pub fn drawSurfaceLayers(
                 if (sc.right <= sc.left or sc.bottom <= sc.top) continue;
                 f(ctx_ptr, 1, &sc);
             }
+
+            // Reset this row's band to exactly (bg * opacity, opacity) before
+            // drawing it. Layers are redrawn whole every paint, and a
+            // translucent background blended over its own previous output
+            // compounds toward opaque; the overwrite also erases whatever a
+            // now-empty row used to show (a closed split's separator).
+            // An opaque surface needs it only for a row the core emptied.
+            if (g.opacity < 1.0 or rv.verts.items.len == 0) {
+                g.drawClearRowOverwrite() catch continue;
+            }
+            if (rv.verts.items.len == 0) continue;
 
             const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
             g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch continue;
@@ -3205,6 +3285,12 @@ pub const CursorOverlayParams = struct {
     /// cursor is on the surface's root grid.
     cursor_layer_origin_x_px: f32 = 0,
     cursor_layer_origin_y_px: f32 = 0,
+    /// The cursor's row in its own layer, when the cursor is not on the root
+    /// grid. Blink-off redraws this instead of the root's (empty) row.
+    cursor_layer_row: ?*RowVerts = null,
+    /// How far a row-shift hint moved that row's vertices from where they
+    /// were built; the layer draw applies the same offset.
+    cursor_layer_row_dy_px: f32 = 0,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     last_painted_cursor_row: *?u32,
@@ -3220,6 +3306,48 @@ pub const CursorOverlayParams = struct {
     /// row content.
     row_already_redrawn: bool = false,
 };
+
+/// Redraw the content of the row the cursor sits on, so a cleared band gets
+/// its text back. The cursor may belong to a layer, whose row lives in that
+/// layer's own storage rather than the root's row set — under ext_multigrid
+/// the root's row there is empty, so redrawing it would erase the text.
+fn redrawCursorRowContent(
+    g: *d3d11.Renderer,
+    p: CursorOverlayParams,
+    cursor_row: u32,
+    cursor_ox: f32,
+    cursor_oy: f32,
+    layer_w: f32,
+    layer_h: f32,
+) !void {
+    if (p.cursor_layer_row) |lr| {
+        if (lr.verts.items.len == 0) return;
+        const need_bytes = lr.verts.items.len * @sizeOf(Vertex);
+        try g.ensureExternalVertexBuffer(&lr.vb, &lr.vb_bytes, need_bytes);
+        const lvb = lr.vb orelse return error.CursorRowVertexBufferMissing;
+        if (lr.uploaded_gen != lr.gen) {
+            try g.uploadVertsToVB(lvb, lr.verts.items);
+            lr.uploaded_gen = lr.gen;
+        }
+        // Same offset drawSurfaceLayers applies: a shift hint moved these
+        // vertices between rows without rewriting them.
+        g.setLayerTransform(cursor_ox, cursor_oy + p.cursor_layer_row_dy_px, layer_w, layer_h);
+        try g.drawVB(lvb, lr.verts.items.len);
+        return;
+    }
+    if (cursor_row >= p.row_vbs.len or cursor_row >= p.row_map.len) return;
+    const rvb = &p.row_vbs[cursor_row];
+    const mapping = p.row_map[cursor_row];
+    const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
+    if (rvb.vb) |row_vb| {
+        if (slot_verts_len > 0) {
+            g.setLayerTransform(0, 0, layer_w, layer_h);
+            try g.drawVB(row_vb, slot_verts_len);
+        }
+    } else if (slot_verts_len > 0) {
+        return error.CursorRowVertexBufferMissing;
+    }
+}
 
 pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     const log_enabled = applog.isEnabled();
@@ -3263,9 +3391,11 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     const cursor_ox = p.cursor_layer_origin_x_px;
     const cursor_oy = p.cursor_layer_origin_y_px;
 
-    // 3. Set scissor to cursor row.
+    // 3. Set scissor to cursor row. cursor_row is grid-local to the cursor's
+    // layer, so the layer's own origin places it on the surface.
+    const layer_top_px: i32 = @intFromFloat(@floor(cursor_oy));
     if (p.rs_set_sc_fn) |f| {
-        const top_px: i32 = p.y_offset + @as(i32, @intCast(cursor_row)) * p.row_h_px;
+        const top_px: i32 = p.y_offset + layer_top_px + @as(i32, @intCast(cursor_row)) * p.row_h_px;
         const bottom_px: i32 = top_px + p.row_h_px;
         var sc: c.D3D11_RECT = .{
             .left = p.x_offset,
@@ -3295,19 +3425,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     } else if (p.erase_cursor_row) {
         if (log_enabled) applog.appLog("[cursor-overlay] erase+draw row={d} verts={d} blink={}\n", .{ cursor_row, p.cursor_verts.len, p.blink_visible });
         try g.drawClearRow();
-        if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
-            const rvb = &p.row_vbs[cursor_row];
-            const mapping = p.row_map[cursor_row];
-            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
-            if (rvb.vb) |row_vb| {
-                if (slot_verts_len > 0) {
-                    g.setLayerTransform(0, 0, layer_w, layer_h);
-                    try g.drawVB(row_vb, slot_verts_len);
-                }
-            } else if (slot_verts_len > 0) {
-                return error.CursorRowVertexBufferMissing;
-            }
-        }
+        try redrawCursorRowContent(g, p, cursor_row, cursor_ox, cursor_oy, layer_w, layer_h);
         if (p.blink_visible) {
             g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
             try g.drawVB(vb, p.cursor_verts.len);
@@ -3322,19 +3440,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
         // Redrawing that list is a no-op, so first overwrite the scissored row
         // with the default background to erase the previously composited cursor.
         try g.drawClearRow();
-        if (cursor_row < p.row_vbs.len and cursor_row < p.row_map.len) {
-            const rvb = &p.row_vbs[cursor_row];
-            const mapping = p.row_map[cursor_row];
-            const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
-            if (rvb.vb) |row_vb| {
-                if (slot_verts_len > 0) {
-                    g.setLayerTransform(0, 0, layer_w, layer_h);
-                    try g.drawVB(row_vb, slot_verts_len);
-                }
-            } else if (slot_verts_len > 0) {
-                return error.CursorRowVertexBufferMissing;
-            }
-        }
+        try redrawCursorRowContent(g, p, cursor_row, cursor_ox, cursor_oy, layer_w, layer_h);
     }
 
     // 5. Update tracking for scroll ghost erasure.
@@ -3692,6 +3798,7 @@ pub const App = struct {
     // Checked and cleared by onFlushEnd to decide whether to InvalidateRect.
     // Skips InvalidateRect for flushes with no visual changes (e.g. msg_showcmd-only).
     flush_needs_invalidate: bool = false,
+
 
     // Set (under app.mu) by vertex callbacks that hit OOM mid-flush, paired
     // with zonvie_core_abort_flush (which makes the CORE keep its dirty
