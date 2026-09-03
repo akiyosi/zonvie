@@ -835,6 +835,11 @@ pub const GridBuf = struct {
     cells: []Cell = &[_]Cell{},
     dirty: bool = true, // Dirty flag for external grid vertex updates
     dirty_rows: std.DynamicBitSetUnmanaged = .{}, // Row-level dirty tracking for partial updates
+    // Dominates dirty_rows: when set, every row in [0, rows) is dirty and the
+    // per-row bits are not maintained. Mirrors Grid.dirty_all so grid 1 can be
+    // represented by a GridBuf. resize() and clear() set it; clearDirtyContent()
+    // is the only thing that clears it.
+    dirty_all: bool = true,
     last_scroll_op: ?ScrollDelta = null, // Per-GridBuf scroll tracking for on_grid_row_scroll
     scroll_notify_pending: bool = false, // Independent of row-shift provenance; survives a pre-dispatch flush abort
     scroll_notify_rows: i32 = 0, // Signed rows accumulated for the pending notification; one event can cover several scrolls
@@ -861,6 +866,7 @@ pub const GridBuf = struct {
         self.vertex_budget_touched_next = null;
         self.rows = 0;
         self.cols = 0;
+        self.dirty_all = true;
     }
 
     fn resize(self: *GridBuf, alloc: std.mem.Allocator, rows: u32, cols: u32) !void {
@@ -919,18 +925,15 @@ pub const GridBuf = struct {
         self.rows = rows;
         self.cols = cols;
         self.dirty = true;
-
-        const dirty_end = @min(rows, self.dirty_rows.bit_length);
-        self.dirty_rows.setRangeValue(.{ .start = 0, .end = dirty_end }, true);
+        // Everything needs redraw after a resize. dirty_all covers rows the
+        // freshly allocated bitset may not (a zero-cell shape allocates none).
+        self.dirty_all = true;
     }
 
     fn clear(self: *GridBuf) void {
         @memset(self.cells, .{ .cp = ' ', .hl = 0 });
         self.dirty = true;
-        // Mark all rows as dirty
-        if (self.dirty_rows.bit_length > 0) {
-            self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, true);
-        }
+        self.dirty_all = true;
     }
 
     /// Returns true if the cell was actually changed.
@@ -944,10 +947,7 @@ pub const GridBuf = struct {
 
         self.cells[idx] = .{ .cp = cp, .hl = hl };
         self.dirty = true;
-        // Mark this row as dirty for partial updates
-        if (self.dirty_rows.bit_length > row) {
-            self.dirty_rows.set(row);
-        }
+        self.markDirtyRow(row);
         return true;
     }
 
@@ -1024,37 +1024,55 @@ pub const GridBuf = struct {
             // row dirty here too, or these blanked cells never reach the
             // frontend and the GPU-side region keeps its stale pre-scroll
             // content forever (core and GPU permanently disagree).
-            var rr: u32 = top;
-            while (rr < bot) : (rr += 1) {
-                if (rr < self.dirty_rows.bit_length) self.dirty_rows.set(rr);
-            }
+            self.markDirtyRect(top, bot);
             self.dirty = true;
             return;
         }
 
         scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
-        // Mark only vacated rows as dirty — non-vacated rows are just shifted
-        // and the frontend's row slot remapping handles the visual shift.
-        // grid_line events will mark truly-changed rows dirty separately.
-        if (self.dirty_rows.bit_length > 0) {
+        // Move the dirty marks with the cells they describe. A mark says "this
+        // row must be regenerated", and the row's content just moved, so a mark
+        // left behind would regenerate the wrong row. This matters as soon as
+        // two scrolls accumulate in one batch: the first one's vacated mark has
+        // to travel with the second's shift.
+        if (!self.dirty_all and self.dirty_rows.bit_length > 0) {
+            const bits = self.dirty_rows.bit_length;
             if (rows > 0) {
-                // Scroll up: vacated band is [bot-shift, bot)
-                var rr: u32 = bot - shift;
-                while (rr < bot) : (rr += 1) {
-                    if (rr < self.dirty_rows.bit_length) {
-                        self.dirty_rows.set(rr);
+                var r: u32 = top;
+                while (r + shift < bot) : (r += 1) {
+                    if (r >= bits) break;
+                    const src = r + shift;
+                    if (src < bits and self.dirty_rows.isSet(src)) {
+                        self.dirty_rows.set(r);
+                    } else {
+                        self.dirty_rows.unset(r);
                     }
                 }
             } else {
-                // Scroll down: vacated band is [top, top+shift)
-                var rr: u32 = top;
-                while (rr < top + shift) : (rr += 1) {
-                    if (rr < self.dirty_rows.bit_length) {
-                        self.dirty_rows.set(rr);
+                var r: u32 = bot;
+                while (r > top + shift) {
+                    r -= 1;
+                    if (r >= bits) continue;
+                    const src = r - shift;
+                    if (src < bits and self.dirty_rows.isSet(src)) {
+                        self.dirty_rows.set(r);
+                    } else {
+                        self.dirty_rows.unset(r);
                     }
                 }
             }
+        }
+
+        // Mark only vacated rows as dirty — non-vacated rows are just shifted
+        // and the frontend's row slot remapping handles the visual shift.
+        // grid_line events will mark truly-changed rows dirty separately.
+        if (rows > 0) {
+            // Scroll up: vacated band is [bot-shift, bot)
+            self.markDirtyRect(bot - shift, bot);
+        } else {
+            // Scroll down: vacated band is [top, top+shift)
+            self.markDirtyRect(top, top + shift);
         }
         self.dirty = true;
     }
@@ -1063,6 +1081,7 @@ pub const GridBuf = struct {
     /// committed separately after on_flush_end accepts the whole transaction.
     pub fn clearDirtyContent(self: *GridBuf) void {
         self.dirty = false;
+        self.dirty_all = false;
         if (self.dirty_rows.bit_length > 0) {
             self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, false);
         }
@@ -1081,17 +1100,53 @@ pub const GridBuf = struct {
         self.clearScrollState();
     }
 
-    /// Mark the entire sub-grid dirty: every row must be regenerated.
+    /// Mark the entire grid dirty: every row must be regenerated.
     /// Used by atlas-reset recovery paths where per-row UV invalidation
     /// cannot be attributed to specific rows. Mirrors the dirty-marking
     /// half of clear() (grid.zig `clear()`), without touching cell contents.
-    /// No allocation: dirty_rows capacity is already sized to `rows` by
-    /// resize(), so this is a pure bit-flip.
+    /// O(1): dirty_all dominates, so the bitset is left alone.
     pub fn markAllDirty(self: *GridBuf) void {
         self.dirty = true;
-        if (self.dirty_rows.bit_length > 0) {
-            self.dirty_rows.setRangeValue(.{ .start = 0, .end = self.dirty_rows.bit_length }, true);
-        }
+        self.dirty_all = true;
+    }
+
+    /// True when `row` must be regenerated. This is the ONLY supported way to
+    /// read per-row dirtiness off a GridBuf: dirty_all dominates, and the
+    /// bitset may be shorter than `rows` (or absent) for a zero-cell shape.
+    pub fn isRowDirty(self: *const GridBuf, row: u32) bool {
+        if (row >= self.rows) return false;
+        if (self.dirty_all) return true;
+        const r: usize = @as(usize, row);
+        if (r >= self.dirty_rows.bit_length) return false;
+        return self.dirty_rows.isSet(r);
+    }
+
+    /// True when at least one row is dirty.
+    pub fn anyDirty(self: *const GridBuf) bool {
+        if (self.dirty_all) return self.rows != 0;
+        if (self.dirty_rows.bit_length == 0) return false;
+        return self.dirty_rows.count() != 0;
+    }
+
+    /// Mark one row dirty. No-op when dirty_all already dominates, when the row
+    /// is out of range, or when the bitset does not cover it.
+    pub fn markDirtyRow(self: *GridBuf, row: u32) void {
+        if (row >= self.rows) return;
+        if (self.dirty_all) return;
+        const r: usize = @as(usize, row);
+        if (r >= self.dirty_rows.bit_length) return;
+        self.dirty = true;
+        self.dirty_rows.set(r);
+    }
+
+    /// Mark [top, bot) dirty, clamped to `rows` and to the bitset length.
+    pub fn markDirtyRect(self: *GridBuf, top: u32, bot: u32) void {
+        if (self.dirty_all) return;
+        const start: usize = @as(usize, top);
+        const end: usize = @min(@as(usize, @min(bot, self.rows)), self.dirty_rows.bit_length);
+        if (start >= end) return;
+        self.dirty = true;
+        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
     }
 };
 
@@ -1281,11 +1336,18 @@ pub const Grid = struct {
     // cmdline grid, so it derives this from the main window width. 0 = fall
     // back to the main grid's cols.
     cmdline_default_cols: u32 = 0,
-    // Dirty tracking (global grid only)
-    dirty_all: bool = true,
-    dirty_rows: std.DynamicBitSetUnmanaged = .{},
+    /// Grid 1's cells, dirty state and vertex ledger, held in the same
+    /// container every sub-grid uses, so one render loop can treat grid 1
+    /// like any other grid. `rows`/`cols` above mirror `main_buf.rows`/`cols`;
+    /// Grid.resize is the only writer of either.
+    main_buf: GridBuf = .{},
 
-    cells: []Cell = &[_]Cell{},
+    /// Grids Neovim destroyed since the last successful flush. Drained by the
+    /// flush into on_grid_destroy so a frontend can release that grid's
+    /// buffers. Best effort: on allocation failure the id is dropped and the
+    /// frontend simply retains the buffers, which costs memory but is safe.
+    destroyed_pending: std.ArrayListUnmanaged(i64) = .empty,
+
     // O(1) aggregate allocation budget accounting for cells plus every
     // sub-grid. Updated only after a resize/destroy transaction commits.
     total_grid_cells: usize = 0,
@@ -1618,13 +1680,11 @@ pub const Grid = struct {
 
     pub fn deinit(self: *Grid) void {
         // global grid
-        if (self.cells.len != 0) self.alloc.free(self.cells);
-        self.cells = &[_]Cell{};
+        self.main_buf.deinit(self.alloc);
+        self.destroyed_pending.deinit(self.alloc);
         self.rows = 0;
         self.cols = 0;
         self.total_grid_cells = 0;
-
-        self.dirty_rows.deinit(self.alloc);
 
         // sub grids
         var it = self.sub_grids.iterator();
@@ -1719,7 +1779,7 @@ pub const Grid = struct {
         }
         self.sub_grids.deinit(self.alloc);
         self.sub_grids = .{};
-        self.total_grid_cells = self.cells.len;
+        self.total_grid_cells = self.main_buf.cells.len;
         self.win_pos.deinit(self.alloc);
         self.win_pos = .{};
         self.grid_win_ids.deinit(self.alloc);
@@ -1794,7 +1854,7 @@ pub const Grid = struct {
         // grid_resize will markAllDirty too, but this is the no-op-resize
         // case (same dimensions) where redraw_handler doesn't reach
         // resizeGrid.
-        self.dirty_all = true;
+        self.main_buf.dirty_all = true;
     }
 
     // ── Cell overflow helpers ────────────────────────────────────────
@@ -2034,7 +2094,7 @@ pub const Grid = struct {
     pub fn getCellHL(self: *const Grid, row: u32, col: u32) u32 {
         if (row >= self.rows or col >= self.cols) return 0;
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx].hl;
+        return self.main_buf.cells[idx].hl;
     }
 
     pub fn getCellHLGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) u32 {
@@ -2051,7 +2111,7 @@ pub const Grid = struct {
     pub fn getCell(self: *const Grid, row: u32, col: u32) Cell {
         if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx];
+        return self.main_buf.cells[idx];
     }
 
     /// Get cell at (row, col) for any grid
@@ -2069,41 +2129,35 @@ pub const Grid = struct {
 
     /// Grow `dirty_rows` to cover `rows`, leaving new bits clean.
     ///
-    /// `Grid.resize` calls this unconditionally, which is what lets readers
-    /// index `dirty_rows` by row without a length check first:
-    /// `bit_length >= rows` holds for the global grid at all times. `GridBuf`
-    /// gives no such guarantee — it skips the bitset entirely for a zero-cell
-    /// shape while still updating `rows` — so its readers do have to test
-    /// `bit_length` before `isSet`.
+    /// Grid 1 now lives in a GridBuf, which skips the bitset entirely for a
+    /// zero-cell shape while still updating `rows`. No caller may index
+    /// `dirty_rows` directly: read dirtiness through `isRowDirty` and set it
+    /// through `markDirtyRow`/`markDirtyRect`, all of which bounds-check.
     pub fn ensureDirtyCapacity(self: *Grid, rows: u32) !void {
         // Grow only: a shrink leaves the bitset longer than `rows`, which the
         // `>=` invariant above allows. Initialize new bits as "clean" (false).
         const r: usize = @as(usize, rows);
-        if (self.dirty_rows.bit_length >= r) return;
-        try self.dirty_rows.resize(self.alloc, r, false);
+        if (self.main_buf.dirty_rows.bit_length >= r) return;
+        try self.main_buf.dirty_rows.resize(self.alloc, r, false);
+    }
+
+    /// Grid 1's dirty accessors forward to main_buf so the global grid and a
+    /// sub-grid answer the same question the same way.
+    pub fn isRowDirty(self: *const Grid, row: u32) bool {
+        return self.main_buf.isRowDirty(row);
     }
 
     pub fn markDirtyRow(self: *Grid, row: u32) void {
-        if (row >= self.rows) return;
-        // When dirty_all is true, per-row bits are not necessary.
-        if (self.dirty_all) return;
-        self.dirty_rows.set(@as(usize, row));
+        self.main_buf.markDirtyRow(row);
     }
 
     pub fn markDirtyRect(self: *Grid, top: u32, bot: u32) void {
-        if (self.dirty_all) return;
-        const start: usize = @as(usize, top);
-        // Clamping to `rows` is enough: `bit_length >= rows` holds for the
-        // global grid at all times (see Grid.ensureDirtyCapacity), which is
-        // the same invariant markDirtyRow relies on to set a bit unguarded.
-        const end: usize = @as(usize, @min(bot, self.rows));
-        if (start >= end) return;
-        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
+        self.main_buf.markDirtyRect(top, bot);
     }
 
     pub fn markAllDirty(self: *Grid) void {
         // Fast path: avoid setting all bits; dirty_all dominates.
-        self.dirty_all = true;
+        self.main_buf.markAllDirty();
     }
 
     /// Shift previously-recorded touched rows by a new scroll delta.
@@ -2162,11 +2216,7 @@ pub const Grid = struct {
     }
 
     pub fn clearDirty(self: *Grid) void {
-        self.dirty_all = false;
-        // Make all bits clean.
-        if (self.dirty_rows.bit_length != 0) {
-            self.dirty_rows.unsetAll();
-        }
+        self.main_buf.clearDirtyContent();
     }
 
     /// Copy the current main-grid dirty state into `out`, growing it only when
@@ -2174,8 +2224,8 @@ pub const Grid = struct {
     /// frontend rejection can restore exactly that instead of resending every
     /// row. Allocation happens on layout change only, never per flush.
     pub fn snapshotDirty(self: *const Grid, alloc: std.mem.Allocator, out: *DirtySnapshot) !void {
-        out.dirty_all = self.dirty_all;
-        const len = self.dirty_rows.bit_length;
+        out.dirty_all = self.main_buf.dirty_all;
+        const len = self.main_buf.dirty_rows.bit_length;
         if (out.rows.bit_length != len) {
             out.rows.deinit(alloc);
             out.rows = .{};
@@ -2184,7 +2234,7 @@ pub const Grid = struct {
             out.rows.unsetAll();
         }
         if (len == 0) return;
-        var it = self.dirty_rows.iterator(.{});
+        var it = self.main_buf.dirty_rows.iterator(.{});
         while (it.next()) |bit| out.rows.set(bit);
     }
 
@@ -2192,13 +2242,13 @@ pub const Grid = struct {
     /// snapshot stay set: a rejected flush must resend what it consumed plus
     /// anything that changed afterwards.
     pub fn restoreDirty(self: *Grid, snapshot: *const DirtySnapshot) void {
-        if (snapshot.dirty_all) self.dirty_all = true;
-        if (snapshot.rows.bit_length == 0 or self.dirty_rows.bit_length == 0) return;
-        const len = @min(snapshot.rows.bit_length, self.dirty_rows.bit_length);
+        if (snapshot.dirty_all) self.main_buf.dirty_all = true;
+        if (snapshot.rows.bit_length == 0 or self.main_buf.dirty_rows.bit_length == 0) return;
+        const len = @min(snapshot.rows.bit_length, self.main_buf.dirty_rows.bit_length);
         var it = snapshot.rows.iterator(.{});
         while (it.next()) |bit| {
             if (bit >= len) break;
-            self.dirty_rows.set(bit);
+            self.main_buf.dirty_rows.set(bit);
         }
     }
 
@@ -2214,43 +2264,33 @@ pub const Grid = struct {
     }
 
     pub fn clear(self: *Grid) void {
-        @memset(self.cells, .{ .cp = ' ', .hl = 0 });
+        @memset(self.main_buf.cells, .{ .cp = ' ', .hl = 0 });
     }
 
     pub fn resize(self: *Grid, rows: u32, cols: u32) !void {
         const new_len = try checkedGridCellCount(rows, cols);
-        const new_total = try self.checkedAggregateCellCount(self.cells.len, new_len);
-        const new_cells = try self.alloc.alloc(Cell, new_len);
-        errdefer self.alloc.free(new_cells);
-
-        // Fill new buffer with spaces using vectorized memset.
-        @memset(new_cells, .{ .cp = ' ', .hl = 0 });
-
-        const min_rows = @min(self.rows, rows);
-        const min_cols = @min(self.cols, cols);
-
-        if (self.cells.len != 0) {
-            // Row-level @memcpy instead of per-cell copy
-            var r: u32 = 0;
-            while (r < min_rows) : (r += 1) {
-                const old_start: usize = @as(usize, r) * @as(usize, self.cols);
-                const new_start: usize = @as(usize, r) * @as(usize, cols);
-                @memcpy(new_cells[new_start .. new_start + min_cols], self.cells[old_start .. old_start + min_cols]);
-            }
-        }
-
-        // The dirty bitset is part of the published grid shape. Grow it
-        // before releasing the old cells so OOM leaves rows/cols/cells and
-        // dirty metadata describing the same old grid.
-        try self.ensureDirtyCapacity(rows);
-
-        if (self.cells.len != 0) self.alloc.free(self.cells);
-        self.cells = new_cells;
+        const new_total = try self.checkedAggregateCellCount(self.main_buf.cells.len, new_len);
+        // GridBuf.resize preserves the overlapping cell rect, reallocates the
+        // dirty bitset and the vertex row ledger, and is transactional: on OOM
+        // the previous buffer is left intact, so rows/cols/total below still
+        // describe the old shape.
+        try self.main_buf.resize(self.alloc, rows, cols);
         self.rows = rows;
         self.cols = cols;
         self.total_grid_cells = new_total;
-        self.clearDirty(); // reset bitset
-        self.markAllDirty(); // everything needs redraw after resize
+        // GridBuf.resize already marked everything dirty via dirty_all.
+    }
+
+    /// The render buffer for `grid_id`. Grid 1 is the global grid and lives in
+    /// `main_buf`, not in `sub_grids`; every other id is a sub-grid.
+    pub fn bufFor(self: *Grid, grid_id: i64) ?*GridBuf {
+        if (grid_id == 1) return &self.main_buf;
+        return self.sub_grids.getPtr(grid_id);
+    }
+
+    pub fn bufForConst(self: *const Grid, grid_id: i64) ?*const GridBuf {
+        if (grid_id == 1) return &self.main_buf;
+        return self.sub_grids.getPtr(grid_id);
     }
 
     pub fn putCell(self: *Grid, row: u32, col: u32, cp: u32, hl: u32) void {
@@ -2259,11 +2299,11 @@ pub const Grid = struct {
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
 
         // If no actual change, do nothing (avoid increasing dirty state)
-        const old = self.cells[idx];
+        const old = self.main_buf.cells[idx];
         if (old.cp == cp and old.hl == hl) return;
 
         // Apply the change only when it actually differs
-        self.cells[idx] = .{ .cp = cp, .hl = hl };
+        self.main_buf.cells[idx] = .{ .cp = cp, .hl = hl };
 
         // Treat only actual changes as dirty
         self.markDirtyRow(row);
@@ -2310,7 +2350,7 @@ pub const Grid = struct {
 
         // If the shift exceeds region height, everything is scrolled out.
         if (shift >= height) {
-            scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+            scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
             // Clear overflow for the entire scrolled-out region
             self.clearOverflowRect(1, top, bot, left, right);
             // Mark every row in the region dirty. The caller (scrollGrid)
@@ -2326,7 +2366,7 @@ pub const Grid = struct {
             return;
         }
 
-        scrollCells(self.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
+        scrollCells(self.main_buf.cells, self.cols, top, bot, left, right, rows, .{ .cp = ' ', .hl = 0 });
 
         self.markDirtyRect(top, bot);
 
@@ -2734,18 +2774,41 @@ pub const Grid = struct {
             self.subgrid_surface_vertex_count -|=
                 old_surface_vertex_count -| sg.surface_vertex_count;
             self.scrollOverflow(grid_id, top, bot, left, right, rows);
-            // Multiple scrolls in same batch block the fast path (same as global grid)
-            if (sg.last_scroll_op != null) {
-                sg.scroll_fast_path_blocked = true;
+            // A second scroll of the SAME region in one batch accumulates, as
+            // the global grid has always done: the frontend shifts once by the
+            // total. Only a different region blocks, because one shift cannot
+            // describe two of them.
+            //
+            // This used to cost nothing -- a composited sub-grid's rows were
+            // rendered through the global grid's own accumulating path -- but
+            // every grid renders itself now, and a blocked fast path makes the
+            // whole grid regenerate.
+            var accumulated = false;
+            if (sg.last_scroll_op) |*prev| {
+                if (prev.top == top and prev.bot == bot and
+                    prev.left == left and prev.right == right and cols == 0)
+                {
+                    if (std.math.add(i32, prev.rows, rows)) |sum| {
+                        prev.rows = sum;
+                        accumulated = true;
+                    } else |_| {
+                        sg.scroll_fast_path_blocked = true;
+                        accumulated = true;
+                    }
+                } else {
+                    sg.scroll_fast_path_blocked = true;
+                }
             }
-            sg.last_scroll_op = .{
-                .top = top,
-                .bot = bot,
-                .left = left,
-                .right = right,
-                .rows = rows,
-                .cols = cols,
-            };
+            if (!accumulated) {
+                sg.last_scroll_op = .{
+                    .top = top,
+                    .bot = bot,
+                    .left = left,
+                    .right = right,
+                    .rows = rows,
+                    .cols = cols,
+                };
+            }
             if (self.win_pos.get(grid_id)) |p| {
                 if (self.external_grids.contains(p.anchor_grid)) {
                     // Float anchored to an EXTERNAL grid: it composites into
@@ -2934,6 +2997,15 @@ pub const Grid = struct {
         }
     }
 
+    /// Record a destroyed grid for the next flush's on_grid_destroy. Silently
+    /// drops the id when it cannot be recorded; see `destroyed_pending`.
+    fn recordDestroyedGrid(self: *Grid, grid_id: i64) void {
+        for (self.destroyed_pending.items) |id| {
+            if (id == grid_id) return;
+        }
+        self.destroyed_pending.append(self.alloc, grid_id) catch return;
+    }
+
     pub fn destroyGrid(self: *Grid, grid_id: i64) !void {
         if (grid_id == 1) {
             // Neovim's UI protocol never destroys the main grid (grid_id=1);
@@ -2967,6 +3039,7 @@ pub const Grid = struct {
             self.subgrid_surface_vertex_count -|= buf.surface_vertex_count;
             buf.deinit(self.alloc);
         }
+        self.recordDestroyedGrid(grid_id);
         self.clearOverflowForGrid(grid_id);
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
@@ -4319,36 +4392,53 @@ pub const Grid = struct {
     }
 };
 
-test "the global grid always has a dirty bit per row, a sub-grid may not" {
+test "the global grid and a sub-grid answer dirtiness identically" {
     var grid = Grid.init(std.testing.allocator);
     defer grid.deinit();
 
-    // Grid.resize goes through ensureDirtyCapacity every time, so readers can
-    // index dirty_rows by row with no length check. Callers in flush.zig rely
-    // on this; if it ever stops holding they index past the bitset.
+    // Grid 1 lives in a GridBuf now, so no caller may index dirty_rows by row.
+    // Dirtiness is read through isRowDirty and written through markDirtyRow /
+    // markDirtyRect, all of which bounds-check. These assertions guard exactly
+    // the indexing hazard the old bit_length invariant used to cover.
     try grid.resize(24, 80);
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
-    try grid.resize(50, 80); // grow
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
-    try grid.resize(10, 80); // shrink: the bitset is allowed to stay long
-    try std.testing.expect(grid.dirty_rows.bit_length >= grid.rows);
+    grid.clearDirty();
+    grid.markDirtyRow(23);
+    try std.testing.expect(grid.isRowDirty(23));
+    try std.testing.expect(!grid.isRowDirty(0));
+    // One past the last row is never dirty and never indexes the bitset.
+    try std.testing.expect(!grid.isRowDirty(24));
+
+    try grid.resize(50, 80); // grow: resize marks everything dirty again
+    try std.testing.expect(grid.isRowDirty(49));
+    try std.testing.expect(!grid.isRowDirty(50));
+
+    try grid.resize(10, 80); // shrink
+    try std.testing.expect(grid.isRowDirty(9));
+    try std.testing.expect(!grid.isRowDirty(10));
 
     // The zero-cell shape needs its own grid. Reaching it after a larger
-    // resize proves nothing: the bitset only ever grows, so a stale length
-    // from an earlier shape would satisfy the assertion on its own.
+    // resize proves nothing: a stale bitset from an earlier shape would
+    // satisfy the assertion on its own.
     var zero_cols = Grid.init(std.testing.allocator);
     defer zero_cols.deinit();
     try zero_cols.resize(30, 0);
     try std.testing.expectEqual(@as(u32, 30), zero_cols.rows);
-    try std.testing.expect(zero_cols.dirty_rows.bit_length >= zero_cols.rows);
+    // A zero-cell shape skips the bitset entirely while rows keeps the
+    // requested value, for the global grid and a sub-grid alike.
+    try std.testing.expectEqual(@as(usize, 0), zero_cols.main_buf.dirty_rows.bit_length);
+    try std.testing.expect(zero_cols.isRowDirty(0)); // via dirty_all
+    zero_cols.clearDirty();
+    zero_cols.markDirtyRow(0); // must not index the empty bitset
+    try std.testing.expect(!zero_cols.isRowDirty(0));
 
-    // GridBuf makes no such promise: a zero-cell shape skips the bitset while
-    // rows keeps the requested value. This is why the sub-grid paths in
-    // flush.zig test bit_length before isSet.
     try grid.resizeGrid(2, 8, 0);
     const sub = grid.sub_grids.getPtr(2).?;
     try std.testing.expectEqual(@as(u32, 8), sub.rows);
     try std.testing.expectEqual(@as(usize, 0), sub.dirty_rows.bit_length);
+    try std.testing.expect(sub.isRowDirty(0));
+    sub.clearDirtyContent();
+    sub.markDirtyRow(0);
+    try std.testing.expect(!sub.isRowDirty(0));
 }
 
 test "reopening a clean external grid regenerates every row" {
@@ -4365,10 +4455,15 @@ test "reopening a clean external grid regenerates every row" {
     try grid.hideWin(2);
     try std.testing.expect(try grid.setWinExternalPos(2, 42));
     try std.testing.expect(sub_grid.dirty);
-    var dirty_rows = sub_grid.dirty_rows.iterator(.{});
-    var dirty_count: usize = 0;
-    while (dirty_rows.next()) |_| dirty_count += 1;
-    try std.testing.expectEqual(@as(usize, 4), dirty_count);
+    // markAllDirty is O(1) through dirty_all, so the per-row bits stay clear.
+    // Assert the property the frontend actually depends on: every row reads
+    // dirty, which is what isRowDirty answers.
+    try std.testing.expect(sub_grid.anyDirty());
+    var r: u32 = 0;
+    while (r < sub_grid.rows) : (r += 1) {
+        try std.testing.expect(sub_grid.isRowDirty(r));
+    }
+    try std.testing.expectEqual(@as(u32, 4), sub_grid.rows);
 }
 
 fn checkExternalRegistrationAllocationFailure(alloc: std.mem.Allocator) !void {
@@ -4592,12 +4687,12 @@ test "subgrid clear dirties every covered main row" {
     grid.clearGrid(2);
 
     try std.testing.expect(grid.content_rev != old_rev);
-    try std.testing.expect(!grid.dirty_rows.isSet(0));
-    try std.testing.expect(!grid.dirty_rows.isSet(1));
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
-    try std.testing.expect(!grid.dirty_rows.isSet(4));
-    try std.testing.expect(!grid.dirty_rows.isSet(5));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(0));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(1));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(4));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(5));
 }
 
 test "grid line coverage is dirtied once per redraw epoch while order advances" {
@@ -4613,21 +4708,21 @@ test "grid line coverage is dirtied once per redraw epoch while order advances" 
     const order_before = grid.win_layer.get(2).?.order;
     const generation_before = grid.layout_generation;
     grid.noteGridLine(2, epoch);
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
     const first_order = grid.win_layer.get(2).?.order;
     try std.testing.expect(first_order != order_before);
 
     grid.clearDirty();
     grid.noteGridLine(2, epoch);
-    try std.testing.expect(!grid.dirty_rows.isSet(2));
-    try std.testing.expect(!grid.dirty_rows.isSet(3));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
     try std.testing.expect(grid.win_layer.get(2).?.order != first_order);
     try std.testing.expect(grid.layout_generation != generation_before);
 
     grid.noteGridLine(2, grid.beginRedrawBatch());
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
 }
 
 test "main row index accounting follows placement and external anchor visibility" {
@@ -4697,21 +4792,21 @@ test "viewport margin changes invalidate their vertex consumers" {
     const main_rev = grid.content_rev;
     try grid.setViewportMargins(1, 1, 1, 1, 1);
     try std.testing.expect(grid.content_rev != main_rev);
-    try std.testing.expect(grid.dirty_all);
+    try std.testing.expect(grid.main_buf.dirty_all);
 
     grid.clearDirty();
     const unchanged_rev = grid.content_rev;
     try grid.setViewportMargins(1, 1, 1, 1, 1);
     try std.testing.expectEqual(unchanged_rev, grid.content_rev);
-    try std.testing.expect(!grid.dirty_all);
+    try std.testing.expect(!grid.main_buf.dirty_all);
 
     try grid.resizeGrid(2, 2, 3);
     try grid.setWinPos(2, 42, 2, 1);
     grid.clearDirty();
     grid.sub_grids.getPtr(2).?.clearDirty();
     try grid.setViewportMargins(2, 0, 0, 1, 1);
-    try std.testing.expect(grid.dirty_rows.isSet(2));
-    try std.testing.expect(grid.dirty_rows.isSet(3));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
     try std.testing.expect(grid.sub_grids.get(2).?.dirty);
 }
 
@@ -4720,12 +4815,12 @@ test "grid resize rejects oversized and aggregate dimensions transactionally" {
     defer grid.deinit();
 
     try grid.resizeGrid(1, 2, 3);
-    const old_cells = grid.cells.ptr;
+    const old_cells = grid.main_buf.cells.ptr;
     const old_total = grid.total_grid_cells;
     try std.testing.expectError(error.GridTooLarge, grid.resizeGrid(1, MAX_GRID_ROWS + 1, 1));
     try std.testing.expectEqual(@as(u32, 2), grid.rows);
     try std.testing.expectEqual(@as(u32, 3), grid.cols);
-    try std.testing.expectEqual(old_cells, grid.cells.ptr);
+    try std.testing.expectEqual(old_cells, grid.main_buf.cells.ptr);
     try std.testing.expectEqual(old_total, grid.total_grid_cells);
     try std.testing.expectError(error.GridTooLarge, grid.checkedAggregateCellCount(0, MAX_TOTAL_GRID_CELLS + 1));
 }
@@ -4757,13 +4852,13 @@ fn checkResizeAllocationFailure(alloc: std.mem.Allocator) !void {
     var grid = Grid.init(alloc);
     defer grid.deinit();
     try grid.resizeGrid(1, 2, 3);
-    const old_cells = grid.cells.ptr;
+    const old_cells = grid.main_buf.cells.ptr;
     const old_total = grid.total_grid_cells;
 
     grid.resizeGrid(1, 100, 100) catch |err| {
         try std.testing.expectEqual(@as(u32, 2), grid.rows);
         try std.testing.expectEqual(@as(u32, 3), grid.cols);
-        try std.testing.expectEqual(old_cells, grid.cells.ptr);
+        try std.testing.expectEqual(old_cells, grid.main_buf.cells.ptr);
         try std.testing.expectEqual(old_total, grid.total_grid_cells);
         return err;
     };
@@ -5214,4 +5309,179 @@ test "scrollCells shifts a rect and blanks what it vacates" {
     seed(&cells);
     scrollCells(&cells, cols, 0, rows, 0, cols, std.math.minInt(i32), blank);
     for (cells) |cell| try std.testing.expectEqual(blank, cell);
+}
+
+test "GridBuf markAllDirty reports every row dirty without setting bits" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 4, 8);
+
+    buf.clearDirtyContent();
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(!buf.anyDirty());
+
+    buf.markAllDirty();
+    try std.testing.expect(buf.dirty_all);
+    // O(1): the bitset itself is not touched by markAllDirty.
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.count());
+    // Every in-range row still reads as dirty.
+    var r: u32 = 0;
+    while (r < buf.rows) : (r += 1) try std.testing.expect(buf.isRowDirty(r));
+    try std.testing.expect(buf.anyDirty());
+    // Out-of-range rows are never dirty, even under dirty_all.
+    try std.testing.expect(!buf.isRowDirty(buf.rows));
+}
+
+test "GridBuf markDirtyRow is a no-op while dirty_all dominates" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 3, 3);
+
+    buf.clearDirtyContent();
+    buf.markAllDirty();
+    buf.markDirtyRow(1);
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.count());
+
+    buf.clearDirtyContent();
+    buf.markDirtyRow(1);
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(buf.isRowDirty(1));
+    try std.testing.expect(!buf.isRowDirty(2));
+    try std.testing.expect(buf.anyDirty());
+}
+
+test "GridBuf markDirtyRect clamps to rows and respects dirty_all" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    try buf.resize(alloc, 4, 4);
+
+    buf.clearDirtyContent();
+    buf.markDirtyRect(1, 99);
+    try std.testing.expect(!buf.isRowDirty(0));
+    try std.testing.expect(buf.isRowDirty(1));
+    try std.testing.expect(buf.isRowDirty(3));
+
+    buf.clearDirtyContent();
+    buf.markDirtyRect(2, 2); // empty range
+    try std.testing.expect(!buf.anyDirty());
+}
+
+test "GridBuf zero-cell shape has no bitset but still answers isRowDirty" {
+    const alloc = std.testing.allocator;
+    var buf: GridBuf = .{};
+    defer buf.deinit(alloc);
+    // cols == 0 keeps the bitset unallocated (see GridBuf.resize).
+    try buf.resize(alloc, 5, 0);
+    try std.testing.expectEqual(@as(usize, 0), buf.dirty_rows.bit_length);
+    // resize() marks the buffer dirty; with no bitset that has to come from
+    // dirty_all, not from a bit.
+    try std.testing.expect(buf.isRowDirty(0));
+    buf.clearDirtyContent();
+    try std.testing.expect(!buf.isRowDirty(0));
+    buf.markDirtyRow(0); // must not crash on the empty bitset
+    try std.testing.expect(!buf.isRowDirty(0));
+}
+
+test "bufFor returns the main buffer for grid 1 and the sub-grid otherwise" {
+    const alloc = std.testing.allocator;
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.resize(4, 8);
+    try grid.resizeGrid(2, 3, 5);
+
+    const main = grid.bufFor(1).?;
+    try std.testing.expectEqual(&grid.main_buf, main);
+    try std.testing.expectEqual(@as(u32, 4), main.rows);
+    try std.testing.expectEqual(@as(u32, 8), main.cols);
+    // Grid.rows/cols mirror the main buffer exactly.
+    try std.testing.expectEqual(grid.rows, main.rows);
+    try std.testing.expectEqual(grid.cols, main.cols);
+
+    const sub = grid.bufFor(2).?;
+    try std.testing.expectEqual(@as(u32, 3), sub.rows);
+    try std.testing.expectEqual(@as(u32, 5), sub.cols);
+    try std.testing.expect(sub != main);
+
+    // Grid 1 is not a member of sub_grids and an unknown id has no buffer.
+    try std.testing.expect(grid.sub_grids.getPtr(1) == null);
+    try std.testing.expect(grid.bufFor(999) == null);
+}
+
+test "main grid cells and dirty state live in main_buf" {
+    const alloc = std.testing.allocator;
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.resize(3, 3);
+
+    grid.clearDirty();
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expect(!grid.main_buf.isRowDirty(1));
+
+    grid.putCell(1, 2, 'X', 7);
+    try std.testing.expect(grid.main_buf.isRowDirty(1));
+    try std.testing.expect(!grid.main_buf.isRowDirty(0));
+    try std.testing.expectEqual(@as(u32, 'X'), grid.getCell(1, 2).cp);
+    try std.testing.expectEqual(@as(u32, 7), grid.getCell(1, 2).hl);
+    // The cell really is stored in main_buf, not in a separate Grid buffer.
+    try std.testing.expectEqual(@as(u32, 'X'), grid.main_buf.cells[1 * 3 + 2].cp);
+
+    grid.markAllDirty();
+    try std.testing.expect(grid.main_buf.dirty_all);
+}
+
+test "a sub-grid accumulates same-region scrolls in one batch instead of blocking" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 20, 40);
+    try grid.setWinPos(2, 100, 0, 0);
+
+    // Two scrolls of the same region in one redraw batch. The frontend shifts
+    // once by the total, so the fast path must stay available: blocking here
+    // makes the whole grid regenerate, which is what a held key produces
+    // dozens of times a second.
+    grid.scrollGrid(2, 0, 20, 0, 40, 1, 0);
+    grid.scrollGrid(2, 0, 20, 0, 40, 1, 0);
+    const sg = grid.sub_grids.getPtr(2).?;
+    try std.testing.expect(!sg.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(i32, 2), sg.last_scroll_op.?.rows);
+    try std.testing.expectEqual(@as(u32, 0), sg.last_scroll_op.?.top);
+    try std.testing.expectEqual(@as(u32, 20), sg.last_scroll_op.?.bot);
+
+    // Opposite directions cancel the same way the frontend's shift would.
+    grid.scrollGrid(2, 0, 20, 0, 40, -1, 0);
+    try std.testing.expect(!sg.scroll_fast_path_blocked);
+    try std.testing.expectEqual(@as(i32, 1), sg.last_scroll_op.?.rows);
+
+    // A different region cannot be described by one shift, so it still blocks.
+    grid.scrollGrid(2, 2, 10, 0, 40, 1, 0);
+    try std.testing.expect(sg.scroll_fast_path_blocked);
+}
+
+test "an accumulated sub-grid scroll carries its dirty marks with the content" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 10, 8);
+    try grid.setWinPos(2, 100, 0, 0);
+    const sg = grid.sub_grids.getPtr(2).?;
+    sg.clearDirtyContent();
+
+    // One row off the top: row 9 is vacated and owed a regeneration.
+    grid.scrollGrid(2, 0, 10, 0, 8, 1, 0);
+    try std.testing.expect(sg.isRowDirty(9));
+
+    // A second scroll in the same batch accumulates. The first scroll's
+    // vacated row has moved up with the content, so its mark must move too --
+    // otherwise the row that is now blank is never regenerated and the one
+    // holding real content is regenerated for nothing.
+    grid.scrollGrid(2, 0, 10, 0, 8, 1, 0);
+    try std.testing.expectEqual(@as(i32, 2), sg.last_scroll_op.?.rows);
+    try std.testing.expect(sg.isRowDirty(8));
+    try std.testing.expect(sg.isRowDirty(9));
+    try std.testing.expect(!sg.isRowDirty(0));
+    try std.testing.expect(!sg.isRowDirty(7));
 }

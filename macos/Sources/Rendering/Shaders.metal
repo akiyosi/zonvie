@@ -60,6 +60,16 @@ struct ScrollOffset {
                             // — a float scrolling above its own backdrop must keep drawing.
 };
 
+// Maps one layer's incoming vertex space to clip space. The core emits row
+// vertices in grid-local pixels (origin top-left, +y down), so the surface
+// binds scale = (2/extent_w, -2/extent_h) and offset = (-1, +1). Everything
+// downstream of the multiply -- row translation, scroll offsets, edge pinning
+// -- stays in NDC and is unchanged by this.
+struct LayerTransform {
+    float2 scale;
+    float2 offset;
+};
+
 // Drawable size for NDC conversion in fragment shader
 struct DrawableSize {
     float width;
@@ -69,16 +79,22 @@ struct DrawableSize {
 vertex VSOut vs_main(VertexIn in [[stage_in]],
                      constant ScrollOffset* scrollOffsets [[buffer(1)]],
                      constant uint& scrollOffsetCount [[buffer(2)]],
-                     constant float& rowTranslationY [[buffer(3)]]) {
+                     constant float& rowTranslationY [[buffer(3)]],
+                     constant LayerTransform& layer [[buffer(4)]]) {
     VSOut o;
-    float2 pos = in.position;
+    // Row translation is in the same grid-local pixels the vertices arrive in:
+    // it moves a row-slot's vertices to the row they must appear at after a
+    // row-shift hint remapped the slots without rewriting them. Applying it
+    // before the transform also means the scroll boundary pin checks below
+    // compare against the logical row position, not the source row position;
+    // without that, remapped rows fail the content_top_y / content_bottom_y
+    // test during smooth scrolling and edge rows are clipped instead of
+    // stretched.
+    float2 pos_px = in.position;
+    pos_px.y += rowTranslationY;
 
-    // Apply row translation first so scroll boundary pin checks compare
-    // against the logical row position, not the source row position.
-    // Without this, remapped rows (from on_main_row_scroll) fail the
-    // content_top_y / content_bottom_y pin test during smooth scrolling,
-    // causing edge rows to be clipped instead of stretched.
-    pos.y += rowTranslationY;
+    // Grid-local pixels -> NDC. Everything below this line works in NDC.
+    float2 pos = pos_px * layer.scale + layer.offset;
 
     // Default: no clipping needed (content bounds cover entire screen)
     o.content_top_y = 2.0;     // Above screen

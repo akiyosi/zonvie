@@ -2244,11 +2244,14 @@ final class MetalTerminalView: MTKView {
         // scrolling it, nothing was staged and the band opened with no rows to
         // fill it. The fast path now stands down for a grid this one already
         // retained, so the two cannot stage the same movement twice.
+        // Grid-local rows, like the external case above: every grid keeps its
+        // own row buffers now, so a span in surface rows would index the wrong
+        // set.
         renderer.setGridScrollCaptureBounds(
             gridId: info.gridId,
             bounds: (
-                top: Int(info.startRow + info.marginTop),
-                bottomEx: Int(info.startRow + info.rows - info.marginBottom)
+                top: Int(info.marginTop),
+                bottomEx: Int(info.rows - info.marginBottom)
             )
         )
     }

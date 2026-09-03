@@ -439,6 +439,41 @@ pub const PendingExternalWindow = struct {
 /// external vertices. Holds vertex storage, grid dimensions, dirty
 /// tracking, and cursor row info. GPU resources (VBs, scratch buffers)
 /// remain on the owning window struct.
+/// One grid placed on one surface, mirroring `zonvie_layer` in
+/// include/zonvie_core.h.
+pub const SurfaceLayer = struct {
+    grid_id: i64,
+    anchor_grid: i64,
+    x_px: i32,
+    y_px: i32,
+    rows: u32,
+    cols: u32,
+    z: i32,
+    follows_scroll: bool,
+};
+
+/// Layer lists are bounded by the core's own placement cap; anything beyond
+/// this is dropped rather than allocated on the paint path.
+pub const MAX_SURFACE_LAYERS: usize = 64;
+
+/// A surface's committed layer list, back-to-front. Fixed capacity so the
+/// paint path never allocates.
+pub const SurfaceLayers = struct {
+    items: [MAX_SURFACE_LAYERS]SurfaceLayer = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const SurfaceLayers) []const SurfaceLayer {
+        return self.items[0..self.len];
+    }
+
+    /// The layer the surface's own grid occupies, or null before the first
+    /// layout arrives.
+    pub fn root(self: *const SurfaceLayers) ?SurfaceLayer {
+        if (self.len == 0) return null;
+        return self.items[0];
+    }
+};
+
 pub const SurfaceState = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_verts: std.ArrayListUnmanaged(RowVerts) = .empty,
@@ -576,6 +611,9 @@ pub const PaintSnapshot = struct {
     /// Scroll region in rows, matching remapRowSlots' [row_start, row_end).
     scroll_row_start: u32 = 0,
     scroll_row_end: u32 = 0,
+    /// Layer list bundled with this committed set, so a paint sees the layers
+    /// and the vertices they place from the same transaction.
+    layers: SurfaceLayers = .{},
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -636,6 +674,12 @@ pub const TripleBufferedSurface = struct {
     // Used by applyScrollShift to limit shiftRowVBs to the same range.
     flush_scroll_row_start: u32 = 0,
     flush_scroll_row_end: u32 = 0,
+
+    // Layer list for this surface. Staged by on_surface_layout during a flush
+    // and promoted at commitFlush, so layers and the vertices they place
+    // become visible in the same transaction.
+    flush_layers: ?SurfaceLayers = null,
+    committed_layers: SurfaceLayers = .{},
 
     // Pending scroll state (rotation_mu protected).
     // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
@@ -846,12 +890,23 @@ pub const TripleBufferedSurface = struct {
         self.main_cursor_flush_new_row = null;
     }
 
+    /// Stage this surface's layer list. Core thread, inside the flush bracket.
+    pub fn stageLayers(self: *TripleBufferedSurface, layers: SurfaceLayers) void {
+        self.flush_layers = layers;
+    }
+
     /// Commit the write set as the new committed set.
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
         if (!self.is_in_flush and !self.main_cursor_in_flush) return;
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
+
+        // Layers and the vertices they place become visible together.
+        if (self.flush_layers) |staged| {
+            self.committed_layers = staged;
+            self.flush_layers = null;
+        }
 
         // Cursor and rows publish while holding the same lock. A paint can
         // therefore observe either the complete old pair or complete new pair,
@@ -1080,6 +1135,7 @@ pub const TripleBufferedSurface = struct {
             .committed_index = ci,
             .cursor_index = cursor_ci,
             .paint_full = paint_full,
+            .layers = self.committed_layers,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -1819,6 +1875,117 @@ pub const SlotPool = struct {
 
 /// Legacy combined struct for backward compatibility during migration.
 /// Contains both CPU vertex data and GPU VB resources.
+/// Vertex storage for one grid a surface places as a non-root layer. Layers
+/// other than the root are small and the core regenerates them wholesale, so
+/// they use plain per-row buffers rather than the root grid's slot pool.
+///
+/// Written on the core thread inside the flush bracket and read by WM_PAINT,
+/// both under `App.mu`.
+pub const LayerGridState = struct {
+    rows: u32 = 0,
+    cols: u32 = 0,
+    rows_buf: std.ArrayListUnmanaged(RowVerts) = .empty,
+    /// The row each stored array's vertices were built for. A row-shift hint
+    /// moves arrays between rows without rewriting their pixels, so the draw
+    /// has to offset them by the difference.
+    origin_rows: std.ArrayListUnmanaged(u32) = .empty,
+
+    pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator, g: ?*d3d11.Renderer) void {
+        for (self.rows_buf.items) |*rv| {
+            rv.verts.deinit(alloc);
+            if (rv.vb) |vb| {
+                if (g) |_| {} // release below regardless of renderer presence
+                _ = vb.*.lpVtbl.*.Release.?(@ptrCast(vb));
+                rv.vb = null;
+                rv.vb_bytes = 0;
+            }
+        }
+        self.rows_buf.deinit(alloc);
+        self.rows_buf = .empty;
+        self.origin_rows.deinit(alloc);
+        self.origin_rows = .empty;
+        self.rows = 0;
+        self.cols = 0;
+    }
+
+    /// Move the surviving rows of a scroll region, leaving the vacated ones
+    /// empty for the core to refill. Returns false when the region does not
+    /// fit this grid's storage, in which case the caller must force a full
+    /// regeneration rather than publish a half-shifted grid.
+    pub fn shiftRows(self: *LayerGridState, row_start: u32, row_end: u32, rows_delta: i32) bool {
+        if (rows_delta == 0 or row_end <= row_start) return true;
+        if (row_end > self.rows_buf.items.len) return false;
+        if (row_end > self.origin_rows.items.len) return false;
+        const region_height: u32 = row_end - row_start;
+        const shift: u32 = @intCast(@abs(rows_delta));
+        if (shift == 0 or shift >= region_height) return false;
+
+        const rows_buf = self.rows_buf.items;
+        const origins = self.origin_rows.items;
+        if (rows_delta > 0) {
+            // Content moves up: row r takes row r + shift.
+            var r: u32 = row_start;
+            while (r + shift < row_end) : (r += 1) {
+                std.mem.swap(RowVerts, &rows_buf[r], &rows_buf[r + shift]);
+                std.mem.swap(u32, &origins[r], &origins[r + shift]);
+            }
+            var v: u32 = row_end - shift;
+            while (v < row_end) : (v += 1) {
+                rows_buf[v].verts.clearRetainingCapacity();
+                rows_buf[v].gen +%= 1;
+                origins[v] = v;
+            }
+        } else {
+            // Content moves down: row r takes row r - shift.
+            var r: u32 = row_end;
+            while (r > row_start + shift) {
+                r -= 1;
+                std.mem.swap(RowVerts, &rows_buf[r], &rows_buf[r - shift]);
+                std.mem.swap(u32, &origins[r], &origins[r - shift]);
+            }
+            var v: u32 = row_start;
+            while (v < row_start + shift) : (v += 1) {
+                rows_buf[v].verts.clearRetainingCapacity();
+                rows_buf[v].gen +%= 1;
+                origins[v] = v;
+            }
+        }
+        return true;
+    }
+
+    /// Replace one row's vertices. Returns false when storage could not be
+    /// grown, in which case the row keeps whatever it had.
+    pub fn storeRow(
+        self: *LayerGridState,
+        alloc: std.mem.Allocator,
+        row: u32,
+        verts: []const Vertex,
+        total_rows: u32,
+        total_cols: u32,
+    ) bool {
+        self.rows = total_rows;
+        self.cols = total_cols;
+        const need: usize = @as(usize, row) + 1;
+        if (self.rows_buf.items.len < need) {
+            const old_len = self.rows_buf.items.len;
+            self.rows_buf.resize(alloc, need) catch return false;
+            for (self.rows_buf.items[old_len..]) |*rv| rv.* = .{};
+        }
+        if (self.origin_rows.items.len < need) {
+            const old_len = self.origin_rows.items.len;
+            self.origin_rows.resize(alloc, need) catch return false;
+            for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
+        }
+        var rv = &self.rows_buf.items[@intCast(row)];
+        rv.verts.clearRetainingCapacity();
+        rv.verts.appendSlice(alloc, verts) catch return false;
+        rv.gen +%= 1;
+        // Freshly generated vertices are built for the row they arrived at.
+        self.origin_rows.items[@intCast(row)] = row;
+        return true;
+    }
+};
+
 pub const RowVerts = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
@@ -2451,6 +2618,10 @@ pub fn drawSurfaceRowsVBFromSlots(
     y_offset: i32,
     content_right: i32,
     row_h_px: i32,
+    /// Where this layer's top-left sits inside the viewport. Zero for a
+    /// surface's root layer; an anchored float carries its own offset.
+    layer_origin_x_px: f32,
+    layer_origin_y_px: f32,
     log_enabled: bool,
     metrics: *SurfaceRowDrawMetrics,
 ) !void {
@@ -2578,6 +2749,9 @@ pub fn drawSurfaceRowsVBFromSlots(
             continue;
         };
         const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
+        // Core row vertices are grid-local pixels against this viewport,
+        // offset by where the layer sits inside it.
+        g.setLayerTransform(layer_origin_x_px, layer_origin_y_px, base_vp.w, base_vp.h);
         g.drawVB(row_vb, src.len) catch {
             metrics.skipped_empty += 1;
             metrics.failed_rows += 1;
@@ -2647,9 +2821,7 @@ pub fn drawRowModeSetupAndRowsFromSlots(
 
     const vp_x_offset = params.content_x_offset orelse 0;
     const vp_y_offset = params.content_y_offset orelse 0;
-    const sidebar_r_w = params.sidebar_right_width orelse 0;
-    const base_w = params.content_width orelse g.width;
-    const vp_width = if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
+    const vp_width = rowModeViewportWidth(g, params);
     const base_vp = BaseViewport{
         .x = @floatFromInt(vp_x_offset),
         .y = @floatFromInt(vp_y_offset),
@@ -2687,6 +2859,8 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         params.y_offset,
         params.content_right,
         params.row_h_px,
+        params.layer_origin_x_px,
+        params.layer_origin_y_px,
         log_enabled,
         &result.metrics,
     );
@@ -2881,6 +3055,10 @@ pub const RowModeDrawParams = struct {
     use_row_scissor: bool = true,
     // DrawEx viewport options (null = use full renderer dimensions)
     content_width: ?u32 = null,
+    /// Where the layer being drawn sits inside the viewport. Zero for a
+    /// surface's root layer; an anchored float carries its own offset.
+    layer_origin_x_px: f32 = 0,
+    layer_origin_y_px: f32 = 0,
     content_y_offset: ?u32 = null,
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
@@ -2933,6 +3111,81 @@ pub const BaseViewport = struct {
 /// Shared cursor overlay: upload cursor VB, draw cursor (blink on) or redraw row (blink off).
 /// Used by both main window and external window paint paths after row VB drawing.
 /// Updates last_painted_cursor_row for scroll ghost erasure tracking.
+/// Width of the viewport the row-mode pass draws into. Core row and cursor
+/// vertices are grid-local pixels against this width, so the cursor overlay
+/// has to build its layer transform from the same number the row pass used.
+pub fn rowModeViewportWidth(g: *d3d11.Renderer, params: RowModeDrawParams) u32 {
+    const vp_x_offset = params.content_x_offset orelse 0;
+    const sidebar_r_w = params.sidebar_right_width orelse 0;
+    const base_w = params.content_width orelse g.width;
+    return if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
+}
+
+/// Draw the surface's non-root layers, back-to-front, on top of the root grid.
+/// Each layer gets its own pixel space and is clipped to its own rect. A layer
+/// whose grid has no rows yet draws nothing, which is what the core's layout
+/// contract requires. Caller must hold `app.mu`.
+pub fn drawSurfaceLayers(
+    g: *d3d11.Renderer,
+    app: *App,
+    layers: []const SurfaceLayer,
+    base_vp: BaseViewport,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    row_h_px: i32,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+) void {
+    if (layers.len <= 1 or row_h_px <= 0) return;
+    for (layers[1..]) |layer| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        if (state.rows_buf.items.len == 0) continue;
+
+        const origin_x: f32 = @floatFromInt(layer.x_px);
+        const origin_y: f32 = @floatFromInt(layer.y_px);
+        const layer_w_px: i32 = @intCast(layer.cols * @as(u32, @intCast(@max(1, app.cell_w_px))));
+
+        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+        for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
+            if (rv.verts.items.len == 0) continue;
+
+            if (rs_set_sc_fn) |f| {
+                const top = y_offset + layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
+                var sc: c.D3D11_RECT = .{
+                    .left = @max(x_offset, x_offset + layer.x_px),
+                    .top = top,
+                    .right = @min(content_right, x_offset + layer.x_px + layer_w_px),
+                    .bottom = top + row_h_px,
+                };
+                if (sc.right <= sc.left or sc.bottom <= sc.top) continue;
+                f(ctx_ptr, 1, &sc);
+            }
+
+            const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
+            g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch continue;
+            const vb = rv.vb orelse continue;
+            if (rv.uploaded_gen != rv.gen) {
+                g.uploadVertsToVB(vb, rv.verts.items) catch continue;
+                rv.uploaded_gen = rv.gen;
+            }
+            // A row-shift hint moves an array between rows without rewriting
+            // its pixels, so offset it by the distance it moved.
+            const origin_row: u32 = if (ri < state.origin_rows.items.len)
+                state.origin_rows.items[ri]
+            else
+                @intCast(ri);
+            const row_dy: f32 = @floatFromInt(
+                (@as(i32, @intCast(ri)) - @as(i32, @intCast(origin_row))) * row_h_px,
+            );
+            g.setLayerTransform(origin_x, origin_y + row_dy, base_vp.w, base_vp.h);
+            g.drawVB(vb, rv.verts.items.len) catch continue;
+        }
+    }
+    // Restore the surface's own pixel space for whatever draws next.
+    g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
+}
+
 pub const CursorOverlayParams = struct {
     cursor_verts: []const Vertex,
     cursor_row: ?u32,
@@ -2945,8 +3198,13 @@ pub const CursorOverlayParams = struct {
     x_offset: i32 = 0,
     y_offset: i32 = 0,
     content_right: i32,
+    content_width: u32,
     content_height: u32,
     row_h_px: i32,
+    /// Where the cursor's own layer sits inside the surface. Zero when the
+    /// cursor is on the surface's root grid.
+    cursor_layer_origin_x_px: f32 = 0,
+    cursor_layer_origin_y_px: f32 = 0,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     last_painted_cursor_row: *?u32,
@@ -2981,22 +3239,29 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     const vb = p.cursor_vb.* orelse return error.CursorVertexBufferMissing;
     try g.uploadVertsToVB(vb, p.cursor_verts);
 
-    // 2. Resolve cursor row: use explicit value or compute from vertex NDC positions.
+    // 2. Resolve cursor row: use explicit value or compute from vertex
+    // positions, which are grid-local pixels with y down.
     const cursor_row: u32 = p.cursor_row orelse blk: {
-        // Compute from cursor vertex center Y (NDC → pixel → row).
         var min_y: f32 = p.cursor_verts[0].position[1];
         var max_y: f32 = min_y;
         for (p.cursor_verts[1..]) |v| {
             if (v.position[1] < min_y) min_y = v.position[1];
             if (v.position[1] > max_y) max_y = v.position[1];
         }
-        const center_ndc_y = (min_y + max_y) * 0.5;
-        const h_f: f32 = @floatFromInt(p.content_height);
-        const pixel_y: f32 = (1.0 - center_ndc_y) * 0.5 * h_f;
+        const pixel_y: f32 = (min_y + max_y) * 0.5;
         const row_i: i32 = @intFromFloat(@floor(pixel_y / @as(f32, @floatFromInt(p.row_h_px))));
         if (row_i < 0) break :blk 0;
         break :blk @intCast(row_i);
     };
+
+    // Core cursor and row vertices are grid-local pixels against the surface's
+    // content extent. drawClearRow() pins the identity transform, so this is
+    // re-applied before every core-vertex draw below. The cursor may belong to
+    // a layer, whose own origin places it.
+    const layer_w: f32 = @floatFromInt(p.content_width);
+    const layer_h: f32 = @floatFromInt(p.content_height);
+    const cursor_ox = p.cursor_layer_origin_x_px;
+    const cursor_oy = p.cursor_layer_origin_y_px;
 
     // 3. Set scissor to cursor row.
     if (p.rs_set_sc_fn) |f| {
@@ -3022,6 +3287,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     if (p.row_already_redrawn) {
         if (p.blink_visible) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
+            g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
             try g.drawVB(vb, p.cursor_verts.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
@@ -3035,6 +3301,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
             const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
+                    g.setLayerTransform(0, 0, layer_w, layer_h);
                     try g.drawVB(row_vb, slot_verts_len);
                 }
             } else if (slot_verts_len > 0) {
@@ -3042,10 +3309,12 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
             }
         }
         if (p.blink_visible) {
+            g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
             try g.drawVB(vb, p.cursor_verts.len);
         }
     } else if (p.blink_visible) {
         if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
+        g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
         try g.drawVB(vb, p.cursor_verts.len);
     } else {
         if (log_enabled) applog.appLog("[cursor-overlay] blink off, redraw row={d}\n", .{cursor_row});
@@ -3059,6 +3328,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
             const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
             if (rvb.vb) |row_vb| {
                 if (slot_verts_len > 0) {
+                    g.setLayerTransform(0, 0, layer_w, layer_h);
                     try g.drawVB(row_vb, slot_verts_len);
                 }
             } else if (slot_verts_len > 0) {
@@ -3090,6 +3360,8 @@ pub fn drawScrollbarOverlay(
     try g.ensureExternalVertexBuffer(vb_ptr, vb_bytes_ptr, need_bytes);
     const vb = vb_ptr.* orelse return error.ScrollbarVertexBufferMissing;
     try g.uploadVertsToVB(vb, scrollbar_verts);
+    // Scrollbar geometry is built in clip space by this frontend.
+    g.setLayerTransform(0, 0, 0, 0);
     try g.drawVB(vb, scrollbar_verts.len);
 }
 
@@ -3143,6 +3415,8 @@ fn drawBloomRowBuffers(
             .MaxDepth = 1,
         };
         set_viewport(d3d_ctx, 1, &viewport);
+        // Core row vertices are grid-local pixels against this viewport.
+        g.setLayerTransform(0, 0, viewport_w, viewport_h);
         g.drawVB(vb, slot.verts.items.len) catch {};
     }
 
@@ -3249,6 +3523,14 @@ pub const App = struct {
 
     // External windows (grid_id -> ExternalWindow)
     external_windows: std.AutoHashMapUnmanaged(i64, *ExternalWindow) = .{},
+
+    /// Vertex storage for grids the main surface places as non-root layers.
+    /// Keyed by grid id; guarded by `mu`. Released on on_grid_destroy.
+    layer_grids: std.AutoHashMapUnmanaged(i64, *LayerGridState) = .{},
+
+    /// Which layer the main surface's cursor belongs to. The surface draws one
+    /// cursor and it has to be placed with its own layer's transform.
+    cursor_layer_grid_id: i64 = 1,
 
     // UI-thread custom-shader animation snapshot. Capacity tracks the
     // high-water external-window count so the 60 Hz path allocates only when
@@ -4171,6 +4453,15 @@ pub const App = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.external_windows.deinit(self.alloc);
+
+        // Layer grid storage
+        var layer_it = self.layer_grids.iterator();
+        while (layer_it.next()) |entry| {
+            entry.value_ptr.*.deinit(self.alloc, null);
+            self.alloc.destroy(entry.value_ptr.*);
+        }
+        self.layer_grids.deinit(self.alloc);
+
         self.shader_anim_external_grids.deinit(self.alloc);
         self.shader_anim_external_renderers.deinit(self.alloc);
         self.pending_external_windows.deinit(self.alloc);

@@ -3042,11 +3042,11 @@ test "pre-flush grid 2 fallback is present in the same committed vertices" {
             _ = row_count;
             _ = total_rows;
             _ = total_cols;
-            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
+            // Every grid emits its own rows now, so grid 2's content arrives
+            // under grid 2 rather than inside grid 1's composited rows.
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (verts.?[0..vert_count]) |vertex| {
-                if (vertex.grid_id == 2) self.saw_grid_2 = true;
-            }
+            if (vert_count != 0) self.saw_grid_2 = true;
         }
     };
 

@@ -1468,7 +1468,6 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 // =========================================================================
 fn makeCoreCbs() core.Callbacks {
     return .{
-        .on_vertices_partial = callbacks.onVerticesPartial,
         .on_vertices_row = callbacks.onVerticesRow,
         // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
         // purpose. They are the Phase 1 (frontend-managed atlas) entry points,
@@ -1518,8 +1517,9 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
-        .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
+        .on_surface_layout = callbacks.onSurfaceLayout,
+        .on_grid_destroy = callbacks.onGridDestroy,
     };
 }
 
@@ -2651,6 +2651,23 @@ pub export fn WndProc(
                         // NDC-to-pixel mapping. Using the client rect (as rectFromCursorVerts
                         // does) causes cumulative position drift because the viewport is
                         // snapped to cell boundaries, which is smaller than the client area.
+                        // Core vertices are grid-local pixels. The root grid's
+                        // layer sits at the surface origin, but a cursor in
+                        // any other grid the surface draws as a layer needs
+                        // that layer's origin added before its position means
+                        // anything in screen space.
+                        var cursor_layer_x_px: f32 = 0;
+                        var cursor_layer_y_px: f32 = 0;
+                        if (cursor_verts_snapshot.len != 0 and cursor_verts_snapshot[0].grid_id != 1) {
+                            for (tbs_snapshot.layers.slice()) |layer| {
+                                if (layer.grid_id == cursor_verts_snapshot[0].grid_id) {
+                                    cursor_layer_x_px = @floatFromInt(layer.x_px);
+                                    cursor_layer_y_px = @floatFromInt(layer.y_px);
+                                    break;
+                                }
+                            }
+                        }
+
                         const cursor_rc_opt: ?c.RECT = if (cursor_verts_snapshot.len != 0) blk: {
                             var minx: f32 = cursor_verts_snapshot[0].position[0];
                             var maxx: f32 = minx;
@@ -2671,15 +2688,15 @@ pub export fn WndProc(
                             const vp_w: u32 = if (base_w > vp_x + sidebar_w) base_w - vp_x - sidebar_w else 1;
                             const vp_h: u32 = content_height;
 
-                            const w_f: f32 = @floatFromInt(vp_w);
-                            const h_f: f32 = @floatFromInt(vp_h);
-                            const x_off_f: f32 = @floatFromInt(vp_x);
-                            const y_off_f: f32 = @floatFromInt(vp_y);
+                            _ = vp_w;
+                            _ = vp_h;
+                            const x_off_f: f32 = @as(f32, @floatFromInt(vp_x)) + cursor_layer_x_px;
+                            const y_off_f: f32 = @as(f32, @floatFromInt(vp_y)) + cursor_layer_y_px;
 
-                            const l_f = x_off_f + (minx + 1.0) * 0.5 * w_f;
-                            const r_f = x_off_f + (maxx + 1.0) * 0.5 * w_f;
-                            const t_f = y_off_f + (1.0 - maxy) * 0.5 * h_f;
-                            const b_f = y_off_f + (1.0 - miny) * 0.5 * h_f;
+                            const l_f = x_off_f + minx;
+                            const r_f = x_off_f + maxx;
+                            const t_f = y_off_f + miny;
+                            const b_f = y_off_f + maxy;
 
                             var l: i32 = @intFromFloat(@floor(l_f));
                             var r: i32 = @intFromFloat(@ceil(r_f));
@@ -2725,15 +2742,18 @@ pub export fn WndProc(
                                         base_w_sh - vp_x_sh - sidebar_w_sh
                                     else
                                         1;
-                                const vp_h_sh: u32 = content_height;
-                                const wf_sh: f32 = @floatFromInt(vp_w_sh);
-                                const hf_sh: f32 = @floatFromInt(vp_h_sh);
-                                const xo_sh: f32 = @floatFromInt(vp_x_sh);
-                                const yo_sh: f32 = @floatFromInt(vp_y_sh);
-                                const left_sh = xo_sh + (minx_sh + 1.0) * 0.5 * wf_sh;
-                                const right_sh = xo_sh + (maxx_sh + 1.0) * 0.5 * wf_sh;
-                                const top_sh = yo_sh + (1.0 - maxy_sh) * 0.5 * hf_sh;
-                                const bottom_sh = yo_sh + (1.0 - miny_sh) * 0.5 * hf_sh;
+                                _ = vp_w_sh;
+                                // The shader reads the cursor uniform in
+                                // screen space, so the layer origin belongs
+                                // here too: without it a cursor shader keeps
+                                // drawing over the top-left window whichever
+                                // split holds the cursor.
+                                const xo_sh: f32 = @as(f32, @floatFromInt(vp_x_sh)) + cursor_layer_x_px;
+                                const yo_sh: f32 = @as(f32, @floatFromInt(vp_y_sh)) + cursor_layer_y_px;
+                                const left_sh = xo_sh + minx_sh;
+                                const right_sh = xo_sh + maxx_sh;
+                                const top_sh = yo_sh + miny_sh;
+                                const bottom_sh = yo_sh + maxy_sh;
                                 // Ghostty's cursor shaders interpret the y
                                 // component as the BOTTOM edge of the
                                 // cursor rect (center is computed as
@@ -3023,6 +3043,12 @@ pub export fn WndProc(
                             .content_x_offset = content_x_offset,
                             .sidebar_right_width = sidebar_right_width,
                             .tabbar_bg_color = tabbar_bg_color,
+                            // The root layer drives the pixel space core
+                            // vertices arrive in. It sits at the surface origin
+                            // today; an anchored float will carry its own
+                            // offset once the core emits multi-layer layouts.
+                            .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+                            .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
                         };
 
                         // Ensure row_vbs array covers committed set's row count.
@@ -3136,6 +3162,46 @@ pub export fn WndProc(
                             }
                         }
 
+                        // Where the cursor's own layer sits, so the overlay is
+                        // placed with that layer's transform rather than the
+                        // root grid's.
+                        const cursor_layer_origin: [2]f32 = blk: {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            const cursor_grid = app.cursor_layer_grid_id;
+                            if (cursor_grid == 1) break :blk .{ 0, 0 };
+                            for (tbs_snapshot.layers.slice()) |l| {
+                                if (l.grid_id == cursor_grid) {
+                                    break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
+                                }
+                            }
+                            break :blk .{ 0, 0 };
+                        };
+
+                        // Non-root layers on top of the root grid, before the
+                        // cursor so the cursor stays on top of everything.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            app_mod.drawSurfaceLayers(
+                                g,
+                                app,
+                                tbs_snapshot.layers.slice(),
+                                .{
+                                    .x = @floatFromInt(content_x_offset orelse 0),
+                                    .y = @floatFromInt(content_y_offset orelse 0),
+                                    .w = @floatFromInt(app_mod.rowModeViewportWidth(g, row_draw_params)),
+                                    .h = @floatFromInt(content_height),
+                                },
+                                content_x_offset_i32,
+                                content_y_offset_i32,
+                                content_right_i32,
+                                row_h_px,
+                                ctx_ptr,
+                                rs_set_sc_fn,
+                            );
+                            app.mu.unlock(core.clock.io());
+                        }
+
                         // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
                         var cursor_overlay_failed = false;
                         app_mod.drawCursorOverlay(g, .{
@@ -3150,8 +3216,11 @@ pub export fn WndProc(
                             .x_offset = content_x_offset_i32,
                             .y_offset = content_y_offset_i32,
                             .content_right = content_right_i32,
+                            .content_width = app_mod.rowModeViewportWidth(g, row_draw_params),
                             .content_height = content_height,
                             .row_h_px = row_h_px,
+                            .cursor_layer_origin_x_px = cursor_layer_origin[0],
+                            .cursor_layer_origin_y_px = cursor_layer_origin[1],
                             .ctx_ptr = ctx_ptr,
                             .rs_set_sc_fn = rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
