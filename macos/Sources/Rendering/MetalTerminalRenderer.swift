@@ -183,7 +183,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     ) {
         guard isInFlush, gridId != 1, rowsDelta != 0 else { return }
         guard prepareMainWriteState() else { return }
-        guard let sets = gridBuffers.existingSets(for: gridId) else { return }
+        guard let sets = gridBuffers.existingSets(for: gridId) else {
+            // The shift is mandatory: the core sends only the rows it vacated,
+            // so a grid whose buffer sets do not exist yet cannot be left with
+            // its surviving rows unshifted. No route to this path is known —
+            // ids are registered on the first submitLayerRow — but failing the
+            // flush is the fail-closed choice: on_flush_end turns this into
+            // zonvie_core_abort_flush plus a retry, which re-dirties the grid
+            // and resends all of its rows.
+            flushFailed = true
+            return
+        }
         remapSurfaceRowSlots(
             bufferSet: sets[writeSetIndex],
             rowStart: rowStart,
