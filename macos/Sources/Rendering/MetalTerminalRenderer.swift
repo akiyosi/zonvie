@@ -239,7 +239,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // carries every layer's rows into it.
         guard prepareMainWriteState() else { return }
         let sets = gridBuffers.sets(for: gridId)
-        _ = submitSurfaceRowVertices(
+        let submitted = submitSurfaceRowVertices(
             target: sets[writeSetIndex],
             sourceSet: sets[flushSourceSetIndex],
             device: device,
@@ -251,6 +251,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             totalCols: totalCols,
             inflightRowBuffers: { (self.inflightRowBuffer(gridId: gridId, atSlot: $0), nil) }
         )
+        if !submitted {
+            // Same contract as the root grid's submitVerticesRowRaw: a row that
+            // could not be stored must abort the flush, or the core clears its
+            // dirty state and never resends it.
+            flushFailed = true
+        }
         markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: 1)
     }
 
@@ -2867,7 +2873,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // The root layer drives the pixel space core vertices arrive in.
             // It sits at the surface origin today; an anchored float will carry
             // its own offset once the core emits multi-layer layouts.
-            let rootLayerOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
+            let rootLayerOrigin = layerSnapshot.first?.originPx ?? simd_float2(0, 0)
             let viewportMetrics = SurfaceViewportMetrics(
                 viewportWidth: vpWidth,
                 viewportHeight: vpHeight,
@@ -3647,6 +3653,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     backTex: backTex,
                     viewportSize: vpSize,
                     drawableSize: view.drawableSize,
+                    layerTransform: viewportMetrics.layerTransform,
                     glowTextures: glowTextures,
                     extractPipeline: extractPipe,
                     kawaseDownPipeline: downPipe,
@@ -3675,11 +3682,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     enc.setVertexBytes(&extractScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
                     var zeroTrans: Float = 0
                     enc.setVertexBytes(&zeroTrans, length: MemoryLayout<Float>.size, index: 3)
-
-                    // Root rows are in the surface's own pixel space. The
-                    // extract viewport is half-size, but NDC is viewport
-                    // relative, so the same transform maps correctly.
-                    bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
 
                     if rowMode {
                         for row in smoothRowRange {

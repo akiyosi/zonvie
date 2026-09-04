@@ -2855,6 +2855,9 @@ final class SurfaceGlowTextures {
 ///   Used for the extract viewport and fragment DrawableSize so NDC ↔ pixel mapping aligns.
 /// - `drawableSize`: raw drawable pixel dimensions. Used for extract texture sizing so that
 ///   blur can bleed beyond the grid viewport into surrounding margin areas.
+/// - `layerTransform`: the pixel space the extract vertices arrive in. Bound before the
+///   closure runs so no call site can forget it; a closure that draws several layers
+///   rebinds it per layer.
 ///
 /// Returns true if bloom was applied.
 @discardableResult
@@ -2864,6 +2867,7 @@ func encodeSurfaceBloomPasses(
     viewportSize: CGSize,
     drawableSize: CGSize,
     viewportOrigin: CGPoint = .zero,
+    layerTransform: LayerTransform,
     glowTextures: SurfaceGlowTextures,
     extractPipeline: MTLRenderPipelineState,
     kawaseDownPipeline: MTLRenderPipelineState,
@@ -2897,6 +2901,9 @@ func encodeSurfaceBloomPasses(
     guard let extractEnc = cmd.makeRenderCommandEncoder(descriptor: extractRPD) else { return false }
     extractEnc.setRenderPipelineState(extractPipeline)
     extractEnc.setViewport(extractViewport)
+    // Vertices are in their layer's own pixel space. The extract viewport is
+    // half-size, but NDC is viewport relative, so the same transform maps correctly.
+    bindLayerTransform(encoder: extractEnc, layerTransform)
     encodeExtractVertices(extractEnc)
     extractEnc.endEncoding()
 
