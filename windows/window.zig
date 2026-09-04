@@ -2902,6 +2902,14 @@ pub export fn WndProc(
                             present_rects.append(app.alloc, cr) catch {};
                         }
 
+                        // Which layers this paint actually built a present rect
+                        // for, indexed by their position in tbs_snapshot.layers.
+                        // The core thread can make a layer dirty after the loop
+                        // below has run; that layer's band is drawn but not
+                        // presented, so only the layers recorded here may have
+                        // their dirty flag consumed.
+                        var layers_presented = std.StaticBitSet(app_mod.MAX_SURFACE_LAYERS).initEmpty();
+
                         // Layers paint whole; present each one that changed.
                         // Their rows are not in rows_to_draw, which only
                         // covers the root grid's own dirty rows.
@@ -2909,7 +2917,7 @@ pub export fn WndProc(
                             app.mu.lockUncancelable(core.clock.io());
                             defer app.mu.unlock(core.clock.io());
                             const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
-                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
                                 const state = app.layer_grids.get(layer.grid_id) orelse continue;
                                 if (!state.dirty) continue;
                                 const l: i32 = @max(0, content_x_offset_i32 + layer.x_px);
@@ -2921,7 +2929,8 @@ pub export fn WndProc(
                                     .bottom = @min(client.bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
                                 };
                                 if (rc.right > rc.left and rc.bottom > rc.top) {
-                                    present_rects.append(app.alloc, rc) catch {};
+                                    present_rects.append(app.alloc, rc) catch continue;
+                                    layers_presented.set(layer_index);
                                 }
                             }
                         }
@@ -3074,6 +3083,13 @@ pub export fn WndProc(
                             // offset once the core emits multi-layer layouts.
                             .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
                             .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+                            // Under ext_multigrid the root grid carries only
+                            // chrome, so the glow pass has to extract the
+                            // layers as well or the buffer text never lights.
+                            .bloom_layers = if (tbs_snapshot.layers.len > 1)
+                                app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
+                            else
+                                null,
                         };
 
                         // Ensure row_vbs array covers committed set's row count.
@@ -3260,7 +3276,16 @@ pub export fn WndProc(
                             );
                             // Their pixels are in back_tex now; the present
                             // rects for this frame were already built above.
-                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                            // Only a layer that got one of those rects has its
+                            // dirty flag consumed here — a layer the core made
+                            // dirty after the rect loop has no rect covering
+                            // it, so it keeps the flag and is presented by the
+                            // next paint. The clear stays inside the same lock
+                            // as the draw so a store landing between the two
+                            // cannot be dropped; a present that then fails
+                            // re-arms these flags below.
+                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
+                                if (!layers_presented.isSet(layer_index)) continue;
                                 if (app.layer_grids.get(layer.grid_id)) |state| state.dirty = false;
                             }
                             app.mu.unlock(core.clock.io());
@@ -3319,6 +3344,11 @@ pub export fn WndProc(
                                 cursor_verts_snapshot
                             else
                                 &[_]core.Vertex{};
+                            // The extract pass reads live layer row storage,
+                            // which the core thread can resize; hold app.mu
+                            // for it exactly as the layer draw above does.
+                            const bloom_locked = row_draw_params.bloom_layers != null;
+                            if (bloom_locked) app.mu.lockUncancelable(core.clock.io());
                             app_mod.drawBloomRowsOverlay(
                                 g,
                                 committed.row_map.items,
@@ -3328,6 +3358,7 @@ pub export fn WndProc(
                                 glow_intensity,
                                 row_draw_params,
                             );
+                            if (bloom_locked) app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {
@@ -3628,6 +3659,21 @@ pub export fn WndProc(
                                     resize_age_ms,
                                 },
                             );
+                        }
+
+                        // Nothing was submitted (the present failed, or
+                        // allow_present refused this frame), so the dirty
+                        // state consumed with the layer draw was never paid
+                        // for: put it back. recoverMainPaintFailure re-arms a
+                        // full paint below on the failure path, and this keeps
+                        // the layer present rects on whichever paint runs next.
+                        if (!render_ok and tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
+                                if (!layers_presented.isSet(layer_index)) continue;
+                                if (app.layer_grids.get(layer.grid_id)) |state| state.dirty = true;
+                            }
+                            app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled) {
@@ -5253,6 +5299,9 @@ pub export fn WndProc(
                     // Complete the generation before publication: shader
                     // pipelines, current client size, and current atlas size
                     // must all belong to the same renderer generation.
+                    // Mirrors the same config flag the core was given in
+                    // loadConfigAndApplyCoreOptions.
+                    r.blur_enabled = app.config.window.blur;
                     r.loadCustomShaderPipelines(&app.config);
                     if (app.corep) |corep| {
                         if (core.zonvie_core_get_glow_enabled(corep)) {
@@ -5810,6 +5859,9 @@ pub export fn WndProc(
                 // because compilation + pixel-shader creation need the
                 // live D3D11 device.
                 if (app.renderer) |*r| {
+                    // Mirrors the same config flag the core was given in
+                    // loadConfigAndApplyCoreOptions.
+                    r.blur_enabled = app.config.window.blur;
                     r.loadCustomShaderPipelines(&app.config);
                     if (r.any_custom_shader_needs_animation) {
                         // Kick continuous-redraw ticker. Runs ~60Hz until

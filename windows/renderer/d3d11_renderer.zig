@@ -343,6 +343,14 @@ pub const Renderer = struct {
     // Background transparency (0.0-1.0, 1.0 = opaque)
     opacity: f32 = 1.0,
 
+    // Mirrors config [window] blur for this renderer's surface. The core
+    // drops the root grid's default-background run when the main surface has
+    // layers AND blur is on (src/core/flush.zig, skip_default_bg), so the row
+    // draw has to overwrite each band itself in that case even at opacity
+    // 1.0. Only the main window sets this; external windows keep their own
+    // default background run.
+    blur_enabled: bool = false,
+
     // Neovim default background color (0x00RRGGBB), used for the
     // ClearRenderTargetView color. Without this, the bottom/right
     // remainder strip below/right of the cell-aligned NDC viewport
