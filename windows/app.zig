@@ -1922,11 +1922,10 @@ pub const LayerGridState = struct {
     /// layer's rect and clears it.
     dirty: bool = false,
 
-    pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator, g: ?*d3d11.Renderer) void {
+    pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator) void {
         for (self.rows_buf.items) |*rv| {
             rv.verts.deinit(alloc);
             if (rv.vb) |vb| {
-                if (g) |_| {} // release below regardless of renderer presence
                 _ = vb.*.lpVtbl.*.Release.?(@ptrCast(vb));
                 rv.vb = null;
                 rv.vb_bytes = 0;
@@ -3538,6 +3537,16 @@ fn drawBloomRowBuffers(
     const ctx: *const BloomRowsContext = @ptrCast(@alignCast(opaque_ctx orelse return));
     const set_viewport = d3d_ctx.*.lpVtbl.*.RSSetViewports orelse return;
 
+    // The extract target is half resolution, so the viewport handed in is half
+    // the surface's while core vertices stay in full-resolution surface pixels.
+    // Binding the FULL-resolution extent against that half-size viewport is
+    // what scales them down by 2 (NDC is viewport relative): a vertex at
+    // surface pixel p lands at extract pixel viewport_origin + p / 2. Binding
+    // the half extent instead would make the mapping one-to-one and push
+    // everything past half the surface outside the extract target.
+    const extent_w_px = viewport_w * 2.0;
+    const extent_h_px = viewport_h * 2.0;
+
     for (ctx.row_map, 0..) |mapping, row_index| {
         if (row_index >= ctx.row_vbs.len or mapping.slot == SLOT_NONE) continue;
         const vb = ctx.row_vbs[row_index].vb orelse continue;
@@ -3547,6 +3556,8 @@ fn drawBloomRowBuffers(
         const row_delta = @as(i32, @intCast(row_index)) - @as(i32, @intCast(slot.origin_row));
         var viewport: c.D3D11_VIEWPORT = .{
             .TopLeftX = viewport_x,
+            // The shift is a full-resolution pixel distance, but the viewport
+            // origin is in half-resolution extract pixels, hence the halving.
             .TopLeftY = viewport_y + @as(f32, @floatFromInt(row_delta * ctx.row_h_px)) / 2.0,
             .Width = viewport_w,
             .Height = viewport_h,
@@ -3555,7 +3566,7 @@ fn drawBloomRowBuffers(
         };
         set_viewport(d3d_ctx, 1, &viewport);
         // Core row vertices are grid-local pixels against this viewport.
-        g.setLayerTransform(0, 0, viewport_w, viewport_h);
+        g.setLayerTransform(0, 0, extent_w_px, extent_h_px);
         g.drawVB(vb, slot.verts.items.len) catch {};
     }
 
@@ -3590,13 +3601,13 @@ fn drawBloomRowBuffers(
                     if (rv.uploaded_gen != rv.gen) continue;
                     const vb = rv.vb orelse continue;
                     const row_dy = layerRowShiftPx(state, ri, ctx.row_h_px);
-                    g.setLayerTransform(origin_x, origin_y + row_dy, viewport_w, viewport_h);
+                    g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px);
                     g.drawVB(vb, rv.verts.items.len) catch {};
                 }
             }
             // Restore the surface's own pixel space for the cursor draw that
             // drawBloomPasses runs after this callback.
-            g.setLayerTransform(0, 0, viewport_w, viewport_h);
+            g.setLayerTransform(0, 0, extent_w_px, extent_h_px);
         }
     }
 }
@@ -3710,10 +3721,6 @@ pub const App = struct {
     /// Vertex storage for grids the main surface places as non-root layers.
     /// Keyed by grid id; guarded by `mu`. Released on on_grid_destroy.
     layer_grids: std.AutoHashMapUnmanaged(i64, *LayerGridState) = .{},
-
-    /// Which layer the main surface's cursor belongs to. The surface draws one
-    /// cursor and it has to be placed with its own layer's transform.
-    cursor_layer_grid_id: i64 = 1,
 
     // UI-thread custom-shader animation snapshot. Capacity tracks the
     // high-water external-window count so the 60 Hz path allocates only when
@@ -4641,7 +4648,7 @@ pub const App = struct {
         // Layer grid storage
         var layer_it = self.layer_grids.iterator();
         while (layer_it.next()) |entry| {
-            entry.value_ptr.*.deinit(self.alloc, null);
+            entry.value_ptr.*.deinit(self.alloc);
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.layer_grids.deinit(self.alloc);

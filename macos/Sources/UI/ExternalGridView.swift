@@ -164,7 +164,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Set (core thread) when a vertex/row buffer allocation fails during
     // this flush bracket. Consumed by ZonvieCore's on_flush_end via
     // consumeFlushFailed(), which cancels the bracket instead of committing
-    // it and calls zonvie_core_force_resend + schedules a retry (mirrors
+    // it and calls zonvie_core_abort_flush, then schedules a retry when the
+    // core reports the flush retryable (mirrors
     // MetalTerminalRenderer.flushFailed).
     private(set) var flushFailed: Bool = false    // Flush bracket thread only
     // Complete row metadata lives independently in every set. A set only
@@ -3300,8 +3301,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     bilinearSampler: bilinSamp,
                     intensity: intensity
                     ) { enc in
-                    // Set up atlas and scroll offsets for extract pass
-                    // NOTE: DrawableSize (fragment buffer 0) is already set by the shared helper
+                    // Set up atlas and scroll offsets for extract pass.
+                    // NOTE: the shared helper binds no fragment buffer, and none is
+                    // needed: ps_glow_extract takes only texture(0) + sampler(0).
+                    // The helper does bind the layer transform (vertex buffer 4).
                     enc.setFragmentTexture(atlasTex, index: 0)
                     enc.setFragmentSamplerState(self.sampler!, index: 0)
 

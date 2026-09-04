@@ -297,11 +297,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private let flushChangedMainRows = StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers)
     private var mainRowStateNeedsFullSync = [false, false, false]
     private var flushHasStructuralMainChange = false
-    // Set (core thread) when a vertex/row buffer allocation fails during
-    // this flush bracket — an empty/undersized buffer set must not become
-    // the new committed state. Consumed by ZonvieCore's on_flush_end (via
-    // consumeFlushFailed()), which cancels the bracket instead of
-    // committing it and calls zonvie_core_force_resend + schedules a retry.
+    // Set (core thread) when a vertex/row buffer allocation fails, or when a
+    // mandatory row shift cannot be applied, during this flush bracket — an
+    // empty/undersized/unshifted buffer set must not become the new committed
+    // state. Consumed by ZonvieCore's on_flush_end (via consumeFlushFailed()),
+    // which cancels the bracket instead of committing it and calls
+    // zonvie_core_abort_flush, then schedules a retry when the core reports
+    // the flush retryable.
     private(set) var flushFailed: Bool = false // Core thread only
     // ExternalGridView carries a deliberately parallel ledger and
     // provisioning pass. The two are NOT unified: the pure parts already live

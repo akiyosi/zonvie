@@ -1468,6 +1468,10 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 // =========================================================================
 fn makeCoreCbs() core.Callbacks {
     return .{
+        // Declares the callbacks layout this frontend was built against; the
+        // core refuses a mismatch. Set explicitly to document the contract,
+        // even though the Zig struct already defaults to it.
+        .abi_version = core.CALLBACKS_ABI_VERSION,
         .on_vertices_row = callbacks.onVerticesRow,
         // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
         // purpose. They are the Phase 1 (frontend-managed atlas) entry points,

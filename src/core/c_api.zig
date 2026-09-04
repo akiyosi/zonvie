@@ -336,7 +336,24 @@ pub const PopupmenuColors = extern struct {
     pmenu_sel_fg: u32,
 };
 
+/// Layout version of Callbacks, mirroring ZONVIE_CALLBACKS_ABI_VERSION in
+/// include/zonvie_core.h. Bump it whenever a field is removed, reordered, or
+/// has its signature changed. Appending a new callback at the end stays
+/// backward compatible through callbacks_size and must NOT bump it.
+pub const CALLBACKS_ABI_VERSION: u32 = 1;
+
 pub const Callbacks = extern struct {
+    /// Must equal CALLBACKS_ABI_VERSION; zonvie_core_create returns null
+    /// otherwise. callbacks_size can only report that the struct's LENGTH
+    /// changed, never that its LAYOUT did: commit 935bdc0 removed two
+    /// callbacks and appended two, so a consumer built before it passes a
+    /// callbacks_size equal to the current @sizeOf while every pointer from
+    /// on_vertices_row onward sits at the wrong offset. The field is first on
+    /// purpose -- a stale build has a function pointer at that offset and
+    /// cannot match the version by accident. It defaults to the current
+    /// version because any Zig caller is compiled against this very layout.
+    abi_version: u32 = CALLBACKS_ABI_VERSION,
+
     on_vertices_row: ?OnVerticesRowFn = null,
 
     on_atlas_ensure_glyph: ?AtlasEnsureGlyphFn = null,
@@ -574,6 +591,18 @@ pub const Callbacks = extern struct {
         surface_cols: u32,
     ) callconv(.c) void = null,
     on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+
+    // No total-size assertion: appending a callback is a legal, ABI-compatible
+    // change. What must hold is that the version stays readable at offset 0 by
+    // any caller, whatever the rest of the struct grows into.
+    comptime {
+        if (@offsetOf(Callbacks, "abi_version") != 0) {
+            @compileError("Callbacks.abi_version offset mismatch! Expected 0.");
+        }
+        if (@sizeOf(@FieldType(Callbacks, "abi_version")) != 4) {
+            @compileError("Callbacks.abi_version size mismatch! Expected 4 bytes.");
+        }
+    }
 };
 
 pub const zonvie_core = opaque {};
@@ -603,6 +632,18 @@ fn asBox(p: *zonvie_core) *CoreBox {
 }
 
 pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, ctx: ?*anyopaque) ?*zonvie_core {
+    // Refuse a consumer built against a different callbacks layout before
+    // anything else is read from it. Only abi_version is touched here: every
+    // other field, on_log included, may sit at the wrong offset, so the
+    // refusal cannot be logged. A zero callbacks_size still means "install no
+    // callbacks at all", so nothing can be mis-wired and no version is read.
+    if (cb) |p| {
+        if (callbacks_size != 0) {
+            if (callbacks_size < @sizeOf(u32)) return null;
+            if (p.abi_version != CALLBACKS_ABI_VERSION) return null;
+        }
+    }
+
     // Eagerly initialize the shared Io before any worker threads spawn.
     clock.init();
 
@@ -820,6 +861,21 @@ test "retry entry points reject work after stop is requested" {
     zonvie_core_retry_flush(p);
     zonvie_core_retry_flush_locked(p);
     try std.testing.expectEqual(@as(u32, 0), state.callback_count);
+}
+
+test "core creation refuses a callbacks struct from a different ABI version" {
+    // A stale consumer can pass a callbacks_size equal to the current
+    // @sizeOf while its layout differs, so the size check alone lets it
+    // through; only abi_version can reject it.
+    var stale: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION + 1 };
+    try std.testing.expect(zonvie_core_create(&stale, @sizeOf(Callbacks), null) == null);
+
+    var zeroed: Callbacks = .{ .abi_version = 0 };
+    try std.testing.expect(zonvie_core_create(&zeroed, @sizeOf(Callbacks), null) == null);
+
+    var current: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION };
+    const p = zonvie_core_create(&current, @sizeOf(Callbacks), null) orelse return error.OutOfMemory;
+    zonvie_core_destroy(p);
 }
 
 test "grid text extraction trims blanks and reports the size a short buffer needs" {
@@ -2438,8 +2494,8 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     if (box.core.isPhase2Atlas()) {
         box.core.resetCoreAtlas();
     }
-    // Scroll cache stores vertices with atlas UVs; invalidate after atlas reset.
-    box.core.invalidateScrollCache();
+    // The mirrored frame holds atlas UVs; invalidate after atlas reset.
+    box.core.invalidateMirroredFrameState();
     box.core.grid.markAllDirty();
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).
