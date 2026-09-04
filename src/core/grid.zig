@@ -2957,6 +2957,17 @@ pub const Grid = struct {
         try self.setWinPos(grid_id, win_id, row, col);
     }
 
+    /// Drop the surface size recorded for a grid that no longer renders as its
+    /// own surface. `grid_resize` only refreshes `external_grid_target_sizes`
+    /// while the grid is in `external_grids` or `ext_windows_grids`, so an
+    /// entry left behind after the grid leaves both freezes the published
+    /// viewport at the pre-transition size while `sg.rows` keeps moving, and
+    /// the window renders truncated to the stale row count.
+    fn dropUntrackedTargetSize(self: *Grid, grid_id: i64) void {
+        if (self.ext_windows_grids.contains(grid_id)) return;
+        _ = self.external_grid_target_sizes.remove(grid_id);
+    }
+
     pub fn setWinFloatPos(
         self: *Grid,
         grid_id: i64,
@@ -3020,6 +3031,7 @@ pub const Grid = struct {
         // This allows a grid to transition from external back to float.
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
+        self.dropUntrackedTargetSize(grid_id);
 
         // Mark old position dirty if this float is moving
         var affects_main = false;
@@ -3131,6 +3143,7 @@ pub const Grid = struct {
         _ = self.win_layer.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
+        self.dropUntrackedTargetSize(grid_id);
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
             self.cursor_rev +%= 1;
