@@ -1648,8 +1648,19 @@ pub fn onGridRowScroll(
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
 
+    // An empty region or a zero shift carries no rows, so the core vacates
+    // none and this owes no resend.
     if (rows_delta == 0 or row_end <= row_start) return;
-    if (col_start != 0 or col_end != total_cols) return;
+    // The core refuses a partial-width scroll and regenerates the grid
+    // instead (see the on_grid_row_scroll contract in include/zonvie_core.h),
+    // so one arriving here means the refusal did not happen. The shift cannot
+    // be applied to full-width row storage; ask for the full resend the
+    // contract owes rather than dropping it.
+    if (col_start != 0 or col_end != total_cols) {
+        core.zonvie_core_force_resend_locked(app.corep);
+        failFlush(app);
+        return;
+    }
 
     // A grid the main surface places as a layer shifts its own rows here. The
     // core sends only the vacated ones afterwards, so the survivors have to be
@@ -1662,6 +1673,12 @@ pub fn onGridRowScroll(
             } else {
                 app.flush_needs_invalidate = true;
             }
+        } else {
+            // No storage for this grid yet, so the mandatory shift cannot be
+            // applied and the vacated-rows-only follow-up would land on rows
+            // that were never carried. Request the full resend instead.
+            core.zonvie_core_force_resend_locked(app.corep);
+            failFlush(app);
         }
         return;
     }

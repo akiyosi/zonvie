@@ -2805,10 +2805,13 @@ pub fn drawSurfaceRowsVBFromSlots(
         const t_draw_start = if (log_enabled) core.clock.nowNs() else 0;
         // A translucent surface must not blend this row over its own previous
         // pixels: reset the band first so alpha does not compound across
-        // redraws. (Only when a scissor limits the band to this row; the
-        // seed path draws every row under a full-area scissor and a
-        // whole-surface overwrite there would erase rows already drawn.)
-        if (g.opacity < 1.0 and rs_set_sc_fn != null) {
+        // redraws. With blur on, the core skips the root grid's default-bg
+        // run entirely (flush.zig, skip_default_bg), so an opaque surface
+        // needs the same overwrite or nothing repaints a vacated column.
+        // (Only when a scissor limits the band to this row; the seed path
+        // draws every row under a full-area scissor and a whole-surface
+        // overwrite there would erase rows already drawn.)
+        if ((g.opacity < 1.0 or g.blur_enabled) and rs_set_sc_fn != null) {
             g.drawClearRowOverwrite() catch {
                 metrics.skipped_empty += 1;
                 metrics.failed_rows += 1;
@@ -3110,6 +3113,16 @@ pub fn drawExternalSurfaceFlat(
     try gpu.drawEx(scratch.items, &[_]Vertex{}, null, draw_opts);
 }
 
+/// The non-root layers a surface places, plus the App that owns their row
+/// storage. The bloom extract pass needs both to light layer rows; under
+/// ext_multigrid the root grid holds only chrome, so a root-only extract
+/// leaves the buffer text unlit.
+pub const BloomLayerSource = struct {
+    app: *App,
+    /// Full layer list, root first; only the non-root entries are extracted.
+    layers: []const SurfaceLayer,
+};
+
 /// Parameters for shared row-mode draw sequence (drawEx setup + drawSurfaceRowsVB + bloom collect).
 /// Used by both main window WM_PAINT and external window paint path.
 pub const RowModeDrawParams = struct {
@@ -3135,6 +3148,10 @@ pub const RowModeDrawParams = struct {
     content_x_offset: ?u32 = null,
     sidebar_right_width: ?u32 = null,
     tabbar_bg_color: ?[4]f32 = null,
+    /// Layers to include in the bloom extract pass. Null for a surface that
+    /// places none; the caller must hold `app.mu` across the bloom call when
+    /// it is set, because the extract reads live layer row storage.
+    bloom_layers: ?BloomLayerSource = null,
 
     /// Compute bloom viewport from these params.
     pub fn bloomViewport(self: RowModeDrawParams, renderer_width: u32) struct { x: u32, y: u32, w: u32, h: u32 } {
@@ -3196,6 +3213,18 @@ pub fn rowModeViewportWidth(g: *d3d11.Renderer, params: RowModeDrawParams) u32 {
     return if (base_w > vp_x_offset + sidebar_r_w) base_w - vp_x_offset - sidebar_r_w else 1;
 }
 
+/// How far a row-shift hint moved this layer row's vertices from where they
+/// were built. The layer draw and the bloom extract apply the same offset.
+fn layerRowShiftPx(state: *const LayerGridState, row_index: usize, row_h_px: i32) f32 {
+    const origin_row: u32 = if (row_index < state.origin_rows.items.len)
+        state.origin_rows.items[row_index]
+    else
+        @intCast(row_index);
+    return @floatFromInt(
+        (@as(i32, @intCast(row_index)) - @as(i32, @intCast(origin_row))) * row_h_px,
+    );
+}
+
 /// Draw the surface's non-root layers, back-to-front, on top of the root grid.
 /// Each layer gets its own pixel space and is clipped to its own rect. A layer
 /// whose grid has no rows yet draws nothing, which is what the core's layout
@@ -3240,8 +3269,11 @@ pub fn drawSurfaceLayers(
             // translucent background blended over its own previous output
             // compounds toward opaque; the overwrite also erases whatever a
             // now-empty row used to show (a closed split's separator).
-            // An opaque surface needs it only for a row the core emptied.
-            if (g.opacity < 1.0 or rv.verts.items.len == 0) {
+            // An opaque surface needs it for a row the core emptied, and with
+            // blur on for every row: the core then skips the root grid's
+            // default-bg run (flush.zig, skip_default_bg), so no other pass
+            // repaints the columns this layer's row no longer covers.
+            if (g.opacity < 1.0 or g.blur_enabled or rv.verts.items.len == 0) {
                 g.drawClearRowOverwrite() catch continue;
             }
             if (rv.verts.items.len == 0) continue;
@@ -3255,13 +3287,7 @@ pub fn drawSurfaceLayers(
             }
             // A row-shift hint moves an array between rows without rewriting
             // its pixels, so offset it by the distance it moved.
-            const origin_row: u32 = if (ri < state.origin_rows.items.len)
-                state.origin_rows.items[ri]
-            else
-                @intCast(ri);
-            const row_dy: f32 = @floatFromInt(
-                (@as(i32, @intCast(ri)) - @as(i32, @intCast(origin_row))) * row_h_px,
-            );
+            const row_dy: f32 = layerRowShiftPx(state, ri, row_h_px);
             g.setLayerTransform(origin_x, origin_y + row_dy, base_vp.w, base_vp.h);
             g.drawVB(vb, rv.verts.items.len) catch continue;
         }
@@ -3495,6 +3521,9 @@ const BloomRowsContext = struct {
     pool: *const SlotPool,
     row_vbs: []const RowVB,
     row_h_px: i32,
+    /// Non-root layers extracted after the root rows. Null for a surface
+    /// without layers.
+    bloom_layers: ?BloomLayerSource = null,
 };
 
 fn drawBloomRowBuffers(
@@ -3541,6 +3570,35 @@ fn drawBloomRowBuffers(
         .MaxDepth = 1,
     };
     set_viewport(d3d_ctx, 1, &base_viewport);
+
+    // Non-root layers glow too: under ext_multigrid the root grid holds only
+    // chrome, so extracting root rows alone leaves the whole buffer unlit.
+    // Same rows, same row-shift offset as drawSurfaceLayers, with each
+    // layer's origin carried by the layer transform instead of the viewport.
+    if (ctx.bloom_layers) |src| {
+        if (src.layers.len > 1) {
+            for (src.layers[1..]) |layer| {
+                const state = src.app.layer_grids.get(layer.grid_id) orelse continue;
+                const origin_x: f32 = @floatFromInt(layer.x_px);
+                const origin_y: f32 = @floatFromInt(layer.y_px);
+                const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+                for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
+                    if (rv.verts.items.len == 0) continue;
+                    // Only a buffer holding this row's current vertices is
+                    // safe to draw: the layer pass skips a row whose upload
+                    // failed and leaves uploaded_gen behind.
+                    if (rv.uploaded_gen != rv.gen) continue;
+                    const vb = rv.vb orelse continue;
+                    const row_dy = layerRowShiftPx(state, ri, ctx.row_h_px);
+                    g.setLayerTransform(origin_x, origin_y + row_dy, viewport_w, viewport_h);
+                    g.drawVB(vb, rv.verts.items.len) catch {};
+                }
+            }
+            // Restore the surface's own pixel space for the cursor draw that
+            // drawBloomPasses runs after this callback.
+            g.setLayerTransform(0, 0, viewport_w, viewport_h);
+        }
+    }
 }
 
 /// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
@@ -3562,6 +3620,20 @@ pub fn drawBloomRowsOverlay(
             break;
         }
     }
+    // A root grid that only holds chrome has no rows here, but its layers do.
+    if (!has_rows) {
+        if (draw_params.bloom_layers) |src| {
+            if (src.layers.len > 1) layer_scan: for (src.layers[1..]) |layer| {
+                const state = src.app.layer_grids.get(layer.grid_id) orelse continue;
+                for (state.rows_buf.items) |*rv| {
+                    if (rv.vb != null and rv.verts.items.len != 0) {
+                        has_rows = true;
+                        break :layer_scan;
+                    }
+                }
+            };
+        }
+    }
     if (!has_rows) return;
 
     const rows_ctx = BloomRowsContext{
@@ -3569,6 +3641,7 @@ pub fn drawBloomRowsOverlay(
         .pool = pool,
         .row_vbs = row_vbs,
         .row_h_px = draw_params.row_h_px,
+        .bloom_layers = draw_params.bloom_layers,
     };
     const bvp = draw_params.bloomViewport(g.width);
     g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
