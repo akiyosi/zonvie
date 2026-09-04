@@ -2193,7 +2193,7 @@ final class MetalTerminalView: MTKView {
     /// - Returns: Current scroll offset in pixels (for sub-cell visual offset)
     /// Tell the renderer which main-surface rows each visible grid's smooth
     /// scroll may retain an outgoing row from. A vertical split or a float
-    /// always fails the core's row-scroll fast path (partial_width), so the
+    /// always fails the core's row-scroll fast path (partial width), so the
     /// grid_scroll capture is the only thing that can keep their outgoing row
     /// alive. A full-width grid normally belongs to the fast path, but that
     /// path only sees rows that actually shifted — a 'smoothscroll' window

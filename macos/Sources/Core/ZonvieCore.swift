@@ -3478,7 +3478,7 @@ final class ZonvieCore {
         let dh = max(1, Int(ds.height))
         zonvie_core_update_layout_px_locked(c, UInt32(dw), UInt32(dh), UInt32(cw), UInt32(ch))
 
-        // Force-dirty all rows and invalidate glyph/scroll caches.
+        // Force-dirty all rows and invalidate the glyph/shape caches.
         // When only the font weight changes (same cell dimensions), Neovim
         // does not send a full redraw.  Without this, row-mode reuses cached
         // vertex data whose atlas UVs point into the old (now cleared) texture.
@@ -3674,7 +3674,7 @@ final class ZonvieCore {
         // pendingGuiFontLock for the same clear-or-stash decision).
         //
         // Setting firstPresentDone, reading the pending payload, clearing
-        // it, AND running setFont/updateLayoutPx_locked/invalidate ALL
+        // it, AND running setFont/updateLayoutPx/invalidate ALL
         // happen under the same continuous grid_mu hold. That makes the
         // deferred apply atomic with respect to handleRedraw exactly like
         // the inline path: an onGuiFont arriving on the RPC thread either

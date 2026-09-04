@@ -3409,7 +3409,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
     ext_win.surface.paint_full = false;
 
-    // Check if renderer resize is needed (deferred from onExternalVertices to avoid deadlock)
+    // Check if renderer resize is needed (deferred from onVerticesRow to avoid deadlock)
     const needs_resize = ext_win.needs_renderer_resize;
     if (needs_resize) {
         ext_win.needs_renderer_resize = false;
