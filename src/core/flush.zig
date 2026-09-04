@@ -70,12 +70,6 @@ pub const CachedSubgrid = struct {
     margin_right: u32 = 0, // viewport margin columns at right (not scrollable)
 };
 
-pub const MainSubgridRowLayout = struct {
-    grid_id: i64,
-    row_start: u32,
-    row_end: u32,
-};
-
 const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
 const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
@@ -390,31 +384,6 @@ comptime {
     );
 }
 
-const RowRange = struct {
-    start: usize,
-    end: usize,
-};
-
-/// The rows of `csg` that fall inside a `row_count`-row viewport, or null when
-/// it contributes none.
-///
-/// The main row index is built in five passes over the same slice, and each
-/// one used to carry its own copy of this predicate. Only one of the couplings
-/// between those passes is guarded by an assert; the rest would corrupt the
-/// index silently if the copies ever disagreed, so they share this one.
-///
-/// The returned rows are CLAMPED. Two of the five passes want the guard but
-/// then record or compare the subgrid's own unclamped row_start/row_end -- the
-/// layout snapshot describes the cache entry, not the part of it that happens
-/// to be on screen -- so they take the range and discard it.
-fn mainSubgridVisibleRowRange(csg: CachedSubgrid, row_count: usize) ?RowRange {
-    const start: usize = @min(@as(usize, csg.row_start), row_count);
-    const end: usize = @min(@as(usize, csg.row_end), row_count);
-    // The zero-size terms are defensive: the builder already drops those.
-    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) return null;
-    return .{ .start = start, .end = end };
-}
-
 /// Size a CSR buffer exactly and, for the counts array, zero it.
 ///
 /// `ensureTotalCapacityPrecise` never shrinks, so the explicit length
@@ -460,14 +429,6 @@ fn csrSeedWriteOffsets(
 ) !void {
     try csrResizeExact(alloc, write_offsets, row_count, false);
     @memcpy(write_offsets.items, offsets[0..row_count]);
-}
-
-fn mainSubgridRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize, layouts: usize) ?usize {
-    const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
-    const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
-    const usize_bytes = std.math.mul(usize, usize_count, @sizeOf(usize)) catch return null;
-    const layout_bytes = std.math.mul(usize, layouts, @sizeOf(MainSubgridRowLayout)) catch return null;
-    return std.math.add(usize, usize_bytes, layout_bytes) catch null;
 }
 
 fn viewportCellScrollable(
@@ -1027,16 +988,6 @@ pub const FlushCache = struct {
 
 
 
-
-/// Result of scroll cache shift + validity check.
-pub const ScrollCacheShiftResult = struct {
-    /// True if all non-regen rows have valid cache after shift.
-    fast_path_ok: bool,
-    /// Number of cached rows that would be emitted (valid, non-regen).
-    cached_emit_count: u32,
-    /// Number of cached rows with vert_count == 0 (empty row emission).
-    empty_emit_count: u32,
-};
 
 
 // ---------------------------------------------------------------------------
@@ -5007,12 +4958,14 @@ fn buildExternalFloatAnchorIndex(core: *Core) !void {
 /// Build a sorted, per-row index for floats visible in one external grid.
 /// The flattened row buckets preserve the global layer order because entries
 /// are inserted into every covered row in sorted order.
-/// The external-float index has no layout array, so its storage size is the
-/// main-grid formula with zero layouts -- with `layouts == 0` the layout term
-/// is 0 and the final add cannot overflow, so the two agree on every input
-/// including the ones that return null.
+/// The index is three usize arrays, so its storage size is their element
+/// counts summed and scaled. Every step is checked: the callers charge the
+/// result against a byte budget, and a wrapped size would pass a budget it
+/// actually blows.
 fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
-    return mainSubgridRowIndexStorageByteSize(offsets, write_offsets, refs, 0);
+    const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
+    const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
+    return std.math.mul(usize, usize_count, @sizeOf(usize)) catch null;
 }
 
 fn externalFloatPersistentScratchCapacityByteSize(core: *const Core) ?usize {
@@ -5633,7 +5586,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // rejects (left/right != full width) but this condition used to miss,
             // leaving the moved region's stale pre-scroll content on the GPU
             // forever (only the vacated band was ever marked dirty).
-            const ext_scroll_needs_full_regen: bool =
+            // Set again below when the regen set overflows: abandoning the
+            // fast path mid-build lands in the same bucket, because the
+            // frontend was already told to shift its rows.
+            var ext_scroll_needs_full_regen: bool =
                 !ext_scroll_fast_path and sg.last_scroll_op != null;
 
             // Cursor is rendered as a separate layer (after row loop), NOT inline
@@ -5658,34 +5614,58 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         } else {
                             // Too many dirty rows for fast path — fall back
                             use_ext_scroll_fast_path = false;
+                            ext_scroll_needs_full_regen = true;
                             break;
                         }
                     }
                 }
                 // When viewport_rows < sg.rows (margin rows present), the Neovim
-                // dirty bitmap marks the out-of-bounds vacated row (e.g. row 44
+                // dirty bitmap marks the out-of-bounds vacated rows (e.g. row 44
                 // for sg.rows=45, viewport_rows=44). The frontend scroll callback
-                // receives the clamped region, so its vacated row is within the
-                // viewport. Add the clamped vacated row to regen if not already
-                // present. Without this, the vacated row gets no vertex data and
-                // renders blank after the GPU scroll blit.
+                // receives the clamped region, so the rows it actually empties
+                // are within the viewport. Add that clamped vacated band to
+                // regen where the dirty bitmap does not already cover it.
+                // Without this, those rows get no vertex data and render blank
+                // after the GPU scroll blit.
+                //
+                // A scroll of k rows vacates a band of k rows, not one. Upward,
+                // GridBuf.scroll dirties [op.bot - k, op.bot) while the frontend
+                // empties [clamped_bot - k, clamped_bot); once op.bot exceeds
+                // viewport_rows the two bands no longer line up and every row in
+                // [clamped_bot - k, min(op.bot - k, clamped_bot)) is vacated on
+                // screen yet never marked dirty. Downward both bands are
+                // [op.top, op.top + k) and the whole band is already dirty, so
+                // op.top alone still stands in for it.
                 if (use_ext_scroll_fast_path and viewport_rows < sg.rows) {
                     const op = sg.last_scroll_op.?;
                     const clamped_bot = @min(op.bot, viewport_rows);
-                    const vacated: u32 = if (op.rows > 0) clamped_bot -| 1 else op.top;
-                    var found = false;
-                    for (regen_rows[0..regen_count]) |rr| {
-                        if (rr == vacated) {
-                            found = true;
-                            break;
+                    // The fast path admitted this op, so 0 < op.rows <=
+                    // (clamped_bot - op.top) / 2 and the band start cannot
+                    // underflow.
+                    const shift_rows: u32 = if (op.rows > 0) @intCast(op.rows) else 0;
+                    const band_start_rows: u32 =
+                        if (op.rows > 0) clamped_bot -| shift_rows else op.top;
+                    const band_end_rows: u32 = if (op.rows > 0)
+                        @min(op.bot -| shift_rows, clamped_bot)
+                    else
+                        op.top + 1;
+                    var vacated = band_start_rows;
+                    while (vacated < band_end_rows) : (vacated += 1) {
+                        var found = false;
+                        for (regen_rows[0..regen_count]) |rr| {
+                            if (rr == vacated) {
+                                found = true;
+                                break;
+                            }
                         }
-                    }
-                    if (!found) {
+                        if (found) continue;
                         if (regen_count < regen_rows.len) {
                             regen_rows[regen_count] = vacated;
                             regen_count += 1;
                         } else {
                             use_ext_scroll_fast_path = false;
+                            ext_scroll_needs_full_regen = true;
+                            break;
                         }
                     }
                 }
@@ -10635,6 +10615,247 @@ test "external scroll without row-shift callback regenerates every retained row"
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
 }
 
+test "an overflowed external scroll regen set regenerates the whole viewport" {
+    const State = struct {
+        row_calls: u32 = 0,
+        scroll_calls: u32 = 0,
+        seen_rows: [14]bool = .{false} ** 14,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.row_calls += row_count;
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scroll_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    // A resize transition: the retained GridBuf is 15 rows while the frontend
+    // target viewport is 14, so one margin row sits outside the viewport.
+    try core.grid.resizeGrid(1, 14, 2);
+    try core.grid.resizeGrid(2, 15, 2);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 14, .cols = 2 });
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 14,
+        .cols = 2,
+    });
+    for (0..15) |row| {
+        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
+    }
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 14;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+
+    // Seed the retained external surface, then isolate the scroll update.
+    core.sendExternalGridVertices(true);
+    try std.testing.expectEqual(@as(u32, 14), state.row_calls);
+    state = .{};
+
+    // A fast-path-eligible one-row scroll. The frontend has already shifted
+    // its row slots by the clamped region when the vertices are composed.
+    core.grid.scrollGrid(2, 0, 15, 0, 2, 1, 0);
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+
+    // Neovim vacates the out-of-viewport row 14; the clamped vacated row the
+    // frontend actually emptied is row 13. Dirty exactly regen_rows.len other
+    // in-viewport rows so the margin compensation has no slot left for row 13
+    // and abandons the fast path.
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    for (0..12) |row| {
+        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('a' + row), 0);
+    }
+    try std.testing.expect(!sg.dirty_all);
+    try std.testing.expect(sg.isRowDirty(14));
+    try std.testing.expect(!sg.isRowDirty(12));
+    try std.testing.expect(!sg.isRowDirty(13));
+
+    state.row_calls = 0;
+    state.seen_rows = .{false} ** 14;
+    core.sendExternalGridVertices(false);
+
+    // An abandoned fast path owes the whole viewport: the frontend's rows are
+    // already shifted, so the dirty bitmap alone would leave row 13 (and the
+    // shifted rows the bitmap never marked) holding stale pre-scroll content.
+    try std.testing.expectEqual([_]bool{true} ** 14, state.seen_rows);
+    try std.testing.expectEqual(@as(u32, 14), state.row_calls);
+}
+
+test "a margin-clamped external scroll regenerates the whole vacated band" {
+    const State = struct {
+        row_calls: u32 = 0,
+        scroll_calls: u32 = 0,
+        seen_rows: [16]bool = .{false} ** 16,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.row_calls += row_count;
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.scroll_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    // A resize transition: the retained GridBuf keeps 20 rows while the
+    // frontend target viewport is 16, so four margin rows sit outside it.
+    try core.grid.resizeGrid(1, 16, 2);
+    try core.grid.resizeGrid(2, 20, 2);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 16, .cols = 2 });
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 16,
+        .cols = 2,
+    });
+    for (0..20) |row| {
+        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
+    }
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 16;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+
+    // Seed the retained external surface, then isolate the scroll update.
+    core.sendExternalGridVertices(true);
+    try std.testing.expectEqual(@as(u32, 16), state.row_calls);
+    state = .{};
+
+    // A fast-path-eligible three-row scroll over the full grid height. The
+    // frontend shifts the clamped region [0, 16) and empties rows 13..15.
+    core.grid.scrollGrid(2, 0, 20, 0, 2, 3, 0);
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+
+    // Neovim vacates [17, 20) — entirely outside the viewport — so the dirty
+    // bitmap marks no in-viewport row at all. Row 2 stands in for an ordinary
+    // grid_line update so the regen set is not empty, and it must not grow the
+    // set past regen_rows.len (that would hand the assertion to the overflow
+    // fix instead of this one).
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    core.grid.putCellGrid(2, 2, 0, 'z', 0);
+    try std.testing.expect(!sg.dirty_all);
+    try std.testing.expect(sg.isRowDirty(17));
+    try std.testing.expect(sg.isRowDirty(2));
+    try std.testing.expect(!sg.isRowDirty(13));
+    try std.testing.expect(!sg.isRowDirty(14));
+    try std.testing.expect(!sg.isRowDirty(15));
+
+    state.row_calls = 0;
+    state.seen_rows = .{false} ** 16;
+    core.sendExternalGridVertices(false);
+
+    // The whole vacated band the frontend emptied — 13, 14 and 15 — must be
+    // resent, not just its last row, and nothing else beyond the dirty row 2.
+    var expected = [_]bool{false} ** 16;
+    expected[2] = true;
+    expected[13] = true;
+    expected[14] = true;
+    expected[15] = true;
+    try std.testing.expectEqual(expected, state.seen_rows);
+    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
+}
+
 test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
     const State = struct {
         raster_calls: u32 = 0,
@@ -14013,31 +14234,29 @@ test "resolveHlCached memoizes below the limit and resolves live above it" {
     try std.testing.expectEqual(@as(u32, 0), unused_misses);
 }
 
-test "the external-float storage size is the main formula with zero layouts" {
-    // Folding one into the other rests on the layout term vanishing at
-    // layouts == 0, including at the boundaries where either returns null.
+test "the external-float storage size is the three arrays, and null at every overflow edge" {
+    // The callers charge this against a byte budget, so a size that wrapped
+    // would pass a budget it actually blows: each of the three checked
+    // operations has to answer null rather than a small number.
     const max = std.math.maxInt(usize);
-    const cases = [_][3]usize{
-        .{ 0, 0, 0 },
-        .{ 1, 2, 3 },
-        .{ 4, 4, 1024 },
-        // Each of the three checked operations at its overflow edge.
-        .{ max, 1, 0 },
-        .{ max / 2, max / 2, max },
-        .{ max / @sizeOf(usize), 1, 0 },
-        .{ max / @sizeOf(usize) + 1, 0, 0 },
+    const cases = [_]struct { in: [3]usize, want: ?usize }{
+        .{ .in = .{ 0, 0, 0 }, .want = 0 },
+        .{ .in = .{ 1, 2, 3 }, .want = 6 * @sizeOf(usize) },
+        .{ .in = .{ 4, 4, 1024 }, .want = 1032 * @sizeOf(usize) },
+        // The offsets + write_offsets add.
+        .{ .in = .{ max, 1, 0 }, .want = null },
+        // The + refs add, on a sum that itself still fits.
+        .{ .in = .{ max / 2, max / 2, max }, .want = null },
+        // The scale by @sizeOf(usize), from both sides of its edge.
+        .{ .in = .{ max / @sizeOf(usize), 1, 0 }, .want = null },
+        .{ .in = .{ max / @sizeOf(usize), 0, 0 }, .want = (max / @sizeOf(usize)) * @sizeOf(usize) },
     };
     for (cases) |c| {
         try std.testing.expectEqual(
-            mainSubgridRowIndexStorageByteSize(c[0], c[1], c[2], 0),
-            externalFloatRowIndexStorageByteSize(c[0], c[1], c[2]),
+            c.want,
+            externalFloatRowIndexStorageByteSize(c.in[0], c.in[1], c.in[2]),
         );
     }
-    // The equivalence is specific to zero layouts: a non-zero layout count
-    // must make the main formula larger, or folding would have lost a term.
-    const with_layouts = mainSubgridRowIndexStorageByteSize(4, 4, 8, 2).?;
-    const without = externalFloatRowIndexStorageByteSize(4, 4, 8).?;
-    try std.testing.expect(with_layouts > without);
 }
 
 test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
@@ -14083,71 +14302,6 @@ test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cur
     try std.testing.expectEqualSlices(usize, &.{0}, &empty_offsets);
     try csrSeedWriteOffsets(alloc, &write_offsets, &empty_offsets, 0);
     try std.testing.expectEqual(@as(usize, 0), write_offsets.items.len);
-}
-
-test "mainSubgridVisibleRowRange clamps to the viewport and rejects the invisible" {
-    // The main row-index builder walks `cached` five times and each pass
-    // repeated this filter by hand. Five copies of a three-term predicate is
-    // one edit away from the passes disagreeing, and only one of the four
-    // couplings between them is guarded by an explicit assert -- the rest
-    // corrupt the index silently. This is the single copy they all call now.
-    const row_count: usize = 10;
-    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
-    const mk = struct {
-        fn f(cp: [*]const grid_mod.Cell, row_start: u32, row_end: u32, sg_cols: u32, sg_rows: u32) CachedSubgrid {
-            return .{
-                .grid_id = 2,
-                .row_start = row_start,
-                .row_end = row_end,
-                .col_start = 0,
-                .sg_cols = sg_cols,
-                .sg_rows = sg_rows,
-                .cells = cp,
-                .margin_top = 0,
-                .margin_bottom = 0,
-            };
-        }
-    }.f;
-    const cp = cells[0..].ptr;
-
-    // Fully inside: the range is the subgrid's own rows.
-    const inside = mainSubgridVisibleRowRange(mk(cp, 2, 5, 4, 3), row_count).?;
-    try std.testing.expectEqual(@as(usize, 2), inside.start);
-    try std.testing.expectEqual(@as(usize, 5), inside.end);
-
-    // Straddling the bottom edge: the end clamps, the start does not move.
-    const straddle = mainSubgridVisibleRowRange(mk(cp, 8, 14, 4, 6), row_count).?;
-    try std.testing.expectEqual(@as(usize, 8), straddle.start);
-    try std.testing.expectEqual(row_count, straddle.end);
-
-    // Both sides of the bottom boundary.
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 10, 12, 4, 2), row_count) == null);
-    const flush_bottom = mainSubgridVisibleRowRange(mk(cp, 8, 10, 4, 2), row_count).?;
-    try std.testing.expectEqual(@as(usize, 8), flush_bottom.start);
-    try std.testing.expectEqual(row_count, flush_bottom.end);
-
-    // row_end is built with a saturating add, so a hostile window position
-    // can present it already saturated. The clamp must absorb that.
-    const saturated = mainSubgridVisibleRowRange(mk(cp, 8, std.math.maxInt(u32), 4, 6), row_count).?;
-    try std.testing.expectEqual(@as(usize, 8), saturated.start);
-    try std.testing.expectEqual(row_count, saturated.end);
-
-    // Entirely below the viewport: both clamp to row_count, so start >= end.
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 12, 16, 4, 4), row_count) == null);
-
-    // Zero-sized in either dimension. The production builder already filters
-    // these out, so both arms are defensive -- do not prune them as dead.
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 0, 3), row_count) == null);
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 4, 0), row_count) == null);
-
-    // The `start >= end` arm on its own. The record is deliberately
-    // inconsistent with the production row_end = row_start + sg_rows
-    // invariant so that neither size term can carry this case.
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 3, 3, 4, 3), row_count) == null);
-
-    // A zero-row viewport admits nothing, which is a real state: neither the
-    // caller nor onFlush guards rows == 0.
-    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 0, 3, 4, 3), 0) == null);
 }
 
 /// Recover the emitted corner order of a six-vertex solid quad.
