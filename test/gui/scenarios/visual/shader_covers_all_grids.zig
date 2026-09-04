@@ -28,7 +28,7 @@ const crop: ?driver.capture.Crop = null;
 
 /// Minimum green pixels before the cursor-band check means anything. A run
 /// that rendered no band at all would otherwise report a centroid of zero
-/// and pass the left-half assertion for the wrong reason.
+/// and pass the left-phase assertion for the wrong reason.
 const min_band_px: usize = 200;
 
 fn stripeFraction(img: driver.capture.Image, x0: usize, x1: usize, y0: usize, y1: usize) f64 {
@@ -71,7 +71,24 @@ fn bandCentroidX(img: driver.capture.Image, y0: usize, y1: usize) struct { x: f6
     return .{ .x = if (n == 0) 0 else sum / @as(f64, @floatFromInt(n)), .n = n };
 }
 
+/// Where the band must land, in capture pixels, for the window holding the
+/// cursor: its first screen column times the cell width. This makes both
+/// phases exact rather than "somewhere in the correct half" — a cursor
+/// pinned to the top-left window produces a left-half band all by itself,
+/// and an origin error of a few cells, or one that used the anchor grid
+/// instead of the layer, stays inside the half it belongs to.
+fn expectedBandX(g: *Gui, cell_w: f64) !f64 {
+    const win_col = try g.evalInt("win_screenpos(0)[1]");
+    return @as(f64, @floatFromInt(win_col - 1)) * cell_w;
+}
+
 pub fn run(alloc: std.mem.Allocator) !void {
+    // A log left by a previous run holds that run's [resizeExternalWindows]
+    // line, and the cellW read below does not filter by timestamp — a stale
+    // cell width would silently become this run's expectation.
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+    std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
+
     var g = try Gui.init(alloc, .{
         .app_args = &.{ "--log", log_path },
         .config_dir = "test/gui/fixtures/config_cursor_shader",
@@ -111,13 +128,23 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.ShaderCoverageMissing;
     }
 
+    // The cell width the app is actually laying out with, which turns a
+    // window's screen column into the x the band must land on.
+    const cell_w = blk: {
+        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+            return error.CellMetricsUnknown;
+        defer alloc.free(line);
+        break :blk app_log.field(line, "cellW") orelse return error.CellMetricsUnknown;
+    };
+
     const left_band = bandCentroidX(left_img, y0, y1);
+    const left_expected_x = try expectedBandX(g, cell_w);
     std.debug.print(
-        "[gui] cursor band with cursor in LEFT split: x={d:.1} px={d}\n",
-        .{ left_band.x, left_band.n },
+        "[gui] cursor band with cursor in LEFT split: x={d:.1} px={d}; expected {d:.1} (cell {d:.1}px)\n",
+        .{ left_band.x, left_band.n, left_expected_x, cell_w },
     );
     if (left_band.n < min_band_px) return error.CursorBandNotRendered;
-    if (left_band.x > @as(f64, @floatFromInt(w)) * 0.5) {
+    if (@abs(left_band.x - left_expected_x) > cell_w) {
         std.debug.print("[gui] cursor band is not in the split holding the cursor\n", .{});
         return error.CursorUniformMisplaced;
     }
@@ -132,20 +159,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const right_band = bandCentroidX(right_img, y0, y1);
 
-    // Where the cursor actually is on screen, so the check is exact rather
-    // than "somewhere in the right half": an origin error of a few cells, or
-    // one that used the anchor grid instead of the layer, stays in that half.
-    const win_col = try g.evalInt("win_screenpos(0)[1]");
-    const cell_w = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
-            return error.CellMetricsUnknown;
-        defer alloc.free(line);
-        break :blk app_log.field(line, "cellW") orelse return error.CellMetricsUnknown;
-    };
-    const expected_x = @as(f64, @floatFromInt(win_col - 1)) * cell_w;
+    const expected_x = try expectedBandX(g, cell_w);
     std.debug.print(
-        "[gui] cursor band with cursor in RIGHT split: x={d:.1} px={d}; expected {d:.1} (screen column {d}, cell {d:.1}px)\n",
-        .{ right_band.x, right_band.n, expected_x, win_col, cell_w },
+        "[gui] cursor band with cursor in RIGHT split: x={d:.1} px={d}; expected {d:.1} (cell {d:.1}px)\n",
+        .{ right_band.x, right_band.n, expected_x, cell_w },
     );
     if (right_band.n < min_band_px) return error.CursorBandNotRendered;
     if (@abs(right_band.x - expected_x) > cell_w) {

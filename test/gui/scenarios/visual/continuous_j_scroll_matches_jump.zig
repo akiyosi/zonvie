@@ -25,10 +25,13 @@ const std = @import("std");
 const driver = @import("../../driver.zig");
 const fixture = @import("fixture.zig");
 const visual = @import("../../visual.zig");
+const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
 
-/// The fixture launches the app with this log.
-const log_path = "tmp/gui_app.log";
+/// The fixture launches the app with this log. It is this scenario's own, not
+/// the shared one: the shift count below is only an oracle while every line it
+/// sees came from this run's app process.
+const log_path = "tmp/gui_continuous_j_scroll.log";
 
 const content_band: visual.Region = .{};
 
@@ -39,7 +42,12 @@ const crop: driver.capture.Crop = .{ .w_pt = 600, .h_pt = 300 };
 const single_steps: usize = 12;
 
 pub fn run(alloc: std.mem.Allocator) !void {
-    var g = try fixture.open(alloc);
+    // A file left by a crashed earlier run would still be appended to, and
+    // its lines would be counted alongside this run's.
+    std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
+    std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
+
+    var g = try fixture.openWithLog(alloc, log_path);
     defer g.deinit();
 
     // Nothing outside the text area may react to the cursor, or the
