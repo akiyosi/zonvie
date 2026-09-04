@@ -669,7 +669,7 @@ pub const TripleBufferedSurface = struct {
     flush_requires_full_sync: bool = false,
 
     // Flush-local scroll state (core thread only, no lock needed).
-    // Accumulated by onMainRowScroll / onGridRowScroll during a single flush.
+    // Accumulated by onGridRowScroll during a single flush.
     flush_scroll_rect: ?c.RECT = null,
     flush_scroll_dy_px: i32 = 0,
     flush_vb_shift: i32 = 0,
@@ -2481,7 +2481,7 @@ pub fn ensureShiftScratch(
     list.resize(alloc, need) catch {};
 }
 
-/// Scroll state consumed by paint. Returned by consumeScrollState / applyScrollShift.
+/// Scroll state consumed by paint. Returned by applyScrollShift.
 pub const ScrollShiftResult = struct {
     /// The scroll region rect (in back_tex coords). null if no scroll was applied.
     scroll_rect: ?c.RECT = null,
@@ -2602,8 +2602,8 @@ pub fn applyScrollShift(
             } else if (vb_shift_rows > 0) {
                 // Scroll up (j-key): gap rows at bottom of scroll region.
                 // Gap rows form a contiguous range; merge them into the sorted
-                // rows_to_draw list in one pass to avoid repeated O(n) scans in
-                // appendRowSorted.
+                // rows_to_draw list in one pass to avoid repeated O(n) scans
+                // from per-row sorted inserts.
                 const gap_start: u32 = region_bot_row - abs_shift;
                 const gap_end: u32 = @min(region_bot_row, effective_rows);
                 if (!render_pipeline_helpers.mergeSortedRowsWithRange(
@@ -2638,7 +2638,7 @@ pub fn applyScrollShift(
 }
 
 /// Draw rows from slot-based row_map with separate RowVB GPU buffers.
-/// This is the TBS-equivalent of drawSurfaceRowsVB.
+/// This is the TBS row-mode draw path.
 pub fn drawSurfaceRowsVBFromSlots(
     g: *d3d11.Renderer,
     budget: *RowVBPhysicalBudget,
@@ -3122,7 +3122,7 @@ pub const BloomLayerSource = struct {
     layers: []const SurfaceLayer,
 };
 
-/// Parameters for shared row-mode draw sequence (drawEx setup + drawSurfaceRowsVB + bloom collect).
+/// Parameters for shared row-mode draw sequence (drawEx setup + drawSurfaceRowsVBFromSlots + bloom collect).
 /// Used by both main window WM_PAINT and external window paint path.
 pub const RowModeDrawParams = struct {
     content_height: u32,
@@ -4452,7 +4452,7 @@ pub const App = struct {
                 // Grid-based: use cursor grid's bounds
                 // Note: For ext-float, we use window bounds (same as .window mode)
                 // because calling zonvie_core_get_visible_grids here would cause deadlock
-                // when called from onExternalVertices with mutex locked.
+                // when called from onVerticesRow with mutex locked.
                 // Mini windows use a different code path that handles grid bounds properly.
                 const cursor_grid = self.last_cursor_grid;
 

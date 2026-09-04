@@ -1972,8 +1972,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
                 // Publish: without a revision bump the next draw computes
                 // hasNewCommit=false and its early-exit path would consume and
-                // discard the dirty marks above. Callers that bump again via
-                // bumpRevisionAndRedraw are harmless (monotonic counter).
+                // discard the dirty marks above. Callers that bump the
+                // revision again are harmless (monotonic counter).
                 commitRevision &+= 1
                 recordCommittedRowMutationLocked(
                     committedIndex: csi,

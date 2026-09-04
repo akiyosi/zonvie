@@ -2652,7 +2652,7 @@ pub export fn WndProc(
 
                         // Compute cursor rect directly from NDC vertices using viewport
                         // dimensions (content_height etc.) to match the D3D11 viewport's
-                        // NDC-to-pixel mapping. Using the client rect (as rectFromCursorVerts
+                        // NDC-to-pixel mapping. Using the client rect (as rectFromVerts
                         // does) causes cumulative position drift because the viewport is
                         // snapped to cell boundaries, which is smaller than the client area.
                         // Core vertices are grid-local pixels. The root grid's
@@ -4164,7 +4164,7 @@ pub export fn WndProc(
                 } else {
                     // Cursor moved to global grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
-                    // Only invalidate if no paint is already pending from on_vertices_row/partial.
+                    // Only invalidate if no paint is already pending from on_vertices_row.
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
                     // will handle cursor rendering as part of the normal draw.
                     app.mu.lockUncancelable(core.clock.io());
