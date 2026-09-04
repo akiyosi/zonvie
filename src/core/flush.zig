@@ -4677,6 +4677,62 @@ pub const SurfaceLayoutSig = struct {
     }
 };
 
+/// The window grids the main surface draws as its own layers, back-to-front
+/// and already truncated to what one layout can carry, in `core.grid_entries`.
+///
+/// `collectSurfaceLayers` and `collectEmitGrids` share this so a grid can never
+/// emit rows no surface places: the acceptance test and the truncation are the
+/// same code for both.
+fn collectMainLayerEntries(self: *Core) []const GridEntry {
+    self.grid_entries.clearRetainingCapacity();
+    var it = self.grid.win_pos.iterator();
+    while (it.next()) |e| {
+        const grid_id = e.key_ptr.*;
+        if (grid_id == 1) continue;
+        // An external grid is its own surface, never a layer of another.
+        if (self.grid.external_grids.contains(grid_id)) continue;
+        const pos = e.value_ptr.*;
+        // A float belongs to the surface its anchor lives on. An external
+        // surface still composites its anchored floats into its own rows, so
+        // they are not layers of it; only the main surface draws its floats as
+        // layers.
+        if (self.grid.external_grids.contains(pos.anchor_grid)) continue;
+        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
+        if (sg.rows == 0 or sg.cols == 0) continue;
+
+        const layer = self.grid.win_layer.get(grid_id) orelse grid_mod.WinLayer{
+            .zindex = 0,
+            .compindex = 0,
+            .order = 0,
+        };
+        self.grid_entries.append(self.alloc, .{
+            .grid_id = grid_id,
+            .zindex = layer.zindex,
+            .compindex = layer.compindex,
+            .order = layer.order,
+        }) catch break;
+    }
+
+    // Back-to-front: smaller first, larger last. Same ordering the composited
+    // overlay used, so z order is unchanged by the move to layers.
+    std.sort.block(GridEntry, self.grid_entries.items, {}, struct {
+        fn lessThan(_: void, a: GridEntry, b: GridEntry) bool {
+            if (a.zindex != b.zindex) return a.zindex < b.zindex;
+            if (a.compindex != b.compindex) return a.compindex < b.compindex;
+            if (a.order != b.order) return a.order < b.order;
+            return a.grid_id < b.grid_id;
+        }
+    }.lessThan);
+
+    // The surface root takes the first layer slot, so the window grids share
+    // what is left of `MAX_SURFACE_LAYERS`. Dropping from the FRONT of a
+    // back-to-front order discards the BOTTOM-most layers: an overflow then
+    // loses what the layers above it would have covered anyway, never the
+    // frontmost windows the user is actually looking at.
+    const first = self.grid_entries.items.len -| (MAX_SURFACE_LAYERS - 1);
+    return self.grid_entries.items[first..];
+}
+
 /// Collect one surface's layers, back-to-front, into `core.layout_scratch`.
 ///
 /// `win_pos` positions are already global grid coordinates, so a layer's
@@ -4710,51 +4766,14 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         root_col = ext.start_col;
     }
 
-    self.grid_entries.clearRetainingCapacity();
-    var it = self.grid.win_pos.iterator();
-    while (it.next()) |e| {
-        const grid_id = e.key_ptr.*;
-        if (grid_id == surface_id) continue;
-        // An external grid is its own surface, never a layer of another.
-        if (self.grid.external_grids.contains(grid_id)) continue;
-        const pos = e.value_ptr.*;
-        // A float belongs to the surface its anchor lives on. Anything
-        // anchored to an external grid composites into that grid's window.
-        const anchor_is_external = self.grid.external_grids.contains(pos.anchor_grid);
-        // An external surface still composites its anchored floats into its
-        // own rows, so they are not layers of it; only the main surface draws
-        // its floats as layers.
-        if (anchor_is_external) continue;
-        if (surface_id != 1) continue;
-        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
-        if (sg.rows == 0 or sg.cols == 0) continue;
+    // Only the main surface draws window grids as layers; an external surface
+    // composites its anchored floats into its own rows.
+    const entries: []const GridEntry = if (surface_id == 1)
+        collectMainLayerEntries(self)
+    else
+        &.{};
 
-        const layer = self.grid.win_layer.get(grid_id) orelse grid_mod.WinLayer{
-            .zindex = 0,
-            .compindex = 0,
-            .order = 0,
-        };
-        self.grid_entries.append(self.alloc, .{
-            .grid_id = grid_id,
-            .zindex = layer.zindex,
-            .compindex = layer.compindex,
-            .order = layer.order,
-        }) catch break;
-    }
-
-    // Back-to-front: smaller first, larger last. Same ordering the composited
-    // overlay used, so z order is unchanged by the move to layers.
-    std.sort.block(GridEntry, self.grid_entries.items, {}, struct {
-        fn lessThan(_: void, a: GridEntry, b: GridEntry) bool {
-            if (a.zindex != b.zindex) return a.zindex < b.zindex;
-            if (a.compindex != b.compindex) return a.compindex < b.compindex;
-            if (a.order != b.order) return a.order < b.order;
-            return a.grid_id < b.grid_id;
-        }
-    }.lessThan);
-
-    for (self.grid_entries.items) |ent| {
-        if (self.layout_scratch.items.len >= MAX_SURFACE_LAYERS) break;
+    for (entries) |ent| {
         const pos = self.grid.win_pos.get(ent.grid_id) orelse continue;
         const sg = self.grid.sub_grids.get(ent.grid_id) orelse continue;
         const dx: i64 = (@as(i64, pos.col) - root_col) * cell_w;
@@ -4801,20 +4820,13 @@ fn collectEmitGrids(self: *Core) void {
     while (ext_it.next()) |grid_id_ptr| {
         self.emit_grid_ids.append(self.alloc, grid_id_ptr.*) catch return;
     }
-    var pos_it = self.grid.win_pos.iterator();
-    while (pos_it.next()) |e| {
-        const grid_id = e.key_ptr.*;
-        if (grid_id == 1) continue;
-        // Already added above as its own surface's root.
-        if (self.grid.external_grids.contains(grid_id)) continue;
-        const pos = e.value_ptr.*;
-        // A float anchored to an external grid is still composited into that
-        // grid's own rows by the loop below, so emitting it separately would
-        // draw it twice. Only the main surface draws its floats as layers.
-        if (self.grid.external_grids.contains(pos.anchor_grid)) continue;
-        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
-        if (sg.rows == 0 or sg.cols == 0) continue;
-        self.emit_grid_ids.append(self.alloc, grid_id) catch return;
+    // Exactly the grids the main surface publishes as layers, truncation
+    // included: a grid past the layer limit is drawn by nobody, so emitting
+    // its rows would only charge them against the vertex budget. A float
+    // anchored to an external grid is composited into that grid's own rows and
+    // is not in this set, so it is never emitted twice.
+    for (collectMainLayerEntries(self)) |ent| {
+        self.emit_grid_ids.append(self.alloc, ent.grid_id) catch return;
     }
 }
 
@@ -14941,6 +14953,59 @@ test "surface layout publishes one root layer per surface and only when it chang
     try std.testing.expectEqual(@as(usize, 1), state.destroyed_count);
 }
 
+test "a flush frees a destroyed grid's glyph mirror before it announces the destruction" {
+    const State = struct {
+        core: *Core,
+        destroyed: [4]i64 = @splat(0),
+        destroyed_count: usize = 0,
+        mirror_live_at_destroy: bool = false,
+
+        fn onDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.core.glyph_mirror.contains(grid_id)) self.mirror_live_at_destroy = true;
+            if (self.destroyed_count < self.destroyed.len) {
+                self.destroyed[self.destroyed_count] = grid_id;
+                self.destroyed_count += 1;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(10, 20);
+    try core.grid.resizeGrid(2, 10, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_grid_destroy = State.onDestroy;
+
+    // One row the grid is showing, recorded the way a generated row records it.
+    const verts = [_]c_api.Vertex{.{
+        .position = .{ 0, 0 },
+        .texCoord = .{ 0.5, 0.25 },
+        .color = .{ 0, 0, 0, 0 },
+        .grid_id = 2,
+        .deco_flags = 0,
+        .deco_phase = 0,
+    }};
+    core.recordGlyphMirrorRow(2, 0, 10, &verts);
+    try std.testing.expect(core.glyph_mirror.contains(2));
+
+    try core.grid.destroyGrid(2);
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    try std.testing.expectEqual(@as(usize, 1), state.destroyed_count);
+    try std.testing.expectEqual(@as(i64, 2), state.destroyed[0]);
+    // A destroyed grid shows nothing, and keeping its rows would pin their
+    // shelves for the rest of the session.
+    try std.testing.expect(!core.glyph_mirror.contains(2));
+    // Released before the destruction is announced, so no handler can see a
+    // mirror that still claims rows for a grid that is gone.
+    try std.testing.expect(!state.mirror_live_at_destroy);
+}
+
 test "an aborted flush owes the surface layout again" {
     const State = struct {
         core: *Core = undefined,
@@ -15491,4 +15556,77 @@ test "a downward scroll publishes a negative shift and refills the top row" {
     try std.testing.expectEqual(@as(i32, -1), state.last_rows_delta);
     try std.testing.expectEqual(@as(u32, 1), state.rows_emitted);
     try std.testing.expectEqual(@as(u32, 0), state.last_row_start);
+}
+
+test "same-region scrolls in a batch reach on_grid_scroll as one signed summed delta" {
+    const State = struct {
+        calls: u32 = 0,
+        main_calls: u32 = 0,
+        main_delta: i32 = 0,
+        sub_calls: u32 = 0,
+        sub_delta: i32 = 0,
+
+        fn onScroll(ctx: ?*anyopaque, grid_id: i64, rows_delta: i32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            if (grid_id == 1) {
+                self.main_calls += 1;
+                self.main_delta = rows_delta;
+            } else if (grid_id == 2) {
+                self.sub_calls += 1;
+                self.sub_delta = rows_delta;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(10, 20);
+    try core.grid.resizeGrid(2, 10, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_grid_scroll = State.onScroll;
+
+    // Several scrolls of one grid in one batch produce one notification. A
+    // frontend holding a sub-cell offset has to give back exactly the distance
+    // the content travelled, so the deltas must net out signed rather than
+    // count events or keep only the last one.
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 3, 0);
+    core.grid.scrollGrid(2, 0, 10, 0, 20, -1, 0);
+    core.grid.scrollGrid(1, 0, 10, 0, 20, 2, 0);
+    core.grid.scrollGrid(1, 0, 10, 0, 20, -1, 0);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    try std.testing.expectEqual(@as(u32, 2), state.calls);
+    try std.testing.expectEqual(@as(u32, 1), state.sub_calls);
+    try std.testing.expectEqual(@as(i32, 2), state.sub_delta);
+    try std.testing.expectEqual(@as(u32, 1), state.main_calls);
+    try std.testing.expectEqual(@as(i32, 1), state.main_delta);
+}
+
+test "an overflowing same-region accumulation fails closed instead of shifting" {
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    // Each event's distance is clamped to the region height, but a batch
+    // accumulates without a bound, so seed the accumulator where one more
+    // event no longer fits an i32. The sum is what the frontend would shift
+    // by: a wrapped one would move the rows the wrong way.
+    core.grid.sub_grids.getPtr(2).?.last_scroll_op.?.rows = std.math.maxInt(i32) - 1;
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 2, 0);
+    try std.testing.expect(core.grid.sub_grids.get(2).?.scroll_fast_path_blocked);
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+
+    // No shift hint, and the whole grid is regenerated instead.
+    try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
+    try std.testing.expectEqual(@as(u32, 10), state.rows_emitted);
 }

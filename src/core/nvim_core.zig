@@ -30,11 +30,23 @@ pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, 
 
 pub const GLYPH_CACHE_INVALID_KEY: u64 = std.math.maxInt(u64);
 
-/// Flushes a shifted-out row stays in the reclamation liveness set. macOS keeps
-/// at most two retained scroll rows and shifts them one flush at a time; one
-/// flush of slack covers the hand-off. An expired shadow only ever delays
-/// reclamation, so erring high is the safe direction.
+/// Flushes a shifted-out row stays in the reclamation liveness set. macOS
+/// shifts its retained rows one flush at a time; one flush of slack covers the
+/// hand-off. An expired shadow only ever delays reclamation, so erring high is
+/// the safe direction.
 pub const retained_shadow_expiry: u8 = 3;
+
+/// Vacated rows the shadow holds at once, sized to what a frontend can still
+/// be drawing after this core stopped mirroring them.
+///
+/// macOS `ScrollRetention` (macos/Sources/Rendering/MetalTypes.swift) draws at
+/// most `maxDepthRows` (4) retained rows for each of `maxRetainedGrids` (8)
+/// grids, so 4 * 8 rows can be on screen without this core's mirror. Windows
+/// retains nothing: `swapAndShiftRows` (windows/callbacks.zig) clears a
+/// vacated row's vertices outright. Holding fewer than the macOS bound lets
+/// reclamation free the shelves of a row that is still being drawn, which
+/// shows whatever glyph next lands in that space.
+pub const retained_shadow_slots: usize = 4 * 8;
 const TRANSIENT_GLYPH_RETRY_INITIAL_NS: i128 = 250 * std.time.ns_per_ms;
 const TRANSIENT_GLYPH_RETRY_MAX_NS: i128 = 4 * std.time.ns_per_s;
 const TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS: u8 = 5;
@@ -542,8 +554,8 @@ pub const Core = struct {
     /// UVs of rows a row-shift hint vacated. The frontend keeps drawing a
     /// retained copy of such a row for the sub-row ease, so its shelves must
     /// stay live for the same number of flushes.
-    retained_uv_shadow: [2]std.ArrayListUnmanaged(f32) = .{ .empty, .empty },
-    retained_shadow_age: [2]u8 = .{ retained_shadow_expiry, retained_shadow_expiry },
+    retained_uv_shadow: [retained_shadow_slots]std.ArrayListUnmanaged(f32) = @splat(.empty),
+    retained_shadow_age: [retained_shadow_slots]u8 = @splat(retained_shadow_expiry),
     retained_shadow_next: usize = 0,
     flush_vertex_count_aggregate: usize = 0,
     vertex_budget_transaction_active: bool = false,
