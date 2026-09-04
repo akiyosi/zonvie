@@ -299,7 +299,9 @@ test "gui:visual_shader_covers_all_grids" {
 }
 
 test "gui:cmdline_cursor_shader_rect" {
-    if (comptime driver.capture.supported) {
+    // macOS only: the shader cursor plumbing and the window enumeration this
+    // uses live in the macOS frontend and macos_window.zig.
+    if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/macos/cmdline_cursor_shader_rect.zig").run(testing.allocator);
     } else {

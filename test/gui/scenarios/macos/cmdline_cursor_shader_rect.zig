@@ -27,6 +27,10 @@ const log_path = "tmp/gui_cmdline_cursor_shader.log";
 const marker = "[shader_cursor]";
 const max_windows = 16;
 
+/// ZonvieCore.cmdlineGridId (macos/Sources/Core/ZonvieCore.swift:4343): the id
+/// the ext-cmdline's surface publishes its shader cursor rect under.
+const cmdline_grid_id: f64 = -100;
+
 
 const Rect = struct { x: f64, y: f64, w: f64, h: f64, grid: f64 };
 
@@ -116,9 +120,17 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // The rect must come from the cmdline's own surface. A stale main-window
     // rect for a cursor at column 0 would otherwise satisfy every bound below
     // whenever the cmdline window starts at or left of the main window.
-    if (rect.grid == 1) {
-        std.debug.print("[gui] the published rect still belongs to the main grid\n", .{});
-        return error.CursorRectFromMainGrid;
+    // Require the publisher to BE the cmdline grid rather than merely not be
+    // the main one: shaderCursorGridId starts at 0
+    // (macos/Sources/Rendering/MetalTerminalRenderer.swift:1080), so a
+    // regression that never staged a grid id, or one that staged a window
+    // grid (2, 3, ...), passes any "not 1" form of this check.
+    if (rect.grid != cmdline_grid_id) {
+        std.debug.print(
+            "[gui] the published rect belongs to grid {d:.0}, not the cmdline grid {d:.0}\n",
+            .{ rect.grid, cmdline_grid_id },
+        );
+        return error.CursorRectNotFromCmdlineGrid;
     }
 
     // Feeding grid-local pixels through the old NDC formula multiplied them
