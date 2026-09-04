@@ -3163,15 +3163,29 @@ fn storeMainSurfaceLayerRowLocked(
 ) bool {
     if (!mainSurfaceOwnsGridLocked(app, grid_id)) return false;
 
-    const gop = app.layer_grids.getOrPut(app.alloc, grid_id) catch return false;
+    // The row belongs to this path, so an allocation failure must not fall
+    // through to the external-window path. Abort the flush and have the core
+    // re-send instead, and still report the row consumed.
+    const gop = app.layer_grids.getOrPut(app.alloc, grid_id) catch {
+        core.zonvie_core_force_resend_locked(app.corep);
+        failFlush(app);
+        return true;
+    };
     if (!gop.found_existing) {
         const created = app.alloc.create(app_mod.LayerGridState) catch {
             _ = app.layer_grids.remove(grid_id);
-            return false;
+            core.zonvie_core_force_resend_locked(app.corep);
+            failFlush(app);
+            return true;
         };
         created.* = .{};
         gop.value_ptr.* = created;
     }
-    _ = gop.value_ptr.*.storeRow(app.alloc, row, verts, total_rows, total_cols);
+    if (!gop.value_ptr.*.storeRow(app.alloc, row, verts, total_rows, total_cols)) {
+        // The row is left stale or empty with its generation unchanged, so the
+        // layer cannot be presented until the core re-sends it.
+        core.zonvie_core_force_resend_locked(app.corep);
+        failFlush(app);
+    }
     return true;
 }
