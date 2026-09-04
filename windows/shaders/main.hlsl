@@ -41,6 +41,11 @@ SamplerState samp0 : register(s0);
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
+// Block elements the core fills geometrically. Nothing here branches on it:
+// solid quads already return premultiply(i.col) at full vertex alpha, and
+// this frontend never fades foreground quads. Declared so the flag is not
+// mistaken for an unknown bit by the next reader.
+#define DECO_SOLID_GLYPH   (1u << 11)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -49,6 +54,7 @@ SamplerState samp0 : register(s0);
 #define TABLINE_TEXTURE  (-5.0)  // BGRA texture sampling mode
 #define ICON_COPY        (-6.0)
 #define ICON_ROUND_FILL  (-7.0)  // filled rounded rect (button hover wash)
+#define ICON_CHECK       (-8.0)  // post-copy acknowledgement checkmark
 
 // Premultiply helper for consistent blending
 float4 premultiply(float4 c) {
@@ -122,7 +128,7 @@ float4 PSMain(VSOut i) : SV_Target {
         return float4(tex.rgb * tex.a, tex.a);
     }
 
-    // Background quads use sentinel uv.x < 0 in current vertexgen.
+    // Background quads use sentinel uv.x < 0, set by VH.solid_uv in flush.zig.
     // For decorations, uv.y contains the local Y position within the quad (0.0 at top, 1.0 at bottom)
     if (i.uv.x < 0.0) {
         // Icon rendering with SDF (uv.x <= -1.9)
@@ -172,6 +178,16 @@ float4 PSMain(VSOut i) : SV_Target {
                 float outlineBack = max(abs(dBack) - stroke, -(dFront + stroke));
                 float outlineFront = abs(dFront) - stroke;
                 return renderIconSDF(i.col, min(outlineBack, outlineFront));
+            }
+            // Checkmark: a short down-stroke into a long up-stroke. Shown in
+            // the copy icon's box for a moment after a successful copy.
+            if (i.uv.x >= ICON_CHECK - 0.1 && i.uv.x <= ICON_CHECK + 0.1) {
+                // sdOrientedBox takes a full width, while the copy icon's
+                // 0.045 is a half-width offset from abs(d) -- 0.09 matches it.
+                float thickness = 0.09;
+                float dShort = sdOrientedBox(localUV, float2(0.20, 0.52), float2(0.42, 0.74), thickness);
+                float dLong = sdOrientedBox(localUV, float2(0.42, 0.74), float2(0.80, 0.28), thickness);
+                return renderIconSDF(i.col, min(dShort, dLong));
             }
             // Filled rounded rect spanning the quad (copy button hover wash)
             if (i.uv.x >= ICON_ROUND_FILL - 0.1 && i.uv.x <= ICON_ROUND_FILL + 0.1) {

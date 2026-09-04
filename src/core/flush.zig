@@ -431,6 +431,78 @@ comptime {
     );
 }
 
+const RowRange = struct {
+    start: usize,
+    end: usize,
+};
+
+/// The rows of `csg` that fall inside a `row_count`-row viewport, or null when
+/// it contributes none.
+///
+/// The main row index is built in five passes over the same slice, and each
+/// one used to carry its own copy of this predicate. Only one of the couplings
+/// between those passes is guarded by an assert; the rest would corrupt the
+/// index silently if the copies ever disagreed, so they share this one.
+///
+/// The returned rows are CLAMPED. Two of the five passes want the guard but
+/// then record or compare the subgrid's own unclamped row_start/row_end -- the
+/// layout snapshot describes the cache entry, not the part of it that happens
+/// to be on screen -- so they take the range and discard it.
+fn mainSubgridVisibleRowRange(csg: CachedSubgrid, row_count: usize) ?RowRange {
+    const start: usize = @min(@as(usize, csg.row_start), row_count);
+    const end: usize = @min(@as(usize, csg.row_end), row_count);
+    // The zero-size terms are defensive: the builder already drops those.
+    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) return null;
+    return .{ .start = start, .end = end };
+}
+
+/// Size a CSR buffer exactly and, for the counts array, zero it.
+///
+/// `ensureTotalCapacityPrecise` never shrinks, so the explicit length
+/// assignment is what keeps a shorter grid than the previous flush from
+/// leaving stale entries in the tail.
+fn csrResizeExact(
+    alloc: std.mem.Allocator,
+    list: *std.ArrayListUnmanaged(usize),
+    len: usize,
+    comptime zero: bool,
+) !void {
+    try list.ensureTotalCapacityPrecise(alloc, len);
+    list.items.len = len;
+    if (zero) @memset(list.items, 0);
+}
+
+/// Turn per-row counts into CSR start offsets, in place.
+///
+/// The caller deposits each row's count at `offsets[row + 1]`, leaving
+/// `offsets[0]` zero; afterwards `offsets[row]` is that row's start and
+/// `offsets[offsets.len - 1]` is the total, which callers assert against
+/// their own count. Shared by the main-grid and external-float row indexes:
+/// only this middle of the CSR build is common to both, because their
+/// counting and filling ends iterate different collections and emit indices
+/// into different arrays.
+fn csrOffsetsFromCounts(offsets: []usize) void {
+    for (1..offsets.len) |i| {
+        offsets[i] += offsets[i - 1];
+    }
+}
+
+/// Seed per-row write cursors from CSR offsets.
+///
+/// `write_offsets` is sized to `row_count`, one shorter than `offsets` -- the
+/// trailing total is not a cursor. The explicit length assignment matters:
+/// `ensureTotalCapacityPrecise` never shrinks, so a shorter grid than the
+/// previous flush would otherwise keep stale cursors in the tail.
+fn csrSeedWriteOffsets(
+    alloc: std.mem.Allocator,
+    write_offsets: *std.ArrayListUnmanaged(usize),
+    offsets: []const usize,
+    row_count: usize,
+) !void {
+    try csrResizeExact(alloc, write_offsets, row_count, false);
+    @memcpy(write_offsets.items, offsets[0..row_count]);
+}
+
 fn mainSubgridRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize, layouts: usize) ?usize {
     const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
     const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
@@ -518,9 +590,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
                 var matches = true;
                 var old_index: usize = 0;
                 for (cached) |csg| {
-                    const start: usize = @min(@as(usize, csg.row_start), row_count);
-                    const end: usize = @min(@as(usize, csg.row_end), row_count);
-                    if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+                    _ = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
                     if (old_index >= core.main_subgrid_row_layout.items.len) {
                         matches = false;
                         break;
@@ -543,11 +613,9 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     var ref_count: usize = 0;
     var layout_count: usize = 0;
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
         layout_count += 1;
-        const coverage = end - start;
+        const coverage = range.end - range.start;
         ref_count = std.math.add(usize, ref_count, coverage) catch return error.LayoutTooComplex;
     }
     const index_bytes = mainSubgridRowIndexByteSize(row_count, ref_count, layout_count) orelse return error.LayoutTooComplex;
@@ -561,37 +629,23 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     ) orelse return error.LayoutTooComplex;
     if (retained_bytes > max_bytes) clearMainSubgridRowIndexStorage(core);
 
-    try core.main_subgrid_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
-    core.main_subgrid_row_offsets.items.len = offset_count;
-    @memset(core.main_subgrid_row_offsets.items, 0);
+    try csrResizeExact(core.alloc, &core.main_subgrid_row_offsets, offset_count, true);
 
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
-        for (start..end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
+        for (range.start..range.end) |row| core.main_subgrid_row_offsets.items[row + 1] += 1;
     }
-    for (1..core.main_subgrid_row_offsets.items.len) |i| {
-        core.main_subgrid_row_offsets.items[i] += core.main_subgrid_row_offsets.items[i - 1];
-    }
+    csrOffsetsFromCounts(core.main_subgrid_row_offsets.items);
 
     std.debug.assert(ref_count == core.main_subgrid_row_offsets.items[row_count]);
-    try core.main_subgrid_row_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
-    core.main_subgrid_row_indices.items.len = ref_count;
-    try core.main_subgrid_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
-    core.main_subgrid_row_write_offsets.items.len = row_count;
-    @memcpy(
-        core.main_subgrid_row_write_offsets.items,
-        core.main_subgrid_row_offsets.items[0..row_count],
-    );
+    try csrResizeExact(core.alloc, &core.main_subgrid_row_indices, ref_count, false);
+    try csrSeedWriteOffsets(core.alloc, &core.main_subgrid_row_write_offsets, core.main_subgrid_row_offsets.items, row_count);
 
     // cached is already sorted back-to-front, so inserting each entry into
     // every covered row preserves composition order without per-row sorting.
     for (cached, 0..) |csg, csg_index| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
-        for (start..end) |row| {
+        const range = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
+        for (range.start..range.end) |row| {
             const dst = core.main_subgrid_row_write_offsets.items[row];
             core.main_subgrid_row_indices.items[dst] = csg_index;
             core.main_subgrid_row_write_offsets.items[row] = dst + 1;
@@ -601,9 +655,7 @@ fn ensureMainSubgridRowIndexWithLimit(core: *Core, cached: []const CachedSubgrid
     try core.main_subgrid_row_layout.ensureTotalCapacityPrecise(core.alloc, layout_count);
     core.main_subgrid_row_layout.items.len = 0;
     for (cached) |csg| {
-        const start: usize = @min(@as(usize, csg.row_start), row_count);
-        const end: usize = @min(@as(usize, csg.row_end), row_count);
-        if (csg.sg_cols == 0 or csg.sg_rows == 0 or start >= end) continue;
+        _ = mainSubgridVisibleRowRange(csg, row_count) orelse continue;
         core.main_subgrid_row_layout.appendAssumeCapacity(.{
             .grid_id = csg.grid_id,
             .row_start = csg.row_start,
@@ -665,15 +717,17 @@ fn setViewportRowDecoFlags(
     if (start < end) @memset(flags[start..end], c_api.DECO_SCROLLABLE);
 }
 
-// Style flags for RenderCell (bit positions)
-pub const STYLE_BOLD: u8 = 1 << 0;
-pub const STYLE_ITALIC: u8 = 1 << 1;
-pub const STYLE_STRIKETHROUGH: u8 = 1 << 2;
-pub const STYLE_UNDERLINE: u8 = 1 << 3;
-pub const STYLE_UNDERCURL: u8 = 1 << 4;
-pub const STYLE_UNDERDOUBLE: u8 = 1 << 5;
-pub const STYLE_UNDERDOTTED: u8 = 1 << 6;
-pub const STYLE_UNDERDASHED: u8 = 1 << 7;
+// Style flags for RenderCell (bit positions). Declared in highlight.zig,
+// which is where getWithStyles packs them; re-exported here because every
+// existing call site says flush.STYLE_*.
+pub const STYLE_BOLD = highlight.STYLE_BOLD;
+pub const STYLE_ITALIC = highlight.STYLE_ITALIC;
+pub const STYLE_STRIKETHROUGH = highlight.STYLE_STRIKETHROUGH;
+pub const STYLE_UNDERLINE = highlight.STYLE_UNDERLINE;
+pub const STYLE_UNDERCURL = highlight.STYLE_UNDERCURL;
+pub const STYLE_UNDERDOUBLE = highlight.STYLE_UNDERDOUBLE;
+pub const STYLE_UNDERDOTTED = highlight.STYLE_UNDERDOTTED;
+pub const STYLE_UNDERDASHED = highlight.STYLE_UNDERDASHED;
 
 /// SoA (Struct of Arrays) cell buffer for cache-efficient RLE scanning.
 /// Each field is a separate contiguous array, improving cache utilization
@@ -750,33 +804,7 @@ pub const RenderCells = struct {
         self.style_flags_arr.items[i] = flags;
         self.overline_arr.items[i] = overline;
     }
-
-    /// Write a single cell at index i, including deco base flags.
-    pub inline fn setWithDeco(self: *RenderCells, i: usize, scalar: u32, fg: u32, bg: u32, sp: u32, gid: i64, flags: u8, overline: u8, deco: u32) void {
-        self.scalars.items[i] = scalar;
-        self.fg_rgbs.items[i] = fg;
-        self.bg_rgbs.items[i] = bg;
-        self.sp_rgbs.items[i] = sp;
-        self.grid_ids.items[i] = gid;
-        self.style_flags_arr.items[i] = flags;
-        self.overline_arr.items[i] = overline;
-        self.deco_base_flags.items[i] = deco;
-    }
 };
-
-/// Pack style flags from ResolvedAttrWithStyles into u8.
-pub fn packStyleFlags(a: ResolvedAttrWithStyles) u8 {
-    var flags: u8 = 0;
-    if (a.bold) flags |= STYLE_BOLD;
-    if (a.italic) flags |= STYLE_ITALIC;
-    if (a.strikethrough) flags |= STYLE_STRIKETHROUGH;
-    if (a.underline) flags |= STYLE_UNDERLINE;
-    if (a.undercurl) flags |= STYLE_UNDERCURL;
-    if (a.underdouble) flags |= STYLE_UNDERDOUBLE;
-    if (a.underdotted) flags |= STYLE_UNDERDOTTED;
-    if (a.underdashed) flags |= STYLE_UNDERDASHED;
-    return flags;
-}
 
 // --- SIMD-accelerated RLE scan helpers ---
 // These use Zig @Vector intrinsics for batch comparison of contiguous SoA arrays.
@@ -847,44 +875,6 @@ pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, ta
     return i;
 }
 
-/// Find end of run where (items[i] & mask) == val.
-/// Used to split glyph runs by bold/italic style so each sub-run is shaped
-/// with the correct font variant, preventing ligature rendering corruption.
-pub inline fn findStyleMaskEnd(items: []const u8, start: usize, limit: usize, mask: u8, val: u8) usize {
-    var i = start + 1;
-    while (i < limit) : (i += 1) {
-        if ((items[i] & mask) != val) return i;
-    }
-    return limit;
-}
-
-/// Find first index where a bit is NOT set: (items[i] & mask) == 0.
-/// Used for strikethrough run scans that check a specific bit rather than exact equality.
-pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usize, mask: u8) usize {
-    var i = start;
-    const V = @Vector(16, u8);
-    const m: V = @splat(mask);
-    const zeros: V = @splat(0);
-    while (i + 16 <= limit) {
-        const chunk: V = items[i..][0..16].*;
-        const masked = chunk & m;
-        if (!@reduce(.Or, masked == zeros)) {
-            // All 16 have the bit set, continue
-            i += 16;
-        } else {
-            // Scalar scan within chunk to find exact position
-            inline for (0..16) |k| {
-                if (items[i + k] & mask == 0) return i + k;
-            }
-            unreachable;
-        }
-    }
-    while (i < limit) : (i += 1) {
-        if (items[i] & mask == 0) return i;
-    }
-    return i;
-}
-
 /// Fused run-end scan over up to 6 SoA attribute arrays in a single pass.
 /// Returns the first index in [start, limit) where ANY of the enabled arrays
 /// differs from its target. Equivalent to:
@@ -893,7 +883,7 @@ pub inline fn simdFindFirstBitUnset(items: []const u8, start: usize, limit: usiz
 ///       simdFindRunEndU32(bg, ..., bg_t),
 ///       simdFindRunEndI64(grid, ..., grid_t),
 ///       simdFindRunEndU32(deco, ..., deco_t),
-///       has_style ? findStyleMaskEnd(style, ..., style_mask, style_val) : limit,
+///       has_style ? (first i where (style[i] & style_mask) != style_val)  : limit,
 ///       has_glow  ? simdFindRunEndU8(glow, ..., glow_t)                  : limit,
 ///     )
 /// but reads each cache line once instead of 4–6 separate passes.
@@ -1055,6 +1045,130 @@ pub inline fn simdFillSequentialFrom(out: [*]u32, count: usize, start: u32) void
     }
     while (i < count) : (i += 1) {
         out[i] = start + @as(u32, @intCast(i));
+    }
+}
+
+/// Resolve one hl id through the per-flush memo array, filling it on a miss.
+///
+/// Written once and called from every composition path. The array is indexed
+/// directly by hl id, so ids at or past its length fall back to a live lookup
+/// and are not memoized -- that fallback is the reason the bound is checked
+/// here rather than by the caller.
+///
+/// `inline` because this sits inside per-cell and per-run loops on the flush
+/// path; the comptime `count` branch folds away where the caller does not
+/// keep hit/miss statistics.
+inline fn resolveHlCached(
+    core: *Core,
+    hl_id: u32,
+    hl_cache: []highlight.ResolvedAttrWithStyles,
+    hl_valid: []bool,
+    hl_cache_limit: u32,
+    comptime count: bool,
+    hits: *u32,
+    misses: *u32,
+) highlight.ResolvedAttrWithStyles {
+    if (hl_id < hl_cache_limit) {
+        if (hl_valid[hl_id]) {
+            if (count) hits.* += 1;
+            return hl_cache[hl_id];
+        }
+        if (count) misses.* += 1;
+        const resolved = core.hl.getWithStyles(hl_id);
+        hl_cache[hl_id] = resolved;
+        hl_valid[hl_id] = true;
+        return resolved;
+    }
+    // Beyond the memo array: resolve live, every time.
+    if (count) misses.* += 1;
+    return core.hl.getWithStyles(hl_id);
+}
+
+/// Whether one cell glows: everything glows in `glow_all` mode, otherwise
+/// only the highlights in the resolved set do.
+///
+/// Five places made this decision -- the main-grid run composition, the
+/// subgrid overlay in each of the two composition modes, and the external
+/// grid's own rows plus the floats composited onto it. Callers keep their own
+/// snapshot of the two glow fields and their own `glow_enabled` guard; only
+/// the decision is shared.
+///
+/// `inline` matters only in Debug. Measured with `nm` on a ReleaseFast
+/// build: this, `resolveHlCached`, and the plain-`fn`
+/// `viewportCellScrollable` in the same per-cell position all emit zero
+/// symbols, so the optimizer inlines them alike. In Debug the plain `fn`
+/// emits a symbol and these do not. Keep the keyword for the Debug-build
+/// per-cell paths, not on a claim about shipped code.
+inline fn cellGlow(glow_all: bool, glow_hl_ids: ?*std.AutoHashMap(u32, void), hl: u32) u8 {
+    if (glow_all) return 1;
+    const ids = glow_hl_ids orelse return 0;
+    return @intFromBool(ids.contains(hl));
+}
+
+/// Compose one main-grid row into `dst`, run-length batched by hl_id.
+///
+/// The row-mode and whole-screen paths differ only in where the row lands:
+/// row-mode fills a row-local buffer starting at 0, the whole-screen path
+/// fills the shared buffer at `dst_offset = row_start`. Both read the same
+/// source cells and produce the same bytes, so they share this body rather
+/// than two copies that drift apart one fix at a time.
+///
+/// `inline` on purpose: this is per-row on the flush path, and inlining
+/// keeps the generated code identical to the two hand-written loops -- the
+/// slice bases and the comptime `count_hl_cache` branch fold away.
+inline fn composeMainRowRuns(
+    core: *Core,
+    dst: *RenderCells,
+    dst_offset: usize,
+    row_start: usize,
+    cols: u32,
+    hl_cache: []highlight.ResolvedAttrWithStyles,
+    hl_valid: []bool,
+    hl_cache_limit: u32,
+    glow_enabled: bool,
+    glow_all: bool,
+    glow_hl_ids: ?*std.AutoHashMap(u32, void),
+    comptime count_hl_cache: bool,
+    hl_hits: *u32,
+    hl_misses: *u32,
+) void {
+    const grid_cells = core.grid.cells;
+    var c: u32 = 0;
+    while (c < cols) {
+        const run_hl = grid_cells[row_start + @as(usize, c)].hl;
+
+        // Find run of consecutive cells with same hl_id.
+        // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids).
+        var run_end: u32 = c + 1;
+        while (run_end < cols) : (run_end += 1) {
+            if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
+        }
+
+        // Get resolved attributes once for the entire run
+        const a = resolveHlCached(core, run_hl, hl_cache, hl_valid, hl_cache_limit, count_hl_cache, hl_hits, hl_misses);
+
+        // Batch write all cells in the run with same fg/bg/sp/style_flags.
+        // Only the scalar differs per cell.
+        const ds: usize = dst_offset + @as(usize, c);
+        const de: usize = dst_offset + @as(usize, run_end);
+        @memset(dst.fg_rgbs.items[ds..de], a.fg);
+        @memset(dst.bg_rgbs.items[ds..de], a.bg);
+        @memset(dst.sp_rgbs.items[ds..de], a.sp);
+        @memset(dst.grid_ids.items[ds..de], 1);
+        @memset(dst.style_flags_arr.items[ds..de], a.style_flags);
+        @memset(dst.overline_arr.items[ds..de], @intFromBool(a.overline));
+        if (glow_enabled) {
+            const has_glow: u8 = cellGlow(glow_all, glow_hl_ids, run_hl);
+            @memset(dst.glow_arr.items[ds..de], has_glow);
+        }
+        // SIMD stride-2 extraction: Cell{cp,hl} -> cp only
+        simdExtractCp(
+            grid_cells.ptr + row_start + @as(usize, c),
+            dst.scalars.items.ptr + ds,
+            @as(usize, run_end - c),
+        );
+
+        c = run_end;
     }
 }
 
@@ -1849,10 +1963,13 @@ fn shapeClustersValid(clusters: []const u32, glyph_count: usize, scalar_count: u
     if (glyph_count == 0 or scalar_count == 0) return false;
     if (clusters[0] != 0) return false;
 
+    // clusters[0] is 0 (checked above) and previous starts at 0, so the
+    // monotonicity test is already vacuous on the first glyph -- it needs no
+    // index guard, and without one the loop needs no index.
     var previous: u32 = 0;
-    for (clusters[0..glyph_count], 0..) |cluster, i| {
+    for (clusters[0..glyph_count]) |cluster| {
         if (cluster >= scalar_count) return false;
-        if (i != 0 and cluster < previous) return false;
+        if (cluster < previous) return false;
         previous = cluster;
     }
     return true;
@@ -2058,7 +2175,7 @@ pub fn generateRowVertices(
 
             // Fused run-end: single SIMD pass over fg/bg/grid + optional
             // style-mask (when shaping splits by bold/italic) + optional glow.
-            // Replaces 3–5 separate simdFindRunEnd*+findStyleMaskEnd calls.
+            // Replaces 3–5 separate per-attribute run-end scans.
             const shaping_style_mask: u8 = STYLE_BOLD | STYLE_ITALIC;
             const run_style_bi: u8 = rc.style_flags_arr.items[@intCast(c)] & shaping_style_mask;
             const run_glow: u8 = if (p.glow_enabled) rc.glow_arr.items[@intCast(c)] else 0;
@@ -2545,7 +2662,7 @@ pub fn generateRowVertices(
                                         const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                         try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                         for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                            VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                            VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                         }
                                     }
                                     penX += blk_w;
@@ -2665,7 +2782,7 @@ pub fn generateRowVertices(
                                     const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                     try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, glyph_scroll_flag);
+                                        VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_w, blk_y0 + rect.y1 * cellH, fg, vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                     }
                                 }
                                 penX += blk_w;
@@ -2952,7 +3069,7 @@ pub fn generateRowVertices(
                                 const blk_y0 = @as(f32, @floatFromInt(r)) * cellH;
                                 try ensureRowQuadCapacity(core, out, p.max_vertices, blk_geo.count);
                                 for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, glyph_scroll_flag);
+                                    VH.pushSolidQuadAssumeCapacity(out, penX + rect.x0 * blk_cell_w, blk_y0 + rect.y0 * cellH, penX + rect.x1 * blk_cell_w, blk_y0 + rect.y1 * cellH, VH.rgb(run_fg), vw, vh, run_grid_id, c_api.DECO_SOLID_GLYPH | glyph_scroll_flag);
                                 }
                             }
                             penX += cellW;
@@ -4630,8 +4747,7 @@ pub const FlushCtx = struct {
 
                             // Record final fast path decision for perf logging
                             used_scroll_fast_path = use_scroll_fast_path and cache_ready;
-                            if (use_scroll_fast_path and !cache_ready) {
-                            }
+                            if (use_scroll_fast_path and !cache_ready) {}
 
                             // Frontends that support main-row scroll shifting can update their
                             // row storage in one callback and avoid per-row cached emission.
@@ -4741,7 +4857,6 @@ pub const FlushCtx = struct {
                             // SIMD-optimized: batch process consecutive cells with same hl_id
                             {
                                 const row_start: usize = @as(usize, r) * @as(usize, cols);
-                                const grid_cells = ctx.core.grid.cells;
                                 setViewportRowDecoFlags(
                                     row_cells.deco_base_flags.items[0..cols],
                                     r,
@@ -4749,63 +4864,22 @@ pub const FlushCtx = struct {
                                     cols,
                                     main_margins,
                                 );
-                                var c: u32 = 0;
-
-                                while (c < cols) {
-                                    const first_cell = grid_cells[row_start + @as(usize, c)];
-                                    const run_hl = first_cell.hl;
-
-                                    // Find run of consecutive cells with same hl_id
-                                    // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids)
-                                    var run_end: u32 = c + 1;
-                                    while (run_end < cols) : (run_end += 1) {
-                                        if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
-                                    }
-
-                                    // Get resolved attributes once for the entire run
-                                    const a = blk: {
-                                        if (run_hl < hl_cache_limit) {
-                                            if (hl_valid[run_hl]) {
-                                                perf_hl_cache_hits += 1;
-                                                break :blk hl_cache[run_hl];
-                                            }
-                                            perf_hl_cache_misses += 1;
-                                            const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                            hl_cache[run_hl] = resolved;
-                                            hl_valid[run_hl] = true;
-                                            break :blk resolved;
-                                        }
-                                        // Fallback for hl_id >= hl_cache_limit
-                                        perf_hl_cache_misses += 1;
-                                        break :blk ctx.core.hl.getWithStyles(run_hl);
-                                    };
-
-                                    // Batch write all cells in the run with same fg/bg/sp/style_flags
-                                    // Only scalar differs per cell
-                                    const fg = a.fg;
-                                    const bg = a.bg;
-                                    const sp = a.sp;
-                                    const flags = a.style_flags;
-
-                                    // Batch fill constant fields with @memset (compiles to SIMD)
-                                    const rs: usize = @intCast(c);
-                                    const re: usize = @intCast(run_end);
-                                    @memset(row_cells.fg_rgbs.items[rs..re], fg);
-                                    @memset(row_cells.bg_rgbs.items[rs..re], bg);
-                                    @memset(row_cells.sp_rgbs.items[rs..re], sp);
-                                    @memset(row_cells.grid_ids.items[rs..re], 1);
-                                    @memset(row_cells.style_flags_arr.items[rs..re], flags);
-                                    @memset(row_cells.overline_arr.items[rs..re], @intFromBool(a.overline));
-                                    if (glow_enabled) {
-                                        const has_glow: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
-                                        @memset(row_cells.glow_arr.items[rs..re], has_glow);
-                                    }
-                                    // Only scalars (codepoints) differ per cell
-                                    // SIMD stride-2 extraction: Cell{cp,hl} → cp only
-                                    simdExtractCp(grid_cells.ptr + row_start + rs, row_cells.scalars.items.ptr + rs, re - rs);
-
-                                    c = run_end;
-                                }
+                                composeMainRowRuns(
+                                    ctx.core,
+                                    row_cells,
+                                    0,
+                                    row_start,
+                                    cols,
+                                    hl_cache,
+                                    hl_valid,
+                                    hl_cache_limit,
+                                    glow_enabled,
+                                    glow_all,
+                                    glow_hl_ids,
+                                    true,
+                                    &perf_hl_cache_hits,
+                                    &perf_hl_cache_misses,
+                                );
 
                                 // Overlay sub-grids using pre-cached info (avoids per-row hash map lookups).
                                 // Write each overlay's scroll flag while its CachedSubgrid is already
@@ -4834,22 +4908,7 @@ pub const FlushCtx = struct {
                                         const src_i: usize = @as(usize, r2) * @as(usize, csg.sg_cols) + @as(usize, c2);
                                         const cell = csg.cells[src_i];
                                         // Use HL cache with direct index for O(1) access
-                                        const a2 = blk2: {
-                                            if (cell.hl < hl_cache_limit) {
-                                                if (hl_valid[cell.hl]) {
-                                                    perf_hl_cache_hits += 1;
-                                                    break :blk2 hl_cache[cell.hl];
-                                                }
-                                                perf_hl_cache_misses += 1;
-                                                const resolved = ctx.core.hl.getWithStyles(cell.hl);
-                                                hl_cache[cell.hl] = resolved;
-                                                hl_valid[cell.hl] = true;
-                                                break :blk2 resolved;
-                                            }
-                                            // Fallback for hl_id >= hl_cache_limit
-                                            perf_hl_cache_misses += 1;
-                                            break :blk2 ctx.core.hl.getWithStyles(cell.hl);
-                                        };
+                                        const a2 = resolveHlCached(ctx.core, cell.hl, hl_cache, hl_valid, hl_cache_limit, true, &perf_hl_cache_hits, &perf_hl_cache_misses);
                                         row_cells.set(@intCast(tc), cell.cp, a2.fg, a2.bg, a2.sp, csg.grid_id, a2.style_flags, @intFromBool(a2.overline));
                                         row_cells.deco_base_flags.items[@intCast(tc)] = if (viewportCellScrollable(
                                             r2,
@@ -4859,7 +4918,7 @@ pub const FlushCtx = struct {
                                             subgrid_margins,
                                         )) c_api.DECO_SCROLLABLE else 0;
                                         if (glow_enabled) {
-                                            row_cells.glow_arr.items[@intCast(tc)] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                            row_cells.glow_arr.items[@intCast(tc)] = cellGlow(glow_all, glow_hl_ids, cell.hl);
                                         }
                                     }
                                 }
@@ -5217,7 +5276,6 @@ pub const FlushCtx = struct {
                     @memset(tmp.deco_base_flags.items, 0);
 
                     // 1) draw global grid(1) with RLE batching + hl_cache
-                    const grid_cells = ctx.core.grid.cells;
                     var row_i: u32 = 0;
                     while (row_i < rows) : (row_i += 1) {
                         const row_start: usize = @as(usize, row_i) * @as(usize, cols);
@@ -5228,56 +5286,24 @@ pub const FlushCtx = struct {
                             cols,
                             nr_main_margins,
                         );
-                        var c: u32 = 0;
-
-                        while (c < cols) {
-                            const first_cell = grid_cells[row_start + @as(usize, c)];
-                            const run_hl = first_cell.hl;
-
-                            // Find run of consecutive cells with same hl_id
-                            var run_end: u32 = c + 1;
-                            while (run_end < cols) : (run_end += 1) {
-                                if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
-                            }
-
-                            // Get resolved attributes with cache
-                            const a = blk: {
-                                if (run_hl < nr_hl_cache_limit) {
-                                    if (nr_hl_valid[run_hl]) {
-                                        break :blk nr_hl_cache[run_hl];
-                                    }
-                                    const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                    nr_hl_cache[run_hl] = resolved;
-                                    nr_hl_valid[run_hl] = true;
-                                    break :blk resolved;
-                                }
-                                break :blk ctx.core.hl.getWithStyles(run_hl);
-                            };
-
-                            const fg = a.fg;
-                            const bg = a.bg;
-                            const sp = a.sp;
-                            const flags = a.style_flags;
-
-                            // Batch fill constant fields with @memset
-                            const fill_start: usize = row_start + @as(usize, c);
-                            const fill_end: usize = row_start + @as(usize, run_end);
-                            @memset(tmp.fg_rgbs.items[fill_start..fill_end], fg);
-                            @memset(tmp.bg_rgbs.items[fill_start..fill_end], bg);
-                            @memset(tmp.sp_rgbs.items[fill_start..fill_end], sp);
-                            @memset(tmp.grid_ids.items[fill_start..fill_end], 1);
-                            @memset(tmp.style_flags_arr.items[fill_start..fill_end], flags);
-                            @memset(tmp.overline_arr.items[fill_start..fill_end], @intFromBool(a.overline));
-                            if (glow_enabled) {
-                                const has_glow_nr: u8 = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
-                                @memset(tmp.glow_arr.items[fill_start..fill_end], has_glow_nr);
-                            }
-                            for (fill_start..fill_end) |i| {
-                                tmp.scalars.items[i] = grid_cells[i].cp;
-                            }
-
-                            c = run_end;
-                        }
+                        var nr_unused_hits: u32 = 0;
+                        var nr_unused_misses: u32 = 0;
+                        composeMainRowRuns(
+                            ctx.core,
+                            tmp,
+                            row_start,
+                            row_start,
+                            cols,
+                            nr_hl_cache,
+                            nr_hl_valid,
+                            nr_hl_cache_limit,
+                            glow_enabled,
+                            glow_all,
+                            glow_hl_ids,
+                            false,
+                            &nr_unused_hits,
+                            &nr_unused_misses,
+                        );
                     }
 
                     // Then overlay subgrids (with hl_cache)
@@ -5316,18 +5342,9 @@ pub const FlushCtx = struct {
                                 }
 
                                 // Get resolved attributes with cache
-                                const a = blk: {
-                                    if (run_hl < nr_hl_cache_limit) {
-                                        if (nr_hl_valid[run_hl]) {
-                                            break :blk nr_hl_cache[run_hl];
-                                        }
-                                        const resolved = ctx.core.hl.getWithStyles(run_hl);
-                                        nr_hl_cache[run_hl] = resolved;
-                                        nr_hl_valid[run_hl] = true;
-                                        break :blk resolved;
-                                    }
-                                    break :blk ctx.core.hl.getWithStyles(run_hl);
-                                };
+                                var sg_unused_hits: u32 = 0;
+                                var sg_unused_misses: u32 = 0;
+                                const a = resolveHlCached(ctx.core, run_hl, nr_hl_cache, nr_hl_valid, nr_hl_cache_limit, false, &sg_unused_hits, &sg_unused_misses);
 
                                 const fg = a.fg;
                                 const bg = a.bg;
@@ -5351,7 +5368,7 @@ pub const FlushCtx = struct {
                                         sg_margins,
                                     )) c_api.DECO_SCROLLABLE else 0;
                                     if (glow_enabled) {
-                                        tmp.glow_arr.items[dst_index] = if (glow_all) 1 else if (glow_hl_ids) |ids| (if (ids.contains(run_hl)) @as(u8, 1) else 0) else 0;
+                                        tmp.glow_arr.items[dst_index] = cellGlow(glow_all, glow_hl_ids, run_hl);
                                     }
                                 }
 
@@ -5549,21 +5566,8 @@ pub const FlushCtx = struct {
                         // Push cursor background quad with DECO_CURSOR flag
                         // (so shader treats it as decoration, not background with transparency)
                         {
-                            const pts = Helpers.ndc4(rx0, ry0, rx1, ry1, dw, dh);
-                            const p0 = pts[0];
-                            const p1 = pts[1];
-                            const p2 = pts[2];
-                            const p3 = pts[3];
                             const col = Helpers.rgb(cursor_out.bgRGB);
-                            const solid_uv = Helpers.solid_uv;
-
-                            try cursor.ensureUnusedCapacity(ctx.core.alloc, 6);
-                            cursor.appendAssumeCapacity(.{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                            cursor.appendAssumeCapacity(.{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = cursor_grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                            try Helpers.pushSolidQuad(cursor, ctx.core.alloc, rx0, ry0, rx1, ry1, col, dw, dh, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                         }
 
                         // Render cursor text (character under cursor) with inverted color
@@ -5576,7 +5580,13 @@ pub const FlushCtx = struct {
                                     try cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6);
                                     const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_SCROLLABLE);
+                                        // DECO_CURSOR for the same reason the cursor background
+                                        // quad above carries it: without it these rects are plain
+                                        // solid quads, and the shader fades plain solids to
+                                        // `backgroundAlpha` once blur is on. The box behind the
+                                        // glyph would stay opaque while the glyph itself went
+                                        // translucent. The external-grid path already sets it.
+                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, dw, dh, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                                     }
                                 }
                             } else {
@@ -6087,10 +6097,12 @@ fn buildExternalFloatAnchorIndex(core: *Core) !void {
 /// Build a sorted, per-row index for floats visible in one external grid.
 /// The flattened row buckets preserve the global layer order because entries
 /// are inserted into every covered row in sorted order.
+/// The external-float index has no layout array, so its storage size is the
+/// main-grid formula with zero layouts -- with `layouts == 0` the layout term
+/// is 0 and the final add cannot overflow, so the two agree on every input
+/// including the ones that return null.
 fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
-    const row_usizes = std.math.add(usize, offsets, write_offsets) catch return null;
-    const total_usizes = std.math.add(usize, row_usizes, refs) catch return null;
-    return std.math.mul(usize, total_usizes, @sizeOf(usize)) catch null;
+    return mainSubgridRowIndexStorageByteSize(offsets, write_offsets, refs, 0);
 }
 
 fn externalFloatPersistentScratchCapacityByteSize(core: *const Core) ?usize {
@@ -6234,9 +6246,7 @@ fn buildExternalFloatRowIndexWithLimits(
     if (projected_retained_bytes > max_index_bytes) {
         clearExternalFloatRowIndexStorage(core);
     }
-    try core.ext_float_row_offsets.ensureTotalCapacityPrecise(core.alloc, offset_count);
-    core.ext_float_row_offsets.items.len = offset_count;
-    @memset(core.ext_float_row_offsets.items, 0);
+    try csrResizeExact(core.alloc, &core.ext_float_row_offsets, offset_count, true);
 
     // Count references per visible row, then convert counts to offsets.
     for (core.ext_float_entries.items) |entry| {
@@ -6252,19 +6262,11 @@ fn buildExternalFloatRowIndexWithLimits(
             core.ext_float_row_offsets.items[row + 1] += 1;
         }
     }
-    for (1..core.ext_float_row_offsets.items.len) |i| {
-        core.ext_float_row_offsets.items[i] += core.ext_float_row_offsets.items[i - 1];
-    }
+    csrOffsetsFromCounts(core.ext_float_row_offsets.items);
 
     std.debug.assert(ref_count == core.ext_float_row_offsets.items[row_count]);
-    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, ref_count);
-    core.ext_float_row_entry_indices.items.len = ref_count;
-    try core.ext_float_row_write_offsets.ensureTotalCapacityPrecise(core.alloc, row_count);
-    core.ext_float_row_write_offsets.items.len = row_count;
-    @memcpy(
-        core.ext_float_row_write_offsets.items,
-        core.ext_float_row_offsets.items[0..row_count],
-    );
+    try csrResizeExact(core.alloc, &core.ext_float_row_entry_indices, ref_count, false);
+    try csrSeedWriteOffsets(core.alloc, &core.ext_float_row_write_offsets, core.ext_float_row_offsets.items, row_count);
 
     // Filling in global sorted order keeps every row bucket sorted without a
     // second per-row sort.
@@ -6898,9 +6900,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         else
                             .{ .cp = ' ', .hl = 0 };
                         const attr = cache.getAttr(&self.hl, cell.hl);
-                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, attr.style_flags, @intFromBool(attr.overline));
                         if (ext_glow_enabled) {
-                            self.row_cells.glow_arr.items[c] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                            self.row_cells.glow_arr.items[c] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
                         }
                     }
                     setViewportRowDecoFlags(
@@ -6962,7 +6964,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     // boundary: base and float text must never
                                     // form one ligature/kerning run merely
                                     // because their resolved styles match.
-                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, packStyleFlags(attr), @intFromBool(attr.overline));
+                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, attr.style_flags, @intFromBool(attr.overline));
                                     self.row_cells.deco_base_flags.items[target_col] = if (viewportCellScrollable(
                                         float_src_row,
                                         float_src_col,
@@ -6971,7 +6973,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         float_margins,
                                     )) c_api.DECO_SCROLLABLE else 0;
                                     if (ext_glow_enabled) {
-                                        self.row_cells.glow_arr.items[target_col] = if (ext_glow_all) 1 else if (ext_glow_hl_ids) |ids| (if (ids.contains(cell.hl)) @as(u8, 1) else 0) else 0;
+                                        self.row_cells.glow_arr.items[target_col] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
                                     }
 
                                     // Every overlaid cell gets an entry, including
@@ -7127,18 +7129,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         self.hl.default_fg;
                     const cursor_color = Helpers.rgb(cursor_bg);
 
-                    const c_pts = Helpers.ndc4(crx0, cry0, crx1, cry1, grid_w, grid_h);
-                    const ctl = c_pts[0];
-                    const ctr = c_pts[1];
-                    const cbl = c_pts[2];
-                    const cbr = c_pts[3];
-
-                    ext_verts.appendAssumeCapacity(.{ .position = ctl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = ctr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbr, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
-                    ext_verts.appendAssumeCapacity(.{ .position = cbl, .texCoord = Helpers.solid_uv, .color = cursor_color, .grid_id = grid_id, .deco_flags = c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, .deco_phase = 0 });
+                    Helpers.pushSolidQuadAssumeCapacity(ext_verts, crx0, cry0, crx1, cry1, cursor_color, grid_w, grid_h, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
 
                     // Cursor text for block cursor
                     if (self.grid.cursor_shape == .block) {
@@ -7243,19 +7234,23 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                             self.hl.default_bg;
                                         const text_col = Helpers.rgb(cursor_fg);
 
-                                        const cg_pts = Helpers.ndc4(gx0, gy0, gx1, gy1, grid_w, grid_h);
-                                        const gtl = cg_pts[0];
-                                        const gtr = cg_pts[1];
-                                        const gbl = cg_pts[2];
-                                        const gbr = cg_pts[3];
-
                                         const cursor_glyph_flags = externalCursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtl, .texCoord = .{ uv_x0, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gtr, .texCoord = .{ uv_x1, uv_y0 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbr, .texCoord = .{ uv_x1, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
-                                        ext_verts.appendAssumeCapacity(.{ .position = gbl, .texCoord = .{ uv_x0, uv_y1 }, .color = text_col, .grid_id = grid_id, .deco_flags = cursor_glyph_flags, .deco_phase = 0 });
+                                        VH.pushGlyphQuadAssumeCapacity(
+                                            ext_verts,
+                                            gx0,
+                                            gy0,
+                                            gx1,
+                                            gy1,
+                                            .{ uv_x0, uv_y0 },
+                                            .{ uv_x1, uv_y0 },
+                                            .{ uv_x0, uv_y1 },
+                                            .{ uv_x1, uv_y1 },
+                                            text_col,
+                                            grid_w,
+                                            grid_h,
+                                            grid_id,
+                                            cursor_glyph_flags,
+                                        );
                                     }
                                 }
                             }
@@ -8287,7 +8282,7 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     // anchor_row/col are local to anchor_grid. Convert to global (grid 1)
     // coordinates using win_pos so the frontend can position the popup
     // relative to the terminal view without knowing about sub-grid offsets.
-    const is_cmdline_completion = (anchor_grid < 0 or anchor_grid == -1);
+    const is_cmdline_completion = anchor_grid < 0;
     var start_row: i32 = undefined;
     var start_col: i32 = undefined;
     if (is_cmdline_completion) {
@@ -8640,15 +8635,18 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     const msg_dirty = self.grid.message_state.msg_dirty;
     const confirm_dirty = self.grid.message_state.confirm_dirty;
-    const showmode_dirty = self.grid.message_state.showmode_dirty;
-    const showcmd_dirty = self.grid.message_state.showcmd_dirty;
-    const ruler_dirty = self.grid.message_state.ruler_dirty;
+    const status_dirty = self.grid.message_state.status_dirty;
     const history_dirty = self.grid.msg_history_state.dirty;
 
     // Also check if there's a pending throttle timeout to handle
     const has_pending_throttle = self.msg_show_pending_since != null;
 
-    if (!msg_dirty and !confirm_dirty and !showmode_dirty and !showcmd_dirty and !ruler_dirty and !history_dirty and !has_pending_throttle) return;
+    var any_status_dirty = false;
+    for (status_dirty) |d| {
+        if (d) any_status_dirty = true;
+    }
+
+    if (!msg_dirty and !confirm_dirty and !any_status_dirty and !history_dirty and !has_pending_throttle) return;
 
     // Guard: at most one on_msg_clear per flush cycle
     var sent_msg_clear = false;
@@ -8764,19 +8762,11 @@ pub fn notifyMessageChanges(self: *Core) void {
 
     self.grid.message_state.msg_dirty = msg_retry_needed;
     self.grid.message_state.confirm_dirty = false;
-    self.grid.message_state.showmode_dirty = false;
-    self.grid.message_state.showcmd_dirty = false;
-    self.grid.message_state.ruler_dirty = false;
+    self.grid.message_state.status_dirty = @splat(false);
 
     // Handle showmode/showcmd/ruler changes only when their respective dirty flag is set
-    if (showmode_dirty) {
-        sendMsgShowmode(self);
-    }
-    if (showcmd_dirty) {
-        sendMsgShowcmd(self);
-    }
-    if (ruler_dirty) {
-        sendMsgRuler(self);
+    for (grid_mod.StatusChannel.all) |channel| {
+        if (status_dirty[channel.index()]) sendMsgStatus(self, channel);
     }
 
     // Handle msg_history_show
@@ -9260,6 +9250,61 @@ pub fn buildMsgLineCache(self: *Core) bool {
     return true;
 }
 
+/// Widest a message panel may grow, in cells.
+const msg_panel_max_width: u32 = 80;
+
+/// start_row/start_col both carry this value on a message panel's external
+/// grid entry. No frontend compares against it — both dispatch on the grid
+/// id — so its only functional effect is being negative, which routes the
+/// grid through the "no main-grid composite" guards.
+const msg_panel_top_right: i32 = -2;
+
+/// One padding column on each side of the content, then the cap. A content
+/// width of 0 yields a 2-column panel: both padding columns, no content
+/// column, since the write loop stops before the right one.
+fn msgPanelWidth(content_width: u32) u32 {
+    return @min(content_width + 2, msg_panel_max_width);
+}
+
+/// Size a message panel's grid and blank it. The clear is not optional:
+/// resizeGrid preserves the overlapping region, so a re-render at an
+/// unchanged shape would otherwise inherit the previous content's tail.
+fn beginMsgPanelGrid(self: *Core, grid_id: i64, height: u32, width: u32) !void {
+    try self.grid.resizeGrid(grid_id, height, width);
+    self.grid.clearGrid(grid_id);
+}
+
+/// Write one line of a message panel, starting after the left padding column
+/// and stopping before the right one. A wide codepoint takes two cells, the
+/// second written as cp 0; when only one cell is left the body is still
+/// written and the placeholder is dropped, so the glyph overhangs the right
+/// padding column.
+fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) void {
+    var col: u32 = 1; // Start with 1 cell padding
+    var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (col >= width - 1) break;
+        self.grid.putCellGrid(grid_id, row, col, cp, 0);
+        col += 1;
+        if (isWideChar(cp)) {
+            if (col >= width - 1) break;
+            self.grid.putCellGrid(grid_id, row, col, 0, 0);
+            col += 1;
+        }
+    }
+}
+
+/// Register a message panel as an external grid at the top-right sentinel
+/// position. Callers own the failure policy: whether the flush is aborted
+/// differs between the panels.
+fn registerMsgPanelExternal(self: *Core, grid_id: i64) !void {
+    try self.grid.putSyntheticExternal(grid_id, .{
+        .win = 1, // Global grid
+        .start_row = msg_panel_top_right,
+        .start_col = msg_panel_top_right,
+    });
+}
+
 /// Render msg_show grid from cache (fast path for scrolling).
 /// Returns false on allocation failure (resizeGrid/external_grids.put) —
 /// the message grid was NOT actually updated to reflect scroll_offset, so
@@ -9278,7 +9323,7 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
     const max_height: u32 = @min(self.grid.rows, 256);
     const visible_lines = lines.len - actual_scroll;
     const height: u32 = @intCast(@min(visible_lines, max_height));
-    const width: u32 = @min(self.msg_cached_max_width + 2, 80);
+    const width: u32 = msgPanelWidth(self.msg_cached_max_width);
 
     self.log.write("[msg] renderMsgGridFromCache: lines={d} scroll={d} visible={d} size={d}x{d}\n", .{
         lines.len,
@@ -9289,41 +9334,22 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
     });
 
     // Create or resize grid
-    self.grid.resizeGrid(msg_grid_id, height, width) catch |e| {
+    beginMsgPanelGrid(self, msg_grid_id, height, width) catch |e| {
         self.log.write("[msg] resizeGrid failed: {any}\n", .{e});
         return false;
     };
-    self.grid.clearGrid(msg_grid_id);
 
     // Write lines to grid from cache
     for (0..height) |row_idx| {
         const source_line_idx = actual_scroll + row_idx;
         if (source_line_idx >= lines.len) break;
 
-        const row: u32 = @intCast(row_idx);
         const cached_line = lines[source_line_idx];
-        const line = cached_line.data[0..cached_line.len];
-
-        var col: u32 = 1; // Start with 1 cell padding
-        var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col >= width - 1) break;
-            self.grid.putCellGrid(msg_grid_id, row, col, cp, 0);
-            col += 1;
-            if (isWideChar(cp)) {
-                if (col >= width - 1) break;
-                self.grid.putCellGrid(msg_grid_id, row, col, 0, 0);
-                col += 1;
-            }
-        }
+        writeMsgPanelRow(self, msg_grid_id, @intCast(row_idx), cached_line.data[0..cached_line.len], width);
     }
 
     // Register as external grid
-    self.grid.putSyntheticExternal(msg_grid_id, .{
-        .win = 1, // Global grid
-        .start_row = -2, // Special marker: position at top-right
-        .start_col = -2,
-    }) catch |e| {
+    registerMsgPanelExternal(self, msg_grid_id) catch |e| {
         self.log.write("[msg] external_grids.put failed: {any}\n", .{e});
         return false;
     };
@@ -9589,14 +9615,7 @@ pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: con
     }
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(view);
 
     // Convert timeout from seconds to milliseconds.
     const timeout_ms = messageTimeoutMs(timeout_sec);
@@ -9677,14 +9696,7 @@ pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHisto
     }};
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(view);
 
     // Use special kind "_msg_history" to distinguish from regular msg_show
     const history_kind = "_msg_history";
@@ -9758,14 +9770,7 @@ pub fn sendPendingMsgShowCallback(self: *Core, pm: *const grid_mod.PendingMessag
     const route_result = self.msg_config.routeMessage(.msg_show, kind, 1);
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(route_result.view);
 
     cb(
         self.ctx,
@@ -9813,17 +9818,29 @@ pub fn closeMessageSplit(self: *Core) void {
     };
 }
 
-/// Send msg_showmode callback to frontend.
-pub fn sendMsgShowmode(self: *Core) void {
-    const chunks = self.grid.message_state.showmode_content.items;
+/// Send one status channel (showmode / showcmd / ruler) to the frontend.
+/// The three differ only in which slot they read, which route they consult,
+/// and which callback they reach; the rest of the send path is identical.
+pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
+    const chunks = self.grid.message_state.status_content[channel.index()].items;
+
+    const event: config.MsgEvent = switch (channel) {
+        .showmode => .msg_showmode,
+        .showcmd => .msg_showcmd,
+        .ruler => .msg_ruler,
+    };
 
     // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_showmode, "", 1);
-    self.log.write("[msg] sendMsgShowmode chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
+    const route_result = self.msg_config.routeMessage(event, "", 1);
+    self.log.write("[msg] sendMsgStatus({s}) chunks={d} routed to view={s}\n", .{ @tagName(channel), chunks.len, @tagName(route_result.view) });
 
     if (route_result.view == .none) return; // Don't show anything
 
-    const cb = self.cb.on_msg_showmode orelse return;
+    const cb = switch (channel) {
+        .showmode => self.cb.on_msg_showmode,
+        .showcmd => self.cb.on_msg_showcmd,
+        .ruler => self.cb.on_msg_ruler,
+    } orelse return;
 
     var c_chunks: [64]c_api.MsgChunk = undefined;
     const chunk_count = @min(chunks.len, c_chunks.len);
@@ -9837,86 +9854,7 @@ pub fn sendMsgShowmode(self: *Core) void {
     }
 
     // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
-
-    cb(self.ctx, c_view, &c_chunks, chunk_count);
-}
-
-/// Send msg_showcmd callback to frontend.
-pub fn sendMsgShowcmd(self: *Core) void {
-    const chunks = self.grid.message_state.showcmd_content.items;
-
-    // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_showcmd, "", 1);
-    self.log.write("[msg] sendMsgShowcmd chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
-
-    if (route_result.view == .none) return; // Don't show anything
-
-    const cb = self.cb.on_msg_showcmd orelse return;
-
-    var c_chunks: [64]c_api.MsgChunk = undefined;
-    const chunk_count = @min(chunks.len, c_chunks.len);
-
-    for (chunks[0..chunk_count], 0..) |chunk, i| {
-        c_chunks[i] = .{
-            .hl_id = chunk.hl_id,
-            .text = chunk.text.ptr,
-            .text_len = chunk.text.len,
-        };
-    }
-
-    // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
-
-    cb(self.ctx, c_view, &c_chunks, chunk_count);
-}
-
-/// Send msg_ruler callback to frontend.
-pub fn sendMsgRuler(self: *Core) void {
-    const chunks = self.grid.message_state.ruler_content.items;
-
-    // Route message using config
-    const route_result = self.msg_config.routeMessage(.msg_ruler, "", 1);
-    self.log.write("[msg] sendMsgRuler chunks={d} routed to view={s}\n", .{ chunks.len, @tagName(route_result.view) });
-
-    if (route_result.view == .none) return; // Don't show anything
-
-    const cb = self.cb.on_msg_ruler orelse return;
-
-    var c_chunks: [64]c_api.MsgChunk = undefined;
-    const chunk_count = @min(chunks.len, c_chunks.len);
-
-    for (chunks[0..chunk_count], 0..) |chunk, i| {
-        c_chunks[i] = .{
-            .hl_id = chunk.hl_id,
-            .text = chunk.text.ptr,
-            .text_len = chunk.text.len,
-        };
-    }
-
-    // Convert view type to C ABI enum
-    const c_view: c_api.zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = c_api.msgViewTypeToC(route_result.view);
 
     cb(self.ctx, c_view, &c_chunks, chunk_count);
 }
@@ -9985,45 +9923,24 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
     // Calculate grid dimensions
     const max_height: u32 = 20;
     const height: u32 = @intCast(@min(line_count, max_height));
-    const width: u32 = @min(max_width + 2, 80); // +2 for padding, max 80
+    const width: u32 = msgPanelWidth(max_width);
 
     self.log.write("[msg_history] show: entries={d} size={d}x{d}\n", .{ entries.len, width, height });
 
     // Create or resize grid
-    self.grid.resizeGrid(history_grid_id, height, width) catch |e| {
+    beginMsgPanelGrid(self, history_grid_id, height, width) catch |e| {
         self.log.write("[msg_history] resizeGrid failed: {any}\n", .{e});
         self.flush_aborted = true;
         return false;
     };
-    self.grid.clearGrid(history_grid_id);
 
     // Write lines to grid
     for (0..height) |row_idx| {
-        const row: u32 = @intCast(row_idx);
-        const line = lines[row_idx][0..line_lens[row_idx]];
-
-        var col: u32 = 1; // Start with 1 cell padding
-        var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
-        while (iter.nextCodepoint()) |cp| {
-            if (col >= width - 1) break;
-            self.grid.putCellGrid(history_grid_id, row, col, cp, 0);
-            col += 1;
-            if (isWideChar(cp)) {
-                if (col >= width - 1) break;
-                self.grid.putCellGrid(history_grid_id, row, col, 0, 0);
-                col += 1;
-            }
-        }
+        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[row_idx][0..line_lens[row_idx]], width);
     }
 
-    // Register as external grid
-    // Position: use special marker -2 to indicate "msg_show position" (top-right)
-    // Frontend will interpret this and position like msg_show
-    self.grid.putSyntheticExternal(history_grid_id, .{
-        .win = 1, // Global grid
-        .start_row = -2, // Special marker: position like msg_show (top-right)
-        .start_col = -2,
-    }) catch |e| {
+    // Register as external grid, positioned like msg_show.
+    registerMsgPanelExternal(self, history_grid_id) catch |e| {
         self.log.write("[msg_history] external_grids.put failed: {any}\n", .{e});
         self.flush_aborted = true;
         return false;
@@ -10418,15 +10335,6 @@ pub fn scanEmojiCluster(text: []const u8, start: usize) EmojiCluster {
     };
 }
 
-pub fn countUtf8Codepoints(s: []const u8) u32 {
-    var count: u32 = 0;
-    var iter = std.unicode.Utf8View.initUnchecked(s).iterator();
-    while (iter.nextCodepoint()) |_| {
-        count += 1;
-    }
-    return count;
-}
-
 /// Check if a codepoint is a wide (double-width) character.
 /// Based on East Asian Width (simplified version for CJK).
 pub fn isWideChar(cp: u32) bool {
@@ -10472,17 +10380,6 @@ pub fn countDisplayWidth(s: []const u8) u32 {
     return count;
 }
 
-/// Check if a cluster contains VS16 (U+FE0F, emoji presentation selector).
-/// When VS16 is present, even text-default codepoints (e.g., ☀ U+2600)
-/// should be rendered as color emoji.
-fn clusterHasVS16(core: *Core, this_cluster: u32, next_cluster: u32) bool {
-    if (next_cluster <= this_cluster + 1) return false;
-    var ci: u32 = this_cluster;
-    while (ci < next_cluster) : (ci += 1) {
-        if (core.shaping_scalars.items[@intCast(ci)] == 0xFE0F) return true;
-    }
-    return false;
-}
 /// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
 /// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
 /// renderers display as color emoji without an explicit VS16 selector.
@@ -10737,7 +10634,6 @@ test "zero-sized main still commits external grid transaction" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resize(0, 0);
     try core.grid.resizeGrid(2, 1, 1);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
@@ -11025,7 +10921,6 @@ test "deferred external pass shares the main vertex budget transaction" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 1, 1);
     try core.grid.resizeGrid(2, 1, 1);
     try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
@@ -11261,7 +11156,6 @@ test "external row scroll hint excludes composited grids and clamps target viewp
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 4, 4);
     try core.grid.resizeGrid(2, 4, 4);
     try core.grid.setWinPos(2, 42, 0, 0);
@@ -11471,7 +11365,7 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
     try core.row_cells.ensureTotalCapacity(core.alloc, 3);
     core.row_cells.setLen(3);
     for (0..3) |col| {
-        core.row_cells.setWithDeco(
+        core.row_cells.set(
             col,
             ' ',
             0xFFFFFF,
@@ -11480,8 +11374,8 @@ test "row generation rejects before vertex capacity exceeds callback budget" {
             1,
             0,
             0,
-            0,
         );
+        core.row_cells.deco_base_flags.items[col] = 0;
         core.row_cells.glow_arr.items[col] = 0;
     }
 
@@ -11546,7 +11440,7 @@ test "row generation preserves left and right margin flags in every emitted laye
     const style = STYLE_UNDERLINE | STYLE_STRIKETHROUGH;
     for (0..5) |col| {
         const deco: u32 = if (col >= 1 and col < 4) c_api.DECO_SCROLLABLE else 0;
-        core.row_cells.setWithDeco(
+        core.row_cells.set(
             col,
             0x2588,
             0xFFFFFF,
@@ -11555,8 +11449,8 @@ test "row generation preserves left and right margin flags in every emitted laye
             1,
             style,
             1,
-            deco,
         );
+        core.row_cells.deco_base_flags.items[col] = deco;
         core.row_cells.glow_arr.items[col] = 0;
     }
     core.cb.on_atlas_ensure_glyph = State.ensure;
@@ -11757,7 +11651,6 @@ test "external scroll without row-shift callback regenerates every retained row"
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(1, 4, 2);
     try core.grid.resizeGrid(2, 4, 2);
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
@@ -12118,10 +12011,11 @@ test "wide block geometry spans continuation across legacy and shaped runs" {
     try core.grid.resizeGrid(1, 1, 2);
     try core.row_cells.ensureTotalCapacity(core.alloc, 2);
     core.row_cells.setLen(2);
-    core.row_cells.setWithDeco(0, 0x2588, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    core.row_cells.set(0, 0x2588, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
     // A different color deliberately splits the SIMD run. Width detection is
     // based on Neovim's continuation cell, not the current style/color run.
-    core.row_cells.setWithDeco(1, 0, 0x00FF00, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, 0);
+    core.row_cells.set(1, 0, 0x00FF00, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    @memset(core.row_cells.deco_base_flags.items, 0);
     @memset(core.row_cells.glow_arr.items, 0);
 
     var state = State{};
@@ -12296,7 +12190,8 @@ test "shaping includes overflow tails in input and cache key" {
     try core.grid.resizeGrid(1, 1, 1);
     try core.row_cells.ensureTotalCapacity(core.alloc, 1);
     core.row_cells.setLen(1);
-    core.row_cells.setWithDeco(0, 'e', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0, c_api.DECO_SCROLLABLE);
+    core.row_cells.set(0, 'e', 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+    core.row_cells.deco_base_flags.items[0] = c_api.DECO_SCROLLABLE;
     core.row_cells.glow_arr.items[0] = 0;
     try core.initGlyphCache();
 
@@ -13220,6 +13115,50 @@ test "external float persistent scratch partitions share one 8 MiB cap" {
     );
 }
 
+test "the layout snapshot records unclamped rows even when the subgrid overhangs" {
+    // Two of the five passes use the visibility filter only as a guard and
+    // then read csg.row_start / csg.row_end UNCLAMPED -- pass 5 stores them,
+    // pass 1 compares against what pass 5 stored. Folding the filter into a
+    // helper that returns clamped rows must not tempt either into using the
+    // clamped value: the snapshot would then stop matching the cache entry it
+    // describes, and the structural fast path would answer wrongly.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
+    var cached = [_]CachedSubgrid{
+        // Overhangs the 4-row viewport by two rows.
+        .{ .grid_id = 10, .row_start = 2, .row_end = 6, .col_start = 0, .sg_cols = 1, .sg_rows = 4, .cells = cells[0..].ptr, .margin_top = 0, .margin_bottom = 0 },
+    };
+    try std.testing.expect(try ensureMainSubgridRowIndex(&core, &cached, 4));
+
+    // Only the two visible rows are indexed...
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0, 0, 1, 2 }, core.main_subgrid_row_offsets.items);
+    // ...but the snapshot keeps the row span the entry actually declares.
+    try std.testing.expectEqual(@as(usize, 1), core.main_subgrid_row_layout.items.len);
+    try std.testing.expectEqual(@as(u32, 2), core.main_subgrid_row_layout.items[0].row_start);
+    try std.testing.expectEqual(@as(u32, 6), core.main_subgrid_row_layout.items[0].row_end);
+
+    // Pass 4 wrote the clamped rows' references, one per visible row.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.main_subgrid_row_indices.items);
+
+    // Pass 1 is reachable only through the limited entry point:
+    // ensureMainSubgridRowIndex deliberately clears main_subgrid_row_index_valid
+    // before delegating, and memoises above that, so it can never take the
+    // structural path. Poison a CSR slot to tell the fast path apart from an
+    // identical rebuild -- the fast path returns without touching it. Pass 1
+    // compares against the rows pass 5 stored, so comparing clamped rows on
+    // either side would mismatch and force the rebuild that overwrites this.
+    core.main_subgrid_row_offsets.items[3] = 99;
+    try std.testing.expect(try ensureMainSubgridRowIndexWithLimit(
+        &core,
+        &cached,
+        4,
+        MAX_MAIN_SUBGRID_ROW_INDEX_BYTES,
+    ));
+    try std.testing.expectEqual(@as(usize, 99), core.main_subgrid_row_offsets.items[3]);
+}
+
 test "main subgrid row index preserves layer order and updates on layout change" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -13441,7 +13380,6 @@ test "external close detection visits known grids once and removes in place" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     var closed: std.ArrayListUnmanaged(i64) = .empty;
     defer closed.deinit(std.testing.allocator);
     core.ctx = &closed;
@@ -13486,7 +13424,6 @@ test "external open abort stops later lifecycle callbacks until retry" {
 
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
-    defer core.known_external_grids.deinit(core.alloc);
     try core.grid.resizeGrid(10, 2, 2);
     try core.grid.resizeGrid(11, 2, 2);
     try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
@@ -14480,4 +14417,1477 @@ test "a tail longer than the cluster buffer truncates instead of overrunning" {
     const len = buildEmojiCluster(&buf, WOMAN, &long);
     try std.testing.expectEqual(@as(u8, 4), len);
     try std.testing.expectEqualSlices(u32, &.{ WOMAN, ZWJ, LAPTOP, ZWJ }, buf[0..len]);
+}
+
+test "a block element in normal text is marked as foreground, not background" {
+    // U+2588 FULL BLOCK is filled geometrically rather than rasterized, so it
+    // reaches the frontend as a solid quad. Without a flag saying it is text,
+    // the shader takes it for a background cell and fades it to the window's
+    // background alpha under blur, while the glyphs beside it stay opaque.
+    const State = struct {
+        solid_glyph_quads: u32 = 0,
+        unflagged_solid_quads: u32 = 0,
+
+        // The glyph pass only runs when the frontend offers some way to
+        // resolve a glyph. Block elements never reach it, but the gate is
+        // upstream of them.
+        fn ensure(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            out_entry: ?*c_api.GlyphEntry,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = out_entry;
+            return 0;
+        }
+
+        fn onVertices(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const verts = main_verts orelse return;
+            for (verts[0..main_count]) |v| {
+                // texCoord.x < 0 marks a solid quad; an atlas glyph carries a UV.
+                if (v.texCoord[0] >= 0) continue;
+                if ((v.deco_flags & c_api.DECO_SOLID_GLYPH) != 0) {
+                    self.solid_glyph_quads += 1;
+                } else {
+                    self.unflagged_solid_quads += 1;
+                }
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 2);
+    core.grid.putCell(0, 0, 0x2588, 0); // FULL BLOCK
+    core.grid.putCell(0, 1, ' ', 0); // plain background cell, for contrast
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_atlas_ensure_glyph = State.ensure;
+    core.cb.on_vertices_partial = State.onVertices;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 2);
+
+    // The block element produced solid quads and every one of them is flagged.
+    try std.testing.expect(state.solid_glyph_quads > 0);
+    // The blank cell's background quad must NOT be flagged, or the frontend
+    // would stop fading real backgrounds under a translucent window.
+    try std.testing.expect(state.unflagged_solid_quads > 0);
+}
+
+test "each status channel reaches its own route and its own callback" {
+    // The three senders used to be three separately-named functions, so
+    // crossing a channel's route or callback meant visibly editing the wrong
+    // one. Merging them turned that into two hand-written switch tables, and
+    // a swap there is silent -- the ruler would render as the mode indicator.
+    // Give each channel a distinct route and a distinct callback so a crossed
+    // mapping shows up as the wrong callback firing, or none at all.
+    const State = struct {
+        showmode_calls: u32 = 0,
+        showcmd_calls: u32 = 0,
+        ruler_calls: u32 = 0,
+        showmode_view: c_api.zonvie_msg_view_type = .none,
+        showcmd_view: c_api.zonvie_msg_view_type = .none,
+
+        fn onShowmode(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.showmode_calls += 1;
+            self.showmode_view = view;
+        }
+        fn onShowcmd(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.showcmd_calls += 1;
+            self.showcmd_view = view;
+        }
+        fn onRuler(ctx: ?*anyopaque, view: c_api.zonvie_msg_view_type, chunks: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            _ = view;
+            _ = chunks;
+            _ = count;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ruler_calls += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+
+    // Distinct per-event routing: showmode -> mini, showcmd -> ext_float,
+    // ruler -> none (suppressed). Crossing the MsgEvent mapping therefore
+    // changes which view a callback reports, or suppresses the wrong channel.
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_showmode }, .view = .mini, .opts = .{ .timeout = 0 } },
+        .{ .filter = .{ .event = .msg_showcmd }, .view = .ext_float, .opts = .{ .timeout = 0 } },
+        .{ .filter = .{ .event = .msg_ruler }, .view = .none, .opts = .{ .timeout = 0 } },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_msg_showmode = State.onShowmode;
+    core.cb.on_msg_showcmd = State.onShowcmd;
+    core.cb.on_msg_ruler = State.onRuler;
+
+    try core.grid.setMsgStatus(.showmode, &.{.{ .hl_id = 0, .text = "-- INSERT --" }});
+    try core.grid.setMsgStatus(.showcmd, &.{.{ .hl_id = 0, .text = "3d" }});
+    try core.grid.setMsgStatus(.ruler, &.{.{ .hl_id = 0, .text = "1,1" }});
+    notifyMessageChanges(&core);
+
+    // Each channel used its OWN route: showmode was shown as mini, showcmd as
+    // ext_float, and ruler was suppressed before reaching its callback.
+    try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
+    try std.testing.expectEqual(c_api.zonvie_msg_view_type.mini, state.showmode_view);
+    try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+    try std.testing.expectEqual(c_api.zonvie_msg_view_type.ext_float, state.showcmd_view);
+    try std.testing.expectEqual(@as(u32, 0), state.ruler_calls);
+
+    // A channel with nothing dirty must not be sent again on the next flush.
+    notifyMessageChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
+    try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+}
+
+test "the internal and ABI message view enums agree name for name and value for value" {
+    // The conversions between these two enums are written as identity
+    // switches, which is only correct because the two agree by NAME and by
+    // VALUE. Both pin 0..5 explicitly and include/zonvie_core.h pins the same
+    // six, so renumbering either side would silently put a different integer
+    // on the wire while every identity switch still compiled.
+    inline for (@typeInfo(config.MsgViewType).@"enum".fields) |field| {
+        const abi = @field(c_api.zonvie_msg_view_type, field.name);
+        try std.testing.expectEqual(@as(c_int, field.value), @intFromEnum(abi));
+    }
+
+    // Comparing the two enums only against each other would pass if both were
+    // renumbered together, or if a variant were added to both -- and either
+    // change silently breaks include/zonvie_core.h, the third copy of this
+    // numbering, which no test reads. Pin the wire values as literals so that
+    // adding or renumbering a view has to come here and say so.
+    const wire = [_]struct { name: []const u8, value: c_int }{
+        .{ .name = "mini", .value = 0 },
+        .{ .name = "ext_float", .value = 1 },
+        .{ .name = "confirm", .value = 2 },
+        .{ .name = "split", .value = 3 },
+        .{ .name = "none", .value = 4 },
+        .{ .name = "notification", .value = 5 },
+    };
+    inline for (wire) |w| {
+        try std.testing.expectEqual(w.value, @intFromEnum(@field(c_api.zonvie_msg_view_type, w.name)));
+        try std.testing.expectEqual(
+            @as(u8, @intCast(w.value)),
+            @intFromEnum(@field(config.MsgViewType, w.name)),
+        );
+    }
+    try std.testing.expectEqual(wire.len, @typeInfo(config.MsgViewType).@"enum".fields.len);
+    try std.testing.expectEqual(wire.len, @typeInfo(c_api.zonvie_msg_view_type).@"enum".fields.len);
+}
+
+test "every routed view reaches the msg_show callback as the matching ABI view" {
+    // Drives the msg_show conversion once per view type. A swapped or dropped
+    // arm shows up as the wrong ABI view arriving at the callback, which a
+    // single-view test could not see.
+    const State = struct {
+        calls: u32 = 0,
+        view: c_api.zonvie_msg_view_type = .none,
+
+        fn onMsgShow(
+            ctx: ?*anyopaque,
+            view: c_api.zonvie_msg_view_type,
+            kind: [*]const u8,
+            kind_len: usize,
+            chunks: [*]const c_api.MsgChunk,
+            chunk_count: usize,
+            replace_last: c_int,
+            history: c_int,
+            append: c_int,
+            msg_id: i64,
+            timeout_ms: u32,
+        ) callconv(.c) void {
+            _ = kind;
+            _ = kind_len;
+            _ = chunks;
+            _ = chunk_count;
+            _ = replace_last;
+            _ = history;
+            _ = append;
+            _ = msg_id;
+            _ = timeout_ms;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.view = view;
+        }
+    };
+
+    // Only the frontend-rendered views reach this callback (showChannelView
+    // routes .ext_float to the core's own external grid and .split back over
+    // RPC, and suppresses .none). The other three are checked by their
+    // absence, which also pins that this conversion is not on their path.
+    const cases = [_]struct { view: config.MsgViewType, expect_call: bool }{
+        .{ .view = .mini, .expect_call = true },
+        .{ .view = .confirm, .expect_call = true },
+        .{ .view = .notification, .expect_call = true },
+        .{ .view = .ext_float, .expect_call = false },
+        .{ .view = .split, .expect_call = false },
+        .{ .view = .none, .expect_call = false },
+    };
+
+    for (cases) |case| {
+        var core = Core.initForTest(std.testing.allocator);
+        defer core.deinitForTest();
+        core.ext_messages_enabled = true;
+
+        var routes = [_]config.MsgRoute{
+            .{ .filter = .{ .event = .msg_show }, .view = case.view, .opts = .{ .timeout = 0 } },
+        };
+        core.msg_config.messages.routes = &routes;
+
+        var state = State{};
+        core.ctx = &state;
+        core.cb.on_msg_show = State.onMsgShow;
+
+        try appendTestMessage(&core, 1, "echo", "hello");
+        _ = sendMsgShow(&core);
+
+        if (case.expect_call) {
+            try std.testing.expectEqual(@as(u32, 1), state.calls);
+            try std.testing.expectEqualStrings(@tagName(case.view), @tagName(state.view));
+        } else {
+            try std.testing.expectEqual(@as(u32, 0), state.calls);
+        }
+    }
+}
+
+test "row-mode and whole-screen composition produce the same main-grid vertices" {
+    // The two paths used to carry separate copies of the run-length
+    // composition loop, so a fix to one could silently miss the other. They
+    // share one body now; this pins that they still agree cell for cell.
+    const Collector = struct {
+        verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
+        alloc: std.mem.Allocator,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const v = verts orelse return;
+            self.verts.appendSlice(self.alloc, v[0..vert_count]) catch {};
+        }
+
+        fn onPartial(
+            ctx: ?*anyopaque,
+            main_verts: ?[*]const c_api.Vertex,
+            main_count: usize,
+            cursor_verts: ?[*]const c_api.Vertex,
+            cursor_count: usize,
+            flags: u32,
+        ) callconv(.c) void {
+            _ = cursor_verts;
+            _ = cursor_count;
+            _ = flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const v = main_verts orelse return;
+            self.verts.appendSlice(self.alloc, v[0..main_count]) catch {};
+        }
+    };
+
+    // Same grid contents for both runs: several distinct hl runs so the
+    // run-length batching, the hl cache and the scalar extraction all engage.
+    const seed_text = "abcABC  ..";
+    const seed_hls = [_]u32{ 0, 0, 1, 1, 1, 2, 2, 0, 3, 3 };
+
+    const Runner = struct {
+        fn collect(alloc: std.mem.Allocator, row_mode: bool, out: *std.ArrayListUnmanaged(c_api.Vertex)) !void {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+            try core.grid.resize(2, 10);
+            for (0..2) |r| {
+                for (seed_text, seed_hls, 0..) |ch, hl, c| {
+                    core.grid.putCell(@intCast(r), @intCast(c), ch, hl);
+                }
+            }
+            core.drawable_w_px = 10;
+            core.drawable_h_px = 2;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+
+            var collector = Collector{ .alloc = alloc };
+            defer collector.verts.deinit(alloc);
+            core.ctx = &collector;
+            if (row_mode) {
+                core.cb.on_vertices_row = Collector.onRow;
+            } else {
+                core.cb.on_vertices_partial = Collector.onPartial;
+            }
+
+            var flush_ctx = FlushCtx{ .core = &core };
+            try flush_ctx.onFlush(2, 10);
+            try out.appendSlice(alloc, collector.verts.items);
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    var row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer row_verts.deinit(alloc);
+    var screen_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer screen_verts.deinit(alloc);
+
+    try Runner.collect(alloc, true, &row_verts);
+    try Runner.collect(alloc, false, &screen_verts);
+
+    // Both paths must have actually produced something, or the comparison
+    // below would pass on two empty lists.
+    try std.testing.expect(row_verts.items.len > 0);
+    try std.testing.expectEqual(row_verts.items.len, screen_verts.items.len);
+
+    for (row_verts.items, screen_verts.items) |a, b| {
+        try std.testing.expectEqual(a.position, b.position);
+        try std.testing.expectEqual(a.color, b.color);
+        try std.testing.expectEqual(a.grid_id, b.grid_id);
+        try std.testing.expectEqual(a.deco_flags, b.deco_flags);
+    }
+}
+
+test "composeMainRowRuns writes one row's attributes, scalars and glow" {
+    // The differential test above can only catch a disagreement BETWEEN the
+    // two call sites, so it cannot see a fault inside the shared body - both
+    // sides would break identically. This drives the body directly.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    // Distinct attributes per hl id, or every run would produce identical
+    // bytes and the assertions below could not tell the runs apart.
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    try core.hl.define(7, 0xAA0000, 0xBB0000, 0xCC0000, false, 0, .{ .bold = true }, false);
+    try core.hl.define(9, 0x00AA00, 0x00BB00, null, false, 0, .{}, false);
+
+    // Row of 12: a run of 6 (exercises simdExtractCp's 4-wide body plus its
+    // tail), then 4, then 2. hl 7 recurs so the cache hit path runs too.
+    const cols: u32 = 12;
+    try core.grid.resize(1, cols);
+    const text = "AAAAAABBBBCC";
+    const hls = [_]u32{ 7, 7, 7, 7, 7, 7, 9, 9, 9, 9, 7, 7 };
+    for (text, hls, 0..) |ch, hl, c| core.grid.putCell(0, @intCast(c), ch, hl);
+
+    try core.initHlCache();
+    const hl_cache: []highlight.ResolvedAttrWithStyles = core.hl_cache_buf orelse &.{};
+    const hl_valid: []bool = core.hl_valid_buf orelse &.{};
+    @memset(hl_valid, false);
+
+    var dst: RenderCells = .{};
+    defer dst.deinit(core.alloc);
+    try dst.ensureTotalCapacity(core.alloc, cols);
+    dst.setLen(cols);
+
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+    composeMainRowRuns(
+        &core,
+        &dst,
+        0,
+        0,
+        cols,
+        hl_cache,
+        hl_valid,
+        @intCast(hl_valid.len),
+        false,
+        false,
+        null,
+        true,
+        &hits,
+        &misses,
+    );
+
+    const a7 = core.hl.getWithStyles(7);
+    const a9 = core.hl.getWithStyles(9);
+    for (0..cols) |i| {
+        const expected = if (hls[i] == 7) a7 else a9;
+        try std.testing.expectEqual(expected.fg, dst.fg_rgbs.items[i]);
+        try std.testing.expectEqual(expected.bg, dst.bg_rgbs.items[i]);
+        try std.testing.expectEqual(expected.sp, dst.sp_rgbs.items[i]);
+        try std.testing.expectEqual(expected.style_flags, dst.style_flags_arr.items[i]);
+        try std.testing.expectEqual(@as(i64, 1), dst.grid_ids.items[i]);
+        // Every cell's codepoint must survive the stride-2 extraction.
+        try std.testing.expectEqual(@as(u32, text[i]), dst.scalars.items[i]);
+    }
+    // The two hl ids really do differ, or the loop above proves nothing.
+    try std.testing.expect(a7.fg != a9.fg and a7.bg != a9.bg);
+
+    // Three runs: first is a miss, the 6 cells after it hit, hl 9 misses,
+    // then hl 7 recurs as a hit. Counted only because count_hl_cache is true.
+    try std.testing.expectEqual(@as(u32, 2), misses);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+
+    // Glow is opt-in: left alone when disabled, filled when enabled.
+    @memset(dst.glow_arr.items[0..cols], 0);
+    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
+    for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
+
+    // The other glow branch: with glow_all off, only the runs whose hl is in
+    // the set light up. hl 7 is in, hl 9 is out, so the answer must differ
+    // per run rather than being uniform either way.
+    var ids = std.AutoHashMap(u32, void).init(core.alloc);
+    defer ids.deinit();
+    try ids.put(7, {});
+    @memset(dst.glow_arr.items[0..cols], 0xFF);
+    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
+    for (0..cols) |i| {
+        const expected: u8 = if (hls[i] == 7) 1 else 0;
+        try std.testing.expectEqual(expected, dst.glow_arr.items[i]);
+    }
+}
+
+/// Glyph callbacks that produce a 1x1 opaque glyph for anything asked for.
+/// Enough to make the vertex generator emit glyph vertices, which is where
+/// DECO_GLOW lands — background quads never carry it.
+const StubGlyphCallbacks = struct {
+    fn rasterize(
+        ctx: ?*anyopaque,
+        scalar: u32,
+        style_flags: u32,
+        out_bitmap: *c_api.GlyphBitmap,
+    ) callconv(.c) c_int {
+        _ = ctx;
+        _ = scalar;
+        _ = style_flags;
+        out_bitmap.* = .{
+            .pixels = null,
+            .width = 1,
+            .height = 1,
+            .pitch = 1,
+            .bearing_x = 0,
+            .bearing_y = 1,
+            .advance_26_6 = 64,
+            .ascent_px = 1,
+            .descent_px = 0,
+            .bytes_per_pixel = 1,
+        };
+        return 1;
+    }
+
+    fn upload(
+        ctx: ?*anyopaque,
+        dest_x: u32,
+        dest_y: u32,
+        width: u32,
+        height: u32,
+        bitmap: *const c_api.GlyphBitmap,
+    ) callconv(.c) void {
+        _ = ctx;
+        _ = dest_x;
+        _ = dest_y;
+        _ = width;
+        _ = height;
+        _ = bitmap;
+    }
+
+    fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+        _ = ctx;
+        _ = atlas_w;
+        _ = atlas_h;
+    }
+
+    fn install(core: *Core) void {
+        core.cb.on_rasterize_glyph = rasterize;
+        core.cb.on_atlas_upload = upload;
+        core.cb.on_atlas_create = create;
+    }
+};
+
+/// Foreground colours of the two highlights the glow tests use, as they
+/// arrive in a vertex. Distinct so a glyph vertex identifies which cell it
+/// came from without decoding its position.
+const glow_in_set_fg: u32 = 0xFF0000;
+const glow_out_of_set_fg: u32 = 0x00FF00;
+const glow_in_set_color = [4]f32{ 1, 0, 0, 1 };
+const glow_out_of_set_color = [4]f32{ 0, 1, 0, 1 };
+
+/// Tallies one grid's glyph vertices by which cell they belong to AND whether
+/// they carry DECO_GLOW. Counting only "some glowed, some did not" would be
+/// symmetric under inversion, so a flipped decision or a swapped destination
+/// index would pass; keeping the two cells apart is what makes those fail.
+const GlowCounter = struct {
+    target_grid: i64,
+    in_set_glow: usize = 0,
+    in_set_plain: usize = 0,
+    out_of_set_glow: usize = 0,
+    out_of_set_plain: usize = 0,
+
+    fn count(self: *@This(), verts: ?[*]const c_api.Vertex, vert_count: usize) void {
+        const v = verts orelse return;
+        for (v[0..vert_count]) |vertex| {
+            if (vertex.grid_id != self.target_grid) continue;
+            // Background quads use the solid UV slot and never carry glow;
+            // counting them would drown the signal.
+            if (std.meta.eql(vertex.texCoord, VH.solid_uv)) continue;
+            const glowing = vertex.deco_flags & c_api.DECO_GLOW != 0;
+            if (std.meta.eql(vertex.color, glow_in_set_color)) {
+                if (glowing) self.in_set_glow += 1 else self.in_set_plain += 1;
+            } else if (std.meta.eql(vertex.color, glow_out_of_set_color)) {
+                if (glowing) self.out_of_set_glow += 1 else self.out_of_set_plain += 1;
+            }
+        }
+    }
+
+    /// With `glow_all` off only the cell whose highlight is in the set glows;
+    /// with it on both do. Either way both cells must have been seen, or the
+    /// fixture stopped emitting one of them and the rest proves nothing.
+    fn expect(self: @This(), glow_all: bool) !void {
+        try std.testing.expect(self.in_set_glow > 0);
+        try std.testing.expectEqual(@as(usize, 0), self.in_set_plain);
+        if (glow_all) {
+            try std.testing.expect(self.out_of_set_glow > 0);
+            try std.testing.expectEqual(@as(usize, 0), self.out_of_set_plain);
+        } else {
+            try std.testing.expect(self.out_of_set_plain > 0);
+            try std.testing.expectEqual(@as(usize, 0), self.out_of_set_glow);
+        }
+    }
+
+    fn onRow(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_count: u32,
+        verts: ?[*]const c_api.Vertex,
+        vert_count: usize,
+        flags: u32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = grid_id;
+        _ = row_start;
+        _ = row_count;
+        _ = flags;
+        _ = total_rows;
+        _ = total_cols;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.count(verts, vert_count);
+    }
+
+    fn onPartial(
+        ctx: ?*anyopaque,
+        main_verts: ?[*]const c_api.Vertex,
+        main_count: usize,
+        cursor_verts: ?[*]const c_api.Vertex,
+        cursor_count: usize,
+        flags: u32,
+    ) callconv(.c) void {
+        _ = cursor_verts;
+        _ = cursor_count;
+        _ = flags;
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.count(main_verts, main_count);
+    }
+};
+
+/// Define the two glow-test highlights and arm glow. hl 42 is in the set,
+/// hl 7 is not; `glow_all` overrides the set and lights both.
+fn armGlowForTest(core: *Core, glow_all: bool) !void {
+    try core.hl.define(42, glow_in_set_fg, 0, null, false, 0, .{}, false);
+    try core.hl.define(7, glow_out_of_set_fg, 0, null, false, 0, .{}, false);
+    var ids = std.AutoHashMap(u32, void).init(core.alloc);
+    errdefer ids.deinit();
+    try ids.put(42, {});
+    core.glow_hl_ids = ids;
+    core.glow_all = glow_all;
+    core.glow_enabled.store(true, .release);
+}
+
+test "a main-grid subgrid overlay glows per cell in both composition modes" {
+    // The subgrid overlay decides glow per cell, separately from the
+    // main-grid run path, and it is written out once for row mode and once
+    // for whole-screen mode. Drive both and require the decision to follow
+    // the cell's own highlight rather than being uniform.
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, row_mode: bool, glow_all: bool) !GlowCounter {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+            try core.grid.resize(1, 4);
+            for (0..4) |c| core.grid.putCell(0, @intCast(c), '.', 0);
+
+            // A two-cell window over the main grid: one cell's highlight is in
+            // the glow set, the other's is not.
+            try core.grid.resizeGrid(2, 1, 2);
+            try core.grid.setWinPos(2, 40, 0, 0);
+            core.grid.putCellGrid(2, 0, 0, 'G', 42);
+            core.grid.putCellGrid(2, 0, 1, 'N', 7);
+
+            core.grid.cursor_visible = false;
+            core.drawable_w_px = 4;
+            core.drawable_h_px = 1;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+            try armGlowForTest(&core, glow_all);
+
+            var counter = GlowCounter{ .target_grid = 2 };
+            core.ctx = &counter;
+            if (row_mode) {
+                core.cb.on_vertices_row = GlowCounter.onRow;
+            } else {
+                core.cb.on_vertices_partial = GlowCounter.onPartial;
+            }
+            StubGlyphCallbacks.install(&core);
+
+            var flush_ctx = FlushCtx{ .core = &core };
+            try flush_ctx.onFlush(1, 4);
+            return counter;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |row_mode| {
+        for ([_]bool{ false, true }) |glow_all| {
+            const counter = try Runner.run(alloc, row_mode, glow_all);
+            try counter.expect(glow_all);
+        }
+    }
+}
+
+test "an external grid and its anchored float glow per cell" {
+    // The external-grid path carries its own copy of the decision, once for
+    // the grid's own rows and once for a float composited onto it.
+    const Runner = struct {
+        fn run(alloc: std.mem.Allocator, target: i64, glow_all: bool) !GlowCounter {
+            var core = Core.initForTest(alloc);
+            defer core.deinitForTest();
+
+            // Four columns so the float can sit beside the grid's own cells
+            // rather than covering them.
+            try core.grid.resizeGrid(2, 1, 4);
+            try core.grid.putSyntheticExternal(2, .{ .win = 42, .start_row = 0, .start_col = 0 });
+            core.grid.putCellGrid(2, 0, 0, 'G', 42);
+            core.grid.putCellGrid(2, 0, 1, 'N', 7);
+
+            // A float anchored on the external grid, same split.
+            try core.grid.resizeGrid(3, 1, 2);
+            try core.grid.setWinFloatPos(3, 43, 0, 2, 10, 0, 2);
+            core.grid.putCellGrid(3, 0, 0, 'G', 42);
+            core.grid.putCellGrid(3, 0, 1, 'N', 7);
+
+            core.grid.cursor_visible = false;
+            core.cell_w_px = 1;
+            core.cell_h_px = 1;
+            try armGlowForTest(&core, glow_all);
+
+            var counter = GlowCounter{ .target_grid = target };
+            core.ctx = &counter;
+            core.cb.on_vertices_row = GlowCounter.onRow;
+            StubGlyphCallbacks.install(&core);
+
+            core.sendExternalGridVertices(true);
+            return counter;
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    // grid 2 is the external grid's own rows; grid 3 is the float overlay.
+    for ([_]i64{ 2, 3 }) |target| {
+        for ([_]bool{ false, true }) |glow_all| {
+            const counter = try Runner.run(alloc, target, glow_all);
+            try counter.expect(glow_all);
+        }
+    }
+}
+
+test "resolveHlCached memoizes below the limit and resolves live above it" {
+    // This memo block used to be written out at four call sites, and two of
+    // them had already drifted: only the row-mode pair counted hits and
+    // misses. With one body the counters are a caller's choice rather than
+    // something a copy can forget, so pin both halves of that choice.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    try core.hl.define(3, 0xAB0000, 0xCD0000, null, false, 0, .{}, false);
+
+    var cache: [4]highlight.ResolvedAttrWithStyles = undefined;
+    var valid = [_]bool{false} ** 4;
+    const limit: u32 = 4;
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+
+    // First touch is a miss and fills the slot.
+    const first = resolveHlCached(&core, 3, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0xAB0000), first.fg);
+    try std.testing.expect(valid[3]);
+    try std.testing.expectEqual(@as(u32, 1), misses);
+    try std.testing.expectEqual(@as(u32, 0), hits);
+
+    // Second touch is served from the slot. Poison the live table first, so a
+    // hit is provably reading the memo rather than resolving again.
+    try core.hl.define(3, 0xFFFFFF, 0xFFFFFF, null, false, 0, .{}, false);
+    const second = resolveHlCached(&core, 3, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0xAB0000), second.fg);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+    try std.testing.expectEqual(@as(u32, 1), misses);
+
+    // Exactly at the limit is the off-by-one that would index one past the
+    // end of both arrays. It must take the live path, not the memo path.
+    try core.hl.define(limit, 0x00CC00, 0x00DD00, null, false, 0, .{}, false);
+    const at_limit = resolveHlCached(&core, limit, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x00CC00), at_limit.fg);
+    // A memoized id would have been recorded; this one must not be, so a
+    // second call resolves live again rather than reporting a hit.
+    const hits_before = hits;
+    try core.hl.define(limit, 0x00EE00, 0x00FF00, null, false, 0, .{}, false);
+    const at_limit_again = resolveHlCached(&core, limit, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x00EE00), at_limit_again.fg);
+    try std.testing.expectEqual(hits_before, hits);
+
+    // Well past the limit: resolve live every time, never index the arrays.
+    try core.hl.define(9, 0x0000EE, 0x0000FF, null, false, 0, .{}, false);
+    const beyond = resolveHlCached(&core, 9, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 0x0000EE), beyond.fg);
+    try std.testing.expectEqual(@as(u32, 4), misses);
+    _ = resolveHlCached(&core, 9, &cache, &valid, limit, true, &hits, &misses);
+    try std.testing.expectEqual(@as(u32, 5), misses);
+    try std.testing.expectEqual(@as(u32, 1), hits);
+
+    // count = false is the non-row-mode callers' choice: same answers, no
+    // statistics. Reuse a fresh memo so the miss path runs again.
+    var valid2 = [_]bool{false} ** 4;
+    var unused_hits: u32 = 0;
+    var unused_misses: u32 = 0;
+    const uncounted = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFF), uncounted.fg);
+    _ = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
+    try std.testing.expectEqual(@as(u32, 0), unused_hits);
+    try std.testing.expectEqual(@as(u32, 0), unused_misses);
+}
+
+test "the external-float storage size is the main formula with zero layouts" {
+    // Folding one into the other rests on the layout term vanishing at
+    // layouts == 0, including at the boundaries where either returns null.
+    const max = std.math.maxInt(usize);
+    const cases = [_][3]usize{
+        .{ 0, 0, 0 },
+        .{ 1, 2, 3 },
+        .{ 4, 4, 1024 },
+        // Each of the three checked operations at its overflow edge.
+        .{ max, 1, 0 },
+        .{ max / 2, max / 2, max },
+        .{ max / @sizeOf(usize), 1, 0 },
+        .{ max / @sizeOf(usize) + 1, 0, 0 },
+    };
+    for (cases) |c| {
+        try std.testing.expectEqual(
+            mainSubgridRowIndexStorageByteSize(c[0], c[1], c[2], 0),
+            externalFloatRowIndexStorageByteSize(c[0], c[1], c[2]),
+        );
+    }
+    // The equivalence is specific to zero layouts: a non-zero layout count
+    // must make the main formula larger, or folding would have lost a term.
+    const with_layouts = mainSubgridRowIndexStorageByteSize(4, 4, 8, 2).?;
+    const without = externalFloatRowIndexStorageByteSize(4, 4, 8).?;
+    try std.testing.expect(with_layouts > without);
+}
+
+test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
+    // The main-grid and external-float row indexes each build a CSR index the
+    // same way. Only the middle of that build is genuinely shared -- the
+    // counting and filling ends differ in what they iterate and in which
+    // array their emitted indices point into -- so this covers exactly the
+    // part both will call.
+    const alloc = std.testing.allocator;
+
+    var offsets: std.ArrayListUnmanaged(usize) = .empty;
+    defer offsets.deinit(alloc);
+    var write_offsets: std.ArrayListUnmanaged(usize) = .empty;
+    defer write_offsets.deinit(alloc);
+
+    // Counts land in offsets[row + 1], as both callers write them: row 0 has
+    // 2 references, row 1 none, row 2 three, row 3 one.
+    const row_count: usize = 4;
+    try offsets.ensureTotalCapacityPrecise(alloc, row_count + 1);
+    offsets.items.len = row_count + 1;
+    @memcpy(offsets.items, &[_]usize{ 0, 2, 0, 3, 1 });
+
+    csrOffsetsFromCounts(offsets.items);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5, 6 }, offsets.items);
+    // The last entry is the total, which is what both callers assert against.
+    try std.testing.expectEqual(@as(usize, 6), offsets.items[row_count]);
+
+    try csrSeedWriteOffsets(alloc, &write_offsets, offsets.items, row_count);
+    // Each row's cursor starts at that row's offset, and the total is NOT
+    // copied -- write_offsets is one shorter than offsets.
+    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5 }, write_offsets.items);
+    try std.testing.expectEqual(row_count, write_offsets.items.len);
+
+    // Seeding again over a longer previous run must not leave stale tail
+    // entries behind: both callers reuse these buffers across flushes.
+    var short_offsets = [_]usize{ 0, 1, 1 };
+    csrOffsetsFromCounts(&short_offsets);
+    try csrSeedWriteOffsets(alloc, &write_offsets, &short_offsets, 2);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, write_offsets.items);
+
+    // A grid with no rows is legal and must not touch the buffer.
+    var empty_offsets = [_]usize{0};
+    csrOffsetsFromCounts(&empty_offsets);
+    try std.testing.expectEqualSlices(usize, &.{0}, &empty_offsets);
+    try csrSeedWriteOffsets(alloc, &write_offsets, &empty_offsets, 0);
+    try std.testing.expectEqual(@as(usize, 0), write_offsets.items.len);
+}
+
+test "mainSubgridVisibleRowRange clamps to the viewport and rejects the invisible" {
+    // The main row-index builder walks `cached` five times and each pass
+    // repeated this filter by hand. Five copies of a three-term predicate is
+    // one edit away from the passes disagreeing, and only one of the four
+    // couplings between them is guarded by an explicit assert -- the rest
+    // corrupt the index silently. This is the single copy they all call now.
+    const row_count: usize = 10;
+    var cells = [_]grid_mod.Cell{.{ .cp = 'x', .hl = 0 }};
+    const mk = struct {
+        fn f(cp: [*]const grid_mod.Cell, row_start: u32, row_end: u32, sg_cols: u32, sg_rows: u32) CachedSubgrid {
+            return .{
+                .grid_id = 2,
+                .row_start = row_start,
+                .row_end = row_end,
+                .col_start = 0,
+                .sg_cols = sg_cols,
+                .sg_rows = sg_rows,
+                .cells = cp,
+                .margin_top = 0,
+                .margin_bottom = 0,
+            };
+        }
+    }.f;
+    const cp = cells[0..].ptr;
+
+    // Fully inside: the range is the subgrid's own rows.
+    const inside = mainSubgridVisibleRowRange(mk(cp, 2, 5, 4, 3), row_count).?;
+    try std.testing.expectEqual(@as(usize, 2), inside.start);
+    try std.testing.expectEqual(@as(usize, 5), inside.end);
+
+    // Straddling the bottom edge: the end clamps, the start does not move.
+    const straddle = mainSubgridVisibleRowRange(mk(cp, 8, 14, 4, 6), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), straddle.start);
+    try std.testing.expectEqual(row_count, straddle.end);
+
+    // Both sides of the bottom boundary.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 10, 12, 4, 2), row_count) == null);
+    const flush_bottom = mainSubgridVisibleRowRange(mk(cp, 8, 10, 4, 2), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), flush_bottom.start);
+    try std.testing.expectEqual(row_count, flush_bottom.end);
+
+    // row_end is built with a saturating add, so a hostile window position
+    // can present it already saturated. The clamp must absorb that.
+    const saturated = mainSubgridVisibleRowRange(mk(cp, 8, std.math.maxInt(u32), 4, 6), row_count).?;
+    try std.testing.expectEqual(@as(usize, 8), saturated.start);
+    try std.testing.expectEqual(row_count, saturated.end);
+
+    // Entirely below the viewport: both clamp to row_count, so start >= end.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 12, 16, 4, 4), row_count) == null);
+
+    // Zero-sized in either dimension. The production builder already filters
+    // these out, so both arms are defensive -- do not prune them as dead.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 0, 3), row_count) == null);
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 1, 4, 4, 0), row_count) == null);
+
+    // The `start >= end` arm on its own. The record is deliberately
+    // inconsistent with the production row_end = row_start + sg_rows
+    // invariant so that neither size term can carry this case.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 3, 3, 4, 3), row_count) == null);
+
+    // A zero-row viewport admits nothing, which is a real state: neither the
+    // caller nor onFlush guards rows == 0.
+    try std.testing.expect(mainSubgridVisibleRowRange(mk(cp, 0, 3, 4, 3), 0) == null);
+}
+
+/// Recover the emitted corner order of a six-vertex solid quad.
+///
+/// Returns the index each vertex takes in the quad's four distinct corners,
+/// ordered TL, TR, BL, BR. The expected pattern is 0,2,1,1,2,3 -- TL, BL, TR,
+/// TR, BL, BR -- which is what every pushSolidQuad body emits. Comparing the
+/// pattern rather than raw NDC keeps the assertion independent of cell
+/// geometry and line spacing.
+fn solidQuadCornerPattern(verts: []const c_api.Vertex) [6]u8 {
+    var xs: [2]f32 = .{ verts[0].position[0], verts[0].position[0] };
+    var ys: [2]f32 = .{ verts[0].position[1], verts[0].position[1] };
+    for (verts) |v| {
+        xs[0] = @min(xs[0], v.position[0]);
+        xs[1] = @max(xs[1], v.position[0]);
+        ys[0] = @min(ys[0], v.position[1]);
+        ys[1] = @max(ys[1], v.position[1]);
+    }
+    var out: [6]u8 = undefined;
+    for (verts, 0..) |v, i| {
+        // ndc4 flips y, so the larger y is the top edge.
+        const right: u8 = if (v.position[0] == xs[1]) 1 else 0;
+        const bottom: u8 = if (v.position[1] == ys[0]) 1 else 0;
+        out[i] = bottom * 2 + right;
+    }
+    return out;
+}
+
+test "the main-grid cursor background is emitted in the shared corner order" {
+    // The cursor background was the one solid quad still hand-expanded into
+    // six appends, at two sites, and the two had drifted apart. Drive the real
+    // main-grid cursor path and pin the order it emits.
+    const State = struct {
+        cursor: [6]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 6) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            // The background quad is the first push after the buffer is cleared.
+            @memcpy(&self.cursor, v[0..6]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 2);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.setCursor(1, 0, 0);
+    // Deliberately non-square, with a non-square cell: a transposed x/y or
+    // width/height argument would preserve the corner ordering and silently
+    // move the quad, so the fixture has to be able to tell them apart.
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
+    try std.testing.expect(state.count >= 6);
+
+    // TL, BL, TR, TR, BL, BR -- the order every pushSolidQuad body emits.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(&state.cursor));
+    // The pattern is blind to placement, so pin the geometry too: a
+    // transposed x/y or width/height argument keeps the ordering and moves
+    // the quad. Cursor at (0,0), 4x2 cell in an 8x4 drawable, double-width.
+    try std.testing.expectEqual([2]f32{ -1, 1 }, state.cursor[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.cursor[5].position);
+    for (state.cursor) |v| {
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+        try std.testing.expectEqual(state.cursor[0].color, v.color);
+    }
+}
+
+test "the external-grid cursor background uses the same corner order" {
+    // This is the site whose hand-expansion had drifted: it emitted the same
+    // two triangles wound the other way. Both backends disable culling, so
+    // nothing rendered differently and nothing caught it -- the defect was
+    // that the two sites disagreed at all.
+    const State = struct {
+        cursor: [6]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 6) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(&self.cursor, v[0..6]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(2, 2, 2);
+    core.grid.putCell(0, 0, 'B', 0);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    core.grid.setCursor(2, 0, 0);
+    // Non-square cell, as in the main-grid test: the corner pattern alone
+    // cannot tell a transposed width/height argument from the right one.
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    core.sendExternalGridVertices(true);
+    try std.testing.expect(state.count >= 6);
+
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(&state.cursor));
+    try std.testing.expectEqual([2]f32{ -1, 1 }, state.cursor[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, state.cursor[5].position);
+    for (state.cursor) |v| {
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+        try std.testing.expectEqual(state.cursor[0].color, v.color);
+    }
+}
+
+test "the external-grid cursor glyph uses the same corner order as every other quad" {
+    // The cursor background at this site was routed through pushSolidQuad
+    // in "refactor(core): route both cursor backgrounds through pushSolidQuad",
+    // but the glyph quad directly below it stayed hand-expanded and kept
+    // the old winding: TL, TR, BL, TR, BR, BL against everything else's
+    // TL, BL, TR, TR, BL, BR. Both backends disable culling -- Windows sets
+    // D3D11_CULL_NONE explicitly (d3d11_renderer.zig) and Metal defaults to
+    // none -- so nothing rendered differently, which is why it survived. The
+    // defect is that one quad in the tree disagrees with the rest.
+    const State = struct {
+        verts: [12]c_api.Vertex = undefined,
+        count: usize = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const v = verts orelse return;
+            if (vert_count < 12) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            @memcpy(&self.verts, v[0..12]);
+            self.count = vert_count;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(2, 2, 2);
+    // The cell under the cursor must be in grid 2, not the main grid, or there
+    // is no glyph to draw and only the background quad is emitted.
+    core.grid.putCellGrid(2, 0, 0, 'B', 0);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    core.grid.setCursor(2, 0, 0);
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    // The glyph quad is only emitted once a glyph entry exists for the cell.
+    StubGlyphCallbacks.install(&core);
+
+    core.sendExternalGridVertices(true);
+
+    // Background quad first, then the glyph quad on top of it.
+    try std.testing.expect(state.count >= 12);
+    const background = state.verts[0..6];
+    const glyph = state.verts[6..12];
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(background));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(glyph));
+
+    // The two really are different quads, or the assertion above proved
+    // nothing about the glyph: the background carries the solid UV slot and
+    // the glyph does not.
+    try std.testing.expectEqual(VH.solid_uv, background[0].texCoord);
+    try std.testing.expect(!std.meta.eql(VH.solid_uv, glyph[0].texCoord));
+}
+
+test "VH's two solid-quad variants emit the same corner order" {
+    // The file carries three copies of this helper -- VH and one per
+    // vertex-generating function -- but the other two are function-local and
+    // unreachable from a test. They are covered instead by the two cursor
+    // tests above, which drive the real paths. This one pins VH's own pair.
+    const alloc = std.testing.allocator;
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(alloc);
+    try out.ensureTotalCapacity(alloc, 12);
+
+    try VH.pushSolidQuad(&out, alloc, 0, 0, 4, 2, .{ 1, 0, 0, 1 }, 8, 4, 1, c_api.DECO_CURSOR);
+    VH.pushSolidQuadAssumeCapacity(&out, 0, 0, 4, 2, .{ 1, 0, 0, 1 }, 8, 4, 1, c_api.DECO_CURSOR);
+    try std.testing.expectEqual(@as(usize, 12), out.items.len);
+
+    for (0..6) |i| {
+        try std.testing.expectEqual(out.items[i], out.items[i + 6]);
+    }
+    try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(out.items[0..6]));
+
+    // The pattern is deliberately blind to placement, so pin the geometry too:
+    // a transposed x/y or vw/vh argument would keep the ordering and move the
+    // quad. ndc = (x/vw*2-1, 1-y/vh*2), so (0,0)-(4,2) in an 8x4 viewport puts
+    // the top-left corner at (-1, 1) and the bottom-right at (0, 0).
+    try std.testing.expectEqual([2]f32{ -1, 1 }, out.items[0].position);
+    try std.testing.expectEqual([2]f32{ 0, 0 }, out.items[5].position);
+
+    // The first triangle is wound counter-clockwise in NDC. Computed from the
+    // EMITTED vertices, not from ndc4's return, so it tests what was pushed.
+    const a = out.items[0].position;
+    const b = out.items[1].position;
+    const c = out.items[2].position;
+    const cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    try std.testing.expect(cross > 0);
+
+    for (out.items) |v| {
+        try std.testing.expectEqual([4]f32{ 1, 0, 0, 1 }, v.color);
+        try std.testing.expectEqual(VH.solid_uv, v.texCoord);
+        try std.testing.expectEqual(@as(i64, 1), v.grid_id);
+        try std.testing.expectEqual(c_api.DECO_CURSOR, v.deco_flags);
+        try std.testing.expectEqual(@as(f32, 0), v.deco_phase);
+    }
+}
+
+/// Append one line to the msg_show line cache, as buildMsgLineCache would.
+fn seedMsgCacheLine(core: *Core, text: []const u8) !void {
+    var cached: MsgCachedLine = .{};
+    @memcpy(cached.data[0..text.len], text);
+    cached.len = @intCast(text.len);
+    cached.display_width = @intCast(countDisplayWidth(text));
+    try core.msg_line_cache.append(core.alloc, cached);
+}
+
+/// One history entry holding a single chunk. The caller owns the entry and
+/// must deinit it with the same allocator.
+fn makeTestHistoryEntry(core: *Core, text: []const u8) !grid_mod.MsgHistoryEntry {
+    var entry: grid_mod.MsgHistoryEntry = .{};
+    const owned = try core.alloc.dupe(u8, text);
+    errdefer core.alloc.free(owned);
+    try entry.content.append(core.alloc, .{ .hl_id = 0, .text = owned });
+    return entry;
+}
+
+fn panelCols(core: *Core, grid_id: i64) u32 {
+    return core.grid.sub_grids.get(grid_id).?.cols;
+}
+
+fn panelRows(core: *Core, grid_id: i64) u32 {
+    return core.grid.sub_grids.get(grid_id).?.rows;
+}
+
+test "both message panels lay out text with one padding column and double-cell wide chars" {
+    // Both panels write the same way: column 0 is padding, content starts at
+    // column 1, and a wide codepoint consumes two cells so what follows it is
+    // pushed one column further right. clearGrid fills with ' ', so the
+    // placeholder's cp 0 is distinguishable from an untouched cell.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "aあb");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(mgid, 0, 2).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 'b'), core.grid.getCellGrid(mgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+    // Both the body and the placeholder are written with hl 0.
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 2).hl);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(mgid, 0, 3).hl);
+
+    // The history panel writes the identical layout. Its width differs only
+    // because its content-width floor is 20 rather than the cached max.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "aあb")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 22), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 0).cp);
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(hgid, 0, 2).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 3).cp);
+    try std.testing.expectEqual(@as(u32, 'b'), core.grid.getCellGrid(hgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 2).hl);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.getCellGrid(hgid, 0, 3).hl);
+}
+
+test "both message panels write each line to its own row" {
+    // Every other fixture here is single-row, which would let a shared
+    // per-line helper drop its row argument and collapse the whole panel
+    // onto row 0.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "ab");
+    try seedMsgCacheLine(&core, "cd");
+    core.msg_cached_max_width = 2;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'c'), core.grid.getCellGrid(mgid, 1, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 1, 2).cp);
+
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var entries = [_]grid_mod.MsgHistoryEntry{
+        try makeTestHistoryEntry(&core, "ab"),
+        try makeTestHistoryEntry(&core, "cd"),
+    };
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'c'), core.grid.getCellGrid(hgid, 1, 1).cp);
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 1, 2).cp);
+}
+
+test "a message panel re-render clears what the previous render left behind" {
+    // resizeGrid keeps the overlapping region when the shape does not change,
+    // so the clear after it is what stops a shorter line from inheriting the
+    // tail of a longer one.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    core.msg_cached_max_width = 4;
+    try seedMsgCacheLine(&core, "abcd");
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 0, 4).cp);
+
+    // Same width, so the grid is not reshaped and nothing is memset for us.
+    core.msg_line_cache.clearRetainingCapacity();
+    try seedMsgCacheLine(&core, "a");
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(mgid, 0, 1).cp);
+    for (2..5) |col| {
+        try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, @intCast(col)).cp);
+    }
+
+    // The history panel's width is derived from its content, so both renders
+    // are kept under its floor of 20 to hold the shape constant.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "abcd")};
+    defer for (&long_entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &long_entries));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 0, 4).cp);
+
+    var short_entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "a")};
+    defer for (&short_entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &short_entries));
+
+    try std.testing.expectEqual(@as(u32, 22), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 1).cp);
+    for (2..5) |col| {
+        try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, @intCast(col)).cp);
+    }
+}
+
+test "only the history panel aborts the flush when registration fails" {
+    // The two panels share the registration call but not its failure policy:
+    // history marks the flush aborted, msg leaves that to its callers. A
+    // shared registration helper must not unify the two.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    // Saturate the placement budget so putSyntheticExternal fails for any new
+    // grid id, without depending on allocation-failure injection.
+    var filler_id: i64 = 1000;
+    while (core.grid.external_grids.count() < grid_mod.MAX_WINDOW_PLACEMENTS) : (filler_id += 1) {
+        try core.grid.external_grids.put(core.alloc, filler_id, .{ .win = 1, .start_row = 0, .start_col = 0 });
+    }
+
+    try seedMsgCacheLine(&core, "hello");
+    core.msg_cached_max_width = 5;
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try std.testing.expect(!renderMsgGridFromCache(&core, 0));
+    try std.testing.expect(!core.flush_aborted);
+    // The grid was resized and written before the failure, so what failed is
+    // the registration and nothing earlier.
+    try std.testing.expectEqual(@as(u32, 7), panelCols(&core, mgid));
+    try std.testing.expect(core.grid.external_grids.get(mgid) == null);
+
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "hello")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(!renderMsgHistoryGrid(&core, &entries));
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.grid.external_grids.get(grid_mod.MSG_HISTORY_GRID_ID) == null);
+}
+
+test "a wide char on the last usable column writes its body without the placeholder" {
+    // The inner guard breaks after the body cell, so the wide glyph overhangs
+    // the right padding column with no cell reserved for its second half, and
+    // everything after it is dropped.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "aaaあz");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(mgid, 0, 4).cp);
+    // Still the cleared space: no placeholder was written for the second half.
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+    // 'z' never fits, on any column.
+    for (0..6) |col| {
+        try std.testing.expect(core.grid.getCellGrid(mgid, 0, @intCast(col)).cp != 'z');
+    }
+
+    // Same edge on the history panel, reachable only at the 80-column cap:
+    // 77 narrow columns, then a wide char whose body lands on the last usable
+    // column. This is the guard that distinguishes the current loop from
+    // writeUtf8ToGrid, which would drop the whole cluster instead.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_line: [81]u8 = undefined;
+    @memset(long_line[0..77], 'a');
+    @memcpy(long_line[77..80], "あ");
+    long_line[80] = 'z';
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, &long_line)};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 0x3042), core.grid.getCellGrid(hgid, 0, 78).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 79).cp);
+    for (0..80) |col| {
+        try std.testing.expect(core.grid.getCellGrid(hgid, 0, @intCast(col)).cp != 'z');
+    }
+}
+
+test "both message panels stop writing at the last usable column" {
+    // The right padding column is never written. Each panel is filled to its
+    // own edge, since their widths are derived differently, and the trailing
+    // 'z' must be dropped in both.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "abcdz");
+    core.msg_cached_max_width = 4;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    try std.testing.expectEqual(@as(u32, 6), panelCols(&core, mgid));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(mgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(mgid, 0, 5).cp);
+
+    // The history panel's floor is 20, so its edge is only reachable at the
+    // 80-column cap: 78 columns of content, then one codepoint too many.
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    var long_line: [79]u8 = undefined;
+    @memset(long_line[0..78], 'a');
+    long_line[78] = 'z';
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, &long_line)};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'a'), core.grid.getCellGrid(hgid, 0, 78).cp);
+    try std.testing.expectEqual(@as(u32, ' '), core.grid.getCellGrid(hgid, 0, 79).cp);
+}
+
+test "the message panel width adds a padding column per side and caps at 80" {
+    // width is content + 2, capped at 80. A content width of 0 is not
+    // reachable through buildMsgLineCache, which floors the cached width at
+    // 10; it is set directly here to pin the formula's lower bound, which a
+    // shared helper could otherwise clamp differently.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    try seedMsgCacheLine(&core, "");
+    core.msg_cached_max_width = 0;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 2), panelCols(&core, mgid));
+
+    core.msg_cached_max_width = 200;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 80), panelCols(&core, mgid));
+}
+
+test "both message panels register with the top-right placement sentinel" {
+    // -2 in both position fields is what the core registers a message panel
+    // with. The frontends select top-right placement by grid id rather than
+    // by this value, but they do rely on it being negative.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    try seedMsgCacheLine(&core, "hello");
+    core.msg_cached_max_width = 5;
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+
+    var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, "hello")};
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+
+    for ([_]i64{ grid_mod.MESSAGE_GRID_ID, grid_mod.MSG_HISTORY_GRID_ID }) |gid| {
+        const info = core.grid.external_grids.get(gid).?;
+        try std.testing.expectEqual(@as(i64, 1), info.win);
+        try std.testing.expectEqual(@as(i32, -2), info.start_row);
+        try std.testing.expectEqual(@as(i32, -2), info.start_col);
+    }
 }

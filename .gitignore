@@ -26,3 +26,5 @@ __pycache__/
 # Intermediate shader bytecode (compile.bat output; the checked-in
 # artifact is windows/shaders/compiled_shaders.zig)
 *.cso
+.worktrees/
+docs/

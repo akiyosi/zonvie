@@ -1529,203 +1529,6 @@ pub const Renderer = struct {
         self.advanceSwapchainIndex();
     }
 
-    pub fn presentOnlyFromBackRects(self: *Renderer, rects: []const c.RECT) !void {
-        try self.resize();
-        if (!self.resourcesReady()) return; // pending resize retry / device lost — skip this frame safely
-
-        const ctx = self.ctx orelse return error.NoContext;
-        const sc = self.swapchain orelse return error.NoSwapchain;
-
-        const bb_tex = self.currentBackBufferTex();
-        const back_tex = self.back_tex orelse return error.NoBackTex;
-
-        const ctx_vtbl = ctx.*.lpVtbl;
-
-        // Custom shader pass writes directly into the current bb; skip
-        // the back→bb copy when it ran.
-        var shader_handled_por: bool = false;
-        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
-            shader_handled_por = self.drawCustomShaderPass(ctx, ctx_vtbl);
-        }
-
-        const copy_sub_opt = ctx_vtbl.*.CopySubresourceRegion;
-        const copy_res_opt = ctx_vtbl.*.CopyResource;
-
-        const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
-        const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
-
-        // If rects is empty (or first present after resize), use full copy.
-        if (shader_handled_por) {
-            // shader already wrote bb; no copy needed
-        } else if (!self.has_presented_once or rects.len == 0) {
-            const copy_res = copy_res_opt orelse return;
-            copy_res(ctx, bb_res, back_res);
-        } else {
-            const w_i32: i32 = @intCast(self.width);
-            const h_i32: i32 = @intCast(self.height);
-
-            if (copy_sub_opt == null) return;
-            const copy_sub = copy_sub_opt.?;
-
-            var i: usize = 0;
-            while (i < rects.len) : (i += 1) {
-                var dr = rects[i];
-
-                if (dr.left < 0) dr.left = 0;
-                if (dr.top < 0) dr.top = 0;
-                if (dr.right > w_i32) dr.right = w_i32;
-                if (dr.bottom > h_i32) dr.bottom = h_i32;
-
-                const valid =
-                    (dr.left < dr.right) and (dr.top < dr.bottom) and
-                    (dr.left >= 0) and (dr.top >= 0) and
-                    (dr.right <= w_i32) and (dr.bottom <= h_i32);
-
-                if (!valid) continue;
-
-                const box: c.D3D11_BOX = .{
-                    .left = @intCast(dr.left),
-                    .top = @intCast(dr.top),
-                    .front = 0,
-                    .right = @intCast(dr.right),
-                    .bottom = @intCast(dr.bottom),
-                    .back = 1,
-                };
-
-                copy_sub(
-                    ctx,
-                    bb_res,
-                    0,
-                    @intCast(dr.left),
-                    @intCast(dr.top),
-                    0,
-                    back_res,
-                    0,
-                    &box,
-                );
-            }
-        }
-
-        const sc_vtbl = sc.*.lpVtbl;
-        const present = sc_vtbl.*.Present orelse return;
-        const hrp: c.HRESULT = present(sc, 0, 0);
-        if (!c.FAILED(hrp)) {
-            self.has_presented_once = true;
-        } else if (isDeviceLost(hrp)) {
-            self.device_lost = true;
-        }
-        self.advanceSwapchainIndex();
-    }
-
-    pub fn presentOnlyFromBackRectsNoResize(self: *Renderer, rects: []const c.RECT) !void {
-        var t_present_start: i128 = 0;
-        if (applog.isEnabled()) t_present_start = core.clock.nowNs();
-
-        const ctx = self.ctx orelse return error.NoContext;
-        const sc = self.swapchain orelse return error.NoSwapchain;
-        if (!self.resourcesReady()) return; // pending resize retry / device lost — skip this frame safely
-
-        const bb_tex = self.currentBackBufferTex();
-        const back_tex = self.back_tex orelse return error.NoBackTex;
-
-        const ctx_vtbl = ctx.*.lpVtbl;
-
-        // Custom shader pass writes directly into the current bb; skip
-        // the back→bb copy when it ran.
-        var shader_handled_ponr: bool = false;
-        if (self.custom_shader_pipelines.items.len > 0 and self.custom_shader_post_process == 0) {
-            shader_handled_ponr = self.drawCustomShaderPass(ctx, ctx_vtbl);
-        }
-
-        // If rects is empty (or first present after resize), equivalent to full screen
-        if (shader_handled_ponr) {
-            // shader already wrote bb; no copy needed
-        } else if (!self.has_presented_once or rects.len == 0) {
-            const copy_res = ctx_vtbl.*.CopyResource orelse return;
-
-            const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
-            const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
-
-            copy_res(ctx, bb_res, back_res);
-        } else {
-            // Clamp each rect and CopySubresourceRegion
-            var i: usize = 0;
-            while (i < rects.len) : (i += 1) {
-                var dr = rects[i];
-
-                if (dr.left < 0) dr.left = 0;
-                if (dr.top < 0) dr.top = 0;
-
-                const w_i32: i32 = @intCast(self.width);
-                const h_i32: i32 = @intCast(self.height);
-
-                if (dr.right > w_i32) dr.right = w_i32;
-                if (dr.bottom > h_i32) dr.bottom = h_i32;
-
-                const valid =
-                    (dr.left < dr.right) and (dr.top < dr.bottom) and
-                    (dr.left >= 0) and (dr.top >= 0) and
-                    (dr.right <= w_i32) and (dr.bottom <= h_i32);
-
-                if (valid) {
-                    const box: c.D3D11_BOX = .{
-                        .left = @intCast(dr.left),
-                        .top = @intCast(dr.top),
-                        .front = 0,
-                        .right = @intCast(dr.right),
-                        .bottom = @intCast(dr.bottom),
-                        .back = 1,
-                    };
-
-                    const copy_sub = ctx_vtbl.*.CopySubresourceRegion orelse return;
-                    const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
-                    const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
-
-                    copy_sub(
-                        ctx,
-                        bb_res,
-                        0,
-                        @intCast(dr.left),
-                        @intCast(dr.top),
-                        0,
-                        back_res,
-                        0,
-                        &box,
-                    );
-                } else {
-                    // If still broken after clamp, full copy as fallback
-                    const copy_res = ctx_vtbl.*.CopyResource orelse return;
-
-                    const bb_res: *c.ID3D11Resource = @ptrCast(bb_tex);
-                    const back_res: *c.ID3D11Resource = @ptrCast(back_tex);
-
-                    copy_res(ctx, bb_res, back_res);
-                    break;
-                }
-            }
-        }
-
-        const sc_vtbl = sc.*.lpVtbl;
-        const present = sc_vtbl.*.Present orelse return;
-
-        // sync interval: 0 (no vsync wait)
-        const hrp: c.HRESULT = present(sc, 0, 0);
-
-        if (!c.FAILED(hrp)) {
-            self.has_presented_once = true;
-        } else if (isDeviceLost(hrp)) {
-            self.device_lost = true;
-        }
-        self.advanceSwapchainIndex();
-
-        // Performance log: present
-        if (applog.isEnabled() and t_present_start != 0) {
-            const t_present_end = core.clock.nowNs();
-            const present_us = @divTrunc(@max(0, t_present_end - t_present_start), 1000);
-            applog.appLog("[perf] present rects={d} us={d}\n", .{ rects.len, present_us });
-        }
-    }
-
     pub fn presentFromBackRectsWithCursorNoResize(
         self: *Renderer,
         rects: []const c.RECT,
@@ -1904,30 +1707,6 @@ pub const Renderer = struct {
         }
         if (c.FAILED(hrp)) return error.PresentFailed;
         self.advanceSwapchainIndex();
-    }
-
-    /// Draw multiple dirty rects.
-    /// - rects.len == 0: treated as dirty_rect == null
-    /// - Only the last rect will perform Present (opts.present), others draw into persistent back buffer only.
-    pub fn drawExRects(
-        self: *Renderer,
-        main: []const core.Vertex,
-        cursor: []const core.Vertex,
-        rects: []const c.RECT,
-        opts: DrawOpts,
-    ) !void {
-        if (rects.len == 0) {
-            try self.drawEx(main, cursor, null, opts);
-            return;
-        }
-
-        var i: usize = 0;
-        while (i < rects.len) : (i += 1) {
-            var local_opts = opts;
-            // Present only once at the end.
-            local_opts.present = opts.present and (i + 1 == rects.len);
-            try self.drawEx(main, cursor, rects[i], local_opts);
-        }
     }
 
     /// Backward-compatible single-rect draw.
@@ -2625,26 +2404,25 @@ pub const Renderer = struct {
         dcomp_visual = null;
     }
 
-    /// Create swap chain and DirectComposition using the pre-set self.device/self.ctx.
-    fn createSwapchainOnly(self: *Renderer) !void {
-        var rc: c.RECT = undefined;
-        _ = c.GetClientRect(self.hwnd, &rc);
-        self.width = @intCast(@max(1, rc.right - rc.left));
-        self.height = @intCast(@max(1, rc.bottom - rc.top));
-
-        const dev = self.device;
+    /// Create the flip-model composition swapchain for `dev` at the
+    /// renderer's current size, bind it to a DirectComposition visual, and
+    /// publish it on self along with the derived IDXGISwapChain3.
+    ///
+    /// Every Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so composition is
+    /// the only path that can produce a visible renderer -- there is no legacy
+    /// HWND fallback, and a failure here fails initialization. The DXGI
+    /// device, adapter and factory are transient and released before return;
+    /// on failure nothing is left owned.
+    ///
+    /// Caller keeps the device: createSwapchainOnly reuses one self already
+    /// holds, createDeviceAndSwapchain transfers a freshly created one after
+    /// this returns.
+    fn createCompositionSwapchain(self: *Renderer, dev: *c.ID3D11Device) !void {
         var hr: c.HRESULT = 0;
-
-        // Skip device creation -- jump straight to swap chain.
-        // Feature level was determined at device creation time.
-        dbgLog("[d3d] createSwapchainOnly: begin (device=0x{x})\n", .{if (dev) |p| @intFromPtr(p) else 0});
-
-        const enable_flip_model = true;
-
         var sc1: ?*c.IDXGISwapChain1 = null;
         var sc0: ?*c.IDXGISwapChain = null;
-        defer safeRelease(&sc1);
-        defer safeRelease(&sc0);
+        errdefer safeRelease(&sc1);
+        errdefer safeRelease(&sc0);
         var sc1_buf_count: u32 = 3;
         var dxgi_dev: ?*c.IDXGIDevice = null;
         var adapter: ?*c.IDXGIAdapter = null;
@@ -2653,7 +2431,7 @@ pub const Renderer = struct {
         defer safeRelease(&adapter);
         defer safeRelease(&factory2);
 
-        const dev_unk: *c.IUnknown = @ptrCast(dev.?);
+        const dev_unk: *c.IUnknown = @ptrCast(dev);
         const dev_vtbl = dev_unk.*.lpVtbl;
         const qi = dev_vtbl.*.QueryInterface orelse return error.D3DCreateFailed;
 
@@ -2669,8 +2447,9 @@ pub const Renderer = struct {
                 }
             }
         }
+        dbgLog("[d3d] createCompositionSwapchain: factory2=0x{x}\n", .{if (factory2) |p| @intFromPtr(p) else 0});
 
-        if (enable_flip_model and factory2 != null) {
+        if (factory2 != null) {
             var sd1: c.DXGI_SWAP_CHAIN_DESC1 = std.mem.zeroes(c.DXGI_SWAP_CHAIN_DESC1);
             sd1.Width = self.width;
             sd1.Height = self.height;
@@ -2680,12 +2459,15 @@ pub const Renderer = struct {
             sd1.BufferCount = 3;
             sd1.SwapEffect = c.DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
             sd1.Scaling = c.DXGI_SCALING_STRETCH;
+            // Always premultiplied alpha: WS_EX_NOREDIRECTIONBITMAP requires
+            // the composition path.
             sd1.AlphaMode = c.DXGI_ALPHA_MODE_PREMULTIPLIED;
             sc1_buf_count = @intCast(sd1.BufferCount);
 
             const fac_vtbl = factory2.?.lpVtbl;
             if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
-                hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
+                hr = create_sc_comp(factory2.?, @ptrCast(dev), &sd1, null, @ptrCast(&sc1));
+                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
                 if (!c.FAILED(hr) and sc1 != null) {
                     const sc1_vtbl = sc1.?.lpVtbl;
                     if (sc1_vtbl.*.QueryInterface) |sc_qi| {
@@ -2693,12 +2475,12 @@ pub const Renderer = struct {
                         if (c.FAILED(sc0_hr)) safeRelease(&sc0);
                     }
                 }
+            } else {
+                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
             }
         }
 
-        if (sc1 == null or sc0 == null) {
-            return error.D3DCreateFailed;
-        }
+        if (sc1 == null or sc0 == null) return error.D3DCreateFailed;
         const composition_device = dxgi_dev orelse return error.D3DCreateFailed;
         try self.createDirectComposition(sc1.?, composition_device);
 
@@ -2715,11 +2497,29 @@ pub const Renderer = struct {
             if (sc0_vtbl.*.QueryInterface) |sc_qi| {
                 var sc3: ?*c.IDXGISwapChain3 = null;
                 const hr_sc3 = sc_qi(sc0p, &c.IID_IDXGISwapChain3, @ptrCast(&sc3));
+                if (applog.isEnabled()) {
+                    applog.appLog("[d3d] QI IDXGISwapChain3 hr=0x{x} sc3=0x{x}\n", .{ @as(u32, @bitCast(hr_sc3)), if (sc3) |p| @intFromPtr(p) else 0 });
+                }
                 if (!c.FAILED(hr_sc3) and sc3 != null) {
                     self.swapchain3 = sc3;
                 }
             }
         }
+    }
+
+    fn createSwapchainOnly(self: *Renderer) !void {
+        var rc: c.RECT = undefined;
+        _ = c.GetClientRect(self.hwnd, &rc);
+        self.width = @intCast(@max(1, rc.right - rc.left));
+        self.height = @intCast(@max(1, rc.bottom - rc.top));
+
+        const dev = self.device;
+
+        // Skip device creation -- jump straight to swap chain.
+        // Feature level was determined at device creation time.
+        dbgLog("[d3d] createSwapchainOnly: begin (device=0x{x})\n", .{if (dev) |p| @intFromPtr(p) else 0});
+
+        try self.createCompositionSwapchain(dev.?);
     }
 
     fn createDeviceAndSwapchain(self: *Renderer) !void {
@@ -2782,105 +2582,14 @@ pub const Renderer = struct {
         dbgLog("[d3d] init: D3D11CreateDevice ok dev=0x{x} ctx=0x{x} fl=0x{x}\n", .{ if (dev) |p| @intFromPtr(p) else 0, if (ctx) |p| @intFromPtr(p) else 0, fl });
         self.feature_level = fl;
 
-        const enable_flip_model = true;
-
-        // Try flip-model swapchain (IDXGIFactory2)
-        var sc1: ?*c.IDXGISwapChain1 = null;
-        var sc0: ?*c.IDXGISwapChain = null;
-        errdefer safeRelease(&sc1);
-        errdefer safeRelease(&sc0);
-        var sc1_buf_count: u32 = 3;
-        var dxgi_dev: ?*c.IDXGIDevice = null;
-        var adapter: ?*c.IDXGIAdapter = null;
-        var factory2: ?*c.IDXGIFactory2 = null;
-        defer safeRelease(&dxgi_dev);
-        defer safeRelease(&adapter);
-        defer safeRelease(&factory2);
-
-        const dev_unk: *c.IUnknown = @ptrCast(dev.?);
-        const dev_vtbl = dev_unk.*.lpVtbl;
-        const qi = dev_vtbl.*.QueryInterface orelse return error.D3DCreateFailed;
-
-        if (!c.FAILED(qi(dev_unk, &c.IID_IDXGIDevice, @ptrCast(&dxgi_dev))) and dxgi_dev != null) {
-            const dxgi_vtbl = dxgi_dev.?.lpVtbl;
-            if (dxgi_vtbl.*.GetAdapter) |get_adapter| {
-                if (!c.FAILED(get_adapter(dxgi_dev.?, @ptrCast(&adapter))) and adapter != null) {
-                    const adap_vtbl = adapter.?.lpVtbl;
-                    if (adap_vtbl.*.GetParent) |get_parent| {
-                        const parent_hr = get_parent(adapter.?, &c.IID_IDXGIFactory2, @ptrCast(&factory2));
-                        if (c.FAILED(parent_hr)) safeRelease(&factory2);
-                    }
-                }
-            }
-        }
-        dbgLog("[d3d] init: factory2=0x{x}\n", .{if (factory2) |p| @intFromPtr(p) else 0});
-
-        if (enable_flip_model and factory2 != null) {
-            var sd1: c.DXGI_SWAP_CHAIN_DESC1 = std.mem.zeroes(c.DXGI_SWAP_CHAIN_DESC1);
-            sd1.Width = self.width;
-            sd1.Height = self.height;
-            sd1.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
-            sd1.SampleDesc.Count = 1;
-            sd1.BufferUsage = c.DXGI_USAGE_RENDER_TARGET_OUTPUT;
-            sd1.BufferCount = 3;
-            sd1.SwapEffect = c.DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
-            sd1.Scaling = c.DXGI_SCALING_STRETCH;
-            // Always premultiplied alpha: WS_EX_NOREDIRECTIONBITMAP requires composition path.
-            sd1.AlphaMode = c.DXGI_ALPHA_MODE_PREMULTIPLIED;
-            sc1_buf_count = @intCast(sd1.BufferCount);
-
-            const fac_vtbl = factory2.?.lpVtbl;
-
-            // Always use CreateSwapChainForComposition (required by WS_EX_NOREDIRECTIONBITMAP).
-            if (applog.isEnabled()) applog.appLog("[d3d] Attempting CreateSwapChainForComposition...\n", .{});
-            if (fac_vtbl.*.CreateSwapChainForComposition) |create_sc_comp| {
-                hr = create_sc_comp(factory2.?, @ptrCast(dev.?), &sd1, null, @ptrCast(&sc1));
-                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition hr=0x{x} sc1=0x{x}\n", .{ @as(u32, @bitCast(hr)), if (sc1) |p| @intFromPtr(p) else 0 });
-                if (!c.FAILED(hr) and sc1 != null) {
-                    const sc1_vtbl = sc1.?.lpVtbl;
-                    if (sc1_vtbl.*.QueryInterface) |sc_qi| {
-                        const sc0_hr = sc_qi(sc1.?, &c.IID_IDXGISwapChain, @ptrCast(&sc0));
-                        if (c.FAILED(sc0_hr)) safeRelease(&sc0);
-                    }
-                }
-            } else {
-                if (applog.isEnabled()) applog.appLog("[d3d] CreateSwapChainForComposition is NULL!\n", .{});
-            }
-        }
-
-        // Every Zonvie HWND uses WS_EX_NOREDIRECTIONBITMAP, so a legacy HWND
-        // swapchain cannot produce a visible renderer. Fail initialization and
-        // let the local errdefers release any partial composition interfaces.
-        if (sc1 == null or sc0 == null) return error.D3DCreateFailed;
-        const composition_device = dxgi_dev orelse return error.D3DCreateFailed;
-        try self.createDirectComposition(sc1.?, composition_device);
+        // Build the swapchain before transferring the device, so the
+        // errdefers above still own dev and ctx if this fails.
+        try self.createCompositionSwapchain(dev.?);
 
         self.device = dev;
         self.ctx = ctx;
-        self.swapchain = sc0;
-        self.swapchain1 = sc1;
         dev = null;
         ctx = null;
-        sc0 = null;
-        sc1 = null;
-        // swapchain3 is derived from swapchain (if supported)
-        self.swapchain_buf_count = sc1_buf_count;
-        self.swapchain_buf_index = 0;
-        self.swapchain3 = null;
-
-        if (self.swapchain) |sc0p| {
-            const sc0_vtbl = sc0p.*.lpVtbl;
-            if (sc0_vtbl.*.QueryInterface) |sc_qi| {
-                var sc3: ?*c.IDXGISwapChain3 = null;
-                const hr_sc3 = sc_qi(sc0p, &c.IID_IDXGISwapChain3, @ptrCast(&sc3));
-                if (applog.isEnabled()) {
-                    applog.appLog("[d3d] QI IDXGISwapChain3 hr=0x{x} sc3=0x{x}\n", .{ @as(u32, @bitCast(hr_sc3)), if (sc3) |p| @intFromPtr(p) else 0 });
-                }
-                if (!c.FAILED(hr_sc3) and sc3 != null) {
-                    self.swapchain3 = sc3;
-                }
-            }
-        }
 
         // ★ Added: If Debug layer enabled, get InfoQueue and break on critical messages
         const is_debug2 = (@import("builtin").mode == .Debug);
@@ -4529,15 +4238,6 @@ pub const Renderer = struct {
         const built = try self.buildAtlasTexture(w, h);
         self.atlas_tex = built.tex;
         self.atlas_srv = built.srv;
-    }
-
-    /// Return the maximum 2D texture dimension supported by the device's feature level.
-    pub fn maxTextureSize(self: *const Renderer) u32 {
-        // D3D_FEATURE_LEVEL enum values: 9_1=0x9100, 9_2=0x9200, 9_3=0x9300, 10_0=0xa000, 11_0=0xb000
-        if (self.feature_level >= 0xb000) return 16384; // FL 11_0+
-        if (self.feature_level >= 0xa000) return 8192; // FL 10_0+
-        if (self.feature_level >= 0x9300) return 4096; // FL 9_3
-        return 2048; // FL 9_1, 9_2
     }
 
     /// Recreate atlas texture if dimensions changed. No-op for same-size resets.

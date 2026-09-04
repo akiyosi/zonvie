@@ -5,8 +5,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const clock = @import("clock.zig");
 const c_api = @import("c_api.zig");
-const grid_mod = @import("grid.zig");
-const highlight = @import("highlight.zig");
 const mp = @import("msgpack.zig");
 const rpc = @import("rpc_encode.zig");
 const redraw = @import("redraw_handler.zig");
@@ -19,57 +17,8 @@ const Core = nvim_core.Core;
 const Callbacks = nvim_core.Callbacks;
 const rpc_transport = @import("rpc_transport.zig");
 
-pub const PipeReader = struct {
-    file: rpc_transport.Stream,
-    buf: [8192]u8 = undefined,
-    start: usize = 0,
-    end: usize = 0,
-
-    fn fill(self: *PipeReader) !void {
-        if (self.start < self.end) return;
-        const n = try self.file.read(&self.buf);
-        self.start = 0;
-        self.end = n;
-    }
-
-    pub fn read(self: *PipeReader, dest: []u8) !usize {
-        if (dest.len == 0) return 0;
-
-        var out_i: usize = 0;
-        while (out_i < dest.len) {
-            try self.fill();
-            if (self.end == 0) break; // EOF
-
-            const avail = self.end - self.start;
-            const take = @min(avail, dest.len - out_i);
-            std.mem.copyForwards(u8, dest[out_i .. out_i + take], self.buf[self.start .. self.start + take]);
-            self.start += take;
-            out_i += take;
-
-            if (take == 0) break;
-        }
-        return out_i;
-    }
-
-    pub fn readByte(self: *PipeReader) !u8 {
-        var one: [1]u8 = undefined;
-        const n = try self.read(one[0..]);
-        if (n != 1) return error.EndOfStream;
-        return one[0];
-    }
-
-    pub fn readNoEof(self: *PipeReader, dest: []u8) !void {
-        var off: usize = 0;
-        while (off < dest.len) {
-            const n = try self.read(dest[off..]);
-            if (n == 0) return error.EndOfStream;
-            off += n;
-        }
-    }
-};
-
-/// Contiguous buffered reader designed to feed `mpack_stream.SkipDecoder`
-/// with zero-copy slices.
+/// Contiguous buffered reader that hands the MessagePack decoder zero-copy
+/// slices of the pending frame.
 ///
 /// Invariants:
 ///   - `buf[pos..end]` is the unconsumed window visible to the decoder
@@ -115,18 +64,6 @@ pub const FrameReader = struct {
             self.pos = 0;
             self.end = 0;
         }
-    }
-
-    /// Commit an advance position expressed as the remaining (uneaten) slice
-    /// of the view — i.e., the `data` field of an `InnerDecoder` / `SkipDecoder`
-    /// after a successful run. `remaining` must be a sub-slice of `view()`.
-    pub fn consumeTo(self: *FrameReader, remaining: []const u8) void {
-        const base_addr = @intFromPtr(self.buf.ptr) + self.pos;
-        const rem_addr = @intFromPtr(remaining.ptr);
-        std.debug.assert(rem_addr >= base_addr);
-        std.debug.assert(rem_addr <= base_addr + (self.end - self.pos));
-        const consumed_n = rem_addr - base_addr;
-        self.consume(consumed_n);
     }
 
     /// Pull more bytes from the pipe into `buf[end..]`. Compacts or grows
@@ -455,6 +392,78 @@ pub const StderrPump = struct {
 };
 
 /// Check if data contains a password prompt (case-insensitive)
+/// Split a spawn command into argv slices borrowed from `cmd`, stopping when
+/// `out` is full. Returns how many slots were filled.
+///
+/// This was written out twice in runLoop, once per spawn branch. The two
+/// copies were byte-identical in the scanner and differed only in what each
+/// did with the result, so only the scanner moved here.
+///
+/// The rules are the ones those copies already implemented, quirks included,
+/// because a spawn command that worked before must keep working:
+///   - only ' ' separates; a tab or newline is part of the token
+///   - runs of separators collapse, leading and trailing ones are harmless
+///   - a quote groups until its unescaped partner; \" and \' are skipped but
+///     NOT unescaped, so the backslash reaches the child
+///   - an unterminated quote consumes to the end and is emitted, no error
+///   - an empty quoted token is dropped, so "" cannot pass an empty argument
+///   - there is no concatenation: a"b c" yields a"b and c"
+fn tokenizeCommand(cmd: []const u8, out: [][]const u8) usize {
+    return tokenizeCommandSkipping(cmd, out, null);
+}
+
+/// As tokenizeCommand, but a leading run of tokens equal to `skip_leading` is
+/// consumed without occupying an output slot.
+///
+/// Dropping the run after tokenizing is not equivalent: the wrapper tokens
+/// would take slots first, so a command long enough to fill `out` would lose
+/// its tail. Skipping here restores the pre-extraction behaviour, where the
+/// wrapper was stepped over inside the argc-bounded loop and cost nothing.
+fn tokenizeCommandSkipping(cmd: []const u8, out: [][]const u8, skip_leading: ?[]const u8) usize {
+    var argc: usize = 0;
+    var skipping = skip_leading != null;
+    var i: usize = 0;
+    while (i < cmd.len and argc < out.len) {
+        while (i < cmd.len and cmd[i] == ' ') : (i += 1) {}
+        if (i >= cmd.len) break;
+
+        var arg_start = i;
+        var arg_end = i;
+
+        if (cmd[i] == '\'' or cmd[i] == '"') {
+            const quote_char = cmd[i];
+            i += 1;
+            arg_start = i;
+            while (i < cmd.len) {
+                if (cmd[i] == '\\' and i + 1 < cmd.len and cmd[i + 1] == quote_char) {
+                    // Skip escaped quote (e.g., \" inside "..." or \' inside '...')
+                    i += 2;
+                } else if (cmd[i] == quote_char) {
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            arg_end = i;
+            if (i < cmd.len) i += 1; // Skip closing quote
+        } else {
+            while (i < cmd.len and cmd[i] != ' ') : (i += 1) {}
+            arg_end = i;
+        }
+
+        if (arg_end > arg_start) {
+            const tok = cmd[arg_start..arg_end];
+            if (skipping) {
+                if (std.mem.eql(u8, tok, skip_leading.?)) continue;
+                skipping = false;
+            }
+            out[argc] = tok;
+            argc += 1;
+        }
+    }
+    return argc;
+}
+
 pub fn containsPasswordPrompt(data: []const u8) bool {
     // Convert to lowercase for comparison
     var i: usize = 0;
@@ -1975,50 +1984,16 @@ pub fn runLoop(self: *Core) void {
 
     if (is_wsl or is_ssh or is_ssh_askpass or is_cmd or is_devcontainer or is_shell) {
         // Parse command string into arguments (split by spaces, handle quotes and escapes)
-        var i: usize = 0;
-        while (i < nvim_path.len and argc < argv_buf.len) {
-            // Skip leading spaces
-            while (i < nvim_path.len and nvim_path[i] == ' ') : (i += 1) {}
-            if (i >= nvim_path.len) break;
-
-            var arg_start = i;
-            var arg_end = i;
-
-            if (nvim_path[i] == '\'' or nvim_path[i] == '"') {
-                // Quoted argument - find closing quote (handle escaped quotes)
-                const quote_char = nvim_path[i];
-                i += 1;
-                arg_start = i;
-                while (i < nvim_path.len) {
-                    if (nvim_path[i] == '\\' and i + 1 < nvim_path.len and nvim_path[i + 1] == quote_char) {
-                        // Skip escaped quote (e.g., \" inside "..." or \' inside '...')
-                        i += 2;
-                    } else if (nvim_path[i] == quote_char) {
-                        // Found unescaped closing quote
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                arg_end = i;
-                if (i < nvim_path.len) i += 1; // Skip closing quote
-            } else {
-                // Unquoted argument - find next space
-                while (i < nvim_path.len and nvim_path[i] != ' ') : (i += 1) {}
-                arg_end = i;
-            }
-
-            if (arg_end > arg_start) {
-                const part = nvim_path[arg_start..arg_end];
-                // Skip "ssh-askpass" prefix - actual ssh command is next argument
-                if (argc == 0 and is_ssh_askpass and std.mem.eql(u8, part, "ssh-askpass")) {
-                    // Don't add to argv, just continue to next argument
-                    continue;
-                }
-                argv_buf[argc] = part;
-                argc += 1;
-            }
-        }
+        // The wrapper name is not part of the command; the real ssh invocation
+        // follows it. The whole leading RUN is skipped, matching the original
+        // inline form whose argc == 0 guard re-fired until something else was
+        // emitted -- and it is skipped during tokenization so the dropped
+        // tokens do not consume argv slots.
+        argc = tokenizeCommandSkipping(
+            nvim_path,
+            &argv_buf,
+            if (is_ssh_askpass) "ssh-askpass" else null,
+        );
         if (is_wsl) {
             self.log.write("WSL mode: parsed {d} arguments\n", .{argc});
         } else if (is_ssh_askpass) {
@@ -2038,51 +2013,18 @@ pub fn runLoop(self: *Core) void {
         // Native: parse command string and insert --embed after first argument
         // e.g., "nvim file.txt" → ["nvim", "--embed", "file.txt"]
         // e.g., "nvim -u /tmp/init.lua +10 file.txt" → ["nvim", "--embed", "-u", "/tmp/init.lua", "+10", "file.txt"]
-        var i: usize = 0;
-        while (i < nvim_path.len and argc < argv_buf.len - 1) { // -1 to leave room for --embed
-            // Skip leading spaces
-            while (i < nvim_path.len and nvim_path[i] == ' ') : (i += 1) {}
-            if (i >= nvim_path.len) break;
-
-            var arg_start = i;
-            var arg_end = i;
-
-            if (nvim_path[i] == '\'' or nvim_path[i] == '"') {
-                // Quoted argument - find closing quote (handle escaped quotes)
-                const quote_char = nvim_path[i];
-                i += 1;
-                arg_start = i;
-                while (i < nvim_path.len) {
-                    if (nvim_path[i] == '\\' and i + 1 < nvim_path.len and nvim_path[i + 1] == quote_char) {
-                        // Skip escaped quote
-                        i += 2;
-                    } else if (nvim_path[i] == quote_char) {
-                        // Found unescaped closing quote
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                arg_end = i;
-                if (i < nvim_path.len) i += 1; // Skip closing quote
-            } else {
-                // Unquoted argument - find next space
-                while (i < nvim_path.len and nvim_path[i] != ' ') : (i += 1) {}
-                arg_end = i;
-            }
-
-            if (arg_end > arg_start) {
-                argv_buf[argc] = nvim_path[arg_start..arg_end];
-                argc += 1;
-
-                // Insert --embed after first argument (nvim executable)
-                if (argc == 1) {
-                    argv_buf[argc] = "--embed";
-                    argc += 1;
-                }
-            }
+        // Reserve the last slot for --embed, which is inserted after the
+        // executable below. Passing the shortened slice is what caps the user
+        // tokens at 14; today's argc counts the injected --embed, so the
+        // budget is one less than it looks.
+        argc = tokenizeCommand(nvim_path, argv_buf[0 .. argv_buf.len - 2]);
+        if (argc > 0) {
+            // Open a hole at index 1 for --embed.
+            var k: usize = argc;
+            while (k > 1) : (k -= 1) argv_buf[k] = argv_buf[k - 1];
+            argv_buf[1] = "--embed";
+            argc += 1;
         }
-
         // If no arguments parsed, fall back to simple path + --embed
         if (argc == 0) {
             argv_buf[0] = nvim_path;
@@ -2466,8 +2408,12 @@ pub fn runLoop(self: *Core) void {
         self.requestSetClientInfo() catch |e| self.log.write("send set_client_info failed: {any}\n", .{e});
 
         // If config.toml [font] family is set, push it to nvim's `guifont`
-        // BEFORE ui_attach (avoids a second paint round-trip; see original
-        // statusline-on-Windows note for context).
+        // BEFORE ui_attach. Setting it afterwards lands mid-redraw: nvim emits
+        // an option_set carrying its default guifont during its initial paint,
+        // then a second one once it processes ours. That second paint
+        // round-trip was observed briefly dropping the statusline text on
+        // Windows at startup; resizing the window forced a full re-seed that
+        // restored it. The ordering itself is not platform-specific.
         if (self.msg_config.font.family_explicit) {
             var guifont_buf: [256]u8 = undefined;
             const guifont_str = std.fmt.bufPrint(&guifont_buf, "{s}:h{d}", .{
@@ -2561,11 +2507,14 @@ pub fn runLoop(self: *Core) void {
         // Passed to cleanupSession as `kill_on_restart_pending`.
         var remote_restart_break: bool = false;
 
-        // Inner reader loop — same for both transports. Earlier iterations
-        // experimented with a streaming fast path here; microbenchmarks
-        // showed the Value-tree path was 1.24x–1.94x faster, so the
-        // streaming machinery (mpack_stream / decodeFromStream) is kept
-        // only as a reference implementation.
+        // Inner reader loop — same for both transports. An earlier iteration
+        // experimented with a zero-copy streaming decoder here. It lost this
+        // path by 1.24x-1.94x at building Value trees, which is a real
+        // measurement; the separate bench meant to show its zero-allocation
+        // cell writes paying off never actually wrote a cell, so that half
+        // proved nothing. The machinery was removed rather than kept as an
+        // unwired reference. See DEVELOPMENT.md, "Speeding up grid_line
+        // decoding", before attempting it again.
         outer: while (!self.stop_flag.load(.seq_cst)) {
             var root: mp.Value = undefined;
             const log_on_msg = self.log.cb != null;
@@ -3356,6 +3305,182 @@ const ClipboardSetProbe = struct {
         return out.toOwnedSlice(alloc);
     }
 };
+
+test "a skipped wrapper run costs no argv slot" {
+    // "refactor(core): share the spawn command tokenizer between both
+    // branches" moved the ssh-askpass skip after tokenization, so the
+    // wrapper tokens took output slots before being dropped. A command
+    // that filled the buffer then lost its tail: "ssh-askpass" + 16
+    // tokens produced 15 args instead of 16, and a leading run of 16
+    // wrappers produced none at all.
+    var buf: [16][]const u8 = undefined;
+
+    // Exactly the threshold: one wrapper plus a full buffer's worth of tokens.
+    {
+        var cmd: std.ArrayListUnmanaged(u8) = .empty;
+        defer cmd.deinit(std.testing.allocator);
+        try cmd.appendSlice(std.testing.allocator, "ssh-askpass");
+        var i: usize = 0;
+        while (i < 16) : (i += 1) {
+            try cmd.append(std.testing.allocator, ' ');
+            try cmd.append(std.testing.allocator, @intCast('a' + i));
+        }
+        const n = tokenizeCommandSkipping(cmd.items, &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 16), n);
+        try std.testing.expectEqualStrings("a", buf[0]);
+        try std.testing.expectEqualStrings("p", buf[15]);
+    }
+
+    // A doubled wrapper is still one run, and still costs nothing.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh-askpass ssh -t host nvim", &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 4), n);
+        try std.testing.expectEqualStrings("ssh", buf[0]);
+        try std.testing.expectEqualStrings("nvim", buf[3]);
+    }
+
+    // The run only counts at the front: a later occurrence is a real argument.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh ssh-askpass host", &buf, "ssh-askpass");
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualStrings("ssh", buf[0]);
+        try std.testing.expectEqualStrings("ssh-askpass", buf[1]);
+    }
+
+    // Passing null skips nothing, so tokenizeCommand is unchanged.
+    {
+        const n = tokenizeCommandSkipping("ssh-askpass ssh host", &buf, null);
+        try std.testing.expectEqual(@as(usize, 3), n);
+        try std.testing.expectEqualStrings("ssh-askpass", buf[0]);
+    }
+}
+
+test "the spawn command tokenizer keeps the quirks both copies had" {
+    // These are not desirable rules, they are the rules the two inline copies
+    // already implemented. A spawn command that worked before the extraction
+    // has to keep working, so each quirk is pinned deliberately rather than
+    // tidied up.
+    var buf: [16][]const u8 = undefined;
+
+    const expectTokens = struct {
+        fn f(out: [][]const u8, cmd: []const u8, want: []const []const u8) !void {
+            const n = tokenizeCommand(cmd, out);
+            try std.testing.expectEqual(want.len, n);
+            for (want, out[0..n]) |w, got| try std.testing.expectEqualStrings(w, got);
+        }
+    }.f;
+
+    // The ordinary case, and separator runs collapsing.
+    try expectTokens(&buf, "nvim file.txt", &.{ "nvim", "file.txt" });
+    try expectTokens(&buf, "  nvim   -u  init.lua  ", &.{ "nvim", "-u", "init.lua" });
+    try expectTokens(&buf, "", &.{});
+    try expectTokens(&buf, "   ", &.{});
+
+    // Only ' ' separates. A tab stays inside the token.
+    try expectTokens(&buf, "nvim\tfoo", &.{"nvim\tfoo"});
+
+    // Quotes group, and both kinds work.
+    try expectTokens(&buf, "ssh host \"nvim --embed\"", &.{ "ssh", "host", "nvim --embed" });
+    try expectTokens(&buf, "sh -c 'nvim -u x'", &.{ "sh", "-c", "nvim -u x" });
+
+    // An escaped quote is skipped but NOT unescaped: the backslash survives
+    // into the argument handed to the child.
+    try expectTokens(&buf, "nvim \"a\\\"b\" c", &.{ "nvim", "a\\\"b", "c" });
+
+    // An empty quoted token is dropped, so "" cannot pass an empty argument.
+    try expectTokens(&buf, "nvim \"\" x", &.{ "nvim", "x" });
+
+    // An unterminated quote consumes to the end and is emitted without error.
+    try expectTokens(&buf, "nvim \"unclosed", &.{ "nvim", "unclosed" });
+
+    // No concatenation: the quote starts a new token wherever it appears.
+    try expectTokens(&buf, "nvim a\"b c\"", &.{ "nvim", "a\"b", "c\"" });
+
+    // The output slice is the cap, and it truncates silently.
+    var small: [2][]const u8 = undefined;
+    try expectTokens(&small, "a b c d", &.{ "a", "b" });
+}
+
+test "every RPC response carries the same four-element type-1 header" {
+    // Four senders each wrote the msgpack-RPC response frame by hand. The
+    // header -- array of 4, type 1, msgid -- is what they share; the error and
+    // result slots are what they do not. Pin the shared half at every sender,
+    // and the differing half too, so a shared header cannot quietly change one
+    // caller's error slot into another's.
+    const alloc = std.testing.allocator;
+
+    const Case = struct {
+        name: []const u8,
+        msgid: i64,
+        send: *const fn (*Core, i64) anyerror!void,
+        err_is_nil: bool,
+    };
+
+    const senders = struct {
+        fn err(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcErrorResponse(core, msgid, "boom");
+        }
+        fn boolean(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcBoolResponse(core, msgid, true);
+        }
+        fn int(core: *Core, msgid: i64) anyerror!void {
+            try sendRpcIntResponse(core, msgid, 1234);
+        }
+        fn clipboard(core: *Core, msgid: i64) anyerror!void {
+            try sendClipboardGetResponse(core, msgid, "one\ntwo");
+        }
+    };
+
+    const cases = [_]Case{
+        .{ .name = "error", .msgid = 11, .send = senders.err, .err_is_nil = false },
+        .{ .name = "bool", .msgid = 22, .send = senders.boolean, .err_is_nil = true },
+        .{ .name = "int", .msgid = 33, .send = senders.int, .err_is_nil = true },
+        .{ .name = "clipboard", .msgid = 44, .send = senders.clipboard, .err_is_nil = true },
+    };
+
+    for (cases) |case| {
+        var fds: [2]std.posix.fd_t = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+
+        var core = Core.initForTest(alloc);
+        core.stdin_file = rpc_transport.Stream.fromFile(
+            .{ .handle = fds[1], .flags = .{ .nonblocking = false } },
+        );
+        core.transport_kind = .pipes;
+        try std.testing.expect(core.startWriterThread());
+
+        try case.send(&core, case.msgid);
+
+        var rbuf: [4096]u8 = undefined;
+        const n = try rpc_transport.Stream.fromFile(read_file).read(&rbuf);
+        var reader = mp.SliceReader{ .data = rbuf[0..n] };
+        const decoded = try mp.decode(alloc, &reader);
+        defer mp.freeValue(alloc, decoded);
+
+        // The shared header, identical at all four senders.
+        try std.testing.expect(decoded == .arr);
+        try std.testing.expectEqual(@as(usize, 4), decoded.arr.len);
+        try std.testing.expectEqual(@as(i64, 1), decoded.arr[0].int);
+        try std.testing.expectEqual(case.msgid, decoded.arr[1].int);
+
+        // The per-sender half: only the error sender fills the error slot, and
+        // exactly one of the two payload slots is nil at each sender.
+        if (case.err_is_nil) {
+            try std.testing.expect(decoded.arr[2] == .nil);
+            try std.testing.expect(decoded.arr[3] != .nil);
+        } else {
+            try std.testing.expectEqualStrings("boom", decoded.arr[2].str);
+            try std.testing.expect(decoded.arr[3] == .nil);
+        }
+
+        core.stop();
+        read_file.close(clock.io());
+        // deinitForTest is intentionally omitted, as in the sibling
+        // writer-thread tests: iterating a never-populated std HashMap asserts
+        // on Zig 0.16.
+    }
+}
 
 test "clipboard set delivers every line when the register exceeds the staging buffer" {
     const alloc = std.testing.allocator;

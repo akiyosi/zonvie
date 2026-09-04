@@ -26,7 +26,6 @@ pub fn shouldWarnDeviceLostRecovery(failed_attempts: u32, warning_shown: bool) b
 pub fn geometricBufferCapacity(current_bytes: usize, need_bytes: usize, max_bytes: usize) ?usize {
     if (need_bytes > max_bytes) return null;
     if (need_bytes <= current_bytes) return current_bytes;
-    if (need_bytes == 0) return current_bytes;
 
     var capacity = @max(current_bytes, @min(max_bytes, 4096));
     while (capacity < need_bytes) {

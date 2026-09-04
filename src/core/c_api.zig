@@ -16,7 +16,6 @@ pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const msgpack = @import("msgpack.zig");
-pub const mpack_stream = @import("mpack_stream.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
 pub const highlight = @import("highlight.zig");
@@ -53,6 +52,10 @@ pub const DECO_SCROLLABLE: u32 = 1 << 7; // Vertex is in scrollable content area
 pub const DECO_OVERLINE: u32 = 1 << 8;
 pub const DECO_GLOW: u32 = 1 << 9;
 pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, not coverage
+// Solid-color quad that is foreground text: block elements filled
+// geometrically rather than rasterized. Tells the frontend not to treat them
+// as background, which would fade them under a translucent/blurred window.
+pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -1288,6 +1291,24 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     };
 }
 
+/// Milliseconds until the next armed message deadline, or -1 when none is
+/// armed and 0 when one is already due.
+///
+/// Rounds up: a deadline 1 ns away must report 1 ms, not 0, or a frontend
+/// that trusts the value schedules a timer that fires before the deadline and
+/// spins. Both exported entry points share this so the two cannot round
+/// differently.
+///
+/// The caller owns grid_mu; this only reads under it.
+fn nextMsgTimeoutMsLocked(box: *CoreBox) i64 {
+    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
+    const now = clock.nowNs();
+    if (deadline <= now) return 0;
+    const remaining_ns = deadline - now;
+    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
+    return @intCast(remaining_ms);
+}
+
 /// Returns milliseconds until the earliest pending message or render-
 /// maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
 /// Frontends use this to schedule one timer instead of polling every frame.
@@ -1296,12 +1317,7 @@ pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64
     const box = asBox(p.?);
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
-    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
-    const now = clock.nowNs();
-    if (deadline <= now) return 0;
-    const remaining_ns = deadline - now;
-    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
-    return @intCast(remaining_ms);
+    return nextMsgTimeoutMsLocked(box);
 }
 
 /// Non-blocking version of zonvie_core_next_msg_timeout_ms.
@@ -1318,12 +1334,7 @@ pub export fn zonvie_core_try_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c)
     box.core.perf_lock_msg_timeout.record(acquired);
     if (!acquired) return -2;
     defer box.core.grid_mu.unlock(clock.io());
-    const deadline = flush_mod.nextMsgTimeoutNs(&box.core) orelse return -1;
-    const now = clock.nowNs();
-    if (deadline <= now) return 0;
-    const remaining_ns = deadline - now;
-    const remaining_ms = @divTrunc(remaining_ns - 1, std.time.ns_per_ms) + 1;
-    return @intCast(remaining_ms);
+    return nextMsgTimeoutMsLocked(box);
 }
 
 /// Report whether the pointer rests on a message ext_float window. While
@@ -1573,6 +1584,22 @@ pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callco
     box.core.option_as_meta.store(value, .release);
 }
 
+/// Write the three blink intervals into whichever out-pointers the caller
+/// supplied. Shared by the blocking and try variants so a future fourth
+/// interval cannot reach one and miss the other.
+///
+/// The caller owns grid_mu; this only reads under it.
+fn writeCursorBlinkLocked(
+    box: *CoreBox,
+    out_wait_ms: ?*u32,
+    out_on_ms: ?*u32,
+    out_off_ms: ?*u32,
+) void {
+    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
+    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
+    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+}
+
 /// Get current cursor blink parameters (in milliseconds).
 pub export fn zonvie_core_get_cursor_blink(
     p: ?*zonvie_core,
@@ -1589,9 +1616,7 @@ pub export fn zonvie_core_get_cursor_blink(
     const box = asBox(p.?);
     box.core.grid_mu.lockUncancelable(clock.io());
     defer box.core.grid_mu.unlock(clock.io());
-    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
-    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
-    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+    writeCursorBlinkLocked(box, out_wait_ms, out_on_ms, out_off_ms);
 }
 
 /// Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
@@ -1612,9 +1637,7 @@ pub export fn zonvie_core_try_get_cursor_blink(
     box.core.perf_lock_cursor_blink.record(acquired);
     if (!acquired) return false;
     defer box.core.grid_mu.unlock(clock.io());
-    if (out_wait_ms) |ptr| ptr.* = box.core.grid.cursor_blink_wait_ms;
-    if (out_on_ms) |ptr| ptr.* = box.core.grid.cursor_blink_on_ms;
-    if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
+    writeCursorBlinkLocked(box, out_wait_ms, out_on_ms, out_off_ms);
     return true;
 }
 
@@ -1868,6 +1891,29 @@ pub export fn zonvie_core_get_layout(
 // Message routing API
 // ========================================================================
 
+/// Convert an internal view type to the one the frontends receive.
+///
+/// The arms are written out rather than expressed as
+/// `@enumFromInt(@intFromEnum(view))`, and that is the whole point of this
+/// function. The exhaustive switch with no `else` is a compile-time guard:
+/// adding a variant to `config.MsgViewType` breaks the build here and forces
+/// a decision about what it means on the wire. A numeric cast would compile
+/// unchanged and ship an out-of-range `c_int` -- which neither frontend
+/// rejects, since macOS falls through to ext_float and Windows to mini.
+///
+/// Do not replace the arm list. The identity is only correct because both
+/// enums, and include/zonvie_core.h, pin the same six values.
+pub fn msgViewTypeToC(view: config.MsgViewType) zonvie_msg_view_type {
+    return switch (view) {
+        .mini => .mini,
+        .ext_float => .ext_float,
+        .confirm => .confirm,
+        .split => .split,
+        .none => .none,
+        .notification => .notification,
+    };
+}
+
 /// Message view type (C ABI compatible - must match C enum size)
 pub const zonvie_msg_view_type = enum(c_int) {
     mini = 0,
@@ -1963,14 +2009,7 @@ pub export fn zonvie_core_route_message(
     const route_result = box.msg_config.routeMessage(cfg_event, kind_str, line_count);
 
     // Convert config view type to C view type
-    const c_view: zonvie_msg_view_type = switch (route_result.view) {
-        .mini => .mini,
-        .ext_float => .ext_float,
-        .confirm => .confirm,
-        .split => .split,
-        .none => .none,
-        .notification => .notification,
-    };
+    const c_view = msgViewTypeToC(route_result.view);
 
     return zonvie_route_result{
         .view = c_view,
@@ -1984,19 +2023,28 @@ pub export fn zonvie_core_route_message(
 
 pub const zonvie_config = opaque {};
 
+/// Source for the `font.*`, `window.*` and `performance.*` defaults below,
+/// so `zonvie_config_get_values(NULL)` reports what a config-less run really
+/// uses. Those groups are the ones that had gone wrong: the two cache sizes
+/// each diverged in a separate commit, and the macOS-only window translucency
+/// and font size were written out with the non-macOS values from the start.
+/// The remaining fields are still hand-copied; the test at the end of this
+/// file is what keeps every one of them honest.
+const cfg_defaults: config.Config = .{};
+
 pub const zonvie_config_values = extern struct {
     // font
     font_family: [*:0]const u8 = "",
-    font_size: f32 = 14.0,
-    font_linespace: i32 = 0,
+    font_size: f32 = cfg_defaults.font.size,
+    font_linespace: i32 = cfg_defaults.font.linespace,
     // True when the user explicitly set [font] family / size in config.toml.
     // Frontends should prefer config over nvim's default `guifont`.
     font_family_explicit: bool = false,
     font_size_explicit: bool = false,
     // window
-    window_blur: bool = false,
-    window_opacity: f32 = 1.0,
-    window_blur_radius: i32 = 20,
+    window_blur: bool = cfg_defaults.window.blur,
+    window_opacity: f32 = cfg_defaults.window.opacity,
+    window_blur_radius: i32 = cfg_defaults.window.blur_radius,
     // scrollbar
     scrollbar_enabled: bool = true,
     scrollbar_show_mode: [*:0]const u8 = "scroll",
@@ -2030,11 +2078,11 @@ pub const zonvie_config_values = extern struct {
     log_scroll_only: bool = false,
     log_verbose: bool = false,
     // performance
-    perf_glyph_cache_ascii: i32 = 512,
-    perf_glyph_cache_non_ascii: i32 = 256,
-    perf_hl_cache_size: i32 = 512,
-    perf_shape_cache_size: i32 = 4096,
-    perf_atlas_size: i32 = 2048,
+    perf_glyph_cache_ascii: i32 = @intCast(cfg_defaults.performance.glyph_cache_ascii_size),
+    perf_glyph_cache_non_ascii: i32 = @intCast(cfg_defaults.performance.glyph_cache_non_ascii_size),
+    perf_hl_cache_size: i32 = @intCast(cfg_defaults.performance.hl_cache_size),
+    perf_shape_cache_size: i32 = @intCast(cfg_defaults.performance.shape_cache_size),
+    perf_atlas_size: i32 = @intCast(cfg_defaults.performance.atlas_size),
     // ime
     ime_disable_on_activate: bool = false,
     ime_disable_on_modechange: bool = false,
@@ -2780,7 +2828,6 @@ pub export fn zonvie_shader_compile_glsl(
             error.SpirvGenFailed => buildShaderError("SPIR-V generation failed"),
             error.CrossCompileFailed => buildShaderError("SPIR-V cross-compile failed"),
             error.OutOfMemory => buildShaderError("out of memory"),
-            error.NotImplemented => buildShaderError("shader compiler not implemented"),
         };
     };
     return buildShaderSuccess(gpa, compiled);
@@ -2800,4 +2847,66 @@ pub export fn zonvie_shader_result_destroy(result: ?*zonvie_shader_result) callc
     r.data = null;
     r.data_len = 0;
     r.error_msg = null;
+}
+
+test "the exported route API reports every view as its matching ABI view" {
+    // This is the only conversion site reachable with every view: the two
+    // msg_show sites are called from one arm that only ever holds mini,
+    // confirm and notification, and the status site early-returns on none.
+    // Without this, the split and none arms are dead in every test and a
+    // shared helper could get them wrong unnoticed.
+    const p = zonvie_core_create(null, 0, null) orelse return error.OutOfMemory;
+    defer zonvie_core_destroy(p);
+
+    // "confirm" and the interactive-prompt kinds are pinned to their own views
+    // upstream of the user routes, so the kinds here are deliberately inert.
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .kinds = &.{"k_mini"} }, .view = .mini },
+        .{ .filter = .{ .kinds = &.{"k_float"} }, .view = .ext_float },
+        .{ .filter = .{ .kinds = &.{"k_conf"} }, .view = .confirm },
+        .{ .filter = .{ .kinds = &.{"k_split"} }, .view = .split },
+        .{ .filter = .{ .kinds = &.{"k_none"} }, .view = .none },
+        .{ .filter = .{ .kinds = &.{"k_notify"} }, .view = .notification },
+    };
+    asBox(p).msg_config.messages.routes = &routes;
+
+    const cases = [_]struct { kind: [*:0]const u8, expect: zonvie_msg_view_type }{
+        .{ .kind = "k_mini", .expect = .mini },
+        .{ .kind = "k_float", .expect = .ext_float },
+        .{ .kind = "k_conf", .expect = .confirm },
+        .{ .kind = "k_split", .expect = .split },
+        .{ .kind = "k_none", .expect = .none },
+        .{ .kind = "k_notify", .expect = .notification },
+    };
+    for (cases) |case| {
+        const result = zonvie_core_route_message(p, .msg_show, case.kind, 1);
+        try std.testing.expectEqualStrings(@tagName(case.expect), @tagName(result.view));
+    }
+}
+
+test "the null-handle config values match what a default config would build" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const built = buildConfigValues(arena.allocator(), &cfg_defaults);
+    const declared: zonvie_config_values = .{};
+
+    inline for (@typeInfo(zonvie_config_values).@"struct".fields) |f| {
+        // font_family is the one field the null path cannot reproduce: the
+        // candidate list is formatted into allocated memory, and there is no
+        // allocator to format it into when the handle is NULL.
+        if (comptime std.mem.eql(u8, f.name, "font_family")) continue;
+
+        const built_v = @field(built, f.name);
+        const declared_v = @field(declared, f.name);
+        switch (@typeInfo(f.type)) {
+            .pointer => try std.testing.expectEqualStrings(std.mem.span(built_v), std.mem.span(declared_v)),
+            .optional => {
+                try std.testing.expectEqual(built_v == null, declared_v == null);
+                if (built_v != null) {
+                    try std.testing.expectEqualStrings(std.mem.span(built_v.?), std.mem.span(declared_v.?));
+                }
+            },
+            else => try std.testing.expectEqual(built_v, declared_v),
+        }
+    }
 }

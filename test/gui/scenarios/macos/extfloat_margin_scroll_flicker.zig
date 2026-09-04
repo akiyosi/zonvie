@@ -141,7 +141,6 @@ fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !Margin
     };
 }
 
-
 /// True when every pixel in rows [start, end) up to `width` is the same
 /// colour — what a region looks like when nothing was drawn into it.
 fn bandIsUniform(img: capture.Image, start: usize, end: usize, width: u32) bool {
@@ -631,5 +630,4 @@ pub fn run(alloc: std.mem.Allocator) !void {
             return error.ShaderPassRescales;
         }
     }
-
 }

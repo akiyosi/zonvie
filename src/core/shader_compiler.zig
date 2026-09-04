@@ -39,7 +39,6 @@ pub const Target = enum(u8) {
 };
 
 pub const CompileError = error{
-    NotImplemented,
     EmptySource,
     ParseFailed,
     LinkFailed,

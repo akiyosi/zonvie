@@ -181,9 +181,6 @@ pub const Stream = union(enum) {
     ///
     /// `is_socket` MUST be accurate: posix.shutdown panics on a
     /// non-socket fd (NOTSOCK is `unreachable` in the Zig wrapper).
-    /// Errors are swallowed — at teardown we only care that the
-    /// blocked thread is woken; a SocketNotConnected or
-    /// ConnectionResetByPeer is acceptable noise.
     /// Errors are returned rather than swallowed: a failed shutdown means a
     /// concurrently blocked reader or writer is never released, which
     /// presents as a hang with no other symptom. Callers own a logger; make
@@ -209,7 +206,7 @@ pub const Stream = union(enum) {
                     .handle = f.handle,
                     .address = .{ .ip4 = .loopback(0) },
                 } };
-                net_stream.shutdown(clock.io(), .both) catch {};
+                try net_stream.shutdown(clock.io(), .both);
             },
             .win_pipe => {},
         }

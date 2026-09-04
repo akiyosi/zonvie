@@ -662,7 +662,6 @@ const ExternalWindow = app_mod.ExternalWindow;
 const RowVerts = app_mod.RowVerts;
 const PendingExternalWindow = app_mod.PendingExternalWindow;
 const PendingExternalVertices = app_mod.PendingExternalVertices;
-const PendingGlyph = app_mod.PendingGlyph;
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 const BufferEntry = app_mod.BufferEntry;
@@ -679,7 +678,6 @@ const getApp = app_mod.getApp;
 const setApp = app_mod.setApp;
 
 // WM_APP_* message constants
-const WM_APP_ATLAS_ENSURE_GLYPH = app_mod.WM_APP_ATLAS_ENSURE_GLYPH;
 const WM_APP_CREATE_EXTERNAL_WINDOW = app_mod.WM_APP_CREATE_EXTERNAL_WINDOW;
 const WM_APP_CURSOR_GRID_CHANGED = app_mod.WM_APP_CURSOR_GRID_CHANGED;
 const WM_APP_CLOSE_EXTERNAL_WINDOW = app_mod.WM_APP_CLOSE_EXTERNAL_WINDOW;
@@ -1472,8 +1470,11 @@ fn makeCoreCbs() core.Callbacks {
     return .{
         .on_vertices_partial = callbacks.onVerticesPartial,
         .on_vertices_row = callbacks.onVerticesRow,
-        .on_atlas_ensure_glyph = callbacks.onAtlasEnsureGlyph,
-        .on_atlas_ensure_glyph_styled = callbacks.onAtlasEnsureGlyphStyled,
+        // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
+        // purpose. They are the Phase 1 (frontend-managed atlas) entry points,
+        // and the core skips them entirely whenever the three Phase 2
+        // callbacks below are set - which this frontend always does. Same
+        // arrangement as the macOS frontend.
         .on_log = callbacks.onLog,
         .on_guifont = callbacks.onGuiFont,
         .on_linespace = callbacks.onLineSpace,
@@ -1567,6 +1568,60 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
 // Creates core, loads config, inits DWrite metrics, spawns nvim, and
 // kicks off D3D11 device creation on a separate thread.
 // =========================================================================
+/// Build the `devcontainer exec ... nvim --embed` command line into `buf` and
+/// return the slice actually written. Both the early and deferred nvim launch
+/// paths built this identically.
+///
+/// Returns a plain slice, not an error union: a truncated command would be
+/// caught downstream when the spawn fails, and the writer's own errors were
+/// already swallowed at both call sites.
+fn buildDevcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]const u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    const writer = &w;
+    writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
+    writer.writeAll(workspace) catch {};
+    writer.writeAll("\"") catch {};
+    if (config_path) |cfg| {
+        writer.writeAll(" --config \"") catch {};
+        writer.writeAll(cfg) catch {};
+        writer.writeAll("\"") catch {};
+    }
+    writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
+    return buf[0..w.end];
+}
+
+/// Read the user's config file into the core, then push every option the
+/// frontend owns. Both core-creation paths -- the early init and the
+/// WSL/SSH/devcontainer deferred init -- ran this identically.
+///
+/// Returns void rather than an error: the only fallible call here already
+/// swallows its error, since a missing config file is the normal case.
+fn loadConfigAndApplyCoreOptions(app: *App) void {
+    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
+        defer app.alloc.free(config_path);
+        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
+        if (config_path_z) |cpath| {
+            defer app.alloc.free(cpath);
+            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
+        }
+    } else |_| {}
+
+    setLogEnabledViaCore(app, app.config.log.enabled);
+    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
+    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
+    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
+    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
+    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
+    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
+    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
+    core.zonvie_core_set_glyph_cache_size(
+        app.corep,
+        app.config.performance.glyph_cache_ascii_size,
+        app.config.performance.glyph_cache_non_ascii_size,
+    );
+    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+}
+
 fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     const log_enabled = applog.isEnabled();
     var t1: c.LARGE_INTEGER = undefined;
@@ -1582,31 +1637,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         applog.appLog("[win] doEarlyCoreInit: core_create {d}ms\n", .{ms});
     }
 
-    // 2. Load config into core
-    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
-        defer app.alloc.free(config_path);
-        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
-        if (config_path_z) |cpath| {
-            defer app.alloc.free(cpath);
-            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
-        }
-    } else |_| {}
-
-    // 3. Set log/ext flags
-    setLogEnabledViaCore(app, app.config.log.enabled);
-    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
-    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
-    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
-    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
-    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
-    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
-    core.zonvie_core_set_glyph_cache_size(
-        app.corep,
-        app.config.performance.glyph_cache_ascii_size,
-        app.config.performance.glyph_cache_non_ascii_size,
-    );
-    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+    loadConfigAndApplyCoreOptions(app);
 
     // 4. DWrite metrics init (font metrics calculation) -> store in early_atlas.
     // Pass the raw config family string; initMetrics walks the
@@ -1813,10 +1844,9 @@ pub export fn WndProc(
                         app.mu.unlock(core.clock.io());
 
                         if (tab_count > 0) {
-                            // Calculate tab positions using same logic as drawTablineContent
-                            const available_width = client_width - app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) - app.scalePx(40) - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-                            const ideal_width = @divTrunc(available_width, @as(i32, @intCast(tab_count)));
-                            const tab_width = @min(app.scalePx(TablineState.TAB_MAX_WIDTH), @max(app.scalePx(TablineState.TAB_MIN_WIDTH), ideal_width));
+                            // Same geometry the tabline draws and hit-tests with.
+                            const tab_count_i: i32 = @intCast(tab_count);
+                            const tab_width = tabline_mod.tabWidthPx(app, client_width, tab_count_i);
 
                             var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
                             for (0..tab_count) |_| {
@@ -1827,9 +1857,9 @@ pub export fn WndProc(
                                 tab_x += tab_width + 1;
                             }
 
-                            // Check + button area
-                            const plus_x = tab_x + app.scalePx(8);
-                            if (client_x >= plus_x and client_x < plus_x + app.scalePx(24)) {
+                            const plus_x = tabline_mod.plusButtonXPx(app, tab_count_i, tab_width);
+                            const plus_size = tabline_mod.plusButtonSizePx(app);
+                            if (client_x >= plus_x and client_x < plus_x + plus_size) {
                                 return c.HTCLIENT;
                             }
                         }
@@ -2177,7 +2207,8 @@ pub export fn WndProc(
 
                 // If the glyph atlas was reset, all cached row vertex UVs are stale.
                 // Request a full re-seed so the core regenerates every row.
-                // Guard with renderer mutex (resetAtlas sets the flag under a.mu).
+                // Guard with renderer mutex (recreateAtlasTexture sets the flag
+                // under a.mu).
                 if (atlas_ptr) |a| {
                     var reset_pending = false;
                     var cur_atlas_w: u32 = 0;
@@ -2421,7 +2452,9 @@ pub export fn WndProc(
                             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
                         } else if (app.tabline_style == .sidebar) {
-                            // Always call renderSidebarToD3D: it releases texture when tab_count == 0
+                            // Called unconditionally: unlike the tabline, the sidebar
+                            // has no tab_count gate, and it draws an empty strip rather
+                            // than releasing anything when there are no tabs.
                             const sw: u32 = @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))));
                             const sh: u32 = @intCast(@max(1, client_for_content.bottom));
                             tabline_mod.renderSidebarToD3D(app, sw, sh);
@@ -2767,6 +2800,16 @@ pub export fn WndProc(
                         if (rows_to_draw.items.len != 0) {
                             // Build full-width row rects.
                             // rows_to_draw is already sorted+deduplicated from the normalize step above.
+                            // The external windows build the same spans in
+                            // external_windows.zig and are NOT shared with this:
+                            // they reserve exactly rows + 5 and append
+                            // infallibly, while this path appends fallibly and
+                            // swallows the error, covered by the force-full-
+                            // present fallback above. It also adds
+                            // present_y_offset for the ext_tabline strip, which
+                            // external windows have no equivalent of. Reviewed
+                            // under the 2026-08-25 audit, observation 1,
+                            // finding 332; left duplicated on purpose.
                             var span_start: u32 = rows_to_draw.items[0];
                             var span_end: u32 = span_start + 1;
 
@@ -2975,7 +3018,6 @@ pub export fn WndProc(
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
                             .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
-                            .glow_enabled = glow_enabled,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
                             .content_x_offset = content_x_offset,
@@ -3724,41 +3766,6 @@ pub export fn WndProc(
             // Use a coalescing timer to avoid flooding the message queue
             // during window drag (SetTimer resets if the same ID is pending).
             _ = c.SetTimer(hwnd, TIMER_REPOSITION_FLOATS, 15, null);
-            return 0;
-        },
-
-        WM_APP_ATLAS_ENSURE_GLYPH => {
-            if (getApp(hwnd)) |app| {
-                const scalar: u32 = @intCast(wParam);
-
-                // lParam is signed (isize). Preserve bits when converting to pointer.
-                const out_entry_ptr_bits: usize = @as(usize, @bitCast(lParam));
-                const out_entry: *core.GlyphEntry = @ptrFromInt(out_entry_ptr_bits);
-
-                // This handler is always executed on UI thread.
-                // Do NOT take app.mu here: SendMessageW can re-enter while WM_PAINT holds app.mu.
-                if (app.atlas) |*a| {
-                    const e = a.atlasEnsureGlyphEntry(scalar) catch |err| {
-                        if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: atlasEnsureGlyphEntry ERROR: {any}", .{err});
-                        return 0;
-                    };
-                    out_entry.* = e;
-
-                    if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: ok scalar={d} out_entry_ptr=0x{x} uv_min=({d:.6},{d:.6}) uv_max=({d:.6},{d:.6})", .{
-                        scalar,
-                        out_entry_ptr_bits,
-                        e.uv_min[0],
-                        e.uv_min[1],
-                        e.uv_max[0],
-                        e.uv_max[1],
-                    });
-
-                    return 1;
-                }
-
-                if (applog.isEnabled()) applog.appLog("WM_APP_ATLAS_ENSURE_GLYPH: renderer is null", .{});
-                return 0;
-            }
             return 0;
         },
 
@@ -4699,18 +4706,7 @@ pub export fn WndProc(
                             var nvim_cmd_slice: []const u8 = undefined;
 
                             if (app.devcontainer_workspace) |workspace| {
-                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
-                                const writer = &w;
-                                writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-                                writer.writeAll(workspace) catch {};
-                                writer.writeAll("\"") catch {};
-                                if (app.devcontainer_config) |config_path| {
-                                    writer.writeAll(" --config \"") catch {};
-                                    writer.writeAll(config_path) catch {};
-                                    writer.writeAll("\"") catch {};
-                                }
-                                writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
+                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
                                 // Start nvim
@@ -5381,31 +5377,7 @@ pub export fn WndProc(
                         applog.appLog("  [TIMING] zonvie_core_create: {d}ms", .{core_create_ms});
                     }
 
-                    // Load config into core for message routing
-                    if (config_mod.getConfigFilePath(app.alloc)) |config_path| {
-                        defer app.alloc.free(config_path);
-                        const config_path_z = app.alloc.dupeZ(u8, config_path) catch null;
-                        if (config_path_z) |cpath| {
-                            defer app.alloc.free(cpath);
-                            _ = core.zonvie_core_load_config(app.corep, cpath.ptr);
-                        }
-                    } else |_| {}
-
-                    // Configure core settings
-                    setLogEnabledViaCore(app, app.config.log.enabled);
-                    if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
-                    if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
-                    if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
-                    if (app.ext_tabline_enabled) core.zonvie_core_set_ext_tabline(app.corep, 1);
-                    if (app.ext_windows_enabled) core.zonvie_core_set_ext_windows(app.corep, 1);
-                    core.zonvie_core_set_background_opacity(app.corep, app.config.window.opacity);
-                    core.zonvie_core_set_blur_enabled(app.corep, if (app.config.window.blur) 1 else 0);
-                    core.zonvie_core_set_glyph_cache_size(
-                        app.corep,
-                        app.config.performance.glyph_cache_ascii_size,
-                        app.config.performance.glyph_cache_non_ascii_size,
-                    );
-                    core.zonvie_core_set_atlas_size(app.corep, app.config.performance.atlas_size);
+                    loadConfigAndApplyCoreOptions(app);
 
                     // DWrite metrics init: walk the guifont-style candidate
                     // list from config and pick the first loadable font.
@@ -5523,18 +5495,7 @@ pub export fn WndProc(
                                 break :devcontainer_block;
                             } else {
                                 dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
-                                var w = std.Io.Writer.fixed(&nvim_cmd_buf);
-                                const writer = &w;
-                                writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-                                writer.writeAll(workspace) catch {};
-                                writer.writeAll("\"") catch {};
-                                if (app.devcontainer_config) |config_path| {
-                                    writer.writeAll(" --config \"") catch {};
-                                    writer.writeAll(config_path) catch {};
-                                    writer.writeAll("\"") catch {};
-                                }
-                                writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-                                nvim_cmd_slice = nvim_cmd_buf[0..w.end];
+                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                             }
                         } else {
                             nvim_cmd_slice = quoted_nvim;
@@ -5692,32 +5653,6 @@ pub export fn WndProc(
                         if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM SetTimer hwnd={*} interval={d}ms -> {d}\n", .{ hwnd, app_mod.CUSTOM_SHADER_ANIM_INTERVAL_MS, tr });
                     } else {
                         if (applog.isEnabled()) applog.appLog("[win] TIMER_CUSTOM_SHADER_ANIM not started (no animated shader)\n", .{});
-                    }
-                }
-
-                // Process pending glyphs
-                {
-                    app.mu.lockUncancelable(core.clock.io());
-                    var pending_glyphs = app.pending_glyphs;
-                    app.pending_glyphs = .empty;
-                    app.mu.unlock(core.clock.io());
-                    defer pending_glyphs.deinit(app.alloc);
-
-                    if (pending_glyphs.items.len > 0) {
-                        if (deferred_log_enabled) applog.appLog("  processing {d} pending glyphs", .{pending_glyphs.items.len});
-                        var atlas_ptr: ?*dwrite_d2d.Renderer = null;
-                        app.mu.lockUncancelable(core.clock.io());
-                        if (app.atlas) |*a| atlas_ptr = a;
-                        app.mu.unlock(core.clock.io());
-                        if (atlas_ptr) |a| {
-                            for (pending_glyphs.items) |pg| {
-                                if (pg.style_flags == 0) {
-                                    _ = a.atlasEnsureGlyphEntry(pg.scalar) catch {};
-                                } else {
-                                    _ = a.atlasEnsureGlyphEntryStyled(pg.scalar, pg.style_flags) catch {};
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -5922,15 +5857,7 @@ pub export fn WndProc(
         c.WM_IME_STARTCOMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
             if (getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = true;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, false);
 
                 // Position IME candidate window at cursor
                 input.positionImeCandidateWindow(hwnd, app);
@@ -5941,145 +5868,7 @@ pub export fn WndProc(
         c.WM_IME_COMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
             if (getApp(hwnd)) |app| {
-                const himc = c.ImmGetContext(hwnd);
-                if (himc != null) {
-                    defer _ = c.ImmReleaseContext(hwnd, himc);
-
-                    const lparam_u: c.LPARAM = lParam;
-
-                    // Get composition string
-                    if ((lparam_u & c.GCS_COMPSTR) != 0) {
-                        const byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, null, 0);
-                        if (byte_len > 0) {
-                            const char_len: usize = @intCast(@divTrunc(byte_len, 2));
-
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.resize(app.alloc, char_len) catch {
-                                app.mu.unlock(core.clock.io());
-                                return 0;
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPSTR, app.ime_composition_str.items.ptr, @intCast(byte_len));
-
-                            // Convert to UTF-8 for display
-                            input.updateImeCompositionUtf8(app);
-                            if (applog.isEnabled()) applog.appLog("[IME] composition_str len={d}\n", .{app.ime_composition_str.items.len});
-                            app.mu.unlock(core.clock.io());
-                        } else {
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_composition_str.clearRetainingCapacity();
-                            app.ime_composition_utf8.clearRetainingCapacity();
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get clause info (for underline segments)
-                    if ((lparam_u & c.GCS_COMPCLAUSE) != 0) {
-                        const clause_byte_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, null, 0);
-                        if (clause_byte_len > 0) {
-                            const clause_count: usize = @intCast(@divTrunc(clause_byte_len, 4));
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_clause_info.resize(app.alloc, clause_count) catch {
-                                app.mu.unlock(core.clock.io());
-                                return 0;
-                            };
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPCLAUSE, app.ime_clause_info.items.ptr, @intCast(clause_byte_len));
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Get cursor position in composition
-                    if ((lparam_u & c.GCS_CURSORPOS) != 0) {
-                        const cursor_pos = c.ImmGetCompositionStringW(himc, c.GCS_CURSORPOS, null, 0);
-                        app.mu.lockUncancelable(core.clock.io());
-                        app.ime_cursor_pos = @intCast(@max(0, cursor_pos));
-                        app.mu.unlock(core.clock.io());
-                    }
-
-                    // Get target clause (the clause being converted)
-                    // Always try to get COMPATTR, not just when flag is set
-                    {
-                        const attr_len = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, null, 0);
-                        if (applog.isEnabled()) applog.appLog("[IME] GCS_COMPATTR attr_len={d} lparam_has_flag={d}\n", .{
-                            attr_len,
-                            @intFromBool((lparam_u & c.GCS_COMPATTR) != 0),
-                        });
-                        if (attr_len > 0) {
-                            var attr_buf: [256]u8 = undefined;
-                            const len: usize = @intCast(@min(@as(usize, @intCast(@max(0, attr_len))), 256));
-                            _ = c.ImmGetCompositionStringW(himc, c.GCS_COMPATTR, &attr_buf, @intCast(len));
-
-                            // Debug: log all attributes
-                            if (applog.isEnabled()) {
-                                applog.appLog("[IME] COMPATTR len={d} attrs=", .{len});
-                                for (0..len) |idx| {
-                                    applog.appLog("{x} ", .{attr_buf[idx]});
-                                }
-                                applog.appLog("\n", .{});
-                            }
-
-                            // Find target clause (ATTR_TARGET_CONVERTED or ATTR_TARGET_NOTCONVERTED)
-                            // ATTR_INPUT = 0x00, ATTR_TARGET_CONVERTED = 0x01,
-                            // ATTR_CONVERTED = 0x02, ATTR_TARGET_NOTCONVERTED = 0x03
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.ime_target_start = 0;
-                            app.ime_target_end = 0;
-                            var found_start: bool = false;
-                            var i: u32 = 0;
-                            while (i < len) : (i += 1) {
-                                const attr = attr_buf[i];
-                                // ATTR_TARGET_CONVERTED = 0x01, ATTR_TARGET_NOTCONVERTED = 0x03
-                                if (attr == 0x01 or attr == 0x03) {
-                                    if (!found_start) {
-                                        app.ime_target_start = i;
-                                        found_start = true;
-                                    }
-                                    app.ime_target_end = i + 1;
-                                }
-                            }
-                            if (applog.isEnabled()) applog.appLog("[IME] target_start={d} target_end={d}\n", .{ app.ime_target_start, app.ime_target_end });
-                            app.mu.unlock(core.clock.io());
-                        }
-                    }
-
-                    // Display preedit: prefer the core's inline-extmark mode
-                    // when it accepts it (extmark mode + insert/replace);
-                    // otherwise fall back to the overlay. Copy the UTF-8 out
-                    // under the lock so the core call runs unlocked.
-                    var handled = false;
-                    if (app.corep) |corep| {
-                        app.mu.lockUncancelable(core.clock.io());
-                        // ime_composition_utf8 is mutated only on this (UI)
-                        // thread, and the core call below runs synchronously on
-                        // it, so the backing buffer stays valid after unlock —
-                        // pass the full string directly (no copy/truncation).
-                        const utf8_ptr = app.ime_composition_utf8.items.ptr;
-                        const utf8_len = app.ime_composition_utf8.items.len;
-                        // Map the target clause (UTF-16 unit indices) to UTF-8
-                        // byte offsets within the composition string.
-                        const units = app.ime_composition_str.items;
-                        var ts: usize = 0;
-                        var te: usize = 0;
-                        if (app.ime_target_start < app.ime_target_end) {
-                            ts = input.utf16PrefixUtf8Len(units, app.ime_target_start);
-                            te = input.utf16PrefixUtf8Len(units, app.ime_target_end);
-                        }
-                        app.mu.unlock(core.clock.io());
-                        if (utf8_len == 0) {
-                            app_mod.zonvie_core_clear_preedit(corep);
-                            handled = true; // nothing to display
-                        } else {
-                            handled = app_mod.zonvie_core_set_preedit(corep, utf8_ptr, utf8_len, ts, te) != 0;
-                        }
-                    }
-                    app.mu.lockUncancelable(core.clock.io());
-                    app.ime_extmark_active = handled;
-                    app.mu.unlock(core.clock.io());
-                    if (handled) {
-                        input.hideImePreeditOverlay(app);
-                    } else {
-                        input.updateImePreeditOverlay(hwnd, app);
-                    }
-                }
+                if (input.handleImeComposition(app, hwnd, lParam) == .alloc_failed) return 0;
             }
             // Let DefWindowProc handle for default IME processing
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -6087,16 +5876,7 @@ pub export fn WndProc(
 
         c.WM_IME_ENDCOMPOSITION => {
             if (getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                app.ime_composing = false;
-                app.ime_composition_str.clearRetainingCapacity();
-                app.ime_composition_utf8.clearRetainingCapacity();
-                app.ime_clause_info.clearRetainingCapacity();
-                app.ime_cursor_pos = 0;
-                app.ime_target_start = 0;
-                app.ime_target_end = 0;
-                app.ime_extmark_active = false;
-                app.mu.unlock(core.clock.io());
+                input.resetImeComposition(app, true);
 
                 // Clear any inline preedit extmark and hide the overlay.
                 if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
@@ -6106,28 +5886,9 @@ pub export fn WndProc(
         },
 
         c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim. Non-BMP commits arrive
-            // as two consecutive WM_IME_CHAR messages (high then low surrogate).
+            // IME committed character - send to Neovim.
             if (getApp(hwnd)) |app| {
-                const ch: u16 = @intCast(wParam);
-
-                var out: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch >= 0xD800 and ch <= 0xDBFF) {
-                    app.pending_high_surrogate_ime = ch;
-                    return 0;
-                } else if (ch >= 0xDC00 and ch <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_ime;
-                    app.pending_high_surrogate_ime = 0;
-                    if (hi == 0) return 0;
-                    s = input.utf16UnitsToUtf8(&out, hi, ch);
-                } else {
-                    app.pending_high_surrogate_ime = 0;
-                    s = input.utf16UnitsToUtf8(&out, ch, null);
-                }
-
-                const text = s orelse return 0;
-                input.sendKeyEventToCore(app, 0, 0, text, text);
+                input.handleImeChar(app, @intCast(wParam));
                 return 0;
             }
         },
@@ -6224,17 +5985,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
@@ -6324,17 +6079,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
@@ -6375,16 +6124,11 @@ pub export fn WndProc(
                 const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 const mod_buf = input.buildMouseModifiers(wParam);
 
@@ -6422,16 +6166,11 @@ pub export fn WndProc(
                 const row_h = app.rowHeightPx();
                 app.mu.unlock(core.clock.io());
 
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 const mod_buf = input.buildMouseModifiers(wParam);
 
@@ -6651,17 +6390,11 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @as(i32, x) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    @as(i32, x);
-                const col: i32 = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0;
-                // When ext_tabline titlebar is enabled, subtract tabbar height to get content-relative Y coordinate
-                const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @as(i32, y) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                else
-                    @as(i32, y);
-                const row: i32 = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0;
+                // This procedure only ever serves the main window, so the
+                // content offsets always apply.
+                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
+                const col = cell.col;
+                const row = cell.row;
 
                 // Build modifier string
                 const mod_buf = input.buildMouseModifiers(wParam);
