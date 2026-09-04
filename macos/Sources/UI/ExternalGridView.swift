@@ -2107,8 +2107,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let vpOriginX = Float(viewportOriginPx.x) * scale
         let vpOriginY = Float(viewportOriginPx.y) * scale
         // Same root-layer origin the draw path feeds SurfaceViewportMetrics,
-        // so the two mappings cannot drift.
+        // so the two mappings cannot drift. commitFlush replaces the array
+        // wholesale under tripleBufferLock on the core thread, and this runs
+        // on both the core thread (cursor forward) and the main thread (window
+        // move), so copy the one value out under the lock — never hold it
+        // across the renderer callout below.
+        tripleBufferLock.lock()
         let rootOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
+        tripleBufferLock.unlock()
         let leftPx = offX + vpOriginX + rootOrigin.x + local.minX
         let rightPx = offX + vpOriginX + rootOrigin.x + local.maxX
         let topPx = offY + vpOriginY + rootOrigin.y + local.minY
@@ -2388,6 +2394,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // is the duplicate the publish-on-commit rule exists to prevent.
             // (MetalTerminalRenderer already snapshots it under its lock.)
             let retainedSnapshot: [RetainedScrollRow]
+            // commitFlush replaces committedSurfaceLayers wholesale under this
+            // lock, so the root origin must be copied out here rather than read
+            // later in the frame.
+            let rootLayerOriginSnapshot: simd_float2
             tripleBufferLock.lock()
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
                 let terminal = rowCapacityHardFailure
@@ -2542,6 +2552,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             cursorDirty = false
             lastKnownCursorRowSnapshot = lastKnownCursorRow
             cursorBlinkStateSnapshot = cursorBlinkStateStorage
+            rootLayerOriginSnapshot = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
             tripleBufferLock.unlock()
             defer {
                 submittedDirtyRows.removeAll(keepingCapacity: true)
@@ -2758,7 +2769,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let vpOriginX = Double(viewportOriginPx.x) * Double(scale)
             let vpOriginY = Double(viewportOriginPx.y) * Double(scale)
             // The root layer drives the pixel space core vertices arrive in.
-            let rootLayerOrigin = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
+            let rootLayerOrigin = rootLayerOriginSnapshot
             let viewportMetrics = SurfaceViewportMetrics(
                 viewportWidth: vpWidth,
                 viewportHeight: vpHeight,
@@ -3279,6 +3290,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     viewportSize: vpSize,
                     drawableSize: view.drawableSize,
                     viewportOrigin: CGPoint(x: vpOriginX, y: vpOriginY),
+                    layerTransform: viewportMetrics.layerTransform,
                     glowTextures: glowTextures,
                     extractPipeline: extractPipe,
                     kawaseDownPipeline: downPipe,
