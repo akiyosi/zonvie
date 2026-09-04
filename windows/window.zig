@@ -3205,7 +3205,10 @@ pub export fn WndProc(
                         // The cursor's own row in its layer. Blink-off redraws
                         // this instead of the root's row, which is empty under
                         // ext_multigrid.
-                        var cursor_layer_row: ?*app_mod.RowVerts = null;
+                        // Only plain values are carried out of this block: a
+                        // pointer into rows_buf would dangle once the lock is
+                        // released, so the row is re-resolved below.
+                        var cursor_layer_row_index: ?usize = null;
                         var cursor_layer_row_dy_px: f32 = 0;
                         if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
                             app.mu.lockUncancelable(core.clock.io());
@@ -3222,7 +3225,7 @@ pub export fn WndProc(
                                 ));
                                 const local_row: usize = @intCast(@max(0, ri));
                                 if (local_row < state.rows_buf.items.len) {
-                                    cursor_layer_row = &state.rows_buf.items[local_row];
+                                    cursor_layer_row_index = local_row;
                                     const origin_row: u32 = if (local_row < state.origin_rows.items.len)
                                         state.origin_rows.items[local_row]
                                     else
@@ -3267,8 +3270,20 @@ pub export fn WndProc(
                         var cursor_overlay_failed = false;
                         // cursor_layer_row points into a layer's row storage,
                         // which the core thread can resize; hold app.mu for as
-                        // long as the overlay dereferences it.
-                        if (cursor_layer_row != null) app.mu.lockUncancelable(core.clock.io());
+                        // long as the overlay dereferences it. The pointer is
+                        // resolved under this lock — between the capture above
+                        // and here the core thread can have resized rows_buf or
+                        // destroyed the grid, and a null falls back to the
+                        // root grid's row.
+                        if (cursor_layer_row_index != null) app.mu.lockUncancelable(core.clock.io());
+                        var cursor_layer_row: ?*app_mod.RowVerts = null;
+                        if (cursor_layer_row_index) |local_row| {
+                            if (app.layer_grids.get(cursor_grid)) |state| {
+                                if (local_row < state.rows_buf.items.len) {
+                                    cursor_layer_row = &state.rows_buf.items[local_row];
+                                }
+                            }
+                        }
                         app_mod.drawCursorOverlay(g, .{
                             .cursor_verts = cursor_verts_snapshot,
                             .cursor_row = committed_cursor.last_cursor_row,
@@ -3296,7 +3311,7 @@ pub export fn WndProc(
                             cursor_overlay_failed = true;
                             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
                         };
-                        if (cursor_layer_row != null) app.mu.unlock(core.clock.io());
+                        if (cursor_layer_row_index != null) app.mu.unlock(core.clock.io());
 
                         // Post-process bloom (neon glow) for row-mode
                         if (glow_enabled) {

@@ -1987,7 +1987,11 @@ pub const LayerGridState = struct {
     }
 
     /// Replace one row's vertices. Returns false when storage could not be
-    /// grown, in which case the row keeps whatever it had.
+    /// grown: a failed rows_buf or origin_rows resize leaves the row with
+    /// whatever it had, while a failed vertex append leaves it EMPTY because
+    /// the old vertices were already cleared. No failure path updates `gen` or
+    /// `self.dirty`, so the caller must have the row re-sent rather than
+    /// presenting the layer.
     pub fn storeRow(
         self: *LayerGridState,
         alloc: std.mem.Allocator,
