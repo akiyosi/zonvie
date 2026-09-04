@@ -31,11 +31,25 @@ pub fn requireScreenAccess() !void {
     }
 }
 
+/// The app log a scenario gets when it does not ask for one of its own.
+pub const default_log_path = "tmp/gui_app.log";
+
 /// Launch the app ready for visual capture, or skip when screen capture is
 /// unavailable. Caller owns the returned Gui (defer g.deinit()).
 pub fn open(alloc: std.mem.Allocator) !*Gui {
+    return openWithLog(alloc, default_log_path);
+}
+
+/// open(), with the app's `--log` pointed at `log_path`.
+///
+/// A scenario whose oracle READS that log needs its own path: the app opens
+/// the file for append and stamps every line with its own start-relative
+/// clock, so a log shared with other scenarios carries earlier processes'
+/// lines at overlapping timestamps and any count taken from it spans more
+/// than the run being measured.
+pub fn openWithLog(alloc: std.mem.Allocator, log_path: []const u8) !*Gui {
     try requireScreenAccess();
-    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", "tmp/gui_app.log" } });
+    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
     errdefer g.deinit();
     // Pin the window to a fixed screen position so subpixel (ClearType)
     // rendering is identical run-to-run; the OS otherwise places the window
