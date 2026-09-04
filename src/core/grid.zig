@@ -210,14 +210,15 @@ pub const MAX_TOTAL_GRID_CELLS: usize = 16 * 1024 * 1024;
 // cell and placement budgets.
 pub const MAX_SUBGRIDS: usize = 32 * 1024;
 const MAX_SUBGRID_METADATA_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = 8 * 1024 * 1024;
-const MAIN_SUBGRID_ROW_LAYOUT_BYTES: usize = @sizeOf(i64) + 2 * @sizeOf(u32);
 // Window placements have independent storage even when the peer never creates
 // a backing sub-grid (or creates a zero-cell grid). Bound their maps separately
 // from MAX_TOTAL_GRID_CELLS so hostile win_pos/win_float_pos streams cannot
 // grow placement and external-float scratch state until allocator exhaustion.
-// 64K also keeps every placement-derived scratch list within its share of the
-// core flush path's aggregate 8 MiB external-float budget.
+// 64K also keeps every placement-derived scratch list within its fixed
+// partition of the core flush path's aggregate 8 MiB external-float budget
+// (MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES in flush.zig): the anchor
+// entries within 3 MiB and the grid entries within 2 MiB, both asserted at
+// comptime against this constant.
 pub const MAX_WINDOW_PLACEMENTS: usize = 64 * 1024;
 // Overflow values are inline 15-scalar clusters stored in a hash map. Bound
 // their independent memory footprint even when a hostile peer fills every
@@ -512,7 +513,7 @@ pub const StatusChannel = enum(u2) {
 ///
 /// Only the cells are shared between GridBuf.scroll and Grid.scroll. Dirty
 /// marking stays with each caller: the main grid is excluded from the
-/// frontend's row-slot remap (see checkScrollFastPath) so it must repaint the
+/// frontend's row-slot remap (see dispatchGridRowScroll) so it must repaint the
 /// whole region, while the sub-grid path gets that remap and repaints only the
 /// vacated band -- and, having done so, must shift its vertex-row ledger
 /// itself. Unifying either of those here would silently swap one contract for
@@ -1168,21 +1169,6 @@ pub const GridPos = struct {
     follows_scroll: bool = false, // float has been repositioned (row changed) after creation
 };
 
-const LayoutAccounting = struct {
-    refs: usize = 0,
-    layouts: usize = 0,
-};
-
-const LayoutProspective = struct {
-    target_grid: ?i64 = null,
-    position_set: bool = false,
-    position: ?GridPos = null,
-    external: ?bool = null,
-    rows: ?u32 = null,
-    cols: ?u32 = null,
-    main_rows: ?u32 = null,
-};
-
 /// Info for an external grid (displayed in a separate window).
 pub const ExternalGridInfo = struct {
     win: i64,
@@ -1297,23 +1283,16 @@ pub const DirtySnapshot = struct {
 pub const Grid = struct {
     // Capacity of scroll_touched_rows below (declarations cannot be
     // interspersed between container fields, so this lives at the top of
-    // the struct). flush.zig's regen_rows array has a comptime assertion
-    // tying its size to this constant plus margin for cursor-row appends.
+    // the struct).
     pub const SCROLL_TOUCHED_ROWS_CAP: usize = 32;
 
     alloc: std.mem.Allocator,
 
     content_rev: u64 = 0, // cells / layering / resize / scroll etc
-    // Materialized main row-index semantics: placement coverage and layer
-    // order. Zero is reserved so wrap can reset per-layer epoch stamps.
-    layout_generation: u64 = 1,
     // Completed vertex count across standalone subgrid surfaces. Membership,
     // resize, and row replacement update this incrementally so flush begin
-    // never rescans every external grid after a layout generation change.
+    // never rescans every external grid after a layout change.
     subgrid_surface_vertex_count: usize = 0,
-    main_row_index_ref_count: usize = 0,
-    main_row_index_layout_count: usize = 0,
-    row_index_budget_enabled: bool = false,
     redraw_epoch: u64 = 1,
     redraw_epoch_override: ?u64 = null,
     // Monotonic revision of the visible glyph working set across every
@@ -1487,10 +1466,6 @@ pub const Grid = struct {
     // Tracked as a fixed-size array to avoid allocation.  Capacity covers
     // high-speed mouse wheel batches (e.g. 10 grid_scroll × 3 grid_line rows).
     // Overflow blocks fast path but preserves pending_scroll for delta accumulation.
-    // NOTE: flush.zig's regen_rows array has a comptime assertion tying its size
-    // to SCROLL_TOUCHED_ROWS_CAP (declared above, near the top of this struct)
-    // plus margin for cursor-row appends — if you raise this, that assertion
-    // will fail to compile until regen_rows is resized too.
     scroll_touched_rows: [SCROLL_TOUCHED_ROWS_CAP]u32 = undefined,
     scroll_touched_count: u8 = 0,
 
@@ -1521,146 +1496,11 @@ pub const Grid = struct {
         return self.redraw_epoch;
     }
 
-    fn advanceLayoutGeneration(self: *Grid) void {
-        self.layout_generation +%= 1;
-        if (self.layout_generation == 0) self.layout_generation = 1;
-    }
-
     fn invalidateSubgridVertexSurface(self: *Grid, grid_id: i64) void {
         const sg = self.sub_grids.getPtr(grid_id) orelse return;
         self.subgrid_surface_vertex_count -|= sg.surface_vertex_count;
         sg.surface_vertex_count = 0;
         sg.vertex_row_ledger_valid = false;
-    }
-
-    pub fn setRowIndexBudgetEnabled(self: *Grid, enabled: bool) void {
-        self.row_index_budget_enabled = enabled;
-    }
-
-    fn mainRowIndexByteSize(rows: u32, refs: usize, layouts: usize) ?usize {
-        const row_count: usize = rows;
-        const offset_count = std.math.add(usize, row_count, 1) catch return null;
-        const row_slots = std.math.add(usize, offset_count, row_count) catch return null;
-        const usize_count = std.math.add(usize, row_slots, refs) catch return null;
-        const usize_bytes = std.math.mul(usize, usize_count, @sizeOf(usize)) catch return null;
-        const layout_bytes = std.math.mul(usize, layouts, MAIN_SUBGRID_ROW_LAYOUT_BYTES) catch return null;
-        return std.math.add(usize, usize_bytes, layout_bytes) catch null;
-    }
-
-    fn prospectiveExternal(self: *const Grid, grid_id: i64, prospective: LayoutProspective) bool {
-        if (prospective.target_grid == grid_id) {
-            if (prospective.external) |external| return external;
-        }
-        return self.external_grids.contains(grid_id);
-    }
-
-    fn prospectiveGridSize(self: *const Grid, grid_id: i64, prospective: LayoutProspective) ?GridSize {
-        if (prospective.target_grid == grid_id and (prospective.rows != null or prospective.cols != null)) {
-            const current = self.sub_grids.get(grid_id);
-            return .{
-                .rows = prospective.rows orelse if (current) |sg| sg.rows else 0,
-                .cols = prospective.cols orelse if (current) |sg| sg.cols else 0,
-            };
-        }
-        const sg = self.sub_grids.get(grid_id) orelse return null;
-        return .{ .rows = sg.rows, .cols = sg.cols };
-    }
-
-    fn layoutContribution(
-        self: *const Grid,
-        grid_id: i64,
-        pos: GridPos,
-        prospective: LayoutProspective,
-    ) LayoutAccounting {
-        if (grid_id == 1 or self.prospectiveExternal(grid_id, prospective)) return .{};
-        if (self.prospectiveExternal(pos.anchor_grid, prospective)) return .{};
-        const size = self.prospectiveGridSize(grid_id, prospective) orelse return .{};
-        if (size.rows == 0 or size.cols == 0) return .{};
-        const main_rows = prospective.main_rows orelse self.rows;
-        const start: usize = @min(@as(usize, pos.row), @as(usize, main_rows));
-        const end: usize = @min(@as(usize, pos.row +| size.rows), @as(usize, main_rows));
-        if (start >= end) return .{};
-        return .{ .refs = end - start, .layouts = 1 };
-    }
-
-    fn computeLayoutAccounting(self: *const Grid, prospective: LayoutProspective) !LayoutAccounting {
-        var accounting = LayoutAccounting{};
-        var saw_target = false;
-        var it = self.win_pos.iterator();
-        while (it.next()) |entry| {
-            const grid_id = entry.key_ptr.*;
-            var pos = entry.value_ptr.*;
-            if (prospective.target_grid == grid_id and prospective.position_set) {
-                saw_target = true;
-                pos = prospective.position orelse continue;
-            } else if (prospective.target_grid == grid_id) {
-                saw_target = true;
-            }
-            const contribution = self.layoutContribution(grid_id, pos, prospective);
-            accounting.refs = std.math.add(usize, accounting.refs, contribution.refs) catch
-                return error.LayoutTooComplex;
-            accounting.layouts = std.math.add(usize, accounting.layouts, contribution.layouts) catch
-                return error.LayoutTooComplex;
-        }
-        if (prospective.target_grid) |grid_id| {
-            if (prospective.position_set and !saw_target) {
-                if (prospective.position) |pos| {
-                    const contribution = self.layoutContribution(grid_id, pos, prospective);
-                    accounting.refs = std.math.add(usize, accounting.refs, contribution.refs) catch
-                        return error.LayoutTooComplex;
-                    accounting.layouts = std.math.add(usize, accounting.layouts, contribution.layouts) catch
-                        return error.LayoutTooComplex;
-                }
-            }
-        }
-        return accounting;
-    }
-
-    fn validateLayoutAccounting(self: *const Grid, accounting: LayoutAccounting, main_rows: u32) !void {
-        if (!self.row_index_budget_enabled) return;
-        const bytes = mainRowIndexByteSize(main_rows, accounting.refs, accounting.layouts) orelse
-            return error.LayoutTooComplex;
-        if (bytes > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) return error.LayoutTooComplex;
-    }
-
-    fn prospectiveLayoutAccounting(self: *const Grid, prospective: LayoutProspective) !LayoutAccounting {
-        const accounting = try self.computeLayoutAccounting(prospective);
-        try self.validateLayoutAccounting(accounting, prospective.main_rows orelse self.rows);
-        return accounting;
-    }
-
-    fn layoutAccountingAfterDelta(
-        self: *const Grid,
-        old: LayoutAccounting,
-        new: LayoutAccounting,
-    ) !LayoutAccounting {
-        if (old.refs > self.main_row_index_ref_count or old.layouts > self.main_row_index_layout_count) {
-            return error.LayoutTooComplex;
-        }
-        var accounting = LayoutAccounting{
-            .refs = self.main_row_index_ref_count - old.refs,
-            .layouts = self.main_row_index_layout_count - old.layouts,
-        };
-        accounting.refs = std.math.add(usize, accounting.refs, new.refs) catch
-            return error.LayoutTooComplex;
-        accounting.layouts = std.math.add(usize, accounting.layouts, new.layouts) catch
-            return error.LayoutTooComplex;
-        try self.validateLayoutAccounting(accounting, self.rows);
-        return accounting;
-    }
-
-    fn commitLayoutAccounting(self: *Grid, accounting: LayoutAccounting) void {
-        self.main_row_index_ref_count = accounting.refs;
-        self.main_row_index_layout_count = accounting.layouts;
-        self.advanceLayoutGeneration();
-    }
-
-    pub fn currentMainRowIndexByteSize(self: *const Grid) ?usize {
-        return mainRowIndexByteSize(
-            self.rows,
-            self.main_row_index_ref_count,
-            self.main_row_index_layout_count,
-        );
     }
 
     fn checkedAggregateCellCount(self: *const Grid, old_len: usize, new_len: usize) !usize {
@@ -1749,8 +1589,8 @@ pub const Grid = struct {
     /// / `msg_clear` for the previous session's UI overlays. Without an
     /// explicit teardown, any leftover entry in `sub_grids` / `win_pos` /
     /// `win_layer` is rendered as a stale composited float by
-    /// flush.zig:rebuildMain and reported as a visible grid by
-    /// nvim_core.zig:getVisibleGridsLocked (hit-testing). The same logic
+    /// flush.zig's main rebuild and reported as a visible grid by
+    /// nvim_core.zig:getVisibleGridsSnapshotLocked (hit-testing). The same logic
     /// applies to ext UI state that survives across the channel close.
     ///
     /// Preserves intentionally:
@@ -1771,8 +1611,8 @@ pub const Grid = struct {
     /// previous session's high-water allocation must not remain resident.
     pub fn resetForNewSession(self: *Grid) void {
         // Composited / multigrid layout: stale entries here would be
-        // emitted as floats by flush.zig:rebuildMain (iterating win_pos)
-        // and counted as visible by getVisibleGridsLocked.
+        // emitted as floats by flush.zig's main rebuild (iterating win_pos)
+        // and counted as visible by getVisibleGridsSnapshotLocked.
         var sg_it = self.sub_grids.iterator();
         while (sg_it.next()) |e| {
             e.value_ptr.deinit(self.alloc);
@@ -1791,10 +1631,7 @@ pub const Grid = struct {
         self.grid_metrics.clearRetainingCapacity();
         self.clearAllOverflow();
         self.layer_order_counter = 0;
-        self.layout_generation = 1;
         self.subgrid_surface_vertex_count = 0;
-        self.main_row_index_ref_count = 0;
-        self.main_row_index_layout_count = 0;
         self.redraw_epoch = 1;
         self.redraw_epoch_override = null;
         self.composited_win_closed = false;
@@ -2187,7 +2024,7 @@ pub const Grid = struct {
     /// Overflow fallback behaviour per frontend:
     ///   macOS  – applyMainRowScrollRaw (MetalTerminalRenderer.swift) is NOT called;
     ///            fallback clears back texture and redraws all dirty rows from scratch.
-    ///   Windows – onMainRowScroll (callbacks.zig) is NOT called;
+    ///   Windows – onGridRowScroll (callbacks.zig) is NOT called;
     ///            fallback regenerates all dirty rows via on_vertices_row.
     /// Both paths produce correct output because the full dirty set covers
     /// every row affected by the accumulated scroll.
@@ -2204,8 +2041,8 @@ pub const Grid = struct {
         // is preserved for subsequent grid_scroll events in the same batch.
         // Setting pending_scroll = null here would lose the accumulated rows
         // delta; the next grid_scroll would create a fresh pending_scroll
-        // with only its own partial delta, causing the scroll cache fast
-        // path to shift by the wrong amount.
+        // with only its own partial delta, causing the scroll fast path to
+        // shift by the wrong amount.
         if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
             self.scroll_fast_path_blocked = true;
             return;
@@ -2356,7 +2193,7 @@ pub const Grid = struct {
             // Mark every row in the region dirty. The caller (scrollGrid)
             // already bumps content_rev unconditionally, but need_main
             // alone is not enough: the row-mode flush's per-row loop skips
-            // any row whose dirty_rows bit isn't set (checkScrollFastPath
+            // any row whose dirty_rows bit isn't set (gridScrollFastPathRegion
             // already makes the fast path ineligible here — abs_rows >
             // region_height/2 — so it falls to the plain per-row dirty
             // check, not a full-region regen). Without this, the just-
@@ -2375,18 +2212,12 @@ pub const Grid = struct {
     }
 
     pub fn resizeGrid(self: *Grid, grid_id: i64, rows: u32, cols: u32) !void {
-        // Validate before getOrCreateSub so an invalid request cannot leave a
-        // phantom empty sub-grid behind.
+        // Validate before creating the sub-grid so an invalid request cannot
+        // leave a phantom empty sub-grid behind.
         _ = try checkedGridCellCount(rows, cols);
         if (grid_id == 1) {
             const shape_changed = self.rows != rows or self.cols != cols;
-            const row_shape_changed = self.rows != rows;
-            const new_accounting = if (row_shape_changed)
-                try self.prospectiveLayoutAccounting(.{ .main_rows = rows })
-            else
-                LayoutAccounting{};
             try self.resize(rows, cols);
-            if (row_shape_changed) self.commitLayoutAccounting(new_accounting);
             if (shape_changed) self.glyph_working_set_rev +%= 1;
             self.content_rev +%= 1;
             // Remove overflow entries that fall outside the new dimensions.
@@ -2399,30 +2230,11 @@ pub const Grid = struct {
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             const old_rows = sg.rows;
             const shape_changed = sg.rows != rows or sg.cols != cols;
-            const old_contribution = if (self.win_pos.get(grid_id)) |pos|
-                self.layoutContribution(grid_id, pos, .{})
-            else
-                LayoutAccounting{};
-            const size_prospective = LayoutProspective{
-                .target_grid = grid_id,
-                .rows = rows,
-                .cols = cols,
-            };
-            const new_contribution = if (self.win_pos.get(grid_id)) |pos|
-                self.layoutContribution(grid_id, pos, size_prospective)
-            else
-                LayoutAccounting{};
-            const new_accounting = try self.layoutAccountingAfterDelta(old_contribution, new_contribution);
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
             const old_surface_vertex_count = sg.surface_vertex_count;
             try sg.resize(self.alloc, rows, cols);
             self.subgrid_surface_vertex_count -|= old_surface_vertex_count;
-            if (old_contribution.refs != new_contribution.refs or
-                old_contribution.layouts != new_contribution.layouts)
-            {
-                self.commitLayoutAccounting(new_accounting);
-            }
             if (shape_changed and (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id))) {
                 self.glyph_working_set_rev +%= 1;
             }
@@ -2447,16 +2259,6 @@ pub const Grid = struct {
         const new_len = try checkedGridCellCount(rows, cols);
         const new_total = try self.checkedAggregateCellCount(0, new_len);
         if (!subgridInsertFits(self.sub_grids.count(), true)) return error.TooManySubgrids;
-        const size_prospective = LayoutProspective{
-            .target_grid = grid_id,
-            .rows = rows,
-            .cols = cols,
-        };
-        const new_contribution = if (self.win_pos.get(grid_id)) |pos|
-            self.layoutContribution(grid_id, pos, size_prospective)
-        else
-            LayoutAccounting{};
-        const new_accounting = try self.layoutAccountingAfterDelta(.{}, new_contribution);
         const sg = blk: {
             var new_grid: GridBuf = .{};
             errdefer new_grid.deinit(self.alloc);
@@ -2465,7 +2267,6 @@ pub const Grid = struct {
             break :blk self.sub_grids.getPtr(grid_id).?;
         };
         _ = sg;
-        if (new_contribution.layouts != 0) self.commitLayoutAccounting(new_accounting);
         self.total_grid_cells = new_total;
         if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
             self.glyph_working_set_rev +%= 1;
@@ -2946,7 +2747,6 @@ pub const Grid = struct {
             self.layer_order_counter +%= 1;
             layer.order = self.layer_order_counter;
             self.glyph_working_set_rev +%= 1;
-            self.advanceLayoutGeneration();
 
             if (layer.coverage_dirty_epoch == redraw_epoch) return;
             layer.coverage_dirty_epoch = redraw_epoch;
@@ -2990,15 +2790,6 @@ pub const Grid = struct {
             return;
         }
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
-        const new_accounting = if (was_visible)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = null,
-                .external = false,
-            })
-        else
-            LayoutAccounting{};
 
         // Capture before removal below: needed to dirty the right target
         // (main grid vs. an external anchor) once grid_id's own state is gone.
@@ -3049,7 +2840,6 @@ pub const Grid = struct {
             self.cursor_rev +%= 1;
         }
         if (was_visible) self.glyph_working_set_rev +%= 1;
-        if (was_visible) self.commitLayoutAccounting(new_accounting);
     }
 
     pub fn setWinPos(self: *Grid, grid_id: i64, win_id: i64, row: u32, col: u32) !void {
@@ -3082,19 +2872,7 @@ pub const Grid = struct {
         // (redraw_handler.zig) stop treating this grid as a float.
         const was_float = self.win_layer.contains(grid_id);
         const old_pos_before = self.win_pos.get(grid_id);
-        const old_contribution = if (old_pos_before) |old_pos|
-            self.layoutContribution(grid_id, old_pos, .{})
-        else
-            LayoutAccounting{};
         const new_pos = GridPos{ .row = row, .col = col };
-        const new_contribution = if (!is_external)
-            self.layoutContribution(grid_id, new_pos, .{})
-        else
-            LayoutAccounting{};
-        const new_accounting = if (!is_external)
-            try self.layoutAccountingAfterDelta(old_contribution, new_contribution)
-        else
-            LayoutAccounting{};
 
         // Store grid_id -> winid mapping
         if (grid_win_is_new) {
@@ -3140,7 +2918,6 @@ pub const Grid = struct {
         // rows just marked above. Mirrors the setWinFloatPos fix below.
         self.content_rev +%= 1;
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
 
         // Only advance cursor_rev if cursor is on this grid
         if (self.cursor_grid == grid_id and self.cursor_valid) {
@@ -3158,14 +2935,6 @@ pub const Grid = struct {
         if (!self.external_grids.contains(grid_id)) {
             return self.setWinPos(grid_id, win_id, row, col);
         }
-
-        const new_pos = GridPos{ .row = row, .col = col };
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .position_set = true,
-            .position = new_pos,
-            .external = false,
-        });
 
         // setWinPos becomes infallible once both possible insertions have
         // capacity. Reserve before removing external visibility so OOM leaves
@@ -3186,11 +2955,6 @@ pub const Grid = struct {
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
         try self.setWinPos(grid_id, win_id, row, col);
-        // setWinPos accounts for this grid's new placement. Removing the
-        // external classification can also move floats anchored to this grid
-        // into the main composite, so publish the exact prevalidated totals.
-        self.main_row_index_ref_count = new_accounting.refs;
-        self.main_row_index_layout_count = new_accounting.layouts;
     }
 
     pub fn setWinFloatPos(
@@ -3223,21 +2987,6 @@ pub const Grid = struct {
             .col = col,
             .anchor_grid = anchor_grid,
             .follows_scroll = follows_scroll,
-        };
-        const old_contribution = if (old_pos_before) |old_pos|
-            self.layoutContribution(grid_id, old_pos, .{})
-        else
-            LayoutAccounting{};
-        const new_accounting = if (was_external)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = prospective_pos,
-                .external = false,
-            })
-        else blk: {
-            const new_contribution = self.layoutContribution(grid_id, prospective_pos, .{});
-            break :blk try self.layoutAccountingAfterDelta(old_contribution, new_contribution);
         };
 
         const grid_win_is_new = win_id > 0 and !self.grid_win_ids.contains(grid_id);
@@ -3344,7 +3093,6 @@ pub const Grid = struct {
             layer_ptr.* = new_layer;
         }
         if (working_set_changed) self.glyph_working_set_rev +%= 1;
-        if (working_set_changed) self.commitLayoutAccounting(new_accounting);
         if (self.cursor_grid == grid_id and self.cursor_valid) {
             self.cursor_rev +%= 1;
         }
@@ -3352,15 +3100,6 @@ pub const Grid = struct {
 
     pub fn hideWin(self: *Grid, grid_id: i64) !void {
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
-        const new_accounting = if (was_visible)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .position_set = true,
-                .position = null,
-                .external = false,
-            })
-        else
-            LayoutAccounting{};
         // Mark the rows this grid was covering as dirty before removal,
         // so they get recomposed with the underlying grid=1 content
         // (e.g., window separators that were previously overlaid).
@@ -3397,7 +3136,6 @@ pub const Grid = struct {
             self.cursor_rev +%= 1;
         }
         if (was_visible) self.glyph_working_set_rev +%= 1;
-        if (was_visible) self.commitLayoutAccounting(new_accounting);
     }
 
     /// Mark a grid as external (displayed in a separate top-level window).
@@ -3429,12 +3167,6 @@ pub const Grid = struct {
             }
             return false;
         }
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .position_set = true,
-            .position = null,
-            .external = true,
-        });
         try self.external_grids.ensureUnusedCapacity(self.alloc, 1);
 
         if (grid_win_is_new) {
@@ -3470,7 +3202,6 @@ pub const Grid = struct {
             .start_col = start_col,
         });
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
 
         // A newly registered frontend surface has no reusable vertex state,
         // even when the GridBuf stayed clean across win_hide (tab switch).
@@ -3503,18 +3234,10 @@ pub const Grid = struct {
         if (!windowPlacementInsertFits(self.external_grids.count(), is_new)) {
             return error.TooManyWindowPlacements;
         }
-        const new_accounting = if (is_new)
-            try self.prospectiveLayoutAccounting(.{
-                .target_grid = grid_id,
-                .external = true,
-            })
-        else
-            LayoutAccounting{};
         if (is_new) self.invalidateSubgridVertexSurface(grid_id);
         try self.external_grids.put(self.alloc, grid_id, info);
         if (is_new) {
             self.glyph_working_set_rev +%= 1;
-            self.commitLayoutAccounting(new_accounting);
         }
     }
 
@@ -3522,14 +3245,9 @@ pub const Grid = struct {
     /// visible, and advances the atlas-recovery input only on a real removal.
     pub fn removeSyntheticExternal(self: *Grid, grid_id: i64) !bool {
         if (!self.external_grids.contains(grid_id)) return false;
-        const new_accounting = try self.prospectiveLayoutAccounting(.{
-            .target_grid = grid_id,
-            .external = false,
-        });
         self.invalidateSubgridVertexSurface(grid_id);
         if (self.external_grids.fetchRemove(grid_id) == null) return false;
         self.glyph_working_set_rev +%= 1;
-        self.commitLayoutAccounting(new_accounting);
         return true;
     }
 
@@ -3583,36 +3301,6 @@ pub const Grid = struct {
         self.cursor_valid = true;
 
         if (changed) self.cursor_rev +%= 1;
-    }
-
-    /// Return the current cursor row in global-grid coordinates when the cursor is
-    /// on the specified grid. Returns null if the cursor is hidden or on another grid.
-    pub fn currentCursorMainRow(self: *const Grid, grid_id: i64) ?u32 {
-        if (!self.cursor_valid or self.cursor_grid != grid_id) return null;
-
-        const win_offset: u32 = if (grid_id != 1)
-            if (self.win_pos.get(grid_id)) |p| p.row else 0
-        else
-            0;
-
-        return win_offset +| self.cursor_row;
-    }
-
-    /// Return the previous cursor row after applying the active scroll operation.
-    /// This converts the pre-scroll screen row into the post-scroll screen row,
-    /// which is the row that must be regenerated to clear old cursor text.
-    pub fn prevCursorMainRowAfterScroll(self: *const Grid, scroll_op: ScrollOp) ?u32 {
-        const prev_row = self.prev_cursor_row orelse return null;
-        const prev_grid = self.prev_cursor_grid orelse return null;
-        if (prev_grid != scroll_op.grid_id) return prev_row;
-
-        const shifted = @as(i64, prev_row) - @as(i64, scroll_op.rows);
-        if (shifted < 0) return null;
-
-        const max_rows = @as(i64, scroll_op.win_pos_row) + @as(i64, scroll_op.target_rows);
-        if (shifted >= max_rows) return null;
-
-        return @intCast(shifted);
     }
 
     /// Set viewport info from win_viewport event.
@@ -4678,7 +4366,6 @@ test "grid line coverage is dirtied once per redraw epoch while order advances" 
 
     const epoch = grid.beginRedrawBatch();
     const order_before = grid.win_layer.get(2).?.order;
-    const generation_before = grid.layout_generation;
     grid.noteGridLine(2, epoch);
     try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
     try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
@@ -4690,69 +4377,10 @@ test "grid line coverage is dirtied once per redraw epoch while order advances" 
     try std.testing.expect(!grid.main_buf.dirty_rows.isSet(2));
     try std.testing.expect(!grid.main_buf.dirty_rows.isSet(3));
     try std.testing.expect(grid.win_layer.get(2).?.order != first_order);
-    try std.testing.expect(grid.layout_generation != generation_before);
 
     grid.noteGridLine(2, grid.beginRedrawBatch());
     try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
     try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
-}
-
-test "main row index accounting follows placement and external anchor visibility" {
-    var grid = Grid.init(std.testing.allocator);
-    defer grid.deinit();
-    grid.setRowIndexBudgetEnabled(true);
-
-    try grid.resizeGrid(1, 4, 1);
-    try grid.resizeGrid(2, 2, 1);
-    try grid.resizeGrid(3, 1, 1);
-    try grid.setWinPos(2, 42, 1, 0);
-    try grid.setWinFloatPos(3, 43, 2, 0, 10, 0, 2);
-    try std.testing.expectEqual(@as(usize, 3), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 2), grid.main_row_index_layout_count);
-
-    _ = try grid.setWinExternalPos(2, 42);
-    try std.testing.expectEqual(@as(usize, 0), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 0), grid.main_row_index_layout_count);
-
-    try grid.promoteExternalToWinPos(2, 42, 1, 0);
-    try std.testing.expectEqual(@as(usize, 3), grid.main_row_index_ref_count);
-    try std.testing.expectEqual(@as(usize, 2), grid.main_row_index_layout_count);
-}
-
-test "row index budget rejects a placement without changing the accepted layout" {
-    var grid = Grid.init(std.testing.allocator);
-    defer grid.deinit();
-    grid.setRowIndexBudgetEnabled(true);
-
-    const main_rows = MAX_GRID_ROWS;
-    try grid.resizeGrid(1, main_rows, 1);
-    const base_bytes = Grid.mainRowIndexByteSize(main_rows, 0, 0).?;
-    const one_layout_bytes = Grid.mainRowIndexByteSize(main_rows, main_rows, 1).? - base_bytes;
-    const fitting_layouts = (MAX_MAIN_SUBGRID_ROW_INDEX_BYTES - base_bytes) / one_layout_bytes;
-    try std.testing.expect(fitting_layouts > 0);
-
-    for (0..fitting_layouts) |index| {
-        const grid_id: i64 = @intCast(index + 2);
-        try grid.resizeGrid(grid_id, main_rows, 1);
-        try grid.setWinPos(grid_id, grid_id, 0, 0);
-    }
-    try std.testing.expectEqual(fitting_layouts, grid.main_row_index_layout_count);
-    try std.testing.expectEqual(fitting_layouts * @as(usize, main_rows), grid.main_row_index_ref_count);
-
-    const rejected_grid_id: i64 = @intCast(fitting_layouts + 2);
-    try grid.resizeGrid(rejected_grid_id, main_rows, 1);
-    const accepted_refs = grid.main_row_index_ref_count;
-    const accepted_layouts = grid.main_row_index_layout_count;
-    const accepted_generation = grid.layout_generation;
-    try std.testing.expectError(
-        error.LayoutTooComplex,
-        grid.setWinPos(rejected_grid_id, rejected_grid_id, 0, 0),
-    );
-    try std.testing.expect(!grid.win_pos.contains(rejected_grid_id));
-    try std.testing.expect(!grid.grid_win_ids.contains(rejected_grid_id));
-    try std.testing.expectEqual(accepted_refs, grid.main_row_index_ref_count);
-    try std.testing.expectEqual(accepted_layouts, grid.main_row_index_layout_count);
-    try std.testing.expectEqual(accepted_generation, grid.layout_generation);
 }
 
 test "viewport margin changes invalidate their vertex consumers" {

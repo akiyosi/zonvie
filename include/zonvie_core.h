@@ -701,7 +701,22 @@ typedef int (*zonvie_on_clipboard_set_fn)(
     size_t len
 );
 
+/* Layout version of zonvie_callbacks. Bump it whenever a field is removed,
+   reordered, or has its signature changed. Appending a new callback at the
+   end stays backward compatible through callbacks_size and must NOT bump it. */
+#define ZONVIE_CALLBACKS_ABI_VERSION 1
+
 typedef struct zonvie_callbacks {
+    /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
+       NULL otherwise. It exists because callbacks_size can only report that
+       the struct's LENGTH changed, never that its LAYOUT did: commit 935bdc0
+       removed two callbacks and appended two, so a consumer built before it
+       passes a callbacks_size equal to the current sizeof while every pointer
+       from on_vertices_row onward sits at the wrong offset. This field is
+       first on purpose -- it is the one offset a stale consumer cannot match
+       by accident, because a stale build has a function pointer there. */
+    uint32_t abi_version;
+
     zonvie_on_vertices_row_fn on_vertices_row;
     zonvie_atlas_ensure_glyph_fn on_atlas_ensure_glyph;
     zonvie_atlas_ensure_glyph_styled_fn on_atlas_ensure_glyph_styled;
@@ -865,7 +880,8 @@ typedef struct zonvie_callbacks {
        two removals and these two additions cancel out in sizeof, so
        callbacks_size cannot detect the change: this struct is NOT layout
        compatible with a consumer built before it, even though the size
-       matches. Both in-tree frontends were updated in the same commit. */
+       matches. Both in-tree frontends were updated in the same commit, and
+       abi_version above is what lets the core refuse such a consumer. */
     zonvie_on_surface_layout_fn on_surface_layout;
     zonvie_on_grid_destroy_fn on_grid_destroy;
 } zonvie_callbacks;
@@ -975,7 +991,11 @@ void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
                    against an older (smaller) struct layout.
                    Must be non-zero when cb is non-NULL: a zero size cannot
                    bound the read, so the core installs no callbacks at all.
-   ctx:            opaque frontend context forwarded to all callbacks. */
+                   It cannot detect a layout change -- see abi_version.
+   ctx:            opaque frontend context forwarded to all callbacks.
+   Returns NULL when cb is non-NULL and cb->abi_version is not
+   ZONVIE_CALLBACKS_ABI_VERSION. Nothing is logged in that case: on_log lives
+   in the very struct whose layout is in doubt. */
 zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
 /* Must be called from a lifecycle thread which is not currently executing a
    Zonvie callback. Calling destroy re-entrantly from a callback only requests

@@ -396,8 +396,6 @@ pub const Callbacks = struct {
 };
 
 const GridEntry = flush.GridEntry;
-const CachedSubgrid = flush.CachedSubgrid;
-const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
 const STYLE_ITALIC = flush.STYLE_ITALIC;
 const RenderCells = flush.RenderCells;
@@ -519,11 +517,6 @@ pub const Core = struct {
     // accumulating under-decoration, glyph, strike, and overline layers here.
     // Capacities are retained across flushes; no per-frame buffers are created.
 
-    // Scroll-aware flush: per-row vertex cache.
-    // Each entry holds the last emitted vertices for that row.
-    // On scroll, entries are logically shifted and y-coordinates adjusted.
-    // Invalidated on resize, guifont, atlas reset.
-    scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
     /// Per-grid mirror of the atlas rows every grid is currently showing.
     ///
     /// Reclamation decides liveness from what the frontend actually holds, and
@@ -532,18 +525,16 @@ pub const Core = struct {
     /// not the vertices: that is all shelf resolution needs, and it is two
     /// orders of magnitude smaller than a full copy.
     glyph_mirror: std.AutoHashMapUnmanaged(i64, GlyphMirror) = .{},
-    scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
-    scroll_cache_rows: u32 = 0,
     /// The row buffer currently being composed, while it is being composed.
-    /// A row only reaches scroll_cache once it is finished, so without this the
-    /// mid-flush collection cannot see the quads the in-progress row has
-    /// already emitted and would reclaim the shelves they point into. Held as a
-    /// pointer, not a slice: the list grows as the row is built.
+    /// A row only reaches its grid's mirror once it is finished, so without
+    /// this the mid-flush collection cannot see the quads the in-progress row
+    /// has already emitted and would reclaim the shelves they point into. Held
+    /// as a pointer, not a slice: the list grows as the row is built.
     inflight_row_verts: ?*const std.ArrayListUnmanaged(c_api.Vertex) = null,
     /// Set when the frontend declined to publish a frame this core had already
-    /// regenerated rows for. scroll_cache then holds the refused frame while
-    /// the screen still shows the previous one, so it no longer describes what
-    /// is displayed and cannot be used to prove a shelf is unreferenced.
+    /// regenerated rows for. The glyph mirrors then hold the refused frame
+    /// while the screen still shows the previous one, so they no longer
+    /// describe what is displayed and cannot prove a shelf is unreferenced.
     /// Cleared by the next accepted publication.
     display_mirror_stale: bool = false,
     /// Copies of the rows the scroll fast path most recently shifted out of the
@@ -561,20 +552,7 @@ pub const Core = struct {
     vertex_budget_transaction_active: bool = false,
     vertex_budget_touched_grid_head: ?i64 = null,
 
-    // Subgrid layout snapshot for scroll fast path.
-    // Stores the (grid_id, row_start, row_end) of every composited subgrid
-    // from the previous successful flush. Compared against the current layout
-    // to detect position changes, additions, and removals that invalidate
-    // cached row vertices inside the scroll region.
-    prev_subgrid_snapshots: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
-    // Current-layout normalization and row-dedup scratch for the subgrid
-    // scroll-cache diff. Capacities persist across flushes.
-    subgrid_diff_current: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
-    subgrid_diff_row_marks: std.ArrayListUnmanaged(u32) = .empty,
-    subgrid_diff_row_generation: u32 = 0,
-
     // Reusable scratch buffers (zero-allocation hot path)
-    tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
     grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
     // Sort scratch for float overlays anchored to an external grid — same
@@ -594,22 +572,6 @@ pub const Core = struct {
     ext_float_row_entry_indices: std.ArrayListUnmanaged(usize) = .empty,
     ext_float_row_index_valid: bool = false,
     ext_float_index_generation: u64 = 0,
-    cached_subgrids_buf: std.ArrayListUnmanaged(flush.CachedSubgrid) = .empty,
-    // Persistent main-composition row buckets. The exact layout snapshot
-    // avoids rebuilding these on content-only flushes.
-    main_subgrid_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_indices: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_layout: std.ArrayListUnmanaged(flush.MainSubgridRowLayout) = .empty,
-    main_subgrid_row_index_rows: u32 = 0,
-    main_subgrid_row_index_valid: bool = false,
-    main_subgrid_row_index_generation: u64 = 0,
-    // The buckets store positions into the per-flush cached_subgrids slice, so
-    // reuse additionally requires that slice to have the same length. A grid
-    // clipped entirely off the bottom of the main grid contributes nothing to
-    // the layout accounting, so a resize that adds or drops one changes the
-    // slice without advancing layout_generation.
-    main_subgrid_row_index_cached_len: usize = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
@@ -1204,8 +1166,7 @@ pub const Core = struct {
     }
 
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
-        var grid = Grid.init(alloc);
-        grid.setRowIndexBudgetEnabled(cb.on_vertices_row != null);
+        const grid = Grid.init(alloc);
         return .{
             .alloc = alloc,
             .cb = cb,
@@ -1255,13 +1216,7 @@ pub const Core = struct {
         self.row_verts.deinit(self.alloc);
         self.flush_dirty_snapshot.deinit(self.alloc);
         self.flush_row_counts_snapshot.deinit(self.alloc);
-        for (self.scroll_cache.items) |*row_cache| {
-            row_cache.deinit(self.alloc);
-        }
-        self.scroll_cache.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
-        self.scroll_cache_valid.deinit(self.alloc);
-        self.tmp_cells.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit(self.alloc);
         self.ext_float_entries.deinit(self.alloc);
@@ -1269,14 +1224,6 @@ pub const Core = struct {
         self.ext_float_row_offsets.deinit(self.alloc);
         self.ext_float_row_write_offsets.deinit(self.alloc);
         self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.cached_subgrids_buf.deinit(self.alloc);
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.prev_subgrid_snapshots.deinit(self.alloc);
-        self.subgrid_diff_current.deinit(self.alloc);
-        self.subgrid_diff_row_marks.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
@@ -1390,7 +1337,7 @@ pub const Core = struct {
     ///     win_layer / viewport(_margins) / cell_overflow / grid_metrics.
     ///     The new server never sends grid_destroy for grid_ids it does
     ///     not know about, so leftover entries would be rendered as
-    ///     stale floats (flush.zig:rebuildMain) and reported as visible
+    ///     stale floats (flush.zig's main rebuild) and reported as visible
     ///     by getVisibleGridsSnapshotLocked (hit-testing).
     ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
     ///     tabline_state / message_state / msg_history_state. The new
@@ -1399,7 +1346,7 @@ pub const Core = struct {
     ///   - cursor state: cursor_grid may point at a now-deleted sub_grid.
     ///   - Core-side flush bookkeeping: last_sent_*_rev, msg throttle
     ///     state, last_cmd snapshot, popupmenu Lua-mirror handles,
-    ///     pre_cmdline cursor snapshot, prev_subgrid_snapshots.
+    ///     pre_cmdline cursor snapshot.
     ///
     /// Frontend overlay teardown:
     ///   - external_grids cleanup below already fires on_external_window_close
@@ -1650,26 +1597,6 @@ pub const Core = struct {
         self.last_cmd_len = 0;
         self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
-
-        // Subgrid layout snapshot for scroll fast path: stale entries
-        // would reference grid_ids the new session has not (yet) created.
-        self.prev_subgrid_snapshots.clearRetainingCapacity();
-
-        // The row buckets describe the previous session's placement maps.
-        // Release their hostile-input high-water capacity together with the
-        // placement maps and force the first new-session row flush to rebuild.
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_offsets = .empty;
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets = .empty;
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_indices = .empty;
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.main_subgrid_row_layout = .empty;
-        self.main_subgrid_row_index_rows = 0;
-        self.main_subgrid_row_index_valid = false;
-        self.main_subgrid_row_index_generation = 0;
-        self.main_subgrid_row_index_cached_len = 0;
 
         // External-float scratch is bounded during a session, but a hostile
         // previous peer may have driven it to that high-water mark. Session
@@ -2037,13 +1964,6 @@ pub const Core = struct {
         if (m.valid.isSet(src)) m.valid.set(dst) else m.valid.unset(dst);
     }
 
-    /// Drop a grid's mirror: its rows no longer describe anything on screen.
-    pub fn invalidateGlyphMirror(self: *Core, grid_id: i64) void {
-        const m = self.glyph_mirror.getPtr(grid_id) orelse return;
-        for (m.rows.items) |*r| r.clearRetainingCapacity();
-        if (m.valid.bit_length != 0) m.valid.unsetAll();
-    }
-
     /// Free a destroyed grid's mirror outright. Neovim hands out increasing
     /// grid ids, so a session that never removed them would keep every closed
     /// split's and float's rows pinning atlas shelves forever.
@@ -2063,60 +1983,16 @@ pub const Core = struct {
         }
     }
 
-    /// Ensure scroll_cache has exactly `target_rows` entries.
-    /// Grows or shrinks the per-row vertex lists as needed.
-    pub fn ensureScrollCache(self: *Core, target_rows: u32) !void {
-        const cur = self.scroll_cache_rows;
-        if (cur == target_rows and
-            self.scroll_cache.items.len == target_rows) return;
-
-        // Shrink: deinit excess row buffers
-        if (self.scroll_cache.items.len > target_rows) {
-            for (self.scroll_cache.items[target_rows..]) |*row_buf| {
-                row_buf.deinit(self.alloc);
-            }
-            self.scroll_cache.items.len = target_rows;
-        }
-
-        // Grow: append empty row buffers
-        while (self.scroll_cache.items.len < target_rows) {
-            try self.scroll_cache.append(self.alloc, .empty);
-        }
-
-        // Resize the valid bitset
-        if (self.scroll_cache_valid.bit_length != target_rows) {
-            self.scroll_cache_valid.deinit(self.alloc);
-            self.scroll_cache_valid = .{}; // zero state so use-after-free cannot occur on alloc failure
-            self.scroll_cache_rows = 0; // invalidate cache_ready check in flush
-            self.scroll_cache_valid = try std.DynamicBitSetUnmanaged.initEmpty(self.alloc, target_rows);
-        }
-
-        self.scroll_cache_rows = target_rows;
-    }
-
-    /// Invalidate all scroll cache entries (e.g., on resize, guifont, atlas reset).
-    /// Also releases per-row vertex capacity to reclaim peak memory from prior frames.
-    pub fn invalidateScrollCache(self: *Core) void {
-        // Free per-row vertex buffers to release peak capacity
-        for (self.scroll_cache.items) |*row_buf| {
-            row_buf.deinit(self.alloc);
-        }
-        self.scroll_cache.items.len = 0;
-
-        if (self.scroll_cache_valid.bit_length != 0) {
-            self.scroll_cache_valid.unsetAll();
-        }
-        self.scroll_cache_rows = 0;
-        // Whatever invalidated the scroll cache -- an atlas reset, a font or
-        // linespace change, a resize -- also invalidated every mirrored UV.
+    /// Drop everything this core mirrors of the displayed frame (e.g. on
+    /// resize, guifont, atlas reset) and reset the main grid's vertex ledger.
+    pub fn invalidateMirroredFrameState(self: *Core) void {
+        // Whatever invalidated the mirrors -- an atlas reset, a font or
+        // linespace change, a resize -- invalidated every mirrored UV.
         self.invalidateAllGlyphMirrors();
         @memset(self.grid.main_buf.vertex_row_counts, 0);
         self.flush_vertex_count_aggregate -|= self.grid.main_buf.surface_vertex_count;
         self.grid.main_buf.surface_vertex_count = 0;
         self.grid.main_buf.vertex_row_ledger_valid = true;
-
-        // Reset subgrid snapshot so the next flush treats all subgrids as new.
-        self.prev_subgrid_snapshots.clearRetainingCapacity();
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)
@@ -2523,7 +2399,7 @@ pub const Core = struct {
 
     fn beginNegativeGlyphReprobe(self: *Core) void {
         self.invalidateNegativeGlyphCacheEntries();
-        self.invalidateScrollCache();
+        self.invalidateMirroredFrameState();
         self.grid.markAllDirty();
         self.grid.scroll_fast_path_blocked = true;
         var sg_it = self.grid.sub_grids.valueIterator();
@@ -2808,8 +2684,8 @@ pub const Core = struct {
     }
 
     /// True when every main-grid row the frontend is currently showing is
-    /// either mirrored in scroll_cache (so its atlas references are readable
-    /// here) or already dirty (so this flush regenerates it before publishing).
+    /// either mirrored here (so its atlas references are readable) or already
+    /// dirty (so this flush regenerates it before publishing).
     /// Without this, a retained row whose vertices the core cannot inspect
     /// could keep a glyph that garbage collection would recycle underneath it.
     fn mainRowsAccountedForCollect(self: *Core) bool {
@@ -2860,17 +2736,17 @@ pub const Core = struct {
     /// viewport rebuild, and refills the atlas immediately, i.e. it spirals.
     ///
     /// Liveness comes from the vertices the frontend is actually holding
-    /// (scroll_cache mirrors the retained main rows; cursor_verts mirrors the
-    /// cursor layer), never from glyph-cache reachability — a cache entry can
+    /// (the per-grid glyph mirrors cover the retained rows; cursor_verts
+    /// mirrors the cursor layer), never from glyph-cache reachability — a cache entry can
     /// be displaced by a hash collision while its glyph stays on screen, so
     /// "no cache entry points here" does not mean "nothing draws this".
     ///
     /// Returns true when at least one shelf became reusable.
-    /// Reclaim atlas space before this flush generates anything, while
-    /// scroll_cache still mirrors exactly what the frontend is showing.
+    /// Reclaim atlas space before this flush generates anything, while the
+    /// glyph mirrors still describe exactly what the frontend is showing.
     ///
     /// Collecting mid-generation instead was actively harmful: the rows this
-    /// flush had already recomposed were not in scroll_cache yet, so the
+    /// flush had already recomposed were not mirrored yet, so the
     /// glyphs it had just packed looked unreferenced, were reclaimed, and had
     /// to be rasterized all over again on the next pass — the atlas never held
     /// a screenful for longer than one flush.
@@ -2961,8 +2837,8 @@ pub const Core = struct {
         }
         if (!self.mainRowsAccountedForCollect()) {
             if (log_on) self.log.write(
-                "[perf] atlas_gc skip=rows scroll_cache_rows={d} grid_rows={d} dirty_all={any}\n",
-                .{ self.scroll_cache_rows, self.grid.rows, self.grid.main_buf.dirty_all },
+                "[perf] atlas_gc skip=rows mirrored_grids={d} grid_rows={d} dirty_all={any}\n",
+                .{ self.glyph_mirror.count(), self.grid.rows, self.grid.main_buf.dirty_all },
             );
             return false;
         }
@@ -3008,8 +2884,8 @@ pub const Core = struct {
         for (self.cursor_verts.items) |v| {
             markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
         }
-        // The row this flush is composing right now. Its quads are not in
-        // scroll_cache yet, and a glyph it took from the cache was allocated in
+        // The row this flush is composing right now. Its quads are not
+        // mirrored yet, and a glyph it took from the cache was allocated in
         // an earlier epoch, so the epoch guard does not cover it either.
         if (self.inflight_row_verts) |row| {
             for (row.items) |v| {
@@ -5836,13 +5712,13 @@ test "main row ledger structural changes cannot leave stale per-row counts" {
     try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
     try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
 
-    // invalidateScrollCache zeroes the counts in place and removes the main
+    // invalidateMirroredFrameState zeroes the counts in place and removes the main
     // surface's contribution from the aggregate.
     core.grid.main_buf.vertex_row_counts[0] = 40;
     core.grid.main_buf.vertex_row_counts[1] = 26;
     core.grid.main_buf.surface_vertex_count = 66;
     core.flush_vertex_count_aggregate = 166;
-    core.invalidateScrollCache();
+    core.invalidateMirroredFrameState();
     try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.main_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
@@ -7405,9 +7281,6 @@ fn initCoreForAtlasGcTest(core: *Core, rows: u32) !void {
     core.cb.on_atlas_create = AtlasGcTestCallbacks.create;
 
     try core.grid.resize(rows, 4);
-    try core.ensureScrollCache(rows);
-    var r: u32 = 0;
-    while (r < rows) : (r += 1) core.scroll_cache_valid.set(r);
 
     var packer = shelf_packer.ShelfPacker.init(16, 4096);
     _ = packer.alloc(12, 1).?;

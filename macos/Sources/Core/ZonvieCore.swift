@@ -506,6 +506,9 @@ final class ZonvieCore {
         self.ctxPtr = unmanaged.toOpaque()
 
         var cb = zonvie_callbacks(
+            // Declares the callbacks layout this frontend was built against;
+            // zonvie_core_create returns NULL on a mismatch.
+            abi_version: UInt32(ZONVIE_CALLBACKS_ABI_VERSION),
             on_vertices_row: { ctx, gridId, rowStart, rowCount, verts, vertCount, flags, totalRows, totalCols in
                 guard let ctx else { return }
 

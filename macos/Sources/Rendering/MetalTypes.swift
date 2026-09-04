@@ -2852,7 +2852,8 @@ final class SurfaceGlowTextures {
 /// receives the encoder with pipeline/viewport/fragment state already configured.
 ///
 /// - `viewportSize`: grid-snapped pixel dimensions matching the main render pass viewport.
-///   Used for the extract viewport and fragment DrawableSize so NDC ↔ pixel mapping aligns.
+///   Used for the extract viewport only; NDC is viewport relative, so the half-size
+///   viewport keeps the NDC ↔ pixel mapping aligned with the main pass.
 /// - `drawableSize`: raw drawable pixel dimensions. Used for extract texture sizing so that
 ///   blur can bleed beyond the grid viewport into surrounding margin areas.
 /// - `layerTransform`: the pixel space the extract vertices arrive in. Bound before the

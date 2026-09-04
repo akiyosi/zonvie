@@ -56,25 +56,6 @@ pub const ExternalFloatAnchorEntry = struct {
 
 // Pre-computed subgrid info for row-mode compose optimization.
 // Caches win_pos/sub_grids lookups to avoid per-row hash map access.
-/// Lightweight snapshot of a composited subgrid's identity and row range.
-/// Stored across flushes to detect layout changes (move/add/remove) that
-/// invalidate cached row vertices inside the scroll region.
-pub const SubgridSnapshot = struct {
-    grid_id: i64,
-    row_start: u32,
-    row_end: u32,
-    col_start: u32,
-    sg_cols: u32,
-    margin_top: u32,
-    margin_bottom: u32,
-    margin_left: u32,
-    margin_right: u32,
-
-    fn lessThanGridId(_: void, a: SubgridSnapshot, b: SubgridSnapshot) bool {
-        return a.grid_id < b.grid_id;
-    }
-};
-
 pub const CachedSubgrid = struct {
     grid_id: i64,
     row_start: u32, // pos.row
@@ -95,10 +76,6 @@ pub const MainSubgridRowLayout = struct {
     row_end: u32,
 };
 
-// Keep the persistent materialized row index bounded. Layouts whose total
-// row coverage exceeds this limit are rejected: falling back to scanning all
-// subgrids for every dirty row makes CPU time unbounded under grid_mu.
-const MAX_MAIN_SUBGRID_ROW_INDEX_BYTES: usize = grid_mod.MAX_MAIN_SUBGRID_ROW_INDEX_BYTES;
 const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
 const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
@@ -278,9 +255,9 @@ fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
 /// accounting and only the rows this attempt consumed are owed again.
 fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_main_ledger: bool) void {
     if (!core.vertex_budget_transaction_active) return;
-    // scroll_cache mirrors the displayed frame only while publications are
-    // being accepted; a refusal leaves it describing a frame that never
-    // reached the screen. Atlas reclamation reads it, so it has to know.
+    // The glyph mirrors describe the displayed frame only while publications
+    // are being accepted; a refusal leaves them describing a frame that never
+    // reached the screen. Atlas reclamation reads them, so it has to know.
     if (commit) core.display_mirror_stale = false;
     clearTouchedVertexBudgetSurfaces(core);
     if (!commit and restore_main_ledger and restoreMainVertexRowLedger(core)) {
@@ -459,10 +436,10 @@ fn csrResizeExact(
 /// The caller deposits each row's count at `offsets[row + 1]`, leaving
 /// `offsets[0]` zero; afterwards `offsets[row]` is that row's start and
 /// `offsets[offsets.len - 1]` is the total, which callers assert against
-/// their own count. Shared by the main-grid and external-float row indexes:
-/// only this middle of the CSR build is common to both, because their
-/// counting and filling ends iterate different collections and emit indices
-/// into different arrays.
+/// their own count. Used by the external-float row index; only this middle of
+/// the CSR build was ever common to more than one index, because the counting
+/// and filling ends iterate different collections and emit indices into
+/// different arrays.
 fn csrOffsetsFromCounts(offsets: []usize) void {
     for (1..offsets.len) |i| {
         offsets[i] += offsets[i - 1];
@@ -492,67 +469,6 @@ fn mainSubgridRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs
     const layout_bytes = std.math.mul(usize, layouts, @sizeOf(MainSubgridRowLayout)) catch return null;
     return std.math.add(usize, usize_bytes, layout_bytes) catch null;
 }
-
-fn mainSubgridRowIndexByteSize(rows: usize, refs: usize, layouts: usize) ?usize {
-    const offset_count = std.math.add(usize, rows, 1) catch return null;
-    return mainSubgridRowIndexStorageByteSize(offset_count, rows, refs, layouts);
-}
-
-fn clearMainSubgridRowIndexStorage(core: *Core) void {
-    core.main_subgrid_row_offsets.deinit(core.alloc);
-    core.main_subgrid_row_offsets = .empty;
-    core.main_subgrid_row_write_offsets.deinit(core.alloc);
-    core.main_subgrid_row_write_offsets = .empty;
-    core.main_subgrid_row_indices.deinit(core.alloc);
-    core.main_subgrid_row_indices = .empty;
-    core.main_subgrid_row_layout.deinit(core.alloc);
-    core.main_subgrid_row_layout = .empty;
-    core.main_subgrid_row_index_valid = false;
-    core.main_subgrid_row_index_generation = 0;
-    core.main_subgrid_row_index_cached_len = 0;
-}
-
-fn preflightMainSubgridRowIndex(core: *Core, rows: u32) !void {
-    if (core.cb.on_vertices_row == null) return;
-    if (core.main_subgrid_row_index_valid and
-        core.main_subgrid_row_index_rows == rows and
-        core.main_subgrid_row_index_generation == core.grid.layout_generation)
-    {
-        return;
-    }
-    const row_count: usize = rows;
-    const ref_count = core.grid.main_row_index_ref_count;
-    const layout_count = core.grid.main_row_index_layout_count;
-    const needed = core.grid.currentMainRowIndexByteSize() orelse {
-        core.flush_retryable = false;
-        return error.LayoutTooComplex;
-    };
-    if (needed > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) {
-        core.flush_retryable = false;
-        return error.LayoutTooComplex;
-    }
-    const offset_count = std.math.add(usize, row_count, 1) catch {
-        core.flush_retryable = false;
-        return error.LayoutTooComplex;
-    };
-    const retained = mainSubgridRowIndexStorageByteSize(
-        @max(core.main_subgrid_row_offsets.capacity, offset_count),
-        @max(core.main_subgrid_row_write_offsets.capacity, row_count),
-        @max(core.main_subgrid_row_indices.capacity, ref_count),
-        @max(core.main_subgrid_row_layout.capacity, layout_count),
-    ) orelse {
-        core.flush_retryable = false;
-        return error.LayoutTooComplex;
-    };
-    if (retained > MAX_MAIN_SUBGRID_ROW_INDEX_BYTES) {
-        // The current layout fits. Drop incompatible high-water allocations
-        // from an older layout instead of treating retained capacity as live
-        // protocol complexity.
-        clearMainSubgridRowIndexStorage(core);
-    }
-}
-
-
 
 fn viewportCellScrollable(
     row: u32,
@@ -2826,9 +2742,7 @@ fn dispatchGridRowScroll(
     core: *Core,
     scroll_cb: GridRowScrollCallback,
     grid_id: i64,
-    anchor_entries: []const ExternalFloatAnchorEntry,
 ) bool {
-    _ = anchor_entries;
     if (grid_id < 2) return false;
     // An external grid's frontend surface only exists once its open callback
     // has seeded one; until then there are no row slots to remap. A grid the
@@ -2857,7 +2771,6 @@ pub const FlushCtx = struct {
     pub fn onFlush(ctx: *FlushCtx, rows: u32, cols: u32) !void {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
-        try preflightMainSubgridRowIndex(ctx.core, rows);
         try beginVertexBudgetTransaction(ctx.core);
         const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
         const last_sent_cursor_rev_before = ctx.core.last_sent_cursor_rev;
@@ -2988,8 +2901,8 @@ pub const FlushCtx = struct {
             }
         }
         const aborted_at_flush_begin = ctx.core.flush_aborted;
-        // Reclaim atlas space while scroll_cache still describes the frame the
-        // frontend is showing, and before this flush packs anything of its own.
+        // Reclaim atlas space while the glyph mirrors still describe the frame
+        // the frontend is showing, and before this flush packs anything of its own.
         if (!aborted_at_flush_begin) ctx.core.collectAtlasGarbageIfNeeded();
         // pre_row "blackhole" bracket start. Surfaces the untimed gap between
         // cb_flush_begin and the row loop entry: scrolled-grid dispatch,
@@ -3110,9 +3023,8 @@ pub const FlushCtx = struct {
                 }
                 // sendExternalGridVertices can itself call
                 // zonvie_core_abort_flush (e.g. Windows external row-buffer
-                // OOM), AFTER the main grid already ran clearDirty() /
-                // saveSubgridSnapshots() earlier in this function on the
-                // assumption of a successful commit. But the frontend's
+                // OOM), AFTER the main grid already ran clearDirty() earlier
+                // in this function on the assumption of a successful commit. But the frontend's
                 // on_flush_end abort handling cancels ALL brackets for this
                 // flush, main included — so an abort discovered only here
                 // would otherwise drop the main-grid update permanently
@@ -3127,7 +3039,7 @@ pub const FlushCtx = struct {
                     ctx.core.force_ext_cursor_recheck = true;
                     // last_sent_cursor_rev was already synced to the current
                     // cursor_rev earlier in this same onFlush() call (the
-                    // on_vertices_partial fast path above), before this
+                    // on_vertices_row cursor dispatch), before this
                     // late-discovered abort was known. The cancelled
                     // bracket includes the main cursor too, so force a
                     // mismatch (wrapping, matching cursor_rev's own +%=
@@ -3289,12 +3201,7 @@ pub const FlushCtx = struct {
             var sg_it = ctx.core.grid.sub_grids.iterator();
             while (sg_it.next()) |entry| {
                 if (entry.value_ptr.row_scroll_notify_pending) {
-                    _ = dispatchGridRowScroll(
-                        ctx.core,
-                        scroll_cb,
-                        entry.key_ptr.*,
-                        ctx.core.ext_float_anchor_entries.items,
-                    );
+                    _ = dispatchGridRowScroll(ctx.core, scroll_cb, entry.key_ptr.*);
                     entry.value_ptr.row_scroll_notify_pending = false;
                     if (ctx.core.flush_aborted) break;
                 }
@@ -3368,7 +3275,7 @@ pub const FlushCtx = struct {
                     if (ctx.core.flush_aborted) return;
                 }
                 if (need_main) {
-                    ctx.core.invalidateScrollCache();
+                    ctx.core.invalidateMirroredFrameState();
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     ctx.core.grid.clearDirty();
                 }
@@ -3669,7 +3576,7 @@ pub const FlushCtx = struct {
             var main_retry_required: bool = false;
 
             // Pre-compute subgrid info — declared outside need_main so the
-            // snapshot is accessible for saveSubgridSnapshots in all exit paths.
+            // set is accessible in all exit paths.
             // Backed by a persistent Core-owned buffer (no fixed cap): row-mode
             // composition draws ONLY from this set, so truncating it would
             // silently drop the topmost floats in layouts with many grids.
@@ -3757,7 +3664,6 @@ pub const FlushCtx = struct {
                     var perf_ascii_fast_path: u32 = 0;
                     var perf_row_prep_hl_init_us: i64 = 0;
                     var perf_row_prep_glyph_init_us: i64 = 0;
-                    var perf_row_prep_scroll_ensure_us: i64 = 0;
                     var perf_row_prep_fast_path_check_us: i64 = 0;
                     var perf_row_prep_regen_build_us: i64 = 0;
                     var perf_row_prep_shift_us: i64 = 0;
@@ -3828,17 +3734,6 @@ pub const FlushCtx = struct {
                     // on placement, which cannot change mid-flush.
                     const main_has_layers = mainSurfaceHasLayers(ctx.core);
 
-                    // Ensure scroll cache is sized for row-mode flush.
-                    // This prepares the cache so fallback path can populate it
-                    // for future fast-path reuse.
-                    var t_prep_scroll_ensure_start: i128 = 0;
-                    if (log_enabled) t_prep_scroll_ensure_start = clock.nowNs();
-                    try ctx.core.ensureScrollCache(rows);
-                    if (log_enabled) {
-                        const t_prep_scroll_ensure_end = clock.nowNs();
-                        perf_row_prep_scroll_ensure_us = @intCast(@divTrunc(@max(0, t_prep_scroll_ensure_end - t_prep_scroll_ensure_start), 1000));
-                    }
-
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
                     var used_scroll_fast_path: bool = false;
@@ -3869,7 +3764,6 @@ pub const FlushCtx = struct {
                             perf_ascii_fast_path = 0;
                             perf_row_prep_hl_init_us = 0;
                             perf_row_prep_glyph_init_us = 0;
-                            perf_row_prep_scroll_ensure_us = 0;
                             perf_row_prep_fast_path_check_us = 0;
                             perf_row_prep_regen_build_us = 0;
                             perf_row_prep_shift_us = 0;
@@ -4107,7 +4001,7 @@ pub const FlushCtx = struct {
                                 }
                                 ctx.core.flush_atlas_corrupted = true;
                                 ctx.core.grid.markAllDirty();
-                                ctx.core.invalidateScrollCache();
+                                ctx.core.invalidateMirroredFrameState();
                                 var reset_sg_it = ctx.core.grid.sub_grids.valueIterator();
                                 while (reset_sg_it.next()) |sg| {
                                     sg.markAllDirty();
@@ -4183,15 +4077,15 @@ pub const FlushCtx = struct {
                     if (had_glyph_miss or saw_atlas_reset) {
                         main_retry_required = true;
                         ctx.core.grid.markAllDirty();
-                        // Atlas reset invalidates cached UVs in scroll cache — but only
+                        // Atlas reset invalidates the mirrored UVs — but only
                         // when the retry was aborted (partial/stale data) or no retry ran.
                         // When the retry succeeded, all rows were regenerated with the
-                        // fresh atlas, so scroll cache entries are already valid.
+                        // fresh atlas, so the mirrored UVs are already valid.
                         // Invalidating here would undo that work and force a full
                         // regeneration on the next scroll flush (~65-80ms for CJK).
                         if (saw_atlas_reset) {
                             if (!atlas_retried) {
-                                ctx.core.invalidateScrollCache();
+                                ctx.core.invalidateMirroredFrameState();
                             }
                             var sg_it = ctx.core.grid.sub_grids.valueIterator();
                             while (sg_it.next()) |sg| {
@@ -4264,11 +4158,10 @@ pub const FlushCtx = struct {
                             },
                         );
                         ctx.core.log.write(
-                            "[perf] row_mode_prep hl_init_us={d} glyph_init_us={d} scroll_ensure_us={d} fast_path_check_us={d} regen_build_us={d} shift_us={d}\n",
+                            "[perf] row_mode_prep hl_init_us={d} glyph_init_us={d} fast_path_check_us={d} regen_build_us={d} shift_us={d}\n",
                             .{
                                 perf_row_prep_hl_init_us,
                                 perf_row_prep_glyph_init_us,
-                                perf_row_prep_scroll_ensure_us,
                                 perf_row_prep_fast_path_check_us,
                                 perf_row_prep_regen_build_us,
                                 perf_row_prep_shift_us,
@@ -4516,7 +4409,7 @@ pub const FlushCtx = struct {
             // next flush regenerates everything against the fresh atlas.
             if (ctx.core.atlas_reset_during_flush) {
                 ctx.core.grid.markAllDirty();
-                ctx.core.invalidateScrollCache();
+                ctx.core.invalidateMirroredFrameState();
                 var sg_it = ctx.core.grid.sub_grids.valueIterator();
                 while (sg_it.next()) |sg| {
                     sg.markAllDirty();
@@ -4531,9 +4424,8 @@ pub const FlushCtx = struct {
             }
 
             // ----------------------------
-            // Send vertices via on_vertices_partial when registered. A
-            // row-only consumer receives main content above and the cursor as
-            // a dedicated row callback below.
+            // Send vertices via on_vertices_row. The consumer receives main
+            // content above and the cursor as a dedicated row callback below.
             // ----------------------------
 
             // Row-only ABI consumer. Main rows were sent individually above;
@@ -4585,8 +4477,8 @@ pub const FlushCtx = struct {
         if (ctx.core.isPhase2Atlas()) {
             ctx.core.resetCoreAtlas();
         }
-        // Scroll cache uses atlas UVs; invalidate on font/atlas change.
-        ctx.core.invalidateScrollCache();
+        // The mirrored frame holds atlas UVs; invalidate on font/atlas change.
+        ctx.core.invalidateMirroredFrameState();
 
         // Mark ALL grids dirty so row-mode vertex generation re-renders
         // every row with the new font/atlas. Without this, the global grid
@@ -4627,7 +4519,7 @@ pub const FlushCtx = struct {
         // resolved-color consumer before the frontend callback can re-enter
         // layout/vertex generation.
         ctx.core.reinitHlCache();
-        ctx.core.invalidateScrollCache();
+        ctx.core.invalidateMirroredFrameState();
         ctx.core.grid.markAllDirty();
         var sg_it = ctx.core.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| sg.markAllDirty();
@@ -6049,7 +5941,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         // before this deferred external-grid pass). Mark it so it
                         // regenerates against the fresh atlas on the next flush.
                         self.grid.markAllDirty();
-                        self.invalidateScrollCache();
+                        self.invalidateMirroredFrameState();
                         if (!ext_retried) {
                             ext_retried = true;
                             use_ext_scroll_fast_path = false; // Retry needs full redraw
@@ -6224,7 +6116,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         ext_saw_atlas_reset_any = true;
                                         self.atlas_reset_during_flush = false;
                                         self.grid.markAllDirty();
-                                        self.invalidateScrollCache();
+                                        self.invalidateMirroredFrameState();
                                     }
 
                                     if (glyph_ok != 0 and glyph_entry.bbox_size_px[0] > 0 and glyph_entry.bbox_size_px[1] > 0) {
@@ -6332,7 +6224,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // resend next flush against the corrected atlas) can heal.
     if (ext_saw_atlas_reset_any) {
         self.grid.markAllDirty();
-        self.invalidateScrollCache();
+        self.invalidateMirroredFrameState();
         var sg_it = self.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg_val| {
             sg_val.markAllDirty();
@@ -9865,7 +9757,7 @@ test "vertex budget permits aggregate redistribution across external surfaces" {
     );
 }
 
-test "external vertex aggregate follows lifecycle without layout-generation scans" {
+test "external vertex aggregate follows lifecycle without layout-order scans" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
 
@@ -9885,7 +9777,7 @@ test "external vertex aggregate follows lifecycle without layout-generation scan
 
     // Layout order changes do not affect physical surface membership or
     // require an external-grid rescan at the next transaction boundary.
-    core.grid.layout_generation +%= 1;
+    core.grid.layer_order_counter +%= 1;
     try beginVertexBudgetTransaction(&core);
     try std.testing.expectEqual(@as(usize, 20), core.flush_vertex_count_aggregate);
     finishVertexBudgetTransaction(&core, true);
@@ -10206,7 +10098,7 @@ test "row scroll hint covers composited grids and clamps target viewport" {
     // cannot disturb a neighbour and the hint applies to it too. This is the
     // case composition had to exclude.
     core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.calls);
     try std.testing.expectEqual(@as(i64, 2), state.grid_id);
     state = .{};
@@ -10219,7 +10111,7 @@ test "row scroll hint covers composited grids and clamps target viewport" {
     // with the core's external-row fast path.
     try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 3, .cols = 2 });
     core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
-    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 0), state.calls);
     try core.known_external_grids.put(core.alloc, 2, .{
         .win = 42,
@@ -10228,7 +10120,7 @@ test "row scroll hint covers composited grids and clamps target viewport" {
         .rows = 3,
         .cols = 2,
     });
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.calls);
     try std.testing.expectEqual(@as(i64, 2), state.grid_id);
     try std.testing.expectEqual(@as(u32, 0), state.row_start);
@@ -10739,7 +10631,7 @@ test "external scroll without row-shift callback regenerates every retained row"
 
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
 }
 
@@ -11888,7 +11780,7 @@ test "atlas reset on a scroll fast path flush still resends every row" {
         core.cb.on_atlas_create = State.create;
         if (use_scroll_cb) core.cb.on_grid_row_scroll = State.onMainRowScroll;
 
-        // Warm the scroll cache and the row ledger, then settle dirty_all so
+        // Warm the glyph mirror and the row ledger, then settle dirty_all so
         // the next flush is eligible for the scroll fast path.
         var flush_ctx = FlushCtx{ .core = &core };
         try flush_ctx.onFlush(ROWS, COLS);
@@ -14149,11 +14041,10 @@ test "the external-float storage size is the main formula with zero layouts" {
 }
 
 test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
-    // The main-grid and external-float row indexes each build a CSR index the
-    // same way. Only the middle of that build is genuinely shared -- the
-    // counting and filling ends differ in what they iterate and in which
-    // array their emitted indices point into -- so this covers exactly the
-    // part both will call.
+    // Only the middle of the external-float row index's CSR build is
+    // reusable -- the counting and filling ends differ in what they iterate
+    // and in which array their emitted indices point into -- so this covers
+    // exactly the part any such index calls.
     const alloc = std.testing.allocator;
 
     var offsets: std.ArrayListUnmanaged(usize) = .empty;
@@ -15212,12 +15103,12 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     try core.grid.setWinPos(3, 102, 0, 20);
 
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(i64, 2), state.last_grid);
 
     // Scrollbind: the other split scrolls in the same batch and is eligible too.
     core.grid.scrollGrid(3, 0, 10, 0, 20, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 3, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 3));
     try std.testing.expectEqual(@as(u32, 2), state.calls);
     try std.testing.expectEqual(@as(i64, 3), state.last_grid);
 
@@ -15227,23 +15118,23 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     try core.grid.resizeGrid(4, 3, 8);
     try core.grid.setWinFloatPos(4, 103, 2, 2, 50, 0, 1);
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 3), state.calls);
 
     // The float itself scrolls through the same path.
     core.grid.scrollGrid(4, 0, 3, 0, 8, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 4, &.{}));
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 4));
     try std.testing.expectEqual(@as(i64, 4), state.last_grid);
 
     // Grid-internal limits still hold: a partial-width scroll and one that
     // vacates more than half the region are both refused.
     core.grid.sub_grids.getPtr(3).?.clearScrollState();
     core.grid.scrollGrid(3, 0, 10, 0, 10, 1, 0);
-    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3, &.{}));
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3));
 
     core.grid.sub_grids.getPtr(3).?.clearScrollState();
     core.grid.scrollGrid(3, 0, 10, 0, 20, 8, 0);
-    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3, &.{}));
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3));
 }
 
 test "a vertical split's scroll publishes a shift instead of regenerating the band" {

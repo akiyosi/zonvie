@@ -3145,7 +3145,7 @@ pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
     if (app.layer_grids.fetchRemove(grid_id)) |kv| {
-        kv.value.deinit(app.alloc, null);
+        kv.value.deinit(app.alloc);
         app.alloc.destroy(kv.value);
     }
 }
