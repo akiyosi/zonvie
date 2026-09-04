@@ -1336,7 +1336,7 @@ pub const Renderer = struct {
         // Custom shader pass used to live here but was moved to the
         // present paths. Calling it at THIS point (before opts.present's
         // branch below) would run the shader on a back_tex that hasn't been
-        // populated yet in row-mode (rows land via drawSurfaceRowsVB after
+        // populated yet in row-mode (rows land via drawSurfaceRowsVBFromSlots after
         // drawEx returns), and also leaves the pipeline state (VS/PS/slot0
         // SRV) dirty, which breaks subsequent row drawVB calls that inherit
         // that state. drawCustomShaderPass is invoked from the present paths
@@ -1350,7 +1350,7 @@ pub const Renderer = struct {
         if (opts.present) {
             // Custom post-process shader pass: runs on the fully-rendered
             // back_tex (already populated here — unlike row-mode, where rows
-            // land via drawSurfaceRowsVB after drawEx returns, this present
+            // land via drawSurfaceRowsVBFromSlots after drawEx returns, this present
             // branch runs after all of this frame's content is in back_tex)
             // and writes its output directly into the current swapchain bb.
             // Skip the back->bb copy below when it handled the frame,

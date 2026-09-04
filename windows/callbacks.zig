@@ -259,7 +259,7 @@ fn stripCursorVerts(verts: *std.ArrayListUnmanaged(app_mod.Vertex)) void {
 }
 
 /// Swap and shift row vertex buffers for a scroll region.
-/// Shared between onMainRowScroll and onGridRowScroll.
+/// Shared between onGridRowScroll's external-window and pending-capture paths.
 /// Swaps RowVerts structs to follow scroll direction. Moved rows keep their
 /// existing VB data (origin_row tracks where vertices were generated; the draw
 /// path applies viewport Y translation). Only vacated rows are invalidated.
@@ -281,7 +281,7 @@ fn swapAndShiftRows(
         while (dst + shift < end_idx) : (dst += 1) {
             const src = dst + shift;
             std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
-            // No shiftVertsY or gen increment — VB is reused via viewport Y offset.
+            // No vertex Y shift or gen increment — VB is reused via viewport Y offset.
             if (row_valid) |rv| {
                 if (src < rv.bit_length and rv.isSet(src)) {
                     rv.set(dst);
@@ -304,7 +304,7 @@ fn swapAndShiftRows(
             dst -= 1;
             const src = dst - shift;
             std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
-            // No shiftVertsY or gen increment — VB is reused via viewport Y offset.
+            // No vertex Y shift or gen increment — VB is reused via viewport Y offset.
             if (row_valid) |rv| {
                 if (src < rv.bit_length and rv.isSet(src)) {
                     rv.set(dst);
@@ -632,7 +632,7 @@ pub fn onVerticesPartial(
             app.surface.row_mode = false;
             row_mode = false;
         }
-        // Note: We don't set content_rows_dirty here.
+        // Note: We don't mark the content rows dirty here.
         // For non-row-mode, full repaints are triggered anyway.
         // For row-mode, WM_PAINT determines if it's cursor-only.
 
@@ -1497,7 +1497,7 @@ pub fn onVerticesRow(
         }
     }
 
-    // Note: We don't set content_rows_dirty here anymore.
+    // Note: We don't mark the content rows dirty here anymore.
     // The WM_PAINT handler will determine if it's cursor-only by checking
     // if all dirty rows are covered by cursor rects from paint_rects_snapshot.
 
@@ -1631,7 +1631,7 @@ pub fn onVerticesRow(
 }
 
 /// Shift row vertex buffers for external grid scroll.
-/// Same row-swap + Y-shift logic as onMainRowScroll, but operates on
+/// Uses swapAndShiftRows' row-swap + Y-shift logic, but operates on
 /// ext_win.surface.row_verts and has no row_valid/dirty_rows tracking.
 pub fn onGridRowScroll(
     ctx: ?*anyopaque,
@@ -1785,12 +1785,12 @@ pub fn onGridRowScroll(
 
     // Reserve EVERY storage this scroll needs (external surface row
     // storage, TBS write-set row storage, TBS dirty bitmap size) BEFORE any
-    // mutation below — same reserve-before-mutate rationale as
-    // onMainRowScroll above: swapAndShiftRows physically shifts
-    // ext_win.surface's row data in place, and aborting AFTER that shift
-    // (if a later TBS-side reservation failed) would leave it shifted
-    // while the core retries the same scroll delta, causing a second,
-    // corrupting shift on already-shifted data.
+    // mutation below — reserve-before-mutate is mandatory here:
+    // swapAndShiftRows physically shifts ext_win.surface's row data in
+    // place, and aborting AFTER that shift (if a later TBS-side
+    // reservation failed) would leave it shifted while the core retries
+    // the same scroll delta, causing a second, corrupting shift on
+    // already-shifted data.
     const last_row: u32 = row_end - 1;
     const ws_needs_reserve = ext_win.tbs.is_in_flush and ext_win.tbs.writeSet().row_mode;
     if (ws_needs_reserve) {
@@ -1812,8 +1812,8 @@ pub fn onGridRowScroll(
     const ws_ok = !ws_needs_reserve or
         (last_row < ext_win.tbs.writeSet().row_map.items.len and ext_win.tbs.sparse_sync.isReady(total_rows));
     if (!surface_ok or !ws_ok) {
-        // Row storage OOM (surface and/or TBS side): same rationale as
-        // onMainRowScroll's identical check above — without an abort,
+        // Row storage OOM (surface and/or TBS side): same rationale as the
+        // reserve-before-mutate abort above — without an abort,
         // non-vacated rows are never shifted while the core's row indexing
         // has already moved on.
         core.zonvie_core_force_resend_locked(app.corep);
@@ -1860,7 +1860,7 @@ pub fn onGridRowScroll(
                     return;
                 }
             }
-            // Mark only vacated rows dirty (same as onMainRowScroll).
+            // Mark only vacated rows dirty (same as swapAndShiftRows above).
             // back_tex is persistent, so non-vacated rows retain correct content.
             if (rows_delta > 0) {
                 var sr: u32 = row_end - abs_rows;
@@ -2114,8 +2114,8 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
 
     // Coalesce all per-callback dirty state into a single InvalidateRect per
     // window.  Individual vertex callbacks (onVerticesRow, onVerticesPartial,
-    // onMainRowScroll, onGridRowScroll) no longer call InvalidateRect directly;
-    // they only accumulate dirty state (dirty_rows, paint_full, needs_redraw,
+    // onGridRowScroll) no longer call InvalidateRect directly; they only
+    // accumulate dirty state (dirty_rows, paint_full, needs_redraw,
     // flush_needs_invalidate).  This prevents mid-flush WM_PAINT from drawing
     // incomplete frames, and skips InvalidateRect entirely for flushes that
     // carry no visual changes (e.g. msg_showcmd-only flushes).

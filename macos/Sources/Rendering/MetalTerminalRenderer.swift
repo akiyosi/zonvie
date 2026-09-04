@@ -5633,8 +5633,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     /// Retain the outgoing row of a grid the row-scroll fast path cannot
     /// cover. A non-full-width window (vertical split, float) always fails
-    /// checkScrollFastPath with partial_width, so applyMainRowScrollRaw — and
-    /// with it captureRetainedScrollRow — never runs for it: its outgoing row
+    /// that path on partial width, so applyMainRowScrollRaw — and with it
+    /// captureRetainedScrollRow — never runs for it: its outgoing row
     /// is recomposed away within the flush, and the vacated band falls back
     /// to the edge-row background stretch, which paints the neighbouring
     /// row's highlight across the band. Full-width grids are armed too — the
@@ -5794,19 +5794,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return seeds
     }
 
-    /// Core on_main_row_scroll callback — shift row slot mappings for scroll fast path.
-    /// Windows equivalent: onMainRowScroll (windows/callbacks.zig).
-    /// Called only when core's checkScrollFastPath returns eligible.
+    /// Shift main-surface row slot mappings for the scroll fast path.
+    /// Per-grid rendering removed the core's on_main_row_scroll callback, so
+    /// nothing reaches this any more; a grid's shift now arrives through
+    /// on_grid_row_scroll and lands in applyLayerRowScroll or
+    /// ExternalGridView.applyRowScroll (Windows equivalent: onGridRowScroll
+    /// in windows/callbacks.zig).
     /// When scroll_fast_path_blocked (e.g. touched-row overflow in
-    /// Grid.recordScrollTouchedRow), this is NOT called and both frontends
+    /// Grid.recordScrollTouchedRow), no shift is sent and both frontends
     /// fall back to full dirty-row regeneration via on_vertices_row.
     ///
     /// Returns false only when the CPU-shift fallback (cpuShiftMainRowBuffers)
-    /// failed to allocate storage for a row it needed to preserve — the
-    /// caller (ZonvieCore.swift's on_main_row_scroll registration) must call
-    /// zonvie_core_abort_flush() in that case, matching the pattern already
-    /// used for on_atlas_upload failures, instead of silently committing a
-    /// frame with that row blanked.
+    /// failed to allocate storage for a row it needed to preserve — a caller
+    /// must call zonvie_core_abort_flush() in that case, matching the pattern
+    /// already used for on_atlas_upload failures, instead of silently
+    /// committing a frame with that row blanked.
     @discardableResult
     func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) -> Bool {
         guard isInFlush else {
