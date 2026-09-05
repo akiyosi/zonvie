@@ -643,6 +643,30 @@ pub const Harness = struct {
         h.row_scroll_count = 0;
     }
 
+    // ── Dirty-row readback ─────────────────────────────────────────────
+    //
+    // The dirty set is what a frontend would be asked to repaint. This harness
+    // leaves `on_vertices_row` null, so flush never reaches `clearDirty()` and
+    // the set only accumulates; a scenario therefore clears it itself to make
+    // the rows one gesture dirtied readable.
+
+    /// True when `grid_id` currently has row `row` marked for repaint.
+    pub fn isRowDirty(h: *Harness, grid_id: i64, row: u32) bool {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return false;
+        return buf.isRowDirty(row);
+    }
+
+    /// Drop `grid_id`'s accumulated dirty rows, so what follows can be
+    /// attributed to one gesture. Scroll provenance is left alone.
+    pub fn clearDirtyRows(h: *Harness, grid_id: i64) void {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return;
+        buf.clearDirtyContent();
+    }
+
     // ── Neovim window observation ──────────────────────────────────────
 
     /// Number of positioned, non-external Neovim windows, derived from
@@ -832,6 +856,18 @@ pub const Harness = struct {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.external_grids.contains(grid_id);
+    }
+
+    /// Where an external grid sat on the main surface before it was detached,
+    /// or -1 when it never was. Both paths that composite an anchored float
+    /// into an external grid's rows — `Grid.dirtyCompositedRow` and
+    /// `buildExternalFloatRowIndexWithLimits` — return early on a negative
+    /// `start_row`, so this is what says whether compositing is live at all.
+    pub fn externalGridStartRow(h: *Harness, grid_id: i64) i32 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const info = h.core.grid.external_grids.get(grid_id) orelse return -1;
+        return info.start_row;
     }
 
     /// Snapshot of all external grid ids. Caller owns slice.
