@@ -194,6 +194,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             flushFailed = true
             return
         }
+        // Must run before the remap: it reuses the outgoing row's slot for the
+        // incoming row within this same flush.
+        captureLayerScrollStep(
+            gridId: gridId,
+            sets: sets,
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta
+        )
         remapSurfaceRowSlots(
             bufferSet: sets[writeSetIndex],
             rowStart: rowStart,
@@ -827,23 +836,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// time: Neovim's response can land within a millisecond, before any
     /// frame is drawn, which left every gesture's first row uncaptured.
     private var gridScrollCaptureBounds: [Int64: (top: Int, bottomEx: Int)] = [:]
-    /// Grids this bracket has already retained rows for, so the row-scroll fast
-    /// path does not stage the same movement a second time. Reset in
-    /// beginFlush. Written and read only inside the flush bracket, which is
-    /// wholly on the core thread, so it carries no lock of its own.
-    private var bracketStagedGrids: Set<Int64> = []
-    /// Scratch for draining ScrollRetention's eviction record; reused so the
-    /// drain allocates nothing.
-    private var evictedGridsScratch: [Int64] = []
-
-    /// A grid whose rows the retention's cap dropped no longer counts as
-    /// staged, so the row-scroll fast path may cover it after all.
-    private func forgetEvictedStagedGrids() {
-        evictedGridsScratch.removeAll(keepingCapacity: true)
-        retention.takeEvictedGrids(into: &evictedGridsScratch)
-        for grid in evictedGridsScratch { bracketStagedGrids.remove(grid) }
-    }
-
     /// grid_scroll steps captured by a bracket that has not committed yet.
     /// Cleared by commitFlush; replayed by beginFlush when a bracket aborted
     /// instead. Guarded by `lock`.
@@ -859,6 +851,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Per-grid distance the source set is behind the steps staged so far in
     /// this bracket. Reset every beginFlush. Guarded by `lock`.
     private var bracketSourceShift: [Int64: Int] = [:]
+
+    /// Grids that have opened a retention step in this bracket. The
+    /// grid_scroll capture and the row-shift capture can both see the same
+    /// movement — a full-width window is reached by either — and a second
+    /// beginStep would shift the rows the first one staged twice. Reset every
+    /// beginFlush. Guarded by `lock`.
+    private var bracketStagedGrids: Set<Int64> = []
 
     // ScrollOffset struct matching Shaders.metal
     struct ScrollOffset {
@@ -5223,204 +5222,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Ensure row storage arrays in the specified buffer set cover at least `row + 1` entries.
-    private func ensureRowStorageInSet(_ setIdx: Int, _ row: Int) {
-        ensureSurfaceRowStorage(bufferSet: bufferSets[setIdx], row, maxRowBuffers: maxRowBuffers)
-    }
-
-    private func prepareRowModeSetForWrite(_ setIdx: Int, totalRows: Int, totalCols: Int) {
-        prepareSurfaceRowModeSetForWrite(bufferSet: bufferSets[setIdx], totalRows: totalRows, totalCols: totalCols)
-    }
-
-    private func ensureRowBufferInSet(_ setIdx: Int, row: Int, vertexCount: Int) -> MTLBuffer? {
-        if setIdx == writeSetIndex {
-            precondition(isInFlush, "write-set row buffer allocation is only valid during an active flush")
-        }
-        // Synchronous allocation restored (was allowAllocation: false): the
-        // async row-capacity-provisioning detour (417c825) raced its own
-        // requirement snapshot against the row-to-slot remap that a fast,
-        // continuous scroll performs every flush — each retry's provisioned
-        // sizing was already stale by the time grid_mu was reacquired,
-        // which made recovery not converge under sustained scroll (observed:
-        // multi-second display freezes). A same-thread MTLBuffer allocation
-        // here is a small, bounded shared-storage-mode buffer (a handful of
-        // KB), not the atlas texture the no-per-frame-allocation rule in
-        // CLAUDE.md targets; the surfaceMaxProvisionedRow* budget checks
-        // still gate genuinely pathological growth via requirePreparedRowCapacity
-        // below on real allocation failure.
-        return ensureSurfaceRowBuffer(
-            bufferSet: bufferSets[setIdx],
-            sourceSet: bufferSets[flushSourceSetIndex],
-            device: device,
-            row: row,
-            vertexCount: vertexCount,
-            maxRowBuffers: maxRowBuffers,
-            inflightRowBuffers: (inflightRowBuffer(atSlot: row), nil)
-        )
-    }
-
-    private func canUseGpuMainRowScrollCopy() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return hasPresentedOnce && backBuffer != nil
-    }
-
-    /// Shift row slot indices for scroll region. Windows equivalent: remapRowSlots (windows/callbacks.zig).
-    /// Vacated rows retain old slot references (COW safety); on_vertices_row replaces them later.
-    private func remapMainRowSlots(
-        setIdx: Int,
-        rowStart: Int,
-        rowEnd: Int,
-        rowsDelta: Int,
-        totalRows: Int,
-        totalCols: Int
-    ) {
-        remapSurfaceRowSlots(
-            bufferSet: bufferSets[setIdx],
-            rowStart: rowStart,
-            rowEnd: rowEnd,
-            rowsDelta: rowsDelta,
-            totalRows: totalRows,
-            totalCols: totalCols,
-            maxRowBuffers: maxRowBuffers
-        )
-    }
-
-    /// Returns false if a row buffer allocation failed while shifting an
-    /// otherwise-non-empty row (srcCount > 0) — the caller must propagate
-    /// this to zonvie_core_abort_flush() rather than silently committing a
-    /// frame with that row blanked (count set to 0 below): the core only
-    /// expects the vacated band to be empty and assumes every other shifted
-    /// row still shows its real content, so silently dropping one is a
-    /// content-loss bug, not a safe degradation, the same class of issue
-    /// GlyphAtlas.uploadRegion's failure path exists to avoid.
-    @discardableResult
-    private func cpuShiftMainRowBuffers(
-        setIdx: Int,
-        rowStart: Int,
-        rowEnd: Int,
-        rowsDelta: Int,
-        totalRows: Int,
-        totalCols: Int
-    ) -> Bool {
-        prepareRowModeSetForWrite(setIdx, totalRows: totalRows, totalCols: totalCols)
-        remapMainRowSlots(setIdx: setIdx, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols)
-
-        let regionHeight = rowEnd - rowStart
-        let shift = abs(rowsDelta)
-        guard shift > 0, shift < regionHeight else { return true }
-        var didFail = false
-
-        let drawableH: Float = {
-            lock.lock()
-            let h = committedDrawableH
-            lock.unlock()
-            return h > 0 ? Float(h) : Float(max(1, totalRows)) * max(1.0, cellHeightPx)
-        }()
-        // Pixels, y down: a positive grid_scroll moves content up.
-        let deltaY = -Float(rowsDelta) * cellHeightPx
-
-        let srcSet = bufferSets[flushSourceSetIndex]
-        for row in rowStart..<rowEnd {
-            if row >= maxRowBuffers { break }
-            ensureRowStorageInSet(setIdx, row)
-        }
-
-        if rowsDelta > 0 {
-            for dstRow in rowStart..<(rowEnd - shift) {
-                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
-                                        srcRow: dstRow + shift, deltaY: deltaY, totalRows: totalRows) {
-                    didFail = true
-                }
-            }
-            clearVacatedMainRows(setIdx: setIdx, rows: (rowEnd - shift)..<rowEnd)
-        } else {
-            for dstRow in stride(from: rowEnd - 1, through: rowStart + shift, by: -1) {
-                if !copyScrolledMainRow(setIdx: setIdx, srcSet: srcSet, dstRow: dstRow,
-                                        srcRow: dstRow - shift, deltaY: deltaY, totalRows: totalRows) {
-                    didFail = true
-                }
-            }
-            clearVacatedMainRows(setIdx: setIdx, rows: rowStart..<(rowStart + shift))
-        }
-
-        markDirtyRows(rowStart: rowStart, rowCount: rowEnd - rowStart)
-        return !didFail
-    }
-
-    /// Copy one logical row from the flush source set into the write set,
-    /// shifting its vertices by `deltaY`. The two arms of
-    /// cpuShiftMainRowBuffers were mirror images of this; they now differ only
-    /// in how srcRow is derived and in which direction they iterate.
-    ///
-    /// Returns false only when a row with real content could not be given a
-    /// destination buffer -- see cpuShiftMainRowBuffers' doc comment. A source
-    /// row that is out of range or empty leaves the destination row empty and
-    /// still returns true.
-    ///
-    /// The upward arm never produced a negative srcRow, so its bounds check
-    /// omitted the lower half; checking both here is a superset and changes
-    /// nothing for either caller.
-    private func copyScrolledMainRow(
-        setIdx: Int,
-        srcSet: SurfaceBufferSet,
-        dstRow: Int,
-        srcRow: Int,
-        deltaY: Float,
-        totalRows: Int
-    ) -> Bool {
-        let dstSlot = bufferSets[setIdx].rowLogicalToSlot[dstRow]
-        guard srcRow >= 0, srcRow < srcSet.rowLogicalToSlot.count else {
-            bufferSets[setIdx].rowState.counts[dstSlot] = 0
-            return true
-        }
-        let srcSlot = srcSet.rowLogicalToSlot[srcRow]
-        guard srcSlot >= 0, srcSlot < srcSet.rowState.counts.count else {
-            bufferSets[setIdx].rowState.counts[dstSlot] = 0
-            return true
-        }
-        let srcCount = srcSet.rowState.counts[srcSlot]
-        guard srcCount > 0, srcSlot < srcSet.rowState.buffers.count, let srcBuffer = srcSet.rowState.buffers[srcSlot] else {
-            bufferSets[setIdx].rowState.counts[dstSlot] = 0
-            return true
-        }
-        guard let dstBuffer = ensureRowBufferInSet(setIdx, row: dstSlot, vertexCount: srcCount) else {
-            // Allocation failure with real content to preserve
-            // (srcCount > 0, checked above) — not a safe row-empty
-            // case, see cpuShiftMainRowBuffers' doc comment.
-            bufferSets[setIdx].rowState.counts[dstSlot] = 0
-            _ = requirePreparedRowCapacity(
-                row: dstSlot,
-                vertexCount: srcCount,
-                totalRows: totalRows,
-                rowIsPhysical: true
-            )
-            return false
-        }
-        let byteCount = srcCount * MemoryLayout<Vertex>.stride
-        memcpy(dstBuffer.contents(), srcBuffer.contents(), byteCount)
-        let verts = dstBuffer.contents().bindMemory(to: Vertex.self, capacity: srcCount)
-        for i in 0..<srcCount {
-            verts[i].position.y += deltaY
-        }
-        bufferSets[setIdx].rowState.counts[dstSlot] = srcCount
-        bufferSets[setIdx].rowSlotSourceRows[dstSlot] = dstRow
-        return true
-    }
-
-    /// Empty the rows the scroll vacated, so nothing of the pre-scroll frame
-    /// survives in them.
-    private func clearVacatedMainRows(setIdx: Int, rows: Range<Int>) {
-        for vacatedRow in rows {
-            let slot = bufferSets[setIdx].rowLogicalToSlot[vacatedRow]
-            ensureRowStorageInSet(setIdx, slot)
-            bufferSets[setIdx].rowState.counts[slot] = 0
-            bufferSets[setIdx].rowSlotSourceRows[slot] = vacatedRow
-        }
-    }
-
-
-
     private func encodePendingMainRowScrollCopy(
         commandBuffer: MTLCommandBuffer,
         backTexture: MTLTexture,
@@ -5497,129 +5298,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Copy the row that is about to leave the scroll region into the
-    /// retention ring, and stage the matching ease seed. Called from inside
-    /// the flush bracket, before the row slots are rotated: by draw time the
-    /// outgoing row's slot holds the incoming row instead.
-    ///
-    /// Staged, not published — commitFlush hands both to draw() at the same
-    /// time as the scrolled vertices.
-    private func captureRetainedScrollRow(rowStart: Int, rowEnd: Int, rowsDelta: Int) {
-        guard Self.smoothScrollEnabled else { return }
-        let ws = bufferSets[writeSetIndex]
-        guard ws.rowState.usingRowBuffers else { return }
-        let depth = retention.depthRows
-        // A step is one row for a held key, but 'mousescroll' rows for a
-        // trackpad gesture — a full-width window takes this path for both, and
-        // retaining only the first of them left the rest of the band to the
-        // edge stretch.
-        guard let plan = ScrollRetention.plan(
-            rowStart: rowStart,
-            rowEnd: rowEnd,
-            rowsDelta: rowsDelta,
-            depth: depth
-        ) else { return }
-
-        // Read before locking: the accessor takes `lock` itself, which is not
-        // recursive.
-        let capturedCellHeightPx = cellHeightPx
-        var stepGridId: Int64?
-        var alreadyRetained = false
-        for i in 0..<plan.count {
-            let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-            guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { continue }
-            let slot = ws.rowLogicalToSlot[outgoingRow]
-            guard slot >= 0, slot < ws.rowState.counts.count, slot < ws.rowState.buffers.count else { continue }
-            let vc = ws.rowState.counts[slot]
-            guard vc > 0, let srcBuf = ws.rowState.buffers[slot] else { continue }
-            // Where these vertices actually sit. The GPU scroll-copy path never
-            // rewrites vertex positions — it remaps slots and lets draw() fix the
-            // position through rowSlotSourceRows — so under a continuous scroll
-            // this drifts one row per step away from the logical row.
-            let sourceRow = slot < ws.rowSlotSourceRows.count ? ws.rowSlotSourceRows[slot] : outgoingRow
-
-            // The composite carries every grid's vertices. A row that mixes
-            // grids (a float overlapping the scrolled window) cannot be
-            // translated as a unit — the shader would move the float's cells
-            // with the buffer — so leave that row to the edge stretch rather
-            // than abandoning the whole step.
-            let src = srcBuf.contents().bindMemory(to: Vertex.self, capacity: vc)
-            let gid = src[0].grid_id
-            var mixed = false
-            for j in 1..<vc where src[j].grid_id != gid {
-                mixed = true
-                break
-            }
-            if mixed { continue }
-            if let stepGridId, gid != stepGridId { continue }
-            if stepGridId == nil {
-                // The grid_scroll notification is dispatched earlier in this
-                // bracket and may already have retained this grid's movement,
-                // read from the source set before any of this flush's writes.
-                // Staging it again would open a second step and shift the
-                // seeded rows twice. Per grid, not per bracket: two windows can
-                // scroll in one flush, and a blanket check would leave the
-                // second one's band empty.
-                //
-                // Standing down means not staging — it must not mean leaving
-                // the function, because the ease seed below is this path's
-                // alone: the grid_scroll capture deliberately stages none. A
-                // `return` here cost a held key its sub-row ease on every step
-                // where the previous step's offset had not yet decayed, which
-                // reads as judder rather than a clean loss.
-                forgetEvictedStagedGrids()
-                alreadyRetained = bracketStagedGrids.contains(gid)
-                if !alreadyRetained {
-                    retention.beginStep(gridId: gid, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
-                }
-                stepGridId = gid
-            }
-            if alreadyRetained { continue }
-
-            // Content cells only, same invariant as the grid_scroll capture
-            // (see copyRetainedScrollableRow). The rows this path can reach
-            // today — full-width, single-grid, no float anchored — happen to
-            // hold only scrollable cells, but that rests on what Neovim
-            // currently reports, not on a check: win_viewport_margins allows
-            // left/right margins on any window, and a margin column retained
-            // whole would land unshifted and unclipped on the margin rows,
-            // exactly the external-float border bug.
-            guard let copied = copyRetainedScrollableRow(
-                retention: retention,
-                srcBuf: srcBuf,
-                vertexCount: vc,
-                gridId: gid,
-                scrollableMask: ZONVIE_DECO_SCROLLABLE
-            ) else { continue }
-
-            bracketStagedGrids.insert(gid)
-            retention.stage(RetainedScrollRow(
-                buffer: copied.buffer,
-                count: copied.count,
-                gridId: gid,
-                // Its place once this scroll is applied: just outside the
-                // region edge it left through.
-                sourceRow: sourceRow,
-                targetRow: outgoingRow - rowsDelta,
-                cellHeightPx: capturedCellHeightPx
-            ))
-        }
-        // Seed the keyboard ease only for the single-row steps a held key
-        // produces. A larger jump — page motion, a shift from a resize — keeps
-        // the pre-existing behaviour of landing where it lands: seeding it
-        // would displace the picture by the whole jump and ease back only the
-        // few rows the clamp allows, animating a motion that never was
-        // animated. The multi-row RETENTION above still runs, because a
-        // trackpad step is routinely several rows; a gesture's seed is dropped
-        // by tickSmoothScroll anyway (the gesture reconciles its own offset),
-        // so this gate costs it nothing.
-        if let stepGridId, abs(rowsDelta) == 1 {
-            lock.lock()
-            stagedSmoothScrollSeeds.append((gridId: stepGridId, rowsDelta: rowsDelta))
-            lock.unlock()
-        }
-    }
-
     /// Raise the retention to cover a band this many rows wide. Set from the
     /// scroll input path, where a wheel event's row count is known.
     func setRetentionDepthRows(_ rows: Int) {
@@ -5647,10 +5325,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// before row recomposition, so the flush's source set still holds the
     /// on-screen content. Only the grid's own DECO_SCROLLABLE vertices are
     /// copied: composite rows mix the grid with its backdrop, and its
-    /// border/margin cells must not ease. No ease seed is staged — the
+    /// border/margin cells must not ease. No ease seed is staged here — the
     /// trackpad gesture owns the offset it reconciles against (a seed would
-    /// pay the row twice), and a keyboard scroll on such a grid never
-    /// displaces it, so its retained row is pruned unused.
+    /// pay the row twice). captureLayerScrollStep stages the seed for the
+    /// steps that need one, and stands down from staging rows for a grid this
+    /// path has already claimed through `bracketStagedGrids`.
     func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int) {
         captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta, replaying: false)
     }
@@ -5722,6 +5401,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+        // Claim the step so the row-shift capture stands down for this grid.
+        lock.lock()
+        bracketStagedGrids.insert(gridId)
+        lock.unlock()
 
         for i in 0..<plan.count {
             let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
@@ -5768,7 +5451,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             scrollableMask: ZONVIE_DECO_SCROLLABLE
         ) else { return }
 
-        bracketStagedGrids.insert(gridId)
         retention.stage(RetainedScrollRow(
             buffer: copied.buffer,
             count: copied.count,
@@ -5779,6 +5461,75 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         ))
     }
 
+
+    /// Retain the rows a layer's shift takes out of view, and stage the ease
+    /// seed for it. The per-grid successor to the row-scroll fast path's
+    /// capture: the core hands the scrolled region over here, so a keyboard
+    /// scroll is covered without the gesture-armed spans
+    /// captureRetainedRowForGridScroll depends on — nothing arms those until
+    /// the first trackpad gesture, and a held key never sends one.
+    ///
+    /// The seed is staged for every single-row step, gesture or not, and the
+    /// view decides whether to spend it: tickSmoothScroll drops a seed for a
+    /// grid a gesture owns, because that gesture already holds compensation of
+    /// its own and paying both would displace the picture twice. Gating it
+    /// here instead would need the gesture state the main thread owns, and
+    /// would drop the held-key seed on exactly the steps that need it: the
+    /// grid_scroll capture claims the step whenever the previous step's offset
+    /// has not decayed yet, which reads as judder rather than a clean loss.
+    ///
+    /// A larger jump — page motion, a resize — is not seeded: it would displace
+    /// the picture by the whole jump and ease back only the rows the retention
+    /// can cover, animating a motion that was never animated. The rows are
+    /// still retained for it, and updateScrollOffsets prunes them unused.
+    private func captureLayerScrollStep(
+        gridId: Int64,
+        sets: [SurfaceBufferSet],
+        rowStart: Int,
+        rowEnd: Int,
+        rowsDelta: Int
+    ) {
+        guard Self.smoothScrollEnabled else { return }
+        lock.lock()
+        // The grid_scroll notification is dispatched earlier in this bracket
+        // and may already have opened a step for this grid. Opening a second
+        // one would shift the rows it staged twice. Standing down means not
+        // staging — it must not mean leaving the function, because the seed
+        // below is this path's alone: the grid_scroll capture deliberately
+        // stages none.
+        var stepped = bracketStagedGrids.contains(gridId)
+        lock.unlock()
+
+        let cs = sets[flushSourceSetIndex]
+        if !stepped, cs.rowState.usingRowBuffers,
+           let plan = ScrollRetention.plan(
+               rowStart: rowStart,
+               rowEnd: rowEnd,
+               rowsDelta: rowsDelta,
+               depth: retention.depthRows
+           ) {
+            retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+            lock.lock()
+            bracketStagedGrids.insert(gridId)
+            lock.unlock()
+            for i in 0..<plan.count {
+                let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+                captureOneRetainedRow(cs: cs, gridId: gridId, readRow: row, targetRow: row - rowsDelta)
+            }
+            stepped = true
+        }
+        // commitFlush publishes the seeds only when a step was staged, so a
+        // step that could not be opened would have its seed dropped there.
+        guard stepped, abs(rowsDelta) == 1 else { return }
+        lock.lock()
+        stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
+        lock.unlock()
+        if ZonvieCore.appLogEnabled {
+            ZonvieCore.appLog(
+                "[smooth_scroll_seed] gridId=\(gridId) rowsDelta=\(rowsDelta)"
+            )
+        }
+    }
 
     /// Drain the ease seeds committed since the last call. The view converts
     /// them into a pixel offset and decays it; the renderer only records which
@@ -5792,91 +5543,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let seeds = smoothScrollSeeds
         smoothScrollSeeds.removeAll(keepingCapacity: true)
         return seeds
-    }
-
-    /// Shift main-surface row slot mappings for the scroll fast path.
-    /// Per-grid rendering removed the core's on_main_row_scroll callback, so
-    /// nothing reaches this any more; a grid's shift now arrives through
-    /// on_grid_row_scroll and lands in applyLayerRowScroll or
-    /// ExternalGridView.applyRowScroll (Windows equivalent: onGridRowScroll
-    /// in windows/callbacks.zig).
-    /// When scroll_fast_path_blocked (e.g. touched-row overflow in
-    /// Grid.recordScrollTouchedRow), no shift is sent and both frontends
-    /// fall back to full dirty-row regeneration via on_vertices_row.
-    ///
-    /// Returns false only when the CPU-shift fallback (cpuShiftMainRowBuffers)
-    /// failed to allocate storage for a row it needed to preserve — a caller
-    /// must call zonvie_core_abort_flush() in that case, matching the pattern
-    /// already used for on_atlas_upload failures, instead of silently
-    /// committing a frame with that row blanked.
-    @discardableResult
-    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) -> Bool {
-        guard isInFlush else {
-            ZonvieCore.appLog("[WARNING] applySurfaceRowScrollRaw called outside flush bracket")
-            return true
-        }
-        guard rowsDelta != 0 else { return true }
-        if FrameTracer.enabled {
-            let geom = UInt64(UInt32(bitPattern: Int32(colStart)))
-                | (UInt64(UInt32(bitPattern: Int32(colEnd))) << 16)
-                | (UInt64(UInt32(bitPattern: Int32(totalCols))) << 32)
-            if !(rowStart >= 0 && rowEnd > rowStart) {
-                FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (4 << 8), b: geom)
-            } else if !(colStart == 0 && colEnd == totalCols) {
-                FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (3 << 8), b: geom)
-            }
-        }
-        guard rowStart >= 0, rowEnd > rowStart else { return true }
-        guard colStart == 0, colEnd == totalCols else { return true }
-        // No capacity pre-check here (was requirePreparedRowCapacity with
-        // vertexCount: 0, added by 417c825): this call only grows the
-        // logical row-state arrays (rowState.buffers/capacities/counts,
-        // rowLogicalToSlot, etc.) to totalRows, a plain Array append with no
-        // MTLBuffer allocation. remapMainRowSlots and cpuShiftMainRowBuffers
-        // below already perform that growth synchronously via
-        // ensureRowStorageInSet — routing it through the async row-capacity
-        // detour was redundant and (per submitVerticesRowRaw's identical
-        // pattern) prone to not converging under sustained scroll.
-        guard prepareMainWriteState() else { return false }
-        flushHasStructuralMainChange = true
-
-        // Must run before either branch below: both reuse the outgoing row's
-        // slot for the incoming row within this same flush.
-        captureRetainedScrollRow(rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta)
-
-        let s = writeSetIndex
-        if canUseGpuMainRowScrollCopy() {
-            remapMainRowSlots(setIdx: s, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols)
-            bufferSets[s].pendingScroll = SurfaceRowScroll(
-                rowStart: rowStart,
-                rowEnd: rowEnd,
-                colStart: colStart,
-                colEnd: colEnd,
-                rowsDelta: rowsDelta,
-                totalRows: totalRows,
-                totalCols: totalCols
-            )
-            // pendingScrollAccum is accumulated in commitFlush() (not here)
-            // to ensure draw() never sees a delta ahead of committed vertex data.
-            FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (1 << 8))
-            return true
-        } else {
-            FrameTracer.trace(.mainRowScrollPath, a: UInt64(abs(rowsDelta)) | (2 << 8))
-            bufferSets[s].pendingScroll = nil
-            let ok = cpuShiftMainRowBuffers(
-                setIdx: s,
-                rowStart: rowStart,
-                rowEnd: rowEnd,
-                rowsDelta: rowsDelta,
-                totalRows: totalRows,
-                totalCols: totalCols
-            )
-            // CPU path: clear accumulated scroll since backbuffer was fully updated
-            lock.lock()
-            pendingScrollAccum = nil
-            lock.unlock()
-            return ok
-        }
     }
 
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0, totalCols: Int = 0) {

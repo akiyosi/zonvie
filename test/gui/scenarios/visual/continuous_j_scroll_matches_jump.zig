@@ -129,6 +129,23 @@ fn runPhase(
             std.debug.print("[gui] the burst did not coalesce into a multi-row shift\n", .{});
             return error.ScrollHintNotCoalesced;
         }
+    } else {
+        // A held key's single-row steps must also seed the smooth-scroll ease,
+        // or each row lands as a jump instead of easing in. The seed is staged
+        // only for |rowsDelta| == 1, so it belongs to this phase alone — the
+        // burst coalesces past it by design. Only one is required: the shift
+        // count above already tolerates hints this scenario cannot pin down to
+        // one row, and the failure this guards is the producer being
+        // disconnected, which yields zero.
+        const seeds = try app_log.countLinesSince(alloc, log_path, "[smooth_scroll_seed]", t_scroll);
+        std.debug.print(
+            "[gui] continuous_j_scroll_matches_jump[single]: ease seeds staged {d} (need 1)\n",
+            .{seeds},
+        );
+        if (seeds == 0) {
+            std.debug.print("[gui] no smooth-scroll ease seed was staged for a one-row step\n", .{});
+            return error.SmoothScrollSeedMissing;
+        }
     }
 
     const topline_after = try g.evalInt("line('w0')");
