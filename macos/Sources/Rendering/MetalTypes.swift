@@ -2316,6 +2316,8 @@ func copySurfaceBufferSetRowState(from src: SurfaceBufferSet, to dst: SurfaceBuf
             includeActiveBuffers: false
         )
     }
+    // The correct reset for a set two rotations old, so callers must stage a
+    // new shift only AFTER the prepare that runs this copy.
     dst.pendingScroll = nil
 }
 

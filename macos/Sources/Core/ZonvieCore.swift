@@ -1222,6 +1222,7 @@ final class ZonvieCore {
                     core.terminalView?.renderer?.applyLayerRowScroll(
                         gridId: gid,
                         rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        colStart: Int(colStart), colEnd: Int(colEnd),
                         rowsDelta: Int(rowsDelta),
                         totalRows: Int(totalRows), totalCols: Int(totalCols)
                     )
@@ -1652,6 +1653,16 @@ final class ZonvieCore {
 
             // Performance / IME / blur knobs identical to spawn path; the
             // core only needs them set before the run-thread starts.
+            //
+            // This must stay unconditionally true, independently of
+            // `config.window.blur`. The core gates its default-background run
+            // on `main_has_layers and blur_enabled` (flush.zig), so telling it
+            // blur is on is what stops grid 1 emitting a full-width background
+            // under every layer. The renderer's per-layer dirty gating relies
+            // on that: a root row that painted its own background would cover
+            // the layers drawn over it, and the gated layer loop does not
+            // repaint a layer just because a root row beneath it was dirty.
+            // See the layer draw loop in MetalTerminalRenderer.swift.
             setBlurEnabled(true)
             setInheritCwd(noforkMode)
             let perfConfig = config.performance
@@ -1798,7 +1809,14 @@ final class ZonvieCore {
             ZonvieCore.appLog("[start] Added nvim extra args: \(nvimExtraArgs)")
         }
 
-        // Enable blur transparency for macOS (always enabled for blur effect)
+        // Enable blur transparency for macOS (always enabled for blur effect).
+        //
+        // Unconditional on purpose, independently of `config.window.blur`: the
+        // core gates its default-background run on `main_has_layers and
+        // blur_enabled` (flush.zig), so this is what stops grid 1 emitting a
+        // full-width background under every layer. The renderer's per-layer
+        // dirty gating relies on that -- see the layer draw loop in
+        // MetalTerminalRenderer.swift.
         setBlurEnabled(true)
 
         // Inherit CWD from parent when --nofork mode is active
@@ -6774,6 +6792,7 @@ final class ZonvieCore {
     private func onGridDestroy(gridId: Int64) {
         guard gridId != 1 else { return }
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
+        terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
         externalGridViewsLock.lock()
         let isOwnSurface = externalGridViews[gridId] != nil
         let hosts = isOwnSurface ? [] : Array(externalGridViews.values)
