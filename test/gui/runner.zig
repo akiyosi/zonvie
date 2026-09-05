@@ -298,6 +298,16 @@ test "gui:visual_scroll_then_cursor_move" {
     }
 }
 
+test "gui:visual_scrolled_layer_row_gating" {
+    // macOS only: reads the macOS frontend's per-layer [layer_draw] line.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/scrolled_layer_row_gating.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_proportional_font_support" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
