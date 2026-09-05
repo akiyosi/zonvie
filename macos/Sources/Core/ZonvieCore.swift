@@ -1658,11 +1658,16 @@ final class ZonvieCore {
             // `config.window.blur`. The core gates its default-background run
             // on `main_has_layers and blur_enabled` (flush.zig), so telling it
             // blur is on is what stops grid 1 emitting a full-width background
-            // under every layer. The renderer's per-layer dirty gating relies
-            // on that: a root row that painted its own background would cover
-            // the layers drawn over it, and the gated layer loop does not
-            // repaint a layer just because a root row beneath it was dirty.
-            // See the layer draw loop in MetalTerminalRenderer.swift.
+            // under every layer.
+            //
+            // The renderer compensates for the consequence: with no background
+            // under them, grid 1's own glyphs cannot erase themselves, so a
+            // dirty root row is banded before it is drawn and the layer rows
+            // that band crosses are marked dirty. Note the two flags are
+            // separate -- `config.window.blur` drives the renderer's own
+            // pipelines and alphas, and can be off while this stays on. See
+            // the root band and the layer draw loop in
+            // MetalTerminalRenderer.swift.
             setBlurEnabled(true)
             setInheritCwd(noforkMode)
             let perfConfig = config.performance
@@ -1814,9 +1819,12 @@ final class ZonvieCore {
         // Unconditional on purpose, independently of `config.window.blur`: the
         // core gates its default-background run on `main_has_layers and
         // blur_enabled` (flush.zig), so this is what stops grid 1 emitting a
-        // full-width background under every layer. The renderer's per-layer
-        // dirty gating relies on that -- see the layer draw loop in
-        // MetalTerminalRenderer.swift.
+        // full-width background under every layer. The renderer compensates by
+        // banding a dirty root row before drawing it -- without a background
+        // beneath them, grid 1's glyphs cannot erase themselves. The two flags
+        // are separate: `config.window.blur` drives the renderer's pipelines
+        // and alphas and can be off while this stays on. See the root band and
+        // the layer draw loop in MetalTerminalRenderer.swift.
         setBlurEnabled(true)
 
         // Inherit CWD from parent when --nofork mode is active
