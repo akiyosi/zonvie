@@ -177,6 +177,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         gridId: Int64,
         rowStart: Int,
         rowEnd: Int,
+        colStart: Int,
+        colEnd: Int,
         rowsDelta: Int,
         totalRows: Int,
         totalCols: Int
@@ -212,8 +214,61 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             totalCols: totalCols,
             maxRowBuffers: maxRowBuffers
         )
-        // Every row in the shifted region shows different content now.
-        markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: rowEnd - rowStart)
+        let regionRows = rowEnd - rowStart
+        // Stage the shift on the WRITE set, never straight onto the per-grid
+        // accumulator: commitFlush merges it under `lock` after
+        // committedSetIndex is published, so a draw() interleaving with this
+        // bracket can never consume a delta whose vertices are not committed
+        // yet (the same split as ExternalGridView.applyRowScroll).
+        //
+        // This has to run AFTER prepareMainWriteState() returned true above.
+        // That call runs prepareLayerGridsForWrite(), whose
+        // copySurfaceBufferSetRowState resets the destination's pendingScroll —
+        // the correct reset for a set two rotations old, and it would wipe
+        // anything staged before it.
+        let ws = sets[writeSetIndex]
+        if colStart == 0, colEnd == totalCols, regionRows > 0 {
+            if let staged = ws.pendingScroll,
+               staged.rowStart == rowStart,
+               staged.rowEnd == rowEnd {
+                ws.pendingScroll = SurfaceRowScroll(
+                    rowStart: rowStart, rowEnd: rowEnd,
+                    colStart: colStart, colEnd: colEnd,
+                    rowsDelta: clampRowsDelta(staged.rowsDelta &+ rowsDelta),
+                    totalRows: totalRows, totalCols: totalCols
+                )
+            } else {
+                // Region change within one bracket: the older staged shift can
+                // no longer be represented, but its row slots were already
+                // remapped — dirty its rows so they redraw post-remap.
+                if let staged = ws.pendingScroll, staged.rowEnd > staged.rowStart {
+                    markLayerRowsDirty(
+                        gridId: gridId,
+                        rowStart: staged.rowStart,
+                        rowCount: staged.rowEnd - staged.rowStart
+                    )
+                }
+                ws.pendingScroll = SurfaceRowScroll(
+                    rowStart: rowStart, rowEnd: rowEnd,
+                    colStart: colStart, colEnd: colEnd,
+                    rowsDelta: rowsDelta,
+                    totalRows: totalRows, totalCols: totalCols
+                )
+            }
+            // Only the band the shift vacated needs new content; the surviving
+            // rows are carried by the remapped slots. A draw that refuses the
+            // blit dirties the whole region itself.
+            let shiftRows = min(abs(rowsDelta), regionRows)
+            let vacatedStart = rowsDelta > 0 ? rowEnd - shiftRows : rowStart
+            markLayerRowsDirty(gridId: gridId, rowStart: vacatedStart, rowCount: shiftRows)
+        } else {
+            // The core only takes this path on full grid-local width
+            // (gridScrollFastPathRegion in src/core/flush.zig), so a partial
+            // width never arrives; if it ever did, the shift could not be
+            // expressed as one rectangle, so redraw the whole region instead
+            // of staging something the blit would apply too wide.
+            markLayerRowsDirty(gridId: gridId, rowStart: rowStart, rowCount: regionRows)
+        }
         // Once per hint, not per row: the scroll scenarios assert the fast
         // path actually ran, since regenerating everything looks identical on
         // screen and would let them pass with the shift broken.
@@ -224,21 +279,43 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Mark the surface rows a layer's change lands on.
+    /// This grid's draw state, created on first use. Called on the core thread
+    /// when a grid first submits a row or a scroll — grid creation time, the
+    /// same moment GridBufferRegistry allocates its buffer sets, not a
+    /// per-frame path. Must not be called while holding `lock`.
+    private func layerDrawState(gridId: Int64) -> LayerDrawState {
+        lock.lock()
+        defer { lock.unlock() }
+        if let existing = layerDrawStates[gridId] { return existing }
+        let created = LayerDrawState()
+        layerDrawStates[gridId] = created
+        return created
+    }
+
+    /// Drop a destroyed grid's draw state, alongside its buffer sets.
+    func releaseLayerDrawState(gridId: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        layerDrawStates.removeValue(forKey: gridId)
+    }
+
+    /// Mark the rows a layer's change lands on, in that grid's own row space.
     ///
-    /// The draw decides whether a frame has anything to render from the
-    /// surface's dirty rows, and deactivates the continuous draw loop after a
-    /// few frames that have nothing. A layer change leaves the root grid clean,
-    /// so without this the frame is skipped and held-key scrolling drops to
-    /// on-demand redraws.
+    /// The draw decides whether a frame has anything to render, and deactivates
+    /// the continuous draw loop after a few frames that have nothing. A layer
+    /// change leaves the root grid clean, so without this the frame is skipped
+    /// and held-key scrolling drops to on-demand redraws.
+    ///
+    /// The mark no longer depends on the grid being in the layer list. The old
+    /// surface-row form had to find the layer to resolve its pixel origin, and
+    /// silently dropped the mark when the layout placing a newly created grid
+    /// had not been staged yet; per-grid rows have no origin to resolve, so the
+    /// rows are always recorded and the layout decides when they are drawn.
     private func markLayerRowsDirty(gridId: Int64, rowStart: Int, rowCount: Int) {
-        guard rowCount > 0 else { return }
-        let layers = pendingSurfaceLayers ?? committedSurfaceLayers
-        guard let layer = layers.first(where: { $0.gridId == gridId }) else { return }
-        let cellH = max(1, Int(cellHeightPx.rounded(.up)))
-        let base = Int((layer.originPx.y / Float(cellH)).rounded(.down))
-        let first = max(0, base + rowStart)
-        flushDirtyRows.insert(integersIn: first..<(first + rowCount))
+        guard rowCount > 0, rowStart >= 0 else { return }
+        layerDrawState(gridId: gridId).flushDirtyRows
+            .insert(integersIn: rowStart..<(rowStart + rowCount))
+        flushHadLayerWork = true
     }
 
     /// Store one row for a non-root layer. Layers other than the root are
@@ -287,6 +364,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     ]                                                    // Protected by lock
     private var writeSetIndex: Int = 0       // Core thread only
     private var mainWritePrepared = false    // Core thread only
+    /// Whether this bracket dirtied any layer grid's rows. The root grid's own
+    /// dirty marks no longer stand in for layer work, so commitFlush reads this
+    /// to decide whether the commit carried a visual change.
+    private var flushHadLayerWork = false    // Core thread only
     // Valid only while isInFlush == true. Tracks the committed set we are detaching from.
     private var flushSourceSetIndex: Int = 0 // Core thread only
     private var committedSetIndex: Int = 0   // Protected by lock
@@ -581,11 +662,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // the offset hits zero, mirroring ExternalGridView's
     // wasScrollOffsetActiveInLastPresentedFrame. Without this, when
     // processPendingScrollClears reduces offset to exactly 0 in a flush that
-    // also carried a grid_scroll (pendingScroll != nil), the next draw sees
-    // smoothScrolling=false + pendingScroll != nil and enters
-    // useGpuScrollCopy. The GPU blit then shifts the back buffer pixels that
-    // were rendered with a non-zero shader offset, producing a mixed-state
-    // frame visible as a 1-row jitter.
+    // also carried a grid_scroll, the next draw sees smoothScrolling=false
+    // with a pending shift and takes the row-scroll copy. The GPU blit then
+    // shifts the back buffer pixels that were rendered with a non-zero shader
+    // offset, producing a mixed-state frame visible as a 1-row jitter.
     private var lastDrawnHadActiveScrollOffset: Bool = false // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by lock
@@ -968,6 +1048,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// index-aligned, each layer's buffer sets. Reused across frames.
     private var layerSnapshot: [SurfaceLayer] = []
     private var layerSetsSnapshot: [[SurfaceBufferSet]] = []
+    /// Index-aligned with `layerSnapshot` as well: the draw state of the grid
+    /// each layer places, nil for the root grid and for a grid that has not
+    /// submitted anything yet. Reused across frames.
+    private var layerStateSnapshot: [LayerDrawState?] = []
+    /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
+    /// Protected by `lock`; an entry is created when a grid first submits a row
+    /// or a scroll (grid creation time, the same moment GridBufferRegistry
+    /// allocates its buffer sets) and released when the grid is destroyed.
+    private var layerDrawStates: [Int64: LayerDrawState] = [:]
+    /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
+    /// does not allocate.
+    private var commitGridIdScratch: [Int64] = []
     /// Indices into `retainedSnapshot` belonging to the layer being drawn.
     private var retainedIndexScratch: [Int] = []
     // Dirty marks staged during the current flush bracket (guarded by `lock`;
@@ -987,13 +1079,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Written from presented handlers (Metal internal thread) under `lock`;
     /// only touched when logging is enabled, to measure true present cadence.
     private var lastPresentedTime: CFTimeInterval = 0
-
-    // --- Accumulated scroll delta (survives across flushes, consumed by draw) ---
-    // When multiple flushes occur between draws, each commitFlush accumulates
-    // the scroll delta here.  draw() snapshots and resets under lock.
-    // Updated ONLY in commitFlush (not in the callback) so that draw() never
-    // sees a scroll delta that is ahead of the committed vertex data.
-    private var pendingScrollAccum: SurfaceRowScroll? = nil
 
     // --- Persistent back buffer (for correct partial redraw) ---
     private var backBuffer: MTLTexture? = nil
@@ -1196,6 +1281,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             return nil
         }
         self.queue = q
+        // Sized once so a new layer grid's first submit never rehashes the
+        // dictionary while a frame holds references into it.
+        layerDrawStates.reserveCapacity(64)
 
         // Initial font: walk the config's candidate list (parsed from
         // [font] family using guifont syntax) and pick the first family
@@ -1783,6 +1871,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
+        // Drop every layer's staged dirty marks: the core re-dirties the grid
+        // and resends its rows on the retry. The write sets' stale pendingScroll
+        // needs no cleanup here — the next bracket's prepareLayerGridsForWrite
+        // copies fresh row state over each layer set, and that copy resets it.
+        lock.lock()
+        for state in layerDrawStates.values {
+            state.flushDirtyRows.removeAll()
+        }
+        lock.unlock()
+        flushHadLayerWork = false
         mainWritePrepared = false
         cursorWritePrepared = false
         isInFlush = false
@@ -1843,6 +1941,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[ws].knownTotalCols)
         let mainLayoutIsEmpty = didMainWrite
             && (bufferSets[ws].knownTotalRows == 0 || bufferSets[ws].knownTotalCols == 0)
+        // Grid ids for the per-layer merge below, taken before `lock`. The
+        // registry carries its own lock and the established order is
+        // lock -> registryLock; reading the id list here keeps the walk out of
+        // that nesting entirely.
+        gridBuffers.copyGridIds(into: &commitGridIdScratch)
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -1854,6 +1957,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         // Layers and the vertices they place become visible together.
         if let staged = pendingSurfaceLayers {
+            // A layer that is new, or that moved or changed size, cannot reuse
+            // anything the back texture holds for it: its rows are somewhere
+            // else now, and a shift computed for the old rectangle would move
+            // the wrong pixels.
+            for layer in staged where layer.gridId != 1 {
+                guard let state = layerDrawStates[layer.gridId] else { continue }
+                let previous = committedSurfaceLayers.first { $0.gridId == layer.gridId }
+                let unchanged = previous.map {
+                    $0.originPx == layer.originPx && $0.rows == layer.rows && $0.cols == layer.cols
+                } ?? false
+                if !unchanged {
+                    state.needsFullRedraw = true
+                    state.pendingScrollAccum = nil
+                }
+            }
             committedSurfaceLayers = staged
             pendingSurfaceLayers = nil
         }
@@ -1883,47 +2001,61 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             state: &rowStorageRetirement,
             retireMainBuffers: mainLayoutIsEmpty
         )
-        // Accumulate the write set's pendingScroll into the global accumulator.
-        // Done here (under lock, after committedSetIndex update) so draw() never
-        // sees a scroll delta that precedes the matching vertex data.
-        if didMainWrite, let ps = bufferSets[ws].pendingScroll {
-            if let existing = pendingScrollAccum,
-               existing.rowStart == ps.rowStart,
-               existing.rowEnd == ps.rowEnd {
-                pendingScrollAccum = SurfaceRowScroll(
-                    rowStart: ps.rowStart,
-                    rowEnd: ps.rowEnd,
-                    colStart: ps.colStart,
-                    colEnd: ps.colEnd,
-                    // Wrapping add: both operands originate from the core's
-                    // i32 scroll delta, so this can't realistically overflow
-                    // Swift's 64-bit Int, but &+ (matching the core's own
-                    // +%= idiom for the same class of accumulator) avoids a
-                    // hard trap/crash if a corrupted value ever did. Clamp
-                    // the result so a wrapped value can never itself reach
-                    // Int.min/max — downstream code calls abs() on this
-                    // field (e.g. for GPU scroll-copy shift amounts), which
-                    // traps on Int.min. The clamp bound is astronomically
-                    // larger than any real row count, so it never affects
-                    // legitimate scrolling, and a value already within it
-                    // plus another clamped value can never itself overflow.
-                    rowsDelta: clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta),
-                    totalRows: ps.totalRows,
-                    totalCols: ps.totalCols
-                )
-            } else {
-                // Region mismatch: the old accumulator's GPU back-buffer blit
-                // will never be applied, but its row slots were already
-                // remapped at scroll-apply time — the committed vertices are
-                // post-scroll. Dirty the dropped region's rows so draw()
-                // redraws them from those vertices instead of leaving
-                // pre-scroll pixels on the non-vacated rows (two stacked
-                // windows scrolling in consecutive flushes between draws).
-                if let existing = pendingScrollAccum,
-                   existing.rowEnd > existing.rowStart {
-                    pendingDirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
+        // Merge each layer grid's staged shift into its own accumulator and
+        // publish the dirty marks this bracket staged for it. Done here (under
+        // lock, after committedSetIndex was updated) so draw() never sees a
+        // scroll delta that precedes the matching vertex data, and so a draw
+        // that interleaved with the flush and already consumed the grid's
+        // pendingDirtyRows gets those rows back.
+        for gridId in commitGridIdScratch where gridId != 1 {
+            guard let state = layerDrawStates[gridId] else { continue }
+            if didMainWrite,
+               let sets = gridBuffers.existingSets(for: gridId),
+               let ps = sets[ws].pendingScroll {
+                if let existing = state.pendingScrollAccum,
+                   existing.rowStart == ps.rowStart,
+                   existing.rowEnd == ps.rowEnd {
+                    state.pendingScrollAccum = SurfaceRowScroll(
+                        rowStart: ps.rowStart,
+                        rowEnd: ps.rowEnd,
+                        colStart: ps.colStart,
+                        colEnd: ps.colEnd,
+                        // Wrapping add: both operands originate from the core's
+                        // i32 scroll delta, so this can't realistically overflow
+                        // Swift's 64-bit Int, but &+ (matching the core's own
+                        // +%= idiom for the same class of accumulator) avoids a
+                        // hard trap/crash if a corrupted value ever did. Clamp
+                        // the result so a wrapped value can never itself reach
+                        // Int.min/max — downstream code calls abs() on this
+                        // field (e.g. for GPU scroll-copy shift amounts), which
+                        // traps on Int.min. The clamp bound is astronomically
+                        // larger than any real row count, so it never affects
+                        // legitimate scrolling, and a value already within it
+                        // plus another clamped value can never itself overflow.
+                        rowsDelta: clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta),
+                        totalRows: ps.totalRows,
+                        totalCols: ps.totalCols
+                    )
+                } else {
+                    // Region mismatch: the old accumulator's blit will never be
+                    // applied, but its row slots were already remapped at
+                    // scroll-apply time — the committed vertices are post-scroll.
+                    // Dirty the dropped region so draw() redraws it from those
+                    // vertices instead of leaving pre-scroll pixels on the rows
+                    // the shift did not vacate.
+                    if let existing = state.pendingScrollAccum,
+                       existing.rowEnd > existing.rowStart {
+                        state.pendingDirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
+                    }
+                    state.pendingScrollAccum = ps
                 }
-                pendingScrollAccum = ps
+                // A committed set must not keep the staged shift, or a later
+                // frame would apply it a second time.
+                sets[ws].pendingScroll = nil
+            }
+            if !state.flushDirtyRows.isEmpty {
+                state.pendingDirtyRows.formUnion(state.flushDirtyRows)
+                state.flushDirtyRows.removeAll()
             }
         }
         // Re-publish dirty marks staged during this flush. A draw() that
@@ -1938,12 +2070,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushDirtyRows.removeAll()
         flushDirtyRectPx = nil
         // Only update lastCommitTime when there are pending visual changes
-        // (dirty rows, dirty rect, or scroll delta). Empty flushes should not
-        // prevent the draw loop from deactivating.
-        if !pendingDirtyRows.isEmpty || pendingDirtyRectPx != nil || pendingScrollAccum != nil {
+        // (dirty rows, dirty rect, or a layer's rows/shift). Empty flushes
+        // should not prevent the draw loop from deactivating.
+        if !pendingDirtyRows.isEmpty || pendingDirtyRectPx != nil || flushHadLayerWork {
             lastCommitTime = mach_absolute_time()
         }
         lock.unlock()
+        flushHadLayerWork = false
 
         if didMainWrite {
             // Only a successful publication advances other sets' sparse
@@ -2183,6 +2316,29 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // fixed floats with a STRICTLY higher zindex, so a float scrolling
         // above its own backdrop keeps drawing.
         var zindex: Int32 = 0
+    }
+
+    /// What one grid the surface places as a layer owes the next frame.
+    ///
+    /// A reference type, so mutating one grid's entry never detaches the
+    /// dictionary's storage while the draw thread holds a reference into it.
+    ///
+    /// Threading mirrors the surface-wide fields these replace: `flushDirtyRows`
+    /// belongs to the core thread inside the flush bracket, `pendingDirtyRows`,
+    /// `pendingScrollAccum` and `needsFullRedraw` are handed from the core
+    /// thread to the draw thread under `lock`, and the `draw*` fields belong to
+    /// the draw thread for the length of one frame. Every row number here is
+    /// grid-local, the space the layer paths already report rows in.
+    private final class LayerDrawState {
+        var flushDirtyRows = IndexSet()
+        var pendingDirtyRows = IndexSet()
+        var pendingScrollAccum: SurfaceRowScroll? = nil
+        var needsFullRedraw = false
+        /// Consumed under `lock` at the top of a frame; capacity is reused.
+        var drawRows: [Int] = []
+        var drawScroll: SurfaceRowScroll? = nil
+        var drawAllRows = false
+        var lastDrawnRowCount = 0
     }
 
     /// - Parameters:
@@ -2557,7 +2713,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let retainedSnapshot: [RetainedScrollRow]  // Rows kept alive across a smooth-scroll step
             let fixedFloatBandsSnapshot: [FixedFloatBand]  // Snapshots for setFragmentBytes
             let fixedFloatIntervalsSnapshot: [FixedFloatInterval]
-            let pendingScroll: SurfaceRowScroll?
+            // Whether any layer the committed layout places owes this frame
+            // rows, a shift, or a full redraw. The root grid's dirty rows no
+            // longer stand in for that, so every predicate that used to be
+            // satisfied by them consults this instead.
+            var anyLayerWork = false
             let rowLogicalToSlotSnapshot: [Int]
             let rowSlotSourceRowsSnapshot: [Int]
             // The committed layer list, each layer's buffer sets (index
@@ -2600,7 +2760,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Extend smoothScrolling for one extra frame after the offset
             // drops to zero so the back buffer (still holding pixels rendered
             // with a non-zero shader offset) is replaced by a full redraw
-            // instead of being GPU-blitted by useGpuScrollCopy, which would
+            // instead of being GPU-blitted by a row-scroll copy, which would
             // shift those already-shifted pixels and produce a 1-row jitter
             // for the frame where offset transitions to 0.
             hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
@@ -2609,24 +2769,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             retainedSnapshot = retention.snapshotPublished()
             fixedFloatBandsSnapshot = fixedFloatBandData  // Value-type copies (safe across frames)
             fixedFloatIntervalsSnapshot = fixedFloatIntervalData
-            // Use accumulated scroll delta (covers multiple flushes between draws)
-            // instead of per-set pendingScroll which only has the last flush's delta.
-            // pendingScrollAccum is the sole authority: applySurfaceRowScrollRaw
-            // goes through prepareMainWriteState(), so any set carrying a
-            // pendingScroll was committed with didMainWrite and accumulated here.
-            // Never fall back to bufferSets[csi].pendingScroll — that field is not
-            // cleared once a draw consumes it, and a cursor-only flush neither
-            // rotates committedSetIndex nor clears it, so reading it would re-apply
-            // an already-applied scroll on every subsequent cursor-only draw.
-            pendingScroll = pendingScrollAccum
-            pendingScrollAccum = nil
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             layerSnapshot.removeAll(keepingCapacity: true)
             layerSetsSnapshot.removeAll(keepingCapacity: true)
+            layerStateSnapshot.removeAll(keepingCapacity: true)
             for layer in committedSurfaceLayers {
                 layerSnapshot.append(layer)
                 layerSetsSnapshot.append(gridBuffers.existingSets(for: layer.gridId) ?? [])
+                // Only a grid the committed layout actually places is consumed.
+                // Work staged for a grid that is not on screen yet has to wait
+                // for the layout that places it, and that layout marks the grid
+                // fully dirty when it arrives (see commitFlush).
+                let state = layer.gridId == 1 ? nil : layerDrawStates[layer.gridId]
+                if let state {
+                    state.drawRows.removeAll(keepingCapacity: true)
+                    state.drawRows.append(contentsOf: state.pendingDirtyRows)
+                    state.pendingDirtyRows.removeAll()
+                    state.drawScroll = state.pendingScrollAccum
+                    state.pendingScrollAccum = nil
+                    state.drawAllRows = state.needsFullRedraw
+                    state.needsFullRedraw = false
+                    if !state.drawRows.isEmpty || state.drawScroll != nil || state.drawAllRows {
+                        anyLayerWork = true
+                    }
+                }
+                layerStateSnapshot.append(state)
             }
             cursorLayerOriginSnapshot = committedCursorLayerOriginPx
             snappedBgRGB = defaultBgRGB
@@ -2667,10 +2835,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     a: UInt64(dirtyRows.count),
                     b: rowMode ? 1 : 0,
                     seq: UInt32(truncatingIfNeeded: committedMainCount)
-                )
-                FrameTracer.trace(
-                    .scrollAdvance,
-                    a: UInt64(bitPattern: Int64(pendingScroll?.rowsDelta ?? 0))
                 )
             }
 
@@ -2745,6 +2909,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let isBlinkOnlyFrame = blinkStateChanged
                 && !hasNewCommit
                 && dirtyRows.isEmpty
+                && !anyLayerWork
                 && dirtyRectPxOpt == nil
                 && !smoothScrolling
                 && !drawableSizeChanged
@@ -2762,6 +2927,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                !hasNewCommit,
                dirtyRectPxOpt == nil,
                dirtyRows.isEmpty,
+               !anyLayerWork,
                !smoothScrolling,
                !blinkStateChanged,
                !drawableSizeChanged,
@@ -2778,7 +2944,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
             // destroys the backbuffer between GPU-blit scroll frames.
             // Same animation exception as above.
-            if rowMode && dirtyRows.isEmpty && pendingScroll == nil && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation {
+            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation {
                 FrameTracer.trace(.drawSkipNoChange, a: 3)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -2798,13 +2964,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // cursor is normally visible.
             //
             // isBlinkOnlyFrame already covers !hasNewCommit, dirtyRows.isEmpty,
-            // dirtyRectPxOpt == nil, !smoothScrolling, !drawableSizeChanged,
-            // hasPresentedOnce — critical because pendingDirtyRectPx was
-            // consumed under the lock above; skipping without checking it
-            // would lose the update.
+            // !anyLayerWork, dirtyRectPxOpt == nil, !smoothScrolling,
+            // !drawableSizeChanged, hasPresentedOnce — critical because
+            // pendingDirtyRectPx and every layer's pending state were consumed
+            // under the lock above; skipping without checking them would lose
+            // the update.
             if rowMode
                 && isBlinkOnlyFrame
-                && pendingScroll == nil
                 && currentCursorCount == 0
                 && !anyCustomShaderNeedsAnimation {
                 lastRenderedBlinkState = cursorBlinkStateSnapshot
@@ -2858,7 +3024,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // smoothScrolling) so the one-frame extension does not self-latch.
             // Storing the combined value would keep smoothScrolling true
             // forever after the first active frame, permanently disabling
-            // useGpuScrollCopy and the idle/skip paths.
+            // the row-scroll copy and the idle/skip paths.
             lastDrawnHadActiveScrollOffset = hadActiveScrollOffsetThisFrame
 
             // Update last rendered blink state since we're proceeding with render
@@ -2911,17 +3077,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let glowEnabled = configuredGlowEnabled
                 && !(smoothScrolling && !fixedFloatBandsSnapshot.isEmpty)
 
-            let useGpuScrollCopy = rowMode
-                && hasNewCommit
-                && pendingScroll != nil
-                && hasPresentedOnceSnapshot
-                && !smoothScrolling
-                && !drawableSizeChanged
-                && !glowEnabled
-                // Blur partial redraw requires overwrite-background and
-                // alpha-glyph pipelines. If either failed to initialize,
-                // skip the blit and full-redraw from retained row slots.
-                && (!blurEnabled || use2Pass)
             func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow >= 0, logicalRow < safeRowCount else { return nil }
                 let slot = rowLogicalToSlotSnapshot[logicalRow]
@@ -2999,6 +3154,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // dirty-empty frame qualifies.
             let noMainWorkFrame = !hasNewCommit
                 && dirtyRows.isEmpty
+                && !anyLayerWork
                 && dirtyRectPxOpt == nil
                 && !smoothScrolling
                 && !drawableSizeChanged
@@ -3018,6 +3174,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             func bailWithoutSubmit(_ reason: String) {
                 ZonvieCore.appLog("[WARNING] draw bailed (\(reason)); restoring dirty state for retry")
                 markAllRowsDirty()
+                markAllLayersDirty()
                 if let r = dirtyRectPxOpt {
                     lock.lock()
                     pendingDirtyRectPx = pendingDirtyRectPx?.union(r) ?? r
@@ -3062,44 +3219,62 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 gpuPerfNextIdx = 0
                 gpuStatsSlots.removeAll(keepingCapacity: true)
             }
-            // GPU scroll blit: shift back texture pixels and expand dirty rows.
-            // Windows equivalent: applyScrollShift (windows/app.zig) which calls
-            // scrollBackTex + shiftRowVBs + gap row expansion.
-            // When fast path is blocked (pendingScroll == nil), both platforms
-            // skip the blit and redraw all dirty rows from scratch.
-            var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
-            if useGpuScrollCopy, let pendingScroll = pendingScroll {
-                let scrollCopy = encodePendingMainRowScrollCopy(
-                    commandBuffer: cmd,
-                    backTexture: backTex,
-                    drawableWidthPx: Int(vpWidth > 0 ? vpWidth : view.drawableSize.width),
-                    rowHeightPx: Int(cellHi),
-                    scroll: pendingScroll,
-                    logEnabled: ZonvieCore.appLogEnabled
-                )
-
-                if let plan = scrollCopy {
-                    scrollClearBand = (clearTopPx: plan.clearTopPx, clearBottomPx: plan.clearBottomPx)
-                    // The vacated band plus the intermediate rows accumulated
-                    // steps left stale, stopping at the row the blit was
-                    // clamped to; see RowScrollBlitPlan.dirtyRows.
-                    dirtyRows.append(contentsOf: plan.dirtyRows)
-                } else if let fallback = RowScrollBlitPlan.dirtyRowsWithoutBlit(
-                    rowStart: pendingScroll.rowStart,
-                    rowEnd: pendingScroll.rowEnd,
+            // Per-layer row-scroll copy: the shift is staged, merged and
+            // consumed, but no blit is encoded yet. Refuse every one — the
+            // layer redraws its whole shifted region from the row slots the
+            // core already remapped, which is exactly what it did before this
+            // state existed. Only the rows that fit under the layer's origin
+            // are asked for; the rest is off the texture.
+            for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                guard let state = layerStateSnapshot[li], let scroll = state.drawScroll else { continue }
+                state.drawScroll = nil
+                guard let refusedRows = RowScrollBlitPlan.dirtyRowsWithoutBlit(
+                    rowStart: scroll.rowStart,
+                    rowEnd: scroll.rowEnd,
+                    originYPx: Int(layer.originPx.y.rounded(.down)),
                     textureHeightPx: backTex.height,
                     rowHeightPx: Int(cellHi)
-                ) {
-                    // The blit never ran, so nothing was shifted: redraw the
-                    // whole region from scratch in the per-row scissor draw
-                    // below. Appended contiguously; the combined rows are
-                    // canonicalized below, which avoids the previous
-                    // contains(row) scan that made a failed blit O(R²).
-                    dirtyRows.append(contentsOf: fallback)
+                ) else { continue }
+                state.drawRows.append(contentsOf: refusedRows)
+            }
+
+            // A root dirty row that resolves to no vertices is overpainted
+            // below with an opaque background band spanning the whole drawable
+            // width (the root's empty-dirty-row overwrite, which .load makes
+            // mandatory for the pixels the root owns). Once the main surface
+            // has layers the root no longer owns most of that width: the core
+            // drops every default-background run from the root's rows
+            // (flush.zig `skip_default_bg`), which is exactly what a row under
+            // a window resolves to, so the band erases pixels that belong to a
+            // layer. Mark the grid-local rows it lands on, here where the
+            // damage is produced — the layer then repaints those rows and only
+            // those, instead of the whole layer.
+            let bandRowHeightPx = Int(cellHi)
+            if layerSnapshot.count > 1 && bandRowHeightPx > 0 {
+                for row in dirtyRows where resolvedRowState(row) == nil {
+                    let bandTopPx = row * bandRowHeightPx
+                    let bandBottomPx = bandTopPx + bandRowHeightPx
+                    for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                        guard let state = layerStateSnapshot[li], layer.rows > 0 else { continue }
+                        let originY = Int(layer.originPx.y.rounded(.down))
+                        guard bandBottomPx > originY else { continue }
+                        // A layer need not be cell-aligned, so one root row can
+                        // straddle two of its rows.
+                        let firstRow = max(0, (bandTopPx - originY) / bandRowHeightPx)
+                        let lastRow = min(layer.rows - 1, (bandBottomPx - 1 - originY) / bandRowHeightPx)
+                        guard lastRow >= firstRow else { continue }
+                        state.drawRows.append(contentsOf: firstRow...lastRow)
+                    }
                 }
             }
-            if useGpuScrollCopy {
-                surfaceSortAndDeduplicateRows(&dirtyRows)
+
+            // Both producers above append to lists the core already filled, so
+            // a row can appear more than once. The layer draw loop encodes this
+            // list one row at a time now, and a duplicate is a second draw of
+            // the same row.
+            for state in layerStateSnapshot {
+                guard let state else { continue }
+                surfaceSortAndDeduplicateRows(&state.drawRows)
             }
 
             // --- 1) Render into back buffer (partial redraw is valid here) ---
@@ -3115,7 +3290,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // - Semi-transparent backgrounds (alpha=0.7) blend with previous frame when using .load
             // - This causes ghosting and gradual opacity buildup, making blur invisible
             // - ExternalGridView uses the same approach (always .clear) and works correctly
-            let hasAnyDirtyInRowMode = rowMode && !dirtyRows.isEmpty
+            // A layer that owes rows counts as dirty here: its rows no longer
+            // appear in the surface's own dirty set, and without this a frame
+            // that only updates a layer would clear the whole back buffer.
+            let hasAnyDirtyInRowMode = rowMode && (!dirtyRows.isEmpty || anyLayerWork)
 
             // When glow is enabled, force full redraw (.clear) to prevent additive
             // bloom composite from accumulating brightness across frames.
@@ -3126,20 +3304,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // flushes (e.g. statusline updates).
             let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
                 && hasPresentedOnceSnapshot && !smoothScrolling && !drawableSizeChanged && !glowEnabled
-            let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
+            let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnceSnapshot,
                 drawableSizeChanged: drawableSizeChanged,
                 shouldReusePreviousContents: shouldReusePreviousContents,
-                forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
+                forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || canDirtyOnlyWithBlur)
             )
 
             if rpd.colorAttachments[0].loadAction == .load {
                 if canBlinkFastPath {
                     ZonvieCore.appLog("[draw] loadAction=.load (blinkFastPath cursorRow=\(cursorGridRow))")
-                } else if useGpuScrollCopy {
-                    ZonvieCore.appLog("[draw] loadAction=.load (gpuScrollCopy)")
                 } else {
                     ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
                 }
@@ -3231,9 +3407,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     drawBackgroundClearBand(
                         enc,
                         clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                        drawableWidth: width,
+                        xRangePx: (leftPx: 0, rightPx: width),
                         drawableHeight: height,
-                        bgRGB: snappedBgRGB
+                        bgRGB: snappedBgRGB,
+                        gridId: 1
                     )
                 }
             }
@@ -3311,61 +3488,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         }
 
                         ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc) unified=\(unifiedBlurPipeline != nil)")
-                    } else if useGpuScrollCopy {
-                        // Switch to backgroundPipeline (overwrite blend: one, zero)
-                        // for ALL clear operations in the scroll path.  With blur
-                        // enabled, the main pipeline's alpha blend would leave stale
-                        // content in both the scrollClearBand and vc==0 rows.
-                        let scrollDrawableW = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
-                        let scrollDrawableH = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
-                        let scrollCellHiI = Int(cellHi)
-                        if let bgPipe = backgroundPipeline {
-                            enc.setRenderPipelineState(bgPipe)
-                        }
-                        if let clearBand = scrollClearBand {
-                            drawBackgroundClearBand(
-                                enc,
-                                clearBand: clearBand,
-                                drawableWidth: scrollDrawableW,
-                                drawableHeight: scrollDrawableH,
-                                bgRGB: snappedBgRGB
-                            )
-                        }
-                        // Also clear dirty rows with vc==0 that fall outside the
-                        // scrollClearBand (e.g. intermediate rows from accumulated
-                        // scroll steps).
-                        for row in dirtyRows {
-                            if resolvedRowState(row) == nil {
-                                let topPx = row * scrollCellHiI
-                                let bottomPx = topPx + scrollCellHiI
-                                drawBackgroundClearBand(
-                                    enc,
-                                    clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
-                                    drawableWidth: scrollDrawableW,
-                                    drawableHeight: scrollDrawableH,
-                                    bgRGB: snappedBgRGB
-                                )
-                            }
-                        }
-                        _ = encodeSurfaceRowDraws(
-                            encoder: enc,
-                            rows: dirtyRows,
-                            resolve: resolvedRowState,
-                            scissor: { row in
-                                makeRowScissorRect(
-                                    row: row,
-                                    cellHeight_px: scrollCellHiI,
-                                    drawableWidth_px: drawableW,
-                                    renderTargetWidth_px: backTex.width,
-                                    renderTargetHeight_px: backTex.height
-                                )
-                            },
-                            pipeline: pipeline!,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
-                            useTwoPass: true,
-                            unifiedBlurPipeline: unifiedBlurPipeline
-                        )
                     } else if canDirtyOnlyWithBlur {
                         // Partial redraw with .load for blur: only dirty rows are
                         // redrawn using 2-pass (overwrite bg + alpha glyph) with
@@ -3389,9 +3511,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     drawBackgroundClearBand(
                                         enc,
                                         clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
-                                        drawableWidth: drawableWidthF,
+                                        xRangePx: (leftPx: 0, rightPx: drawableWidthF),
                                         drawableHeight: drawableHeightF,
-                                        bgRGB: snappedBgRGB
+                                        bgRGB: snappedBgRGB,
+                                        gridId: 1
                                     )
                                 }
                             }
@@ -3440,18 +3563,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         glyphPipeline: nil,
                         useTwoPass: false
                     )
-                } else if useGpuScrollCopy {
-                    if let clearBand = scrollClearBand {
-                        drawBackgroundClearBand(
-                            enc,
-                            clearBand: clearBand,
-                            drawableWidth: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
-                            drawableHeight: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
-                            bgRGB: snappedBgRGB
-                        )
-                    }
-                    drawScissoredDirtyRows()
-                } else if !glowEnabled && !dirtyRows.isEmpty && !drawableSizeChanged
+                } else if !glowEnabled && (!dirtyRows.isEmpty || anyLayerWork) && !drawableSizeChanged
                             && rpd.colorAttachments[0].loadAction == .load {
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
                     // Skipped when glow is enabled — full redraw needed for correct bloom composite.
@@ -3523,6 +3635,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let set = sets[csi]
                     let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
                     guard rowCount > 0 else { continue }
+                    // What this layer owes the frame; nil for a grid with no
+                    // draw state, which is treated as owing everything.
+                    let st = layerStateSnapshot[li]
 
                     bindLayerTransform(
                         encoder: enc,
@@ -3544,27 +3659,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         continue
                     }
 
-                    // Rows the core emptied must overwrite their old pixels:
-                    // backTex is loaded, not cleared, on this path. The blur
-                    // arm's background pass already overwrites.
-                    if !use2Pass {
-                        for row in 0..<rowCount {
-                            let slot = set.rowLogicalToSlot[row]
-                            let empty = slot < 0 || slot >= set.rowState.buffers.count
-                                || set.rowState.buffers[slot] == nil || set.rowState.counts[slot] == 0
-                            guard empty else { continue }
-                            let topPx = row * Int(cellHi)
-                            drawBackgroundClearBand(
-                                enc,
-                                clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
-                                drawableWidth: Float(widthPx),
-                                drawableHeight: Float(rowCount * Int(cellHi)),
-                                bgRGB: snappedBgRGB
-                            )
-                        }
-                        enc.setRenderPipelineState(pipeline!)
-                    }
-
                     // This layer's rows, then the rows its own smooth scroll
                     // retained: both live in its grid-local space, which the
                     // transform above places. The index list is reused so a
@@ -3577,41 +3671,161 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let retainedForLayerCount = retainedIndexScratch.count
                     let retainedBase = rowCount
 
-                    // Same pipeline choice as the root grid: under blur the
-                    // background pass overwrites rather than blending, so a
-                    // single-pass layer would darken its own background
-                    // against whatever it covers.
-                    _ = encodeSurfaceRowDraws(
-                        encoder: enc,
-                        rows: 0..<(rowCount + retainedForLayerCount),
-                        resolve: { row in
-                            if row >= retainedBase {
-                                let r = retainedSnapshot[self.retainedIndexScratch[row - retainedBase]]
-                                return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
+                    // What one row of this layer owes the encoder. Shared by
+                    // both arms below so the gated path resolves rows exactly
+                    // the way the full redraw does.
+                    func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                        if row >= retainedBase {
+                            let i = row - retainedBase
+                            // Only the full-redraw arm asks for retained rows;
+                            // on the gated arm there are none by construction,
+                            // and a dirty row can name a row the layer lost.
+                            guard i < self.retainedIndexScratch.count else { return nil }
+                            let r = retainedSnapshot[self.retainedIndexScratch[i]]
+                            return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
+                        }
+                        guard row >= 0, row < rowCount else { return nil }
+                        let slot = set.rowLogicalToSlot[row]
+                        guard slot >= 0, slot < set.rowState.buffers.count,
+                              let vb = set.rowState.buffers[slot],
+                              set.rowState.counts[slot] > 0
+                        else { return nil }
+                        // A row-shift hint remaps slots without rewriting
+                        // their vertices, so a slot still holds the pixels
+                        // it was built for. Same relation the root grid
+                        // uses: they live at sourceRow and must appear at
+                        // this row.
+                        let sourceRow = slot < set.rowSlotSourceRows.count
+                            ? set.rowSlotSourceRows[slot]
+                            : row
+                        let translationY = Float(row - sourceRow) * Float(cellHi)
+                        return (set.rowState.counts[slot], vb, translationY)
+                    }
+
+                    // Why this layer cannot be drawn from its dirty rows alone:
+                    //  - .clear erased the whole back texture, so every row of
+                    //    every layer has to be put back.
+                    //  - no draw state means nothing tracked what this grid
+                    //    owes (a grid the core never staged rows for).
+                    //  - drawAllRows: the layer moved, resized or is new, so
+                    //    the pixels it left behind belong to another rectangle.
+                    //  - an eased frame re-places every row with a shader
+                    //    offset, so rows nobody marked dirty still move —
+                    //    that covers both smoothScrolling and this layer's own
+                    //    retained rows, which exist only while it eases.
+                    //  - glow composites bloom from the whole back texture.
+                    //  - a row count that changed since the last frame means
+                    //    the layer grew or shrank without a layout diff having
+                    //    caught it; the rows it gained were never drawn.
+                    //
+                    // The root grid drawing its own dirty rows is deliberately
+                    // NOT a reason: it draws them full width, across the pixels
+                    // a layer covers, but the core drops every default-background
+                    // run from the root's rows while the main surface has layers
+                    // (flush.zig `skip_default_bg`), and the root's cells under a
+                    // window are exactly those — nvim sends window content to the
+                    // window's own grid. So the root has nothing to paint there.
+                    let drawAll = rpd.colorAttachments[0].loadAction == .clear
+                        || st == nil
+                        || st!.drawAllRows
+                        || smoothScrolling
+                        || glowEnabled
+                        || retainedForLayerCount > 0
+                        || rowCount != st!.lastDrawnRowCount
+
+                    var encodedRows = 0
+                    if drawAll {
+                        // Rows the core emptied must overwrite their old pixels:
+                        // backTex is loaded, not cleared, on this path. The blur
+                        // arm's background pass already overwrites.
+                        if !use2Pass {
+                            for row in 0..<rowCount {
+                                let slot = set.rowLogicalToSlot[row]
+                                let empty = slot < 0 || slot >= set.rowState.buffers.count
+                                    || set.rowState.buffers[slot] == nil || set.rowState.counts[slot] == 0
+                                guard empty else { continue }
+                                let topPx = row * Int(cellHi)
+                                drawBackgroundClearBand(
+                                    enc,
+                                    clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
+                                    xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
+                                    drawableHeight: Float(rowCount * Int(cellHi)),
+                                    bgRGB: snappedBgRGB,
+                                    gridId: layer.gridId
+                                )
+                                encodedRows += 1
                             }
-                            guard row < set.rowLogicalToSlot.count else { return nil }
-                            let slot = set.rowLogicalToSlot[row]
-                            guard slot >= 0, slot < set.rowState.buffers.count,
-                                  let vb = set.rowState.buffers[slot],
-                                  set.rowState.counts[slot] > 0
-                            else { return nil }
-                            // A row-shift hint remaps slots without rewriting
-                            // their vertices, so a slot still holds the pixels
-                            // it was built for. Same relation the root grid
-                            // uses: they live at sourceRow and must appear at
-                            // this row.
-                            let sourceRow = slot < set.rowSlotSourceRows.count
-                                ? set.rowSlotSourceRows[slot]
-                                : row
-                            let translationY = Float(row - sourceRow) * Float(cellHi)
-                            return (set.rowState.counts[slot], vb, translationY)
-                        },
-                        pipeline: pipeline!,
-                        backgroundPipeline: backgroundPipeline,
-                        glyphPipeline: glyphPipeline,
-                        useTwoPass: use2Pass,
-                        unifiedBlurPipeline: unifiedBlurPipeline
-                    )
+                            enc.setRenderPipelineState(pipeline!)
+                        }
+
+                        // Same pipeline choice as the root grid: under blur the
+                        // background pass overwrites rather than blending, so a
+                        // single-pass layer would darken its own background
+                        // against whatever it covers.
+                        encodedRows += encodeSurfaceRowDraws(
+                            encoder: enc,
+                            rows: 0..<(rowCount + retainedForLayerCount),
+                            resolve: resolveLayerRow,
+                            pipeline: pipeline!,
+                            backgroundPipeline: backgroundPipeline,
+                            glyphPipeline: glyphPipeline,
+                            useTwoPass: use2Pass,
+                            unifiedBlurPipeline: unifiedBlurPipeline
+                        )
+                    } else {
+                        let dirtyLayerRows = st!.drawRows
+                        // A dirty row the core emptied resolves to nothing, so
+                        // encodeSurfaceRowDraws skips it and .load keeps its old
+                        // glyphs. Overwrite it explicitly — on the blur arm too,
+                        // where the background pass that would normally do the
+                        // overwriting never runs for a row with no vertices.
+                        // Still under this layer's whole-rect scissor, so a band
+                        // cannot reach past the layer.
+                        if !dirtyLayerRows.isEmpty {
+                            enc.setRenderPipelineState(use2Pass ? (backgroundPipeline ?? pipeline!) : pipeline!)
+                            for row in dirtyLayerRows where resolveLayerRow(row) == nil {
+                                guard row >= 0, row < rowCount else { continue }
+                                let topPx = row * Int(cellHi)
+                                drawBackgroundClearBand(
+                                    enc,
+                                    clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
+                                    xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
+                                    drawableHeight: Float(rowCount * Int(cellHi)),
+                                    bgRGB: snappedBgRGB,
+                                    gridId: layer.gridId
+                                )
+                                encodedRows += 1
+                            }
+                        }
+                        // One scissor per dirty row, the root's precedent for a
+                        // dirty-only draw. makeRowScissorRect cannot serve here:
+                        // it pins x to 0, and a layer starts at its own origin.
+                        encodedRows += encodeSurfaceRowDraws(
+                            encoder: enc,
+                            rows: dirtyLayerRows,
+                            resolve: resolveLayerRow,
+                            scissor: { row in
+                                clampScissor(
+                                    x: originX,
+                                    y: originY + row * Int(cellHi),
+                                    width: widthPx,
+                                    height: Int(cellHi),
+                                    targetWidth: backTex.width,
+                                    targetHeight: backTex.height
+                                )
+                            },
+                            pipeline: pipeline!,
+                            backgroundPipeline: backgroundPipeline,
+                            glyphPipeline: glyphPipeline,
+                            useTwoPass: use2Pass,
+                            unifiedBlurPipeline: unifiedBlurPipeline
+                        )
+                    }
+                    st?.lastDrawnRowCount = rowCount
+                    // rows= counts the row draws this layer actually encoded
+                    // (drawn rows plus overwritten empty rows); a quiet layer
+                    // encodes none. blit= is reserved for the GPU scroll copy.
+                    ZonvieCore.appLog("[layer_draw] gridId=\(layer.gridId) rows=\(encodedRows) of=\(rowCount) blit=0")
                 }
                 // Restore the surface's own pixel space for the cursor pass.
                 bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
@@ -3624,7 +3838,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
             // canBlinkFastPath also sets a scissor that must be reset.
-            if (rowMode && (!use2Pass || useGpuScrollCopy)) || canBlinkFastPath {
+            if (rowMode && !use2Pass) || canBlinkFastPath {
                 let fullW = max(0, Int(view.drawableSize.width.rounded(.down)))
                 let fullH = max(0, Int(view.drawableSize.height.rounded(.down)))
                 if fullW > 0 && fullH > 0 {
@@ -3951,7 +4165,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let category: String
                 if customShaderHandled {
                     category = "shader"
-                } else if smoothScrolling || useGpuScrollCopy {
+                } else if smoothScrolling {
                     category = "scroll"
                 } else if isBlinkOnlyFrame {
                     category = "blink"
@@ -3966,7 +4180,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 let noopEligible = dirtyRows.isEmpty
                     && !smoothScrolling
-                    && !useGpuScrollCopy
                     && !drawableSizeChanged
                     && !blinkStateChanged
                     && hasPresentedOnceSnapshot
@@ -5222,48 +5435,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func encodePendingMainRowScrollCopy(
-        commandBuffer: MTLCommandBuffer,
-        backTexture: MTLTexture,
-        drawableWidthPx: Int,
-        rowHeightPx: Int,
-        scroll: SurfaceRowScroll,
-        logEnabled: Bool
-    ) -> RowScrollBlitPlan? {
-        // The clamps live in RowScrollBlitPlan.make, which is what
-        // row-scroll-blit-plan-tests checks; nil means nothing was shifted.
-        guard let plan = RowScrollBlitPlan.make(
-            rowStart: scroll.rowStart,
-            rowEnd: scroll.rowEnd,
-            rowsDelta: scroll.rowsDelta,
-            textureWidthPx: backTexture.width,
-            textureHeightPx: backTexture.height,
-            drawableWidthPx: drawableWidthPx,
-            rowHeightPx: rowHeightPx
-        ) else { return nil }
-        ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
-        guard let scratch = scrollScratchTexture,
-              let blit = commandBuffer.makeBlitCommandEncoder()
-        else { return nil }
-
-        let t0 = logEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratch, plan: plan)
-        blit.endEncoding()
-        if logEnabled {
-            let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
-            let usStr = String(format: "%.1f", us)
-            let regionHeightRows = plan.clampedRowEnd - scroll.rowStart
-            ZonvieCore.appLogPerf("[perf] gpu_row_scroll_copy rows=\(regionHeightRows) shift=\(scroll.rowsDelta) us=\(usStr)")
-        }
-        return plan
-    }
-
     private func drawBackgroundClearBand(
         _ encoder: MTLRenderCommandEncoder,
         clearBand: (clearTopPx: Int, clearBottomPx: Int),
-        drawableWidth: Float,
+        xRangePx: (leftPx: Float, rightPx: Float),
         drawableHeight: Float,
-        bgRGB: UInt32
+        bgRGB: UInt32,
+        gridId: Int64
     ) {
         let top = max(0, clearBand.clearTopPx)
         let bottom = max(top, clearBand.clearBottomPx)
@@ -5272,18 +5450,22 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let g = Float((bgRGB >> 8) & 0xFF) / 255.0
         let b = Float(bgRGB & 0xFF) / 255.0
         let color = simd_float4(r, g, b, 1.0)
-        // Surface pixels: drawableWidth/Height are the viewport extent the
-        // layer transform divides by, so this band lands exactly where the
-        // NDC form used to.
+        // Pixels in whatever space the bound layer transform maps: the surface
+        // for a root-grid band, the layer's own rect for a layer's band. The
+        // band lands exactly where the NDC form used to.
         _ = drawableHeight
-        let x0: Float = 0
-        let x1 = drawableWidth
+        let x0 = xRangePx.leftPx
+        let x1 = xRangePx.rightPx
+        guard x1 > x0 else { return }
         let y0 = Float(top)
         let y1 = Float(bottom)
-        let tl = Vertex(position: simd_float2(x0, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let tr = Vertex(position: simd_float2(x1, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let bl = Vertex(position: simd_float2(x0, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
-        let br = Vertex(position: simd_float2(x1, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+        // The vertex stage binary-searches scrollOffsets by grid_id, so a band
+        // must carry the id of the grid it covers: tagging a layer's band with
+        // the root's id would move it by the root's scroll offset.
+        let tl = Vertex(position: simd_float2(x0, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+        let tr = Vertex(position: simd_float2(x1, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+        let bl = Vertex(position: simd_float2(x0, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+        let br = Vertex(position: simd_float2(x1, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
         // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
         // (no heap) instead of building a fresh [Vertex] array every scroll frame.
         withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
@@ -5695,6 +5877,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         // Also clear the rect so full redraw happens
         pendingDirtyRectPx = nil
+    }
+
+    /// Mark every layer for a full redraw, the layer counterpart of
+    /// markAllRowsDirty: a bailed draw already consumed each layer's pending
+    /// rows and shift, and a full redraw of the layer heals the shift it never
+    /// applied, since the committed vertices are already post-scroll.
+    func markAllLayersDirty() {
+        lock.lock()
+        defer { lock.unlock() }
+        for state in layerDrawStates.values {
+            state.needsFullRedraw = true
+            state.drawScroll = nil
+        }
     }
 
 }
