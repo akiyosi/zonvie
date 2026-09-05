@@ -361,3 +361,8 @@ test "e2e:msg_split_payload_ceiling" {
     try requireNvim();
     try @import("scenarios/msg_split_payload_ceiling.zig").run(testing.allocator);
 }
+
+test "e2e:born_external_anchor_float" {
+    try requireNvim();
+    try @import("scenarios/born_external_anchor_float.zig").run(testing.allocator);
+}
