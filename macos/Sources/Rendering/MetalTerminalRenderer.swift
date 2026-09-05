@@ -2338,6 +2338,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         var drawRows: [Int] = []
         var drawScroll: SurfaceRowScroll? = nil
         var drawAllRows = false
+        /// The band this frame's accepted GPU scroll copy vacated, in the
+        /// layer's own pixel space, or nil when no blit ran for this layer.
+        /// Draw-thread state for the length of one frame, like the fields
+        /// above; cleared where `drawScroll` is consumed.
+        var drawBlitClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
         var lastDrawnRowCount = 0
     }
 
@@ -2405,15 +2410,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // (main, extract, and cursor) observes the same ordering contract.
         scrollOffsetData.sort { $0.grid_id < $1.grid_id }
 
-        // The parameter is shadowed by the pruning snapshot below; keep the
-        // input infos reachable for the per-entry log line.
-        let offsetInfos = offsets
-        // A retained row is only meaningful while its grid is displaced: with
-        // no offset it would be drawn one row above real content.
-        let offsets = scrollOffsetData
-        retention.prunePublished { retained in
-            !offsets.contains { Int64($0.grid_id) == retained.gridId }
-        }
+        // Prune before the pin decision below, so `coversBand` is asked about
+        // rows this frame will actually draw. `draw(in:)` applies the same rule
+        // again on the frames this function does not run at all — which is
+        // every frame once nothing is easing.
+        retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
             let retained = retention.publishedCount(gridId: gid)
@@ -2428,7 +2429,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // a frame actually renders with — the GUI harness derives the
             // margin band and asserts retained-row band coverage from these
             // fields, mirroring the [ExternalGridView] scroll offset line.
-            let info = offsetInfos.first { $0.gridId == gid }
+            let info = offsets.first { $0.gridId == gid }
             ZonvieCore.appLog("[renderer] scroll offset: gridId=\(gid) offsetYPx=\(info?.offsetYPx ?? 0) marginTop=\(info?.marginTop ?? 0) marginBottom=\(info?.marginBottom ?? 0) ndc=\(scrollOffsetData[i].offset_y) top=\(scrollOffsetData[i].content_top_y) bot=\(scrollOffsetData[i].content_bottom_y) pin=\(scrollOffsetData[i].pin_edges) retained=\(retained) gridTop=\(info?.gridTopYNDC ?? 0) cellNDC=\(cellHeightNDC) vpH=\(drawableHeight)")
         }
 
@@ -2766,6 +2767,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
             smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            // Retire retained rows whose grid is no longer displaced. This runs
+            // here, and not only in updateScrollOffsets, because the view skips
+            // that function entirely once nothing is easing — so a grid that
+            // scrolled without ever being displaced (a page jump, a repaint
+            // that seeded nothing) kept its rows for the rest of the session,
+            // drawing them one row off real content and forcing its layer to
+            // redraw every row on every frame. Cheap enough for the draw path:
+            // a scan of at most `maxRetainedGrids * maxDepthRows` rows, with no
+            // allocation. `smoothScrollSeeds` is read under the same lock that
+            // published them, which is what keeps an ease that has committed
+            // but not yet been spent from losing its band.
+            retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
             retainedSnapshot = retention.snapshotPublished()
             fixedFloatBandsSnapshot = fixedFloatBandData  // Value-type copies (safe across frames)
             fixedFloatIntervalsSnapshot = fixedFloatIntervalData
@@ -2788,6 +2801,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     state.pendingDirtyRows.removeAll()
                     state.drawScroll = state.pendingScrollAccum
                     state.pendingScrollAccum = nil
+                    state.drawBlitClearBand = nil
                     state.drawAllRows = state.needsFullRedraw
                     state.needsFullRedraw = false
                     if !state.drawRows.isEmpty || state.drawScroll != nil || state.drawAllRows {
@@ -3219,24 +3233,215 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 gpuPerfNextIdx = 0
                 gpuStatsSlots.removeAll(keepingCapacity: true)
             }
-            // Per-layer row-scroll copy: the shift is staged, merged and
-            // consumed, but no blit is encoded yet. Refuse every one — the
-            // layer redraws its whole shifted region from the row slots the
-            // core already remapped, which is exactly what it did before this
-            // state existed. Only the rows that fit under the layer's origin
-            // are asked for; the rest is off the texture.
+            // The rows of a layer the current buffer set can actually resolve.
+            // Asked for by both the blit decision below and the layer draw
+            // loop, which have to agree on how tall the layer is.
+            func layerResolvableRowCount(_ li: Int, _ layer: SurfaceLayer) -> Int {
+                let sets = layerSetsSnapshot[li]
+                guard sets.count == 3 else { return 0 }
+                return min(sets[csi].rowLogicalToSlot.count, layer.rows)
+            }
+
+            // Collect into `retainedIndexScratch` the retained rows belonging
+            // to this layer at the current cell height, and report how many.
+            // The draw loop needs the indices as well as the count; the blit
+            // decision only needs the count, and refilling the scratch costs
+            // it nothing because the loop refills it per layer anyway.
+            func collectLayerRetainedRows(_ gridId: Int64) -> Int {
+                retainedIndexScratch.removeAll(keepingCapacity: true)
+                for (i, r) in retainedSnapshot.enumerated()
+                where r.gridId == gridId && r.cellHeightPx == Float(cellHi) {
+                    retainedIndexScratch.append(i)
+                }
+                return retainedIndexScratch.count
+            }
+
+            // Why a layer has to redraw every row instead of only the rows it
+            // owes. Asked twice per frame for a layer with a staged scroll:
+            // once here, where a layer that will redraw everything must refuse
+            // the blit that the redraw would overwrite, and once in the draw
+            // loop, which acts on it. The condition therefore lives in exactly
+            // one place. See the draw loop for what each term means.
+            //
+            // Only `loadActionIsClear` is not yet known here; the caller below
+            // explains why passing false for it is exact. A disagreement would
+            // cost a wasted blit or a wider redraw, never correctness: a full
+            // redraw is a superset of the blit's dirty rows, and a refusal
+            // dirties the whole scroll region.
+            func layerNeedsAllRows(
+                state: LayerDrawState?,
+                rowCount: Int,
+                retainedRowCount: Int,
+                loadActionIsClear: Bool
+            ) -> Bool {
+                guard let state else { return true }
+                return loadActionIsClear
+                    || state.drawAllRows
+                    || smoothScrolling
+                    || glowEnabled
+                    || retainedRowCount > 0
+                    || rowCount != state.lastDrawnRowCount
+            }
+
+            // Per-layer row-scroll copy. Each layer owns a rectangle of the
+            // shared back texture, so its shift is a blit of that rectangle
+            // only — `RowScrollBlitPlan` carries the origin that makes the
+            // copy stop at the layer's own columns. A layer that clears the
+            // ladder below is shifted on the GPU and redraws only the band the
+            // shift vacated plus the rows accumulated steps left stale; a
+            // layer that fails any rung falls back to exactly what this loop
+            // did before there was a blit — redraw the whole shifted region
+            // from the row slots the core already remapped. Only the rows that
+            // fit under the layer's origin are asked for either way; the rest
+            // is off the texture.
+            var useGpuScrollCopy = false
+            var scrollBlitEncoder: MTLBlitCommandEncoder? = nil
             for (li, layer) in layerSnapshot.enumerated().dropFirst() {
                 guard let state = layerStateSnapshot[li], let scroll = state.drawScroll else { continue }
                 state.drawScroll = nil
+
+                let originXPx = Int(layer.originPx.x.rounded(.down))
+                let originYPx = Int(layer.originPx.y.rounded(.down))
+                var refusalReason: String? = nil
+                var plan: RowScrollBlitPlan? = nil
+
+                // Surface-wide rungs first: none of them depends on the layer,
+                // and each is the same reason the main surface used to refuse.
+                if !hasPresentedOnceSnapshot {
+                    // Nothing valid to shift: the back texture has never been
+                    // presented, so its pixels are not the previous frame.
+                    refusalReason = "presented"
+                } else if smoothScrolling {
+                    // An eased frame renders every row through a shader offset,
+                    // and the one-frame extension at the `smoothScrolling`
+                    // definition keeps this true for the frame after the offset
+                    // returns to zero. Those back-texture pixels are already
+                    // shifted; shifting them again is the 1-row jitter that
+                    // extension exists to prevent.
+                    refusalReason = "smooth"
+                } else if drawableSizeChanged || !hasNewCommit {
+                    // A resized drawable has no previous pixels at these
+                    // coordinates, and without a new commit the row slots were
+                    // not remapped, so there is no shift to apply.
+                    refusalReason = "resize"
+                } else if glowEnabled {
+                    // Bloom composites the whole back texture and forces
+                    // .clear, which erases anything the blit moved.
+                    refusalReason = "glow"
+                } else if blurEnabled && !use2Pass {
+                    // Blur's partial redraw needs the overwrite-background and
+                    // alpha-glyph pipelines. Fail closed to a full redraw if
+                    // either could not be created.
+                    refusalReason = "blur"
+                } else if layer.rows <= 0 || layer.cols <= 0 {
+                    // A layer the layout has not sized yet owns no rectangle.
+                    refusalReason = "layout"
+                } else if scroll.totalRows != layer.rows || scroll.totalCols != layer.cols {
+                    // The shift was staged against a grid size the committed
+                    // layout no longer places, so its rows do not name this
+                    // rectangle's rows.
+                    refusalReason = "size"
+                } else {
+                    plan = RowScrollBlitPlan.make(
+                        rowStart: scroll.rowStart,
+                        rowEnd: scroll.rowEnd,
+                        rowsDelta: scroll.rowsDelta,
+                        originXPx: originXPx,
+                        originYPx: originYPx,
+                        widthPx: layer.cols * Int(cellWi),
+                        textureWidthPx: backTex.width,
+                        textureHeightPx: backTex.height,
+                        rowHeightPx: Int(cellHi)
+                    )
+                    if plan == nil {
+                        // Degenerate: nothing of the region survives the
+                        // texture clamp, or the shift covers it entirely.
+                        refusalReason = "plan"
+                    }
+                }
+
+                if let p = plan, refusalReason == nil {
+                    // The blit moves and clears pixels across the whole
+                    // scrolled rectangle, and a layer drawn on top of this one
+                    // owns some of those pixels: its content would be dragged
+                    // by the copy or erased by the vacated band, and nothing
+                    // marked it dirty. TEMPORARY: refuse the shift outright
+                    // rather than repaint the overlap. Step 5 replaces this
+                    // with blit-then-repaint, which keeps the shift and marks
+                    // the covering layers' intersecting rows dirty instead.
+                    // The snapshot is back-to-front, so only a higher index is
+                    // above this layer.
+                    let blitLeftPx = p.originXPx
+                    let blitRightPx = p.originXPx + p.copyWidthPx
+                    let blitTopPx = min(min(p.srcYPx, p.dstYPx), p.clearTopPx)
+                    let blitBottomPx = max(max(p.srcYPx, p.dstYPx) + p.copyHeightPx, p.clearBottomPx)
+                    for above in layerSnapshot[(li + 1)...] {
+                        guard above.rows > 0, above.cols > 0 else { continue }
+                        let aLeftPx = Int(above.originPx.x.rounded(.down))
+                        let aTopPx = Int(above.originPx.y.rounded(.down))
+                        let aRightPx = aLeftPx + above.cols * Int(cellWi)
+                        let aBottomPx = aTopPx + above.rows * Int(cellHi)
+                        if aLeftPx < blitRightPx, aRightPx > blitLeftPx,
+                           aTopPx < blitBottomPx, aBottomPx > blitTopPx {
+                            refusalReason = "overlap"
+                            break
+                        }
+                    }
+                }
+
+                if refusalReason == nil {
+                    // A layer that redraws every row overwrites whatever the
+                    // blit moved, so the shift would be pure cost. The frame
+                    // has not chosen its load action yet, but accepting a plan
+                    // sets `useGpuScrollCopy`, which forces
+                    // `forceReusePreviousContents`; combined with the
+                    // hasPresentedOnce and !drawableSizeChanged rungs already
+                    // passed, resolveSurfaceColorLoadAction returns .load on
+                    // its first branch. So .clear is impossible here.
+                    if layerNeedsAllRows(
+                        state: state,
+                        rowCount: layerResolvableRowCount(li, layer),
+                        retainedRowCount: collectLayerRetainedRows(layer.gridId),
+                        loadActionIsClear: false
+                    ) {
+                        refusalReason = "drawall"
+                    }
+                }
+
+                if refusalReason == nil, let p = plan {
+                    if scrollBlitEncoder == nil {
+                        ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
+                        scrollBlitEncoder = cmd.makeBlitCommandEncoder()
+                    }
+                    if let blit = scrollBlitEncoder, let scratch = scrollScratchTexture {
+                        let t0 = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                        encodeRowScrollBlit(blit, backTexture: backTex, scratch: scratch, plan: p)
+                        useGpuScrollCopy = true
+                        state.drawRows.append(contentsOf: p.dirtyRows)
+                        state.drawBlitClearBand = p.localClearBand()
+                        if ZonvieCore.appLogEnabled {
+                            let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
+                            ZonvieCore.appLog("[layer_blit] gridId=\(layer.gridId) rowStart=\(scroll.rowStart) rowEnd=\(p.clampedRowEnd) rowsDelta=\(scroll.rowsDelta) us=\(String(format: "%.1f", us))")
+                        }
+                        continue
+                    }
+                    // The scratch texture or the encoder could not be made.
+                    refusalReason = "plan"
+                }
+
+                if ZonvieCore.appLogEnabled, let reason = refusalReason {
+                    ZonvieCore.appLog("[layer_blit_refused] gridId=\(layer.gridId) reason=\(reason)")
+                }
                 guard let refusedRows = RowScrollBlitPlan.dirtyRowsWithoutBlit(
                     rowStart: scroll.rowStart,
                     rowEnd: scroll.rowEnd,
-                    originYPx: Int(layer.originPx.y.rounded(.down)),
+                    originYPx: originYPx,
                     textureHeightPx: backTex.height,
                     rowHeightPx: Int(cellHi)
                 ) else { continue }
                 state.drawRows.append(contentsOf: refusedRows)
             }
+            scrollBlitEncoder?.endEncoding()
 
             // Every root dirty row is overpainted below with a background band
             // spanning the whole drawable width before it is drawn (the root's
@@ -3304,18 +3509,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // flushes (e.g. statusline updates).
             let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
                 && hasPresentedOnceSnapshot && !smoothScrolling && !drawableSizeChanged && !glowEnabled
-            let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
+            let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnceSnapshot,
                 drawableSizeChanged: drawableSizeChanged,
                 shouldReusePreviousContents: shouldReusePreviousContents,
-                forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || canDirtyOnlyWithBlur)
+                forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
             )
 
             if rpd.colorAttachments[0].loadAction == .load {
                 if canBlinkFastPath {
                     ZonvieCore.appLog("[draw] loadAction=.load (blinkFastPath cursorRow=\(cursorGridRow))")
+                } else if useGpuScrollCopy {
+                    ZonvieCore.appLog("[draw] loadAction=.load (layerScrollCopy)")
                 } else {
                     ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
                 }
@@ -3644,7 +3851,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     let sets = layerSetsSnapshot[li]
                     guard sets.count == 3 else { continue }
                     let set = sets[csi]
-                    let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
+                    let rowCount = layerResolvableRowCount(li, layer)
                     guard rowCount > 0 else { continue }
                     // What this layer owes the frame; nil for a grid with no
                     // draw state, which is treated as owing everything.
@@ -3674,12 +3881,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // retained: both live in its grid-local space, which the
                     // transform above places. The index list is reused so a
                     // layer costs no allocation per frame.
-                    retainedIndexScratch.removeAll(keepingCapacity: true)
-                    for (i, r) in retainedSnapshot.enumerated()
-                    where r.gridId == layer.gridId && r.cellHeightPx == Float(cellHi) {
-                        retainedIndexScratch.append(i)
-                    }
-                    let retainedForLayerCount = retainedIndexScratch.count
+                    let retainedForLayerCount = collectLayerRetainedRows(layer.gridId)
                     let retainedBase = rowCount
 
                     // What one row of this layer owes the encoder. Shared by
@@ -3723,7 +3925,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     //  - an eased frame re-places every row with a shader
                     //    offset, so rows nobody marked dirty still move —
                     //    that covers both smoothScrolling and this layer's own
-                    //    retained rows, which exist only while it eases.
+                    //    retained rows. Those are pruned the moment the layer
+                    //    stops being displaced (draw's pruneUndisplaced), so a
+                    //    layer still holding them is one that is easing now or
+                    //    is about to; a layer that merely scrolled once in the
+                    //    past holds none.
                     //  - glow composites bloom from the whole back texture.
                     //  - a row count that changed since the last frame means
                     //    the layer grew or shrank without a layout diff having
@@ -3736,13 +3942,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // (flush.zig `skip_default_bg`), and the root's cells under a
                     // window are exactly those — nvim sends window content to the
                     // window's own grid. So the root has nothing to paint there.
-                    let drawAll = rpd.colorAttachments[0].loadAction == .clear
-                        || st == nil
-                        || st!.drawAllRows
-                        || smoothScrolling
-                        || glowEnabled
-                        || retainedForLayerCount > 0
-                        || rowCount != st!.lastDrawnRowCount
+                    let drawAll = layerNeedsAllRows(
+                        state: st,
+                        rowCount: rowCount,
+                        retainedRowCount: retainedForLayerCount,
+                        loadActionIsClear: rpd.colorAttachments[0].loadAction == .clear
+                    )
 
                     var encodedRows = 0
                     if drawAll {
@@ -3785,6 +3990,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         )
                     } else {
                         let dirtyLayerRows = st!.drawRows
+                        // The band this layer's GPU scroll copy vacated. In the
+                        // layer's own pixel space, which is what the transform
+                        // bound above places and what the row bands below use,
+                        // and inside this layer's whole-rect scissor. Drawn
+                        // before the rows: the plan's dirty rows cover the band,
+                        // and they must land on top of it, not under it.
+                        if let band = st!.drawBlitClearBand {
+                            enc.setRenderPipelineState(use2Pass ? (backgroundPipeline ?? pipeline!) : pipeline!)
+                            drawBackgroundClearBand(
+                                enc,
+                                clearBand: band,
+                                xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
+                                drawableHeight: Float(rowCount * Int(cellHi)),
+                                bgRGB: snappedBgRGB,
+                                gridId: layer.gridId
+                            )
+                        }
                         // A dirty row the core emptied resolves to nothing, so
                         // encodeSurfaceRowDraws skips it and .load keeps its old
                         // glyphs. Overwrite it explicitly — on the blur arm too,
@@ -3835,8 +4057,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     st?.lastDrawnRowCount = rowCount
                     // rows= counts the row draws this layer actually encoded
                     // (drawn rows plus overwritten empty rows); a quiet layer
-                    // encodes none. blit= is reserved for the GPU scroll copy.
-                    ZonvieCore.appLog("[layer_draw] gridId=\(layer.gridId) rows=\(encodedRows) of=\(rowCount) blit=0")
+                    // encodes none. blit=1 means a GPU scroll copy shifted this
+                    // layer's pixels this frame, so rows= counts only what the
+                    // shift left stale.
+                    ZonvieCore.appLog("[layer_draw] gridId=\(layer.gridId) rows=\(encodedRows) of=\(rowCount) blit=\(st?.drawBlitClearBand != nil ? 1 : 0)")
                 }
                 // Restore the surface's own pixel space for the cursor pass.
                 bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
@@ -4176,7 +4400,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let category: String
                 if customShaderHandled {
                     category = "shader"
-                } else if smoothScrolling {
+                } else if smoothScrolling || useGpuScrollCopy {
                     category = "scroll"
                 } else if isBlinkOnlyFrame {
                     category = "blink"
@@ -4191,6 +4415,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 let noopEligible = dirtyRows.isEmpty
                     && !smoothScrolling
+                    && !useGpuScrollCopy
                     && !drawableSizeChanged
                     && !blinkStateChanged
                     && hasPresentedOnceSnapshot
@@ -5674,7 +5899,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// A larger jump — page motion, a resize — is not seeded: it would displace
     /// the picture by the whole jump and ease back only the rows the retention
     /// can cover, animating a motion that was never animated. The rows are
-    /// still retained for it, and updateScrollOffsets prunes them unused.
+    /// still retained for it, and the draw path prunes them unused.
     private func captureLayerScrollStep(
         gridId: Int64,
         sets: [SurfaceBufferSet],
