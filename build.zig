@@ -22,6 +22,22 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const host_os = @import("builtin").os.tag;
 
+    // Run only the tests whose name contains this substring, e.g.
+    // `zig build e2e -Dtest-filter=scrollbind`. Wired into the three
+    // multi-scenario binaries: `test`, `e2e` and `gui-test`. A binary whose
+    // names all miss the filter simply runs nothing and passes.
+    //
+    // This exists so that iterating on one scenario never means editing a
+    // shared registration file: commenting out or deleting other scenarios to
+    // go faster loses them silently, because the build still succeeds.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose name contains this substring (test, e2e, gui-test)",
+    );
+    const test_filters: []const []const u8 =
+        if (test_filter) |f| &.{f} else &.{};
+
     // TOML parser dependency
     const zig_toml = b.dependency("zig-toml", .{
         .target = target,
@@ -326,6 +342,7 @@ pub fn build(b: *std.Build) !void {
     // as a separate module do not execute the dependency module's own tests.
     const core_tests = b.addTest(.{
         .root_module = core_mod,
+        .filters = test_filters,
     });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
@@ -569,6 +586,7 @@ pub fn build(b: *std.Build) !void {
     });
     const e2e_tests = b.addTest(.{
         .root_module = e2e_mod,
+        .filters = test_filters,
     });
     const e2e_run = b.addRunArtifact(e2e_tests);
     // Force rerun — results depend on the external nvim binary.
@@ -598,6 +616,7 @@ pub fn build(b: *std.Build) !void {
         }
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
+            .filters = test_filters,
         });
         const gui_run = b.addRunArtifact(gui_tests);
         // Force rerun — results depend on the external app and nvim.
