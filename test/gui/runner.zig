@@ -308,6 +308,26 @@ test "gui:visual_scrolled_layer_row_gating" {
     }
 }
 
+test "gui:visual_float_over_scrolled_split" {
+    // macOS only: reads the macOS frontend's [layer_blit] / [layer_draw] lines.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/float_over_scrolled_split.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_scrollbind_layers_blit_matches_jump" {
+    // macOS only: reads the macOS frontend's [layer_blit] line.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_proportional_font_support" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
