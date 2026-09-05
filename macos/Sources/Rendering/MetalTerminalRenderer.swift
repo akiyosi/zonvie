@@ -1062,6 +1062,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var commitGridIdScratch: [Int64] = []
     /// Indices into `retainedSnapshot` belonging to the layer being drawn.
     private var retainedIndexScratch: [Int] = []
+    /// The blit rectangles this frame's per-layer scroll copies were accepted
+    /// for, in the shared back texture's pixel space. Filled back-to-front by
+    /// the blit pre-pass so a layer above one of them can refuse its own shift.
+    /// Persistent only to keep its capacity; the pre-pass clears it per frame.
+    private var acceptedBlitRectsPx: [(leftPx: Int, topPx: Int, rightPx: Int, bottomPx: Int)] = []
     // Dirty marks staged during the current flush bracket (guarded by `lock`;
     // written only on the core thread while isInFlush). A draw() interleaving
     // with a flush consumes pendingDirtyRows BEFORE commitFlush publishes the
@@ -3283,6 +3288,91 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     || rowCount != state.lastDrawnRowCount
             }
 
+            // Repaint both sides of the damage an accepted per-layer blit does
+            // to the layers drawn on top of it.
+            //
+            // The blit rewrites every pixel of the scrolled rectangle R: the
+            // copy fills the region minus the shift and the vacated band fills
+            // the rest, so R spans the whole clamped region across the layer's
+            // own columns. A layer M above this one owns some of those pixels,
+            // and two things happened to them:
+            //  - M's pixels inside R moved by the shift, so every row of M that
+            //    intersects R has to be drawn again to put M back.
+            //  - what those pixels covered moved with them, into rows of this
+            //    layer that M no longer hides, so those rows have to be drawn
+            //    again from this layer's own vertices.
+            // The second set is the first, shifted by -rowsDelta in this
+            // layer's row space (a row r of the layer sits at originYPx + r *
+            // rowHeightPx, and the copy moves pixels by -rowsDelta rows). The
+            // unshifted rows go in as well: it costs a couple of rows and
+            // removes every off-by-one at the boundary.
+            //
+            // Both row ranges come from a pixel intersection, so a layer whose
+            // origin is not cell-aligned gets both rows a boundary straddles.
+            //
+            // Only layers ABOVE are marked, and none below needs to be: R is
+            // inside this layer's own rect, so every visible pixel in it
+            // belongs to this layer or to a layer drawn on top of it. And
+            // `layerSnapshot` is back-to-front, so a marked layer is drawn
+            // later in the render pass than this one — the covering layer's
+            // repaint lands on top of this layer's, which is the screen order.
+            func markLayersOverBlit(
+                _ li: Int,
+                _ layer: SurfaceLayer,
+                _ state: LayerDrawState,
+                _ p: RowScrollBlitPlan,
+                _ rowsDelta: Int
+            ) {
+                let rowHeightPx = Int(cellHi)
+                guard rowHeightPx > 0 else { return }
+                let blitLeftPx = p.originXPx
+                let blitRightPx = p.originXPx + p.copyWidthPx
+                let blitTopPx = min(min(p.srcYPx, p.dstYPx), p.clearTopPx)
+                let blitBottomPx = max(max(p.srcYPx, p.dstYPx) + p.copyHeightPx, p.clearBottomPx)
+                // The region in this layer's own rows; blitTopPx is exactly
+                // originYPx + rowStart * rowHeightPx.
+                let regionFirstRow = (blitTopPx - p.originYPx) / rowHeightPx
+                let regionLastRow = p.clampedRowEnd - 1
+                guard regionLastRow >= regionFirstRow else { return }
+
+                for mi in (li + 1)..<layerSnapshot.count {
+                    let above = layerSnapshot[mi]
+                    guard above.rows > 0, above.cols > 0 else { continue }
+                    let aLeftPx = Int(above.originPx.x.rounded(.down))
+                    let aTopPx = Int(above.originPx.y.rounded(.down))
+                    let aRightPx = aLeftPx + above.cols * Int(cellWi)
+                    let aBottomPx = aTopPx + above.rows * rowHeightPx
+                    guard aLeftPx < blitRightPx, aRightPx > blitLeftPx,
+                          aTopPx < blitBottomPx, aBottomPx > blitTopPx
+                    else { continue }
+                    let overlapTopPx = max(aTopPx, blitTopPx)
+                    let overlapBottomPx = min(aBottomPx, blitBottomPx)
+
+                    // The covering layer puts itself back. A layer with no draw
+                    // state redraws every row anyway, so there is nothing to
+                    // mark for it.
+                    if let aboveState = layerStateSnapshot[mi] {
+                        let aFirstRow = max(0, (overlapTopPx - aTopPx) / rowHeightPx)
+                        let aLastRow = min(above.rows - 1, (overlapBottomPx - 1 - aTopPx) / rowHeightPx)
+                        if aLastRow >= aFirstRow {
+                            aboveState.drawRows.append(contentsOf: aFirstRow...aLastRow)
+                        }
+                    }
+
+                    // This layer puts back the rows the covering layer's pixels
+                    // were dragged into, plus the rows they came from.
+                    let underFirstRow = max(regionFirstRow, (overlapTopPx - p.originYPx) / rowHeightPx)
+                    let underLastRow = min(regionLastRow, (overlapBottomPx - 1 - p.originYPx) / rowHeightPx)
+                    guard underLastRow >= underFirstRow else { continue }
+                    state.drawRows.append(contentsOf: underFirstRow...underLastRow)
+                    let shiftedFirstRow = max(regionFirstRow, underFirstRow - rowsDelta)
+                    let shiftedLastRow = min(regionLastRow, underLastRow - rowsDelta)
+                    if shiftedLastRow >= shiftedFirstRow {
+                        state.drawRows.append(contentsOf: shiftedFirstRow...shiftedLastRow)
+                    }
+                }
+            }
+
             // Per-layer row-scroll copy. Each layer owns a rectangle of the
             // shared back texture, so its shift is a blit of that rectangle
             // only — `RowScrollBlitPlan` carries the origin that makes the
@@ -3296,6 +3386,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // is off the texture.
             var useGpuScrollCopy = false
             var scrollBlitEncoder: MTLBlitCommandEncoder? = nil
+            acceptedBlitRectsPx.removeAll(keepingCapacity: true)
             for (li, layer) in layerSnapshot.enumerated().dropFirst() {
                 guard let state = layerStateSnapshot[li], let scroll = state.drawScroll else { continue }
                 state.drawScroll = nil
@@ -3360,32 +3451,28 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
                 }
 
-                if let p = plan, refusalReason == nil {
-                    // The blit moves and clears pixels across the whole
-                    // scrolled rectangle, and a layer drawn on top of this one
-                    // owns some of those pixels: its content would be dragged
-                    // by the copy or erased by the vacated band, and nothing
-                    // marked it dirty. TEMPORARY: refuse the shift outright
-                    // rather than repaint the overlap. Step 5 replaces this
-                    // with blit-then-repaint, which keeps the shift and marks
-                    // the covering layers' intersecting rows dirty instead.
-                    // The snapshot is back-to-front, so only a higher index is
-                    // above this layer.
-                    let blitLeftPx = p.originXPx
-                    let blitRightPx = p.originXPx + p.copyWidthPx
-                    let blitTopPx = min(min(p.srcYPx, p.dstYPx), p.clearTopPx)
-                    let blitBottomPx = max(max(p.srcYPx, p.dstYPx) + p.copyHeightPx, p.clearBottomPx)
-                    for above in layerSnapshot[(li + 1)...] {
-                        guard above.rows > 0, above.cols > 0 else { continue }
-                        let aLeftPx = Int(above.originPx.x.rounded(.down))
-                        let aTopPx = Int(above.originPx.y.rounded(.down))
-                        let aRightPx = aLeftPx + above.cols * Int(cellWi)
-                        let aBottomPx = aTopPx + above.rows * Int(cellHi)
-                        if aLeftPx < blitRightPx, aRightPx > blitLeftPx,
-                           aTopPx < blitBottomPx, aBottomPx > blitTopPx {
-                            refusalReason = "overlap"
-                            break
-                        }
+                if plan != nil, refusalReason == nil {
+                    // The one overlap case that still refuses, now that
+                    // markLayersOverBlit repaints the rest. Every accepted blit
+                    // goes into one blit encoder in snapshot order, so a layer
+                    // above one that was already accepted would copy pixels the
+                    // lower shift has just moved, and carry the smear into its
+                    // own rows. Repainting cannot fix that — putting one layer
+                    // back would undo the other's shift — so drop the upper
+                    // shift and let the refusal path below redraw that layer's
+                    // whole region. This also keeps the marking below strictly
+                    // one-directional: a layer that gains rows from a lower
+                    // layer's blit never also holds a blit of its own that
+                    // depends on the pixels those rows are about to overwrite.
+                    let layerLeftPx = originXPx
+                    let layerRightPx = originXPx + layer.cols * Int(cellWi)
+                    let layerTopPx = originYPx
+                    let layerBottomPx = originYPx + layer.rows * Int(cellHi)
+                    for r in acceptedBlitRectsPx
+                    where layerLeftPx < r.rightPx && layerRightPx > r.leftPx
+                        && layerTopPx < r.bottomPx && layerBottomPx > r.topPx {
+                        refusalReason = "overlap"
+                        break
                     }
                 }
 
@@ -3419,6 +3506,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         useGpuScrollCopy = true
                         state.drawRows.append(contentsOf: p.dirtyRows)
                         state.drawBlitClearBand = p.localClearBand()
+                        markLayersOverBlit(li, layer, state, p, scroll.rowsDelta)
+                        acceptedBlitRectsPx.append((
+                            leftPx: p.originXPx,
+                            topPx: min(min(p.srcYPx, p.dstYPx), p.clearTopPx),
+                            rightPx: p.originXPx + p.copyWidthPx,
+                            bottomPx: max(max(p.srcYPx, p.dstYPx) + p.copyHeightPx, p.clearBottomPx)
+                        ))
                         if ZonvieCore.appLogEnabled {
                             let us = (CFAbsoluteTimeGetCurrent() - t0) * 1_000_000
                             ZonvieCore.appLog("[layer_blit] gridId=\(layer.gridId) rowStart=\(scroll.rowStart) rowEnd=\(p.clampedRowEnd) rowsDelta=\(scroll.rowsDelta) us=\(String(format: "%.1f", us))")
