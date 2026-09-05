@@ -265,6 +265,32 @@ final class ScrollRetention {
         lock.unlock()
     }
 
+    /// Drop the rows of every grid that is neither displaced now nor about to
+    /// be. This is the whole lifetime rule for a published row: it exists to
+    /// fill the band a grid's own sub-cell offset opens, so with no offset it
+    /// would be drawn one row off real content — and its mere presence makes
+    /// the grid's layer redraw every row (see `layerNeedsAllRows`). It must
+    /// therefore be applied on every frame, not only on the frames an ease
+    /// happens to rebuild the offsets on.
+    ///
+    /// `seedGrids` names the grids whose ease seed has been committed but not
+    /// yet spent. The seed and the rows are published together, while the
+    /// offset they belong to is installed one main-thread step later, so a
+    /// prune that landed in between would empty the band of the ease that is
+    /// about to start.
+    ///
+    /// No allocation: both lookups are linear scans of arrays the caller
+    /// already owns, over at most `maxRetainedGrids * maxDepthRows` rows.
+    func pruneUndisplaced(
+        offsets: [MetalTerminalRenderer.ScrollOffset],
+        seedGrids: [(gridId: Int64, rowsDelta: Int)]
+    ) {
+        prunePublished { retained in
+            !offsets.contains { Int64($0.grid_id) == retained.gridId }
+                && !seedGrids.contains { $0.gridId == retained.gridId }
+        }
+    }
+
     func publishedCount(gridId: Int64) -> Int {
         lock.lock()
         defer { lock.unlock() }

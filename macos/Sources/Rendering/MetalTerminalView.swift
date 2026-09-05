@@ -2130,7 +2130,7 @@ final class MetalTerminalView: MTKView {
     ///
     /// What it would reset is handled elsewhere: pendingRetentionReplay by
     /// commitFlush, bracketSourceShift by beginFlush, published rows by
-    /// updateScrollOffsets' prune. scrollOffsetData is rebuilt whenever
+    /// the draw path's prune. scrollOffsetData is rebuilt whenever
     /// anything is displaced — updateScrollShaderOffset takes an idle early-out
     /// once nothing is, having pushed one empty state through first.
     ///
@@ -2609,7 +2609,7 @@ final class MetalTerminalView: MTKView {
             // Mirrors processPendingScrollClears' gestureOwns: only a scroll
             // whose compensation will displace the grid needs its row kept —
             // an unowned (keyboard/nvim) scroll here clears the offset, and
-            // updateScrollOffsets would prune the retained row unused.
+            // the draw path would prune the retained row unused.
             //
             // padIsDriving covers the bound windows of a 'scrollbind' group on
             // their first arrival, where none of the three terms above hold yet:
@@ -2999,7 +2999,7 @@ final class MetalTerminalView: MTKView {
         // retained — the shape a held key produces. Page motion and
         // non-fast-path redraws seed nothing and simply land where they land;
         // rows may still be retained for them, but with no offset to show
-        // them in, updateScrollOffsets prunes them unused.
+        // them in, the draw path prunes them unused.
         seedScratch.removeAll(keepingCapacity: true)
         for seed in renderer.takeSmoothScrollSeeds() {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
