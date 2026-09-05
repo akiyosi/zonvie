@@ -445,6 +445,53 @@ private enum ScrollRetentionTests {
         )
     }
 
+    /// The lifetime rule: a published row lives exactly as long as its grid is
+    /// displaced. The prune used to run only from the offset rebuild, which the
+    /// view skips entirely once nothing is easing, so a grid that scrolled once
+    /// kept its rows for the rest of the session — drawn a row off real content
+    /// and forcing its layer to redraw every row on every frame.
+    private static func verifyUndisplacedPrune(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(2)
+        retention.beginFlush()
+        retention.beginStep(gridId: 2, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 2, targetRow: 0))
+        retention.beginStep(gridId: 3, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
+        _ = retention.commit()
+
+        let displaced = MetalTerminalRenderer.ScrollOffset(
+            grid_id: 3, offset_y: 0.04, content_top_y: 1, content_bottom_y: -1
+        )
+        retention.pruneUndisplaced(offsets: [displaced], seedGrids: [])
+        requireEqual(
+            retention.publishedCount(gridId: 2), 0,
+            "a grid with no scroll offset loses its retained rows"
+        )
+        requireEqual(
+            retention.publishedCount(gridId: 3), 1,
+            "a grid that is still displaced keeps them"
+        )
+
+        // A step whose ease seed has been committed but not yet spent has no
+        // offset yet. Pruning it there would empty the band of the ease that is
+        // one main-thread step away from starting.
+        retention.beginFlush()
+        retention.beginStep(gridId: 4, rowsDelta: 1, pivotTargetRow: 0)
+        retention.stage(makeRow(retention, gridId: 4, targetRow: 0))
+        _ = retention.commit()
+        retention.pruneUndisplaced(offsets: [], seedGrids: [(gridId: 4, rowsDelta: 1)])
+        requireEqual(
+            retention.publishedCount(gridId: 4), 1,
+            "an unspent ease seed keeps its grid's rows alive"
+        )
+        retention.pruneUndisplaced(offsets: [], seedGrids: [])
+        requireEqual(
+            retention.publishedCount(gridId: 4), 0,
+            "a seed spent without producing an offset stops keeping them"
+        )
+    }
+
     /// The depth is what the ease can reach, so it bounds a single step.
     private static func verifyDepthClamp(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
@@ -478,6 +525,7 @@ private enum ScrollRetentionTests {
         verifyCapSurvivesAbortedBrackets(device: device)
         verifyEvictionIsReported(device: device)
         verifyPrune(device: device)
+        verifyUndisplacedPrune(device: device)
         verifyDepthClamp(device: device)
         print("ScrollRetentionTests: OK")
     }
