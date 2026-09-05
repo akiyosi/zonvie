@@ -1425,15 +1425,6 @@ pub fn handleRedraw(
                         return err;
                     };
 
-                    // Update external grid target size so NDC viewport matches the actual grid.
-                    // Only for grids that are actual external windows (ext_windows splits
-                    // or UI-extension grids like popupmenu/messages). Float windows
-                    // (e.g. Telescope) must NOT get entries here — they render on the
-                    // global grid and their NDC uses sg.rows/sg.cols directly.
-                    if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
-                        try grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width });
-                    }
-
                     // Record the global grid size so core can detect a
                     // Neovim-initiated resize (`:set columns=` / `:set lines=`)
                     // after the batch completes.
@@ -1693,7 +1684,6 @@ pub fn handleRedraw(
                     // On hide (tab switch), keep tracking so win_pos can restore.
                     if (is_close) {
                         _ = grid.ext_windows_grids.remove(grid_id);
-                        _ = grid.external_grid_target_sizes.remove(grid_id);
                     }
                 }
             },
