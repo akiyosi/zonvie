@@ -13120,124 +13120,10 @@ test "every routed view reaches the msg_show callback as the matching ABI view" 
     }
 }
 
-test "row-mode and whole-screen composition produce the same main-grid vertices" {
-    // The two paths used to carry separate copies of the run-length
-    // composition loop, so a fix to one could silently miss the other. They
-    // share one body now; this pins that they still agree cell for cell.
-    const Collector = struct {
-        verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
-        alloc: std.mem.Allocator,
-
-        fn onRow(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_count: u32,
-            verts: ?[*]const c_api.Vertex,
-            vert_count: usize,
-            flags: u32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = row_start;
-            _ = row_count;
-            _ = flags;
-            _ = total_rows;
-            _ = total_cols;
-            if (grid_id != 1) return;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const v = verts orelse return;
-            self.verts.appendSlice(self.alloc, v[0..vert_count]) catch {};
-        }
-
-        fn onPartial(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_count: u32,
-            main_verts: ?[*]const c_api.Vertex,
-            main_count: usize,
-            flags: u32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = grid_id;
-            _ = row_start;
-            _ = row_count;
-            _ = total_rows;
-            _ = total_cols;
-            const cursor_verts: ?[*]const c_api.Vertex = null;
-            const cursor_count: usize = 0;
-            _ = cursor_verts;
-            _ = cursor_count;
-            _ = flags;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            const v = main_verts orelse return;
-            self.verts.appendSlice(self.alloc, v[0..main_count]) catch {};
-        }
-    };
-
-    // Same grid contents for both runs: several distinct hl runs so the
-    // run-length batching, the hl cache and the scalar extraction all engage.
-    const seed_text = "abcABC  ..";
-    const seed_hls = [_]u32{ 0, 0, 1, 1, 1, 2, 2, 0, 3, 3 };
-
-    const Runner = struct {
-        fn collect(alloc: std.mem.Allocator, row_mode: bool, out: *std.ArrayListUnmanaged(c_api.Vertex)) !void {
-            var core = Core.initForTest(alloc);
-            defer core.deinitForTest();
-            try core.grid.resize(2, 10);
-            for (0..2) |r| {
-                for (seed_text, seed_hls, 0..) |ch, hl, c| {
-                    core.grid.putCell(@intCast(r), @intCast(c), ch, hl);
-                }
-            }
-            core.drawable_w_px = 10;
-            core.drawable_h_px = 2;
-            core.cell_w_px = 1;
-            core.cell_h_px = 1;
-
-            var collector = Collector{ .alloc = alloc };
-            defer collector.verts.deinit(alloc);
-            core.ctx = &collector;
-            if (row_mode) {
-                core.cb.on_vertices_row = Collector.onRow;
-            } else {
-                core.cb.on_vertices_row = Collector.onPartial;
-            }
-
-            var flush_ctx = FlushCtx{ .core = &core };
-            try flush_ctx.onFlush(2, 10);
-            try out.appendSlice(alloc, collector.verts.items);
-        }
-    };
-
-    const alloc = std.testing.allocator;
-    var row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
-    defer row_verts.deinit(alloc);
-    var screen_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
-    defer screen_verts.deinit(alloc);
-
-    try Runner.collect(alloc, true, &row_verts);
-    try Runner.collect(alloc, false, &screen_verts);
-
-    // Both paths must have actually produced something, or the comparison
-    // below would pass on two empty lists.
-    try std.testing.expect(row_verts.items.len > 0);
-    try std.testing.expectEqual(row_verts.items.len, screen_verts.items.len);
-
-    for (row_verts.items, screen_verts.items) |a, b| {
-        try std.testing.expectEqual(a.position, b.position);
-        try std.testing.expectEqual(a.color, b.color);
-        try std.testing.expectEqual(a.grid_id, b.grid_id);
-        try std.testing.expectEqual(a.deco_flags, b.deco_flags);
-    }
-}
-
 test "composeMainRowRuns writes one row's attributes, scalars and glow" {
-    // The differential test above can only catch a disagreement BETWEEN the
-    // two call sites, so it cannot see a fault inside the shared body - both
-    // sides would break identically. This drives the body directly.
+    // The flush-level tests reach this body only through whatever the row
+    // path happens to emit, so a fault inside it can hide behind them. This
+    // drives the body directly.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
 
@@ -13451,30 +13337,6 @@ const GlowCounter = struct {
         self.count(verts, vert_count);
     }
 
-    fn onPartial(
-        ctx: ?*anyopaque,
-        grid_id: i64,
-        row_start: u32,
-        row_count: u32,
-        main_verts: ?[*]const c_api.Vertex,
-        main_count: usize,
-        flags: u32,
-        total_rows: u32,
-        total_cols: u32,
-    ) callconv(.c) void {
-        _ = grid_id;
-        _ = row_start;
-        _ = row_count;
-        _ = total_rows;
-        _ = total_cols;
-        const cursor_verts: ?[*]const c_api.Vertex = null;
-        const cursor_count: usize = 0;
-        _ = cursor_verts;
-        _ = cursor_count;
-        _ = flags;
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
-        self.count(main_verts, main_count);
-    }
 };
 
 /// Define the two glow-test highlights and arm glow. hl 42 is in the set,
@@ -13490,12 +13352,12 @@ fn armGlowForTest(core: *Core, glow_all: bool) !void {
     core.glow_enabled.store(true, .release);
 }
 
-test "a main-grid subgrid overlay glows per cell in both composition modes" {
+test "a main-grid subgrid overlay glows per cell" {
     // The subgrid overlay decides glow per cell, separately from the main-grid
     // run path. Require the decision to follow the cell's own highlight rather
     // than being uniform.
     const Runner = struct {
-        fn run(alloc: std.mem.Allocator, row_mode: bool, glow_all: bool) !GlowCounter {
+        fn run(alloc: std.mem.Allocator, glow_all: bool) !GlowCounter {
             var core = Core.initForTest(alloc);
             defer core.deinitForTest();
             try core.grid.resize(1, 4);
@@ -13517,11 +13379,7 @@ test "a main-grid subgrid overlay glows per cell in both composition modes" {
 
             var counter = GlowCounter{ .target_grid = 2 };
             core.ctx = &counter;
-            if (row_mode) {
-                core.cb.on_vertices_row = GlowCounter.onRow;
-            } else {
-                core.cb.on_vertices_row = GlowCounter.onPartial;
-            }
+            core.cb.on_vertices_row = GlowCounter.onRow;
             StubGlyphCallbacks.install(&core);
 
             var flush_ctx = FlushCtx{ .core = &core };
@@ -13531,11 +13389,9 @@ test "a main-grid subgrid overlay glows per cell in both composition modes" {
     };
 
     const alloc = std.testing.allocator;
-    for ([_]bool{ true, false }) |row_mode| {
-        for ([_]bool{ false, true }) |glow_all| {
-            const counter = try Runner.run(alloc, row_mode, glow_all);
-            try counter.expect(glow_all);
-        }
+    for ([_]bool{ false, true }) |glow_all| {
+        const counter = try Runner.run(alloc, glow_all);
+        try counter.expect(glow_all);
     }
 }
 
