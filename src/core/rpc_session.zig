@@ -1602,7 +1602,6 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
             if (promote_target) |p| {
                 try self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col);
                 _ = self.grid.ext_windows_grids.remove(p.grid_id);
-                _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
                 _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
                 try self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols);
                 try self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols);
@@ -3200,12 +3199,12 @@ const RedrawDriver = struct {
 };
 
 test "a grid that stops being external publishes its real row count" {
-    // Reproduces the stale `external_grid_target_sizes` entry through the
-    // core's own redraw handling: an external window is resized (which stores
-    // the entry), then converted back to a float by `win_float_pos` (which
-    // drops it from `external_grids`), then resized again. The second resize
-    // is not stored, so the surface size the row callback publishes freezes at
-    // the pre-transition size and the window renders truncated.
+    // Drives the transition through the core's own redraw handling: an
+    // external window is resized, converted back to a float by
+    // `win_float_pos` (which drops it from `external_grids`), then resized
+    // again. The surface size the row callback publishes must follow the grid
+    // across the transition, or the window renders truncated to a size it
+    // last had while external.
     const FLOAT_GRID: i64 = 5;
     const FLOAT_WIN: i64 = 500;
     const FLOAT_COLS: i64 = 10;
@@ -3260,7 +3259,6 @@ test "a grid that stops being external publishes its real row count" {
     var fctx = flush.FlushCtx{ .core = &core };
 
     // 1. The float grid is created and promoted to its own top-level window.
-    //    `grid_resize` precedes `win_external_pos`, so no entry exists yet.
     var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
     var resize_new = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = 5 } };
     var ext_pos = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_WIN } };
@@ -3313,8 +3311,9 @@ test "a grid that stops being external publishes its real row count" {
 
 test "a grid resized while hidden publishes its real row count when shown again" {
     // The other exit from external tracking: `win_hide` (sent for every window
-    // of a non-current tab) drops the grid from `external_grids` too, so a
-    // `grid_resize` that lands while it is hidden is not recorded either.
+    // of a non-current tab) drops the grid from `external_grids` too, so the
+    // `grid_resize` that lands while it is hidden arrives while the grid is
+    // in neither tracking set.
     const HIDDEN_GRID: i64 = 6;
     const HIDDEN_WIN: i64 = 600;
     const HIDDEN_COLS: i64 = 10;
@@ -3381,7 +3380,7 @@ test "a grid resized while hidden publishes its real row count when shown again"
     };
     try RedrawDriver.run(&fctx, arena, &batch1);
 
-    // Resize while external: the entry is stored.
+    // Resize while external.
     var batch2 = [_]mp.Value{.{ .arr = &ev_resize_new }};
     try RedrawDriver.run(&fctx, arena, &batch2);
 

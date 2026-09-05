@@ -1413,11 +1413,6 @@ pub const Grid = struct {
     // Only removed on win_close (permanent close).
     ext_windows_grids: std.AutoHashMapUnmanaged(i64, i64) = .{}, // grid_id -> win_id
 
-    // ext_windows: actual grid dimensions for each external grid.
-    // Updated on grid_resize so NDC viewport always matches the grid data.
-    // Also set initially by tryResizeGrid for new windows.
-    external_grid_target_sizes: std.AutoHashMapUnmanaged(i64, GridSize) = .{},
-
     // ext_windows: set during handleRedraw when a composited (non-external,
     // non-float) editor window receives win_close. Used by the promotion
     // logic in rpc_session.zig to detect that Neovim may have re-composited
@@ -1540,7 +1535,6 @@ pub const Grid = struct {
         self.pending_win_ops.deinit(self.alloc);
         self.pending_ext_window_grids.deinit(self.alloc);
         self.ext_windows_grids.deinit(self.alloc);
-        self.external_grid_target_sizes.deinit(self.alloc);
         self.grid_metrics.deinit(self.alloc);
         self.viewport.deinit(self.alloc);
         self.viewport_margins.deinit(self.alloc);
@@ -2815,7 +2809,6 @@ pub const Grid = struct {
         _ = self.external_grids.remove(grid_id);
         _ = self.pending_ext_window_grids.remove(grid_id);
         _ = self.ext_windows_grids.remove(grid_id);
-        _ = self.external_grid_target_sizes.remove(grid_id);
 
         if (old_pos) |p| {
             if (self.external_grids.contains(p.anchor_grid)) {
@@ -2957,17 +2950,6 @@ pub const Grid = struct {
         try self.setWinPos(grid_id, win_id, row, col);
     }
 
-    /// Drop the surface size recorded for a grid that no longer renders as its
-    /// own surface. `grid_resize` only refreshes `external_grid_target_sizes`
-    /// while the grid is in `external_grids` or `ext_windows_grids`, so an
-    /// entry left behind after the grid leaves both freezes the published
-    /// viewport at the pre-transition size while `sg.rows` keeps moving, and
-    /// the window renders truncated to the stale row count.
-    fn dropUntrackedTargetSize(self: *Grid, grid_id: i64) void {
-        if (self.ext_windows_grids.contains(grid_id)) return;
-        _ = self.external_grid_target_sizes.remove(grid_id);
-    }
-
     pub fn setWinFloatPos(
         self: *Grid,
         grid_id: i64,
@@ -3031,7 +3013,6 @@ pub const Grid = struct {
         // This allows a grid to transition from external back to float.
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
-        self.dropUntrackedTargetSize(grid_id);
 
         // Mark old position dirty if this float is moving
         var affects_main = false;
@@ -3143,7 +3124,6 @@ pub const Grid = struct {
         _ = self.win_layer.remove(grid_id);
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
-        self.dropUntrackedTargetSize(grid_id);
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
             self.cursor_rev +%= 1;

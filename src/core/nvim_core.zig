@@ -1516,10 +1516,6 @@ pub const Core = struct {
         // the redraw_handler.zig stale-detection path that re-promotes
         // it to external (redraw_handler.zig:~1171).
         self.grid.ext_windows_grids.clearRetainingCapacity();
-        // external_grid_target_sizes: dimensions used to match resize
-        // events to known external grids (redraw_handler.zig:~960).
-        // Stale entries would feed the wrong size into the new session.
-        self.grid.external_grid_target_sizes.clearRetainingCapacity();
         // pending_ext_window_grids: grids waiting for their first
         // grid_resize before the frontend window is created.
         self.grid.pending_ext_window_grids.clearRetainingCapacity();
@@ -4671,11 +4667,11 @@ pub const Core = struct {
 
     /// Request resize of a specific grid (for external windows).
     /// Request Neovim to resize an external grid.
-    /// Does NOT update external_grid_target_sizes here — the authoritative
-    /// update happens in grid_resize (redraw_handler.zig) when Neovim confirms
-    /// the new size. Updating target_sizes eagerly would cause viewport_rows
-    /// to temporarily mismatch the NDC baked into existing row vertices (e.g.
-    /// frontend requests 44 rows but Neovim keeps 45 including winbar).
+    /// The published surface size follows `sg.rows`/`sg.cols`, which only move
+    /// when Neovim confirms the new size via grid_resize (redraw_handler.zig).
+    /// Anticipating the requested size here would make the published viewport
+    /// mismatch the NDC baked into existing row vertices (e.g. the frontend
+    /// requests 44 rows but Neovim keeps 45 including winbar).
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
             self.log.write("requestTryResizeGrid error: {any}\n", .{e});
