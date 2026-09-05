@@ -249,9 +249,8 @@ fn finishVertexBudgetTransaction(core: *Core, commit: bool) void {
 /// accounting and only the rows this attempt consumed are owed again.
 fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_main_ledger: bool) void {
     if (!core.vertex_budget_transaction_active) return;
-    // The glyph mirrors describe the displayed frame only while publications
-    // are being accepted; a refusal leaves them describing a frame that never
-    // reached the screen. Atlas reclamation reads them, so it has to know.
+    // A refusal leaves the glyph mirrors describing a frame that never reached
+    // the screen, and atlas reclamation reads them.
     if (commit) core.display_mirror_stale = false;
     clearTouchedVertexBudgetSurfaces(core);
     if (!commit and restore_main_ledger and restoreMainVertexRowLedger(core)) {
@@ -293,9 +292,8 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_mai
     core.vertex_budget_transaction_active = false;
 }
 
-/// Reset one grid's row ledger before it is written again. Grid 1 is not part
-/// of subgrid_surface_vertex_count, which counts standalone sub-grid surfaces
-/// only, so only a sub-grid adjusts it here.
+/// Reset one grid's row ledger before it is written again. Only a sub-grid
+/// adjusts subgrid_surface_vertex_count; grid 1 is not counted there.
 fn prepareVertexRowLedgerForWrite(core: *Core, grid_id: i64, buf: *grid_mod.GridBuf) void {
     if (buf.vertex_row_ledger_valid) return;
     core.flush_vertex_count_aggregate -|= buf.surface_vertex_count;
@@ -332,9 +330,8 @@ fn replaceSurfaceRowVertexCount(
 }
 
 /// Publish `new_count` as grid `grid_id`'s vertex count for `row`, replacing
-/// whatever that row previously contributed. Handles grid 1 and every sub-grid
-/// through one path; only a sub-grid participates in
-/// subgrid_surface_vertex_count.
+/// whatever that row previously contributed. Grid 1 and every sub-grid share
+/// this path; only a sub-grid participates in subgrid_surface_vertex_count.
 fn replaceGridSurfaceRowVertexCount(
     core: *Core,
     grid_id: i64,
@@ -405,10 +402,9 @@ fn csrResizeExact(
 /// The caller deposits each row's count at `offsets[row + 1]`, leaving
 /// `offsets[0]` zero; afterwards `offsets[row]` is that row's start and
 /// `offsets[offsets.len - 1]` is the total, which callers assert against
-/// their own count. Used by the external-float row index; only this middle of
-/// the CSR build was ever common to more than one index, because the counting
-/// and filling ends iterate different collections and emit indices into
-/// different arrays.
+/// their own count. Only this middle of the CSR build is shared: the counting
+/// and filling ends iterate different collections and emit into different
+/// arrays.
 fn csrOffsetsFromCounts(offsets: []usize) void {
     for (1..offsets.len) |i| {
         offsets[i] += offsets[i - 1];
@@ -826,11 +822,10 @@ inline fn resolveHlCached(
 /// Whether one cell glows: everything glows in `glow_all` mode, otherwise
 /// only the highlights in the resolved set do.
 ///
-/// Five places made this decision -- the main-grid run composition, the
-/// subgrid overlay in each of the two composition modes, and the external
-/// grid's own rows plus the floats composited onto it. Callers keep their own
-/// snapshot of the two glow fields and their own `glow_enabled` guard; only
-/// the decision is shared.
+/// Three places make this decision: the main-grid run composition, the external
+/// grid's own rows, and the floats composited onto it. Callers keep their own
+/// snapshot of the two glow fields and their own `glow_enabled` guard; only the
+/// decision is shared.
 ///
 /// `inline` matters only in Debug. Measured with `nm` on a ReleaseFast
 /// build: this, `resolveHlCached`, and the plain-`fn`
@@ -997,10 +992,8 @@ pub const FlushCache = struct {
 // ---------------------------------------------------------------------------
 pub const VH = struct {
 
-    /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
-    /// Quad corners in grid-local pixels: TL, TR, BL, BR.
-    /// The frontend converts to NDC with the layer transform, so the
-    /// core never needs the surface extent here.
+    /// Quad corners in grid-local pixels: TL, TR, BL, BR. The frontend applies
+    /// the layer transform, so the core never needs the surface extent here.
     inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
         return .{
             .{ x0, y0 },
@@ -1198,11 +1191,9 @@ pub const RowGenParams = struct {
     is_cmdline: bool,
     glow_enabled: bool,
     /// Skip runs whose background is the surface default. Set for the ROOT
-    /// grid of a surface that draws other grids as layers: the root is a
-    /// container there, its cells are blank, and every layer paints the same
-    /// default background over it. Painting it twice compounds alpha under
-    /// blur (each pass is a premultiplied `over`), which is what made the
-    /// main window opaque while the alpha-0 ext-cmdline stayed translucent.
+    /// grid of a surface that draws other grids as layers: each layer paints
+    /// that background itself, and a second premultiplied `over` compounds
+    /// alpha under blur.
     skip_default_bg: bool = false,
     max_vertices: usize = MAX_VERTICES_PER_CALLBACK,
 };
@@ -2642,14 +2633,11 @@ fn externalFloatAnchorEntries(
 }
 
 /// Whether one grid's pending scroll can be published as a row shift rather
-/// than a regeneration of the whole scrolled band.
-///
-/// Every condition here is internal to the grid. Composition used to add two
-/// more -- the scrolling grid had to span the full surface width, and no other
-/// grid could overlap the band -- because a surface row buffer held cells from
-/// several grids. Each grid owns its rows now, so a shift cannot disturb a
-/// neighbour and those conditions are gone. That is what makes a vertical
-/// split, a float, the content under a float, and a scrollbind group eligible.
+/// than a regeneration of the whole scrolled band. Every condition here is
+/// internal to the grid: composition also required full surface width and no
+/// overlapping grid, because one surface row buffer held several grids' cells.
+/// Each grid owns its rows now, so a split, a float, the content under a
+/// float, and a scrollbind group are all eligible.
 fn gridScrollFastPathRegion(
     op: grid_mod.ScrollDelta,
     grid_rows: u32,
@@ -2668,12 +2656,10 @@ fn gridScrollFastPathRegion(
     if (row_end <= op.top or row_end - op.top <= 1) return null;
     const col_start = @min(op.left, viewport_cols);
     const col_end = @min(op.right, viewport_cols);
-    // Full local width: a partial-width scroll would leave the columns outside
-    // it holding shifted content.
+    // Full local width: outside columns would otherwise hold shifted content.
     if (col_start != 0 or col_end != viewport_cols) return null;
 
-    // Beyond half the region, too many rows are vacated for the shift to save
-    // anything over a plain regeneration.
+    // Beyond half the region, the vacated rows outnumber what the shift saves.
     const region_height = row_end - op.top;
     const abs_rows: u32 = if (op.rows == std.math.minInt(i32))
         region_height
@@ -2695,9 +2681,8 @@ fn dispatchGridRowScroll(
     grid_id: i64,
 ) bool {
     if (grid_id < 2) return false;
-    // An external grid's frontend surface only exists once its open callback
-    // has seeded one; until then there are no row slots to remap. A grid the
-    // main surface places as a layer always has somewhere to remap into.
+    // An external grid has no frontend surface to remap into until its open
+    // callback has seeded one; a layer of the main surface always has one.
     if (core.grid.external_grids.contains(grid_id) and
         !core.known_external_grids.contains(grid_id)) return false;
     const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
@@ -2706,8 +2691,7 @@ fn dispatchGridRowScroll(
     const op = sg.last_scroll_op orelse return false;
     const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols) orelse return false;
     // The frontend keeps the surviving rows and is sent only the vacated ones,
-    // so the mirror must move the same way or it would answer for rows that
-    // are no longer where it thinks.
+    // so the mirror has to move with them.
     core.shiftGlyphMirror(grid_id, region.row_start, region.row_end, op.rows);
     scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, sg.rows, sg.cols);
     return true;
@@ -2953,11 +2937,9 @@ pub const FlushCtx = struct {
         defer {
             if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                 // Surface lifecycle and placement first: a frontend routes a
-                // grid's rows by which surface places it, so the layout has to
-                // arrive before the rows. This is also required for
-                // timer/retry-driven flushes, which have no redraw-batch
-                // post-processing phase, and lets an allocation failure here
-                // cancel/retry the same transaction.
+                // grid's rows by which surface places it, and a timer/retry
+                // flush has no redraw-batch phase to do it in. An allocation
+                // failure here also cancels and retries the same transaction.
                 _ = notifyExternalWindowChanges(ctx.core);
                 notifySurfaceLayouts(ctx.core);
 
@@ -2971,13 +2953,11 @@ pub const FlushCtx = struct {
                 }
                 // sendExternalGridVertices can itself call
                 // zonvie_core_abort_flush (e.g. Windows external row-buffer
-                // OOM), AFTER the main grid already ran clearDirty() earlier
-                // in this function on the assumption of a successful commit. But the frontend's
-                // on_flush_end abort handling cancels ALL brackets for this
-                // flush, main included — so an abort discovered only here
-                // would otherwise drop the main-grid update permanently
-                // (core thinks it already sent it; frontend never commits
-                // it). Force a full resend next flush to recover.
+                // OOM) after the main grid already ran clearDirty() on the
+                // assumption of a successful commit, and the frontend's
+                // on_flush_end abort cancels ALL brackets for this flush, main
+                // included. Without a full resend the main-grid update would
+                // be dropped permanently.
                 if (ctx.core.flush_aborted) {
                     ctx.core.grid.markAllDirty();
                     var sg_it = ctx.core.grid.sub_grids.valueIterator();
@@ -2985,22 +2965,18 @@ pub const FlushCtx = struct {
                         sg.markAllDirty();
                     }
                     ctx.core.force_ext_cursor_recheck = true;
-                    // last_sent_cursor_rev was already synced to the current
-                    // cursor_rev earlier in this same onFlush() call (the
-                    // on_vertices_row cursor dispatch), before this
-                    // late-discovered abort was known. The cancelled
-                    // bracket includes the main cursor too, so force a
-                    // mismatch (wrapping, matching cursor_rev's own +%=
-                    // idiom) so the next flush's need_cursor check resends
-                    // it instead of assuming it was already delivered.
+                    // last_sent_cursor_rev was already synced to cursor_rev
+                    // earlier in this same onFlush() call (the on_vertices_row
+                    // cursor dispatch). The cancelled bracket includes the main
+                    // cursor too, so force a mismatch (wrapping, matching
+                    // cursor_rev's own +%= idiom) to make the next flush's
+                    // need_cursor check resend it.
                     ctx.core.last_sent_cursor_rev -%= 1;
                 }
             }
-            // This defer runs before on_flush_end. Validate the completed
-            // completed main+external state only after every row was generated,
-            // so moving vertices between rows cannot fail on a mixed old/new
-            // intermediate ledger. A failure cancels the frontend bracket and
-            // the final transaction defer above invalidates its accounting.
+            // Runs before on_flush_end: validate the completed main+external
+            // state only after every row was generated, so moving vertices
+            // between rows cannot fail on a mixed old/new intermediate ledger.
             if (!ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted) {
                 validateCompletedVertexBudget(ctx.core) catch |err| {
                     ctx.core.flush_aborted = true;
@@ -3011,21 +2987,14 @@ pub const FlushCtx = struct {
 
         // A composition step below (vertex buffer growth, glyph push, etc.)
         // can fail with an internal Zig error (OOM) rather than an explicit
-        // frontend-signaled zonvie_core_abort_flush() call. Without this,
-        // such an error would propagate straight out of onFlush and be
-        // silently swallowed by callers (`catch {}` / logged and dropped),
-        // while the on_flush_end/sendExternalGridVertices defers above still
-        // run as if nothing happened — frontends would commit whatever
-        // partial write-set was composed before the failure as a complete,
-        // successful frame. Registered AFTER those two defers so it runs
-        // FIRST during unwind (LIFO), setting flush_aborted before they see
-        // it — sendExternalGridVertices's defer already skips on
-        // flush_aborted, and zonvie_core_flush_was_aborted() lets both
-        // frontends' on_flush_end handlers detect this and cancel their
-        // bracket instead of committing.
+        // frontend-signaled zonvie_core_abort_flush() call. Such an error
+        // propagates straight out of onFlush and is swallowed by callers
+        // (`catch {}` / logged and dropped) while the two defers above still
+        // run — frontends would commit a partial write-set as a complete
+        // frame. Registered AFTER those defers so it runs FIRST during unwind
+        // (LIFO), setting flush_aborted before they see it.
         errdefer ctx.core.flush_aborted = true;
 
-        // If frontend aborted, skip all vertex/atlas work.
         // Grid scroll events are NOT dispatched or cleared — they are preserved
         // for the retry flush so smooth-scroll offsets stay in sync with vertices.
         if (ctx.core.flush_aborted) {
@@ -3129,9 +3098,8 @@ pub const FlushCtx = struct {
         // Dispatch per-grid row scroll notifications for external grids.
         // Fires at the same dispatch point as on_grid_scroll (after abort check).
         // Skipped when multiple scrolls occurred in the same batch (fast path ineligible).
-        // Also skipped when float windows are anchored to the grid, because the core
-        // composites float content into the grid's row vertices — GPU-blitting old pixels
-        // would shift stale overlay content to wrong positions.
+        // There is no float-anchor exclusion: eligibility is decided entirely by
+        // the grid's own scroll state and gridScrollFastPathRegion.
         // last_scroll_op is committed by the transaction-final defer, not here.
         if (ctx.core.cb.on_grid_row_scroll) |scroll_cb| {
             var has_pending_external_scroll = false;
@@ -3157,34 +3125,28 @@ pub const FlushCtx = struct {
         }
         if (ctx.core.flush_aborted) return;
 
-        // Check msg_show throttle timeout for external commands
         ctx.core.checkMsgShowThrottleTimeout();
 
-        // Process cmdline changes BEFORE generating vertices.
-        // This ensures cursor position is restored before vertex generation.
+        // Before vertex generation, so the cursor position is restored first.
         notifyCmdlineChanges(ctx.core);
 
-        // Process popupmenu changes inside the flush bracket so ext-popupmenu
-        // vertices are generated from the current selection state in the same
-        // flush. If this runs after redraw.handleRedraw returns, the popupmenu
-        // grid lags one flush behind cmdline_show updates.
+        // Inside the flush bracket so ext-popupmenu vertices come from the
+        // current selection in the same flush; run after redraw.handleRedraw
+        // returns, the popupmenu grid lags one flush behind cmdline_show.
         notifyPopupmenuChanges(ctx.core);
 
-        // Process message changes inside the flush bracket so msg_show
-        // (ext_float) grid is registered in external_grids and gets vertices
-        // generated by sendExternalGridVertices (the LIFO-deferred call below)
-        // in the same flush. If this runs only after handleRedraw returns
-        // (rpc_session.zig), the newly created msg grid misses vertex generation
-        // for one flush and the frontend's first WM_PAINT shows a blank window
-        // until the next user event triggers another flush.
+        // Inside the flush bracket so the msg_show (ext_float) grid is
+        // registered in external_grids and gets vertices from
+        // sendExternalGridVertices (the LIFO-deferred call below) in the same
+        // flush; run only after handleRedraw returns (rpc_session.zig), the new
+        // msg grid shows a blank window until the next user event.
         notifyMessageChanges(ctx.core);
         if (ctx.core.flush_aborted) return;
 
-        // A zero-cell main grid has no rows to generate, but its layout still
-        // has to cross the transaction boundary. Publish it through the
-        // existing row ABI as a layout-only MAIN update, followed by the
-        // independent empty cursor layer. Dirty/revision state is consumed
-        // only after both callbacks accept the bracket.
+        // A zero-cell main grid has no rows, but its layout still has to cross
+        // the transaction boundary: publish a layout-only MAIN update through
+        // the row ABI plus the independent empty cursor layer, consuming
+        // dirty/revision state only after both callbacks accept the bracket.
         if (n_cells == 0) {
             const need_main =
                 ctx.core.grid.content_rev != ctx.core.last_sent_content_rev or
@@ -3247,9 +3209,8 @@ pub const FlushCtx = struct {
             .blink_off_ms = 0,
         };
 
-        // NOTE: cursor row/col are relative to cursor_grid.
-        // Convert them to screen(grid 1) coordinates using win_pos,
-        // because we already flattened sub-grids into tmp[] in screen space.
+        // Cursor row/col are relative to cursor_grid; win_pos converts them to
+        // grid 1 coordinates.
         if (ctx.core.grid.cursor_valid and ctx.core.grid.cursor_visible) {
             var cr: i64 = @as(i64, ctx.core.grid.cursor_row);
             var cc: i64 = @as(i64, ctx.core.grid.cursor_col);
@@ -3278,12 +3239,10 @@ pub const FlushCtx = struct {
                 };
                 cursor_out.cell_percentage = ctx.core.grid.cursor_cell_percentage;
 
-                // Set blink parameters
                 cursor_out.blink_wait_ms = ctx.core.grid.cursor_blink_wait_ms;
                 cursor_out.blink_on_ms = ctx.core.grid.cursor_blink_on_ms;
                 cursor_out.blink_off_ms = ctx.core.grid.cursor_blink_off_ms;
 
-                // Resolve cursor colors
                 if (ctx.core.grid.cursor_attr_id != 0) {
                     const attr = ctx.core.hl.get(ctx.core.grid.cursor_attr_id);
                     cursor_out.fgRGB = attr.fg;
@@ -3294,7 +3253,6 @@ pub const FlushCtx = struct {
                     cursor_out.bgRGB = ctx.core.hl.default_fg;
                 }
 
-                // Debug log: cursor_out values
                 if (ctx.core.log.cb != null) {
                     ctx.core.log.write("cursor_out: shape={d} cell_pct={d} blink=({d},{d},{d}) row={d} col={d}\n", .{
                         @intFromEnum(cursor_out.shape),
@@ -3309,17 +3267,13 @@ pub const FlushCtx = struct {
             }
         }
 
-        // --- fast path: build vertices directly (skip bg_spans/text_runs/scalars_buf) ---
         if (ctx.core.cb.on_vertices_row != null) {
 
-            // Decide what needs rebuilding/sending.
             // dirty_all must force a rebuild even when content_rev is already
             // synced: the atlas-reset/glyph-miss recovery paths call
             // markAllDirty() AFTER last_sent_content_rev was synced for this
-            // flush (row-mode retry exit, and the non-row-mode unsent-return
-            // above the partial send). Without this OR, the early return
-            // below would clearDirty() the pending recovery and the screen
-            // would stay stale/blank until the next real content change.
+            // flush. Without this OR, the early return below would clearDirty()
+            // the pending recovery and the screen would stay stale.
             const need_main: bool = (ctx.core.grid.content_rev != ctx.core.last_sent_content_rev) or ctx.core.grid.main_buf.dirty_all;
             const need_cursor: bool = (ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev);
             var cursor_retry_required = false;
@@ -3340,10 +3294,8 @@ pub const FlushCtx = struct {
 
             const Helpers = struct {
 
-                /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
-                /// Quad corners in grid-local pixels: TL, TR, BL, BR.
-                /// The frontend converts to NDC with the layer transform, so the
-                /// core never needs the surface extent here.
+                /// Quad corners in grid-local pixels: TL, TR, BL, BR. The
+                /// frontend applies the layer transform.
                 inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
                     return .{
                         .{ x0, y0 },
@@ -3498,22 +3450,18 @@ pub const FlushCtx = struct {
                     const p2 = pts[2];
                     const p3 = pts[3];
 
-                    // UV coordinates for decorations:
-                    // - UV.x = -1 (sentinel for solid/decoration)
-                    // - UV.y = local Y position within quad (0.0 at top, 1.0 at bottom)
-                    // This allows the shader to know the fragment's position within the quad
+                    // Decoration UV: x = -1 sentinel, y = local position within
+                    // the quad (0.0 top, 1.0 bottom) for the shader.
                     const uv_top: [2]f32 = .{ -1.0, 0.0 }; // y0 vertices (top)
                     const uv_bottom: [2]f32 = .{ -1.0, 1.0 }; // y1 vertices (bottom)
 
                     try out.ensureUnusedCapacity(alloc, 6);
                     const v = out.addManyAsSliceAssumeCapacity(6);
 
-                    // Triangle 1: p0 (top-left), p2 (bottom-left), p1 (top-right)
                     v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
 
-                    // Triangle 2: p1 (top-right), p2 (bottom-left), p3 (bottom-right)
                     v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
                     v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
@@ -3523,19 +3471,7 @@ pub const FlushCtx = struct {
             var sent_main_by_rows: bool = false;
             var main_retry_required: bool = false;
 
-            // Pre-compute subgrid info — declared outside need_main so the
-            // set is accessible in all exit paths.
-            // Backed by a persistent Core-owned buffer (no fixed cap): row-mode
-            // composition draws ONLY from this set, so truncating it would
-            // silently drop the topmost floats in layouts with many grids.
-            // ----------------------------
-            // Rebuild MAIN only when needed
-            // ----------------------------
             if (need_main) {
-
-                // -------------------------------------------------
-                // Row callback mode: send only dirty rows (global grid)
-                // -------------------------------------------------
 
                 {
                     const row_cb = ctx.core.cb.on_vertices_row.?;
@@ -3570,7 +3506,6 @@ pub const FlushCtx = struct {
                         ctx.core.log.write("[perf] pre_row us={d} dirty_rows={d}\n", .{ pre_row_us, log_dirty_rows });
                     }
 
-                    // Scroll-aware flush diagnostics: log scroll state and fast-path eligibility
                     if (log_enabled and scrolled_count > 0) {
                         const cached_sg_count = ctx.core.grid_entries.items.len;
                         ctx.core.log.write(
@@ -3600,7 +3535,6 @@ pub const FlushCtx = struct {
                         }
                     }
 
-                    // Performance counters for cache statistics
                     var perf_hl_cache_hits: u32 = 0;
                     var perf_hl_cache_misses: u32 = 0;
                     var perf_glyph_ascii_hits: u32 = 0;
@@ -3641,7 +3575,6 @@ pub const FlushCtx = struct {
                     var perf_row_atlas_ensure_sum_ns: i64 = 0;
                     var perf_row_quad_emit_sum_ns: i64 = 0;
 
-                    // Initialize dynamic caches if not already done
                     var t_prep_hl_init_start: i128 = 0;
                     if (log_enabled) t_prep_hl_init_start = clock.nowNs();
                     ctx.core.initHlCache() catch {
@@ -3661,44 +3594,34 @@ pub const FlushCtx = struct {
                         perf_row_prep_glyph_init_us = @intCast(@divTrunc(@max(0, t_prep_glyph_init_end - t_prep_glyph_init_start), 1000));
                     }
 
-                    // HL cache: direct-index for O(1) lookup
-                    // Uses heap-allocated buffers from NvimCore (sized by hl_cache_size config)
+                    // Direct-index O(1) lookup into NvimCore-owned buffers
+                    // (sized by the hl_cache_size config).
                     const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
                     const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
                     const hl_cache_limit: u32 = @intCast(hl_valid.len);
                     @memset(hl_valid, false);
-                    // Glyph cache is persistent across flushes.
-                    // It is only reset on font changes (see onGuifont).
-                    // NOTE: Do NOT call resetGlyphCacheFlags() here. With Phase 2
-                    // (core-managed atlas), clearing the cache every flush causes
-                    // every glyph to be re-rasterized every frame, filling the atlas
-                    // and triggering constant atlas resets.
+                    // The glyph cache is persistent across flushes and reset only
+                    // on font change (onGuifont). Do NOT call
+                    // resetGlyphCacheFlags() here: with the core-managed atlas
+                    // that re-rasterizes every glyph every frame and triggers
+                    // constant atlas resets.
 
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
 
-                    // Whether any window grid is drawn on this surface as its
-                    // own layer. Hoisted out of the row loop: it depends only
-                    // on placement, which cannot change mid-flush.
+                    // Hoisted out of the row loop: placement cannot change
+                    // mid-flush.
                     const main_has_layers = mainSurfaceHasLayers(ctx.core);
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
                     var used_scroll_fast_path: bool = false;
 
-                    // Dirty-row composition uses persistent per-row buckets.
-                    // Content-only flushes validate the layout in O(G), then
-                    // visit only subgrids intersecting each dirty row.
                     retry_loop: while (true) {
                         // On retry: force all rows (stale UVs in non-dirty rows too)
                         const effective_rebuild_all = rebuild_all or atlas_retried;
                         if (atlas_retried) {
-                            // Reset all per-pass mutable state for clean retry.
-                            // used_scroll_fast_path gates the row loop below; the
-                            // retry regenerates every row, so a stale true from the
-                            // pre-reset pass would filter every row against an empty
-                            // regen set and compose nothing. Matches the external-grid
-                            // retry, which clears use_ext_scroll_fast_path the same way.
+                            // Reset all per-pass mutable state for a clean retry.
                             used_scroll_fast_path = false;
                             had_glyph_miss = false;
                             perf_hl_cache_hits = 0;
@@ -3746,36 +3669,32 @@ pub const FlushCtx = struct {
                             // glyph caches already cleared by resetGlyphCacheFlags() inside resetCoreAtlas()
                         }
 
-                        // Grid 1 owns only its own rows now, and under ext_multigrid it
-                        // never receives a grid_scroll of its own: Neovim scrolls the window
-                        // grids, each of which publishes its own shift through
-                        // on_grid_row_scroll. The main surface therefore has no scroll fast
-                        // path of its own, and every row it owes is a dirty row.
+                        // Grid 1 owns only its own rows, and under ext_multigrid
+                        // Neovim scrolls the window grids, not grid 1: each
+                        // publishes its own shift through on_grid_row_scroll, so
+                        // the main surface has no scroll fast path of its own and
+                        // every row it owes is a dirty row.
                         var r: u32 = 0;
                         while (r < rows) : (r += 1) {
                             if (!effective_rebuild_all and
                                 !ctx.core.grid.main_buf.isRowDirty(r)) continue;
 
-                            // A prior row_cb call this loop may have called
+                            // A prior row_cb in this loop may have called
                             // zonvie_core_abort_flush (e.g. Windows row-buffer
-                            // OOM). Stop emitting further rows into a frontend
-                            // that already told us it cannot accept this flush —
-                            // composing and sending them would be discarded work
-                            // (the frontend cancels its whole bracket on abort).
+                            // OOM); the frontend cancels its whole bracket on
+                            // abort, so further rows would be discarded work.
                             if (ctx.core.flush_aborted) break;
 
                             var out = &ctx.core.row_verts;
                             out.clearRetainingCapacity();
                             var row_compose_us: i64 = 0;
 
-                            // Row-mode timing for composition measurement
                             var t_row_compose_start: i128 = 0;
                             if (log_enabled) {
                                 t_row_compose_start = clock.nowNs();
                             }
 
-                            // Compose this row only (avoid full-screen tmp)
-                            // SIMD-optimized: batch process consecutive cells with same hl_id
+                            // SIMD-optimized: batch consecutive cells with the same hl_id.
                             {
                                 const row_start: usize = @as(usize, r) * @as(usize, cols);
                                 setViewportRowDecoFlags(
@@ -3804,7 +3723,6 @@ pub const FlushCtx = struct {
 
                             }
 
-                            // Row-mode timing
                             var t_row_compose_end: i128 = 0;
                             var t_row_gen_start: i128 = 0;
                             if (log_enabled) {
@@ -3812,18 +3730,13 @@ pub const FlushCtx = struct {
                                 t_row_gen_start = t_row_compose_end;
                             }
 
-                            // Unified 5-pass vertex generation.
-                            // On error (e.g. buffer allocation failure), skip this row
-                            // so partial vertices are not cached or sent to the frontend.
-                            // markAllDirty at the end of the flush ensures a retry, but
-                            // that alone only makes the CONTENT eligible for regeneration
-                            // next flush — it does not stop this flush's write-set (with
-                            // this row silently missing/stale) from being committed as a
-                            // successful frame. Setting flush_aborted makes
-                            // zonvie_core_flush_was_aborted() tell both frontends to
-                            // cancel this bracket instead, and stops the loop (see the
-                            // flush_aborted check at the top of it) rather than composing
-                            // further rows into a flush that's being discarded anyway.
+                            // On error (e.g. buffer allocation failure), skip this
+                            // row so partial vertices are not cached or sent.
+                            // markAllDirty alone would only make the CONTENT
+                            // eligible next flush; it would not stop this flush's
+                            // write-set, with this row missing, from committing as
+                            // a successful frame. flush_aborted is what makes both
+                            // frontends cancel the bracket instead.
                             const row_gen_stats = generateRowVertices(ctx.core, .{
                                 .row = r,
                                 .cols = cols,
@@ -3835,22 +3748,17 @@ pub const FlushCtx = struct {
                                 .background_opacity = ctx.core.background_opacity,
                                 .is_cmdline = false,
                                 .glow_enabled = glow_enabled,
-                                // The root grid is a container once its
-                                // windows draw as layers: every layer paints
-                                // the same default background over it, and a
-                                // second premultiplied `over` pass compounds
-                                // alpha (0.5 -> 0.75 -> 0.875), which is what
-                                // stopped the Windows main window being
+                                // The root grid is a container once its windows
+                                // draw as layers: every layer paints the same
+                                // default background, and a second premultiplied
+                                // `over` compounds alpha (0.5 -> 0.75 -> 0.875),
+                                // which stopped the Windows main window being
                                 // translucent enough for blur to show.
-                                //
-                                // BLUR ONLY. Without blur the frontends do not
-                                // composite per-pixel alpha for the window at
-                                // all — macOS forces backgrounds opaque once
-                                // backgroundAlpha >= 1.0 and applies window
-                                // opacity at the layer level — so nothing
-                                // compounds, while dropping the run makes the
-                                // surface visibly thinner and can leave the
-                                // gaps between layers unpainted.
+                                // BLUR ONLY: without blur the frontends force
+                                // backgrounds opaque and apply window opacity at
+                                // the layer level, so nothing compounds and
+                                // dropping the run only thins the surface and
+                                // leaves the gaps between layers unpainted.
                                 .skip_default_bg = main_has_layers and ctx.core.blur_enabled,
                             }, out) catch |err| {
                                 out.clearRetainingCapacity();
@@ -3863,7 +3771,6 @@ pub const FlushCtx = struct {
                             perf_shape_cache_hits += row_gen_stats.shape_cache_hits;
                             perf_shape_cache_misses += row_gen_stats.shape_cache_misses;
                             perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
-                            // Log row timing for performance measurement
                             if (log_enabled) {
                                 const t_row_gen_end = clock.nowNs();
                                 row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
@@ -3876,8 +3783,7 @@ pub const FlushCtx = struct {
                                     perf_row_max_total_us = total_us;
                                     perf_row_max_total_idx = r;
                                 }
-                                // Accumulate per-pass times. Pass 3 (glyph) max-row tracked
-                                // separately to surface the row most expensive in the dominant pass.
+                                // Pass 3 (glyph) tracks its own max row: it dominates.
                                 perf_row_pass_bg_sum_ns += row_gen_stats.bg_ns;
                                 perf_row_pass_under_sum_ns += row_gen_stats.under_ns;
                                 perf_row_pass_glyph_sum_ns += row_gen_stats.glyph_ns;
@@ -3902,10 +3808,8 @@ pub const FlushCtx = struct {
                                 }
                             }
 
-                            // Anomaly detection: warn if row has non-space cells but 0 glyph vertices
-                            // (could indicate atlas/cache corruption causing all glyphs to fail)
+                            // Non-space cells with zero vertices suggests atlas/cache corruption.
                             if (log_enabled and scrolled_count > 0 and out.items.len == 0) {
-                                // Check if this row actually has visible content
                                 var has_visible: bool = false;
                                 for (0..cols) |idx| {
                                     const sc = row_cells.scalars.items[idx];
@@ -3919,14 +3823,12 @@ pub const FlushCtx = struct {
                                 }
                             }
 
-                            // CHECK: atlas reset happened during glyph processing for this row.
-                            // Already-sent rows have stale UVs → need to restart or abort.
+                            // An atlas reset during this row leaves the rows already sent with stale UVs.
                             if (ctx.core.atlas_reset_during_flush) {
                                 saw_atlas_reset = true;
                                 ctx.core.atlas_reset_during_flush = false; // Clear before retry
 
                                 if (!atlas_retried) {
-                                    // First occurrence: restart loop from row 0 with all rows
                                     atlas_retried = true;
                                     if (log_enabled) {
                                         ctx.core.log.write(
@@ -3936,11 +3838,10 @@ pub const FlushCtx = struct {
                                     }
                                     continue :retry_loop;
                                 }
-                                // A second reset invalidates rows already sent
-                                // by the retry. Publishing empty replacements
-                                // would commit a full-screen blank frame. Match
-                                // the external-grid path: cancel this bracket
-                                // and regenerate every layer next flush.
+                                // A second reset invalidates rows already sent by
+                                // the retry; publishing empty replacements would
+                                // commit a full-screen blank frame. Cancel this
+                                // bracket and regenerate every layer next flush.
                                 if (log_enabled) {
                                     ctx.core.log.write(
                                         "[scroll_debug] atlas_reset_during_flush at row={d} on retry: cancelling flush\n",
@@ -3964,15 +3865,12 @@ pub const FlushCtx = struct {
                                 t_row_post_misc_before_cache_store = clock.nowNs();
                             }
 
-                            // Charge the exact generated row before either
-                            // retaining a scroll-cache copy or invoking the
-                            // frontend. Overflow clusters therefore count all
-                            // emitted glyphs, while blank cells are not charged
-                            // for geometry they did not produce.
+                            // Charge the exact generated row before invoking the
+                            // frontend: overflow clusters then count all emitted
+                            // glyphs, and blank cells are charged nothing.
                             try replaceGridSurfaceRowVertexCount(ctx.core, 1, ctx.core.grid.bufFor(1).?, r, out.items.len);
 
-                            // Mirror this row's glyph UVs so atlas reclamation
-                            // can see what grid 1 is still showing.
+                            // Mirror this row's glyph UVs for atlas reclamation.
                             ctx.core.recordGlyphMirrorRow(1, r, rows, out.items);
 
                             var t_row_before_cb: i128 = 0;
@@ -3981,7 +3879,6 @@ pub const FlushCtx = struct {
                                 t_row_before_cb = t_row_cache_store_end;
                             }
 
-                            // Contract: row_count == 1, grid_id == 1 for main window
                             row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
 
                             if (log_enabled) {
@@ -4010,27 +3907,22 @@ pub const FlushCtx = struct {
                         break; // Normal exit from retry_loop
                     }
 
-                    // A row_cb call in the loop above may have aborted this
-                    // flush (e.g. Windows row-buffer OOM). The frontend
-                    // cancels its whole triple-buffer bracket on abort — none
-                    // of what was composed above actually reached the
-                    // screen. clearDirty() here would erase the record that
-                    // this content still needs sending, and syncing
-                    // last_sent_content_rev below would make need_main false
-                    // on the next flush attempt — together these would make
-                    // zonvie_core_retry_flush's has_pending check see nothing
-                    // pending, permanently losing this content until an
-                    // unrelated future edit happens to touch the same rows.
+                    // A row_cb in the loop above may have aborted this flush
+                    // (e.g. Windows row-buffer OOM), and the frontend cancels
+                    // its whole triple-buffer bracket — nothing composed above
+                    // reached the screen. clearDirty() here plus the
+                    // last_sent_content_rev sync below would leave
+                    // zonvie_core_retry_flush's has_pending check seeing nothing
+                    // pending, losing this content until an unrelated later edit
+                    // happens to touch the same rows.
                     if (!ctx.core.flush_aborted) ctx.core.grid.clearDirty();
                     if (had_glyph_miss or saw_atlas_reset) {
                         main_retry_required = true;
                         ctx.core.grid.markAllDirty();
-                        // Atlas reset invalidates the mirrored UVs — but only
-                        // when the retry was aborted (partial/stale data) or no retry ran.
-                        // When the retry succeeded, all rows were regenerated with the
-                        // fresh atlas, so the mirrored UVs are already valid.
-                        // Invalidating here would undo that work and force a full
-                        // regeneration on the next scroll flush (~65-80ms for CJK).
+                        // A successful retry already regenerated every row with
+                        // the fresh atlas, so its mirrored UVs are valid;
+                        // invalidating them would force a full regeneration on
+                        // the next scroll flush (~65-80ms for CJK).
                         if (saw_atlas_reset) {
                             if (!atlas_retried) {
                                 ctx.core.invalidateMirroredFrameState();
@@ -4039,11 +3931,9 @@ pub const FlushCtx = struct {
                             while (sg_it.next()) |sg| {
                                 sg.markAllDirty();
                             }
-                            // The cursor is a separate vertex consumer gated
-                            // on cursor_rev alone (main and external both) —
-                            // an atlas reset invalidates its cached UVs too,
-                            // but dirtying grid/sub_grid content above never
-                            // touches this counter.
+                            // The cursor is a separate vertex consumer gated on
+                            // cursor_rev alone, and dirtying content above never
+                            // touches that counter.
                             ctx.core.grid.cursor_rev +%= 1;
                         }
                         if (log_enabled) {
@@ -4052,14 +3942,9 @@ pub const FlushCtx = struct {
                             });
                         }
                     }
-                    // Clear unconditionally so sendExternalGridVertices sees clean state
-                    // (sub_grids already marked dirty above if needed)
+                    // Clear unconditionally so sendExternalGridVertices sees clean state.
                     ctx.core.atlas_reset_during_flush = false;
-                    // Skip on abort — see the clearDirty() guard above. Syncing
-                    // this would make the next flush's need_main check (and
-                    // zonvie_core_retry_flush's has_pending check) see no
-                    // pending main content, even though nothing was actually
-                    // committed this attempt.
+                    // Skip on abort — see the clearDirty() guard above.
                     if (!ctx.core.flush_aborted) ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
                         const t_rows_done_ns: i128 = clock.nowNs();
@@ -4083,13 +3968,12 @@ pub const FlushCtx = struct {
                                 perf_row_max_cb_us,
                             },
                         );
-                        // generateRowVertices per-pass aggregate. Pass 3 (glyph) sum
-                        // includes shape callback time; subtract row_mode shape sum to
-                        // isolate glyph-emit cost. max_glyph_row pinpoints worst row.
-                        // ensure_sum_ns and quad_emit_sum_ns sub-divide glyph_sum_ns;
-                        // residual (glyph - shape*1000 - ensure - quad) ≈ cache lookup.
-                        // Those two cost two clock reads per emitted quad, so they are
-                        // only measured in the verbose tier and report -1 otherwise.
+                        // glyph_sum_ns includes shape callback time; subtract the
+                        // row_mode shape sum to isolate glyph-emit cost.
+                        // ensure_sum_ns and quad_emit_sum_ns sub-divide it, and
+                        // the residual (glyph - shape*1000 - ensure - quad) is
+                        // roughly cache lookup. Those two cost two clock reads per
+                        // quad, so they are verbose-tier only and report -1 otherwise.
                         ctx.core.log.write(
                             "[perf] row_mode_pass_breakdown rows={d} bg_sum_ns={d} under_sum_ns={d} glyph_sum_ns={d} strike_sum_ns={d} overline_sum_ns={d} max_glyph_row={d} max_glyph_ns={d} ensure_sum_ns={d} quad_emit_sum_ns={d}\n",
                             .{
@@ -4142,25 +4026,12 @@ pub const FlushCtx = struct {
 
             }
 
-            // ----------------------------
-            // Rebuild CURSOR only when needed
-            // ----------------------------
             if (need_cursor) {
                 cursor.clearRetainingCapacity();
 
-                // Skip cursor generation if cursor is NOT on global grid and NOT embedded in global grid
-                // Embedded grids (win_pos) have their cursor drawn on global grid via coordinate transform
-                // External/special grids (external_grids, cmdline, etc.) render their own cursor
                 const cursor_grid = ctx.core.grid.cursor_grid;
-                // A float that is also an external (separate-window) grid is
-                // composited into the main grid via win_pos AND rendered in its
-                // own window. Its window draws the real, shape-aware cursor, so
-                // the main grid must NOT also embed one — otherwise a second,
-                // stale block cursor is drawn at the float's anchor and never
-                // tracks the mode (block / vertical / horizontal) change.
-                // Every grid is its own layer now, so the cursor is emitted on
-                // the grid it is actually on. Grid 1's rows carry a cursor only
-                // when the cursor is on grid 1.
+                // Every grid is its own layer, so the cursor is emitted on the
+                // grid it is actually on.
                 const cursor_embedded_in_main = (cursor_grid == 1);
 
                 if (cursor_embedded_in_main) {
@@ -4180,15 +4051,13 @@ pub const FlushCtx = struct {
                         const tW = cellW * pct / 100.0;
                         const tH = cellH * pct / 100.0;
 
-                        // Get the cell at cursor position (grid-relative coordinates)
                         const cursor_grid_id = ctx.core.grid.cursor_grid;
                         const grid_cursor_row = ctx.core.grid.cursor_row;
                         const grid_cursor_col = ctx.core.grid.cursor_col;
                         const cursor_cell = ctx.core.grid.getCellGrid(cursor_grid_id, grid_cursor_row, grid_cursor_col);
                         const cursor_cp = cursor_cell.cp;
 
-                        // Check if this is a double-width character
-                        // Next cell having cp == 0 indicates a continuation cell for wide char
+                        // A next cell with cp == 0 is a wide char's continuation cell.
                         var is_double_width = false;
                         if (cursor_grid_id == 1) {
                             if (grid_cursor_col + 1 < ctx.core.grid.cols) {
@@ -4227,29 +4096,26 @@ pub const FlushCtx = struct {
                             },
                         }
 
-                        // Push cursor background quad with DECO_CURSOR flag
-                        // (so shader treats it as decoration, not background with transparency)
+                        // DECO_CURSOR so the shader treats it as decoration, not
+                        // a background subject to transparency.
                         {
                             const col = Helpers.rgb(cursor_out.bgRGB);
                             try Helpers.pushSolidQuad(cursor, ctx.core.alloc, rx0, ry0, rx1, ry1, col, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                         }
 
-                        // Render cursor text (character under cursor) with inverted color
-                        // Only for block cursor and non-space characters
+                        // The character under the cursor, in inverted colour.
                         if (@intFromEnum(cursor_out.shape) == 0 and cursor_cp != 0 and cursor_cp != ' ') {
-                            // Block element under cursor: geometric rendering
                             if (block_elements.isBlockElement(cursor_cp)) {
                                 const blk_geo = block_elements.getBlockGeometry(cursor_cp);
                                 if (blk_geo.count > 0) {
                                     try cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6);
                                     const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
                                     for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        // DECO_CURSOR for the same reason the cursor background
-                                        // quad above carries it: without it these rects are plain
-                                        // solid quads, and the shader fades plain solids to
-                                        // `backgroundAlpha` once blur is on. The box behind the
-                                        // glyph would stay opaque while the glyph itself went
-                                        // translucent. The external-grid path already sets it.
+                                        // DECO_CURSOR for the same reason the cursor
+                                        // background quad carries it: the shader fades
+                                        // plain solids to `backgroundAlpha` once blur is
+                                        // on, so the box behind the glyph would stay
+                                        // opaque while the glyph itself went translucent.
                                         Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
                                     }
                                 }
@@ -4261,7 +4127,6 @@ pub const FlushCtx = struct {
                                     var ge: c_api.GlyphEntry = undefined;
                                     var glyph_ok = false;
 
-                                    // Resolve style_flags for the cell under the cursor
                                     const cursor_style: u8 = ctx.core.hl.getWithStyles(cursor_cell.hl).style_flags;
                                     const cursor_style_mask = cursor_style & (STYLE_BOLD | STYLE_ITALIC);
                                     const cursor_c_style: u32 =
@@ -4285,7 +4150,6 @@ pub const FlushCtx = struct {
                                     }
                                     defer ctx.core.emoji_cluster_len = 0;
 
-                                    // Get glyph entry from atlas using actual style
                                     if (ctx.core.isPhase2Atlas()) {
                                         const overflow = ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col);
                                         if (try ensureCachedPhase2Glyph(ctx.core, cursor_cp, cursor_c_style, overflow)) |entry| {
@@ -4295,9 +4159,8 @@ pub const FlushCtx = struct {
                                             return;
                                         } else {
                                             // Do not consume cursor_rev on a transient
-                                            // rasterizer miss. The next flush retries the
-                                            // same stationary cursor without cancelling
-                                            // the current transaction.
+                                            // rasterizer miss: the next flush retries the
+                                            // same cursor without cancelling this transaction.
                                             cursor_retry_required = true;
                                         }
                                     } else if (cursor_style_mask != 0 and ensure_styled != null) {
@@ -4309,8 +4172,6 @@ pub const FlushCtx = struct {
                                     }
 
                                     if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                        // Calculate glyph position (same as global grid rendering)
-                                        // Use topPad from outer scope
                                         const cursorBaseY: f32 = y0 + topPad;
                                         const baselineY: f32 = cursorBaseY + ge.ascent_px;
 
@@ -4319,13 +4180,11 @@ pub const FlushCtx = struct {
                                         const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
                                         const gy1: f32 = gy0 + ge.bbox_size_px[1];
 
-                                        // UV coordinates from atlas
                                         const uv0 = [2]f32{ ge.uv_min[0], ge.uv_min[1] };
                                         const uv1 = [2]f32{ ge.uv_max[0], ge.uv_min[1] };
                                         const uv2 = [2]f32{ ge.uv_min[0], ge.uv_max[1] };
                                         const uv3 = [2]f32{ ge.uv_max[0], ge.uv_max[1] };
 
-                                        // Use cursor foreground color (inverted)
                                         const fg = Helpers.rgb(cursor_out.fgRGB);
 
                                         try Helpers.pushGlyphQuad(
@@ -4351,10 +4210,9 @@ pub const FlushCtx = struct {
                 }
             }
 
-            // If atlas was reset during vertex generation, do NOT submit this flush.
-            // Vertices emitted before the reset carry stale UVs and would sample
-            // unrelated atlas contents for one frame. Preserve dirty state so the
-            // next flush regenerates everything against the fresh atlas.
+            // Vertices emitted before an atlas reset carry stale UVs and would
+            // sample unrelated contents for one frame. Preserve dirty state so
+            // the next flush regenerates against the fresh atlas.
             if (ctx.core.atlas_reset_during_flush) {
                 ctx.core.grid.markAllDirty();
                 ctx.core.invalidateMirroredFrameState();
@@ -4363,18 +4221,12 @@ pub const FlushCtx = struct {
                     sg.markAllDirty();
                 }
                 ctx.core.atlas_reset_during_flush = false;
-                // Row callbacks may already have published vertices whose UVs
-                // refer to the atlas generation that the cursor ensure just
-                // replaced. Dirtying repairs the next flush only; cancel this
-                // transaction so the stale rows are never committed once.
+                // Dirtying repairs the next flush only; cancel this transaction
+                // so the rows already published against the replaced atlas
+                // generation are never committed.
                 ctx.core.flush_atlas_corrupted = true;
                 return;
             }
-
-            // ----------------------------
-            // Send vertices via on_vertices_row. The consumer receives main
-            // content above and the cursor as a dedicated row callback below.
-            // ----------------------------
 
             // Row-only ABI consumer. Main rows were sent individually above;
             // use the same callback's CURSOR flag for the separate cursor
@@ -4404,21 +4256,18 @@ pub const FlushCtx = struct {
     }
 
     pub fn onGuifont(ctx: *FlushCtx, font: []const u8) !void {
-        // "*" is a picker request (`:set guifont=*`), not a real font change.
-        // Skip cache/atlas invalidation and dirtying: the frontend only opens
-        // a font dialog and later writes back a concrete "Name:hN" via
-        // nvim_set_option_value, which arrives as a normal guifont option_set
-        // and goes through the full path below. Resetting here would cause a
-        // pointless re-render flash just to show the dialog.
+        // "*" is a picker request (`:set guifont=*`), not a real font change:
+        // the frontend only opens a dialog and later writes back a concrete
+        // "Name:hN" that arrives as a normal guifont option_set. Resetting here
+        // would flash a pointless re-render just to show the dialog.
         if (std.mem.eql(u8, font, "*")) {
             ctx.core.emitGuiFont(font);
             return;
         }
 
-        // Invalidate caches BEFORE emitting callback: the callback may
-        // trigger vertex generation (e.g., Windows' updateLayoutToCore
-        // calls sendExternalGridVertices when cell dimensions change).
-        // Clearing first ensures those vertices use fresh cache lookups.
+        // Invalidate caches BEFORE emitting the callback: it may trigger vertex
+        // generation (Windows' updateLayoutToCore calls sendExternalGridVertices
+        // when cell dimensions change), which must use fresh cache lookups.
         ctx.core.resetAtlasMaintenanceBackoff();
         ctx.core.resetGlyphCacheFlags();
         ctx.core.resetShapeCache();
@@ -4428,17 +4277,12 @@ pub const FlushCtx = struct {
         // The mirrored frame holds atlas UVs; invalidate on font/atlas change.
         ctx.core.invalidateMirroredFrameState();
 
-        // Mark ALL grids dirty so row-mode vertex generation re-renders
-        // every row with the new font/atlas. Without this, the global grid
-        // keeps old vertices referencing the now-empty atlas → blank screen
-        // until Neovim resends content after nvim_ui_try_resize.
-        // sg.dirty alone is not enough for sub_grids: the per-row emit path
-        // checks dirty_rows to pick which rows to regenerate, so with no
-        // bits set every row is skipped and dirty gets cleared at flush end
-        // with nothing ever resent — markAllDirty() sets both. The cursor
-        // is a separate vertex consumer gated on cursor_rev alone (main and
-        // external both), which this font change also invalidates but
-        // neither grid/sub_grid dirtying touches.
+        // Mark ALL grids dirty so every row re-renders with the new font/atlas;
+        // otherwise old vertices keep referencing the now-empty atlas until
+        // Neovim resends content. sg.dirty alone is not enough for sub_grids:
+        // the per-row emit path picks rows from dirty_rows, so with no bits set
+        // every row is skipped — markAllDirty() sets both. The cursor is a
+        // separate consumer gated on cursor_rev, which no grid dirtying touches.
         ctx.core.grid.markAllDirty();
         var sg_it = ctx.core.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
@@ -4485,13 +4329,12 @@ pub const FlushCtx = struct {
 };
 
 /// Upper bound on the layers one surface publishes. Matches the frontends'
-/// fixed-capacity layer arrays; a surface with more visible grids than this
-/// publishes the first `MAX_SURFACE_LAYERS` in back-to-front order.
+/// fixed-capacity layer arrays.
 pub const MAX_SURFACE_LAYERS: usize = 64;
 
-/// What was last published for one surface, so a layout is only re-sent when
-/// it actually changed. Holding the layers themselves makes the comparison
-/// exact rather than a hash that could suppress a needed update.
+/// What was last published for one surface, so a layout is re-sent only when it
+/// actually changed. Holding the layers themselves makes the comparison exact
+/// rather than a hash that could suppress a needed update.
 pub const SurfaceLayoutSig = struct {
     layers: [MAX_SURFACE_LAYERS]c_api.Layer = undefined,
     len: usize = 0,
@@ -4501,8 +4344,7 @@ pub const SurfaceLayoutSig = struct {
     fn matches(self: *const SurfaceLayoutSig, layers: []const c_api.Layer, rows: u32, cols: u32) bool {
         if (self.len != layers.len) return false;
         if (self.surface_rows != rows or self.surface_cols != cols) return false;
-        // Layer has no equality operator; compare the fields that describe a
-        // placement. Every field is compared, so a change cannot be missed.
+        // Layer has no equality operator; every field is compared.
         for (self.layers[0..self.len], layers) |a, b| {
             if (a.grid_id != b.grid_id or
                 a.anchor_grid != b.anchor_grid or
@@ -4519,10 +4361,8 @@ pub const SurfaceLayoutSig = struct {
 
 /// The window grids the main surface draws as its own layers, back-to-front
 /// and already truncated to what one layout can carry, in `core.grid_entries`.
-///
 /// `collectSurfaceLayers` and `collectEmitGrids` share this so a grid can never
-/// emit rows no surface places: the acceptance test and the truncation are the
-/// same code for both.
+/// emit rows no surface places.
 fn collectMainLayerEntries(self: *Core) []const GridEntry {
     self.grid_entries.clearRetainingCapacity();
     var it = self.grid.win_pos.iterator();
@@ -4532,10 +4372,8 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
         // An external grid is its own surface, never a layer of another.
         if (self.grid.external_grids.contains(grid_id)) continue;
         const pos = e.value_ptr.*;
-        // A float belongs to the surface its anchor lives on. An external
-        // surface still composites its anchored floats into its own rows, so
-        // they are not layers of it; only the main surface draws its floats as
-        // layers.
+        // A float belongs to the surface its anchor lives on, and an external
+        // surface composites its floats into its own rows rather than as layers.
         if (self.grid.external_grids.contains(pos.anchor_grid)) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
@@ -4553,8 +4391,7 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
         }) catch break;
     }
 
-    // Back-to-front: smaller first, larger last. Same ordering the composited
-    // overlay used, so z order is unchanged by the move to layers.
+    // Back-to-front: smaller first. Same z order the composited overlay used.
     std.sort.block(GridEntry, self.grid_entries.items, {}, struct {
         fn lessThan(_: void, a: GridEntry, b: GridEntry) bool {
             if (a.zindex != b.zindex) return a.zindex < b.zindex;
@@ -4566,19 +4403,16 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
 
     // The surface root takes the first layer slot, so the window grids share
     // what is left of `MAX_SURFACE_LAYERS`. Dropping from the FRONT of a
-    // back-to-front order discards the BOTTOM-most layers: an overflow then
-    // loses what the layers above it would have covered anyway, never the
-    // frontmost windows the user is actually looking at.
+    // back-to-front order discards the BOTTOM-most layers, which the layers
+    // above would have covered anyway, never the frontmost windows.
     const first = self.grid_entries.items.len -| (MAX_SURFACE_LAYERS - 1);
     return self.grid_entries.items[first..];
 }
 
 /// Collect one surface's layers, back-to-front, into `core.layout_scratch`.
-///
-/// `win_pos` positions are already global grid coordinates, so a layer's
-/// origin on the main surface is just its cell position scaled by the cell
-/// size. On an external surface the root grid's own global position is
-/// subtracted, which is the same arithmetic the float overlay used.
+/// `win_pos` positions are already global grid coordinates, so a main-surface
+/// layer's origin is its cell position scaled by the cell size; on an external
+/// surface the root grid's own global position is subtracted.
 fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
     self.layout_scratch.clearRetainingCapacity();
     const root = self.grid.bufFor(surface_id) orelse return &.{};
@@ -4606,8 +4440,7 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         root_col = ext.start_col;
     }
 
-    // Only the main surface draws window grids as layers; an external surface
-    // composites its anchored floats into its own rows.
+    // Only the main surface draws window grids as layers.
     const entries: []const GridEntry = if (surface_id == 1)
         collectMainLayerEntries(self)
     else
@@ -4633,13 +4466,9 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
     return self.layout_scratch.items;
 }
 
-/// Fill `core.emit_grid_ids` with every grid that emits its own rows: the
-/// external grids, plus the composited grids the main surface or an external
-/// surface places as layers. Grid 1 is emitted by the main row loop and is
-/// deliberately absent.
-/// Whether the main surface draws any window grid as its own layer. Mirrors
-/// the acceptance test in `collectEmitGrids`: an entry there is a layer, so
-/// the root grid's cells beneath it are never what the user sees.
+/// Whether the main surface draws any window grid as its own layer. Mirrors the
+/// acceptance test in `collectMainLayerEntries`, so the root grid's cells
+/// beneath such a layer are never what the user sees.
 fn mainSurfaceHasLayers(self: *Core) bool {
     var it = self.grid.win_pos.iterator();
     while (it.next()) |e| {
@@ -4654,6 +4483,9 @@ fn mainSurfaceHasLayers(self: *Core) bool {
     return false;
 }
 
+/// Fill `core.emit_grid_ids` with every grid that emits its own rows: the
+/// external grids plus the composited grids the main surface places as layers.
+/// Grid 1 is emitted by the main row loop and is deliberately absent.
 fn collectEmitGrids(self: *Core) void {
     self.emit_grid_ids.clearRetainingCapacity();
     var ext_it = self.grid.external_grids.keyIterator();
@@ -4661,10 +4493,9 @@ fn collectEmitGrids(self: *Core) void {
         self.emit_grid_ids.append(self.alloc, grid_id_ptr.*) catch return;
     }
     // Exactly the grids the main surface publishes as layers, truncation
-    // included: a grid past the layer limit is drawn by nobody, so emitting
-    // its rows would only charge them against the vertex budget. A float
-    // anchored to an external grid is composited into that grid's own rows and
-    // is not in this set, so it is never emitted twice.
+    // included: a grid past the layer limit is drawn by nobody, so its rows
+    // would only charge the vertex budget. A float anchored to an external grid
+    // is composited into that grid's own rows and is not in this set.
     for (collectMainLayerEntries(self)) |ent| {
         self.emit_grid_ids.append(self.alloc, ent.grid_id) catch return;
     }
@@ -4717,9 +4548,8 @@ pub fn notifySurfaceLayouts(self: *Core) void {
     }
 
     if (self.grid.destroyed_pending.items.len != 0) {
-        // The mirror answers "what is on screen"; a destroyed grid shows
-        // nothing, and keeping its rows would pin their shelves for the rest
-        // of the session.
+        // A destroyed grid shows nothing, and keeping its mirrored rows would
+        // pin their shelves for the rest of the session.
         for (self.grid.destroyed_pending.items) |destroyed_id| {
             self.removeGlyphMirror(destroyed_id);
         }
@@ -4737,14 +4567,12 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
     var new_grids_added = false;
 
     // Never emit window lifecycle callbacks for a flush whose frontend
-    // transaction was cancelled. The retry flush will regenerate vertices and
-    // retry these notifications before its own commit.
+    // transaction was cancelled; the retry flush repeats them before its commit.
     if (self.flush_aborted) return false;
 
-    // Removal marks the current slot as a tombstone without rehashing or
-    // relocating entries, so advancing the iterator then removeByPtr is safe
-    // and visits every known grid once (O(G), rather than rescanning from the
-    // beginning after each close).
+    // Removal marks the slot as a tombstone without rehashing or relocating
+    // entries, so advancing the iterator then removeByPtr is safe and visits
+    // every known grid once.
     var known_it = self.known_external_grids.iterator();
     while (known_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;
@@ -4755,13 +4583,11 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
         }
     }
 
-    // Find new or changed external windows
     var ext_it = self.grid.external_grids.iterator();
     while (ext_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;
         const info = entry.value_ptr.*;
 
-        // Get dimensions from sub_grids
         var rows: u32 = 0;
         var cols: u32 = 0;
         if (self.grid.sub_grids.get(grid_id)) |sg| {
@@ -4797,30 +4623,27 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
                 _ = self.grid.pending_ext_window_grids.remove(grid_id);
             }
 
-            // Reserve the known-map entry before invoking the frontend. This
-            // makes OOM a clean pre-callback abort instead of opening a window
-            // and then failing to record it, which would otherwise cause
-            // duplicate opens and lost closes on later retries.
+            // Reserve the known-map entry before invoking the frontend, so OOM
+            // is a clean pre-callback abort rather than an opened window that
+            // was never recorded (duplicate opens, lost closes on retry).
             self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch {
                 self.flush_aborted = true;
                 return new_grids_added;
             };
         }
 
-        // Notify frontend with position info
         if (self.cb.on_external_window) |cb| {
             cb(self.ctx, grid_id, info.win, rows, cols, info.start_row, info.start_col);
         }
         // A lifecycle callback may abort the enclosing frontend transaction
-        // (Windows does this when queueing or PostMessageW fails). Do not leak
-        // later window-create side effects from a transaction that every
-        // frontend will cancel in on_flush_end; the retry flush will revisit
-        // this grid and every undispatched grid.
+        // (Windows does this when queueing or PostMessageW fails), which every
+        // frontend cancels in on_flush_end; the retry flush revisits this grid
+        // and every undispatched one.
         if (self.flush_aborted) return new_grids_added;
 
         // Add/update the known set only after the callback completed without
-        // aborting. New entries use the capacity reserved above; changed
-        // entries update in place and cannot allocate.
+        // aborting. New entries use the capacity reserved above; changed ones
+        // update in place and cannot allocate.
         const known_info: nvim_core.KnownExtGridInfo = .{
             .win = info.win,
             .start_row = info.start_row,
@@ -4843,10 +4666,9 @@ fn externalCursorVisibleOnGrid(grid: *const grid_mod.Grid, grid_id: i64) bool {
     return grid.cursor_grid == grid_id and grid.cursor_valid and grid.cursor_visible;
 }
 
-/// Pixels of the row's line spacing that sit above the text, the rest going
-/// below. Neovim allows 'linespace' to be negative to pull lines together when
-/// a font reserves more room for ascent and descent than the text needs, so
-/// this is signed and the row is then shorter than the font's own cell.
+/// Pixels of the row's line spacing that sit above the text, the rest below.
+/// Neovim allows a negative 'linespace' to pull lines together, so this is
+/// signed and the row is then shorter than the font's own cell.
 fn rowTopPadPx(linespace_px: i32) i32 {
     return @divTrunc(linespace_px, 2);
 }
@@ -4886,9 +4708,6 @@ fn externalFloatVisibleRowRange(
     };
 }
 
-/// Build one flush-local index of every float anchored to an external grid.
-/// The win_pos map is scanned once; per-anchor users then binary-search a
-/// contiguous, already layer-sorted slice instead of rescanning the map.
 fn releaseOversizedExternalFloatScratch(
     comptime T: type,
     list: *std.ArrayListUnmanaged(T),
@@ -4901,6 +4720,9 @@ fn releaseOversizedExternalFloatScratch(
     list.* = .empty;
 }
 
+/// Build one flush-local index of every float anchored to an external grid.
+/// The win_pos map is scanned once; per-anchor users then binary-search a
+/// contiguous, already layer-sorted slice instead of rescanning the map.
 fn buildExternalFloatAnchorIndexWithLimit(core: *Core, max_bytes: usize) !void {
     core.ext_float_anchor_entries.clearRetainingCapacity();
     releaseOversizedExternalFloatScratch(
@@ -4952,13 +4774,9 @@ fn buildExternalFloatAnchorIndex(core: *Core) !void {
     );
 }
 
-/// Build a sorted, per-row index for floats visible in one external grid.
-/// The flattened row buckets preserve the global layer order because entries
-/// are inserted into every covered row in sorted order.
-/// The index is three usize arrays, so its storage size is their element
-/// counts summed and scaled. Every step is checked: the callers charge the
-/// result against a byte budget, and a wrapped size would pass a budget it
-/// actually blows.
+/// The index is three usize arrays: sum their element counts and scale. Every
+/// step is checked because callers charge the result against a byte budget, and
+/// a wrapped size would pass a budget it actually blows.
 fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
     const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
     const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
@@ -5009,6 +4827,9 @@ fn releaseOversizedExternalFloatRowIndex(core: *Core, max_bytes: usize) void {
     clearExternalFloatRowIndexStorage(core);
 }
 
+/// Build a sorted, per-row index for floats visible in one external grid.
+/// The flattened row buckets preserve the global layer order because entries
+/// are inserted into every covered row in sorted order.
 fn buildExternalFloatRowIndexWithLimits(
     core: *Core,
     anchor_entries: []const ExternalFloatAnchorEntry,
@@ -5187,8 +5008,6 @@ fn buildExternalFloatRowIndex(
     );
 }
 
-/// Generate and send vertices for all external grids.
-/// force_render: if true, render all grids regardless of dirty/cursor flags (used when new grids added)
 /// Generate and send vertices for external grids.
 /// force_render: if true, render regardless of dirty flags
 /// only_grid_id: if non-null, only update this specific grid (for scroll optimization)
@@ -5211,9 +5030,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     }
 
     // The overlay map is visible only while generateRowVertices consumes one
-    // fully-composed row. In particular, frontend row callbacks run with this
-    // cleared so a re-entrant external-grid flush cannot observe stale row
-    // state from the outer invocation.
+    // fully-composed row, so frontend row callbacks run with it cleared and a
+    // re-entrant external-grid flush cannot observe the outer row state.
     self.flush_float_overlay = null;
     defer self.flush_float_overlay = null;
 
@@ -5238,42 +5056,36 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Always update cursor rev to prevent stale changed=true accumulation.
     const has_external_grids = self.known_external_grids.count() > 0;
     // Hold off consuming the cursor grid while the cursor sits on an external
-    // grid whose host window has not been created yet (in external_grids but
-    // not yet known_external_grids). Consuming it here lets grid_changed go
-    // false on the next flush, so the cursor layer is never re-emitted into
-    // the freshly created grid view and the cursor stays invisible until the
-    // next keystroke. This happens when another external window is already
-    // open (e.g. opening ext_cmdline from a focused float): has_external_grids
-    // is already true, so the old broad gate did not protect this case.
+    // grid whose host window is not created yet (in external_grids but not yet
+    // known_external_grids). Consuming it lets grid_changed go false on the next
+    // flush, so the cursor layer is never re-emitted into the freshly created
+    // view and stays invisible until the next keystroke. has_external_grids can
+    // already be true here (opening ext_cmdline from a focused float), so that
+    // broader gate does not cover this case.
     const cursor_grid_pending = self.grid.external_grids.contains(cursor_grid) and
         !self.known_external_grids.contains(cursor_grid);
     defer {
-        // A per-grid callback below (e.g. Windows external row-buffer OOM)
-        // may call zonvie_core_abort_flush mid-loop. The frontend cancels
-        // this whole bracket on abort, so the external cursor update just
-        // computed above was never actually committed — skip syncing these
-        // so cursor_changed/cursor_grid_changed still read true on the next
-        // call and the cancelled update gets resent instead of silently
-        // dropped.
+        // A per-grid callback below (e.g. Windows external row-buffer OOM) may
+        // call zonvie_core_abort_flush mid-loop, and the frontend cancels the
+        // whole bracket — skip syncing so cursor_changed/cursor_grid_changed
+        // still read true next call and the cancelled update is resent.
         if (!self.flush_aborted and !ext_cursor_retry_required) {
             if (has_external_grids and !cursor_grid_pending) {
                 self.last_ext_cursor_grid = cursor_grid;
             }
             self.last_ext_cursor_rev = cursor_rev;
-            // Only a full scan (only_grid_id == null, i.e. every external
-            // grid was actually re-checked) may consume this. A filtered,
-            // single-grid call (e.g. scroll-optimization's only_grid_id)
-            // can run before the real retry and would otherwise clear the
-            // flag having re-checked only ONE grid, silently skipping the
-            // rest — the exact case this flag exists to cover.
+            // Only a full scan (only_grid_id == null) may consume this. A
+            // filtered, single-grid call can run before the real retry and
+            // would otherwise clear the flag having re-checked only ONE grid,
+            // silently skipping the rest.
             if (only_grid_id == null) {
                 self.force_ext_cursor_recheck = false;
             }
         }
     }
 
-    // Check if cursor is on a non-existent external grid (e.g., closed cmdline)
-    // In this case, we need to force redraw the grid that previously had cursor
+    // Cursor on a closed external grid (e.g. cmdline): force-redraw whichever
+    // grid previously held it.
     const cursor_on_closed_grid = !self.known_external_grids.contains(cursor_grid) and
         cursor_grid != 1; // cursor_grid != global grid
     const need_force_redraw_last = cursor_on_closed_grid and
@@ -5283,17 +5095,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         self.log.write("[sendExternalGridVertices] cursor on closed grid, forcing redraw of last_grid={d}\n", .{self.last_ext_cursor_grid});
     }
 
-    // Notify frontend when cursor grid changes (for window activation).
-    // Only fire when external grids exist — window activation is only relevant
-    // for external grid windows. Without external grids, cursor_grid_changed
-    // comparison against stale last_ext_cursor_grid produces false positives.
+    // Window activation only matters for external grid windows, and without
+    // them cursor_grid_changed compares against a stale last_ext_cursor_grid
+    // and produces false positives.
     if (cursor_grid_changed and has_external_grids) {
         if (self.cb.on_cursor_grid_changed) |cursor_cb| {
             cursor_cb(self.ctx, cursor_grid);
         }
     }
 
-    // Early return if no row-based vertices callback
     const row_cb = self.cb.on_vertices_row orelse return;
     const owns_vertex_budget_transaction = !self.vertex_budget_transaction_active;
     if (owns_vertex_budget_transaction) {
@@ -5325,10 +5135,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
     const Helpers = struct {
 
-        /// Batch NDC transform for 4 quad corners (TL, TR, BL, BR).
-        /// Quad corners in grid-local pixels: TL, TR, BL, BR.
-        /// The frontend converts to NDC with the layer transform, so the
-        /// core never needs the surface extent here.
+        /// Quad corners in grid-local pixels: TL, TR, BL, BR. The frontend
+        /// applies the layer transform.
         inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
             return .{
                 .{ x0, y0 },
@@ -5384,10 +5192,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         }
     };
 
-    // Default background for blur transparency
     const default_bg = self.hl.default_bg;
 
-    // Initialize dynamic caches (same as row_mode)
     self.initHlCache() catch {
         self.log.write("[ext_grid] Failed to initialize hl cache\n", .{});
     };
@@ -5395,52 +5201,40 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         self.log.write("[ext_grid] Failed to initialize glyph cache\n", .{});
     };
 
-    // Initialize FlushCache for hl_cache optimization (uses heap buffers from NvimCore)
     var cache = FlushCache{
         .hl_cache_buf = self.hl_cache_buf orelse &.{},
         .hl_valid_buf = self.hl_valid_buf orelse &.{},
     };
     // Glyph cache is persistent across flushes (same as row_mode path).
 
-    // Track atlas reset across all external grids.
-    // If any grid triggers a reset, already-sent grids also have stale UVs.
+    // If any grid triggers an atlas reset, already-sent grids have stale UVs.
     var ext_saw_atlas_reset_any: bool = false;
 
-    // Iterate over all external grids (not just known_external_grids).
-    // This ensures newly added grids (e.g., popupmenu from sendPopupmenuShow)
-    // get vertices generated inside the flush bracket, even before
-    // notifyExternalWindowChanges adds them to known_external_grids.
-    // Every grid other than grid 1 is emitted here, in its own grid-local
-    // pixel space: external grids as their own surface's root, and composited
-    // grids as a layer of the surface that places them.
+    // Every grid other than grid 1 is emitted here, in its own grid-local pixel
+    // space: external grids as their own surface's root, composited grids as a
+    // layer of the surface that places them. The set is built from
+    // external_grids rather than known_external_grids, so a newly added grid
+    // (e.g. a popupmenu) still gets vertices inside this flush bracket.
     collectEmitGrids(self);
     for (self.emit_grid_ids.items) |grid_id_value| {
         const grid_id_ptr = &grid_id_value;
-        // A prior grid this loop may have aborted the flush (allocation
-        // failure). The frontend cancels its whole bracket on abort, so
-        // composing further grids would be discarded work — matches the
-        // equivalent check in the main row-mode loop.
+        // A prior grid in this loop may have aborted the flush; the frontend
+        // cancels the whole bracket, so composing more would be discarded work.
         if (self.flush_aborted) break;
 
         const grid_id = grid_id_ptr.*;
 
-        // Filter by specific grid if requested (for scroll optimization)
         if (only_grid_id) |target_id| {
             if (grid_id != target_id) continue;
         }
 
         const sg = self.grid.sub_grids.getPtr(grid_id) orelse continue;
 
-        // Need update if:
-        // 1. Grid content is dirty, OR
-        // 2. Cursor moved to/from this grid (grid changed), OR
-        // 3. Cursor moved within this grid (cursor changed while on this grid)
         const cursor_on_this_grid = externalCursorVisibleOnGrid(&self.grid, grid_id);
         const cursor_was_on_this_grid = (self.last_ext_cursor_grid == grid_id);
-        // force_ext_cursor_recheck (force resend): re-check EVERY external
-        // grid's cursor state once, since a prior failed flush may have
-        // left last_ext_cursor_grid naming the wrong (or right, but
-        // unconfirmed) grid — see its doc comment.
+        // force_ext_cursor_recheck re-checks EVERY external grid's cursor state
+        // once, since a prior failed flush may have left last_ext_cursor_grid
+        // naming the wrong (or right, but unconfirmed) grid.
         const cursor_affected = (cursor_changed and (cursor_on_this_grid or cursor_was_on_this_grid)) or
             self.force_ext_cursor_recheck;
         const cursor_moved_within = cursor_changed and cursor_on_this_grid and !cursor_grid_changed;
@@ -5453,17 +5247,14 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             cursor_grid, self.last_ext_cursor_grid, cursor_rev,          self.last_ext_cursor_rev,
         });
 
-        // Skip if no update needed (unless force_render is set or forced due to closed grid)
         if (!force_render and !force_redraw_this and !sg.dirty and !cursor_affected and !cursor_moved_within) continue;
 
-        // Reset hl_cache for this grid
         cache.reset();
 
         // Full redraw only for forced operations, not cursor-only changes.
         // Cursor rows are handled via regen_rows (fast path) or dirty_rows marking below.
         const need_full_redraw = force_render or force_redraw_this;
 
-        // NDC viewport: the grid's own dimensions, which grid_resize moves.
         const viewport_cols = sg.cols;
         const viewport_rows = sg.rows;
         const cursor_row: ?u32 = if (externalCursorVisibleOnGrid(&self.grid, grid_id))
@@ -5477,21 +5268,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         var regen_count: u32 = 0;
         var use_ext_scroll_fast_path = false;
 
-        // Debug: count non-space cells
-        // (glyph statistics now tracked inside generateRowVertices; retained
-        //  as zero stubs for debug logging compatibility)
-
         ext_verts.clearRetainingCapacity();
 
-        // Debug: log grid cell array info
         self.log.write("[ext_grid_debug] grid_id={d} sg.rows={d} sg.cols={d} sg.cells.len={d}\n", .{
             grid_id, sg.rows, sg.cols, sg.cells.len,
         });
-
-        // Two-pass vertex generation (same as main window):
-        // Pass 1: All backgrounds first
-        // Pass 2: All glyphs on top
-        // This prevents glyphs that extend beyond cell bounds from being clipped by adjacent backgrounds.
 
         // Cursor-only changes must not allocate/scan an entire external grid.
         // The row pipeline below is needed only when content itself is dirty.
@@ -5516,9 +5297,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             );
 
             // Build float layer order and visible-row buckets once for this
-            // anchor grid. A callback can re-enter external flushing and reuse
-            // the scratch; the row loop below detects that by generation and
-            // rebuilds only on the rare re-entrant path.
+            // anchor grid. A callback can re-enter and reuse the scratch; the
+            // row loop detects that by generation and rebuilds only then.
             var ext_float_index_generation = buildExternalFloatRowIndex(
                 self,
                 anchor_entries,
@@ -5535,26 +5315,21 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 continue;
             };
 
-            // Row-based vertex generation: process each row independently
-            // This matches the main window's row-based approach for better partial updates
             const ext_margins = self.grid.getViewportMargins(grid_id);
 
             const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
 
             var ext_retried: bool = false;
 
-            // Determine external grid scroll fast path eligibility (before retry loop).
-            // When eligible, we skip non-dirty rows even when sg.dirty is set,
-            // because scroll() now only marks vacated rows dirty.
+            // When eligible, non-dirty rows are skipped even with sg.dirty set,
+            // because scroll() only marks the vacated rows dirty.
             const ext_scroll_fast_path: bool = blk: {
                 if (force_render or need_full_redraw) break :blk false;
-                // Without this callback the consumer has no way to shift its
-                // retained row slots. Regenerate the whole viewport instead
-                // of sending only the vacated band.
+                // Without this callback the consumer cannot shift its retained
+                // row slots, so regenerate the whole viewport.
                 if (self.cb.on_grid_row_scroll == null) break :blk false;
-                // A newly/re-opened external grid has no frontend seed until
-                // its lifecycle callback is committed. Regenerate all rows
-                // instead of asking a not-yet-existing surface to shift them.
+                // A newly/re-opened external grid has no frontend seed until its
+                // lifecycle callback is committed; nothing exists to shift yet.
                 if (self.grid.external_grids.contains(grid_id) and
                     !self.known_external_grids.contains(grid_id)) break :blk false;
                 const op = sg.last_scroll_op orelse break :blk false;
@@ -5570,34 +5345,28 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             };
 
             // When a scroll happened but the fast path is not usable (multiple
-            // scrolls in one batch, scroll delta > 1, partial-width region,
-            // or float overlay suppressed the row scroll callback), the
-            // frontend won't receive on_grid_row_scroll (no row slot remap) and
-            // GPU scroll copy is disabled for external grids. All shifted rows
-            // need full vertex regeneration — dirty_rows only covers vacated
-            // rows. Any last_scroll_op the fast path rejected (not just the
-            // multi-scroll/float/abs(rows)>1 cases previously enumerated here)
-            // falls into this same "frontend can't shift it visually" bucket —
-            // e.g. a partial-width, abs(rows)==1 scroll, which ext_scroll_fast_path
-            // rejects (left/right != full width) but this condition used to miss,
-            // leaving the moved region's stale pre-scroll content on the GPU
-            // forever (only the vacated band was ever marked dirty).
+            // scrolls in one batch, a delta past half the region, or a
+            // partial-width region), the frontend receives no on_grid_row_scroll
+            // and cannot shift its row slots, so every shifted row needs full
+            // regeneration — dirty_rows only covers the vacated band. Any
+            // last_scroll_op the fast path rejected falls into this same bucket
+            // — e.g. a partial-width, abs(rows)==1 scroll, which this condition
+            // used to miss, leaving the moved region's stale pre-scroll content
+            // on the GPU forever.
             const ext_scroll_needs_full_regen: bool =
                 !ext_scroll_fast_path and sg.last_scroll_op != null;
 
-            // Cursor is rendered as a separate layer (after row loop), NOT inline
-            // in row vertices. This eliminates cursor ghost artifacts during GPU
-            // scroll copy. No prev_cursor_row tracking needed for row regeneration.
+            // The cursor is a separate layer emitted after the row loop, never
+            // inline in row vertices, which is what stops it ghosting across a
+            // scroll copy.
 
-            // Build regen_rows set for scroll fast path (mirrors global grid approach).
-            // Pre-compute which rows need regeneration: dirty_rows only (no cursor rows).
+            // Rows to regenerate under the fast path: dirty rows only.
             var regen_rows: [12]u32 = undefined;
             use_ext_scroll_fast_path = ext_scroll_fast_path;
 
             if (ext_scroll_fast_path) {
-                // Add all dirty rows within viewport bounds.
-                // Rows beyond viewport_rows are invisible (outside NDC viewport)
-                // and should not be included in the regen set.
+                // Rows beyond viewport_rows are invisible and must not be in the
+                // regen set.
                 for (0..viewport_rows) |ri| {
                     const r: u32 = @intCast(ri);
                     if (sg.isRowDirty(r)) {
@@ -5605,10 +5374,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             regen_rows[regen_count] = r;
                             regen_count += 1;
                         } else {
-                            // Too many dirty rows for fast path — fall back to
-                            // the dirty-row check below, which regenerates
-                            // every row this set would have held and every row
-                            // past the bitmap's length besides.
+                            // Too many dirty rows for the fast path — fall back
+                            // to the dirty-row check below, which regenerates
+                            // every row this set would have held.
                             use_ext_scroll_fast_path = false;
                             break;
                         }
@@ -5625,18 +5393,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 }
                 const ext_effective_rebuild = ext_retried;
 
-                // Iterate only up to viewport_rows (not sg.rows).
-                // Rows beyond viewport_rows are outside the NDC viewport and
-                // produce clipped vertices. Matching the vertex loop to the
-                // viewport ensures the frontend receives data only for drawable
-                // rows — the same invariant the main window always satisfies.
+                // Only up to viewport_rows, not sg.rows: rows beyond it are not
+                // drawable, so the frontend must not receive vertices for them.
                 for (0..viewport_rows) |row_idx| {
-                    // A prior row_cb call this loop may have called
+                    // A prior row_cb in this loop may have called
                     // zonvie_core_abort_flush (e.g. Windows external row-buffer
-                    // OOM). Stop composing further rows in this grid — the
-                    // frontend cancels its whole bracket on abort, so continuing
-                    // would be discarded work — mirrors the identical check in the
-                    // main grid's row-mode loop.
+                    // OOM); the frontend cancels the whole bracket, so further
+                    // rows would be discarded work.
                     if (self.flush_aborted) break;
 
                     const row: u32 = @intCast(row_idx);
@@ -5663,12 +5426,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         };
                     }
 
-                    // Row skip logic — mirrors global grid approach:
-                    // Fast path: only compose rows in regen set (dirty + cursor rows).
-                    // Fallback: check dirty_rows bitmap.
-                    // When scroll happened but fast path is ineligible, regenerate all
-                    // rows because the frontend has no GPU blit or row slot remap to
-                    // shift the non-vacated rows visually.
+                    // Fast path: compose only the rows in the regen set.
+                    // Otherwise use the dirty_rows bitmap, except after a scroll
+                    // the fast path rejected: the frontend cannot shift rows
+                    // itself, so every row must be regenerated.
                     if (use_ext_scroll_fast_path and !ext_retried) {
                         var in_regen = false;
                         for (regen_rows[0..regen_count]) |rr| {
@@ -5679,9 +5440,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         }
                         if (!in_regen) continue;
                     } else if (!need_full_redraw and !ext_effective_rebuild and !ext_scroll_needs_full_regen) {
-                        // dirty_all dominates. Otherwise keep the original
-                        // guard exactly: a row the bitset does not cover is
-                        // regenerated, never skipped.
+                        // dirty_all dominates; otherwise a row the bitset does
+                        // not cover is regenerated, never skipped.
                         if (!sg.dirty_all and
                             sg.dirty_rows.bit_length > row and
                             !sg.dirty_rows.isSet(@as(usize, row)))
@@ -5690,19 +5450,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         }
                     }
 
-                    // Clear buffer for this row
                     ext_verts.clearRetainingCapacity();
 
                     // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
                     const row_est = @as(usize, sg.cols) * 24 + 12;
                     ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
                         ext_had_row_error = true;
-                        // Whole-flush abort (see the ensureTotalCapacity/alloc
-                        // catches earlier in this function) — the frontend must
-                        // cancel this bracket rather than commit it with this row
-                        // silently missing. Stop composing further rows for this
-                        // grid; the outer grid loop's flush_aborted check stops
-                        // further grids too.
+                        // The frontend must cancel this bracket rather than
+                        // commit it with this row silently missing; the outer
+                        // grid loop's flush_aborted check stops the rest.
                         self.flush_aborted = true;
                         break :ext_retry;
                     };
@@ -5716,9 +5472,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     };
                     self.row_cells.setLen(sg.cols);
 
-                    // Resolve the base external-grid row directly into the
-                    // row scratch. Work is proportional to the rows selected
-                    // above; clean rows never copy or scan their cells.
+                    // Resolve the base external-grid row directly into the row
+                    // scratch; clean rows never copy or scan their cells.
                     const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
                     for (0..sg.cols) |c| {
                         const cell_idx = row_start + c;
@@ -5740,10 +5495,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         ext_margins,
                     );
 
-                    // Rebuild the row-local float state every time. A row
+                    // Rebuild the row-local float state every time: a row
                     // callback may re-enter this function and reuse both
-                    // persistent containers; the next outer row must not rely
-                    // on their pre-callback contents.
+                    // persistent containers.
                     self.flush_float_overlay_buf.clearRetainingCapacity();
                     self.flush_float_overlay_buf.ensureTotalCapacity(self.alloc, sg.cols) catch {
                         ext_had_row_error = true;
@@ -5787,10 +5541,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                     else
                                         .{ .cp = ' ', .hl = 0 };
                                     const attr = cache.getAttr(&self.hl, cell.hl);
-                                    // Keep the source grid identity as a shaping
+                                    // The source grid identity is a shaping
                                     // boundary: base and float text must never
-                                    // form one ligature/kerning run merely
-                                    // because their resolved styles match.
+                                    // form one ligature/kerning run.
                                     self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, attr.style_flags, @intFromBool(attr.overline));
                                     self.row_cells.deco_base_flags.items[target_col] = if (viewportCellScrollable(
                                         float_src_row,
@@ -5853,18 +5606,14 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         self.failHardRender(err);
                         break :ext_retry;
                     };
-                    // Cursor rendering moved to separate layer (after row loop)
-
-                    // CHECK: atlas reset happened during glyph processing for this row.
-                    // Already-sent rows have stale UVs → need to restart or abort.
+                    // An atlas reset during this row leaves the rows already sent with stale UVs.
                     if (self.atlas_reset_during_flush) {
                         ext_saw_atlas_reset = true;
                         ext_saw_atlas_reset_any = true;
                         self.atlas_reset_during_flush = false; // Clear for retry
-                        // A reset here can also invalidate glyphs the MAIN grid already
-                        // used earlier in this same flush (main grid always renders
-                        // before this deferred external-grid pass). Mark it so it
-                        // regenerates against the fresh atlas on the next flush.
+                        // A reset here can also invalidate glyphs the MAIN grid
+                        // used earlier in this flush (it always renders before
+                        // this deferred external-grid pass).
                         self.grid.markAllDirty();
                         self.invalidateMirroredFrameState();
                         if (!ext_retried) {
@@ -5874,10 +5623,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         }
                         // 2nd reset: clear all sent rows (match global grid behavior)
                         for (0..viewport_rows) |clear_ri| {
-                            // A clear callback can itself call zonvie_core_abort_flush
-                            // (e.g. Windows COW detach failure) — stop issuing further
-                            // clear callbacks into a flush that's already being
-                            // discarded, matching the abort check elsewhere in this loop.
+                            // A clear callback can itself call
+                            // zonvie_core_abort_flush (e.g. Windows COW detach failure).
                             if (self.flush_aborted) break;
                             replaceGridSurfaceRowVertexCount(self, grid_id, sg, clear_ri, 0) catch |err| {
                                 self.flush_aborted = true;
@@ -5890,12 +5637,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         break; // Abort remaining rows
                     }
 
-                    // Send this row's vertices
-                    // Pass viewport dimensions (target size) instead of sg dimensions so that
-                    // the frontend's scroll offset calculation matches the NDC viewport used here.
+                    // Pass viewport dimensions, not sg's, so the frontend's
+                    // scroll offset calculation matches the rows emitted here.
                     const row_ptr = if (ext_verts.items.len == 0) null else ext_verts.items.ptr;
-                    // Mirror this row's glyph UVs so atlas reclamation can see
-                    // what this grid is still showing.
+                    // Mirror this row's glyph UVs for atlas reclamation.
                     self.recordGlyphMirrorRow(grid_id, row, viewport_rows, ext_verts.items);
                     row_cb(self.ctx, grid_id, row, 1, row_ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
                 }
@@ -5903,12 +5648,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             }
         }
 
-        // --- Cursor layer: send cursor vertices as separate on_vertices_row with CURSOR flag ---
-        // This keeps cursor independent of row buffers, so GPU scroll copy
-        // cannot create cursor ghosts.
-        // Skipped on abort (see the row-loop check above) — the frontend
-        // cancels this grid's whole bracket, so sending a cursor layer for
-        // it would be discarded work on top of an already-doomed flush.
+        // Cursor layer: a separate on_vertices_row with the CURSOR flag, which
+        // keeps the cursor out of the row buffers so a GPU scroll copy cannot
+        // ghost it. Skipped on abort — the frontend cancels this grid's whole
+        // bracket, so a cursor layer would be discarded work.
         if (!self.flush_aborted) {
             if (cursor_row) |cur_row| {
                 if (cur_row < sg.rows and cursor_col < sg.cols) {
@@ -5951,7 +5694,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         .block => {},
                     }
 
-                    // Cursor background quad
                     const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
                         self.hl.get(self.grid.cursor_attr_id).bg
                     else
@@ -5960,7 +5702,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                     Helpers.pushSolidQuadAssumeCapacity(ext_verts, crx0, cry0, crx1, cry1, cursor_color, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
 
-                    // Cursor text for block cursor
                     if (self.grid.cursor_shape == .block) {
                         const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
                         if (cell_idx < sg.cells.len) {
@@ -6032,10 +5773,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                         glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
                                     }
 
-                                    // CHECK: the cursor glyph ensure above can itself trigger an
-                                    // atlas reset that no later code in this function re-checks.
-                                    // Handle it here instead of leaking the flag into the next
-                                    // external grid's retry check or the next flush.
+                                    // The cursor glyph ensure above can trigger an
+                                    // atlas reset no later code re-checks; handle it
+                                    // here rather than leak the flag to the next grid.
                                     if (self.atlas_reset_during_flush) {
                                         ext_saw_atlas_reset = true;
                                         ext_saw_atlas_reset_any = true;
@@ -6086,29 +5826,24 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                     if (self.flush_aborted) return;
 
-                    // Send cursor vertices as separate layer (flags = CURSOR)
                     row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                     self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
                 }
             } else if ((cursor_was_on_this_grid or self.force_ext_cursor_recheck) and !cursor_on_this_grid) {
-                // Cursor left this grid: send empty cursor to clear previous
-                // cursor. force_ext_cursor_recheck: last_ext_cursor_grid cannot
-                // be trusted to still name the right grid after a prior failed
-                // flush (see its doc comment) — clearing the cursor on every
-                // OTHER external grid unconditionally is a harmless no-op for
-                // grids that were already clean, and closes the actual gap for
-                // whichever grid was NOT the one that got renamed.
+                // Cursor left this grid: send an empty cursor to clear the
+                // previous one. Under force_ext_cursor_recheck,
+                // last_ext_cursor_grid cannot be trusted after a prior failed
+                // flush, so clearing every OTHER external grid is a harmless
+                // no-op for clean grids and closes the gap for the misnamed one.
                 row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                 self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
             }
         }
 
-        // Debug log glyph statistics
         self.log.write("[ext_grid_row] grid_id={d} rows={d} cols={d} scroll_fast_path={} regen_count={d}\n", .{
             grid_id, sg.rows, sg.cols, use_ext_scroll_fast_path, regen_count,
         });
 
-        // Log cache performance for this grid
         self.log.write("[ext_grid_perf] grid_id={d} hl_cache hits={d} misses={d}\n", .{
             grid_id, cache.perf_hl_cache_hits, cache.perf_hl_cache_misses,
         });
@@ -6116,37 +5851,28 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             grid_id, cache.perf_glyph_ascii_hits, cache.perf_glyph_ascii_misses, cache.perf_glyph_nonascii_hits, cache.perf_glyph_nonascii_misses,
         });
 
-        // Clear dirty flags after sending (both dirty and dirty_rows).
-        // Skipped on mid-flush abort (frontend OOM via
-        // zonvie_core_abort_flush): keep dirty so the rows are re-sent.
+        // Skipped on mid-flush abort: keep dirty so the rows are re-sent.
         if (!self.flush_aborted) sg.clearDirtyContent();
-        // If a row failed (allocation error), re-mark the grid dirty
-        // so the failed rows get regenerated on the next flush.
+        // Re-mark dirty so the failed rows regenerate next flush.
         if (ext_had_row_error) {
             sg.markAllDirty();
         }
-        // If atlas was reset during this grid's rendering, re-mark dirty
-        // so it gets re-rendered with correct UVs next flush.
+        // Re-mark dirty so the grid re-renders with correct UVs next flush.
         if (ext_saw_atlas_reset) {
             sg.markAllDirty();
         }
         // A rasterizer miss is transient (font backend/cache publication may
-        // complete before the next frame). Keep the grid dirty so the missing
-        // glyph is regenerated instead of becoming permanently blank.
+        // complete before the next frame), so keep the grid dirty rather than
+        // let the missing glyph become permanently blank.
         if (ext_had_glyph_miss) {
             sg.markAllDirty();
         }
     }
 
-    // After ALL grids processed: if any atlas reset occurred,
-    // already-sent grids also have stale UVs → mark ALL sub_grids dirty.
-    // The MAIN grid is included too: this function runs as a deferred call
-    // AFTER the main row-mode loop already dispatched its vertices this
-    // same flush (on_vertices_row, with UVs baked against the pre-reset
-    // atlas). Those vertices are committed as-is alongside the just-reset
-    // (differently-packed) atlas texture — one frame of main-grid glyph
-    // corruption/blank cells that only markAllDirty (forcing a full main
-    // resend next flush against the corrected atlas) can heal.
+    // If any atlas reset occurred, every already-sent grid has stale UVs. The
+    // MAIN grid is included: this function runs as a deferred call AFTER the
+    // main row loop already dispatched its vertices this same flush, with UVs
+    // baked against the pre-reset atlas.
     if (ext_saw_atlas_reset_any) {
         self.grid.markAllDirty();
         self.invalidateMirroredFrameState();
@@ -6154,14 +5880,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         while (sg_it.next()) |sg_val| {
             sg_val.markAllDirty();
         }
-        // The cursor is a separate vertex consumer gated on cursor_rev
-        // alone (main and external both) — this atlas reset invalidates
-        // its cached UVs too, but none of the dirtying above touches it.
+        // The cursor is a separate vertex consumer gated on cursor_rev alone,
+        // which none of the dirtying above touches.
         self.grid.cursor_rev +%= 1;
         // markAllDirty schedules a correct NEXT flush; it cannot undo THIS
-        // flush's already-dispatched main vertices (pre-reset UVs). Signal
-        // frontends to cancel the current commit entirely — see the field
-        // doc comment (nvim_core.zig) and zonvie_core_flush_had_atlas_corruption.
+        // flush's already-dispatched main vertices, so signal frontends to
+        // cancel the current commit entirely.
         self.flush_atlas_corrupted = true;
     }
 }
@@ -6184,10 +5908,9 @@ fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
 pub fn notifyCmdlineChanges(self: *Core) void {
     if (!self.grid.cmdline_dirty) return;
     if (!self.ext_cmdline_enabled) return;
-    // NOTE: dirty is cleared explicitly at each success-return path below, NOT
-    // via defer — on resizeGrid/setWinExternalPos failure (OOM only) we must
-    // leave cmdline_dirty set so the next flush retries, per the "clear dirty
-    // only after successful submission" rule.
+    // dirty is cleared explicitly at each success-return path below, NOT via
+    // defer: on resizeGrid/setWinExternalPos failure cmdline_dirty must stay
+    // set, per the "clear dirty only after successful submission" rule.
 
     // Check if any cmdline is visible, find the highest level (most recent)
     var any_visible = false;
@@ -6223,11 +5946,9 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         };
         const cmdline_grid_id = grid_mod.CMDLINE_GRID_ID;
 
-        // Record command content into last_cmd_buf — currently written and
-        // never read; the split-view label it was collected for was never
-        // wired up (see the field declaration in nvim_core.zig).
-        // (record every update, the final content before hide is the
-        // executed command)
+        // last_cmd_buf is written and never read; the split-view label it was
+        // collected for was never wired up (see nvim_core.zig). Every update is
+        // recorded, so the final content before hide is the executed command.
         self.last_cmd_firstc = state.firstc;
         self.last_cmd_len = 0;
         for (state.content.items) |chunk| {
@@ -6238,14 +5959,12 @@ pub fn notifyCmdlineChanges(self: *Core) void {
                 self.last_cmd_len += copy_len;
             }
         }
-        // Record start time when command is first shown
         if (self.last_cmd_start_time == null) {
             self.last_cmd_start_time = clock.nowNs();
         }
 
-        // Notify Swift about cmdline show (for icon update etc.)
-        // Note: We pass minimal info here since content requires type conversion.
-        // The main purpose is to inform Swift about firstc for icon display.
+        // Minimal info only: the point is to hand the frontend firstc for its
+        // icon display, and the content would need type conversion.
         if (self.cb.on_cmdline_show) |callback| {
             var dummy_content: [1]c_api.CmdlineChunk = .{c_api.CmdlineChunk{
                 .hl_id = 0,
@@ -9858,9 +9577,8 @@ test "flush transaction orders begin vertices end and restores state on every ab
             self.event_count += 1;
         }
 
-        /// Collapse runs of the same event: the row path emits one 'V' per
-        /// row plus one for the cursor layer, and this test is about the
-        /// begin/vertices/end ordering, not how many rows there were.
+        /// Collapse runs of the same event: the row path emits one 'V' per row
+        /// plus one for the cursor layer, and this test pins ordering, not count.
         fn collapsed(self: *const @This(), out: *[16]u8) []const u8 {
             var n: usize = 0;
             for (self.events[0..self.event_count]) |e| {
@@ -10019,9 +9737,8 @@ test "row scroll hint covers composited grids and waits for the external seed" {
     var state = State{};
     core.ctx = &state;
 
-    // A grid the main surface places as a layer owns its rows, so a shift
-    // cannot disturb a neighbour and the hint applies to it too. This is the
-    // case composition had to exclude.
+    // A grid the main surface places as a layer owns its rows, so the hint
+    // applies to it too — the case composition had to exclude.
     core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.calls);
@@ -10542,10 +10259,9 @@ test "external scroll without row-shift callback regenerates every retained row"
     try std.testing.expectEqual(@as(u32, 4), state.row_calls);
     try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
 
-    // A float anchored to the external grid is its own layer and is drawn on
-    // top, so shifting the base grid's rows no longer moves the float's
-    // pixels: the grid stays eligible with a float over it. That exclusion is
-    // exactly what composition forced and what per-grid rows removed.
+    // A float over the external grid no longer blocks the hint: eligibility is
+    // decided by the grid's own scroll state alone. That exclusion is exactly
+    // what composition forced and what per-grid rows removed.
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try core.grid.resizeGrid(3, 1, 1);
     try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2);
@@ -11669,10 +11385,8 @@ test "atlas reset on a scroll fast path flush still resends every row" {
         }
     };
 
-    // The fast path has two publication branches: frontends that implement
-    // on_grid_row_scroll let the frontend shift its own row slots (macOS),
-    // the rest replay the shifted cache row by row (Windows). Both set
-    // used_scroll_fast_path at the same site, so both must survive the retry.
+    // Both branches: a frontend that implements on_grid_row_scroll shifts its
+    // own row slots, and one that does not must survive the retry just the same.
     for ([_]bool{ false, true }) |use_scroll_cb| {
         var core = Core.initForTest(std.testing.allocator);
         defer core.deinitForTest();
@@ -13777,10 +13491,9 @@ fn armGlowForTest(core: *Core, glow_all: bool) !void {
 }
 
 test "a main-grid subgrid overlay glows per cell in both composition modes" {
-    // The subgrid overlay decides glow per cell, separately from the
-    // main-grid run path, and it is written out once for row mode and once
-    // for whole-screen mode. Drive both and require the decision to follow
-    // the cell's own highlight rather than being uniform.
+    // The subgrid overlay decides glow per cell, separately from the main-grid
+    // run path. Require the decision to follow the cell's own highlight rather
+    // than being uniform.
     const Runner = struct {
         fn run(alloc: std.mem.Allocator, row_mode: bool, glow_all: bool) !GlowCounter {
             var core = Core.initForTest(alloc);
@@ -13925,8 +13638,8 @@ test "resolveHlCached memoizes below the limit and resolves live above it" {
     try std.testing.expectEqual(@as(u32, 5), misses);
     try std.testing.expectEqual(@as(u32, 1), hits);
 
-    // count = false is the non-row-mode callers' choice: same answers, no
-    // statistics. Reuse a fresh memo so the miss path runs again.
+    // count = false gives the same answers with no statistics. Reuse a fresh
+    // memo so the miss path runs again.
     var valid2 = [_]bool{false} ** 4;
     var unused_hits: u32 = 0;
     var unused_misses: u32 = 0;
@@ -13938,9 +13651,8 @@ test "resolveHlCached memoizes below the limit and resolves live above it" {
 }
 
 test "the external-float storage size is the three arrays, and null at every overflow edge" {
-    // The callers charge this against a byte budget, so a size that wrapped
-    // would pass a budget it actually blows: each of the three checked
-    // operations has to answer null rather than a small number.
+    // A wrapped size would pass a byte budget it actually blows, so each of the
+    // three checked operations has to answer null rather than a small number.
     const max = std.math.maxInt(usize);
     const cases = [_]struct { in: [3]usize, want: ?usize }{
         .{ .in = .{ 0, 0, 0 }, .want = 0 },
@@ -13963,10 +13675,8 @@ test "the external-float storage size is the three arrays, and null at every ove
 }
 
 test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
-    // Only the middle of the external-float row index's CSR build is
-    // reusable -- the counting and filling ends differ in what they iterate
-    // and in which array their emitted indices point into -- so this covers
-    // exactly the part any such index calls.
+    // Only the middle of the external-float row index's CSR build is reusable,
+    // so this covers exactly the part any such index calls.
     const alloc = std.testing.allocator;
 
     var offsets: std.ArrayListUnmanaged(usize) = .empty;
@@ -14253,16 +13963,14 @@ test "VH's two solid-quad variants emit the same corner order" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 2, 1, 1, 2, 3 }, &solidQuadCornerPattern(out.items[0..6]));
 
     // The pattern is deliberately blind to placement, so pin the geometry too:
-    // a transposed x/y argument would keep the ordering and move the quad.
-    // Positions are grid-local pixels with y down, so (0,0)-(4,2) puts the
-    // top-left corner at (0, 0) and the bottom-right at (4, 2).
+    // a transposed x/y argument keeps the ordering and moves the quad. Positions
+    // are grid-local pixels with y down, so (0,0)-(4,2) is TL to BR.
     try std.testing.expectEqual([2]f32{ 0, 0 }, out.items[0].position);
     try std.testing.expectEqual([2]f32{ 4, 2 }, out.items[5].position);
 
     // In grid-local pixels (y down) the first triangle is wound clockwise; the
-    // frontend's layer transform negates y, which restores the counter-
-    // clockwise NDC winding the pipeline expects. Computed from the EMITTED
-    // vertices, not from quadPx's return, so it tests what was pushed.
+    // frontend's layer transform negates y, restoring the counter-clockwise NDC
+    // winding. Computed from the EMITTED vertices, so it tests what was pushed.
     const a = out.items[0].position;
     const b = out.items[1].position;
     const c = out.items[2].position;
@@ -14951,9 +14659,8 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     var state = State{};
     core.ctx = &state;
 
-    // Two vertical splits: neither spans the surface width. Composition
-    // rejected these outright (ScrollFallbackReason.partial_width) because a
-    // surface row held both. Each owns its rows now.
+    // Two vertical splits: neither spans the surface width. Composition rejected
+    // these outright (ScrollFallbackReason.partial_width); each owns its rows now.
     try core.grid.resizeGrid(2, 10, 20);
     try core.grid.setWinPos(2, 101, 0, 0);
     try core.grid.resizeGrid(3, 10, 20);

@@ -5,13 +5,9 @@ import Metal
 /// can be checked without a device. Pixel values carry `Px`; everything else
 /// is in rows.
 ///
-/// The rectangle being scrolled is a sub-rectangle of the back texture: it
-/// starts at (`originXPx`, `originYPx`) and is `widthPx` wide. For the whole
-/// surface both origins are 0 and `widthPx` is the drawable width; for one
-/// layer they are that layer's pixel origin and width inside the shared back
-/// texture. Every pixel value the plan reports is absolute in the texture,
-/// so it can be fed straight to a blit encoder; `localClearBand()` converts
-/// the vacated band back to the layer's own pixel space.
+/// The scrolled rectangle is a sub-rectangle of the back texture at
+/// (`originXPx`, `originYPx`), `widthPx` wide: origins 0 and the drawable
+/// width for a whole surface, the layer's own origin and width for one layer.
 ///
 /// The row count the scroll callback reports can outlive the current
 /// drawable -- a window shrink is only protected on the first post-shrink
@@ -32,16 +28,12 @@ struct RowScrollBlitPlan: Equatable {
     var clearBottomPx: Int
     /// scroll.rowEnd clamped to the texture: where the blit stopped.
     var clampedRowEnd: Int
-    /// Rows the caller must redraw. When multiple flushes accumulate between
-    /// draws, the blit shifts by the total accumulated delta D. The vacated
-    /// region (D rows) must be redrawn. Additionally, intermediate scroll
-    /// steps each shifted the row slot mapping, so rows that were copied by
-    /// an intermediate step but then overwritten by a subsequent step have
-    /// stale content in the back buffer. Expanding by 2*D covers both.
+    /// Rows the caller must redraw: the band vacated by an accumulated delta
+    /// D, plus another D for rows an intermediate scroll step copied and a
+    /// later one overwrote, which are stale in the back buffer.
     ///
-    /// These are grid-local rows counted from `rowStart`, the same space the
-    /// scroll region is reported in. `originYPx` does NOT shift them: it moves
-    /// the pixels, not the row numbering.
+    /// Grid-local rows counted from `rowStart`, the space the scroll region is
+    /// reported in; `originYPx` moves the pixels, not the row numbering.
     var dirtyRows: Range<Int>
     /// The scrolled rectangle's left edge, which the encoder copies at.
     var originXPx: Int
@@ -114,9 +106,8 @@ struct RowScrollBlitPlan: Equatable {
         )
     }
 
-    /// The vacated band relative to `originYPx`, for callers that draw under a
-    /// layer transform and whose pixel space therefore starts at the layer
-    /// origin rather than at the texture's.
+    /// The vacated band relative to `originYPx`, for callers drawing under a
+    /// layer transform, whose pixel space starts at the layer origin.
     func localClearBand() -> (clearTopPx: Int, clearBottomPx: Int) {
         (clearTopPx: clearTopPx - originYPx, clearBottomPx: clearBottomPx - originYPx)
     }
@@ -142,9 +133,8 @@ struct RowScrollBlitPlan: Equatable {
 }
 
 /// Encode a plan's two copies: the region into the scratch texture at its
-/// own offset, then back into the back texture at the shifted offset. Both
-/// copies use the plan's `originXPx` as their left edge, so only the
-/// scrolled rectangle's columns move. The caller owns the encoder and ends it.
+/// own offset, then back into the back texture at the shifted offset. The
+/// caller owns the encoder and ends it.
 func encodeRowScrollBlit(
     _ blit: MTLBlitCommandEncoder,
     backTexture: MTLTexture,
