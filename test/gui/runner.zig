@@ -190,6 +190,24 @@ test "gui:visual_split" {
     }
 }
 
+test "gui:visual_split_divider_survives_layer_redraw" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/split_divider_survives_layer_redraw.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_statusline_survives_layer_redraw" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/statusline_survives_layer_redraw.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_float" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
