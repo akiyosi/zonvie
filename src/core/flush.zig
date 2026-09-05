@@ -15100,6 +15100,144 @@ test "a vertical split's scroll publishes a shift instead of regenerating the ba
     try std.testing.expectEqual(@as(u32, 0), state.root_rows_emitted);
 }
 
+test "scrollbound splits and a centred float all shift in one batch and resend only the vacated band" {
+    // RowShiftSink below keeps one aggregate tally and hard-codes grid 2, which
+    // cannot say whether each of three grids shifted. This sink is keyed by
+    // grid instead; it stays local so the four setUpRowShiftCore tests keep
+    // reading the aggregate fields they were written against.
+    const State = struct {
+        const Tally = struct {
+            scroll_calls: u32 = 0,
+            last_rows_delta: i32 = 0,
+            rows_emitted: u32 = 0,
+        };
+
+        left: Tally = .{},
+        right: Tally = .{},
+        float: Tally = .{},
+        root_rows_emitted: u32 = 0,
+
+        fn tallyFor(self: *@This(), grid_id: i64) ?*Tally {
+            return switch (grid_id) {
+                2 => &self.left,
+                3 => &self.right,
+                4 => &self.float,
+                else => null,
+            };
+        }
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) {
+                self.root_rows_emitted += 1;
+                return;
+            }
+            const tally = self.tallyFor(grid_id) orelse return;
+            tally.rows_emitted += 1;
+        }
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const tally = self.tallyFor(grid_id) orelse return;
+            tally.scroll_calls += 1;
+            tally.last_rows_delta = rows_delta;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 60;
+    core.drawable_h_px = 12;
+    try core.grid.resize(12, 60);
+    core.grid.cursor_visible = false;
+
+    // Two vertical splits side by side, plus a float centred over the boundary
+    // so it covers columns of both. Every window is its own grid, so neither
+    // the neighbour split nor the float on top can be disturbed by a shift.
+    try core.grid.resizeGrid(2, 12, 30);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    try core.grid.resizeGrid(3, 12, 30);
+    try core.grid.setWinPos(3, 102, 0, 30);
+    try core.grid.resizeGrid(4, 8, 20);
+    try core.grid.setWinFloatPos(4, 103, 2, 20, 50, 0, 1);
+    for (0..12) |r| {
+        core.grid.putCellGrid(2, @intCast(r), 0, 'A' + @as(u32, @intCast(r)), 0);
+        core.grid.putCellGrid(3, @intCast(r), 0, 'a' + @as(u32, @intCast(r)), 0);
+    }
+    for (0..8) |r| {
+        core.grid.putCellGrid(4, @intCast(r), 0, '0' + @as(u32, @intCast(r)), 0);
+    }
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(12, 60);
+    state = .{};
+
+    // A <C-d>-sized step, not a single line: three rows leave each region at
+    // once. Both splits scroll together (scrollbind) and the float scrolls its
+    // own content, all in one batch. Three is within half of every region
+    // (12/2 and 8/2), which is where gridScrollFastPathRegion stops shifting.
+    const shift_rows: i32 = 3;
+    core.grid.scrollGrid(2, 0, 12, 0, 30, shift_rows, 0);
+    core.grid.scrollGrid(3, 0, 12, 0, 30, shift_rows, 0);
+    core.grid.scrollGrid(4, 0, 8, 0, 20, shift_rows, 0);
+    try flush_ctx.onFlush(12, 60);
+
+    // GridBuf.scroll marks exactly the vacated band dirty for an upward scroll
+    // (`markDirtyRect(bot - shift, bot)`, grid.zig:1073), so each grid owes
+    // `shift_rows` rows and no more, whatever its region height is: rows 9..11
+    // of each split and rows 5..7 of the float.
+    const expected_rows: u32 = 3;
+    for ([_]*const State.Tally{ &state.left, &state.right, &state.float }) |tally| {
+        try std.testing.expectEqual(@as(u32, 1), tally.scroll_calls);
+        try std.testing.expectEqual(shift_rows, tally.last_rows_delta);
+        try std.testing.expectEqual(expected_rows, tally.rows_emitted);
+    }
+
+    // Each window owns its rows, so grid 1's cells under all three are
+    // untouched and the root must not be regenerated for any of these scrolls.
+    try std.testing.expectEqual(@as(u32, 0), state.root_rows_emitted);
+}
+
 /// Sink for the row-shift hint tests below: counts one window grid's MAIN
 /// rows and every hint, remembering the last hint's delta and last row sent.
 const RowShiftSink = struct {
