@@ -249,6 +249,11 @@ test "e2e:message_state_corruption" {
     try @import("scenarios/message_state_corruption.zig").run(testing.allocator);
 }
 
+test "e2e:scrollbind_layers_fast_path" {
+    try requireNvim();
+    try @import("scenarios/scrollbind_layers_fast_path.zig").run(testing.allocator);
+}
+
 test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);
