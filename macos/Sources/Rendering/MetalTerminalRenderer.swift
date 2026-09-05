@@ -3238,20 +3238,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 state.drawRows.append(contentsOf: refusedRows)
             }
 
-            // A root dirty row that resolves to no vertices is overpainted
-            // below with an opaque background band spanning the whole drawable
-            // width (the root's empty-dirty-row overwrite, which .load makes
-            // mandatory for the pixels the root owns). Once the main surface
-            // has layers the root no longer owns most of that width: the core
-            // drops every default-background run from the root's rows
-            // (flush.zig `skip_default_bg`), which is exactly what a row under
-            // a window resolves to, so the band erases pixels that belong to a
-            // layer. Mark the grid-local rows it lands on, here where the
-            // damage is produced — the layer then repaints those rows and only
-            // those, instead of the whole layer.
+            // Every root dirty row is overpainted below with a background band
+            // spanning the whole drawable width before it is drawn (the root's
+            // dirty-row overwrite, which .load makes mandatory: the core drops
+            // every default-background run from the root's rows while the main
+            // surface has layers — flush.zig `skip_default_bg` — so a root row
+            // that loses a glyph paints nothing where the glyph was, and a root
+            // row that keeps one re-blends it over its own previous pixels).
+            // The band therefore also erases the pixels that belong to a layer.
+            // Mark the grid-local rows it lands on, here where the damage is
+            // produced — the layer then repaints those rows and only those,
+            // instead of the whole layer.
             let bandRowHeightPx = Int(cellHi)
             if layerSnapshot.count > 1 && bandRowHeightPx > 0 {
-                for row in dirtyRows where resolvedRowState(row) == nil {
+                for row in dirtyRows {
                     let bandTopPx = row * bandRowHeightPx
                     let bandBottomPx = bandTopPx + bandRowHeightPx
                     for (li, layer) in layerSnapshot.enumerated().dropFirst() {
@@ -3393,16 +3393,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
 
-            // With loadAction=.load, a dirty row whose committed vertex count
-            // is zero must actively overwrite its old pixels. The regular
-            // non-blur pipeline is sufficient here: backgroundAlpha is 1.0,
-            // so the solid quad has overwrite semantics while preserving the
-            // same RGB/alpha contract as a normal empty terminal row.
-            func clearEmptyDirtyRowsNonBlur(_ rows: [Int]) {
+            // With loadAction=.load, a dirty row must actively overwrite its
+            // old pixels rather than be drawn on top of them: the core drops
+            // the root's default-background runs while the main surface has
+            // layers (flush.zig `skip_default_bg`), so neither a row that lost
+            // a glyph nor a row that kept one covers what it painted last
+            // frame. The regular non-blur pipeline is sufficient here:
+            // backgroundAlpha is 1.0, so the solid quad has overwrite
+            // semantics while preserving the same RGB/alpha contract as a
+            // normal empty terminal row.
+            func clearDirtyRowsNonBlur(_ rows: [Int]) {
                 enc.setRenderPipelineState(pipeline!)
                 let width = Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width))
                 let height = Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height))
-                for row in rows where resolvedRowState(row) == nil {
+                for row in rows {
                     let topPx = row * cellH
                     drawBackgroundClearBand(
                         enc,
@@ -3417,10 +3421,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // The scissored single-pass dirty-row draw that both the
             // GPU-scroll-copy arm and the plain partial-redraw arm below
-            // perform, verbatim: overwrite the dirty rows that carry no
-            // vertices, then draw the dirty rows one scissor rect each.
+            // perform, verbatim: overwrite the dirty rows, then draw them one
+            // scissor rect each.
             func drawScissoredDirtyRows() {
-                clearEmptyDirtyRowsNonBlur(dirtyRows)
+                clearDirtyRowsNonBlur(dirtyRows)
                 _ = encodeSurfaceRowDraws(
                     encoder: enc,
                     rows: dirtyRows,
@@ -3494,29 +3498,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // scissor rects.  Safe because overwrite blending prevents
                         // alpha accumulation in the redrawn rows.
                         //
-                        // Rows with vc==0 (cleared by core) are dropped by
-                        // resolvedRowState → encodeSurfaceRowDraws.  Since
-                        // loadAction=.load, the old backbuffer pixels would persist.
-                        // Draw a background-color quad for these empty rows using
-                        // backgroundPipeline (overwrite blend) to fully replace old content.
+                        // Since loadAction=.load, a dirty row that does not
+                        // repaint every pixel it owns keeps the previous
+                        // frame's. Two ways that happens, both from the core
+                        // dropping the root's default-background runs while
+                        // the main surface has layers (flush.zig
+                        // `skip_default_bg`): a row with vc==0 is dropped by
+                        // resolvedRowState → encodeSurfaceRowDraws entirely,
+                        // and a row that still carries a glyph — a window
+                        // separator, a statusline — emits no background quad
+                        // under it, so the glyph pass alpha-blends it over its
+                        // own previous output and creeps toward opaque. Band
+                        // every dirty row with backgroundPipeline (overwrite
+                        // blend) first; the row's own background quads then
+                        // overwrite the band where it has any.
                         let drawableWidthF = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
                         let drawableHeightF = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
                         let cellHiI = Int(cellHi)
                         if let bgPipe = backgroundPipeline {
                             enc.setRenderPipelineState(bgPipe)
                             for row in dirtyRows {
-                                if resolvedRowState(row) == nil {
-                                    let topPx = row * cellHiI
-                                    let bottomPx = topPx + cellHiI
-                                    drawBackgroundClearBand(
-                                        enc,
-                                        clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
-                                        xRangePx: (leftPx: 0, rightPx: drawableWidthF),
-                                        drawableHeight: drawableHeightF,
-                                        bgRGB: snappedBgRGB,
-                                        gridId: 1
-                                    )
-                                }
+                                let topPx = row * cellHiI
+                                let bottomPx = topPx + cellHiI
+                                drawBackgroundClearBand(
+                                    enc,
+                                    clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
+                                    xRangePx: (leftPx: 0, rightPx: drawableWidthF),
+                                    drawableHeight: drawableHeightF,
+                                    bgRGB: snappedBgRGB,
+                                    gridId: 1
+                                )
                             }
                         }
                         _ = encodeSurfaceRowDraws(
