@@ -2704,15 +2704,12 @@ fn dispatchGridRowScroll(
     if (sg.scroll_fast_path_blocked) return false;
 
     const op = sg.last_scroll_op orelse return false;
-    const ext_target = core.grid.external_grid_target_sizes.get(grid_id);
-    const vp_rows = if (ext_target) |t| t.rows else sg.rows;
-    const vp_cols = if (ext_target) |t| t.cols else sg.cols;
-    const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, vp_rows, vp_cols) orelse return false;
+    const region = gridScrollFastPathRegion(op, sg.rows, sg.cols, sg.rows, sg.cols) orelse return false;
     // The frontend keeps the surviving rows and is sent only the vacated ones,
     // so the mirror must move the same way or it would answer for rows that
     // are no longer where it thinks.
     core.shiftGlyphMirror(grid_id, region.row_start, region.row_end, op.rows);
-    scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, vp_rows, vp_cols);
+    scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, sg.rows, sg.cols);
     return true;
 }
 
@@ -5466,10 +5463,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Cursor rows are handled via regen_rows (fast path) or dirty_rows marking below.
         const need_full_redraw = force_render or force_redraw_this;
 
-        // NDC viewport: use target dimensions which are kept in sync with grid_resize.
-        const target = self.grid.external_grid_target_sizes.get(grid_id);
-        const viewport_cols = if (target) |t| t.cols else sg.cols;
-        const viewport_rows = if (target) |t| t.rows else sg.rows;
+        // NDC viewport: the grid's own dimensions, which grid_resize moves.
+        const viewport_cols = sg.cols;
+        const viewport_rows = sg.rows;
         const cursor_row: ?u32 = if (externalCursorVisibleOnGrid(&self.grid, grid_id))
             self.grid.cursor_row
         else
@@ -5586,10 +5582,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // rejects (left/right != full width) but this condition used to miss,
             // leaving the moved region's stale pre-scroll content on the GPU
             // forever (only the vacated band was ever marked dirty).
-            // Set again below when the regen set overflows: abandoning the
-            // fast path mid-build lands in the same bucket, because the
-            // frontend was already told to shift its rows.
-            var ext_scroll_needs_full_regen: bool =
+            const ext_scroll_needs_full_regen: bool =
                 !ext_scroll_fast_path and sg.last_scroll_op != null;
 
             // Cursor is rendered as a separate layer (after row loop), NOT inline
@@ -5612,59 +5605,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             regen_rows[regen_count] = r;
                             regen_count += 1;
                         } else {
-                            // Too many dirty rows for fast path — fall back
+                            // Too many dirty rows for fast path — fall back to
+                            // the dirty-row check below, which regenerates
+                            // every row this set would have held and every row
+                            // past the bitmap's length besides.
                             use_ext_scroll_fast_path = false;
-                            ext_scroll_needs_full_regen = true;
-                            break;
-                        }
-                    }
-                }
-                // When viewport_rows < sg.rows (margin rows present), the Neovim
-                // dirty bitmap marks the out-of-bounds vacated rows (e.g. row 44
-                // for sg.rows=45, viewport_rows=44). The frontend scroll callback
-                // receives the clamped region, so the rows it actually empties
-                // are within the viewport. Add that clamped vacated band to
-                // regen where the dirty bitmap does not already cover it.
-                // Without this, those rows get no vertex data and render blank
-                // after the GPU scroll blit.
-                //
-                // A scroll of k rows vacates a band of k rows, not one. Upward,
-                // GridBuf.scroll dirties [op.bot - k, op.bot) while the frontend
-                // empties [clamped_bot - k, clamped_bot); once op.bot exceeds
-                // viewport_rows the two bands no longer line up and every row in
-                // [clamped_bot - k, min(op.bot - k, clamped_bot)) is vacated on
-                // screen yet never marked dirty. Downward both bands are
-                // [op.top, op.top + k) and the whole band is already dirty, so
-                // op.top alone still stands in for it.
-                if (use_ext_scroll_fast_path and viewport_rows < sg.rows) {
-                    const op = sg.last_scroll_op.?;
-                    const clamped_bot = @min(op.bot, viewport_rows);
-                    // The fast path admitted this op, so 0 < op.rows <=
-                    // (clamped_bot - op.top) / 2 and the band start cannot
-                    // underflow.
-                    const shift_rows: u32 = if (op.rows > 0) @intCast(op.rows) else 0;
-                    const band_start_rows: u32 =
-                        if (op.rows > 0) clamped_bot -| shift_rows else op.top;
-                    const band_end_rows: u32 = if (op.rows > 0)
-                        @min(op.bot -| shift_rows, clamped_bot)
-                    else
-                        op.top + 1;
-                    var vacated = band_start_rows;
-                    while (vacated < band_end_rows) : (vacated += 1) {
-                        var found = false;
-                        for (regen_rows[0..regen_count]) |rr| {
-                            if (rr == vacated) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found) continue;
-                        if (regen_count < regen_rows.len) {
-                            regen_rows[regen_count] = vacated;
-                            regen_count += 1;
-                        } else {
-                            use_ext_scroll_fast_path = false;
-                            ext_scroll_needs_full_regen = true;
                             break;
                         }
                     }
@@ -10030,7 +9975,7 @@ test "flush transaction orders begin vertices end and restores state on every ab
     }
 }
 
-test "row scroll hint covers composited grids and clamps target viewport" {
+test "row scroll hint covers composited grids and waits for the external seed" {
     const State = struct {
         calls: u32 = 0,
         grid_id: i64 = 0,
@@ -10085,11 +10030,8 @@ test "row scroll hint covers composited grids and clamps target viewport" {
 
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
-    // During a resize transition the retained GridBuf may still be wider and
-    // taller than the frontend target viewport. The callback rectangle must
-    // describe the visible surface so its full-width eligibility check agrees
-    // with the core's external-row fast path.
-    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 3, .cols = 2 });
+    // An external grid has no frontend surface to remap until its open
+    // callback has seeded one, so the hint must stay silent until then.
     core.grid.scrollGrid(2, 0, 4, 0, 4, 1, 0);
     try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 0), state.calls);
@@ -10097,19 +10039,21 @@ test "row scroll hint covers composited grids and clamps target viewport" {
         .win = 42,
         .start_row = 0,
         .start_col = 0,
-        .rows = 3,
-        .cols = 2,
+        .rows = 4,
+        .cols = 4,
     });
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.calls);
     try std.testing.expectEqual(@as(i64, 2), state.grid_id);
+    // The callback rectangle describes the grid's own surface, so its
+    // full-width eligibility check agrees with the external-row fast path.
     try std.testing.expectEqual(@as(u32, 0), state.row_start);
-    try std.testing.expectEqual(@as(u32, 3), state.row_end);
+    try std.testing.expectEqual(@as(u32, 4), state.row_end);
     try std.testing.expectEqual(@as(u32, 0), state.col_start);
-    try std.testing.expectEqual(@as(u32, 2), state.col_end);
+    try std.testing.expectEqual(@as(u32, 4), state.col_end);
     try std.testing.expectEqual(@as(i32, 1), state.rows_delta);
-    try std.testing.expectEqual(@as(u32, 3), state.total_rows);
-    try std.testing.expectEqual(@as(u32, 2), state.total_cols);
+    try std.testing.expectEqual(@as(u32, 4), state.total_rows);
+    try std.testing.expectEqual(@as(u32, 4), state.total_cols);
 }
 
 test "external row scroll eligibility fails closed on non-representable regions" {
@@ -10613,247 +10557,6 @@ test "external scroll without row-shift callback regenerates every retained row"
     core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
-}
-
-test "an overflowed external scroll regen set regenerates the whole viewport" {
-    const State = struct {
-        row_calls: u32 = 0,
-        scroll_calls: u32 = 0,
-        seen_rows: [14]bool = .{false} ** 14,
-
-        fn onRow(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_count: u32,
-            verts: ?[*]const c_api.Vertex,
-            vert_count: usize,
-            flags: u32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = verts;
-            _ = vert_count;
-            _ = total_rows;
-            _ = total_cols;
-            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.row_calls += row_count;
-            var row = row_start;
-            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
-                self.seen_rows[row] = true;
-            }
-        }
-
-        fn onRowScroll(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_end: u32,
-            col_start: u32,
-            col_end: u32,
-            rows_delta: i32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = grid_id;
-            _ = row_start;
-            _ = row_end;
-            _ = col_start;
-            _ = col_end;
-            _ = rows_delta;
-            _ = total_rows;
-            _ = total_cols;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.scroll_calls += 1;
-        }
-    };
-
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-    // A resize transition: the retained GridBuf is 15 rows while the frontend
-    // target viewport is 14, so one margin row sits outside the viewport.
-    try core.grid.resizeGrid(1, 14, 2);
-    try core.grid.resizeGrid(2, 15, 2);
-    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
-    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 14, .cols = 2 });
-    try core.known_external_grids.put(core.alloc, 2, .{
-        .win = 42,
-        .start_row = 0,
-        .start_col = 0,
-        .rows = 14,
-        .cols = 2,
-    });
-    for (0..15) |row| {
-        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
-    }
-    core.drawable_w_px = 2;
-    core.drawable_h_px = 14;
-    core.cell_w_px = 1;
-    core.cell_h_px = 1;
-    core.grid.cursor_visible = false;
-
-    var state = State{};
-    core.ctx = &state;
-    core.cb.on_vertices_row = State.onRow;
-    core.cb.on_grid_row_scroll = State.onRowScroll;
-
-    // Seed the retained external surface, then isolate the scroll update.
-    core.sendExternalGridVertices(true);
-    try std.testing.expectEqual(@as(u32, 14), state.row_calls);
-    state = .{};
-
-    // A fast-path-eligible one-row scroll. The frontend has already shifted
-    // its row slots by the clamped region when the vertices are composed.
-    core.grid.scrollGrid(2, 0, 15, 0, 2, 1, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
-    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
-
-    // Neovim vacates the out-of-viewport row 14; the clamped vacated row the
-    // frontend actually emptied is row 13. Dirty exactly regen_rows.len other
-    // in-viewport rows so the margin compensation has no slot left for row 13
-    // and abandons the fast path.
-    const sg = core.grid.sub_grids.getPtr(2).?;
-    for (0..12) |row| {
-        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('a' + row), 0);
-    }
-    try std.testing.expect(!sg.dirty_all);
-    try std.testing.expect(sg.isRowDirty(14));
-    try std.testing.expect(!sg.isRowDirty(12));
-    try std.testing.expect(!sg.isRowDirty(13));
-
-    state.row_calls = 0;
-    state.seen_rows = .{false} ** 14;
-    core.sendExternalGridVertices(false);
-
-    // An abandoned fast path owes the whole viewport: the frontend's rows are
-    // already shifted, so the dirty bitmap alone would leave row 13 (and the
-    // shifted rows the bitmap never marked) holding stale pre-scroll content.
-    try std.testing.expectEqual([_]bool{true} ** 14, state.seen_rows);
-    try std.testing.expectEqual(@as(u32, 14), state.row_calls);
-}
-
-test "a margin-clamped external scroll regenerates the whole vacated band" {
-    const State = struct {
-        row_calls: u32 = 0,
-        scroll_calls: u32 = 0,
-        seen_rows: [16]bool = .{false} ** 16,
-
-        fn onRow(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_count: u32,
-            verts: ?[*]const c_api.Vertex,
-            vert_count: usize,
-            flags: u32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = verts;
-            _ = vert_count;
-            _ = total_rows;
-            _ = total_cols;
-            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.row_calls += row_count;
-            var row = row_start;
-            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
-                self.seen_rows[row] = true;
-            }
-        }
-
-        fn onRowScroll(
-            ctx: ?*anyopaque,
-            grid_id: i64,
-            row_start: u32,
-            row_end: u32,
-            col_start: u32,
-            col_end: u32,
-            rows_delta: i32,
-            total_rows: u32,
-            total_cols: u32,
-        ) callconv(.c) void {
-            _ = grid_id;
-            _ = row_start;
-            _ = row_end;
-            _ = col_start;
-            _ = col_end;
-            _ = rows_delta;
-            _ = total_rows;
-            _ = total_cols;
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            self.scroll_calls += 1;
-        }
-    };
-
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-    // A resize transition: the retained GridBuf keeps 20 rows while the
-    // frontend target viewport is 16, so four margin rows sit outside it.
-    try core.grid.resizeGrid(1, 16, 2);
-    try core.grid.resizeGrid(2, 20, 2);
-    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
-    try core.grid.external_grid_target_sizes.put(core.alloc, 2, .{ .rows = 16, .cols = 2 });
-    try core.known_external_grids.put(core.alloc, 2, .{
-        .win = 42,
-        .start_row = 0,
-        .start_col = 0,
-        .rows = 16,
-        .cols = 2,
-    });
-    for (0..20) |row| {
-        core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
-    }
-    core.drawable_w_px = 2;
-    core.drawable_h_px = 16;
-    core.cell_w_px = 1;
-    core.cell_h_px = 1;
-    core.grid.cursor_visible = false;
-
-    var state = State{};
-    core.ctx = &state;
-    core.cb.on_vertices_row = State.onRow;
-    core.cb.on_grid_row_scroll = State.onRowScroll;
-
-    // Seed the retained external surface, then isolate the scroll update.
-    core.sendExternalGridVertices(true);
-    try std.testing.expectEqual(@as(u32, 16), state.row_calls);
-    state = .{};
-
-    // A fast-path-eligible three-row scroll over the full grid height. The
-    // frontend shifts the clamped region [0, 16) and empties rows 13..15.
-    core.grid.scrollGrid(2, 0, 20, 0, 2, 3, 0);
-    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
-    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
-
-    // Neovim vacates [17, 20) — entirely outside the viewport — so the dirty
-    // bitmap marks no in-viewport row at all. Row 2 stands in for an ordinary
-    // grid_line update so the regen set is not empty, and it must not grow the
-    // set past regen_rows.len (that would hand the assertion to the overflow
-    // fix instead of this one).
-    const sg = core.grid.sub_grids.getPtr(2).?;
-    core.grid.putCellGrid(2, 2, 0, 'z', 0);
-    try std.testing.expect(!sg.dirty_all);
-    try std.testing.expect(sg.isRowDirty(17));
-    try std.testing.expect(sg.isRowDirty(2));
-    try std.testing.expect(!sg.isRowDirty(13));
-    try std.testing.expect(!sg.isRowDirty(14));
-    try std.testing.expect(!sg.isRowDirty(15));
-
-    state.row_calls = 0;
-    state.seen_rows = .{false} ** 16;
-    core.sendExternalGridVertices(false);
-
-    // The whole vacated band the frontend emptied — 13, 14 and 15 — must be
-    // resent, not just its last row, and nothing else beyond the dirty row 2.
-    var expected = [_]bool{false} ** 16;
-    expected[2] = true;
-    expected[13] = true;
-    expected[14] = true;
-    expected[15] = true;
-    try std.testing.expectEqual(expected, state.seen_rows);
-    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
 }
 
 test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
