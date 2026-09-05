@@ -1702,35 +1702,6 @@ final class MetalTerminalView: MTKView {
         requestRedrawDrawablePx(rectPx)
     }
 
-    @discardableResult
-    func applyMainRowScrollRaw(rowStart: Int, rowEnd: Int, colStart: Int, colEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) -> Bool {
-        processPendingScrollClears()
-        let ok = renderer.applyMainRowScrollRaw(
-            rowStart: rowStart,
-            rowEnd: rowEnd,
-            colStart: colStart,
-            colEnd: colEnd,
-            rowsDelta: rowsDelta,
-            totalRows: totalRows,
-            totalCols: totalCols
-        )
-
-        let cellHpx = CGFloat(renderer.cellHeightPx)
-        let yFromTopPx = CGFloat(rowStart) * cellHpx
-        let hPx = CGFloat(max(0, rowEnd - rowStart)) * cellHpx
-        let drawableWPx = CGFloat(self.drawableSize.width)
-        guard drawableWPx > 0, hPx > 0 else { return ok }
-
-        let rectPx = NSRect(
-            x: 0,
-            y: max(0, yFromTopPx),
-            width: drawableWPx,
-            height: hPx
-        )
-        requestRedrawDrawablePx(rectPx)
-        return ok
-    }
-
     override func keyDown(with event: NSEvent) {
         guard let core else { return }
 
