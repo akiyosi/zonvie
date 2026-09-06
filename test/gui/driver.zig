@@ -44,7 +44,9 @@ pub const capture = switch (builtin.os.tag) {
 };
 
 pub const default_app_rel_path = switch (builtin.os.tag) {
-    .windows => "windows/zig-out/bin/zonvie.exe",
+    // build.zig installs the Windows exe directly into windows/zig-out, with
+    // no bin/ subdirectory.
+    .windows => "windows/zig-out/zonvie.exe",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
 };
 
