@@ -1428,18 +1428,13 @@ pub const Grid = struct {
     // Pending scroll operation for scroll-aware flush optimization.
     // Set by scrollGrid(), consumed by flush, and cleared at transaction end.
     // When present, flush can potentially reuse row cache instead of recomposing all rows.
-    // A second grid_scroll in the same batch disables fast path for that flush.
     pending_scroll: ?ScrollOp = null,
-
-    // True when this batch observed multiple grid_scroll events and must not use
-    // the scroll fast path. Cleared after flush via clearScrollState().
-    scroll_fast_path_blocked: bool = false,
 
     // Rows touched by grid_line (via putCell/putCellGrid) AFTER pending_scroll was set.
     // These are global grid coordinates (already offset by win_pos for sub-grids).
     // Tracked as a fixed-size array to avoid allocation.  Capacity covers
     // high-speed mouse wheel batches (e.g. 10 grid_scroll × 3 grid_line rows).
-    // Overflow blocks fast path but preserves pending_scroll for delta accumulation.
+    // Overflow preserves pending_scroll for delta accumulation.
     scroll_touched_rows: [SCROLL_TOUCHED_ROWS_CAP]u32 = undefined,
     scroll_touched_count: u8 = 0,
 
@@ -1638,7 +1633,6 @@ pub const Grid = struct {
         // grid_id and would apply to an unrelated grid in the new
         // session if grid_ids overlap.
         self.pending_scroll = null;
-        self.scroll_fast_path_blocked = false;
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
         self.main_scroll_notify_pending = false;
@@ -1981,7 +1975,7 @@ pub const Grid = struct {
 
     /// Record a row touched by grid_line while a pending_scroll is active.
     /// Uses global grid coordinates. Deduplicates entries.
-    /// On overflow, blocks fast path but preserves pending_scroll for delta accumulation.
+    /// On overflow, preserves pending_scroll for delta accumulation.
     fn recordScrollTouchedRow(self: *Grid, row: u32) void {
         if (self.pending_scroll == null) return;
 
@@ -1989,10 +1983,9 @@ pub const Grid = struct {
             if (r == row) return;
         }
 
-        // Overflow: block the fast path but KEEP pending_scroll, or the next
-        // grid_scroll restarts the delta and shifts by the wrong amount.
+        // Overflow: KEEP pending_scroll, or the next grid_scroll restarts the
+        // delta and shifts by the wrong amount.
         if (self.scroll_touched_count >= self.scroll_touched_rows.len) {
-            self.scroll_fast_path_blocked = true;
             return;
         }
 
@@ -2042,7 +2035,6 @@ pub const Grid = struct {
     /// Notification provenance is separate and may survive a begin rejection.
     pub fn clearScrollState(self: *Grid) void {
         self.pending_scroll = null;
-        self.scroll_fast_path_blocked = false;
         self.scroll_touched_count = 0;
         self.prev_cursor_row = null;
         self.prev_cursor_grid = null;
@@ -2489,14 +2481,12 @@ pub const Grid = struct {
                     self.scroll(top, bot, left, right, rows, cols);
                     self.recordScrolledGrid(grid_id, rows);
                     ps.rows = std.math.add(i32, ps.rows, rows) catch {
-                        self.scroll_fast_path_blocked = true;
                         self.scroll_touched_count = 0;
                         return;
                     };
                     return;
                 }
-                // Different grid or region: block fast path.
-                self.scroll_fast_path_blocked = true;
+                // Different grid or region: restart touched-row tracking.
                 self.scroll_touched_count = 0;
             }
             self.scroll(top, bot, left, right, rows, cols);
