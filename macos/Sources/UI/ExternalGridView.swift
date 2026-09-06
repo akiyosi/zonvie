@@ -740,24 +740,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         if let buf = self.backgroundAlphaBuffer {
-            var alpha = resolveSurfaceBackgroundAlpha(
-                blurEnabled: blurEnabled,
-                decoratedSurface: isDecoratedSurface
-            )
-            // Popupmenu has per-row bg colors (Pmenu vs PmenuSel) that the
-            // user must be able to tell apart. The decorated-surface alpha
-            // override above forces the shader to multiply every bg color
-            // by 0 so the cmdline-style "show blur through cells" trick
-            // works for the single-color cmdline / msg surfaces, but it
-            // collapses the popupmenu into a uniform transparent block and
-            // hides the selection. Use 1.0 instead so each cell renders
-            // with its own opaque bg; the popupmenu's surrounding blur is
-            // still preserved by the container view's transparent layer
-            // around the Metal viewport.
-            // -101 = POPUPMENU_GRID_ID (matches grid.zig:9 / ZonvieCore.popupmenuGridId)
-            if gridId == -101 {
-                alpha = 1.0
-            }
+            var alpha = surfaceBackgroundAlpha()
             ZonvieCore.appLog("[ExternalGridView] backgroundAlphaBuffer alpha=\(alpha) isDecoratedSurface=\(isDecoratedSurface) gridId=\(gridId)")
             memcpy(buf.contents(), &alpha, MemoryLayout<Float>.size)
         }
@@ -778,6 +761,34 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         )
 
         setupScrollbar()
+    }
+
+    /// True when this frame's back texture goes to the decorated custom-shader
+    /// chain instead of straight to the compositor — the exact precondition of
+    /// the chain-encoding branch in `draw(in:)`.
+    private var shaderChainConsumesSurface: Bool {
+        guard isDecoratedSurface, let renderer = mainTerminalView?.renderer else { return false }
+        return !renderer.customShaderPipelinesDecorated.isEmpty
+            && renderer.customShaderPostProcess == .afterBloom
+    }
+
+    private func surfaceBackgroundAlpha() -> Float {
+        // Popupmenu has per-row bg colors (Pmenu vs PmenuSel) that the user
+        // must be able to tell apart. The decorated-surface alpha override
+        // forces the shader to multiply every bg color by 0 so the
+        // cmdline-style "show blur through cells" trick works for the
+        // single-color cmdline / msg surfaces, but it collapses the popupmenu
+        // into a uniform transparent block and hides the selection. Use 1.0
+        // instead so each cell renders with its own opaque bg; the popupmenu's
+        // surrounding blur is still preserved by the container view's
+        // transparent layer around the Metal viewport.
+        // -101 = POPUPMENU_GRID_ID (matches grid.zig:9 / ZonvieCore.popupmenuGridId)
+        if gridId == -101 { return 1.0 }
+        return resolveSurfaceBackgroundAlpha(
+            blurEnabled: blurEnabled,
+            decoratedSurface: isDecoratedSurface,
+            shaderChainConsumesSurface: shaderChainConsumesSurface
+        )
     }
 
     deinit {
@@ -2749,6 +2760,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 originY: vpOriginY,
                 layerOriginPx: rootLayerOrigin
             )
+
+            // The shader chain is not loaded yet when this view is built, so
+            // the alpha convention its back texture needs can only be settled
+            // here. Rewritten like cursorBlinkBuffer, per draw.
+            if let alphaBuf = backgroundAlphaBuffer {
+                var alpha = surfaceBackgroundAlpha()
+                memcpy(alphaBuf.contents(), &alpha, MemoryLayout<Float>.size)
+            }
 
             // Check glow early — it disables partial-redraw optimizations to
             // prevent additive bloom composite from accumulating brightness.

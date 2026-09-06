@@ -612,12 +612,21 @@ struct SurfaceViewportMetrics {
     }
 }
 
+/// The decorated custom-shader chain compiles with preserve_alpha OFF, so it
+/// discards alpha and takes RGB as the final colour: a premultiplied
+/// transparent background would reach it as black. Opaque is the one
+/// convention both consumers accept, and the chain forces its output opaque
+/// anyway.
 func resolveSurfaceBackgroundAlpha(
     blurEnabled: Bool,
-    decoratedSurface: Bool
+    decoratedSurface: Bool,
+    shaderChainConsumesSurface: Bool = false
 ) -> Float {
-    if decoratedSurface && blurEnabled {
-        return 0.0
+    if decoratedSurface {
+        if shaderChainConsumesSurface {
+            return 1.0
+        }
+        return blurEnabled ? 0.0 : 1.0
     }
     if blurEnabled {
         return ZonvieConfig.shared.backgroundAlpha

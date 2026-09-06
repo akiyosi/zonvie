@@ -378,3 +378,14 @@ test "gui:cmdline_cursor_shader_rect" {
         return error.SkipZigTest;
     }
 }
+
+test "gui:visual_decorated_surface_background_alpha" {
+    // macOS only: enumerates the app's OS windows to find the ext-cmdline
+    // one and screenshots the desktop composite under it.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/decorated_surface_background_alpha.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
