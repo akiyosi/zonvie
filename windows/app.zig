@@ -2438,6 +2438,22 @@ pub fn computeRowsToDraw(
     return true;
 }
 
+/// The grid-local row a cursor's vertices sit on. Core cursor vertices are
+/// grid-local pixels with y down.
+pub fn cursorRowFromVerts(verts: []const Vertex, row_h_px: i32) u32 {
+    if (verts.len == 0 or row_h_px <= 0) return 0;
+    var min_y: f32 = verts[0].position[1];
+    var max_y: f32 = min_y;
+    for (verts[1..]) |v| {
+        if (v.position[1] < min_y) min_y = v.position[1];
+        if (v.position[1] > max_y) max_y = v.position[1];
+    }
+    const row_i: i32 = @intFromFloat(@floor(
+        (min_y + max_y) * 0.5 / @as(f32, @floatFromInt(row_h_px)),
+    ));
+    return @intCast(@max(0, row_i));
+}
+
 pub fn snapshotSurfaceVerts(
     alloc: std.mem.Allocator,
     scratch: *std.ArrayListUnmanaged(Vertex),
@@ -3914,18 +3930,7 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
 
     // 2. Resolve cursor row: use explicit value or compute from vertex
     // positions, which are grid-local pixels with y down.
-    const cursor_row: u32 = p.cursor_row orelse blk: {
-        var min_y: f32 = p.cursor_verts[0].position[1];
-        var max_y: f32 = min_y;
-        for (p.cursor_verts[1..]) |v| {
-            if (v.position[1] < min_y) min_y = v.position[1];
-            if (v.position[1] > max_y) max_y = v.position[1];
-        }
-        const pixel_y: f32 = (min_y + max_y) * 0.5;
-        const row_i: i32 = @intFromFloat(@floor(pixel_y / @as(f32, @floatFromInt(p.row_h_px))));
-        if (row_i < 0) break :blk 0;
-        break :blk @intCast(row_i);
-    };
+    const cursor_row: u32 = p.cursor_row orelse cursorRowFromVerts(p.cursor_verts, p.row_h_px);
 
     // Core cursor and row vertices are grid-local pixels against the surface's
     // content extent. drawClearRow() pins the identity transform, so this is
