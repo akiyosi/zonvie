@@ -17,7 +17,7 @@
 // that the prune is reached from a path that runs on every frame, which is
 // the part that was broken and that no predicate test can see.
 //
-// macOS-only: [layer_draw] is the macOS frontend's per-layer draw loop.
+// Both frontends emit [layer_draw] from their per-layer draw loop.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
