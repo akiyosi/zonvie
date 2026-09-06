@@ -366,6 +366,11 @@ fragment float4 ps_main(VSOut in [[stage_in]],
         if (backgroundAlpha >= 1.0) {
             return float4(in.color.rgb, 1.0);
         }
+        // Premultiplied, as in ps_background: a colour kept at alpha 0 is added
+        // over the backdrop a second time and haloes glyph edges.
+        if (backgroundAlpha <= 0.0) {
+            return float4(0.0);
+        }
         // Blur enabled: use config opacity directly (ignore Zig-side alpha)
         return float4(in.color.rgb, backgroundAlpha);
     }
@@ -427,9 +432,11 @@ fragment float4 ps_background(VSOut in [[stage_in]],
 
     // A partial redraw can load old glyph pixels. Overwrite them with a fully
     // transparent background instead of discarding, while still allowing the
-    // underlying NSVisualEffectView/paddingView to show through.
+    // underlying NSVisualEffectView/paddingView to show through. Premultiplied:
+    // keeping the colour at alpha 0 makes CoreAnimation add it on top of the
+    // backdrop again, which haloes every antialiased glyph edge.
     if (backgroundAlpha <= 0.0) {
-        return float4(in.color.rgb, 0.0);
+        return float4(0.0);
     }
 
     // Regular solid color background
@@ -587,7 +594,7 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         if (backgroundAlpha <= 0.0) {
             // Do not preserve a loaded glyph pixel. A zero-alpha overwrite
             // remains transparent to the underlying NSVisualEffectView.
-            return float4(in.color.rgb, 0.0);
+            return float4(0.0);
         }
         if (backgroundAlpha >= 1.0) {
             return float4(in.color.rgb, 1.0);
