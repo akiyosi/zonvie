@@ -691,3 +691,544 @@ test "cluster inversion: a variation-selector emoji mid-run" {
         &.{ 0, 1 },
     );
 }
+
+// --- Row-scroll blit plan -------------------------------------------------
+// Ported from macos/Tests/RowScrollBlitPlanTests.swift: one row height, one
+// texture, so each case reads as rows.
+
+const row_h_px: i32 = 20;
+const tex_rows: i32 = 44;
+const tex_w_px: i32 = 800;
+
+fn plan(row_start: u32, row_end: u32, rows_delta: i32, rows_in_tex: i32) ?helpers.RowScrollBlitPlan {
+    return helpers.RowScrollBlitPlan.make(
+        row_start,
+        row_end,
+        rows_delta,
+        0,
+        0,
+        tex_w_px,
+        tex_w_px,
+        rows_in_tex * row_h_px,
+        row_h_px,
+    );
+}
+
+test "row scroll down reads from below and vacates the bottom" {
+    const p = plan(0, 44, 3, tex_rows).?;
+    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.src_y_px);
+    try std.testing.expectEqual(@as(i32, 0), p.dst_y_px);
+    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.copy_h_px);
+    try std.testing.expectEqual(tex_w_px, p.copy_w_px);
+    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.clear_top_px);
+    try std.testing.expectEqual(@as(i32, 44 * row_h_px), p.clear_bottom_px);
+    try std.testing.expectEqual(@as(u32, 44), p.clamped_row_end);
+    try std.testing.expectEqual(@as(u32, 38), p.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 44), p.dirty_row_end);
+}
+
+test "row scroll up is the mirror image" {
+    const p = plan(0, 44, -3, tex_rows).?;
+    try std.testing.expectEqual(@as(i32, 0), p.src_y_px);
+    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.dst_y_px);
+    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.copy_h_px);
+    try std.testing.expectEqual(@as(i32, 0), p.clear_top_px);
+    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.clear_bottom_px);
+    try std.testing.expectEqual(@as(u32, 0), p.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 6), p.dirty_row_end);
+}
+
+test "a region that does not start at row 0 keeps its dirty rows inside" {
+    const p = plan(10, 30, 2, tex_rows).?;
+    try std.testing.expectEqual(@as(i32, 12 * row_h_px), p.src_y_px);
+    try std.testing.expectEqual(@as(i32, 10 * row_h_px), p.dst_y_px);
+    try std.testing.expectEqual(@as(i32, 18 * row_h_px), p.copy_h_px);
+    try std.testing.expectEqual(@as(u32, 26), p.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 30), p.dirty_row_end);
+
+    // The expansion never reaches above the region start.
+    const small = plan(10, 13, 2, tex_rows).?;
+    try std.testing.expectEqual(@as(u32, 10), small.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 13), small.dirty_row_end);
+}
+
+test "the texture clamp stops the copy, the band and the dirty rows together" {
+    const p = plan(0, 45, 1, tex_rows).?;
+    try std.testing.expectEqual(@as(u32, 44), p.clamped_row_end);
+    try std.testing.expectEqual(@as(i32, 43 * row_h_px), p.copy_h_px);
+    try std.testing.expectEqual(@as(i32, 44 * row_h_px), p.clear_bottom_px);
+    try std.testing.expectEqual(@as(u32, 42), p.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 44), p.dirty_row_end);
+
+    const far = plan(0, 50, 2, tex_rows).?;
+    try std.testing.expectEqual(@as(u32, 40), far.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 44), far.dirty_row_end);
+    try std.testing.expectEqual(@as(i32, 42 * row_h_px), far.clear_top_px);
+}
+
+test "geometries that produce no blit plan" {
+    try std.testing.expect(plan(0, 44, 0, tex_rows) == null);
+    try std.testing.expect(plan(0, 10, 10, tex_rows) == null);
+    try std.testing.expect(plan(0, 10, 12, tex_rows) == null);
+    try std.testing.expect(plan(44, 50, 1, tex_rows) == null);
+    try std.testing.expect(plan(0, 44, 1, 0) == null);
+    try std.testing.expect(helpers.RowScrollBlitPlan.make(
+        0,
+        44,
+        1,
+        0,
+        0,
+        0,
+        tex_w_px,
+        44 * row_h_px,
+        row_h_px,
+    ) == null);
+    try std.testing.expect(helpers.RowScrollBlitPlan.make(
+        0,
+        44,
+        1,
+        0,
+        0,
+        tex_w_px,
+        tex_w_px,
+        44 * row_h_px,
+        0,
+    ) == null);
+}
+
+test "the copy width is bounded by the texture" {
+    const narrow = helpers.RowScrollBlitPlan.make(
+        0,
+        44,
+        1,
+        0,
+        0,
+        800,
+        500,
+        44 * row_h_px,
+        row_h_px,
+    ).?;
+    try std.testing.expectEqual(@as(i32, 500), narrow.copy_w_px);
+}
+
+test "blit plan invariants hold over every small geometry" {
+    var planned: usize = 0;
+    var rows_in_tex: i32 = 0;
+    while (rows_in_tex <= 12) : (rows_in_tex += 1) {
+        var row_start: u32 = 0;
+        while (row_start <= 12) : (row_start += 1) {
+            var row_end: u32 = 0;
+            while (row_end <= 16) : (row_end += 1) {
+                var rows_delta: i32 = -8;
+                while (rows_delta <= 8) : (rows_delta += 1) {
+                    const p = plan(row_start, row_end, rows_delta, rows_in_tex) orelse continue;
+                    planned += 1;
+                    const tex_h_px = rows_in_tex * row_h_px;
+                    try std.testing.expect(p.src_y_px >= 0 and p.dst_y_px >= 0);
+                    try std.testing.expect(p.copy_h_px > 0);
+                    try std.testing.expect(p.src_y_px + p.copy_h_px <= tex_h_px);
+                    try std.testing.expect(p.dst_y_px + p.copy_h_px <= tex_h_px);
+                    try std.testing.expect(p.clear_bottom_px <= tex_h_px);
+                    try std.testing.expect(p.clear_top_px < p.clear_bottom_px);
+                    try std.testing.expect(p.clamped_row_end <= @as(u32, @intCast(rows_in_tex)));
+                    try std.testing.expect(p.clamped_row_end <= row_end);
+                    const vacated_first: u32 = @intCast(@divTrunc(p.clear_top_px, row_h_px));
+                    const vacated_end: u32 = @intCast(@divTrunc(p.clear_bottom_px, row_h_px));
+                    try std.testing.expect(p.dirty_row_start <= vacated_first);
+                    try std.testing.expect(vacated_end <= p.dirty_row_end);
+                    try std.testing.expect(p.dirty_row_start >= row_start);
+                    try std.testing.expect(p.dirty_row_end <= p.clamped_row_end);
+                }
+            }
+        }
+    }
+    try std.testing.expect(planned > 100);
+}
+
+test "without a blit the whole region is stale, still clamped to the texture" {
+    try std.testing.expectEqual(
+        [2]u32{ 0, 44 },
+        helpers.dirtyRowsWithoutBlit(0, 45, 0, 44 * row_h_px, row_h_px).?,
+    );
+    try std.testing.expectEqual(
+        [2]u32{ 10, 30 },
+        helpers.dirtyRowsWithoutBlit(10, 30, 0, 44 * row_h_px, row_h_px).?,
+    );
+    try std.testing.expect(helpers.dirtyRowsWithoutBlit(44, 50, 0, 44 * row_h_px, row_h_px) == null);
+    try std.testing.expect(helpers.dirtyRowsWithoutBlit(0, 10, 0, 44 * row_h_px, 0) == null);
+}
+
+test "a layer origin moves the pixels but not the row numbering" {
+    const origin_y_px: i32 = 5 * row_h_px;
+    const origin_x_px: i32 = 400;
+    const base = plan(0, 20, 3, tex_rows).?;
+    const p = helpers.RowScrollBlitPlan.make(
+        0,
+        20,
+        3,
+        origin_x_px,
+        origin_y_px,
+        400,
+        tex_w_px,
+        tex_rows * row_h_px,
+        row_h_px,
+    ).?;
+    try std.testing.expectEqual(base.src_y_px + origin_y_px, p.src_y_px);
+    try std.testing.expectEqual(base.dst_y_px + origin_y_px, p.dst_y_px);
+    try std.testing.expectEqual(base.clear_top_px + origin_y_px, p.clear_top_px);
+    try std.testing.expectEqual(base.clear_bottom_px + origin_y_px, p.clear_bottom_px);
+    try std.testing.expectEqual(base.dirty_row_start, p.dirty_row_start);
+    try std.testing.expectEqual(base.dirty_row_end, p.dirty_row_end);
+    try std.testing.expectEqual(origin_x_px, p.origin_x_px);
+    try std.testing.expectEqual(@as(i32, 400), p.copy_w_px);
+
+    const band = p.localClearBand();
+    try std.testing.expectEqual(base.clear_top_px, band.top_px);
+    try std.testing.expectEqual(base.clear_bottom_px, band.bottom_px);
+
+    // The rewritten pixels stay inside the layer's own rectangle.
+    const r = p.blitRectPx();
+    try std.testing.expectEqual(origin_x_px, r.left);
+    try std.testing.expectEqual(origin_x_px + 400, r.right);
+    try std.testing.expectEqual(origin_y_px, r.top);
+    try std.testing.expectEqual(origin_y_px + 20 * row_h_px, r.bottom);
+}
+
+test "a narrow layer copies its own width, clamped by the texture's right edge" {
+    const inside = helpers.RowScrollBlitPlan.make(
+        0,
+        44,
+        1,
+        0,
+        0,
+        300,
+        800,
+        tex_rows * row_h_px,
+        row_h_px,
+    ).?;
+    try std.testing.expectEqual(@as(i32, 300), inside.copy_w_px);
+
+    const offset = helpers.RowScrollBlitPlan.make(
+        0,
+        44,
+        1,
+        600,
+        0,
+        300,
+        800,
+        tex_rows * row_h_px,
+        row_h_px,
+    ).?;
+    try std.testing.expectEqual(@as(i32, 200), offset.copy_w_px);
+}
+
+test "a layer below the texture has nothing to blit and nothing to redraw" {
+    try std.testing.expect(helpers.RowScrollBlitPlan.make(
+        0,
+        20,
+        2,
+        0,
+        50 * row_h_px,
+        tex_w_px,
+        tex_w_px,
+        tex_rows * row_h_px,
+        row_h_px,
+    ) == null);
+    try std.testing.expect(helpers.dirtyRowsWithoutBlit(
+        0,
+        20,
+        50 * row_h_px,
+        tex_rows * row_h_px,
+        row_h_px,
+    ) == null);
+}
+
+test "a layer whose rows run off the bottom clamps the blit and the fallback alike" {
+    const origin_y_px: i32 = 30 * row_h_px;
+    const tex_h_px: i32 = tex_rows * row_h_px;
+    const p = helpers.RowScrollBlitPlan.make(
+        0,
+        20,
+        2,
+        0,
+        origin_y_px,
+        tex_w_px,
+        tex_w_px,
+        tex_h_px,
+        row_h_px,
+    ).?;
+    try std.testing.expectEqual(@as(u32, 14), p.clamped_row_end);
+    try std.testing.expectEqual(@as(u32, 10), p.dirty_row_start);
+    try std.testing.expectEqual(@as(u32, 14), p.dirty_row_end);
+    try std.testing.expect(p.src_y_px + p.copy_h_px <= tex_h_px);
+    try std.testing.expect(p.dst_y_px + p.copy_h_px <= tex_h_px);
+    try std.testing.expectEqual(tex_h_px, p.clear_bottom_px);
+    try std.testing.expectEqual(
+        [2]u32{ 0, 14 },
+        helpers.dirtyRowsWithoutBlit(0, 20, origin_y_px, tex_h_px, row_h_px).?,
+    );
+}
+
+/// A layer at y=100 scrolled down by 3: the blit rewrites rows 0..20 of it,
+/// pixels 100..500.
+fn overBlitBase() helpers.RowScrollBlitPlan {
+    return helpers.RowScrollBlitPlan.make(
+        0,
+        20,
+        3,
+        0,
+        100,
+        400,
+        tex_w_px,
+        tex_rows * row_h_px,
+        row_h_px,
+    ).?;
+}
+
+test "a float over the blit marks its own rows, the rows under it and their source" {
+    const p = overBlitBase();
+    const r = p.blitRectPx();
+    try std.testing.expectEqual(@as(i32, 0), r.left);
+    try std.testing.expectEqual(@as(i32, 100), r.top);
+    try std.testing.expectEqual(@as(i32, 400), r.right);
+    try std.testing.expectEqual(@as(i32, 500), r.bottom);
+
+    // A float at y=210, 4 rows tall, x=100..200: straddles the band.
+    const got = helpers.rowsOverBlit(p, 3, 100, 210, 4, 10, 10, row_h_px).?;
+    try std.testing.expectEqual([2]u32{ 0, 3 }, got.above.?);
+    try std.testing.expectEqual([2]u32{ 5, 9 }, got.under.?);
+    // Shifted back by the delta, never forward.
+    try std.testing.expectEqual([2]u32{ 2, 6 }, got.shifted.?);
+}
+
+test "rows over a blit clamp to the covering layer and to the scroll region" {
+    const p = overBlitBase();
+
+    // Starts above the blit rectangle: the covering layer's first marked row
+    // is the one the rectangle's top edge lands in, not its own row 0.
+    const high = helpers.rowsOverBlit(p, 3, 0, 60, 4, 40, 10, row_h_px).?;
+    try std.testing.expectEqual([2]u32{ 2, 3 }, high.above.?);
+
+    // Taller than the rectangle: both ranges stop at the region's last row.
+    const tall = helpers.rowsOverBlit(p, 3, 0, 100, 30, 40, 10, row_h_px).?;
+    try std.testing.expectEqual([2]u32{ 0, 19 }, tall.above.?);
+    try std.testing.expectEqual([2]u32{ 0, 19 }, tall.under.?);
+    try std.testing.expectEqual([2]u32{ 0, 16 }, tall.shifted.?);
+}
+
+test "a float that misses the blit rectangle marks nothing" {
+    const p = overBlitBase();
+    // Entirely to the right of the copy.
+    try std.testing.expect(helpers.rowsOverBlit(p, 3, 400, 210, 4, 10, 10, row_h_px) == null);
+    // Entirely below it.
+    try std.testing.expect(helpers.rowsOverBlit(p, 3, 100, 500, 4, 10, 10, row_h_px) == null);
+    // Empty covering layer.
+    try std.testing.expect(helpers.rowsOverBlit(p, 3, 100, 210, 0, 10, 10, row_h_px) == null);
+}
+
+test "a root dirty band marks the layer rows it overpaints" {
+    // Cell-aligned: one root row lands on exactly one layer row.
+    try std.testing.expectEqual([2]u32{ 5, 5 }, helpers.bandLayerRows(200, 220, 100, 10, row_h_px).?);
+    // Off the cell grid: the same band straddles two.
+    try std.testing.expectEqual([2]u32{ 4, 5 }, helpers.bandLayerRows(200, 220, 110, 10, row_h_px).?);
+    // Overlapping the layer's top edge from above.
+    try std.testing.expectEqual([2]u32{ 0, 0 }, helpers.bandLayerRows(90, 110, 100, 10, row_h_px).?);
+    // Entirely above the layer.
+    try std.testing.expect(helpers.bandLayerRows(0, 20, 100, 10, row_h_px) == null);
+    // Entirely below it.
+    try std.testing.expect(helpers.bandLayerRows(400, 420, 100, 2, row_h_px) == null);
+}
+
+test "layer scrolls in one flush accumulate per region and saturate" {
+    const first: helpers.LayerScroll =
+        .{ .row_start = 2, .row_end = 20, .rows_delta = 3, .total_rows = 20, .total_cols = 80 };
+    switch (helpers.mergeLayerScroll(null, first)) {
+        .accumulate => |m| try std.testing.expectEqual(first, m),
+        .conflict => return error.TestUnexpectedResult,
+    }
+
+    var second = first;
+    second.rows_delta = -5;
+    second.total_cols = 90;
+    switch (helpers.mergeLayerScroll(first, second)) {
+        .accumulate => |m| {
+            try std.testing.expectEqual(@as(i32, -2), m.rows_delta);
+            try std.testing.expectEqual(@as(u32, 90), m.total_cols);
+        },
+        .conflict => return error.TestUnexpectedResult,
+    }
+
+    var huge = first;
+    huge.rows_delta = 1_000_000;
+    switch (helpers.mergeLayerScroll(huge, huge)) {
+        .accumulate => |m| try std.testing.expectEqual(@as(i32, 1_000_000), m.rows_delta),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    huge.rows_delta = -1_000_000;
+    switch (helpers.mergeLayerScroll(huge, huge)) {
+        .accumulate => |m| try std.testing.expectEqual(@as(i32, -1_000_000), m.rows_delta),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(i32, 1_000_000), helpers.clampRowsDelta(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(i32, -1_000_000), helpers.clampRowsDelta(std.math.minInt(i32)));
+}
+
+test "layer scrolls of different regions report both regions" {
+    const first: helpers.LayerScroll =
+        .{ .row_start = 2, .row_end = 20, .rows_delta = 3, .total_rows = 20, .total_cols = 80 };
+    var other = first;
+    other.row_start = 5;
+    other.rows_delta = -1;
+    switch (helpers.mergeLayerScroll(first, other)) {
+        .accumulate => return error.TestUnexpectedResult,
+        .conflict => |m| {
+            try std.testing.expectEqual(first, m.old);
+            try std.testing.expectEqual(other, m.new);
+        },
+    }
+
+    var shorter = first;
+    shorter.row_end = 19;
+    switch (helpers.mergeLayerScroll(first, shorter)) {
+        .accumulate => return error.TestUnexpectedResult,
+        .conflict => |m| try std.testing.expectEqual(shorter, m.new),
+    }
+}
+
+test "blit rectangle stays inside the layer it scrolls" {
+    const cell_w_px: i32 = 9;
+    const tex_w: i32 = 1600;
+    const tex_h: i32 = 900;
+    const origins = [_][2]i32{ .{ 0, 0 }, .{ 90, 40 }, .{ 720, 300 }, .{ 1200, 860 } };
+    const deltas = [_]i32{ -7, -3, -1, 1, 3, 7 };
+    const cols: u32 = 40;
+    const rows: u32 = 24;
+
+    for (origins) |o| {
+        for (deltas) |d| {
+            var row_start: u32 = 0;
+            while (row_start < 6) : (row_start += 1) {
+                const p = helpers.RowScrollBlitPlan.make(
+                    row_start,
+                    rows,
+                    d,
+                    o[0],
+                    o[1],
+                    @as(i32, @intCast(cols)) * cell_w_px,
+                    tex_w,
+                    tex_h,
+                    row_h_px,
+                ) orelse continue;
+                const r = p.blitRectPx();
+                try std.testing.expect(r.left >= o[0]);
+                try std.testing.expect(r.right <= o[0] + @as(i32, @intCast(cols)) * cell_w_px);
+                try std.testing.expect(r.right <= tex_w);
+                try std.testing.expect(r.top >= o[1] + @as(i32, @intCast(row_start)) * row_h_px);
+                try std.testing.expect(r.bottom <= o[1] + @as(i32, @intCast(p.clamped_row_end)) * row_h_px);
+                try std.testing.expect(r.bottom <= tex_h);
+                try std.testing.expect(r.bottom > r.top and r.right > r.left);
+            }
+        }
+    }
+}
+
+test "accepted blit rectangles only refuse layers that share pixels" {
+    const accepted: helpers.BlitRectPx = .{ .left = 100, .top = 200, .right = 400, .bottom = 500 };
+    // Touching edges are outside a half-open rectangle.
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 400, .top = 200, .right = 700, .bottom = 500 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 100, .top = 500, .right = 400, .bottom = 800 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 0, .top = 200, .right = 100, .bottom = 500 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 100, .top = 0, .right = 400, .bottom = 200 },
+        accepted,
+    ));
+    // One pixel of overlap is an overlap, in either argument order.
+    const nudged: helpers.BlitRectPx = .{ .left = 399, .top = 499, .right = 700, .bottom = 800 };
+    try std.testing.expect(helpers.blitRectsIntersect(nudged, accepted));
+    try std.testing.expect(helpers.blitRectsIntersect(accepted, nudged));
+    // Contained on both axes.
+    try std.testing.expect(helpers.blitRectsIntersect(
+        .{ .left = 150, .top = 250, .right = 200, .bottom = 300 },
+        accepted,
+    ));
+}
+
+fn bitsFrom(alloc: std.mem.Allocator, len: usize, set: []const usize) !std.DynamicBitSetUnmanaged {
+    var bits = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
+    for (set) |i| bits.set(i);
+    return bits;
+}
+
+fn expectBits(bits: *const std.DynamicBitSetUnmanaged, expected: []const usize) !void {
+    var i: usize = 0;
+    while (i < bits.bit_length) : (i += 1) {
+        const want = std.mem.indexOfScalar(usize, expected, i) != null;
+        if (bits.isSet(i) != want) {
+            std.debug.print("bit {d}: got {}, want {}\n", .{ i, bits.isSet(i), want });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a row bit follows its rows up a scroll region" {
+    const alloc = std.testing.allocator;
+    // grid_line marked row 5, then a second grid_scroll(+3) landed in the same
+    // flush: the vertices are at row 2 now, so the bit has to be.
+    var bits = try bitsFrom(alloc, 10, &.{5});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, 3);
+    try expectBits(&bits, &.{ 2, 7, 8, 9 });
+}
+
+test "a row bit follows its rows down a scroll region" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{2});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, -3);
+    try expectBits(&bits, &.{ 0, 1, 2, 5 });
+}
+
+test "row bits outside the scroll region stay where they are" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 12, &.{ 1, 8, 11 });
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 4, 10, 2);
+    // 8 -> 6; the region vacated [8,10); 1 and 11 are untouched.
+    try expectBits(&bits, &.{ 1, 6, 8, 9, 11 });
+}
+
+test "a shift the row storage refuses leaves the row bits alone" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{5});
+    defer bits.deinit(alloc);
+    // Same guards shiftRows applies before it touches rows_buf.
+    helpers.shiftRowBits(&bits, 0, 10, 0);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 10, 4, 3);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 0, 10, 10);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 0, 11, 3);
+    try expectBits(&bits, &.{5});
+}
+
+test "two shifts in one flush compose" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{6});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, 2);
+    // 6 -> 4, vacated [8,10).
+    try expectBits(&bits, &.{ 4, 8, 9 });
+    helpers.shiftRowBits(&bits, 0, 10, 2);
+    // 4 -> 2, 8 -> 6, 9 -> 7, vacated [8,10) again.
+    try expectBits(&bits, &.{ 2, 6, 7, 8, 9 });
+}

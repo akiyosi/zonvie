@@ -1667,11 +1667,15 @@ pub fn onGridRowScroll(
     // carried by moving them within this grid's own storage.
     if (app.external_windows.get(grid_id) == null) {
         if (app.layer_grids.get(grid_id)) |state| {
-            if (!state.stageShift(app.alloc, row_start, row_end, rows_delta)) {
+            if (!state.stageShift(app.alloc, row_start, row_end, rows_delta, total_rows, total_cols)) {
                 core.zonvie_core_force_resend_locked(app.corep);
                 failFlush(app);
             } else {
                 app.flush_needs_invalidate = true;
+                if (applog.isEnabled()) applog.appLog(
+                    "[layer_row_scroll] gridId={d} rowStart={d} rowEnd={d} rowsDelta={d}\n",
+                    .{ grid_id, row_start, row_end, rows_delta },
+                );
             }
         } else {
             // No storage for this grid yet, so the mandatory shift cannot be
@@ -2008,6 +2012,28 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         while (layer_commit_it.next()) |entry| {
             if (!entry.value_ptr.*.applyStaged(app.alloc)) {
                 core.zonvie_core_force_resend_locked(app.corep);
+            }
+        }
+        // A layer that moved or changed size owns different pixels, so neither
+        // its accumulated shift nor its unchanged rows survive. Must run after
+        // applyStaged, which is what installs pending_scroll. committed_layers
+        // still holds the previous list: app.tbs.commitFlush is its only
+        // writer and runs later on this same thread, so no rotation_mu here.
+        if (app.tbs.flush_layers) |staged_layers| {
+            for (staged_layers.slice(), 0..) |layer, li| {
+                if (li == 0) continue;
+                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                var unchanged = false;
+                for (app.tbs.committed_layers.slice()) |prev| {
+                    if (prev.grid_id != layer.grid_id) continue;
+                    unchanged = prev.x_px == layer.x_px and prev.y_px == layer.y_px and
+                        prev.rows == layer.rows and prev.cols == layer.cols;
+                    break;
+                }
+                if (unchanged) continue;
+                state.needs_full_redraw = true;
+                state.pending_scroll = null;
+                state.dirty = true;
             }
         }
         var ext_commit_it = app.external_windows.iterator();
