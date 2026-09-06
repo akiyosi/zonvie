@@ -3229,7 +3229,6 @@ pub export fn WndProc(
                         // pointer into rows_buf would dangle once the lock is
                         // released, so the row is re-resolved below.
                         var cursor_layer_row_index: ?usize = null;
-                        var cursor_layer_row_dy_px: f32 = 0;
                         if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
                             app.mu.lockUncancelable(core.clock.io());
                             defer app.mu.unlock(core.clock.io());
@@ -3244,16 +3243,7 @@ pub export fn WndProc(
                                     (min_y + max_y) * 0.5 / @as(f32, @floatFromInt(row_h_px)),
                                 ));
                                 const local_row: usize = @intCast(@max(0, ri));
-                                if (local_row < state.rows_buf.items.len) {
-                                    cursor_layer_row_index = local_row;
-                                    const origin_row: u32 = if (local_row < state.origin_rows.items.len)
-                                        state.origin_rows.items[local_row]
-                                    else
-                                        @intCast(local_row);
-                                    cursor_layer_row_dy_px = @floatFromInt(
-                                        (@as(i32, @intCast(local_row)) - @as(i32, @intCast(origin_row))) * row_h_px,
-                                    );
-                                }
+                                if (local_row < state.rows_buf.items.len) cursor_layer_row_index = local_row;
                             }
                         }
 
@@ -3306,10 +3296,20 @@ pub export fn WndProc(
                         // root grid's row.
                         if (cursor_layer_row_index != null) app.mu.lockUncancelable(core.clock.io());
                         var cursor_layer_row: ?*app_mod.RowVerts = null;
+                        // Read with the row itself, so a blink-off redraw uses
+                        // the shift the layer draw above applied.
+                        var cursor_layer_row_dy_px: f32 = 0;
                         if (cursor_layer_row_index) |local_row| {
                             if (app.layer_grids.get(cursor_grid)) |state| {
                                 if (local_row < state.rows_buf.items.len) {
                                     cursor_layer_row = &state.rows_buf.items[local_row];
+                                    const origin_row: u32 = if (local_row < state.origin_rows.items.len)
+                                        state.origin_rows.items[local_row]
+                                    else
+                                        @intCast(local_row);
+                                    cursor_layer_row_dy_px = @floatFromInt(
+                                        (@as(i32, @intCast(local_row)) - @as(i32, @intCast(origin_row))) * row_h_px,
+                                    );
                                 }
                             }
                         }
