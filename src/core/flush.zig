@@ -54,22 +54,6 @@ pub const ExternalFloatAnchorEntry = struct {
     }
 };
 
-// Pre-computed subgrid info for row-mode compose optimization.
-// Caches win_pos/sub_grids lookups to avoid per-row hash map access.
-pub const CachedSubgrid = struct {
-    grid_id: i64,
-    row_start: u32, // pos.row
-    row_end: u32, // pos.row + sg.rows (exclusive)
-    col_start: u32, // pos.col
-    sg_cols: u32,
-    sg_rows: u32,
-    cells: [*]const grid_mod.Cell, // pointer to subgrid cells
-    margin_top: u32, // viewport margin rows at top (not scrollable)
-    margin_bottom: u32, // viewport margin rows at bottom (not scrollable)
-    margin_left: u32 = 0, // viewport margin columns at left (not scrollable)
-    margin_right: u32 = 0, // viewport margin columns at right (not scrollable)
-};
-
 const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
 const MAX_VERTEX_BYTES_AGGREGATE: usize = 512 * 1024 * 1024;
 // A row callback maps to one frontend MTLBuffer on macOS. Keep the core's
@@ -840,20 +824,14 @@ inline fn cellGlow(glow_all: bool, glow_hl_ids: ?*std.AutoHashMap(u32, void), hl
 }
 
 /// Compose one main-grid row into `dst`, run-length batched by hl_id.
+/// `row_start` is the row's first cell index in the main grid; `dst` is a
+/// row-local buffer filled from 0.
 ///
-/// The row-mode and whole-screen paths differ only in where the row lands:
-/// row-mode fills a row-local buffer starting at 0, the whole-screen path
-/// fills the shared buffer at `dst_offset = row_start`. Both read the same
-/// source cells and produce the same bytes, so they share this body rather
-/// than two copies that drift apart one fix at a time.
-///
-/// `inline` on purpose: this is per-row on the flush path, and inlining
-/// keeps the generated code identical to the two hand-written loops -- the
-/// slice bases and the comptime `count_hl_cache` branch fold away.
+/// `inline` on purpose: this is per-row on the flush path, and inlining lets
+/// the slice bases and the comptime `count_hl_cache` branch fold away.
 inline fn composeMainRowRuns(
     core: *Core,
     dst: *RenderCells,
-    dst_offset: usize,
     row_start: usize,
     cols: u32,
     hl_cache: []highlight.ResolvedAttrWithStyles,
@@ -883,8 +861,8 @@ inline fn composeMainRowRuns(
 
         // Batch write all cells in the run with same fg/bg/sp/style_flags.
         // Only the scalar differs per cell.
-        const ds: usize = dst_offset + @as(usize, c);
-        const de: usize = dst_offset + @as(usize, run_end);
+        const ds: usize = @as(usize, c);
+        const de: usize = @as(usize, run_end);
         @memset(dst.fg_rgbs.items[ds..de], a.fg);
         @memset(dst.bg_rgbs.items[ds..de], a.bg);
         @memset(dst.sp_rgbs.items[ds..de], a.sp);
@@ -3615,14 +3593,12 @@ pub const FlushCtx = struct {
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
-                    var used_scroll_fast_path: bool = false;
 
                     retry_loop: while (true) {
                         // On retry: force all rows (stale UVs in non-dirty rows too)
                         const effective_rebuild_all = rebuild_all or atlas_retried;
                         if (atlas_retried) {
                             // Reset all per-pass mutable state for a clean retry.
-                            used_scroll_fast_path = false;
                             had_glyph_miss = false;
                             perf_hl_cache_hits = 0;
                             perf_hl_cache_misses = 0;
@@ -3707,7 +3683,6 @@ pub const FlushCtx = struct {
                                 composeMainRowRuns(
                                     ctx.core,
                                     row_cells,
-                                    0,
                                     row_start,
                                     cols,
                                     hl_cache,
@@ -3950,8 +3925,8 @@ pub const FlushCtx = struct {
                         const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
-                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d} scroll_fast_path={any}\n",
-                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us, used_scroll_fast_path },
+                            "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d}\n",
+                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us },
                         );
                         ctx.core.log.write(
                             "[perf] row_mode_breakdown rows={d} compose_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_cb_row={d} max_cb_us={d}\n",
@@ -13157,7 +13132,6 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
         &core,
         &dst,
         0,
-        0,
         cols,
         hl_cache,
         hl_valid,
@@ -13192,7 +13166,7 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
 
     // Glow is opt-in: left alone when disabled, filled when enabled.
     @memset(dst.glow_arr.items[0..cols], 0);
-    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
+    composeMainRowRuns(&core, &dst, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
     for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
 
     // The other glow branch: with glow_all off, only the runs whose hl is in
@@ -13202,7 +13176,7 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
     defer ids.deinit();
     try ids.put(7, {});
     @memset(dst.glow_arr.items[0..cols], 0xFF);
-    composeMainRowRuns(&core, &dst, 0, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
+    composeMainRowRuns(&core, &dst, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
     for (0..cols) |i| {
         const expected: u8 = if (hls[i] == 7) 1 else 0;
         try std.testing.expectEqual(expected, dst.glow_arr.items[i]);
