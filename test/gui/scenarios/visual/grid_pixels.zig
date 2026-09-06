@@ -62,17 +62,30 @@ pub fn firstContentRow(img: driver.capture.Image, bg: u8) u32 {
     return 0;
 }
 
-/// Longest unbroken vertical run of ink at column `x`, from `y0` down.
-pub fn longestRun(img: driver.capture.Image, x: u32, y0: u32, bg: u8) u32 {
+/// Longest vertical run of ink at column `x`, from `y0` down, treating a gap
+/// of up to `max_gap_px` as part of the run.
+///
+/// The tolerance is not slack: a frontend that draws row by row under a
+/// per-row scissor leaves a seam wherever a fractional cell height rounds,
+/// and a separator that is unbroken on screen then measures one cell long.
+/// On Windows the divider column reads 20px strict against a 31px bar, and
+/// 650px once a single pixel of gap is forgiven.
+pub fn longestRun(img: driver.capture.Image, x: u32, y0: u32, bg: u8, max_gap_px: u32) u32 {
     var best: u32 = 0;
     var current: u32 = 0;
+    var gap: u32 = 0;
     var y = y0;
     while (y < img.h) : (y += 1) {
         if (isInk(img, x, y, bg)) {
-            current += 1;
+            current += 1 + gap;
+            gap = 0;
             if (current > best) best = current;
         } else {
-            current = 0;
+            gap += 1;
+            if (gap > max_gap_px) {
+                current = 0;
+                gap = 0;
+            }
         }
     }
     return best;
@@ -81,11 +94,13 @@ pub fn longestRun(img: driver.capture.Image, x: u32, y0: u32, bg: u8) u32 {
 /// Count the cell columns inside [x0_px, x1_px) that carry a vertical rule,
 /// and print where they are and how long each one is.
 ///
-/// A rule is an unbroken vertical run of ink at least one and a half rows
-/// long. Text cannot reach that: a glyph's ink stops inside its own cell, and
-/// as long as consecutive lines do not repeat the same character the next
-/// row's ink is somewhere else. A window separator, drawn from cell edge to
-/// cell edge, runs unbroken through every row it covers.
+/// A rule is a vertical run of ink at least one and a half rows long, allowing
+/// the row-boundary seam a per-row scissor leaves. Text cannot reach that: a
+/// glyph's ink stops inside its own cell, and as long as consecutive lines do
+/// not repeat the same character the next row's ink is somewhere else. A
+/// window separator runs through every row it covers. Measured on the Windows
+/// capture, in a band of fourteen cells: the divider column 650px, every text
+/// column 12px, against a 31px bar.
 pub fn countVerticalRules(
     label: []const u8,
     img: driver.capture.Image,
@@ -94,6 +109,9 @@ pub fn countVerticalRules(
     cell_w_px: f64,
     cell_h_px: f64,
 ) u32 {
+    // Two, not one: the seam measured 1px, and a different cell height rounds
+    // differently. Text still tops out at 13px against the 31px bar.
+    const seam_gap_px: u32 = 2;
     const bg = modalLuma(img, x0_px, x1_px, 0, img.h);
     // The title bar is a solid block of non-background pixels and would read
     // as a rule in every column, so the scan starts at the grid's first row.
@@ -114,7 +132,7 @@ pub fn countVerticalRules(
         const cx1: u32 = @min(img.w, @as(u32, @intFromFloat(@as(f64, @floatFromInt(cell + 1)) * cell_w_px)));
         var longest: u32 = 0;
         var x = cx0;
-        while (x < cx1) : (x += 1) longest = @max(longest, longestRun(img, x, y0, bg));
+        while (x < cx1) : (x += 1) longest = @max(longest, longestRun(img, x, y0, bg, seam_gap_px));
         if (longest < min_run_px) continue;
         found += 1;
         std.debug.print(" col{d}(run={d}px)", .{ cell, longest });
