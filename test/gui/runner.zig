@@ -272,7 +272,8 @@ test "gui:visual_cmdline_cursor_animation" {
 }
 
 test "gui:visual_continuous_j_scroll_matches_jump" {
-    if (comptime driver.capture.supported) {
+    // macOS only: counts the macOS frontend's [layer_row_scroll] line.
+    if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/visual/continuous_j_scroll_matches_jump.zig").run(testing.allocator);
     } else {
@@ -281,7 +282,8 @@ test "gui:visual_continuous_j_scroll_matches_jump" {
 }
 
 test "gui:visual_incremental_scroll_matches_jump" {
-    if (comptime driver.capture.supported) {
+    // macOS only: counts the macOS frontend's [layer_row_scroll] line.
+    if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/visual/incremental_scroll_matches_jump.zig").run(testing.allocator);
     } else {
@@ -360,7 +362,8 @@ test "gui:visual_proportional_font_support" {
 }
 
 test "gui:visual_shader_covers_all_grids" {
-    if (comptime driver.capture.supported) {
+    // macOS only: reads the macOS frontend's [resizeExternalWindows] line.
+    if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/visual/shader_covers_all_grids.zig").run(testing.allocator);
     } else {
