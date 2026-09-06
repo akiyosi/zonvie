@@ -3,6 +3,13 @@ const builtin = @import("builtin");
 const clock = @import("zonvie_core").clock;
 
 var g_enabled: std.atomic.Value(bool) = .init(false);
+// `--log` enables logging before the config is read, and the config load then
+// re-applies its own (default false) setting. Callers consult this so the CLI
+// flag wins, which is what its help text promises.
+var g_forced_on: std.atomic.Value(bool) = .init(false);
+// Reference for the line timestamps, taken when logging is first enabled.
+// i64 nanoseconds: atomics cap at 64 bits, and the range is ~292 years.
+var g_start_ns: std.atomic.Value(i64) = .init(0);
 var g_log_file: ?std.Io.File = null;
 var g_perf_only: std.atomic.Value(bool) = .init(false);
 var g_scroll_only: std.atomic.Value(bool) = .init(false);
@@ -83,9 +90,11 @@ fn enqueue(bytes: []const u8) void {
     g_queue_cond.signal(clock.io());
 }
 
-fn enqueueParts(prefix: []const u8, bytes: []const u8, suffix: []const u8) void {
-    const total = std.math.add(usize, prefix.len, bytes.len) catch return;
-    const required = std.math.add(usize, total, suffix.len) catch return;
+fn enqueueParts(parts: []const []const u8) void {
+    var required: usize = 0;
+    for (parts) |part| {
+        required = std.math.add(usize, required, part.len) catch return;
+    }
     if (!g_queue_mu.tryLock()) {
         _ = g_queue_busy_drops.fetchAdd(1, .monotonic);
         return;
@@ -101,10 +110,18 @@ fn enqueueParts(prefix: []const u8, bytes: []const u8, suffix: []const u8) void 
         return;
     }
     enqueueDropSummaryLocked(required);
-    _ = enqueueLocked(prefix);
-    _ = enqueueLocked(bytes);
-    _ = enqueueLocked(suffix);
+    for (parts) |part| _ = enqueueLocked(part);
     g_queue_cond.signal(clock.io());
+}
+
+/// `[zonvie] [   12.345ms] `, the prefix the macOS frontend writes and the GUI
+/// harness parses (test/gui/app_log.zig lineTimestampMs). Without it every
+/// timestamp-filtered helper there discards the line.
+fn stampInto(buf: []u8) []const u8 {
+    const start = g_start_ns.load(.acquire);
+    const elapsed_ns: i64 = if (start == 0) 0 else @truncate(clock.nowNs() - start);
+    const ms = @as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms;
+    return std.fmt.bufPrint(buf, "[zonvie] [{d:>9.3}ms] ", .{ms}) catch "[zonvie] [    0.000ms] ";
 }
 
 fn writeChunk(chunk: []const u8) void {
@@ -186,6 +203,9 @@ fn logThreadMain() void {
 /// App-root log switch (Windows side).
 /// This is the single source of truth for "frontend logging enabled".
 pub fn setEnabled(enabled: bool) void {
+    if (enabled and g_start_ns.load(.acquire) == 0) {
+        g_start_ns.store(@truncate(clock.nowNs()), .release);
+    }
     if (enabled and g_log_thread == null) {
         g_queue_stop = false;
         g_log_thread = std.Thread.spawn(.{}, logThreadMain, .{}) catch {
@@ -199,6 +219,17 @@ pub fn setEnabled(enabled: bool) void {
 
 pub fn isEnabled() bool {
     return g_enabled.load(.acquire);
+}
+
+/// Turn logging on from the command line, and record that it must stay on.
+pub fn forceEnabled(path: []const u8) void {
+    setLogPath(path);
+    g_forced_on.store(true, .release);
+    setEnabled(true);
+}
+
+pub fn isForced() bool {
+    return g_forced_on.load(.acquire);
 }
 
 pub fn setFilters(perf_only: bool, scroll_only: bool, verbose: bool) void {
@@ -285,14 +316,16 @@ pub fn appLog(comptime fmt: []const u8, args: anytype) void {
             return;
         },
     };
-    enqueue(msg);
+    var stamp_buf: [40]u8 = undefined;
+    enqueueParts(&.{ stampInto(&stamp_buf), msg });
 }
 
 /// Used by core on_log callback: bytes already contain newline sometimes; caller decides.
 pub fn appLogBytes(prefix: []const u8, bytes: []const u8) void {
     if (!isEnabled() or !shouldEmitBytes(prefix, bytes)) return;
 
-    enqueueParts(prefix, bytes, "\n");
+    var stamp_buf: [40]u8 = undefined;
+    enqueueParts(&.{ stampInto(&stamp_buf), prefix, bytes, "\n" });
 }
 
 /// Panic-only best-effort path. Never wait on the configured sink: it may be a
@@ -371,7 +404,7 @@ test "multipart logging drops atomically when the ring is full" {
     g_queue_head = 0;
     g_queue_len = queue_capacity - 1;
 
-    enqueueParts("a", "b", "c");
+    enqueueParts(&.{ "a", "b", "c" });
 
     try std.testing.expectEqual(queue_capacity - 1, g_queue_len);
     try std.testing.expectEqual(@as(u64, 1), g_queue_full_drops.load(.acquire));
