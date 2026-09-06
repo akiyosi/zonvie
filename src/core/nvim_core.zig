@@ -2370,7 +2370,6 @@ pub const Core = struct {
         self.invalidateNegativeGlyphCacheEntries();
         self.invalidateMirroredFrameState();
         self.grid.markAllDirty();
-        self.grid.scroll_fast_path_blocked = true;
         var sg_it = self.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
             sg.markAllDirty();
