@@ -2040,8 +2040,20 @@ pub export fn WndProc(
                 }
 
                 var ps: c.PAINTSTRUCT = undefined;
-                _ = c.BeginPaint(hwnd, &ps);
+                const begin_hdc = c.BeginPaint(hwnd, &ps);
                 defer _ = c.EndPaint(hwnd, &ps);
+                if (log_enabled) {
+                    applog.appLog(
+                        "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
+                        .{
+                            @intFromBool(begin_hdc != null),
+                            ps.rcPaint.left,   ps.rcPaint.top,
+                            ps.rcPaint.right,  ps.rcPaint.bottom,
+                            @intFromBool(ps.fErase != 0),
+                            @intFromBool(app.wm_paint_reinvalidate_all),
+                        },
+                    );
+                }
 
                 // While minimized, GetClientRect returns the iconic size
                 // (e.g. 160x28); letting drawEx → resize run would shrink
@@ -2569,14 +2581,36 @@ pub export fn WndProc(
                         // relying on those flags alone leaves a window where back_tex is
                         // cleared but only dirty rows are drawn — non-dirty rows show the
                         // clear color until Neovim re-sends grid_line.
+                        //
+                        // An empty ps.rcPaint is not a redraw-all request. Every
+                        // Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so the
+                        // paint DC has no visible region and BeginPaint clips
+                        // rcPaint to nothing on every paint. The app's own damage
+                        // (tbs.pending_dirty -> dirty_row_keys, plus
+                        // paint_full_snapshot) is what computeRowsToDraw reads.
                         const force_full_rows =
                             did_need_seed or
-                            (dirty == null) or
                             paint_full_snapshot or
                             seed_clear_pending_snapshot or
                             (seed_pending_snapshot and !back_tex_valid_snapshot) or
                             glow_enabled or
                             (g.opacity < 1.0);
+
+                        if (log_enabled) {
+                            applog.appLog(
+                                "[win] force_full_rows={d} seed={d} nodirty={d} paintfull={d} seedclear={d} seedpend_notex={d} glow={d} opacity={d}\n",
+                                .{
+                                    @intFromBool(force_full_rows),
+                                    @intFromBool(did_need_seed),
+                                    @intFromBool(dirty == null),
+                                    @intFromBool(paint_full_snapshot),
+                                    @intFromBool(seed_clear_pending_snapshot),
+                                    @intFromBool(seed_pending_snapshot and !back_tex_valid_snapshot),
+                                    @intFromBool(glow_enabled),
+                                    @intFromBool(g.opacity < 1.0),
+                                },
+                            );
+                        }
 
                         const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                         const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
@@ -2785,6 +2819,46 @@ pub export fn WndProc(
                                 "[win] WM_PAINT(row) row_h_px adjust rows={d} client_h={d} fallback={d} row_h={d}\n",
                                 .{ rows_for_layout, client.bottom, fallback_row_h, row_h_px_u32 },
                             );
+                        }
+
+                        // Where the cursor's own layer sits, so the overlay is
+                        // placed with that layer's transform rather than the
+                        // root grid's. The grid id comes from the same
+                        // transaction as the cursor vertices.
+                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
+                        var cursor_layer_rows: u32 = 0;
+                        const cursor_layer_origin: [2]f32 = blk: {
+                            if (cursor_grid == 1) break :blk .{ 0, 0 };
+                            for (tbs_snapshot.layers.slice()) |l| {
+                                if (l.grid_id == cursor_grid) {
+                                    cursor_layer_rows = l.rows;
+                                    break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
+                                }
+                            }
+                            break :blk .{ 0, 0 };
+                        };
+
+                        // The rows the cursor overlay would otherwise erase:
+                        // where the previous cursor was baked into back_tex,
+                        // and where this one lands. Both are grid-local rows of
+                        // the cursor's own grid. Repainting them from that
+                        // grid's vertices is what removes the previous cursor,
+                        // so the overlay's blink-off clear — a full-content-
+                        // width band it can only refill from one grid — never
+                        // has to run.
+                        const cursor_erase_rows: [2]?u32 = .{
+                            app.last_painted_cursor_row,
+                            if (cursor_verts_snapshot.len != 0 and row_h_px > 0)
+                                app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px)
+                            else
+                                null,
+                        };
+                        if (cursor_grid == 1) {
+                            for (cursor_erase_rows) |maybe_row| {
+                                const r = maybe_row orelse continue;
+                                if (r >= max_valid_row) continue;
+                                _ = render_helpers.insertSortedRow(app.alloc, rows_to_draw, r);
+                            }
                         }
 
                         // Use persistent buffer to avoid per-frame alloc/free.
@@ -3240,21 +3314,6 @@ pub export fn WndProc(
                             }
                         }
 
-                        // Where the cursor's own layer sits, so the overlay is
-                        // placed with that layer's transform rather than the
-                        // root grid's. The grid id comes from the same
-                        // transaction as the cursor vertices.
-                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
-                        const cursor_layer_origin: [2]f32 = blk: {
-                            if (cursor_grid == 1) break :blk .{ 0, 0 };
-                            for (tbs_snapshot.layers.slice()) |l| {
-                                if (l.grid_id == cursor_grid) {
-                                    break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
-                                }
-                            }
-                            break :blk .{ 0, 0 };
-                        };
-
                         // The cursor's own row in its layer. Blink-off redraws
                         // this instead of the root's row, which is empty under
                         // ext_multigrid.
@@ -3262,22 +3321,40 @@ pub export fn WndProc(
                         // pointer into rows_buf would dangle once the lock is
                         // released, so the row is re-resolved below.
                         var cursor_layer_row_index: ?usize = null;
+                        // What row_already_redrawn promises drawCursorOverlay:
+                        // this frame repainted the cursor's OWN grid's row, so
+                        // blink-on needs only the cursor quad and blink-off
+                        // needs nothing. A layer's rows have to be claimed here,
+                        // after planLayerFrame settled the redraw set and before
+                        // drawSurfaceLayers' defer clears it.
+                        var cursor_row_redrawn = force_full_rows;
                         if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
                             app.mu.lockUncancelable(core.clock.io());
                             defer app.mu.unlock(core.clock.io());
                             if (app.layer_grids.get(cursor_grid)) |state| {
-                                var min_y: f32 = cursor_verts_snapshot[0].position[1];
-                                var max_y: f32 = min_y;
-                                for (cursor_verts_snapshot[1..]) |v| {
-                                    if (v.position[1] < min_y) min_y = v.position[1];
-                                    if (v.position[1] > max_y) max_y = v.position[1];
-                                }
-                                const ri: i32 = @intFromFloat(@floor(
-                                    (min_y + max_y) * 0.5 / @as(f32, @floatFromInt(row_h_px)),
-                                ));
-                                const local_row: usize = @intCast(@max(0, ri));
+                                const local_row: usize =
+                                    app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px);
                                 if (local_row < state.rows_buf.items.len) cursor_layer_row_index = local_row;
+                                if (!cursor_row_redrawn) {
+                                    var claimed = true;
+                                    for (cursor_erase_rows) |maybe_row| {
+                                        const r = maybe_row orelse continue;
+                                        if (!app_mod.markLayerCursorRow(state, cursor_layer_rows, r))
+                                            claimed = false;
+                                    }
+                                    cursor_row_redrawn = claimed;
+                                }
                             }
+                        } else if (cursor_grid == 1 and !cursor_row_redrawn) {
+                            // Both rows went into rows_to_draw above, unless one
+                            // fell outside the committed row set.
+                            var claimed = true;
+                            for (cursor_erase_rows) |maybe_row| {
+                                const r = maybe_row orelse continue;
+                                if (std.mem.indexOfScalar(u32, rows_to_draw.items, r) == null)
+                                    claimed = false;
+                            }
+                            cursor_row_redrawn = claimed;
                         }
 
                         // Non-root layers on top of the root grid, before the
@@ -3369,7 +3446,7 @@ pub export fn WndProc(
                             .ctx_ptr = ctx_ptr,
                             .rs_set_sc_fn = rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
-                            .row_already_redrawn = force_full_rows,
+                            .row_already_redrawn = cursor_row_redrawn,
                         }) catch |e| {
                             cursor_overlay_failed = true;
                             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
