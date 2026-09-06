@@ -1610,7 +1610,7 @@ fn loadConfigAndApplyCoreOptions(app: *App) void {
         }
     } else |_| {}
 
-    setLogEnabledViaCore(app, app.config.log.enabled);
+    setLogEnabledViaCore(app, app.config.log.enabled or applog.isForced());
     if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
     if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
     if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
