@@ -14,12 +14,13 @@
 // shift drags the float's content along with the text under it while the core
 // resends only the band the shift vacated, and nothing puts the float back.
 //
-// Measured: it does NOT happen. Neovim re-announces a float over a window that
-// scrolled, and `setWinFloatPos` dirties the anchor's covered rows for an
-// external anchor, so the float's rows are in the regen set of every shifted
-// frame (9-12 of 20 rows for a 3-row scroll under a 6-row float, against 3
-// vacated rows). This scenario pins that, since nothing on the fast path
-// arranges it — the repaint is a side effect of an unrelated redraw event.
+// Measured: it does NOT happen. `Grid.scrollGrid` re-marks the composited band
+// of every float anchored to an external grid right after shifting it, so the
+// float's rows are in the regen set of every shifted frame (9-12 of 20 rows for
+// a 3-row scroll under a 6-row float, against 3 vacated rows). Neovim also
+// re-announces the float after the scroll, but only from the second shift on,
+// which is why the single-step comparison below exists alongside the four-step
+// one.
 //
 // The oracle is relational — scrolling in small steps and jumping to the same
 // topline must agree — so it needs no golden and is immune to per-host
@@ -190,11 +191,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // `{external=true}` straight away, and the placement has to reach the core
     // in between. `setWinExternalPos` takes the grid's screen position from
     // `win_pos`, and a window that was never composited has no entry there: its
-    // ExternalGridInfo keeps start_row = -1, at which point
-    // `buildExternalFloatRowIndex` returns early and `dirtyCompositedRow` bails
-    // out, so a float anchored to that window is never composited into it and
-    // never reaches the screen at all. This scenario needs an anchor that does
-    // composite; the other configuration is a separate defect.
+    // ExternalGridInfo keeps start_row = -1 and its floats composite against an
+    // origin of 0 instead. Both routes draw; only this one places the float at
+    // `float_pos.row - start_row`. extfloat_over_born_external_anchor covers
+    // the other.
     gui_io.sleepNs(600 * std.time.ns_per_ms);
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
@@ -270,6 +270,54 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     var start = try captureWindowStable(alloc, ext_win.number, 8000);
     defer start.deinit(alloc);
+
+    // One step on its own first. The first shift after a settled frame is the
+    // one where Neovim announces the float only BEFORE the grid_scroll, so a
+    // band the core failed to re-mark there would be repaired by the later
+    // steps and stay invisible to the four-step comparison below.
+    {
+        const t_one = try app_log.nowMs(alloc, log_path);
+        try g.remoteSend("3<C-e>");
+        gui_io.sleepNs(step_settle_ms * std.time.ns_per_ms);
+        var one_step = try captureWindowStable(alloc, ext_win.number, 8000);
+        defer one_step.deinit(alloc);
+
+        const one_fast = try fastPathFrames(alloc, t_one);
+        std.debug.print(
+            "[gui] extfloat_over_scrolled_anchor: 1 step -> {d} shifted frame(s) (max regen_count {d:.0})\n",
+            .{ one_fast.frames, one_fast.max_regen },
+        );
+        if (one_fast.frames < 1) {
+            std.debug.print(
+                "[gui] the single step did not take the row-shift fast path; it would guard nothing\n",
+                .{},
+            );
+            return error.RowShiftDidNotRun;
+        }
+
+        const one_topline = try g.evalInt("line('w0')");
+        try g.exec("execute('normal! 1Gzt0')");
+        var one_settled = try captureWindowStable(alloc, ext_win.number, 8000);
+        one_settled.deinit(alloc);
+        var one_buf: [64]u8 = undefined;
+        try g.exec(try std.fmt.bufPrint(&one_buf, "execute('normal! {d}Gzt0')", .{one_topline}));
+        var one_jumped = try captureWindowStable(alloc, ext_win.number, 8000);
+        defer one_jumped.deinit(alloc);
+
+        try visual.assertRegionUnchanged(
+            alloc,
+            "extfloat_over_scrolled_anchor_one_step",
+            one_jumped,
+            one_step,
+            region,
+            .{},
+        );
+
+        // Back to the view `start` holds, for the multi-step measurement.
+        try g.exec("execute('normal! 100Gzt0')");
+        var restored = try captureWindowStable(alloc, ext_win.number, 8000);
+        restored.deinit(alloc);
+    }
 
     const t_scroll = try app_log.nowMs(alloc, log_path);
     var i: usize = 0;

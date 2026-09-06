@@ -11,10 +11,11 @@
 // A float anchored to an external window is drawn by exactly one path: it is
 // NOT a main-surface layer (`collectMainLayerEntries` skips a float whose
 // anchor is external) and it gets no OS window of its own; it is composited
-// into the anchor's own rows. Both halves of that compositing bail out on a
-// negative start_row — `Grid.dirtyCompositedRow` returns before marking a row,
-// `buildExternalFloatRowIndexWithLimits` returns before building the index —
-// which would leave the float drawn by nobody.
+// into the anchor's own rows. Both halves of that compositing —
+// `Grid.dirtyCompositedRow` and `buildExternalFloatRowIndexWithLimits` — read
+// the float's stored win_pos against the anchor's origin, which is 0 when the
+// anchor has no position of its own. Reading a negative start_row as "do not
+// composite" instead leaves the float drawn by nobody.
 //
 // The oracle is what a user would see: opening the float changes the anchor's
 // OS window pixels. Arm B — the same float over an anchor externalized the
@@ -30,8 +31,9 @@
 // start_row itself is not reachable from this driver — it is core state with
 // no callback, no log line and no exported getter that reports it directly.
 // The headless scenario e2e/born_external_anchor_float measures it (0 on the
-// control route, -1 on the suspect route) and asserts the same defect against
-// the anchor's dirty set.
+// control route, -1 on the suspect route, and the -1 must stay, since
+// `zonvie_core_is_float_external` reads it) and asserts the same property
+// against the anchor's dirty set.
 //
 // macOS-only: it enumerates the app's OS windows to find the external one and
 // captures that window rather than the main one.
@@ -339,9 +341,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         "[gui] a float over an anchor born external (nvim_open_win external=true) changed {d:.4} of the anchor's " ++
             "OS window, and {d:.4} after a forced redraw, while the SAME float over an anchor externalized from a " ++
             "settled window changed {d:.4}. It takes no OS window of its own and is not a main-surface layer, so " ++
-            "nothing draws it: without a prior win_pos, ExternalGridInfo.start_row stays -1 and both " ++
-            "Grid.dirtyCompositedRow and buildExternalFloatRowIndexWithLimits bail out before compositing it into " ++
-            "the anchor's rows\n",
+            "nothing draws it: without a prior win_pos, ExternalGridInfo.start_row stays -1, and both " ++
+            "Grid.dirtyCompositedRow and buildExternalFloatRowIndexWithLimits must read that as a composite " ++
+            "origin of 0 rather than as a reason to skip the anchor's rows\n",
         .{ suspect.float_paint, suspect.redraw_paint, control.float_paint },
     );
     return error.BornExternalAnchorFloatInvisible;

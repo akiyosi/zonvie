@@ -10,11 +10,17 @@
 //
 // A float anchored to an external window is not a main-surface layer
 // (`collectMainLayerEntries` skips it); it is composited into the anchor's own
-// rows instead. Both halves of that compositing bail out on a negative
-// start_row: `Grid.dirtyCompositedRow` returns before marking anything, and
-// `buildExternalFloatRowIndexWithLimits` returns before building the row
-// index. So on the born-external route nothing marks the anchor's covered rows
-// for repaint.
+// rows instead. Both halves of that compositing read the float's stored
+// win_pos against the anchor's origin — `Grid.dirtyCompositedRow` and
+// `buildExternalFloatRowIndexWithLimits` — and that origin is 0 for an anchor
+// with no position of its own, which is exactly the base redraw_handler used
+// when it stored the float's coordinates. Reading a negative start_row as "no
+// compositing" instead would leave the born-external route drawn by nobody.
+//
+// This is a dirty-row oracle only. Marking the rows is necessary but not
+// sufficient: a fix that repaired `dirtyCompositedRow` alone, leaving the row
+// index unbuilt, would still turn this green while the float stayed invisible.
+// The pixel side is gui/scenarios/visual/extfloat_over_born_external_anchor.
 //
 // The dirty set is what a frontend would be asked to repaint, and this harness
 // leaves `on_vertices_row` null so it only accumulates — clearing it right
@@ -174,24 +180,38 @@ pub fn run(alloc: std.mem.Allocator) !void {
         },
     );
 
-    // Vacuity gate: without a control that composites, a zero on the suspect
-    // route says nothing about the product.
-    if (control.covered_dirty == 0) {
+    // Vacuity gate: without a control that composites, any number on the
+    // suspect route says nothing about the product.
+    if (control.covered_dirty != float_height) {
         std.debug.print(
-            "[e2e] the CONTROL route composited nothing (start_row={d}); this measurement proves nothing\n",
-            .{control.start_row},
+            "[e2e] the CONTROL route marked {d} of the {d} rows its float covers (start_row={d}); " ++
+                "this measurement proves nothing\n",
+            .{ control.covered_dirty, float_height, control.start_row },
         );
         return error.ControlDidNotComposite;
     }
 
-    if (suspect.covered_dirty == 0) {
+    // The two routes must be indistinguishable from the anchor's dirty set.
+    if (suspect.covered_dirty != float_height) {
         std.debug.print(
-            "[e2e] a float over an anchor born external (start_row={d}) marked none of the {d} rows it covers " ++
-                "for repaint, while the same float over a detached-split anchor (start_row={d}) marked {d}: " ++
-                "with start_row < 0 both dirtyCompositedRow and buildExternalFloatRowIndexWithLimits bail out, " ++
-                "so nothing composites the float into its anchor\n",
-            .{ suspect.start_row, float_height, control.start_row, control.covered_dirty },
+            "[e2e] a float over an anchor born external (start_row={d}) marked {d} of the {d} rows it covers " ++
+                "for repaint, while the same float over a detached-split anchor (start_row={d}) marked {d}. " ++
+                "The float's win_pos was stored against an origin of 0, so every consumer must read it back " ++
+                "against 0 too\n",
+            .{ suspect.start_row, suspect.covered_dirty, float_height, control.start_row, control.covered_dirty },
         );
         return error.BornExternalAnchorNeverComposites;
+    }
+
+    // start_row itself must NOT have been normalized: zonvie_core_is_float_external
+    // reads it as the born-external/detached discriminator, and both frontends
+    // pick window styling from it.
+    if (suspect.start_row >= 0) {
+        std.debug.print(
+            "[e2e] the born-external anchor now reports start_row={d}; a write-site normalization would " ++
+                "silently flip zonvie_core_is_float_external for every external window\n",
+            .{suspect.start_row},
+        );
+        return error.BornExternalStartRowNormalized;
     }
 }

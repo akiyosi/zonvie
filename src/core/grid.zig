@@ -1157,6 +1157,22 @@ pub const ExternalGridInfo = struct {
     start_col: i32,
 };
 
+/// Origin to read a float's stored win_pos against when compositing it into
+/// this external anchor. A grid that never had a win_pos keeps start_row/col
+/// negative, and redraw_handler stored floats anchored to it with an implicit
+/// base of 0 — so 0 is the space those coordinates were written in.
+///
+/// Read side only. The stored negative value still distinguishes a
+/// born-external grid from a detached split for `zonvie_core_is_float_external`
+/// and the ext_windows promotion order, so it must not be normalized away.
+pub fn externalCompositeOriginRow(info: ExternalGridInfo) i32 {
+    return if (info.start_row < 0) 0 else info.start_row;
+}
+
+pub fn externalCompositeOriginCol(info: ExternalGridInfo) i32 {
+    return if (info.start_col < 0) 0 else info.start_col;
+}
+
 /// Pending grid resize request from ext_windows win_resize event.
 pub const PendingGridResize = struct {
     grid_id: i64,
@@ -2263,11 +2279,12 @@ pub const Grid = struct {
             // `float_pos.row - start_row` (flush.zig ext overlay). Translate
             // the same way here: marking the global row would dirty rows
             // offset by start_row (or nothing at all) and leave the truly
-            // composited rows stale.
-            if (ext.start_row < 0) return; // no position info: composite disabled
+            // composited rows stale. An anchor with no position of its own
+            // had that base of 0 applied at the write site too.
+            const origin_row = externalCompositeOriginRow(ext);
             if (self.sub_grids.getPtr(p.anchor_grid)) |asg| {
                 asg.dirty = true;
-                const local: i64 = @as(i64, p.row) + @as(i64, row) - @as(i64, ext.start_row);
+                const local: i64 = @as(i64, p.row) + @as(i64, row) - @as(i64, origin_row);
                 if (local >= 0 and local < @as(i64, @intCast(asg.dirty_rows.bit_length))) {
                     asg.dirty_rows.set(@intCast(local));
                 }
@@ -2563,6 +2580,26 @@ pub const Grid = struct {
             }
             // External grids (not in win_pos) do not affect global grid
             // content_rev, dirty state, or pending_scroll.
+
+            // A float anchored to an EXTERNAL grid lives in that grid's own
+            // rows, and sg.scroll just moved this grid's dirty marks with the
+            // content — unsetting every band row whose source was clean. The
+            // band must be re-marked AFTER the shift, or the frontend drags
+            // the float's pixels along and nothing repaints them. Neovim
+            // usually re-announces the float after the grid_scroll, but not on
+            // the first shift of a gesture, so the core cannot depend on it.
+            // Bitset sets only; the scan is over composited windows, of which
+            // the ones anchored here are the floats this grid carries.
+            if (self.external_grids.contains(grid_id)) {
+                var float_it = self.win_pos.iterator();
+                while (float_it.next()) |fe| {
+                    const fp = fe.value_ptr.*;
+                    if (fp.anchor_grid != grid_id) continue;
+                    const fsg = self.sub_grids.get(fe.key_ptr.*) orelse continue;
+                    var fr: u32 = 0;
+                    while (fr < fsg.rows) : (fr += 1) self.dirtyCompositedRow(fp, fr);
+                }
+            }
 
             self.recordScrolledGrid(grid_id, rows);
         }

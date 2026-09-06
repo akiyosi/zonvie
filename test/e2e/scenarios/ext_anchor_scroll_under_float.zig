@@ -14,21 +14,22 @@
 // reach. `collectMainLayerEntries` (flush.zig) skips it precisely because its
 // anchor is external, and `buildExternalFloatRowIndexWithLimits` composites it
 // into the anchor's OWN rows instead — the rows on_grid_row_scroll asks the
-// frontend to shift. What keeps that safe is not a guard but Neovim: it
-// re-announces the float in the same batch as the scroll, and setWinFloatPos
-// dirties the covered anchor rows through dirtyCompositedRow, so the shifted
-// float pixels are painted over.
+// frontend to shift. What keeps that safe is `Grid.scrollGrid`: after shifting
+// an external grid it re-marks the composited band of every float anchored to
+// it, because sg.scroll moved this grid's dirty marks with the content and
+// unset the band rows whose source was clean.
 //
-// The gate below on `start_row >= 0` is load-bearing. An external grid that
-// was never composited keeps start_row == -1 (grid.zig setWinExternalPos), and
-// BOTH compositing paths return early on that — dirtyCompositedRow
-// (grid.zig:2275) and buildExternalFloatRowIndexWithLimits (flush.zig:4861).
-// In that configuration the float has no pixels in the anchor's rows at all,
-// nothing is resent because there is nothing to resend, and this scenario
-// would assert against a screen it is not describing. Measured: reaching the
-// external window with `nvim_open_win{external=true}` yields start_row == -1,
-// while settling an ordinary split first and detaching it with
-// `nvim_win_set_config{external=true}` yields start_row == 0.
+// Leaning on Neovim instead would be wrong. Traced: the first shift's batch
+// carries one win_float_pos for the float and it arrives BEFORE the
+// grid_scroll; the second carries one before AND one after. Only the
+// post-scroll announcement covers the band, so a core that waited for it would
+// miss the bottom rows on every first shift of a gesture.
+//
+// The gate below pins that this scenario measures a positioned anchor, where
+// the band is `float_pos.row - start_row`. Measured: settling an ordinary
+// split first and detaching it with `nvim_win_set_config{external=true}`
+// yields start_row == 0, while `nvim_open_win{external=true}` yields -1 and
+// composites against an origin of 0 instead (born_external_anchor_float).
 
 const std = @import("std");
 const Harness = @import("../harness.zig").Harness;
@@ -136,15 +137,14 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
     try std.testing.expect(float_grid != 0);
 
-    // Compositing is LIVE. Without this gate the scenario passes just as
-    // happily on an anchor whose start_row is -1, where the float is drawn
-    // into the anchor's rows by nobody and "the covered rows came back" would
-    // mean nothing. See the header.
+    // The anchor took the positioned route, so the band below really is
+    // `float_pos.row - start_row`. On the born-external route the origin is 0
+    // instead and this subtraction would name rows the float does not cover.
     const start_row = h.externalGridStartRow(ext_grid);
     if (start_row < 0) {
         std.debug.print(
             "[e2e] ext_anchor_scroll_under_float: anchor grid {d} has start_row={d}; " ++
-                "the float is not composited into its rows and this scenario would prove nothing\n",
+                "the band arithmetic below assumes the positioned route\n",
             .{ ext_grid, start_row },
         );
         return error.ExternalAnchorNotCompositing;
@@ -177,21 +177,27 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     h.resetRowScrolls();
 
-    // Two shifts, i.e. steady-state scrolling rather than the first frame of a
-    // gesture, with the dirty set cleared before each so what is read back is
-    // one frame's worth — the way a real flush starts from a set its own
-    // clearDirty() emptied. On the very FIRST shift after a clear the float's
-    // dirty marks are the ones Neovim set BEFORE the grid_scroll, which
-    // GridBuf.scroll then shifts along with the content, so they land
-    // `rows_delta` above the float and the band's bottom rows are missed. From
-    // the second shift on, the marks Neovim sets after the scroll cover it.
+    // Two shifts, each measured on its own: the dirty set is cleared before
+    // each one so what is read back is a single frame's worth, the way a real
+    // flush starts from a set its own clearDirty() emptied.
+    //
+    // The two are not interchangeable. Measured with a redraw-event trace, the
+    // FIRST shift's batch carries exactly one win_float_pos for the float and
+    // it arrives BEFORE the grid_scroll; the second shift's batch carries one
+    // before AND one after. GridBuf.scroll moves dirty marks with the content
+    // and unsets a destination row whose source was clean, so a band marked
+    // only before the shift lands `rows_delta` above and its bottom rows come
+    // back clean. The core must therefore re-mark the band itself after
+    // shifting an external anchor, not lean on Neovim re-announcing the float.
     h.clearDirtyRows(ext_grid);
     try h.input("<C-d>");
     try h.waitRowText(ext_grid, 0, "line 4", h.opts.timeout_ms);
+    try requireBandResent(h, alloc, ext_grid, ext_size.rows, float_grid, band_start, band_end, 1);
 
     h.clearDirtyRows(ext_grid);
     try h.input("<C-d>");
     try h.waitRowText(ext_grid, 0, "line 7", h.opts.timeout_ms);
+    try requireBandResent(h, alloc, ext_grid, ext_size.rows, float_grid, band_start, band_end, 2);
 
     // The waits above already proved the anchor's content moved, so a silent
     // callback could not be mistaken for a scroll that never happened. The
@@ -211,19 +217,30 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.ExternalAnchorRowScrollNotPublished;
     }
     try std.testing.expectEqual(rows_delta_expected, h.rowScrollDelta(ext_grid));
+}
 
-    // What makes that publish safe: every row the float covers is dirty, so
-    // the frontend repaints the float pixels its shift dragged.
+/// Every row the float covers must be dirty after the shift, so the frontend
+/// repaints the float pixels its row shift dragged.
+fn requireBandResent(
+    h: *Harness,
+    alloc: std.mem.Allocator,
+    ext_grid: i64,
+    ext_rows_total: u32,
+    float_grid: i64,
+    band_start: u32,
+    band_end: u32,
+    shift_index: u32,
+) !void {
     var row: u32 = band_start;
     while (row < band_end) : (row += 1) {
         if (h.isRowDirty(ext_grid, row)) continue;
-        const map = try dirtyMapAlloc(h, alloc, ext_grid, ext_size.rows);
+        const map = try dirtyMapAlloc(h, alloc, ext_grid, ext_rows_total);
         defer alloc.free(map);
         std.debug.print(
-            "[e2e] ext_anchor_scroll_under_float: anchor grid {d} shifted {d} rows with float " ++
+            "[e2e] ext_anchor_scroll_under_float: on shift {d}, anchor grid {d} shifted with float " ++
                 "grid {d} composited at rows {d}..{d}, but row {d} was not resent. The frontend " ++
                 "drags the float's pixels with the text and nothing repaints them. dirty={s}\n",
-            .{ ext_grid, h.rowScrollDelta(ext_grid), float_grid, band_start, band_end, row, map },
+            .{ shift_index, ext_grid, float_grid, band_start, band_end, row, map },
         );
         return error.CoveredFloatRowNotResent;
     }
@@ -232,5 +249,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // dirty_all the scroll left set — would satisfy the loop above without
     // proving anything. The row just below the float's band is regenerated by
     // neither the composite nor the vacated band, so it must be clean.
-    try std.testing.expect(!h.isRowDirty(ext_grid, band_end));
+    if (h.isRowDirty(ext_grid, band_end)) {
+        const map = try dirtyMapAlloc(h, alloc, ext_grid, ext_rows_total);
+        defer alloc.free(map);
+        std.debug.print(
+            "[e2e] ext_anchor_scroll_under_float: on shift {d}, row {d} just below the float's band " ++
+                "is dirty too; the readback cannot distinguish a resent band from a resent grid. " ++
+                "dirty={s}\n",
+            .{ shift_index, band_end, map },
+        );
+        return error.DirtyReadbackNotSelective;
+    }
 }

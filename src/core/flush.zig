@@ -4828,9 +4828,10 @@ fn buildExternalFloatRowIndexWithLimits(
     const row_count: usize = viewport_rows;
 
     const info = ext_info orelse return generation;
-    if (info.start_row < 0 or info.start_col < 0) return generation;
-    const ext_start_row: i64 = info.start_row;
-    const ext_start_col: i64 = info.start_col;
+    // An anchor with no position of its own composites at origin 0: that is
+    // the base redraw_handler applied when it stored the float's win_pos.
+    const ext_start_row: i64 = grid_mod.externalCompositeOriginRow(info);
+    const ext_start_col: i64 = grid_mod.externalCompositeOriginCol(info);
 
     // anchor_entries is already in global layer order for this anchor. Count
     // visible entries before allocating so invisible/missing/zero-cell floats
@@ -5475,10 +5476,14 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     };
 
                     if (ext_info) |info| {
-                        if (info.start_row >= 0 and info.start_col >= 0) {
-                            const ext_start_row: i64 = info.start_row;
+                        {
+                            // Same origin as buildExternalFloatRowIndexWithLimits:
+                            // both must read the float's win_pos in the space it
+                            // was written in, or the assert below would fire on an
+                            // anchor with no position of its own.
+                            const ext_start_row: i64 = grid_mod.externalCompositeOriginRow(info);
                             const row_i64: i64 = row;
-                            const ext_start_col: i64 = info.start_col;
+                            const ext_start_col: i64 = grid_mod.externalCompositeOriginCol(info);
                             const ext_cols_i64: i64 = sg.cols;
                             const row_usize: usize = @intCast(row);
                             std.debug.assert(self.ext_float_row_index_valid);
