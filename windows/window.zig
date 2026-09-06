@@ -3153,6 +3153,32 @@ pub export fn WndProc(
                             }
                         }
 
+                        // Per-layer dirty gating and GPU row scroll, in the
+                        // same slot as the root's applyScrollShift above and
+                        // for the same reason: the copy has to land before the
+                        // rows below paint over the band it moves. The
+                        // renderer context is held by the enclosing defer;
+                        // app.mu was released above, so take it here, in the
+                        // lockContext -> app.mu order the layer draw uses.
+                        if (tbs_snapshot.layers.len > 1 and row_h_px > 0) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
+                                .x_offset = content_x_offset_i32,
+                                .y_offset = content_y_offset_i32,
+                                .content_right = content_right_i32,
+                                .content_height = @intCast(content_height),
+                                .row_h_px = row_h_px,
+                                .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                                .preserve_back = preserve_back,
+                                .paint_full = paint_full_snapshot,
+                                .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
+                                .last_cursor_row = app.last_painted_cursor_row,
+                                .rows_to_draw = rows_to_draw.items,
+                                .log_enabled = log_enabled,
+                            });
+                            app.mu.unlock(core.clock.io());
+                        }
+
                         // TBS lock-free draw: committed set is protected by refcount,
                         // no app.mu needed during VB upload + draw.
                         var row_vb_budget_exceeded = false;
@@ -3174,6 +3200,13 @@ pub export fn WndProc(
                         };
                         if (row_vb_budget_exceeded) {
                             app.row_vb_budget_failed = true;
+                            // Nothing reaches drawSurfaceLayers on this path,
+                            // so the plan taken above is never paid for.
+                            if (tbs_snapshot.layers.len > 1) {
+                                app.mu.lockUncancelable(core.clock.io());
+                                app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
+                                app.mu.unlock(core.clock.io());
+                            }
                             if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
                             return 0;
                         }
@@ -3267,6 +3300,7 @@ pub export fn WndProc(
                                 row_h_px,
                                 ctx_ptr,
                                 rs_set_sc_fn,
+                                log_enabled,
                             );
                             // Their pixels are in back_tex now; the present
                             // rects for this frame were already built above.
@@ -3673,10 +3707,7 @@ pub export fn WndProc(
                         // the layer present rects on whichever paint runs next.
                         if (!render_ok and tbs_snapshot.layers.len > 1) {
                             app.mu.lockUncancelable(core.clock.io());
-                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
-                                if (!layers_presented.isSet(layer_index)) continue;
-                                if (app.layer_grids.get(layer.grid_id)) |state| state.dirty = true;
-                            }
+                            app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
                             app.mu.unlock(core.clock.io());
                         }
 

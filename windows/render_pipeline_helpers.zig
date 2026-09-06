@@ -756,3 +756,303 @@ pub fn invertClusterMap(
         out_clusters[gi] = utf16_to_scalar_idx[first];
     }
 }
+
+/// The arithmetic of a GPU row-scroll blit, kept apart from the encoder so it
+/// can be checked without a device. Ported from
+/// `macos/Sources/Rendering/RowScrollBlitPlan.swift`.
+///
+/// The scrolled rectangle is a sub-rectangle of the back texture at
+/// (`origin_x_px`, `origin_y_px`), `width_px` wide: origin zero and the full
+/// width for a whole surface, the layer's own origin and width for one layer.
+///
+/// The row count the scroll callback reports can outlive the texture -- a
+/// window shrink, or a guifont/linespace change growing the cell height before
+/// try_resize round-trips -- so `row_end` is clamped to the rows that fit below
+/// the origin, and the copy, the vacated band and the dirty expansion all stop
+/// at that same clamped row.
+pub const RowScrollBlitPlan = struct {
+    origin_x_px: i32,
+    /// Already folded into every Y below; `localClearBand` takes it back out.
+    origin_y_px: i32,
+    src_y_px: i32,
+    dst_y_px: i32,
+    copy_w_px: i32,
+    copy_h_px: i32,
+    clear_top_px: i32,
+    clear_bottom_px: i32,
+    clamped_row_end: u32,
+    /// Half-open and grid-local: rows are numbered within the scroll region,
+    /// which `origin_y_px` moves the pixels of but does not renumber.
+    dirty_row_start: u32,
+    dirty_row_end: u32,
+
+    pub fn make(
+        row_start: u32,
+        row_end: u32,
+        rows_delta: i32,
+        origin_x_px: i32,
+        origin_y_px: i32,
+        width_px: i32,
+        tex_w: i32,
+        tex_h: i32,
+        row_h: i32,
+    ) ?RowScrollBlitPlan {
+        if (row_h <= 0 or width_px <= 0 or origin_x_px < 0 or origin_y_px < 0) return null;
+        const h: i64 = row_h;
+        const oy: i64 = origin_y_px;
+        const start: i64 = row_start;
+        const shift: i64 = @intCast(@abs(@as(i64, rows_delta)));
+        // Only the rows below the origin belong to this rectangle.
+        const tex_max_rows = @max(0, @divTrunc(@as(i64, tex_h) - oy, h));
+        const clamped_row_end = @min(@as(i64, row_end), tex_max_rows);
+        const region_rows = clamped_row_end - start;
+        if (shift == 0 or shift >= region_rows) return null;
+
+        const copy_w = @min(@as(i64, width_px), @as(i64, tex_w) - @as(i64, origin_x_px));
+        if (copy_w <= 0) return null;
+        const copy_h = (region_rows - shift) * h;
+        if (copy_h <= 0) return null;
+
+        const src_y = oy + (if (rows_delta > 0) start + shift else start) * h;
+        const dst_y = oy + (if (rows_delta > 0) start else start + shift) * h;
+
+        // Second clamp: a region low in the texture runs off the end from src
+        // or dst even with a within-bounds row count, and the rectangle's own
+        // bottom edge binds as well as the texture's.
+        const region_bottom = oy + clamped_row_end * h;
+        const safe_copy_h = @min(copy_h, @min(@as(i64, tex_h), region_bottom) - @max(src_y, dst_y));
+        if (safe_copy_h <= 0) return null;
+
+        var clear_top: i64 = undefined;
+        var clear_bottom: i64 = undefined;
+        var dirty_start: i64 = undefined;
+        var dirty_end: i64 = undefined;
+        if (rows_delta > 0) {
+            // Scroll down: vacated at the bottom, intermediate rows above.
+            clear_top = oy + (clamped_row_end - shift) * h;
+            clear_bottom = region_bottom;
+            dirty_start = @max(start, clamped_row_end - 2 * shift);
+            dirty_end = clamped_row_end;
+        } else {
+            // Scroll up: vacated at the top, intermediate rows below.
+            clear_top = oy + start * h;
+            clear_bottom = oy + (start + shift) * h;
+            dirty_start = start;
+            dirty_end = @min(clamped_row_end, start + 2 * shift);
+        }
+
+        return .{
+            .origin_x_px = origin_x_px,
+            .origin_y_px = origin_y_px,
+            .src_y_px = @intCast(src_y),
+            .dst_y_px = @intCast(dst_y),
+            .copy_w_px = @intCast(copy_w),
+            .copy_h_px = @intCast(safe_copy_h),
+            .clear_top_px = @intCast(clear_top),
+            .clear_bottom_px = @intCast(clear_bottom),
+            .clamped_row_end = @intCast(clamped_row_end),
+            .dirty_row_start = @intCast(dirty_start),
+            .dirty_row_end = @intCast(dirty_end),
+        };
+    }
+
+    /// The vacated band relative to `origin_y_px`, for callers drawing under a
+    /// layer transform, whose pixel space starts at the layer origin.
+    pub fn localClearBand(self: RowScrollBlitPlan) struct { top_px: i32, bottom_px: i32 } {
+        return .{
+            .top_px = self.clear_top_px - self.origin_y_px,
+            .bottom_px = self.clear_bottom_px - self.origin_y_px,
+        };
+    }
+
+    /// Every pixel the blit rewrites: the copy plus the band it vacated.
+    pub fn blitRectPx(self: RowScrollBlitPlan) BlitRectPx {
+        return .{
+            .left = self.origin_x_px,
+            .top = @min(@min(self.src_y_px, self.dst_y_px), self.clear_top_px),
+            .right = self.origin_x_px + self.copy_w_px,
+            .bottom = @max(@max(self.src_y_px, self.dst_y_px) + self.copy_h_px, self.clear_bottom_px),
+        };
+    }
+};
+
+pub const BlitRectPx = struct { left: i32, top: i32, right: i32, bottom: i32 };
+
+/// Half-open on all four edges, so rectangles that only touch do not
+/// intersect: a layer abutting an accepted blit shares none of its pixels.
+pub fn blitRectsIntersect(a: BlitRectPx, b: BlitRectPx) bool {
+    return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom;
+}
+
+/// The rows to redraw when the blit never ran: nothing was shifted, so every
+/// row of the scroll region is stale and the core will not re-send them (it
+/// vacates only the band, assuming the frontend shifts the rest). Half-open
+/// and grid-local like `dirty_row_start`/`dirty_row_end`, still stopping at
+/// the rows that fit below `origin_y_px`.
+pub fn dirtyRowsWithoutBlit(
+    row_start: u32,
+    row_end: u32,
+    origin_y_px: i32,
+    tex_h: i32,
+    row_h: i32,
+) ?[2]u32 {
+    if (row_h <= 0) return null;
+    const tex_max_rows = @max(0, @divTrunc(@as(i64, tex_h) - @as(i64, origin_y_px), @as(i64, row_h)));
+    const clamped_row_end = @min(@as(i64, row_end), tex_max_rows);
+    if (clamped_row_end <= @as(i64, row_start)) return null;
+    return .{ row_start, @intCast(clamped_row_end) };
+}
+
+/// Inclusive row ranges, each absent when its own intersection is empty.
+pub const OverBlitRows = struct {
+    /// The covering layer's own rows that meet the blit rectangle.
+    above: ?[2]u32 = null,
+    /// The scrolled layer's rows under them.
+    under: ?[2]u32 = null,
+    /// Those rows shifted back by the delta: where the covering pixels came
+    /// from before the copy dragged them.
+    shifted: ?[2]u32 = null,
+};
+
+/// The damage an accepted blit does to a layer drawn on top of it. The blit
+/// rewrites every pixel of its rectangle, so the covering layer's rows inside
+/// it moved, and what they covered moved with them. Ported from
+/// `markLayersOverBlit` in MetalTerminalRenderer.swift. Null when the covering
+/// layer's rectangle does not meet the blit's.
+pub fn rowsOverBlit(
+    p: RowScrollBlitPlan,
+    rows_delta: i32,
+    above_left_px: i32,
+    above_top_px: i32,
+    above_rows: u32,
+    above_cols: u32,
+    cell_w_px: i32,
+    row_h_px: i32,
+) ?OverBlitRows {
+    if (row_h_px <= 0 or above_rows == 0 or above_cols == 0) return null;
+    const h: i64 = row_h_px;
+    const oy: i64 = p.origin_y_px;
+    const r = p.blitRectPx();
+    // r.top is exactly origin_y_px + row_start * row_h.
+    const region_first = @divTrunc(@as(i64, r.top) - oy, h);
+    const region_last = @as(i64, p.clamped_row_end) - 1;
+    if (region_last < region_first) return null;
+
+    const a_top: i64 = above_top_px;
+    const a_left: i64 = above_left_px;
+    const a_right = a_left + @as(i64, above_cols) * @as(i64, cell_w_px);
+    const a_bottom = a_top + @as(i64, above_rows) * h;
+    if (a_left >= @as(i64, r.right) or a_right <= @as(i64, r.left)) return null;
+    if (a_top >= @as(i64, r.bottom) or a_bottom <= @as(i64, r.top)) return null;
+
+    const overlap_top = @max(a_top, @as(i64, r.top));
+    const overlap_bottom = @min(a_bottom, @as(i64, r.bottom));
+
+    var out: OverBlitRows = .{};
+    const a_first = @max(0, @divTrunc(overlap_top - a_top, h));
+    const a_last = @min(@as(i64, above_rows) - 1, @divTrunc(overlap_bottom - 1 - a_top, h));
+    if (a_last >= a_first) out.above = .{ @intCast(a_first), @intCast(a_last) };
+
+    const under_first = @max(region_first, @divTrunc(overlap_top - oy, h));
+    const under_last = @min(region_last, @divTrunc(overlap_bottom - 1 - oy, h));
+    if (under_last < under_first) return out;
+    out.under = .{ @intCast(under_first), @intCast(under_last) };
+    const shifted_first = @max(region_first, under_first - @as(i64, rows_delta));
+    const shifted_last = @min(region_last, under_last - @as(i64, rows_delta));
+    if (shifted_last >= shifted_first) out.shifted = .{ @intCast(shifted_first), @intCast(shifted_last) };
+    return out;
+}
+
+/// Which of a layer's own rows a root dirty band overpaints. The band spans
+/// the full width, so there is no X test; a layer need not be cell-aligned, so
+/// one root row can straddle two of its rows. Inclusive.
+pub fn bandLayerRows(
+    band_top_px: i32,
+    band_bottom_px: i32,
+    origin_y_px: i32,
+    layer_rows: u32,
+    row_h_px: i32,
+) ?[2]u32 {
+    if (row_h_px <= 0 or layer_rows == 0) return null;
+    const h: i64 = row_h_px;
+    const oy: i64 = origin_y_px;
+    if (@as(i64, band_bottom_px) <= oy) return null;
+    const first = @max(0, @divTrunc(@as(i64, band_top_px) - oy, h));
+    const last = @min(@as(i64, layer_rows) - 1, @divTrunc(@as(i64, band_bottom_px) - 1 - oy, h));
+    if (last < first) return null;
+    return .{ @intCast(first), @intCast(last) };
+}
+
+/// One layer grid's pending row scroll, accumulated across a flush.
+pub const LayerScroll = struct {
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    total_rows: u32,
+    total_cols: u32,
+};
+
+pub const LayerScrollMerge = union(enum) {
+    accumulate: LayerScroll,
+    /// Two different regions in one flush. Neither can be blitted, so both are
+    /// handed back for the caller to dirty; blitting the newer one would smear
+    /// the pixels the older one already moved outside its rectangle.
+    conflict: struct { old: LayerScroll, new: LayerScroll },
+};
+
+pub fn mergeLayerScroll(existing: ?LayerScroll, incoming: LayerScroll) LayerScrollMerge {
+    const old = existing orelse return .{ .accumulate = incoming };
+    if (old.row_start != incoming.row_start or old.row_end != incoming.row_end) {
+        return .{ .conflict = .{ .old = old, .new = incoming } };
+    }
+    var merged = incoming;
+    merged.rows_delta = clampRowsDelta(@as(i64, old.rows_delta) + @as(i64, incoming.rows_delta));
+    return .{ .accumulate = merged };
+}
+
+/// Bound a scroll-delta accumulator well below the integer extremes, which
+/// later abs() calls would trap on. Mirrors MetalTypes.swift clampRowsDelta.
+pub fn clampRowsDelta(value: i64) i32 {
+    return @intCast(@max(-1_000_000, @min(1_000_000, value)));
+}
+
+fn swapRowBits(bits: *std.DynamicBitSetUnmanaged, a: usize, b: usize) void {
+    const av = bits.isSet(a);
+    const bv = bits.isSet(b);
+    if (av == bv) return;
+    bits.setValue(a, bv);
+    bits.setValue(b, av);
+}
+
+/// Carry a row bitset through a scroll region's shift, so a bit recorded
+/// before the shift still names the row its vertices ended up on. The swap
+/// chain mirrors the one that moves the row storage: `rows_delta > 0` means
+/// content moves up, so what was bit `r + shift` becomes bit `r`.
+///
+/// The vacated band is set, not cleared: those rows lost their vertices and
+/// have to be repainted whatever the caller does next. A caller that also
+/// marks the band (Windows `mergeShift`) then only repeats itself.
+pub fn shiftRowBits(
+    bits: *std.DynamicBitSetUnmanaged,
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+) void {
+    if (rows_delta == 0 or row_end <= row_start) return;
+    if (row_end > bits.bit_length) return;
+    const shift: u32 = @intCast(@abs(rows_delta));
+    if (shift == 0 or shift >= row_end - row_start) return;
+
+    if (rows_delta > 0) {
+        var r: u32 = row_start;
+        while (r + shift < row_end) : (r += 1) swapRowBits(bits, r, r + shift);
+        bits.setRangeValue(.{ .start = row_end - shift, .end = row_end }, true);
+    } else {
+        var r: u32 = row_end;
+        while (r > row_start + shift) {
+            r -= 1;
+            swapRowBits(bits, r, r - shift);
+        }
+        bits.setRangeValue(.{ .start = row_start, .end = row_start + shift }, true);
+    }
+}

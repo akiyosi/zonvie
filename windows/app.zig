@@ -940,10 +940,11 @@ pub const TripleBufferedSurface = struct {
         // therefore observe either the complete old pair or complete new pair,
         // never new rows with the previous cursor (or vice versa).
         if (self.main_cursor_in_flush) {
-            // The retained back texture contains no cursor after a row draw,
-            // but the currently presented buffer does. Redraw both logical
-            // rows before overlaying the replacement cursor so moves, shape
-            // changes, and disappearance cannot leave the previous cursor.
+            // The cursor is drawn into the retained back texture, not at
+            // present time (present ignores cursor_vb), so the previous one is
+            // still there. Redraw both logical rows before overlaying the
+            // replacement so moves, shape changes, and disappearance cannot
+            // leave it behind.
             const row_count: usize = if (self.is_in_flush)
                 self.sets[self.write_index].row_map.items.len
             else
@@ -1902,6 +1903,8 @@ pub const SlotPool = struct {
     }
 };
 
+pub const LayerScroll = render_pipeline_helpers.LayerScroll;
+
 /// Legacy combined struct for backward compatibility during migration.
 /// Contains both CPU vertex data and GPU VB resources.
 /// Vertex storage for one grid a surface places as a non-root layer. Layers
@@ -1926,6 +1929,20 @@ pub const LayerGridState = struct {
     /// Set when rows changed since the last paint; the paint presents this
     /// layer's rect and clears it.
     dirty: bool = false,
+
+    /// Row scroll accumulated over the open flush and installed by
+    /// applyStaged, for the paint to turn into one GPU copy.
+    pending_scroll: ?LayerScroll = null,
+    /// Rows the core changed since the last paint. Sized by applyStaged.
+    dirty_rows: std.DynamicBitSetUnmanaged = .{},
+    needs_full_redraw: bool = false,
+    /// The four fields below belong to the paint thread for the duration of
+    /// one frame, taken from the three above under `App.mu`.
+    draw_rows: std.DynamicBitSetUnmanaged = .{},
+    draw_all: bool = false,
+    /// Layer-local, like everything the layer transform draws.
+    blit_clear_band: ?struct { top_px: i32, bottom_px: i32 } = null,
+    last_drawn_rows: usize = 0,
 
     /// Ops of the open flush. `staged.items` never shrinks, so entries and
     /// their vertex capacity survive across flushes; `staged_len` is the live
@@ -1965,6 +1982,10 @@ pub const LayerGridState = struct {
         self.rows_buf = .empty;
         self.origin_rows.deinit(alloc);
         self.origin_rows = .empty;
+        self.dirty_rows.deinit(alloc);
+        self.dirty_rows = .{};
+        self.draw_rows.deinit(alloc);
+        self.draw_rows = .{};
         for (self.staged.items) |*op| op.verts.deinit(alloc);
         self.staged.deinit(alloc);
         self.staged = .empty;
@@ -1998,6 +2019,8 @@ pub const LayerGridState = struct {
         row_start: u32,
         row_end: u32,
         rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
     ) bool {
         if (rows_delta == 0 or row_end <= row_start) return true;
         if (row_end > self.plannedRows()) return false;
@@ -2010,6 +2033,8 @@ pub const LayerGridState = struct {
         op.row_start = row_start;
         op.row_end = row_end;
         op.rows_delta = rows_delta;
+        op.total_rows = total_rows;
+        op.total_cols = total_cols;
         return true;
     }
 
@@ -2064,9 +2089,15 @@ pub const LayerGridState = struct {
             self.origin_rows.resize(alloc, need) catch return false;
             for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
         }
+        if (self.dirty_rows.bit_length < need) {
+            self.dirty_rows.resize(alloc, need, false) catch return false;
+        }
         for (self.staged.items[0..self.staged_len]) |*op| {
             switch (op.kind) {
-                .shift => if (!self.shiftRows(op.row_start, op.row_end, op.rows_delta)) return false,
+                .shift => {
+                    if (!self.shiftRows(op.row_start, op.row_end, op.rows_delta)) return false;
+                    self.mergeShift(op);
+                },
                 .row => {
                     self.rows = op.total_rows;
                     self.cols = op.total_cols;
@@ -2076,11 +2107,48 @@ pub const LayerGridState = struct {
                     // Freshly generated vertices are built for the row they
                     // arrived at.
                     self.origin_rows.items[@intCast(op.row)] = op.row;
+                    self.markDirtyRows(op.row, @as(usize, op.row) + 1);
                     self.dirty = true;
                 },
             }
         }
         return true;
+    }
+
+    fn markDirtyRows(self: *LayerGridState, row_start: usize, row_end: usize) void {
+        const end = @min(row_end, self.dirty_rows.bit_length);
+        const start = @min(row_start, end);
+        if (start == end) return;
+        self.dirty_rows.setRangeValue(.{ .start = start, .end = end }, true);
+    }
+
+    /// Record a replayed shift: the band it vacated has to be redrawn, and the
+    /// rest of the region is a GPU copy the paint still owes.
+    fn mergeShift(self: *LayerGridState, op: *const StagedOp) void {
+        const shift: u32 = @intCast(@abs(op.rows_delta));
+        if (op.rows_delta > 0) {
+            self.markDirtyRows(op.row_end - shift, op.row_end);
+        } else {
+            self.markDirtyRows(op.row_start, op.row_start + shift);
+        }
+        const incoming: LayerScroll = .{
+            .row_start = op.row_start,
+            .row_end = op.row_end,
+            .rows_delta = op.rows_delta,
+            .total_rows = op.total_rows,
+            .total_cols = op.total_cols,
+        };
+        switch (render_pipeline_helpers.mergeLayerScroll(self.pending_scroll, incoming)) {
+            .accumulate => |merged| self.pending_scroll = merged,
+            .conflict => |both| {
+                // A copy of the newer region would smear the pixels the older
+                // one already moved outside it, so neither runs and both are
+                // redrawn from vertices.
+                self.markDirtyRows(both.old.row_start, both.old.row_end);
+                self.markDirtyRows(both.new.row_start, both.new.row_end);
+                self.pending_scroll = null;
+            },
+        }
     }
 
     /// Move the surviving rows of a scroll region, leaving the vacated ones
@@ -2124,6 +2192,10 @@ pub const LayerGridState = struct {
                 origins[v] = v;
             }
         }
+        // The bits have to travel with the rows they describe, or a row marked
+        // earlier in this flush keeps its bit at the pre-shift index while its
+        // vertices moved.
+        render_pipeline_helpers.shiftRowBits(&self.dirty_rows, row_start, row_end, rows_delta);
         self.dirty = true;
         return true;
     }
@@ -3330,6 +3402,331 @@ fn layerRowShiftPx(state: *const LayerGridState, row_index: usize, row_h_px: i32
     );
 }
 
+/// What one paint's layer plan needs that does not live on `App`.
+pub const LayerFramePlanParams = struct {
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    content_height: i32,
+    row_h_px: i32,
+    cell_w_px: i32,
+    preserve_back: bool,
+    /// The root's paint_full. Every other reason the root redraws whole is
+    /// already folded into `preserve_back`; this one is not, and an atlas
+    /// reset invalidates the layers' glyph UVs too.
+    paint_full: bool,
+    cursor_grid: i64,
+    last_cursor_row: ?u32,
+    /// The root grid's rows this paint redraws. Each paints its own band over
+    /// whatever sits under it.
+    rows_to_draw: []const u32,
+    log_enabled: bool,
+};
+
+/// Half-open, clamped to the set's length like `markDirtyRows`, so a caller
+/// working in layout rows never has to know the bitset's size.
+fn markDrawRows(state: *LayerGridState, row_start: usize, row_end: usize) void {
+    const end = @min(row_end, state.draw_rows.bit_length);
+    const start = @min(row_start, end);
+    if (start == end) return;
+    state.draw_rows.setRangeValue(.{ .start = start, .end = end }, true);
+}
+
+/// Add the cursor's row to a layer's redraw set, after planLayerFrame settled
+/// it and before drawSurfaceLayers consumes it. False means this frame will
+/// not draw that row, so the caller cannot promise the overlay it was
+/// repainted. Caller must hold `app.mu`.
+pub fn markLayerCursorRow(state: *LayerGridState, layer_rows: u32, row: u32) bool {
+    if (state.draw_all) return true;
+    const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer_rows));
+    if (row >= row_limit or row >= state.draw_rows.bit_length) return false;
+    state.draw_rows.set(row);
+    return true;
+}
+
+/// No copy ran, so the whole scroll region still holds pre-scroll pixels: the
+/// core vacated only the band, leaving the rest to a shift that did not happen.
+fn refuseLayerBlit(
+    state: *LayerGridState,
+    grid_id: i64,
+    scroll: LayerScroll,
+    origin_y_px: i32,
+    tex_h: i32,
+    row_h_px: i32,
+    reason: []const u8,
+    log_enabled: bool,
+) void {
+    if (log_enabled) applog.appLog(
+        "[layer_blit_refused] gridId={d} reason={s}\n",
+        .{ grid_id, reason },
+    );
+    const rows = render_pipeline_helpers.dirtyRowsWithoutBlit(
+        scroll.row_start,
+        scroll.row_end,
+        origin_y_px,
+        tex_h,
+        row_h_px,
+    ) orelse return;
+    markDrawRows(state, rows[0], rows[1]);
+}
+
+/// Decide which rows of each non-root layer this paint has to draw, and shift
+/// on the GPU the ones whose scroll a copy of their own rectangle can serve.
+/// Runs before the root rows for the same reason applyScrollShift does: the
+/// copy has to land before anything paints over the band it moves.
+/// Caller must hold `app.mu`, which is what protects the state consumed here.
+pub fn planLayerFrame(
+    g: *d3d11.Renderer,
+    app: *App,
+    layers: []const SurfaceLayer,
+    p: LayerFramePlanParams,
+) void {
+    if (layers.len <= 1 or p.row_h_px <= 0) return;
+    const n = @min(layers.len, MAX_SURFACE_LAYERS);
+    var scrolls: [MAX_SURFACE_LAYERS]?LayerScroll = @splat(null);
+
+    // 1. Take the core's dirty set and settle the frame's redraw decision.
+    for (layers[1..n], 1..) |layer, li| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        var grow_failed = false;
+        if (state.draw_rows.bit_length < state.dirty_rows.bit_length) {
+            state.draw_rows.resize(app.alloc, state.dirty_rows.bit_length, false) catch {
+                grow_failed = true;
+            };
+        }
+        std.mem.swap(std.DynamicBitSetUnmanaged, &state.draw_rows, &state.dirty_rows);
+        if (state.dirty_rows.bit_length > 0) state.dirty_rows.unsetAll();
+        // A row count that moved invalidates last_drawn_rows' bookkeeping and
+        // the blit's geometry alike, so it belongs with the other full-redraw
+        // reasons rather than only in the refusal ladder.
+        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+        state.draw_all = grow_failed or !p.preserve_back or p.paint_full or
+            state.needs_full_redraw or row_limit != state.last_drawn_rows;
+        state.needs_full_redraw = false;
+        state.blit_clear_band = null;
+        scrolls[li] = state.pending_scroll;
+        state.pending_scroll = null;
+    }
+
+    // 2. Rows a root dirty band overpaints. A root row that resolves to
+    //    nothing counts: cursor damage reaches the root's dirty set as a rect
+    //    and has to propagate to the layer under it.
+    for (layers[1..n]) |layer| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        if (state.draw_all) continue;
+        for (p.rows_to_draw) |row| {
+            const band_top: i32 = @as(i32, @intCast(row)) * p.row_h_px;
+            const rows = render_pipeline_helpers.bandLayerRows(
+                band_top,
+                band_top + p.row_h_px,
+                layer.y_px,
+                layer.rows,
+                p.row_h_px,
+            ) orelse continue;
+            markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
+        }
+    }
+
+    // 3. The refusal ladder, back-to-front. Order matters twice: a rung only
+    //    runs once the cheaper ones passed, and an accepted copy is always the
+    //    lowest in the stack, so the marking below it stays one-directional.
+    var accepted: [MAX_SURFACE_LAYERS]render_pipeline_helpers.BlitRectPx = undefined;
+    var accepted_len: usize = 0;
+    const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
+    for (layers[1..n], 1..) |layer, li| {
+        const scroll = scrolls[li] orelse continue;
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const origin_x: i32 = p.x_offset + layer.x_px;
+        const origin_y: i32 = p.y_offset + layer.y_px;
+
+        var plan: ?render_pipeline_helpers.RowScrollBlitPlan = null;
+        const refusal: ?[]const u8 = ladder: {
+            // Folds macOS's presented/resize/glow/opacity rungs: each of them
+            // is a reason the pixels here are not a previous frame of this
+            // rectangle, and each already clears preserve_back.
+            if (!p.preserve_back) break :ladder "presented";
+            if (layer.rows == 0 or layer.cols == 0) break :ladder "layout";
+            if (scroll.total_rows != layer.rows or scroll.total_cols != layer.cols)
+                break :ladder "size";
+            const made = render_pipeline_helpers.RowScrollBlitPlan.make(
+                scroll.row_start,
+                scroll.row_end,
+                scroll.rows_delta,
+                origin_x,
+                origin_y,
+                @as(i32, @intCast(layer.cols)) * p.cell_w_px,
+                p.content_right,
+                tex_h,
+                p.row_h_px,
+            ) orelse break :ladder "plan";
+            plan = made;
+
+            // A layer over an accepted copy would move pixels that copy just
+            // moved, and repainting cannot undo the smear.
+            const layer_rect: render_pipeline_helpers.BlitRectPx = .{
+                .left = origin_x,
+                .top = origin_y,
+                .right = origin_x + @as(i32, @intCast(layer.cols)) * p.cell_w_px,
+                .bottom = origin_y + @as(i32, @intCast(layer.rows)) * p.row_h_px,
+            };
+            for (accepted[0..accepted_len]) |r| {
+                if (render_pipeline_helpers.blitRectsIntersect(layer_rect, r))
+                    break :ladder "overlap";
+            }
+
+            if (state.draw_all) break :ladder "drawall";
+
+            const t0: i128 = if (p.log_enabled) core.clock.nowNs() else 0;
+            // Positive dy moves content down, so it is the negation of the
+            // core's rows_delta, which counts rows the content moved up.
+            const ok = g.scrollBackTex(.{
+                .left = origin_x,
+                .top = origin_y + @as(i32, @intCast(scroll.row_start)) * p.row_h_px,
+                .right = origin_x + made.copy_w_px,
+                .bottom = origin_y + @as(i32, @intCast(made.clamped_row_end)) * p.row_h_px,
+            }, -scroll.rows_delta * p.row_h_px);
+            if (!ok) break :ladder "plan";
+            if (p.log_enabled) {
+                const us = @as(f64, @floatFromInt(core.clock.nowNs() - t0)) / 1000.0;
+                applog.appLog(
+                    "[layer_blit] gridId={d} rowStart={d} rowEnd={d} rowsDelta={d} us={d:.1}\n",
+                    .{ layer.grid_id, scroll.row_start, made.clamped_row_end, scroll.rows_delta, us },
+                );
+            }
+            break :ladder null;
+        };
+
+        if (refusal) |reason| {
+            refuseLayerBlit(state, layer.grid_id, scroll, origin_y, tex_h, p.row_h_px, reason, p.log_enabled);
+            continue;
+        }
+
+        const pl = plan.?;
+        markDrawRows(state, pl.dirty_row_start, pl.dirty_row_end);
+        const band = pl.localClearBand();
+        state.blit_clear_band = .{ .top_px = band.top_px, .bottom_px = band.bottom_px };
+
+        // The copy rewrote every pixel of its rectangle, so a layer drawn over
+        // it moved with it, and so did what it covered.
+        for (layers[li + 1 .. n]) |above| {
+            const over = render_pipeline_helpers.rowsOverBlit(
+                pl,
+                scroll.rows_delta,
+                p.x_offset + above.x_px,
+                p.y_offset + above.y_px,
+                above.rows,
+                above.cols,
+                p.cell_w_px,
+                p.row_h_px,
+            ) orelse continue;
+            if (over.above) |a| {
+                if (app.layer_grids.get(above.grid_id)) |above_state| {
+                    markDrawRows(above_state, a[0], @as(usize, a[1]) + 1);
+                }
+            }
+            if (over.under) |u| markDrawRows(state, u[0], @as(usize, u[1]) + 1);
+            if (over.shifted) |s| markDrawRows(state, s[0], @as(usize, s[1]) + 1);
+        }
+
+        // Present ignores cursor_vb, so the cursor lives in back_tex and the
+        // copy dragged it from its row to that row minus rows_delta. Redraw
+        // both, as applyScrollShift does for the root grid; rows outside the
+        // scrolled region were not copied and hold no ghost.
+        if (p.cursor_grid == layer.grid_id) {
+            if (p.last_cursor_row) |prev| {
+                const first: i64 = scroll.row_start;
+                const last: i64 = @as(i64, pl.clamped_row_end) - 1;
+                const ghosts = [2]i64{ @as(i64, prev), @as(i64, prev) - scroll.rows_delta };
+                for (ghosts) |row| {
+                    if (row < first or row > last) continue;
+                    markDrawRows(state, @intCast(row), @as(usize, @intCast(row)) + 1);
+                }
+            }
+        }
+
+        accepted[accepted_len] = pl.blitRectPx();
+        accepted_len += 1;
+    }
+}
+
+/// Put back what planLayerFrame consumed when the frame that consumed it never
+/// reached the screen. A full redraw is a correct superset either way: the
+/// committed vertices are already post-shift. Caller must hold `app.mu`.
+pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
+    if (layers.len <= 1) return;
+    for (layers[1..]) |layer| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        state.needs_full_redraw = true;
+        state.dirty = true;
+    }
+}
+
+/// One layer row: scissor, background overwrite, upload, draw. Returns whether
+/// anything was encoded for it, which both arms count for `[layer_draw]`.
+fn drawLayerRow(
+    g: *d3d11.Renderer,
+    state: *LayerGridState,
+    ri: usize,
+    d: LayerRowDrawCtx,
+) bool {
+    const rv = &state.rows_buf.items[ri];
+    if (d.rs_set_sc_fn) |f| {
+        const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(ri)) * d.row_h_px;
+        var sc: c.D3D11_RECT = .{
+            .left = @max(d.x_offset, d.x_offset + d.layer.x_px),
+            .top = top,
+            .right = @min(d.content_right, d.x_offset + d.layer.x_px + d.layer_w_px),
+            .bottom = top + d.row_h_px,
+        };
+        if (sc.right <= sc.left or sc.bottom <= sc.top) return false;
+        f(d.ctx_ptr, 1, &sc);
+    }
+
+    // Reset this row's band to exactly (bg * opacity, opacity) before
+    // drawing it. A translucent background blended over its own previous
+    // output compounds toward opaque; the overwrite also erases whatever a
+    // now-empty row used to show (a closed split's separator).
+    // An opaque surface needs it for a row the core emptied, and with
+    // blur on for every row: the core then skips the root grid's
+    // default-bg run (flush.zig, skip_default_bg), so no other pass
+    // repaints the columns this layer's row no longer covers.
+    var encoded = false;
+    if (g.opacity < 1.0 or g.blur_enabled or rv.verts.items.len == 0) {
+        g.drawClearRowOverwrite() catch return encoded;
+        encoded = true;
+    }
+    if (rv.verts.items.len == 0) return encoded;
+
+    const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
+    g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch return encoded;
+    const vb = rv.vb orelse return encoded;
+    if (rv.uploaded_gen != rv.gen) {
+        g.uploadVertsToVB(vb, rv.verts.items) catch return encoded;
+        rv.uploaded_gen = rv.gen;
+    }
+    // A row-shift hint moves an array between rows without rewriting its
+    // pixels, so offset it by the distance it moved.
+    const row_dy: f32 = layerRowShiftPx(state, ri, d.row_h_px);
+    g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h);
+    g.drawVB(vb, rv.verts.items.len) catch return encoded;
+    return true;
+}
+
+/// Everything drawLayerRow needs that is the same for every row of a layer.
+const LayerRowDrawCtx = struct {
+    layer: SurfaceLayer,
+    layer_w_px: i32,
+    origin_x: f32,
+    origin_y: f32,
+    base_vp: BaseViewport,
+    x_offset: i32,
+    y_offset: i32,
+    content_right: i32,
+    row_h_px: i32,
+    ctx_ptr: ?*c.ID3D11DeviceContext,
+    rs_set_sc_fn: ?RSSetScissorRectsFn,
+};
+
 /// Draw the surface's non-root layers, back-to-front, on top of the root grid.
 /// Each layer gets its own pixel space and is clipped to its own rect. A layer
 /// whose grid has no rows yet draws nothing, which is what the core's layout
@@ -3345,57 +3742,70 @@ pub fn drawSurfaceLayers(
     row_h_px: i32,
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
+    log_enabled: bool,
 ) void {
     if (layers.len <= 1 or row_h_px <= 0) return;
     for (layers[1..]) |layer| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
-        if (state.rows_buf.items.len == 0) continue;
-
-        const origin_x: f32 = @floatFromInt(layer.x_px);
-        const origin_y: f32 = @floatFromInt(layer.y_px);
-        const layer_w_px: i32 = @intCast(layer.cols * @as(u32, @intCast(@max(1, app.cell_w_px))));
-
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
-        for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
-            if (rs_set_sc_fn) |f| {
-                const top = y_offset + layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
-                var sc: c.D3D11_RECT = .{
-                    .left = @max(x_offset, x_offset + layer.x_px),
-                    .top = top,
-                    .right = @min(content_right, x_offset + layer.x_px + layer_w_px),
-                    .bottom = top + row_h_px,
-                };
-                if (sc.right <= sc.left or sc.bottom <= sc.top) continue;
-                f(ctx_ptr, 1, &sc);
-            }
-
-            // Reset this row's band to exactly (bg * opacity, opacity) before
-            // drawing it. Layers are redrawn whole every paint, and a
-            // translucent background blended over its own previous output
-            // compounds toward opaque; the overwrite also erases whatever a
-            // now-empty row used to show (a closed split's separator).
-            // An opaque surface needs it for a row the core emptied, and with
-            // blur on for every row: the core then skips the root grid's
-            // default-bg run (flush.zig, skip_default_bg), so no other pass
-            // repaints the columns this layer's row no longer covers.
-            if (g.opacity < 1.0 or g.blur_enabled or rv.verts.items.len == 0) {
-                g.drawClearRowOverwrite() catch continue;
-            }
-            if (rv.verts.items.len == 0) continue;
-
-            const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
-            g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch continue;
-            const vb = rv.vb orelse continue;
-            if (rv.uploaded_gen != rv.gen) {
-                g.uploadVertsToVB(vb, rv.verts.items) catch continue;
-                rv.uploaded_gen = rv.gen;
-            }
-            // A row-shift hint moves an array between rows without rewriting
-            // its pixels, so offset it by the distance it moved.
-            const row_dy: f32 = layerRowShiftPx(state, ri, row_h_px);
-            g.setLayerTransform(origin_x, origin_y + row_dy, base_vp.w, base_vp.h);
-            g.drawVB(vb, rv.verts.items.len) catch continue;
+        // The plan is spent whether or not this layer drew anything.
+        defer {
+            state.last_drawn_rows = row_limit;
+            state.draw_all = false;
+            if (state.draw_rows.bit_length > 0) state.draw_rows.unsetAll();
+            state.blit_clear_band = null;
         }
+        if (row_limit == 0) continue;
+
+        const d = LayerRowDrawCtx{
+            .layer = layer,
+            .layer_w_px = @intCast(layer.cols * @as(u32, @intCast(@max(1, app.cell_w_px)))),
+            .origin_x = @floatFromInt(layer.x_px),
+            .origin_y = @floatFromInt(layer.y_px),
+            .base_vp = base_vp,
+            .x_offset = x_offset,
+            .y_offset = y_offset,
+            .content_right = content_right,
+            .row_h_px = row_h_px,
+            .ctx_ptr = ctx_ptr,
+            .rs_set_sc_fn = rs_set_sc_fn,
+        };
+
+        var encoded: u32 = 0;
+        var band_drawn = false;
+        if (state.draw_all) {
+            for (0..row_limit) |ri| {
+                if (drawLayerRow(g, state, ri, d)) encoded += 1;
+            }
+        } else {
+            // The band this layer's GPU copy vacated, before the rows: the
+            // plan's dirty rows cover it and have to land on top.
+            if (state.blit_clear_band) |band| {
+                if (rs_set_sc_fn) |f| {
+                    var sc: c.D3D11_RECT = .{
+                        .left = @max(x_offset, x_offset + layer.x_px),
+                        .top = y_offset + layer.y_px + band.top_px,
+                        .right = @min(content_right, x_offset + layer.x_px + d.layer_w_px),
+                        .bottom = y_offset + layer.y_px + band.bottom_px,
+                    };
+                    if (sc.right > sc.left and sc.bottom > sc.top) {
+                        f(ctx_ptr, 1, &sc);
+                        if (g.drawClearRowOverwrite()) |_| {
+                            band_drawn = true;
+                        } else |_| {}
+                    }
+                }
+            }
+            var it = state.draw_rows.iterator(.{});
+            while (it.next()) |ri| {
+                if (ri >= row_limit) break;
+                if (drawLayerRow(g, state, ri, d)) encoded += 1;
+            }
+        }
+        if (log_enabled) applog.appLog(
+            "[layer_draw] gridId={d} rows={d} of={d} blit={d}\n",
+            .{ layer.grid_id, encoded, row_limit, @as(u32, @intFromBool(band_drawn)) },
+        );
     }
     // Restore the surface's own pixel space for whatever draws next.
     g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
