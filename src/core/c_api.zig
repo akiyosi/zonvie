@@ -342,6 +342,71 @@ pub const PopupmenuColors = extern struct {
 /// backward compatible through callbacks_size and must NOT bump it.
 pub const CALLBACKS_ABI_VERSION: u32 = 1;
 
+/// Every field of Callbacks and the byte offset it must keep. Bump
+/// CALLBACKS_ABI_VERSION and update this table together: removing, reordering
+/// or retyping a field moves every offset after it while @sizeOf(Callbacks)
+/// can stay the same, so callbacks_size cannot see it. Appending a callback
+/// only adds a row here and keeps the version.
+const callbacks_layout = [_]struct { []const u8, usize }{
+    .{ "abi_version", 0 },
+    .{ "on_vertices_row", 8 },
+    .{ "on_atlas_ensure_glyph", 16 },
+    .{ "on_atlas_ensure_glyph_styled", 24 },
+    .{ "on_log", 32 },
+    .{ "on_guifont", 40 },
+    .{ "on_linespace", 48 },
+    .{ "on_exit", 56 },
+    .{ "on_set_title", 64 },
+    .{ "on_external_window", 72 },
+    .{ "on_external_window_close", 80 },
+    .{ "on_cursor_grid_changed", 88 },
+    .{ "on_cmdline_show", 96 },
+    .{ "on_cmdline_hide", 104 },
+    .{ "on_cmdline_pos", 112 },
+    .{ "on_cmdline_special_char", 120 },
+    .{ "on_cmdline_block_show", 128 },
+    .{ "on_cmdline_block_append", 136 },
+    .{ "on_cmdline_block_hide", 144 },
+    .{ "on_popupmenu_show", 152 },
+    .{ "on_popupmenu_hide", 160 },
+    .{ "on_popupmenu_select", 168 },
+    .{ "on_msg_show", 176 },
+    .{ "on_msg_clear", 184 },
+    .{ "on_msg_showmode", 192 },
+    .{ "on_msg_showcmd", 200 },
+    .{ "on_msg_ruler", 208 },
+    .{ "on_msg_history_show", 216 },
+    .{ "on_clipboard_get", 224 },
+    .{ "on_clipboard_set", 232 },
+    .{ "on_ssh_auth_prompt", 240 },
+    .{ "on_tabline_update", 248 },
+    .{ "on_tabline_hide", 256 },
+    .{ "on_grid_scroll", 264 },
+    .{ "on_ime_off", 272 },
+    .{ "on_quit_requested", 280 },
+    .{ "on_rasterize_glyph", 288 },
+    .{ "on_atlas_upload", 296 },
+    .{ "on_atlas_create", 304 },
+    .{ "on_flush_begin", 312 },
+    .{ "on_flush_end", 320 },
+    .{ "on_default_colors_set", 328 },
+    .{ "on_win_move", 336 },
+    .{ "on_win_exchange", 344 },
+    .{ "on_win_rotate", 352 },
+    .{ "on_win_resize_equal", 360 },
+    .{ "on_win_move_cursor", 368 },
+    .{ "on_shape_text_run", 376 },
+    .{ "on_rasterize_glyph_by_id", 384 },
+    .{ "on_get_ascii_table", 392 },
+    .{ "on_grid_row_scroll", 400 },
+    .{ "on_restart", 408 },
+    .{ "on_connect", 416 },
+    .{ "on_agent_status", 424 },
+    .{ "on_main_grid_size", 432 },
+    .{ "on_surface_layout", 440 },
+    .{ "on_grid_destroy", 448 },
+};
+
 pub const Callbacks = extern struct {
     /// Must equal CALLBACKS_ABI_VERSION; zonvie_core_create returns null
     /// otherwise. callbacks_size can only report that the struct's LENGTH
@@ -601,6 +666,19 @@ pub const Callbacks = extern struct {
         }
         if (@sizeOf(@FieldType(Callbacks, "abi_version")) != 4) {
             @compileError("Callbacks.abi_version size mismatch! Expected 4 bytes.");
+        }
+        @setEvalBranchQuota(20000);
+        const fields = @typeInfo(Callbacks).@"struct".fields;
+        for (fields[0..@min(fields.len, callbacks_layout.len)], 0..) |f, i| {
+            if (!std.mem.eql(u8, f.name, callbacks_layout[i][0]) or
+                @offsetOf(Callbacks, f.name) != callbacks_layout[i][1])
+            {
+                @compileError("Callbacks layout changed at field '" ++ f.name ++
+                    "': bump CALLBACKS_ABI_VERSION (and ZONVIE_CALLBACKS_ABI_VERSION in include/zonvie_core.h) and update callbacks_layout together.");
+            }
+        }
+        if (fields.len != callbacks_layout.len) {
+            @compileError("Callbacks field count changed: add each appended callback to callbacks_layout; a removal must also bump CALLBACKS_ABI_VERSION.");
         }
     }
 };
