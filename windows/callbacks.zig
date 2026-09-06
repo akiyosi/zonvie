@@ -1667,7 +1667,7 @@ pub fn onGridRowScroll(
     // carried by moving them within this grid's own storage.
     if (app.external_windows.get(grid_id) == null) {
         if (app.layer_grids.get(grid_id)) |state| {
-            if (!state.shiftRows(row_start, row_end, rows_delta)) {
+            if (!state.stageShift(app.alloc, row_start, row_end, rows_delta)) {
                 core.zonvie_core_force_resend_locked(app.corep);
                 failFlush(app);
             } else {
@@ -1971,6 +1971,12 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         while (ext_cancel_it.next()) |entry| {
             entry.value_ptr.*.tbs.cancelFlush();
         }
+        // Layers publish nothing until applyStaged, so dropping their staged
+        // ops leaves WM_PAINT on the previous committed frame.
+        var layer_cancel_it = app.layer_grids.iterator();
+        while (layer_cancel_it.next()) |entry| {
+            entry.value_ptr.*.discardStaged();
+        }
         // Pending captures are CPU-only and can outlive their originating
         // flush while window creation is queued. Drop exactly the captures
         // mutated by this failed generation before active is cleared; a late
@@ -1994,6 +2000,16 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         // otherwise clean.
         if (retryable) core.zonvie_core_force_resend_locked(app.corep);
     } else {
+        // Layer rows go out before the surface layer list that places them,
+        // which app.tbs.commitFlush below promotes: a paint in between then
+        // sees a newly placed layer's rows without the layer, never the layer
+        // without its rows.
+        var layer_commit_it = app.layer_grids.iterator();
+        while (layer_commit_it.next()) |entry| {
+            if (!entry.value_ptr.*.applyStaged(app.alloc)) {
+                core.zonvie_core_force_resend_locked(app.corep);
+            }
+        }
         var ext_commit_it = app.external_windows.iterator();
         while (ext_commit_it.next()) |entry| {
             entry.value_ptr.*.tbs.commitFlush(app.alloc);
@@ -3198,9 +3214,9 @@ fn storeMainSurfaceLayerRowLocked(
         created.* = .{};
         gop.value_ptr.* = created;
     }
-    if (!gop.value_ptr.*.storeRow(app.alloc, row, verts, total_rows, total_cols)) {
-        // The row is left stale or empty with its generation unchanged, so the
-        // layer cannot be presented until the core re-sends it.
+    if (!gop.value_ptr.*.stageRow(app.alloc, row, verts, total_rows, total_cols)) {
+        // Nothing was published, so the layer keeps its previous frame until
+        // the core re-sends this one.
         core.zonvie_core_force_resend_locked(app.corep);
         failFlush(app);
     }

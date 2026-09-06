@@ -1909,7 +1909,12 @@ pub const SlotPool = struct {
 /// they use plain per-row buffers rather than the root grid's slot pool.
 ///
 /// Written on the core thread inside the flush bracket and read by WM_PAINT,
-/// both under `App.mu`.
+/// both under `App.mu`. That lock alone only makes a single row store atomic,
+/// so a flush's row stores and scroll shifts are recorded in `staged` and
+/// reach `rows_buf`/`origin_rows` only in applyStaged(), called once at
+/// on_flush_end. A paint landing between two row callbacks therefore draws the
+/// whole previous frame, and an aborted flush (discardStaged) leaves that
+/// frame untouched for the core's resend to replace.
 pub const LayerGridState = struct {
     rows: u32 = 0,
     cols: u32 = 0,
@@ -1921,6 +1926,31 @@ pub const LayerGridState = struct {
     /// Set when rows changed since the last paint; the paint presents this
     /// layer's rect and clears it.
     dirty: bool = false,
+
+    /// Ops of the open flush. `staged.items` never shrinks, so entries and
+    /// their vertex capacity survive across flushes; `staged_len` is the live
+    /// prefix.
+    staged: std.ArrayListUnmanaged(StagedOp) = .empty,
+    staged_len: usize = 0,
+    /// Row count the staged ops need. stageShift validates against it so a
+    /// shift can never see a shorter array at replay than it was checked
+    /// against, whatever order rows and shifts arrived in.
+    staged_rows_len: usize = 0,
+
+    /// One recorded mutation of the open flush, replayed in arrival order.
+    pub const StagedOp = struct {
+        kind: enum { row, shift } = .row,
+        row: u32 = 0,
+        total_rows: u32 = 0,
+        total_cols: u32 = 0,
+        row_start: u32 = 0,
+        row_end: u32 = 0,
+        rows_delta: i32 = 0,
+        /// Payload of a `.row` op. applyStaged swaps it with the live row, so
+        /// afterwards it holds the replaced buffer and its capacity is reused
+        /// by whatever stages through this slot next.
+        verts: std.ArrayListUnmanaged(Vertex) = .empty,
+    };
 
     pub fn deinit(self: *LayerGridState, alloc: std.mem.Allocator) void {
         for (self.rows_buf.items) |*rv| {
@@ -1935,15 +1965,128 @@ pub const LayerGridState = struct {
         self.rows_buf = .empty;
         self.origin_rows.deinit(alloc);
         self.origin_rows = .empty;
+        for (self.staged.items) |*op| op.verts.deinit(alloc);
+        self.staged.deinit(alloc);
+        self.staged = .empty;
+        self.staged_len = 0;
+        self.staged_rows_len = 0;
         self.rows = 0;
         self.cols = 0;
     }
 
+    /// Rows the arrays will hold once this flush is applied.
+    fn plannedRows(self: *const LayerGridState) usize {
+        return @max(self.rows_buf.items.len, self.staged_rows_len);
+    }
+
+    /// Next free op slot, reusing a previous flush's entry when there is one.
+    fn nextOp(self: *LayerGridState, alloc: std.mem.Allocator) ?*StagedOp {
+        if (self.staged_len == self.staged.items.len) {
+            self.staged.append(alloc, .{}) catch return null;
+        }
+        const op = &self.staged.items[self.staged_len];
+        self.staged_len += 1;
+        return op;
+    }
+
+    /// Record a scroll region's row shift. Returns false when the region does
+    /// not fit the storage applyStaged will produce, in which case the caller
+    /// must force a full regeneration rather than publish a half-shifted grid.
+    pub fn stageShift(
+        self: *LayerGridState,
+        alloc: std.mem.Allocator,
+        row_start: u32,
+        row_end: u32,
+        rows_delta: i32,
+    ) bool {
+        if (rows_delta == 0 or row_end <= row_start) return true;
+        if (row_end > self.plannedRows()) return false;
+        const region_height: u32 = row_end - row_start;
+        const shift: u32 = @intCast(@abs(rows_delta));
+        if (shift == 0 or shift >= region_height) return false;
+        const op = self.nextOp(alloc) orelse return false;
+        // Field-wise, because op.verts owns a buffer this slot keeps.
+        op.kind = .shift;
+        op.row_start = row_start;
+        op.row_end = row_end;
+        op.rows_delta = rows_delta;
+        return true;
+    }
+
+    /// Record one row's vertices. Reserves the painted arrays' capacity here so
+    /// applyStaged cannot fail to grow them after the flush was accepted.
+    /// Returns false when staging could not be grown; every failure path leaves
+    /// the painted rows untouched, so the caller only has to abort the flush.
+    pub fn stageRow(
+        self: *LayerGridState,
+        alloc: std.mem.Allocator,
+        row: u32,
+        verts: []const Vertex,
+        total_rows: u32,
+        total_cols: u32,
+    ) bool {
+        const need: usize = @max(@as(usize, row) + 1, self.plannedRows());
+        self.rows_buf.ensureTotalCapacity(alloc, need) catch return false;
+        self.origin_rows.ensureTotalCapacity(alloc, need) catch return false;
+        const op = self.nextOp(alloc) orelse return false;
+        op.kind = .row;
+        op.row = row;
+        op.total_rows = total_rows;
+        op.total_cols = total_cols;
+        op.verts.clearRetainingCapacity();
+        op.verts.appendSlice(alloc, verts) catch return false;
+        self.staged_rows_len = need;
+        return true;
+    }
+
+    /// Drop the open flush's ops. The painted rows keep the previous committed
+    /// frame and the core's resend rebuilds this one.
+    pub fn discardStaged(self: *LayerGridState) void {
+        self.staged_len = 0;
+        self.staged_rows_len = 0;
+    }
+
+    /// Publish the open flush's ops in one step. Caller must hold `App.mu`,
+    /// the same lock WM_PAINT holds while reading these arrays. Returns false
+    /// only if growing the arrays failed despite stageRow's reservation, which
+    /// leaves the rows partly published and owes the caller a full resend.
+    pub fn applyStaged(self: *LayerGridState, alloc: std.mem.Allocator) bool {
+        defer self.discardStaged();
+        if (self.staged_len == 0) return true;
+        const need = self.plannedRows();
+        if (self.rows_buf.items.len < need) {
+            const old_len = self.rows_buf.items.len;
+            self.rows_buf.resize(alloc, need) catch return false;
+            for (self.rows_buf.items[old_len..]) |*rv| rv.* = .{};
+        }
+        if (self.origin_rows.items.len < need) {
+            const old_len = self.origin_rows.items.len;
+            self.origin_rows.resize(alloc, need) catch return false;
+            for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
+        }
+        for (self.staged.items[0..self.staged_len]) |*op| {
+            switch (op.kind) {
+                .shift => if (!self.shiftRows(op.row_start, op.row_end, op.rows_delta)) return false,
+                .row => {
+                    self.rows = op.total_rows;
+                    self.cols = op.total_cols;
+                    const rv = &self.rows_buf.items[@intCast(op.row)];
+                    std.mem.swap(std.ArrayListUnmanaged(Vertex), &rv.verts, &op.verts);
+                    rv.gen +%= 1;
+                    // Freshly generated vertices are built for the row they
+                    // arrived at.
+                    self.origin_rows.items[@intCast(op.row)] = op.row;
+                    self.dirty = true;
+                },
+            }
+        }
+        return true;
+    }
+
     /// Move the surviving rows of a scroll region, leaving the vacated ones
-    /// empty for the core to refill. Returns false when the region does not
-    /// fit this grid's storage, in which case the caller must force a full
-    /// regeneration rather than publish a half-shifted grid.
-    pub fn shiftRows(self: *LayerGridState, row_start: u32, row_end: u32, rows_delta: i32) bool {
+    /// empty for the core to refill. Replay only: stageShift already checked
+    /// the region against the length applyStaged resized to.
+    fn shiftRows(self: *LayerGridState, row_start: u32, row_end: u32, rows_delta: i32) bool {
         if (rows_delta == 0 or row_end <= row_start) return true;
         if (row_end > self.rows_buf.items.len) return false;
         if (row_end > self.origin_rows.items.len) return false;
@@ -1981,43 +2124,6 @@ pub const LayerGridState = struct {
                 origins[v] = v;
             }
         }
-        self.dirty = true;
-        return true;
-    }
-
-    /// Replace one row's vertices. Returns false when storage could not be
-    /// grown: a failed rows_buf or origin_rows resize leaves the row with
-    /// whatever it had, while a failed vertex append leaves it EMPTY because
-    /// the old vertices were already cleared. No failure path updates `gen` or
-    /// `self.dirty`, so the caller must have the row re-sent rather than
-    /// presenting the layer.
-    pub fn storeRow(
-        self: *LayerGridState,
-        alloc: std.mem.Allocator,
-        row: u32,
-        verts: []const Vertex,
-        total_rows: u32,
-        total_cols: u32,
-    ) bool {
-        self.rows = total_rows;
-        self.cols = total_cols;
-        const need: usize = @as(usize, row) + 1;
-        if (self.rows_buf.items.len < need) {
-            const old_len = self.rows_buf.items.len;
-            self.rows_buf.resize(alloc, need) catch return false;
-            for (self.rows_buf.items[old_len..]) |*rv| rv.* = .{};
-        }
-        if (self.origin_rows.items.len < need) {
-            const old_len = self.origin_rows.items.len;
-            self.origin_rows.resize(alloc, need) catch return false;
-            for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
-        }
-        var rv = &self.rows_buf.items[@intCast(row)];
-        rv.verts.clearRetainingCapacity();
-        rv.verts.appendSlice(alloc, verts) catch return false;
-        rv.gen +%= 1;
-        // Freshly generated vertices are built for the row they arrived at.
-        self.origin_rows.items[@intCast(row)] = row;
         self.dirty = true;
         return true;
     }
