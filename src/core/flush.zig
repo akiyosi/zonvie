@@ -959,17 +959,12 @@ pub const FlushCache = struct {
 // Scroll-aware flush: fast path eligibility
 // ---------------------------------------------------------------
 
-
-
-
-
 // ---------------------------------------------------------------------------
 // VertexHelpers: shared vertex generation utilities for both global grid and
 // external grid pipelines.  Extracted to file level so the 5-pass row
 // generation function can be shared.
 // ---------------------------------------------------------------------------
 pub const VH = struct {
-
     /// Quad corners in grid-local pixels: TL, TR, BL, BR. The frontend applies
     /// the layer transform, so the core never needs the surface extent here.
     inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
@@ -2878,6 +2873,11 @@ pub const FlushCtx = struct {
                     ctx.core.last_sent_content_rev = last_sent_content_rev_before;
                     ctx.core.last_sent_cursor_rev = last_sent_cursor_rev_before;
                     ctx.core.force_ext_cursor_recheck = true;
+                    // notifySurfaceLayouts runs before on_flush_end, so a late
+                    // abort cancels the transaction that carried the layout
+                    // while its signature is already recorded. Drop the
+                    // signatures so the retry republishes them.
+                    ctx.core.last_surface_layout.clearRetainingCapacity();
                 }
                 // A due maintenance reprobe may already have invalidated its
                 // negative entries before a later consumer rejected the flush.
@@ -3267,11 +3267,9 @@ pub const FlushCtx = struct {
             const cellW: f32 = @floatFromInt(ctx.core.cell_w_px);
             const cellH: f32 = @floatFromInt(ctx.core.cell_h_px);
 
-
             const topPad: f32 = @floatFromInt(rowTopPadPx(ctx.core.linespace_px));
 
             const Helpers = struct {
-
                 /// Quad corners in grid-local pixels: TL, TR, BL, BR. The
                 /// frontend applies the layer transform.
                 inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
@@ -3450,7 +3448,6 @@ pub const FlushCtx = struct {
             var main_retry_required: bool = false;
 
             if (need_main) {
-
                 {
                     const row_cb = ctx.core.cb.on_vertices_row.?;
                     sent_main_by_rows = true;
@@ -3695,7 +3692,6 @@ pub const FlushCtx = struct {
                                     &perf_hl_cache_hits,
                                     &perf_hl_cache_misses,
                                 );
-
                             }
 
                             var t_row_compose_end: i128 = 0;
@@ -3998,7 +3994,6 @@ pub const FlushCtx = struct {
                         );
                     }
                 }
-
             }
 
             if (need_cursor) {
@@ -5109,7 +5104,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
 
     const Helpers = struct {
-
         /// Quad corners in grid-local pixels: TL, TR, BL, BR. The frontend
         /// applies the layer transform.
         inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
@@ -13310,7 +13304,6 @@ const GlowCounter = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
         self.count(verts, vert_count);
     }
-
 };
 
 /// Define the two glow-test highlights and arm glow. hl 42 is in the set,
@@ -14333,6 +14326,56 @@ test "an aborted flush owes the surface layout again" {
     core.flush_aborted = false;
     notifySurfaceLayouts(&core);
     try std.testing.expectEqual(@as(u32, 2), state.calls);
+}
+
+test "an abort after the layout callback owes the surface layout again" {
+    const State = struct {
+        core: *Core = undefined,
+        layout_calls: u32 = 0,
+        flush_ends: u32 = 0,
+
+        fn onLayout(
+            ctx: ?*anyopaque,
+            surface_id: i64,
+            layers: [*]const c_api.Layer,
+            count: usize,
+            surface_rows: u32,
+            surface_cols: u32,
+        ) callconv(.c) void {
+            _ = surface_id;
+            _ = layers;
+            _ = count;
+            _ = surface_rows;
+            _ = surface_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.layout_calls += 1;
+        }
+
+        // The frontend rejects the bracket only after notifySurfaceLayouts
+        // already published and recorded the layout.
+        fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.flush_ends += 1;
+            if (self.flush_ends == 1) self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 8);
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_surface_layout = State.onLayout;
+    core.cb.on_flush_end = State.onFlushEnd;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 8);
+    try std.testing.expectEqual(@as(u32, 1), state.layout_calls);
+
+    // The cancelled transaction carried that layout, so the retry owes it.
+    try flush_ctx.onFlush(4, 8);
+    try std.testing.expectEqual(@as(u32, 2), state.layout_calls);
 }
 
 test "an external surface publishes only its own root layer" {
