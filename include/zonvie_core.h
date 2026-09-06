@@ -703,7 +703,10 @@ typedef int (*zonvie_on_clipboard_set_fn)(
 
 /* Layout version of zonvie_callbacks. Bump it whenever a field is removed,
    reordered, or has its signature changed. Appending a new callback at the
-   end stays backward compatible through callbacks_size and must NOT bump it. */
+   end stays backward compatible through callbacks_size and must NOT bump it.
+   Enforced by `callbacks_layout` in src/core/c_api.zig: it pins the name and
+   byte offset of every field, so a layout change fails to compile until this
+   version and that table are updated together. */
 #define ZONVIE_CALLBACKS_ABI_VERSION 1
 
 typedef struct zonvie_callbacks {
