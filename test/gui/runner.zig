@@ -282,8 +282,7 @@ test "gui:visual_continuous_j_scroll_matches_jump" {
 }
 
 test "gui:visual_incremental_scroll_matches_jump" {
-    // macOS only: counts the macOS frontend's [layer_row_scroll] line.
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/incremental_scroll_matches_jump.zig").run(testing.allocator);
     } else {
@@ -301,8 +300,7 @@ test "gui:visual_scroll_then_cursor_move" {
 }
 
 test "gui:visual_scrolled_layer_row_gating" {
-    // macOS only: reads the macOS frontend's per-layer [layer_draw] line.
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/scrolled_layer_row_gating.zig").run(testing.allocator);
     } else {
@@ -311,8 +309,7 @@ test "gui:visual_scrolled_layer_row_gating" {
 }
 
 test "gui:visual_float_over_scrolled_split" {
-    // macOS only: reads the macOS frontend's [layer_blit] / [layer_draw] lines.
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/float_over_scrolled_split.zig").run(testing.allocator);
     } else {
@@ -343,8 +340,7 @@ test "gui:visual_extfloat_over_born_external_anchor" {
 }
 
 test "gui:visual_scrollbind_layers_blit_matches_jump" {
-    // macOS only: reads the macOS frontend's [layer_blit] line.
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig").run(testing.allocator);
     } else {

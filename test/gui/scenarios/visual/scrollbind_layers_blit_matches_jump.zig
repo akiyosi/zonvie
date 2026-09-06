@@ -22,7 +22,7 @@
 // region, so a half-window step that a 22-row split accepts is rejected by an
 // 8-row float and the float would never enter the loop this exists to cover.
 //
-// macOS-only: [layer_blit] is the macOS frontend's line.
+// Both frontends emit [layer_blit].
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

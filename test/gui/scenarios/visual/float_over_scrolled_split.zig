@@ -24,7 +24,7 @@
 // checkout, and is immune to the per-host font/DPI drift a golden suffers. A
 // jump repaints every row from scratch and therefore cannot carry a smear.
 //
-// macOS-only: [layer_blit] and [layer_draw] are the macOS frontend's lines.
+// Both frontends emit [layer_blit] and [layer_draw].
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
