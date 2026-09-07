@@ -107,6 +107,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// in the same transaction.
     func setPendingSurfaceLayers(_ layers: [SurfaceLayer]) {
         pendingSurfaceLayers = layers
+        // Removing or migrating the owner also removes its surface overlay.
+        // Stage this with placement so abort preserves the old complete frame.
+        if !layers.contains(where: { $0.gridId == pendingCursorLayerGridId }) {
+            submitLayerCursor(gridId: pendingCursorLayerGridId, ptr: nil, count: 0)
+            pendingCursorLayerGridId = 1
+        }
     }
 
     /// True when `gridId` is one of this surface's layers. The pending list is
@@ -316,6 +322,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // carries every layer's rows into it.
         guard prepareMainWriteState() else { return }
         let sets = gridBuffers.sets(for: gridId)
+        // Match root rows: reuse buffers, then grow synchronously if needed.
+        // Deferring ordinary growth aborts the whole flush into retry backoff.
         let submitted = submitSurfaceRowVertices(
             target: sets[writeSetIndex],
             sourceSet: sets[flushSourceSetIndex],

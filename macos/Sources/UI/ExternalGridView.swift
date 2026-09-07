@@ -147,6 +147,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // even when this flush does not submit any rows.
         flushHadContent = true
         tripleBufferLock.unlock()
+        if let owner = pendingCursorGridId,
+           !layers.contains(where: { $0.gridId == owner }) {
+            submitLayerCursor(gridId: owner, ptr: nil, count: 0)
+            pendingCursorGridId = gridId
+        }
     }
 
     /// Release a destroyed grid's vertex storage.
@@ -168,6 +173,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     func submitLayerRow(gridId id: Int64, rowStart: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, totalRows: Int, totalCols: Int) {
         guard isInFlush, id != gridId else { return }
         let sets = gridBuffers.sets(for: id)
+        // Match root rows: reuse buffers, then grow synchronously if needed.
+        // Deferring ordinary growth aborts the whole flush into retry backoff.
         let submitted = submitSurfaceRowVertices(
             target: sets[writeSetIndex], sourceSet: sets[flushSourceSetIndex],
             device: mtlDevice, rowStart: rowStart,
@@ -189,6 +196,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_staged surface=\(gridId) grid=\(id) row=\(rowStart) vertices=\(count) accepted=\(submitted)")
         if !submitted { flushFailed = true }
         flushHadContent = true
+        markHostedDamage(gridId: id, rowStart: rowStart, rowEnd: rowStart + 1)
+    }
+
+    private func markHostedDamage(gridId id: Int64, rowStart: Int, rowEnd: Int) {
+        tripleBufferLock.lock()
+        defer { tripleBufferLock.unlock() }
+        guard let layer = (pendingSurfaceLayers ?? committedSurfaceLayers).first(where: { $0.gridId == id }) else { return }
+        let height = max(1, Float(mainTerminalView?.renderer.cellHeightPx ?? 1).rounded(.up))
+        // Include the adjacent rows for glyph ink crossing a cell boundary.
+        let first = max(0, Int(floor(layer.originPx.y / height)) + rowStart - 1)
+        let end = min(Int(gridRows), Int(ceil(layer.originPx.y / height)) + rowEnd + 1)
+        if first < end { flushDirtyRows.formUnion(first..<end) }
     }
 
     func submitLayerCursor(gridId id: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
@@ -218,6 +237,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols,
                             maxRowBuffers: maxRowBuffers)
         flushHadContent = true
+        markHostedDamage(gridId: id, rowStart: rowStart, rowEnd: rowEnd)
     }
     private var writeSetIndex: Int = 0            // Main thread only (during flush)
     private var flushSourceSetIndex: Int = 0      // Main thread only (during flush)
@@ -2687,6 +2707,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 ZonvieCore.appLog("[WARNING][ExternalGridView] draw bailed (\(reason)); restoring dirty state for retry gridId=\(gridId)")
                 tripleBufferLock.lock()
                 pendingDirtyRows.formUnion(submittedDirtyRows)
+                if layoutDamageSnapshot { pendingLayoutDamage = true }
                 if cursorDirtySnapshot {
                     cursorDirty = true
                 }
@@ -3001,16 +3022,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // --- GPU scroll blit (shift pixels in back buffer) ---
-            // dirtyRows is only populated when GPU scroll copy is active.
-            // Without scroll copy, the back buffer doesn't have pixel-shifted
-            // content, so partial row updates would leave stale rows at wrong
-            // positions. In that case dirtyRows stays empty and the full-redraw
-            // fallback branch draws all rows.
+            // A root scroll without pixel copy requires full redraw. Hosted
+            // content changes without a root scroll can use their surface
+            // damage bands without moving any retained pixels.
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             var dirtyRows: [Int] = []
             swap(&dirtyRows, &dirtyRowsScratch)
             dirtyRows.removeAll(keepingCapacity: true)
-            if useGpuScrollCopy {
+            if useGpuScrollCopy || (!layerDrawSnapshot.isEmpty && !hasPendingScroll) {
                 dirtyRows.append(contentsOf: submittedDirtyRows)
             }
             defer {
@@ -3080,14 +3099,22 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if reuseHostedContents {
                 ZonvieCore.renderTrace("side=macos event=retained_content_reuse surface=\(gridId) root_row_draws=0 hosted_row_draws=0")
             }
+            let partialHostedContents = rowMode && !layerDrawSnapshot.isEmpty
+                && !dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
+                && !layoutDamageSnapshot && !hasPendingScroll && !drawableSizeChanged
+                && !scrollOffsetChanged && !smoothScrolling && !shaderAnimates
+                && !glowEnabled && !blurEnabled && !isDecoratedSurface
+            if partialHostedContents {
+                ZonvieCore.renderTrace("event=hosted_partial surface=\(gridId) dirty_rows=\(dirtyRows.count)")
+            }
             // Decorated surfaces (ext-cmdline) always clear: their viewport origin offset
             // means scissor rects for partial redraw don't align correctly.
             let shouldReusePreviousContents = committedFontIsCurrent
                 && !layoutDamageSnapshot
-                && (layerDrawSnapshot.isEmpty || reuseHostedContents)
+                && (layerDrawSnapshot.isEmpty || reuseHostedContents || partialHostedContents)
                 && !isDecoratedSurface
                 && !glowEnabled
-                && (reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || (!smoothScrolling && hasAnyDirtyInRowMode))
+                && (partialHostedContents || reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || (!smoothScrolling && hasAnyDirtyInRowMode))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnce,
@@ -3385,6 +3412,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     encoder.setScissorRect(scissor)
                     bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
                     bindSingleSurfaceScrollOffset(encoder: encoder, offset: nil)
+                    if partialHostedContents && !glow {
+                        // Recompose each dirty surface band back-to-front.
+                        // Every layer is clipped to the band the root erased,
+                        // so unchanged pixels are neither cleared nor blended.
+                        for row in dirtyRows {
+                            let top = max(scissor.y, row * Int(cellHi))
+                            let bottom = min(scissor.y + scissor.height, (row + 1) * Int(cellHi))
+                            guard top < bottom else { continue }
+                            encoder.setScissorRect(MTLScissorRect(x: scissor.x, y: top,
+                                width: scissor.width, height: bottom - top))
+                            let first = max(0, Int(floor((Float(top) - origin.y) / Float(cellHi))) - 1)
+                            let end = min(rows, Int(ceil((Float(bottom) - origin.y) / Float(cellHi))) + 1)
+                            guard first < end else { continue }
+                            _ = encodeSurfaceRowDraws(encoder: encoder, rows: first..<end,
+                                resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
+                                pipeline: pipeline, backgroundPipeline: nil, glyphPipeline: nil, useTwoPass: false)
+                        }
+                        continue
+                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: encoder, rows: 0..<rows,
                         resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
