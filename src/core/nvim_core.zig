@@ -536,7 +536,7 @@ pub const Core = struct {
 
     // Reusable scratch buffers (zero-allocation hot path)
     row_cells: RenderCells = .{},
-    grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
+    grid_entries: c_api.render_layout.List(GridEntry) = .{},
     // Sort scratch for float overlays anchored to an external grid — same
     // (zindex, compindex, order, grid_id) ordering as grid_entries, but kept
     // separate since it's populated by a different function
@@ -833,11 +833,12 @@ pub const Core = struct {
     /// Last layer list published per surface, so on_surface_layout only fires
     /// when the list actually changed.
     last_surface_layout: std.AutoHashMapUnmanaged(i64, flush.SurfaceLayoutSig) = .{},
+    layout_budget: c_api.render_layout.Budget = .{},
     /// Persistent build buffer for one surface's layer list; grown on layout
     /// change only, never per flush.
-    layout_scratch: std.ArrayListUnmanaged(c_api.Layer) = .empty,
+    layout_scratch: c_api.render_layout.List(c_api.Layer) = .{},
     /// Persistent list of the grids that emit their own rows in a flush.
-    emit_grid_ids: std.ArrayListUnmanaged(i64) = .empty,
+    emit_grid_ids: c_api.render_layout.List(i64) = .{},
 
     // ext_cmdline UI extension flag (set before start)
     ext_cmdline_enabled: bool = false,
@@ -1097,6 +1098,7 @@ pub const Core = struct {
             error.TooManySubgrids,
             error.TooManyWindowPlacements,
             error.LayoutTooComplex,
+            error.LayoutBudgetExceeded,
             error.VertexBudgetExceeded,
             error.MessageTooLarge,
             error.FrameTooLarge,
@@ -1197,7 +1199,7 @@ pub const Core = struct {
         self.flush_row_counts_snapshot.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
-        self.grid_entries.deinit(self.alloc);
+        self.grid_entries.deinit();
         self.ext_float_entries.deinit(self.alloc);
         self.ext_float_anchor_entries.deinit(self.alloc);
         self.ext_float_row_offsets.deinit(self.alloc);
@@ -1244,12 +1246,11 @@ pub const Core = struct {
             self.glyph_mirror.deinit(self.alloc);
             self.glyph_mirror = .{};
         }
+        flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
-        self.layout_scratch.deinit(self.alloc);
-        self.layout_scratch = .empty;
-        self.emit_grid_ids.deinit(self.alloc);
-        self.emit_grid_ids = .empty;
+        self.layout_scratch.deinit();
+        self.emit_grid_ids.deinit();
         self.msg_line_cache.deinit(self.alloc);
         self.msg_line_cache = .empty;
         self.msg_line_cache_build.deinit(self.alloc);
@@ -1482,12 +1483,11 @@ pub const Core = struct {
             self.glyph_mirror.deinit(self.alloc);
             self.glyph_mirror = .{};
         }
+        flush.releaseSurfaceLayouts(self);
         self.last_surface_layout.deinit(self.alloc);
         self.last_surface_layout = .{};
-        self.layout_scratch.deinit(self.alloc);
-        self.layout_scratch = .empty;
-        self.emit_grid_ids.deinit(self.alloc);
-        self.emit_grid_ids = .empty;
+        self.layout_scratch.deinit();
+        self.emit_grid_ids.deinit();
         self.grid.external_grids.deinit(self.alloc);
         self.grid.external_grids = .{};
         // ext_windows_grids: grid_id -> win_id mapping. Without clearing,

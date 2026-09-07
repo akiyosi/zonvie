@@ -142,6 +142,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Which layer the committed cursor belongs to. The surface draws one
     /// cursor, and it has to be placed with its own layer's transform.
     private var pendingCursorLayerGridId: Int64 = 1
+    var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
     private var committedCursorLayerGridId: Int64 = 1
 
     /// The committed cursor's layer origin within the surface.
@@ -154,6 +155,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Publish the cursor layer for a grid the surface draws as a layer. The
     /// vertices are in that grid's own pixel space.
     func submitLayerCursor(gridId: Int64, ptr: UnsafeRawPointer?, count: Int) {
+        // Cursor clears are grid-local even though the surface has one overlay.
+        guard count != 0 || pendingCursorLayerGridId == gridId else {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(pendingCursorLayerGridId) reason=empty_nonowner")
+            return
+        }
+        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=1 grid=\(gridId) vertices=\(count)")
         pendingCursorLayerGridId = gridId
         submitVerticesPartialRaw(
             mainPtr: nil,
@@ -1815,6 +1822,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         for state in layerDrawStates.values {
             state.flushDirtyRows.removeAll()
         }
+        pendingSurfaceLayers = nil
+        pendingCursorLayerGridId = committedCursorLayerGridId
         lock.unlock()
         flushHadLayerWork = false
         mainWritePrepared = false
@@ -3768,19 +3777,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
                         }
                         guard row >= 0, row < rowCount else { return nil }
-                        let slot = set.rowLogicalToSlot[row]
-                        guard slot >= 0, slot < set.rowState.buffers.count,
-                              let vb = set.rowState.buffers[slot],
-                              set.rowState.counts[slot] > 0
-                        else { return nil }
-                        // A row-shift hint remaps slots without rewriting their
-                        // vertices, so a slot's vertices still live at sourceRow
-                        // and have to appear at this row.
-                        let sourceRow = slot < set.rowSlotSourceRows.count
-                            ? set.rowSlotSourceRows[slot]
-                            : row
-                        let translationY = Float(row - sourceRow) * Float(cellHi)
-                        return (set.rowState.counts[slot], vb, translationY)
+                        return resolveSurfaceGridRow(set, row: row, cellHeightPx: Float(cellHi))
                     }
 
                     // Why this layer cannot be drawn from its dirty rows alone:
@@ -5784,6 +5781,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let updateMain = (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
         let updateCursor = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
         if updateCursor && !updateMain {
+            guard count != 0 || pendingCursorLayerGridId == 1 else {
+                ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=1 owner=\(pendingCursorLayerGridId) reason=empty_nonowner")
+                return
+            }
             pendingCursorLayerGridId = 1
             submitVerticesPartialRaw(
                 mainPtr: nil,

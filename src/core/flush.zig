@@ -2666,6 +2666,7 @@ fn dispatchGridRowScroll(
     // The frontend keeps the surviving rows and is sent only the vacated ones,
     // so the mirror has to move with them.
     core.shiftGlyphMirror(grid_id, region.row_start, region.row_end, op.rows);
+    traceRender(core, "event=row_shift_send grid={d} start={d} end={d} delta={d}\n", .{ grid_id, region.row_start, region.row_end, op.rows });
     scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, sg.rows, sg.cols);
     return true;
 }
@@ -2806,6 +2807,7 @@ pub const FlushCtx = struct {
             }
         }
         const aborted_at_flush_begin = ctx.core.flush_aborted;
+        traceRender(ctx.core, "event=begin aborted={}\n", .{aborted_at_flush_begin});
         // Reclaim atlas space while the glyph mirrors still describe the frame
         // the frontend is showing, and before this flush packs anything of its own.
         if (!aborted_at_flush_begin) ctx.core.collectAtlasGarbageIfNeeded();
@@ -2821,6 +2823,7 @@ pub const FlushCtx = struct {
         defer {
             ctx.core.ext_float_anchor_index_valid = false;
             const vertex_budget_committed = !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted;
+            traceRender(ctx.core, "event=end outcome={s} retryable={} destroyed_pending={d} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (vertex_budget_committed) "commit" else "abort", ctx.core.flush_retryable, ctx.core.grid.destroyed_pending.items.len, ctx.core.layout_budget.live_bytes.load(.monotonic), c_api.render_layout.Budget.limit_bytes });
             // on_flush_begin runs before any core vertex/atlas mutation. Its
             // backpressure rejection leaves the existing accounting valid,
             // so closing this untouched budget transaction must not invalidate
@@ -2840,6 +2843,11 @@ pub const FlushCtx = struct {
                 frontend_refused_publication,
             );
             if (vertex_budget_committed) {
+                for (ctx.core.grid.destroyed_pending.items) |grid_id| {
+                    traceRender(ctx.core, "event=destroy_release grid={d}\n", .{grid_id});
+                    ctx.core.removeGlyphMirror(grid_id);
+                }
+                ctx.core.grid.destroyed_pending.clearRetainingCapacity();
                 ctx.core.finishAtlasMaintenance();
                 ctx.core.grid.clearScrolledGrids();
                 ctx.core.grid.clearScrollState();
@@ -2877,7 +2885,8 @@ pub const FlushCtx = struct {
                     // abort cancels the transaction that carried the layout
                     // while its signature is already recorded. Drop the
                     // signatures so the retry republishes them.
-                    ctx.core.last_surface_layout.clearRetainingCapacity();
+                    var layout_it = ctx.core.last_surface_layout.valueIterator();
+                    while (layout_it.next()) |layout| layout.valid = false;
                 }
                 // A due maintenance reprobe may already have invalidated its
                 // negative entries before a later consumer rejected the flush.
@@ -3015,6 +3024,12 @@ pub const FlushCtx = struct {
         // takes the bounded reactive reset path during generation.
         _ = ctx.core.prepareAtlasMaintenance();
 
+        // Row shifts are grid-local. Resolve their destination before any
+        // callback can route a moved grid using the previous surface's layout.
+        _ = notifyExternalWindowChanges(ctx.core);
+        publishSurfaceLayouts(ctx.core);
+        if (ctx.core.flush_aborted) return;
+
         // Dispatch grid_scroll events AFTER abort check so they are preserved on retry.
         if (ctx.core.cb.on_grid_scroll) |cb| {
             if (scrolled_overflow) {
@@ -3080,18 +3095,6 @@ pub const FlushCtx = struct {
         // the grid's own scroll state and gridScrollFastPathRegion.
         // last_scroll_op is committed by the transaction-final defer, not here.
         if (ctx.core.cb.on_grid_row_scroll) |scroll_cb| {
-            var has_pending_external_scroll = false;
-            var pending_it = ctx.core.grid.sub_grids.iterator();
-            while (pending_it.next()) |entry| {
-                if (entry.value_ptr.row_scroll_notify_pending and
-                    ctx.core.grid.external_grids.contains(entry.key_ptr.*))
-                {
-                    has_pending_external_scroll = true;
-                    break;
-                }
-            }
-            if (has_pending_external_scroll) try buildExternalFloatAnchorIndex(ctx.core);
-
             var sg_it = ctx.core.grid.sub_grids.iterator();
             while (sg_it.next()) |entry| {
                 if (entry.value_ptr.row_scroll_notify_pending) {
@@ -4298,24 +4301,20 @@ pub const FlushCtx = struct {
     }
 };
 
-/// Upper bound on the layers one surface publishes. Matches the frontends'
-/// fixed-capacity layer arrays.
-pub const MAX_SURFACE_LAYERS: usize = 64;
-
 /// What was last published for one surface, so a layout is re-sent only when it
 /// actually changed. Holding the layers themselves makes the comparison exact
 /// rather than a hash that could suppress a needed update.
 pub const SurfaceLayoutSig = struct {
-    layers: [MAX_SURFACE_LAYERS]c_api.Layer = undefined,
-    len: usize = 0,
+    layers: c_api.render_layout.List(c_api.Layer) = .{},
+    valid: bool = false,
     surface_rows: u32 = 0,
     surface_cols: u32 = 0,
 
     fn matches(self: *const SurfaceLayoutSig, layers: []const c_api.Layer, rows: u32, cols: u32) bool {
-        if (self.len != layers.len) return false;
+        if (!self.valid or self.layers.len != layers.len) return false;
         if (self.surface_rows != rows or self.surface_cols != cols) return false;
         // Layer has no equality operator; every field is compared.
-        for (self.layers[0..self.len], layers) |a, b| {
+        for (self.layers.slice(), layers) |a, b| {
             if (a.grid_id != b.grid_id or
                 a.anchor_grid != b.anchor_grid or
                 a.x_px != b.x_px or
@@ -4329,11 +4328,33 @@ pub const SurfaceLayoutSig = struct {
     }
 };
 
-/// The window grids the main surface draws as its own layers, back-to-front
-/// and already truncated to what one layout can carry, in `core.grid_entries`.
-/// `collectSurfaceLayers` and `collectEmitGrids` share this so a grid can never
-/// emit rows no surface places.
-fn collectMainLayerEntries(self: *Core) []const GridEntry {
+pub fn releaseSurfaceLayouts(self: *Core) void {
+    var it = self.last_surface_layout.valueIterator();
+    while (it.next()) |layout| layout.layers.deinit();
+}
+
+/// Frontends stamp these core-thread records with their callback flush ID.
+fn traceRender(self: *Core, comptime fmt: []const u8, args: anytype) void {
+    if (!self.log.verbose or self.log.cb == null or self.log.perf_only or self.log.scroll_only) return;
+    self.log.write("[render_trace] side=core budget_transaction={} " ++ fmt, .{self.vertex_budget_transaction_active} ++ args);
+}
+
+fn failSurfaceLayout(self: *Core, err: anyerror) void {
+    traceRender(self, "event=layout_failed reason={s} metadata_bytes={d}\n", .{ @errorName(err), self.layout_budget.live_bytes.load(.monotonic) });
+    self.flush_aborted = true;
+    if (Core.isHardRenderFailure(err)) {
+        self.flush_retryable = false;
+        self.failHardRender(err);
+    }
+}
+
+/// Resolve through anchors without guessing a main-window placement for an
+/// unresolved or cyclic chain. No allocation on redraw/flush paths.
+pub fn surfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
+    return grid.surfaceForGrid(grid_id);
+}
+
+fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
     self.grid_entries.clearRetainingCapacity();
     var it = self.grid.win_pos.iterator();
     while (it.next()) |e| {
@@ -4341,10 +4362,7 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
         if (grid_id == 1) continue;
         // An external grid is its own surface, never a layer of another.
         if (self.grid.external_grids.contains(grid_id)) continue;
-        const pos = e.value_ptr.*;
-        // A float belongs to the surface its anchor lives on, and an external
-        // surface composites its floats into its own rows rather than as layers.
-        if (self.grid.external_grids.contains(pos.anchor_grid)) continue;
+        if (surfaceForGrid(&self.grid, grid_id) != surface_id) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
 
@@ -4353,12 +4371,15 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
             .compindex = 0,
             .order = 0,
         };
-        self.grid_entries.append(self.alloc, .{
+        self.grid_entries.append(self.alloc, &self.layout_budget, .{
             .grid_id = grid_id,
             .zindex = layer.zindex,
             .compindex = layer.compindex,
             .order = layer.order,
-        }) catch break;
+        }) catch |err| {
+            failSurfaceLayout(self, err);
+            return &.{};
+        };
     }
 
     // Back-to-front: smaller first. Same z order the composited overlay used.
@@ -4371,12 +4392,7 @@ fn collectMainLayerEntries(self: *Core) []const GridEntry {
         }
     }.lessThan);
 
-    // The surface root takes the first layer slot, so the window grids share
-    // what is left of `MAX_SURFACE_LAYERS`. Dropping from the FRONT of a
-    // back-to-front order discards the BOTTOM-most layers, which the layers
-    // above would have covered anyway, never the frontmost windows.
-    const first = self.grid_entries.items.len -| (MAX_SURFACE_LAYERS - 1);
-    return self.grid_entries.items[first..];
+    return self.grid_entries.items;
 }
 
 /// Collect one surface's layers, back-to-front, into `core.layout_scratch`.
@@ -4389,7 +4405,7 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
     const cell_w: i64 = @intCast(@max(1, self.cell_w_px));
     const cell_h: i64 = @intCast(@max(1, self.cell_h_px));
 
-    self.layout_scratch.append(self.alloc, .{
+    self.layout_scratch.append(self.alloc, &self.layout_budget, .{
         .grid_id = surface_id,
         .anchor_grid = surface_id,
         .x_px = 0,
@@ -4398,7 +4414,10 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         .cols = root.cols,
         .z = 0,
         .flags = 0,
-    }) catch return &.{};
+    }) catch |err| {
+        failSurfaceLayout(self, err);
+        return &.{};
+    };
 
     // Origin of the surface root in global grid cells. Grid 1 is the origin;
     // an external grid carries its own global position.
@@ -4406,22 +4425,18 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
     var root_col: i64 = 0;
     if (surface_id != 1) {
         const ext = self.grid.external_grids.get(surface_id) orelse return self.layout_scratch.items;
-        root_row = ext.start_row;
-        root_col = ext.start_col;
+        root_row = grid_mod.externalCompositeOriginRow(ext);
+        root_col = grid_mod.externalCompositeOriginCol(ext);
     }
 
-    // Only the main surface draws window grids as layers.
-    const entries: []const GridEntry = if (surface_id == 1)
-        collectMainLayerEntries(self)
-    else
-        &.{};
+    const entries = collectSurfaceLayerEntries(self, surface_id);
 
     for (entries) |ent| {
         const pos = self.grid.win_pos.get(ent.grid_id) orelse continue;
         const sg = self.grid.sub_grids.get(ent.grid_id) orelse continue;
         const dx: i64 = (@as(i64, pos.col) - root_col) * cell_w;
         const dy: i64 = (@as(i64, pos.row) - root_row) * cell_h;
-        self.layout_scratch.append(self.alloc, .{
+        self.layout_scratch.append(self.alloc, &self.layout_budget, .{
             .grid_id = ent.grid_id,
             .anchor_grid = pos.anchor_grid,
             .x_px = std.math.cast(i32, dx) orelse continue,
@@ -4430,14 +4445,17 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
             .cols = sg.cols,
             .z = @intCast(self.layout_scratch.items.len),
             .flags = if (pos.follows_scroll) c_api.LAYER_FOLLOWS_SCROLL else 0,
-        }) catch break;
+        }) catch |err| {
+            failSurfaceLayout(self, err);
+            return &.{};
+        };
     }
 
     return self.layout_scratch.items;
 }
 
 /// Whether the main surface draws any window grid as its own layer. Mirrors the
-/// acceptance test in `collectMainLayerEntries`, so the root grid's cells
+/// acceptance test in `collectSurfaceLayerEntries`, so the root grid's cells
 /// beneath such a layer are never what the user sees.
 fn mainSurfaceHasLayers(self: *Core) bool {
     var it = self.grid.win_pos.iterator();
@@ -4445,7 +4463,7 @@ fn mainSurfaceHasLayers(self: *Core) bool {
         const grid_id = e.key_ptr.*;
         if (grid_id == 1) continue;
         if (self.grid.external_grids.contains(grid_id)) continue;
-        if (self.grid.external_grids.contains(e.value_ptr.anchor_grid)) continue;
+        if (surfaceForGrid(&self.grid, grid_id) != 1) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
         return true;
@@ -4460,14 +4478,21 @@ fn collectEmitGrids(self: *Core) void {
     self.emit_grid_ids.clearRetainingCapacity();
     var ext_it = self.grid.external_grids.keyIterator();
     while (ext_it.next()) |grid_id_ptr| {
-        self.emit_grid_ids.append(self.alloc, grid_id_ptr.*) catch return;
+        self.emit_grid_ids.append(self.alloc, &self.layout_budget, grid_id_ptr.*) catch |err| {
+            failSurfaceLayout(self, err);
+            return;
+        };
     }
-    // Exactly the grids the main surface publishes as layers, truncation
-    // included: a grid past the layer limit is drawn by nobody, so its rows
-    // would only charge the vertex budget. A float anchored to an external grid
-    // is composited into that grid's own rows and is not in this set.
-    for (collectMainLayerEntries(self)) |ent| {
-        self.emit_grid_ids.append(self.alloc, ent.grid_id) catch return;
+    var it = self.grid.win_pos.keyIterator();
+    while (it.next()) |id| {
+        if (id.* == 1 or self.grid.external_grids.contains(id.*)) continue;
+        if (surfaceForGrid(&self.grid, id.*) == null) continue;
+        const sg = self.grid.sub_grids.get(id.*) orelse continue;
+        if (sg.rows == 0 or sg.cols == 0) continue;
+        self.emit_grid_ids.append(self.alloc, &self.layout_budget, id.*) catch |err| {
+            failSurfaceLayout(self, err);
+            return;
+        };
     }
 }
 
@@ -4480,19 +4505,56 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
     const cols = root.cols;
 
     const layers = collectSurfaceLayers(self, surface_id);
+    if (self.flush_aborted) return false;
     if (layers.len == 0) return true;
     if (self.last_surface_layout.getPtr(surface_id)) |prev| {
         if (prev.matches(layers, rows, cols)) return true;
     }
 
+    const entry = self.last_surface_layout.getOrPut(self.alloc, surface_id) catch |err| {
+        failSurfaceLayout(self, err);
+        return false;
+    };
+    if (!entry.found_existing) entry.value_ptr.* = .{};
+    const sig = entry.value_ptr;
+    // A destination owns its row storage independently. Placement alone is
+    // insufficient when a grid (including an anchored descendant) migrates
+    // to another surface without a grid_line event.
+    for (layers) |layer| {
+        if (layer.grid_id == surface_id) continue;
+        var already_hosted = false;
+        if (sig.valid) {
+            for (sig.layers.slice()) |old| {
+                if (old.grid_id == layer.grid_id) {
+                    already_hosted = true;
+                    break;
+                }
+            }
+        }
+        if (!already_hosted) {
+            if (self.grid.sub_grids.getPtr(layer.grid_id)) |sg| {
+                sg.markAllDirty();
+                // There are no surviving destination row slots to rotate.
+                sg.scroll_fast_path_blocked = true;
+            }
+        }
+    }
+    sig.valid = false;
+    sig.layers.resize(self.alloc, &self.layout_budget, layers.len) catch |err| {
+        failSurfaceLayout(self, err);
+        return false;
+    };
+    @memcpy(sig.layers.items[0..layers.len], layers);
+    sig.surface_rows = rows;
+    sig.surface_cols = cols;
+
+    traceRender(self, "event=layout_stage surface={d} layers={d} rows={d} cols={d} metadata_bytes={d}\n", .{ surface_id, layers.len, rows, cols, self.layout_budget.live_bytes.load(.monotonic) });
+    if (self.log.verbose and self.log.cb != null and !self.log.perf_only and !self.log.scroll_only) {
+        for (layers) |layer| traceRender(self, "event=placement surface={d} grid={d} anchor={d} x_px={d} y_px={d} rows={d} cols={d} z={d} flags={d}\n", .{ surface_id, layer.grid_id, layer.anchor_grid, layer.x_px, layer.y_px, layer.rows, layer.cols, layer.z, layer.flags });
+    }
     cb(self.ctx, surface_id, layers.ptr, layers.len, rows, cols);
     if (self.flush_aborted) return false;
-
-    // Recording the signature after a successful callback keeps an aborted
-    // flush owing the same layout again.
-    var sig = SurfaceLayoutSig{ .len = layers.len, .surface_rows = rows, .surface_cols = cols };
-    @memcpy(sig.layers[0..layers.len], layers);
-    self.last_surface_layout.put(self.alloc, surface_id, sig) catch {};
+    sig.valid = true;
     return true;
 }
 
@@ -4500,6 +4562,27 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
 /// queue. Runs inside the flush bracket after external-window lifecycle, so a
 /// surface always exists on the frontend before its layout arrives.
 pub fn notifySurfaceLayouts(self: *Core) void {
+    publishSurfaceLayouts(self);
+    if (self.flush_aborted) return;
+
+    if (self.grid.destroyed_pending.items.len != 0) {
+        if (self.cb.on_grid_destroy) |cb| {
+            for (self.grid.destroyed_pending.items) |grid_id| {
+                traceRender(self, "event=destroy_stage grid={d}\n", .{grid_id});
+                cb(self.ctx, grid_id);
+                if (self.flush_aborted) return;
+            }
+        }
+        // A late on_flush_end rejection must retry destruction along with
+        // the layout. Keep mirrors alive until the old frame is replaced.
+        if (!self.vertex_budget_transaction_active) {
+            for (self.grid.destroyed_pending.items) |grid_id| self.removeGlyphMirror(grid_id);
+            self.grid.destroyed_pending.clearRetainingCapacity();
+        }
+    }
+}
+
+fn publishSurfaceLayouts(self: *Core) void {
     if (self.flush_aborted) return;
 
     if (self.cb.on_surface_layout != null) {
@@ -4513,23 +4596,9 @@ pub fn notifySurfaceLayouts(self: *Core) void {
         while (sig_it.next()) |entry| {
             const id = entry.key_ptr.*;
             if (id == 1 or self.grid.external_grids.contains(id)) continue;
+            entry.value_ptr.layers.deinit();
             self.last_surface_layout.removeByPtr(entry.key_ptr);
         }
-    }
-
-    if (self.grid.destroyed_pending.items.len != 0) {
-        // A destroyed grid shows nothing, and keeping its mirrored rows would
-        // pin their shelves for the rest of the session.
-        for (self.grid.destroyed_pending.items) |destroyed_id| {
-            self.removeGlyphMirror(destroyed_id);
-        }
-        if (self.cb.on_grid_destroy) |cb| {
-            for (self.grid.destroyed_pending.items) |grid_id| {
-                cb(self.ctx, grid_id);
-                if (self.flush_aborted) return;
-            }
-        }
-        self.grid.destroyed_pending.clearRetainingCapacity();
     }
 }
 
@@ -4992,20 +5061,6 @@ fn buildExternalFloatRowIndex(
 pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_grid_id: ?i64) void {
     self.log.write("[sendExternalGridVertices] called, known_external_grids.count={d} force={} only_grid={?d}\n", .{ self.known_external_grids.count(), force_render, only_grid_id });
 
-    // Standalone callers own the flush-local anchor index they build. onFlush
-    // may have built it earlier for row-scroll dispatch; in that case its
-    // transaction-final defer invalidates it after this function returns.
-    var owns_anchor_index = false;
-    defer {
-        if (owns_anchor_index) self.ext_float_anchor_index_valid = false;
-    }
-
-    // The overlay map is visible only while generateRowVertices consumes one
-    // fully-composed row, so frontend row callbacks run with it cleared and a
-    // re-entrant external-grid flush cannot observe the outer row state.
-    self.flush_float_overlay = null;
-    defer self.flush_float_overlay = null;
-
     // Cache glow state once — doesn't change while grid_mu is held.
     const ext_glow_enabled = self.glow_enabled.load(.acquire);
     const ext_glow_all = self.glow_all;
@@ -5247,44 +5302,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // Cursor-only changes must not allocate/scan an entire external grid.
         // The row pipeline below is needed only when content itself is dirty.
         if (sg.dirty or need_full_redraw) {
-            const ext_info = self.grid.external_grids.get(grid_id);
-
-            if (!self.ext_float_anchor_index_valid) {
-                buildExternalFloatAnchorIndex(self) catch |err| {
-                    ext_had_row_error = true;
-                    self.flush_aborted = true;
-                    if (Core.isHardRenderFailure(err)) {
-                        self.flush_retryable = false;
-                        self.failHardRender(err);
-                    }
-                    continue;
-                };
-                owns_anchor_index = true;
-            }
-            const anchor_entries = externalFloatAnchorEntries(
-                self.ext_float_anchor_entries.items,
-                grid_id,
-            );
-
-            // Build float layer order and visible-row buckets once for this
-            // anchor grid. A callback can re-enter and reuse the scratch; the
-            // row loop detects that by generation and rebuilds only then.
-            var ext_float_index_generation = buildExternalFloatRowIndex(
-                self,
-                anchor_entries,
-                ext_info,
-                viewport_rows,
-                sg.cols,
-            ) catch |err| {
-                ext_had_row_error = true;
-                self.flush_aborted = true;
-                if (Core.isHardRenderFailure(err)) {
-                    self.flush_retryable = false;
-                    self.failHardRender(err);
-                }
-                continue;
-            };
-
             const ext_margins = self.grid.getViewportMargins(grid_id);
 
             const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
@@ -5374,28 +5391,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                     const row: u32 = @intCast(row_idx);
 
-                    if (self.ext_float_index_generation != ext_float_index_generation) {
-                        const current_anchor_entries = externalFloatAnchorEntries(
-                            self.ext_float_anchor_entries.items,
-                            grid_id,
-                        );
-                        ext_float_index_generation = buildExternalFloatRowIndex(
-                            self,
-                            current_anchor_entries,
-                            ext_info,
-                            viewport_rows,
-                            sg.cols,
-                        ) catch |err| {
-                            ext_had_row_error = true;
-                            self.flush_aborted = true;
-                            if (Core.isHardRenderFailure(err)) {
-                                self.flush_retryable = false;
-                                self.failHardRender(err);
-                            }
-                            break :ext_retry;
-                        };
-                    }
-
                     // Fast path: compose only the rows in the regen set.
                     // Otherwise use the dirty_rows bitmap, except after a scroll
                     // the fast path rejected: the frontend cannot shift rows
@@ -5465,89 +5460,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         ext_margins,
                     );
 
-                    // Rebuild the row-local float state every time: a row
-                    // callback may re-enter this function and reuse both
-                    // persistent containers.
-                    self.flush_float_overlay_buf.clearRetainingCapacity();
-                    self.flush_float_overlay_buf.ensureTotalCapacity(self.alloc, sg.cols) catch {
-                        ext_had_row_error = true;
-                        self.flush_aborted = true;
-                        break :ext_retry;
-                    };
-
-                    if (ext_info) |info| {
-                        {
-                            // Same origin as buildExternalFloatRowIndexWithLimits:
-                            // both must read the float's win_pos in the space it
-                            // was written in, or the assert below would fire on an
-                            // anchor with no position of its own.
-                            const ext_start_row: i64 = grid_mod.externalCompositeOriginRow(info);
-                            const row_i64: i64 = row;
-                            const ext_start_col: i64 = grid_mod.externalCompositeOriginCol(info);
-                            const ext_cols_i64: i64 = sg.cols;
-                            const row_usize: usize = @intCast(row);
-                            std.debug.assert(self.ext_float_row_index_valid);
-                            var entry_cursor: usize = self.ext_float_row_offsets.items[row_usize];
-                            const entry_end: usize = self.ext_float_row_offsets.items[row_usize + 1];
-                            while (entry_cursor < entry_end) : (entry_cursor += 1) {
-                                const entry_index = self.ext_float_row_entry_indices.items[entry_cursor];
-                                const fent = self.ext_float_entries.items[entry_index];
-                                const float_pos = self.grid.win_pos.get(fent.grid_id) orelse continue;
-                                const float_sg = self.grid.sub_grids.get(fent.grid_id) orelse continue;
-                                const float_margins = self.grid.getViewportMargins(fent.grid_id);
-                                const float_row_in_ext = @as(i64, float_pos.row) - ext_start_row;
-                                const float_src_row_i64 = row_i64 - float_row_in_ext;
-                                if (float_src_row_i64 < 0 or float_src_row_i64 >= @as(i64, float_sg.rows)) continue;
-                                const float_src_row: u32 = @intCast(float_src_row_i64);
-
-                                const float_col_in_ext = @as(i64, float_pos.col) - ext_start_col;
-                                const target_col_start = @max(@as(i64, 0), float_col_in_ext);
-                                const target_col_end = @min(ext_cols_i64, float_col_in_ext + @as(i64, float_sg.cols));
-                                if (target_col_start >= target_col_end) continue;
-
-                                var target_col_i64 = target_col_start;
-                                while (target_col_i64 < target_col_end) : (target_col_i64 += 1) {
-                                    const target_col: u32 = @intCast(target_col_i64);
-                                    const float_src_col: u32 = @intCast(target_col_i64 - float_col_in_ext);
-                                    const float_cell_idx = @as(usize, float_src_row) * @as(usize, float_sg.cols) + @as(usize, float_src_col);
-                                    const cell: grid_mod.Cell = if (float_cell_idx < float_sg.cells.len)
-                                        float_sg.cells[float_cell_idx]
-                                    else
-                                        .{ .cp = ' ', .hl = 0 };
-                                    const attr = cache.getAttr(&self.hl, cell.hl);
-                                    // The source grid identity is a shaping
-                                    // boundary: base and float text must never
-                                    // form one ligature/kerning run.
-                                    self.row_cells.set(target_col, cell.cp, attr.fg, attr.bg, attr.sp, fent.grid_id, attr.style_flags, @intFromBool(attr.overline));
-                                    self.row_cells.deco_base_flags.items[target_col] = if (viewportCellScrollable(
-                                        float_src_row,
-                                        float_src_col,
-                                        float_sg.rows,
-                                        float_sg.cols,
-                                        float_margins,
-                                    )) c_api.DECO_SCROLLABLE else 0;
-                                    if (ext_glow_enabled) {
-                                        self.row_cells.glow_arr.items[target_col] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
-                                    }
-
-                                    // Every overlaid cell gets an entry, including
-                                    // null overflow, so the float always shadows
-                                    // any base-grid emoji/combining overflow.
-                                    self.flush_float_overlay_buf.putAssumeCapacity(
-                                        .{ .row = row, .col = target_col },
-                                        self.grid.getOverflow(fent.grid_id, float_src_row, float_src_col),
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    // The map pointer is valid only for synchronous row
-                    // generation. Clear it before any frontend row callback;
-                    // defer also covers allocation/rasterization errors.
                     const row_gen_stats = row_gen: {
-                        self.flush_float_overlay = &self.flush_float_overlay_buf;
-                        defer self.flush_float_overlay = null;
                         break :row_gen generateRowVertices(self, .{
                             .row = row,
                             .cols = sg.cols,
@@ -5616,6 +5529,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     const row_ptr = if (ext_verts.items.len == 0) null else ext_verts.items.ptr;
                     // Mirror this row's glyph UVs for atlas reclamation.
                     self.recordGlyphMirrorRow(grid_id, row, viewport_rows, ext_verts.items);
+                    traceRender(self, "event=row_send grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ grid_id, row, ext_verts.items.len, viewport_rows, viewport_cols });
                     row_cb(self.ctx, grid_id, row, 1, row_ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
                 }
                 break :ext_retry; // Normal exit from retry loop
@@ -5800,6 +5714,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                     if (self.flush_aborted) return;
 
+                    traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, ext_verts.items.len });
                     row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                     self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
                 }
@@ -5809,6 +5724,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 // last_ext_cursor_grid cannot be trusted after a prior failed
                 // flush, so clearing every OTHER external grid is a harmless
                 // no-op for clean grids and closes the gap for the misnamed one.
+                traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
                 row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                 self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
             }
@@ -10060,7 +9976,7 @@ test "external anchored float keeps its own viewport margin flags" {
             _ = flags;
             _ = total_rows;
             _ = total_cols;
-            if (grid_id != 2 or verts == null) return;
+            if (grid_id != 3 or verts == null) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
             for (verts.?[0..vert_count]) |vertex| {
                 if (vertex.grid_id != 3) continue;
@@ -14151,6 +14067,64 @@ test "replaceGridSurfaceRowVertexCount keeps grid 1 and a sub-grid on one ledger
     try validateCompletedVertexBudget(&core);
 }
 
+test "render trace is verbose-only and preserves abort destruction retry ordering" {
+    const State = struct {
+        core: *Core,
+        reject: bool = true,
+        bytes: [32768]u8 = undefined,
+        len: usize = 0,
+        fn onLog(ctx: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const message = ptr[0..len];
+            if (!std.mem.startsWith(u8, message, "[render_trace]")) return;
+            const count = @min(len, self.bytes.len - self.len);
+            @memcpy(self.bytes[self.len..][0..count], message[0..count]);
+            self.len += count;
+        }
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.reject) self.core.flush_aborted = true;
+        }
+        fn onDestroy(_: ?*anyopaque, _: i64) callconv(.c) void {}
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = State{ .core = &core };
+    core.log.cb = State.onLog;
+    core.log.ctx = &state;
+    traceRender(&core, "event=probe\n", .{});
+    try std.testing.expectEqual(@as(usize, 0), state.len);
+    core.log.verbose = true;
+    core.log.perf_only = true;
+    traceRender(&core, "event=probe\n", .{});
+    core.log.perf_only = false;
+    core.log.scroll_only = true;
+    traceRender(&core, "event=probe\n", .{});
+    try std.testing.expectEqual(@as(usize, 0), state.len);
+    core.log.scroll_only = false;
+    core.ctx = &state;
+    core.cb.on_flush_end = State.onEnd;
+    core.cb.on_grid_destroy = State.onDestroy;
+    try core.grid.resize(2, 3);
+    try core.grid.resizeGrid(2, 1, 1);
+    try core.grid.destroyGrid(2);
+    var ctx = FlushCtx{ .core = &core };
+    try ctx.onFlush(2, 3);
+    const aborted = state.bytes[0..state.len];
+    try std.testing.expect(std.mem.indexOf(u8, aborted, "event=destroy_stage grid=2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted, "outcome=abort") != null);
+    try std.testing.expect(std.mem.indexOf(u8, aborted, "event=destroy_release") == null);
+    state.len = 0;
+    state.reject = false;
+    try ctx.onFlush(2, 3);
+    const committed = state.bytes[0..state.len];
+    const stage = std.mem.indexOf(u8, committed, "event=destroy_stage grid=2").?;
+    const end = std.mem.indexOf(u8, committed, "outcome=commit").?;
+    const release = std.mem.indexOf(u8, committed, "event=destroy_release grid=2").?;
+    try std.testing.expect(stage < end and end < release);
+    try std.testing.expect(std.mem.indexOf(u8, committed, "metadata_limit_bytes=8388608") != null);
+}
+
 test "surface layout publishes one root layer per surface and only when it changes" {
     const State = struct {
         calls: u32 = 0,
@@ -14237,12 +14211,18 @@ test "surface layout publishes one root layer per surface and only when it chang
     try std.testing.expectEqual(@as(usize, 1), state.destroyed_count);
 }
 
-test "a flush frees a destroyed grid's glyph mirror before it announces the destruction" {
+test "a destroyed grid retains its glyph mirror and retries destruction until flush commit" {
     const State = struct {
         core: *Core,
         destroyed: [4]i64 = @splat(0),
         destroyed_count: usize = 0,
         mirror_live_at_destroy: bool = false,
+        reject: bool = true,
+
+        fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.reject) self.core.flush_aborted = true;
+        }
 
         fn onDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -14265,6 +14245,7 @@ test "a flush frees a destroyed grid's glyph mirror before it announces the dest
     core.cb.on_grid_destroy = State.onDestroy;
 
     // One row the grid is showing, recorded the way a generated row records it.
+    core.cb.on_flush_end = State.onFlushEnd;
     const verts = [_]c_api.Vertex{.{
         .position = .{ 0, 0 },
         .texCoord = .{ 0.5, 0.25 },
@@ -14282,12 +14263,18 @@ test "a flush frees a destroyed grid's glyph mirror before it announces the dest
 
     try std.testing.expectEqual(@as(usize, 1), state.destroyed_count);
     try std.testing.expectEqual(@as(i64, 2), state.destroyed[0]);
-    // A destroyed grid shows nothing, and keeping its rows would pin their
-    // shelves for the rest of the session.
+    try std.testing.expect(state.mirror_live_at_destroy);
+    try std.testing.expect(core.glyph_mirror.contains(2));
+    try std.testing.expectEqual(@as(usize, 1), core.grid.destroyed_pending.items.len);
+
+    state.reject = false;
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(usize, 2), state.destroyed_count);
+    try std.testing.expectEqual(@as(i64, 2), state.destroyed[1]);
     try std.testing.expect(!core.glyph_mirror.contains(2));
-    // Released before the destruction is announced, so no handler can see a
-    // mirror that still claims rows for a grid that is gone.
-    try std.testing.expect(!state.mirror_live_at_destroy);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.destroyed_pending.items.len);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(usize, 2), state.destroyed_count);
 }
 
 test "an aborted flush owes the surface layout again" {
@@ -14383,11 +14370,44 @@ test "an abort after the layout callback owes the surface layout again" {
     try std.testing.expectEqual(@as(u32, 2), state.layout_calls);
 }
 
-test "an external surface publishes only its own root layer" {
+test "surface layout retains all grids beyond the former 64 layer limit" {
+    const State = struct {
+        count: usize = 0,
+        first: i64 = 0,
+        last: i64 = 0,
+        fn onLayout(ctx: ?*anyopaque, _: i64, layers: [*]const c_api.Layer, count: usize, _: u32, _: u32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.count = count;
+            self.first = layers[1].grid_id;
+            self.last = layers[count - 1].grid_id;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(10, 20);
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_surface_layout = State.onLayout;
+    for (2..129) |id| {
+        const gid: i64 = @intCast(id);
+        try core.grid.resizeGrid(gid, 1, 1);
+        try core.grid.setWinFloatPos(gid, gid + 100, 0, 0, @intCast(id), 0, 1);
+        if (id == 63 or id == 64 or id == 65 or id == 128) {
+            notifySurfaceLayouts(&core);
+            try std.testing.expect(!core.flush_aborted);
+            try std.testing.expectEqual(id, state.count);
+            try std.testing.expectEqual(@as(i64, 2), state.first);
+            try std.testing.expectEqual(gid, state.last);
+        }
+    }
+}
+
+test "an external surface publishes its root and anchored float layers" {
     const State = struct {
         seen_ext: bool = false,
         count: usize = 0,
         root: c_api.Layer = undefined,
+        child: c_api.Layer = undefined,
 
         fn onLayout(
             ctx: ?*anyopaque,
@@ -14404,6 +14424,7 @@ test "an external surface publishes only its own root layer" {
             self.seen_ext = true;
             self.count = count;
             self.root = layers[0];
+            if (count > 1) self.child = layers[1];
         }
     };
 
@@ -14419,19 +14440,86 @@ test "an external surface publishes only its own root layer" {
 
     try core.grid.resizeGrid(2, 5, 20);
     try std.testing.expect(try core.grid.setWinExternalPosAt(2, 42, 4, 8));
-    // A float anchored to the external grid is still composited into that
-    // grid's own rows, so it is not a layer of that surface.
+    // Float content is independent of its external anchor's row contents.
     try core.grid.resizeGrid(3, 2, 4);
     try core.grid.setWinFloatPos(3, 43, 6, 11, 50, 0, 2);
 
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.seen_ext);
-    try std.testing.expectEqual(@as(usize, 1), state.count);
+    try std.testing.expectEqual(@as(usize, 2), state.count);
     try std.testing.expectEqual(@as(i64, 2), state.root.grid_id);
     try std.testing.expectEqual(@as(i32, 0), state.root.x_px);
     try std.testing.expectEqual(@as(i32, 0), state.root.y_px);
     try std.testing.expectEqual(@as(u32, 5), state.root.rows);
     try std.testing.expectEqual(@as(u32, 20), state.root.cols);
+    try std.testing.expectEqual(@as(i64, 3), state.child.grid_id);
+    try std.testing.expectEqual(@as(i64, 2), state.child.anchor_grid);
+    try std.testing.expectEqual(@as(i32, 30), state.child.x_px);
+    try std.testing.expectEqual(@as(i32, 40), state.child.y_px);
+    try std.testing.expectEqual(@as(u32, 2), state.child.rows);
+    try std.testing.expectEqual(@as(u32, 4), state.child.cols);
+}
+
+test "surface ownership follows nested anchors and rejects unresolved or cyclic chains" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 5, 20);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.resizeGrid(3, 2, 4);
+    try core.grid.setWinFloatPos(3, 43, 1, 2, 50, 0, 2);
+    try core.grid.resizeGrid(4, 1, 2);
+    try core.grid.setWinFloatPos(4, 44, 2, 3, 60, 0, 3);
+    try std.testing.expectEqual(@as(?i64, 2), surfaceForGrid(&core.grid, 4));
+    const layers = collectSurfaceLayers(&core, 2);
+    try std.testing.expectEqual(@as(usize, 3), layers.len);
+    // A born-external root has no global origin; its sentinel is not a
+    // coordinate to subtract from the nested float's resolved position.
+    try std.testing.expectEqual(@as(i64, 4), layers[2].grid_id);
+    try std.testing.expectEqual(@as(i32, 3), layers[2].x_px);
+    try std.testing.expectEqual(@as(i32, 2), layers[2].y_px);
+
+    core.grid.win_pos.getPtr(3).?.anchor_grid = 99;
+    try std.testing.expectEqual(@as(?i64, null), surfaceForGrid(&core.grid, 4));
+    core.grid.win_pos.getPtr(3).?.anchor_grid = 4;
+    try std.testing.expectEqual(@as(?i64, null), surfaceForGrid(&core.grid, 4));
+    core.grid.win_pos.getPtr(3).?.anchor_grid = 1;
+    try std.testing.expectEqual(@as(?i64, 1), surfaceForGrid(&core.grid, 4));
+}
+
+test "surface migration resends unchanged nested grids but same-surface movement does not" {
+    const Sink = struct {
+        fn layout(_: ?*anyopaque, _: i64, _: [*]const c_api.Layer, _: usize, _: u32, _: u32) callconv(.c) void {}
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cb.on_surface_layout = Sink.layout;
+    core.cell_w_px = 10;
+    core.cell_h_px = 20;
+    try core.grid.resize(20, 40);
+    try core.grid.resizeGrid(2, 20, 40);
+    _ = try core.grid.setWinExternalPos(2, 20);
+    try core.grid.resizeGrid(3, 4, 8);
+    try core.grid.resizeGrid(4, 4, 8);
+    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 1);
+    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3);
+    notifySurfaceLayouts(&core);
+    core.grid.sub_grids.getPtr(3).?.clearDirty();
+    core.grid.sub_grids.getPtr(4).?.clearDirty();
+
+    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 1);
+    notifySurfaceLayouts(&core);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(4).?.dirty);
+
+    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 2);
+    notifySurfaceLayouts(&core);
+    for ([_]i64{ 3, 4 }) |id| {
+        const sg = core.grid.sub_grids.getPtr(id).?;
+        try std.testing.expect(sg.dirty_all);
+        try std.testing.expect(sg.scroll_fast_path_blocked);
+        try std.testing.expectEqual(@as(?i64, 2), core.grid.surfaceForGrid(id));
+    }
 }
 
 test "surface layout places splits and floats as ordered layers" {
