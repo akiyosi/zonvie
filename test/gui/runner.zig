@@ -48,6 +48,11 @@ test "gui:external_window" {
     try @import("scenarios/common/external_window.zig").run(testing.allocator);
 }
 
+test "gui:render_trace" {
+    try requirePrereqs();
+    try @import("scenarios/common/render_trace.zig").run(testing.allocator);
+}
+
 test "gui:set_columns_lines" {
     try requirePrereqs();
     try @import("scenarios/common/set_columns_lines.zig").run(testing.allocator);

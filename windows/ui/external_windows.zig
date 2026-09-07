@@ -679,7 +679,8 @@ fn drawNormalExternalSurfaceRowMode(
     // premultiplied alpha blending accumulates alpha on redrawn rows
     // unless back_tex is cleared first, which requires force_full to
     // set preserve_back=false → should_clear=true in drawEx.
-    const force_full_rows = force_full or
+    const has_layers = tbs_snap.layers.len > 1;
+    const force_full_rows = force_full or has_layers or
         glow_enabled or
         (g.opacity < 1.0);
 
@@ -717,6 +718,7 @@ fn drawNormalExternalSurfaceRowMode(
         // The root layer drives the pixel space core vertices arrive in.
         .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
         .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+        .bloom_layers = if (has_layers) .{ .app = app, .layers = tbs_snap.layers.slice() } else null,
     };
 
     // Ensure row_vbs array covers committed set's row count.
@@ -765,6 +767,25 @@ fn drawNormalExternalSurfaceRowMode(
         }
     }
 
+    if (has_layers) {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
+            .x_offset = 0,
+            .y_offset = 0,
+            .content_right = content_right,
+            .content_height = @intCast(draw_params.content_height),
+            .row_h_px = row_h_px,
+            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+            .preserve_back = !force_full_rows,
+            .paint_full = force_full_rows,
+            .cursor_grid = tbs_snap.cursor_layer_grid_id,
+            .last_cursor_row = ext_win.last_painted_cursor_row,
+            .rows_to_draw = rows_to_draw.items,
+            .log_enabled = log_enabled,
+        });
+    }
+
     // TBS lock-free draw: committed set is protected by refcount,
     // no app.mu needed during VB upload + draw.
     const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
@@ -786,30 +807,69 @@ fn drawNormalExternalSurfaceRowMode(
     }
     if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
 
-    // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-    try app_mod.drawCursorOverlay(g, .{
-        .cursor_verts = tbs_cursor.verts.items,
-        .cursor_row = tbs_cursor.last_cursor_row,
-        .cursor_vb = &ext_win.cursor_vb,
-        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
-        .row_vbs = ext_win.row_vbs.items,
-        .row_map = tbs_committed.row_map.items,
-        .pool = &ext_win.tbs.pool,
-        .blink_visible = cursor_blink_visible,
-        .content_right = content_right,
-        .content_width = app_mod.rowModeViewportWidth(g, draw_params),
-        .content_height = draw_params.content_height,
-        .row_h_px = row_h_px,
-        .ctx_ptr = result.ctx_ptr,
-        .rs_set_sc_fn = result.rs_set_sc_fn,
-        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-        // External windows preserve back_tex and may not redraw the cursor row on
-        // an in-place shape change, so erase the stale overlay before redrawing.
-        // A full-row frame already cleared the back texture and redrew every row;
-        // clearing again would accumulate alpha on the cursor row when transparent.
-        .erase_cursor_row = !force_full_rows,
-        .row_already_redrawn = force_full_rows,
-    });
+    {
+        const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
+        if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
+        defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
+        if (has_layers) {
+            app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
+                .x = 0,
+                .y = 0,
+                .w = @floatFromInt(app_mod.rowModeViewportWidth(g, draw_params)),
+                .h = @floatFromInt(draw_params.content_height),
+            }, 0, 0, content_right, row_h_px, result.ctx_ptr, result.rs_set_sc_fn, log_enabled);
+        }
+        var cursor_origin_x: f32 = 0;
+        var cursor_origin_y: f32 = 0;
+        var cursor_layer_row: ?*app_mod.RowVerts = null;
+        var cursor_row_dy_px: f32 = 0;
+        if (tbs_snap.cursor_layer_grid_id != grid_id) {
+            for (tbs_snap.layers.slice()) |layer| {
+                if (layer.grid_id != tbs_snap.cursor_layer_grid_id) continue;
+                cursor_origin_x = @floatFromInt(layer.x_px);
+                cursor_origin_y = @floatFromInt(layer.y_px);
+                if (app.layer_grids.get(layer.grid_id)) |state| {
+                    if (tbs_cursor.last_cursor_row) |row| {
+                        if (row < state.rows_buf.items.len) {
+                            cursor_layer_row = &state.rows_buf.items[row];
+                            if (row < state.origin_rows.items.len) {
+                                cursor_row_dy_px = @floatFromInt((@as(i32, @intCast(row)) - @as(i32, @intCast(state.origin_rows.items[row]))) * row_h_px);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
+        try app_mod.drawCursorOverlay(g, .{
+            .cursor_verts = tbs_cursor.verts.items,
+            .cursor_row = tbs_cursor.last_cursor_row,
+            .cursor_vb = &ext_win.cursor_vb,
+            .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
+            .row_vbs = ext_win.row_vbs.items,
+            .row_map = tbs_committed.row_map.items,
+            .pool = &ext_win.tbs.pool,
+            .blink_visible = cursor_blink_visible,
+            .content_right = content_right,
+            .content_width = app_mod.rowModeViewportWidth(g, draw_params),
+            .content_height = draw_params.content_height,
+            .row_h_px = row_h_px,
+            .ctx_ptr = result.ctx_ptr,
+            .rs_set_sc_fn = result.rs_set_sc_fn,
+            .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
+            // External windows preserve back_tex and may not redraw the cursor row on
+            // an in-place shape change, so erase the stale overlay before redrawing.
+            // A full-row frame already cleared the back texture and redrew every row;
+            // clearing again would accumulate alpha on the cursor row when transparent.
+            .erase_cursor_row = !force_full_rows,
+            .row_already_redrawn = force_full_rows,
+            .cursor_layer_origin_x_px = cursor_origin_x,
+            .cursor_layer_origin_y_px = cursor_origin_y,
+            .cursor_layer_row = cursor_layer_row,
+            .cursor_layer_row_dy_px = cursor_row_dy_px,
+        });
+    }
 
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
@@ -1858,6 +1918,12 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     app.mu.unlock(core.clock.io());
+
+    // Layout and rows may have arrived before this HWND was registered.
+    // Never acquire the core lock while holding app.mu (callbacks take the
+    // locks in the opposite direction).
+    core.zonvie_core_force_resend(app.corep);
+    if (app.corep) |corep| app_mod.zonvie_core_retry_flush(corep);
 
     // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
     // call and must not run with app.mu held. Registration is what makes the
@@ -3207,6 +3273,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // TBS: acquire committed set for painting (lock-free vertex reads).
     const tbs_snapshot = ext_win.tbs.acquireForPaint(app.alloc);
     defer {
+        var layers = tbs_snapshot.layers;
+        layers.deinit();
         const needs_reinvalidate = ext_win.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
         if (ext_win.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
             if (!app.atlas_reset_active.load(.seq_cst)) {
