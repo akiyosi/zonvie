@@ -160,6 +160,14 @@ fn fastPathFrames(alloc: std.mem.Allocator, since_ms: f64) !FastPath {
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {
+    return runWithConfig(alloc, "test/gui/fixtures/config");
+}
+
+pub fn runOpaque(alloc: std.mem.Allocator) !void {
+    return runWithConfig(alloc, "test/gui/fixtures/config_hosted_opaque");
+}
+
+fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // A host without screen capture must skip honestly rather than fail from
     // deep inside a capture call.
     try fixture.requireScreenAccess();
@@ -168,7 +176,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
 
-    var g = try fixture.openWithLog(alloc, log_path);
+    var g = try fixture.openWithLogAndConfig(alloc, log_path, config_dir);
     defer g.deinit();
     g.activateApp();
 
@@ -383,4 +391,23 @@ pub fn run(alloc: std.mem.Allocator) !void {
         region,
         .{},
     );
+    if (std.mem.endsWith(u8, config_dir, "config_hosted_opaque")) {
+        try g.exec("luaeval('(function() vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(_G.z_float), 1, 2, false, {\"CHANGED HOSTED ROW\"}) return 1 end)()')");
+        var partial = try captureWindowStable(alloc, ext_win.number, 8000);
+        defer partial.deinit(alloc);
+        if (visual.regionDiffRatio(jumped, partial, region, 6) <= 0.0002) return error.HostedRowDidNotChange;
+        try g.exec("execute('redraw!')");
+        var full = try captureWindowStable(alloc, ext_win.number, 8000);
+        defer full.deinit(alloc);
+        try visual.assertRegionUnchanged(alloc, "hosted_partial_matches_full", full, partial, region, .{});
+        const partial_lines = try app_log.linesSince(alloc, log_path, "event=hosted_partial", 0);
+        defer alloc.free(partial_lines);
+        var saw_partial_band = false;
+        var partial_it = std.mem.splitScalar(u8, partial_lines, '\n');
+        while (partial_it.next()) |line| {
+            const rows = app_log.field(line, "dirty_rows") orelse continue;
+            if (rows > 0 and rows < @as(f64, @floatFromInt(a_height))) saw_partial_band = true;
+        }
+        if (!saw_partial_band) return error.HostedPartialPathDidNotRun;
+    }
 }

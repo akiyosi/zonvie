@@ -3870,6 +3870,7 @@ final class ZonvieCore {
     // Protected by externalGridViewsLock; rebuilt on layout changes only.
     private var gridSurfaceOwners: [Int64: Int64] = [:]
     private var pendingGridSurfaceOwners: [Int64: Int64]?
+    private var surfaceOwnerRemovalScratch: [Int64] = []
     private var pendingGridDestroys: [Int64] = []
     /// Protects externalGridViews for cross-thread read access from core thread.
     private let externalGridViewsLock = NSLock()
@@ -6762,7 +6763,13 @@ final class ZonvieCore {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=layout_stage surface=\(surfaceId) layers=\(layers.count) rows=\(surfaceRows) cols=\(surfaceCols)")
         externalGridViewsLock.lock()
         if pendingGridSurfaceOwners == nil { pendingGridSurfaceOwners = gridSurfaceOwners }
+        surfaceOwnerRemovalScratch.removeAll(keepingCapacity: true)
         for (grid, owner) in pendingGridSurfaceOwners! where owner == surfaceId {
+            surfaceOwnerRemovalScratch.append(grid)
+        }
+        // Finish iteration before mutation to avoid retaining an iterator's
+        // dictionary snapshot across the first removal.
+        for grid in surfaceOwnerRemovalScratch {
             pendingGridSurfaceOwners!.removeValue(forKey: grid)
         }
         for layer in layers { pendingGridSurfaceOwners![layer.gridId] = surfaceId }
@@ -6778,6 +6785,10 @@ final class ZonvieCore {
             view.setPendingSurfaceLayers(layers)
         } else if view == nil {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=layout_defer surface=\(surfaceId) reason=host_not_registered")
+            // No receiver has accepted placement or rows. Preserve the core
+            // transaction until registration schedules a full retry.
+            if let core { zonvie_core_abort_flush(core) }
+            externalFlushAborted = true
         }
     }
 

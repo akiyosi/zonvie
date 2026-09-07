@@ -616,12 +616,39 @@ private enum SurfaceRowProvisionTests {
         )
     }
 
+    private static func verifyLayerGrowthWithoutRetry(device: MTLDevice) {
+        let registry = GridBufferRegistry()
+        let vertex = Vertex(position: .zero, texCoord: .zero, color: .zero,
+            grid_id: 7, deco_flags: 0, deco_phase: 0)
+        let vertices = Array(repeating: vertex, count: 1024)
+        // New grids and changing content sizes must succeed in the submitting
+        // flush, without an asynchronous provision/retry round trip.
+        for gridId in [Int64(7), 8, 9] {
+            let sets = registry.sets(for: gridId)
+            var source = 0
+            for count in [6, 48, 282, 1024, 6, 282] {
+                let target = (source + 1) % 3
+                copySurfaceBufferSetRowState(from: sets[source], to: sets[target])
+                for row in 0..<4 {
+                    let accepted = vertices.withUnsafeBufferPointer { buffer in
+                        submitSurfaceRowVertices(target: sets[target], sourceSet: sets[source],
+                            device: device, rowStart: row, ptr: UnsafeRawPointer(buffer.baseAddress!),
+                            count: count, maxRowBuffers: 16, totalRows: 4, totalCols: 80)
+                    }
+                    require(accepted, "ordinary layer growth must not require a retry")
+                }
+                source = target
+            }
+        }
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
             exit(1)
         }
 
+        verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
 

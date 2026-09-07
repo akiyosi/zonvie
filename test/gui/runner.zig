@@ -333,6 +333,13 @@ test "gui:visual_extfloat_over_scrolled_anchor" {
     }
 }
 
+test "gui:visual_extfloat_opaque_partial" {
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").runOpaque(testing.allocator);
+    } else return error.SkipZigTest;
+}
+
 test "gui:visual_extfloat_over_born_external_anchor" {
     // macOS only: enumerates the app's OS windows to find the external one
     // and captures that window rather than the main one.

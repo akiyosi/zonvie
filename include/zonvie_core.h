@@ -355,7 +355,9 @@ typedef struct zonvie_layer {
    ordering — only on both being visible together at on_flush_end. A grid
    missing from every surface keeps its buffers until on_grid_destroy; the
    frontend must tolerate a layer whose grid has no committed rows yet, and
-   rows arriving for a grid that is in no layer. */
+   rows arriving for a grid that is in no layer. A surface cursor overlay must
+   stop displaying a removed layer's cursor when this layout commits, even
+   if no subsequent cursor callback names that removed grid. */
 typedef void (*zonvie_on_surface_layout_fn)(
     void* ctx,
     int64_t surface_id,

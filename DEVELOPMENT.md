@@ -229,7 +229,28 @@ their back texture for unchanged, non-glow blink frames. The verbose
 that path. This is an operation-count diagnostic, not a measured frame-time
 improvement. Release before/after GPU timings remain outstanding. Windows
 still conservatively redraws all rows when hosted layers are present, and
-macOS hosted content updates/glow still use full recomposition.
+macOS uses dirty surface bands for opaque, non-glow hosted content updates
+without layout changes or active root scrolling. Blur, glow, layout changes,
+and animated frames still use full recomposition; hosted GPU pixel copies
+remain disabled.
+
+Hosted rows use the existing synchronous row-buffer growth and reuse path,
+just like root rows. Ordinary capacity growth must not abort a flush and
+enter the asynchronous retry backoff. The Metal regression test submits
+new grids and growing row contents across all three write sets without a
+provision/retry round trip. The withdrawn asynchronous layer provisioning
+caused three capacity-driven aborts and 112 ms of retry timers in a user
+trace (about 320 ms from float placement to CPU commit, not GPU presentation).
+After withdrawal, the Debug opaque-hosted GUI scenario recorded placement
+to frontend commit in 11.7 ms on the main surface and 5.7 ms on the external
+surface, both in the first submitting flush. These are verbose-log CPU
+timings from a different scene, not a before/after speedup or GPU latency.
+No Release frame-time or Windows hardware performance measurements have
+been made for this follow-up; GUI image comparisons validate correctness,
+not latency.
+The opaque hosted-row GUI scenario observed a six-row damage band on a
+20-row external surface and matched the resulting image against a full
+redraw. This is a damage-count observation, not a frame-time measurement.
 
 ### ABI reference
 
