@@ -48,8 +48,12 @@ pub fn open(alloc: std.mem.Allocator) !*Gui {
 /// lines at overlapping timestamps and any count taken from it spans more
 /// than the run being measured.
 pub fn openWithLog(alloc: std.mem.Allocator, log_path: []const u8) !*Gui {
+    return openWithLogAndConfig(alloc, log_path, "test/gui/fixtures/config");
+}
+
+pub fn openWithLogAndConfig(alloc: std.mem.Allocator, log_path: []const u8, config_dir: []const u8) !*Gui {
     try requireScreenAccess();
-    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
+    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path }, .config_dir = config_dir });
     errdefer g.deinit();
     // Pin the window to a fixed screen position so subpixel (ClearType)
     // rendering is identical run-to-run; the OS otherwise places the window

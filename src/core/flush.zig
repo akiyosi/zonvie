@@ -2654,6 +2654,7 @@ fn dispatchGridRowScroll(
     grid_id: i64,
 ) bool {
     if (grid_id < 2) return false;
+    if (placedSurfaceForGrid(&core.grid, grid_id) == null) return false;
     // An external grid has no frontend surface to remap into until its open
     // callback has seeded one; a layer of the main surface always has one.
     if (core.grid.external_grids.contains(grid_id) and
@@ -4354,6 +4355,13 @@ pub fn surfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
     return grid.surfaceForGrid(grid_id);
 }
 
+/// Resolving an anchor id does not imply that its surface has a root layout.
+fn placedSurfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
+    const surface = surfaceForGrid(grid, grid_id) orelse return null;
+    _ = grid.bufForConst(surface) orelse return null;
+    return surface;
+}
+
 fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
     self.grid_entries.clearRetainingCapacity();
     var it = self.grid.win_pos.iterator();
@@ -4362,7 +4370,7 @@ fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
         if (grid_id == 1) continue;
         // An external grid is its own surface, never a layer of another.
         if (self.grid.external_grids.contains(grid_id)) continue;
-        if (surfaceForGrid(&self.grid, grid_id) != surface_id) continue;
+        if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
 
@@ -4463,7 +4471,7 @@ fn mainSurfaceHasLayers(self: *Core) bool {
         const grid_id = e.key_ptr.*;
         if (grid_id == 1) continue;
         if (self.grid.external_grids.contains(grid_id)) continue;
-        if (surfaceForGrid(&self.grid, grid_id) != 1) continue;
+        if (placedSurfaceForGrid(&self.grid, grid_id) != 1) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
         return true;
@@ -4486,7 +4494,7 @@ fn collectEmitGrids(self: *Core) void {
     var it = self.grid.win_pos.keyIterator();
     while (it.next()) |id| {
         if (id.* == 1 or self.grid.external_grids.contains(id.*)) continue;
-        if (surfaceForGrid(&self.grid, id.*) == null) continue;
+        if (placedSurfaceForGrid(&self.grid, id.*) == null) continue;
         const sg = self.grid.sub_grids.get(id.*) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
         self.emit_grid_ids.append(self.alloc, &self.layout_budget, id.*) catch |err| {
@@ -14520,6 +14528,36 @@ test "surface migration resends unchanged nested grids but same-surface movement
         try std.testing.expect(sg.scroll_fast_path_blocked);
         try std.testing.expectEqual(@as(?i64, 2), core.grid.surfaceForGrid(id));
     }
+}
+
+test "a float waits for its surface root layout without dirtying an unresolved main surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(20, 40);
+    try core.grid.resizeGrid(3, 4, 8);
+    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 99);
+    core.grid.main_buf.clearDirty();
+    const revision = core.grid.content_rev;
+    core.grid.noteGridLine(3, 1);
+    try std.testing.expectEqual(revision, core.grid.content_rev);
+    try std.testing.expect(!core.grid.main_buf.dirty);
+
+    // Registration is allowed to precede grid_resize. Child rows must not
+    // escape merely because the anchor now resolves to an external id.
+    _ = try core.grid.setWinExternalPos(99, 99);
+    collectEmitGrids(&core);
+    try std.testing.expect(std.mem.indexOfScalar(i64, core.emit_grid_ids.items, 3) == null);
+    try std.testing.expectEqual(@as(usize, 0), collectSurfaceLayers(&core, 99).len);
+    try core.grid.resizeGrid(99, 20, 40);
+    collectEmitGrids(&core);
+    try std.testing.expect(std.mem.indexOfScalar(i64, core.emit_grid_ids.items, 3) != null);
+    try std.testing.expectEqual(@as(usize, 2), collectSurfaceLayers(&core, 99).len);
+
+    try core.grid.resizeGrid(4, 2, 4);
+    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3);
+    core.grid.sub_grids.getPtr(3).?.clearDirty();
+    core.grid.noteGridLine(4, 2);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
 }
 
 test "surface layout places splits and floats as ordered layers" {

@@ -3205,6 +3205,21 @@ pub fn onSurfaceLayout(
         };
     }
     tbs.stageLayers(staged);
+    const cursor_owner = tbs.cursorLayerGridIdInFlush();
+    var owner_present = false;
+    for (layers[0..count]) |layer| {
+        if (layer.grid_id == cursor_owner) {
+            owner_present = true;
+            break;
+        }
+    }
+    if (!owner_present) {
+        if (!tbs.storeMainCursor(app.alloc, &.{}, null)) {
+            failFlush(app);
+            return;
+        }
+        tbs.stageCursorLayerGrid(surface_id);
+    }
     traceRender(app, "event=layout_stage surface={d} layers={d} metadata_bytes={d}\n", .{ surface_id, count, app.layout_budget.live_bytes.load(.monotonic) });
     if (app.external_windows.get(surface_id)) |ext_win| ext_win.needs_redraw = true;
     // Layout-only updates must request paint as well as publish placement.
@@ -3285,8 +3300,9 @@ fn storeMainSurfaceLayerRowLocked(
     total_rows: u32,
     total_cols: u32,
 ) bool {
-    const ext = externalSurfaceForGridLocked(app, grid_id);
-    if (!mainSurfaceOwnsGridLocked(app, grid_id) and ext == null) return false;
+    const on_main = mainSurfaceOwnsGridLocked(app, grid_id);
+    const ext = if (on_main) null else externalSurfaceForGridLocked(app, grid_id);
+    if (!on_main and ext == null) return false;
     traceRender(app, "event=row_route surface={d} grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ if (ext) |host| traceExternalSurfaceId(host, grid_id) else @as(i64, 1), grid_id, row, verts.len, total_rows, total_cols });
     if (ext) |host| host.needs_redraw = true;
 

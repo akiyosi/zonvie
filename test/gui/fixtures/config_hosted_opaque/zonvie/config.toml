@@ -1,0 +1,7 @@
+[window]
+blur = false
+opacity = 1.0
+
+[log]
+enabled = true
+verbose = true
