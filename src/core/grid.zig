@@ -1602,6 +1602,8 @@ pub const Grid = struct {
         self.sub_grids.deinit(self.alloc);
         self.sub_grids = .{};
         self.total_grid_cells = self.main_buf.cells.len;
+        // A destroy owed to the old attachment can name a grid the new one has live.
+        self.destroyed_pending.clearRetainingCapacity();
         self.win_pos.deinit(self.alloc);
         self.win_pos = .{};
         self.grid_win_ids.deinit(self.alloc);
@@ -5023,4 +5025,18 @@ test "an accumulated sub-grid scroll carries its dirty marks with the content" {
     try std.testing.expect(sg.isRowDirty(9));
     try std.testing.expect(!sg.isRowDirty(0));
     try std.testing.expect(!sg.isRowDirty(7));
+}
+
+test "a session reset drops the destroys owed to the old session" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 4, 8);
+
+    // Still owed, because the flush carrying it never committed.
+    try grid.destroyGrid(2);
+    try std.testing.expectEqualSlices(i64, &.{2}, grid.destroyed_pending.items);
+
+    grid.resetForNewSession();
+    try std.testing.expectEqual(@as(usize, 0), grid.destroyed_pending.items.len);
 }
