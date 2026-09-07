@@ -75,6 +75,13 @@ final class ZonvieCore {
     /// Off by default — the logging cost itself perturbs the pipeline.
     /// Set from config.log.verbose during configureLogging.
     static var appLogVerbose = false
+    // Core callback thread only; shared with every surface in this bracket.
+    private var renderTraceFlushId: UInt64 = 0
+
+    static func renderTrace(_ message: @autoclosure () -> String) {
+        guard appLogEnabled && appLogVerbose && !appLogPerfOnly && !appLogScrollOnly else { return }
+        appLog("[render_trace] side=macos \(message())")
+    }
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
     /// Process start time captured at first appLog reference; used to prefix
@@ -514,6 +521,7 @@ final class ZonvieCore {
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
 
                 // Notify that Neovim is ready (first vertices received)
+                ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_receive grid=\(gridId) row=\(rowStart) row_count=\(rowCount) vertices=\(vertCount) flags=\(flags)")
                 if !core.hasNotifiedReady {
                     core.hasNotifiedReady = true
                     ZonvieCore.appLog("zonvie: posting neovimReadyNotification")
@@ -552,7 +560,28 @@ final class ZonvieCore {
 
                     core.externalGridViewsLock.lock()
                     let gridView = core.externalGridViews[gridId]
+                    let ownerId = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gridId]
+                    let hostView = ownerId.flatMap { core.externalGridViews[$0] }
                     core.externalGridViewsLock.unlock()
+
+                    // The host's asynchronous creation schedules a full replay.
+                    // Do not mistake a hosted float for another OS window.
+                    if gridView == nil, let ownerId, ownerId != 1 && ownerId != gridId && hostView == nil {
+                        ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(ownerId) grid=\(gridId) reason=host_not_registered")
+                        return
+                    }
+
+                    if gridView == nil, let hostView {
+                        ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=\(ownerId ?? 0) grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
+                        guard core.beginExternalFlushIfNeeded(hostView) else { return }
+                        if (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
+                            hostView.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
+                        } else {
+                            hostView.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
+                                count: Int(vertCount), totalRows: tr, totalCols: tc)
+                        }
+                        return
+                    }
 
                     if gridView == nil,
                        let renderer = core.terminalView?.renderer,
@@ -935,10 +964,17 @@ final class ZonvieCore {
                     me.loggedFirstFlushBegin = true
                     ZonvieCore.appLog("[startup] first on_flush_begin")
                 }
+                me.renderTraceFlushId &+= 1
+                me.terminalView?.renderer.renderTraceFlushId = me.renderTraceFlushId
+                ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=begin")
                 let result = me.terminalView?.renderer.beginFlush() ?? .dropped
                 guard let corePtr = me.core else { return }
                 me.extViewsScratch.removeAll(keepingCapacity: true)
                 me.externalFlushAborted = false
+                me.pendingGridDestroys.removeAll(keepingCapacity: true)
+                me.externalGridViewsLock.lock()
+                me.pendingGridSurfaceOwners = nil
+                me.externalGridViewsLock.unlock()
 
                 switch result {
                 case .dropped:
@@ -978,6 +1014,12 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 defer {
+                    let aborted = me.core.map { zonvie_core_flush_was_aborted($0) } ?? true
+                    ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=end outcome=\(aborted ? "abort" : "commit") destroyed_pending=\(me.pendingGridDestroys.count) metadata_budget=enforcement_pending")
+                    me.externalGridViewsLock.lock()
+                    me.pendingGridSurfaceOwners = nil
+                    me.externalGridViewsLock.unlock()
+                    me.pendingGridDestroys.removeAll(keepingCapacity: true)
                     if FrameTracer.enabled {
                         let aborted = me.core.map { zonvie_core_flush_was_aborted($0) } ?? true
                         FrameTracer.trace(.coreFlushEnd, a: aborted ? 1 : 0)
@@ -1119,6 +1161,13 @@ final class ZonvieCore {
                 for gridView in me.extViewsScratch {
                     gridView.commitFlush()
                 }
+                me.externalGridViewsLock.lock()
+                if let owners = me.pendingGridSurfaceOwners { me.gridSurfaceOwners = owners }
+                me.externalGridViewsLock.unlock()
+                for gridId in me.pendingGridDestroys {
+                    me.onGridDestroy(gridId: gridId)
+                }
+                me.pendingGridDestroys.removeAll(keepingCapacity: true)
                 // commitFlush activates each touched view's automatic draw loop;
                 // a second requestRedraw dispatch per view only allocated more
                 // main-queue work and could redraw untouched surfaces.
@@ -1210,11 +1259,19 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 let gid = Int64(gridId)
+                ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_shift_receive grid=\(gid) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
                 // Call applyRowScroll directly from core thread — it operates
                 // on the write set (owned by flush bracket) under tripleBufferLock.
                 core.externalGridViewsLock.lock()
                 let view = core.externalGridViews[gid]
+                let host = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gid].flatMap { core.externalGridViews[$0] }
                 core.externalGridViewsLock.unlock()
+                if view == nil, let host {
+                    guard core.beginExternalFlushIfNeeded(host) else { return }
+                    host.applyLayerRowScroll(gridId: gid, rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        rowsDelta: Int(rowsDelta), totalRows: Int(totalRows), totalCols: Int(totalCols))
+                    return
+                }
                 guard let view = view else {
                     // A grid the main surface places as a layer shifts its own
                     // row slots in that surface's renderer.
@@ -1300,7 +1357,8 @@ final class ZonvieCore {
             on_grid_destroy: { ctx, gridId in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onGridDestroy(gridId: gridId)
+                ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=destroy_stage grid=\(gridId)")
+                me.pendingGridDestroys.append(gridId)
             }
         )
 
@@ -3205,6 +3263,10 @@ final class ZonvieCore {
         autoreleasepool {
             let data = Data(bytes: bytes, count: max(0, len))
             if let s = String(data: data, encoding: .utf8) {
+                if s.hasPrefix("[render_trace] ") {
+                    ZonvieCore.appLog("[render_trace] flush=\(renderTraceFlushId) \(s.dropFirst(15))")
+                    return
+                }
                 // The core already applied its own tier filter before calling
                 // us; classify by prefix so perf_only/scroll_only do not drop
                 // what it deliberately let through.
@@ -3805,6 +3867,10 @@ final class ZonvieCore {
     /// Mutations happen on main thread only (window create/close).
     /// Reads also happen from core thread (flush callbacks) under externalGridViewsLock.
     private var externalGridViews: [Int64: ExternalGridView] = [:]
+    // Protected by externalGridViewsLock; rebuilt on layout changes only.
+    private var gridSurfaceOwners: [Int64: Int64] = [:]
+    private var pendingGridSurfaceOwners: [Int64: Int64]?
+    private var pendingGridDestroys: [Int64] = []
     /// Protects externalGridViews for cross-thread read access from core thread.
     private let externalGridViewsLock = NSLock()
     /// Per-flush snapshot scratch for external grid views (CORE THREAD ONLY —
@@ -3818,6 +3884,7 @@ final class ZonvieCore {
 
     private func beginExternalFlushIfNeeded(_ gridView: ExternalGridView) -> Bool {
         if externalFlushAborted { return false }
+        gridView.renderTraceFlushId = renderTraceFlushId
         switch gridView.beginFlushIfNeeded() {
         case .alreadyOpen:
             return true
@@ -3825,6 +3892,7 @@ final class ZonvieCore {
             extViewsScratch.append(gridView)
             return true
         case .failed:
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=\(gridView.gridId)")
             externalFlushAborted = true
             terminalView?.renderer.abortFlush()
             if let core {
@@ -6691,6 +6759,14 @@ final class ZonvieCore {
         surfaceRows: UInt32,
         surfaceCols: UInt32
     ) {
+        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=layout_stage surface=\(surfaceId) layers=\(layers.count) rows=\(surfaceRows) cols=\(surfaceCols)")
+        externalGridViewsLock.lock()
+        if pendingGridSurfaceOwners == nil { pendingGridSurfaceOwners = gridSurfaceOwners }
+        for (grid, owner) in pendingGridSurfaceOwners! where owner == surfaceId {
+            pendingGridSurfaceOwners!.removeValue(forKey: grid)
+        }
+        for layer in layers { pendingGridSurfaceOwners![layer.gridId] = surfaceId }
+        externalGridViewsLock.unlock()
         if surfaceId == 1 {
             terminalView?.renderer?.setPendingSurfaceLayers(layers)
             return
@@ -6698,15 +6774,21 @@ final class ZonvieCore {
         externalGridViewsLock.lock()
         let view = externalGridViews[surfaceId]
         externalGridViewsLock.unlock()
-        view?.setPendingSurfaceLayers(layers)
+        if let view, beginExternalFlushIfNeeded(view) {
+            view.setPendingSurfaceLayers(layers)
+        } else if view == nil {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=layout_defer surface=\(surfaceId) reason=host_not_registered")
+        }
     }
 
     /// Neovim destroyed the grid; release the vertex storage held for it.
     private func onGridDestroy(gridId: Int64) {
         guard gridId != 1 else { return }
+        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=destroy_release grid=\(gridId)")
         terminalView?.renderer?.gridBuffers.release(gridId: gridId)
         terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
         externalGridViewsLock.lock()
+        gridSurfaceOwners.removeValue(forKey: gridId)
         let isOwnSurface = externalGridViews[gridId] != nil
         let hosts = isOwnSurface ? [] : Array(externalGridViews.values)
         externalGridViewsLock.unlock()
@@ -6738,9 +6820,12 @@ final class ZonvieCore {
                 return
             }
 
-            if let extWindow = self.externalWindows[gridId] {
+            self.externalGridViewsLock.lock()
+            let surfaceId = self.gridSurfaceOwners[gridId] ?? gridId
+            self.externalGridViewsLock.unlock()
+            if let extWindow = self.externalWindows[surfaceId] {
                 extWindow.makeKeyAndOrderFront(nil)
-                if let gridView = self.externalGridViews[gridId] {
+                if let gridView = self.externalGridViews[surfaceId] {
                     extWindow.makeFirstResponder(gridView)
                 }
                 ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId)")

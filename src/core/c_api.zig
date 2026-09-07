@@ -15,6 +15,7 @@ pub const clock = @import("clock.zig");
 pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
+pub const render_layout = @import("render_layout.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -2626,6 +2627,9 @@ pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void
 // cursor_col), so one cursor_rev bump covers whichever grid currently
 // owns it, main or external.
 fn forceResendAll(cp: *core.Core) void {
+    // A newly registered surface needs placement as well as retained rows.
+    var layout_it = cp.last_surface_layout.valueIterator();
+    while (layout_it.next()) |layout| layout.valid = false;
     cp.grid.markAllDirty();
     var sub_it = cp.grid.sub_grids.iterator();
     while (sub_it.next()) |entry| {

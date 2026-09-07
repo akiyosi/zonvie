@@ -452,27 +452,8 @@ pub const SurfaceLayer = struct {
     follows_scroll: bool,
 };
 
-/// Layer lists are bounded by the core's own placement cap; anything beyond
-/// this is dropped rather than allocated on the paint path.
-pub const MAX_SURFACE_LAYERS: usize = 64;
-
-/// A surface's committed layer list, back-to-front. Fixed capacity so the
-/// paint path never allocates.
-pub const SurfaceLayers = struct {
-    items: [MAX_SURFACE_LAYERS]SurfaceLayer = undefined,
-    len: usize = 0,
-
-    pub fn slice(self: *const SurfaceLayers) []const SurfaceLayer {
-        return self.items[0..self.len];
-    }
-
-    /// The layer the surface's own grid occupies, or null before the first
-    /// layout arrives.
-    pub fn root(self: *const SurfaceLayers) ?SurfaceLayer {
-        if (self.len == 0) return null;
-        return self.items[0];
-    }
-};
+/// Immutable while retained by a paint; capacity is reused after retirement.
+pub const SurfaceLayers = core.render_layout.List(SurfaceLayer);
 
 pub const SurfaceState = struct {
     verts: std.ArrayListUnmanaged(Vertex) = .empty,
@@ -683,6 +664,7 @@ pub const TripleBufferedSurface = struct {
     // become visible in the same transaction.
     flush_layers: ?SurfaceLayers = null,
     committed_layers: SurfaceLayers = .{},
+    spare_layers: SurfaceLayers = .{},
     /// Which grid owns the surface's one cursor. Staged by the cursor
     /// callback and promoted with the cursor set.
     flush_cursor_layer_grid_id: ?i64 = null,
@@ -892,6 +874,7 @@ pub const TripleBufferedSurface = struct {
         if (self.is_in_flush) self.sparse_sync.row_sync_full[self.write_index] = true;
         // An aborted flush's staged state must not be promoted by the next
         // successful commit: the core re-sends everything after an abort.
+        if (self.flush_layers) |*staged| staged.deinit();
         self.flush_layers = null;
         self.flush_cursor_layer_grid_id = null;
         self.is_in_flush = false;
@@ -903,7 +886,15 @@ pub const TripleBufferedSurface = struct {
 
     /// Stage this surface's layer list. Core thread, inside the flush bracket.
     pub fn stageLayers(self: *TripleBufferedSurface, layers: SurfaceLayers) void {
+        if (self.flush_layers) |*staged| staged.deinit();
         self.flush_layers = layers;
+    }
+
+    pub fn prepareLayers(self: *TripleBufferedSurface, alloc: std.mem.Allocator, budget: *core.render_layout.Budget, count: usize) !SurfaceLayers {
+        try self.spare_layers.resize(alloc, budget, count);
+        const layers = self.spare_layers;
+        self.spare_layers = .{};
+        return layers;
     }
 
     /// Stage which grid owns the surface's one cursor. Promoted with the
@@ -921,15 +912,18 @@ pub const TripleBufferedSurface = struct {
 
     /// Commit the write set as the new committed set.
     pub fn commitFlush(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
-        if (!self.is_in_flush and !self.main_cursor_in_flush) return;
+        if (!self.is_in_flush and !self.main_cursor_in_flush and self.flush_layers == null) return;
 
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
 
         // Layers and the vertices they place become visible together.
         if (self.flush_layers) |staged| {
+            self.spare_layers.deinit();
+            self.spare_layers = self.committed_layers;
             self.committed_layers = staged;
             self.flush_layers = null;
+            self.pending_paint_full = true;
         }
         if (self.flush_cursor_layer_grid_id) |staged_grid| {
             self.committed_cursor_layer_grid_id = staged_grid;
@@ -1164,7 +1158,7 @@ pub const TripleBufferedSurface = struct {
             .committed_index = ci,
             .cursor_index = cursor_ci,
             .paint_full = paint_full,
-            .layers = self.committed_layers,
+            .layers = self.committed_layers.retain(),
             .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
@@ -1354,6 +1348,10 @@ pub const TripleBufferedSurface = struct {
 
     /// Free all resources.
     pub fn deinit(self: *TripleBufferedSurface, alloc: std.mem.Allocator) void {
+        if (self.flush_layers) |*staged| staged.deinit();
+        self.flush_layers = null;
+        self.committed_layers.deinit();
+        self.spare_layers.deinit();
         // Release all slot references from each set.
         for (&self.sets) |*set| {
             set.releaseAllSlots(alloc, &self.pool);
@@ -1933,6 +1931,9 @@ pub const LayerGridState = struct {
     /// Row scroll accumulated over the open flush and installed by
     /// applyStaged, for the paint to turn into one GPU copy.
     pending_scroll: ?LayerScroll = null,
+    draw_scroll: ?LayerScroll = null,
+    draw_blit_rect: ?render_pipeline_helpers.BlitRectPx = null,
+    paint_has_present_rect: bool = false,
     /// Rows the core changed since the last paint. Sized by applyStaged.
     dirty_rows: std.DynamicBitSetUnmanaged = .{},
     needs_full_redraw: bool = false,
@@ -2071,10 +2072,24 @@ pub const LayerGridState = struct {
         self.staged_rows_len = 0;
     }
 
-    /// Publish the open flush's ops in one step. Caller must hold `App.mu`,
-    /// the same lock WM_PAINT holds while reading these arrays. Returns false
-    /// only if growing the arrays failed despite stageRow's reservation, which
-    /// leaves the rows partly published and owes the caller a full resend.
+    /// Reserve every fallible part before ANY grid publishes its staged rows.
+    pub fn prepareCommit(self: *LayerGridState, alloc: std.mem.Allocator) bool {
+        if (self.staged_len == 0) return true;
+        const need = self.plannedRows();
+        self.rows_buf.ensureTotalCapacity(alloc, need) catch return false;
+        self.origin_rows.ensureTotalCapacity(alloc, need) catch return false;
+        if (self.dirty_rows.bit_length < need) {
+            self.dirty_rows.resize(alloc, need, false) catch return false;
+        }
+        for (self.staged.items[0..self.staged_len]) |op| {
+            if (op.kind == .shift and (op.row_end > need or op.row_start >= op.row_end or
+                @abs(op.rows_delta) >= op.row_end - op.row_start)) return false;
+        }
+        return true;
+    }
+
+    /// Publish after prepareCommit succeeded for every grid. Caller holds
+    /// App.mu throughout preparation and publication.
     pub fn applyStaged(self: *LayerGridState, alloc: std.mem.Allocator) bool {
         defer self.discardStaged();
         if (self.staged_len == 0) return true;
@@ -3498,11 +3513,10 @@ pub fn planLayerFrame(
     p: LayerFramePlanParams,
 ) void {
     if (layers.len <= 1 or p.row_h_px <= 0) return;
-    const n = @min(layers.len, MAX_SURFACE_LAYERS);
-    var scrolls: [MAX_SURFACE_LAYERS]?LayerScroll = @splat(null);
+    const n = layers.len;
 
     // 1. Take the core's dirty set and settle the frame's redraw decision.
-    for (layers[1..n], 1..) |layer, li| {
+    for (layers[1..n]) |layer| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
         var grow_failed = false;
         if (state.draw_rows.bit_length < state.dirty_rows.bit_length) {
@@ -3520,7 +3534,8 @@ pub fn planLayerFrame(
             state.needs_full_redraw or row_limit != state.last_drawn_rows;
         state.needs_full_redraw = false;
         state.blit_clear_band = null;
-        scrolls[li] = state.pending_scroll;
+        state.draw_scroll = state.pending_scroll;
+        state.draw_blit_rect = null;
         state.pending_scroll = null;
     }
 
@@ -3546,12 +3561,10 @@ pub fn planLayerFrame(
     // 3. The refusal ladder, back-to-front. Order matters twice: a rung only
     //    runs once the cheaper ones passed, and an accepted copy is always the
     //    lowest in the stack, so the marking below it stays one-directional.
-    var accepted: [MAX_SURFACE_LAYERS]render_pipeline_helpers.BlitRectPx = undefined;
-    var accepted_len: usize = 0;
     const tex_h: i32 = @min(@as(i32, @intCast(g.height)), p.y_offset + p.content_height);
     for (layers[1..n], 1..) |layer, li| {
-        const scroll = scrolls[li] orelse continue;
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const scroll = state.draw_scroll orelse continue;
         const origin_x: i32 = p.x_offset + layer.x_px;
         const origin_y: i32 = p.y_offset + layer.y_px;
 
@@ -3585,7 +3598,9 @@ pub fn planLayerFrame(
                 .right = origin_x + @as(i32, @intCast(layer.cols)) * p.cell_w_px,
                 .bottom = origin_y + @as(i32, @intCast(layer.rows)) * p.row_h_px,
             };
-            for (accepted[0..accepted_len]) |r| {
+            for (layers[1..li]) |below| {
+                const below_state = app.layer_grids.get(below.grid_id) orelse continue;
+                const r = below_state.draw_blit_rect orelse continue;
                 if (render_pipeline_helpers.blitRectsIntersect(layer_rect, r))
                     break :ladder "overlap";
             }
@@ -3660,8 +3675,7 @@ pub fn planLayerFrame(
             }
         }
 
-        accepted[accepted_len] = pl.blitRectPx();
-        accepted_len += 1;
+        state.draw_blit_rect = pl.blitRectPx();
     }
 }
 
@@ -4242,6 +4256,8 @@ pub const App = struct {
     /// Vertex storage for grids the main surface places as non-root layers.
     /// Keyed by grid id; guarded by `mu`. Released on on_grid_destroy.
     layer_grids: std.AutoHashMapUnmanaged(i64, *LayerGridState) = .{},
+    layout_budget: core.render_layout.Budget = .{},
+    pending_grid_destroys: std.ArrayListUnmanaged(i64) = .empty,
 
     // UI-thread custom-shader animation snapshot. Capacity tracks the
     // high-water external-window count so the 60 Hz path allocates only when
@@ -5173,6 +5189,7 @@ pub const App = struct {
             self.alloc.destroy(entry.value_ptr.*);
         }
         self.layer_grids.deinit(self.alloc);
+        self.pending_grid_destroys.deinit(self.alloc);
 
         self.shader_anim_external_grids.deinit(self.alloc);
         self.shader_anim_external_renderers.deinit(self.alloc);

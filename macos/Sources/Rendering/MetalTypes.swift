@@ -838,6 +838,19 @@ struct SurfaceLayer {
     var followsScroll: Bool
 }
 
+/// Resolve a retained row in grid-local pixels, including a prior slot shift.
+func resolveSurfaceGridRow(_ set: SurfaceBufferSet, row: Int, cellHeightPx: Float)
+    -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+    guard row >= 0, row < set.rowLogicalToSlot.count else { return nil }
+    let slot = set.rowLogicalToSlot[row]
+    guard slot >= 0, slot < set.rowState.buffers.count,
+          slot < set.rowState.counts.count,
+          let buffer = set.rowState.buffers[slot], set.rowState.counts[slot] > 0
+    else { return nil }
+    let source = slot < set.rowSlotSourceRows.count ? set.rowSlotSourceRows[slot] : row
+    return (set.rowState.counts[slot], buffer, Float(row - source) * cellHeightPx)
+}
+
 final class SurfaceBufferSet {
     let rowState = SurfaceRowBufferState()
     var rowLogicalToSlot: [Int] = []        // logical row -> physical slot

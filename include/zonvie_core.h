@@ -203,6 +203,9 @@ typedef void (*zonvie_on_vertices_row_fn)(
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
      clears it. A cursor-only callback must not replace row contents.
+     Updates for different grids have no ordering guarantee. Consumers that
+     merge grid cursors into one surface overlay must track its owning grid:
+     clearing a different grid must not clear the current owner's cursor.
    A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
@@ -362,7 +365,10 @@ typedef void (*zonvie_on_surface_layout_fn)(
     uint32_t surface_cols
 );
 
-/* Neovim destroyed the grid; the frontend may release its buffers. */
+/* Stage destruction of a grid inside the flush bracket. Release its buffers
+   only after successful on_flush_end publication and after any readers have
+   released them. A cancelled flush keeps the previous frame and retries this
+   notification; hiding a grid does not destroy its buffers. */
 typedef void (*zonvie_on_grid_destroy_fn)(
     void* ctx,
     int64_t grid_id

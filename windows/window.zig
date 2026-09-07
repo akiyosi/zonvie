@@ -2176,6 +2176,8 @@ pub export fn WndProc(
                 // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
                 const tbs_snapshot = app.tbs.acquireForPaint(app.alloc);
                 defer {
+                    var layers = tbs_snapshot.layers;
+                    layers.deinit();
                     const needs_reinvalidate = app.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
                     if (app.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
                         // A successful atlas-reset transaction repaints every
@@ -2980,13 +2982,11 @@ pub export fn WndProc(
                             present_rects.append(app.alloc, cr) catch {};
                         }
 
-                        // Which layers this paint actually built a present rect
-                        // for, indexed by their position in tbs_snapshot.layers.
+                        // Track in each grid whether this paint built a present rect.
                         // The core thread can make a layer dirty after the loop
                         // below has run; that layer's band is drawn but not
                         // presented, so only the layers recorded here may have
                         // their dirty flag consumed.
-                        var layers_presented = std.StaticBitSet(app_mod.MAX_SURFACE_LAYERS).initEmpty();
 
                         // Layers paint whole; present each one that changed.
                         // Their rows are not in rows_to_draw, which only
@@ -2995,8 +2995,9 @@ pub export fn WndProc(
                             app.mu.lockUncancelable(core.clock.io());
                             defer app.mu.unlock(core.clock.io());
                             const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
-                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
                                 const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                                state.paint_has_present_rect = false;
                                 if (!state.dirty) continue;
                                 const l: i32 = @max(0, content_x_offset_i32 + layer.x_px);
                                 const t: i32 = @max(0, content_y_offset_i32 + layer.y_px);
@@ -3008,7 +3009,7 @@ pub export fn WndProc(
                                 };
                                 if (rc.right > rc.left and rc.bottom > rc.top) {
                                     present_rects.append(app.alloc, rc) catch continue;
-                                    layers_presented.set(layer_index);
+                                    state.paint_has_present_rect = true;
                                 }
                             }
                         }
@@ -3389,9 +3390,9 @@ pub export fn WndProc(
                             // as the draw so a store landing between the two
                             // cannot be dropped; a present that then fails
                             // re-arms these flags below.
-                            for (tbs_snapshot.layers.slice()[1..], 1..) |layer, layer_index| {
-                                if (!layers_presented.isSet(layer_index)) continue;
-                                if (app.layer_grids.get(layer.grid_id)) |state| state.dirty = false;
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                                if (state.paint_has_present_rect) state.dirty = false;
                             }
                             app.mu.unlock(core.clock.io());
                         }
@@ -4253,7 +4254,18 @@ pub export fn WndProc(
                 // cursor grid actually changes, so no is_grid_change guard
                 // is needed in the UI handler.
                 app.mu.lockUncancelable(core.clock.io());
-                const ext_hwnd = if (app.external_windows.get(grid_id)) |ext_win| ext_win.hwnd else null;
+                const ext_hwnd = blk: {
+                    if (app.external_windows.get(grid_id)) |ext_win| break :blk ext_win.hwnd;
+                    var ext_it = app.external_windows.valueIterator();
+                    while (ext_it.next()) |entry| {
+                        const ext = entry.*;
+                        if (ext.is_pending_close) continue;
+                        for (ext.tbs.committed_layers.slice()) |layer| {
+                            if (layer.grid_id == grid_id) break :blk ext.hwnd;
+                        }
+                    }
+                    break :blk null;
+                };
                 app.mu.unlock(core.clock.io());
 
                 if (ext_hwnd) |eh| {

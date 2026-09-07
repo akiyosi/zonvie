@@ -2194,7 +2194,7 @@ pub const Grid = struct {
             // Only affect global grid state for composited grids (in win_pos).
             // External grids (not in win_pos) are rendered independently.
             if (self.win_pos.get(grid_id)) |p| {
-                if (self.external_grids.contains(p.anchor_grid)) {
+                if (self.isExternalSurface(p.anchor_grid)) {
                     const h = @max(old_rows, rows);
                     var r: u32 = 0;
                     while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
@@ -2223,7 +2223,7 @@ pub const Grid = struct {
         }
         self.trimOverflowForGrid(grid_id, rows, cols);
         if (self.win_pos.get(grid_id)) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
+            if (self.isExternalSurface(p.anchor_grid)) {
                 var r: u32 = 0;
                 while (r < rows) : (r += 1) self.dirtyCompositedRow(p, r);
             } else {
@@ -2263,26 +2263,38 @@ pub const Grid = struct {
         }
     }
 
-    /// Route a composited grid's cell-change dirty state to the correct target.
-    /// A win_pos grid normally composites into the MAIN grid: dirty the main
-    /// row at p.row + row and bump content_rev. A float anchored to an
-    /// EXTERNAL grid is instead composited into that anchor grid's own window
-    /// (flush.zig ext composite path), so the ANCHOR subgrid must be dirtied —
-    /// dirtying the main grid there would rebuild it spuriously at rows
-    /// translated into the wrong coordinate space, while the float's real
-    /// renderer keeps showing stale content.
+    /// Resolve the owning surface through the complete anchor chain without
+    /// allocating or guessing a main surface for missing/cyclic placement.
+    pub fn surfaceForGrid(self: *const Grid, grid_id: i64) ?i64 {
+        var id = grid_id;
+        var remaining = self.win_pos.count() + 1;
+        while (remaining > 0) : (remaining -= 1) {
+            if (id == 1 or self.external_grids.contains(id)) return id;
+            const pos = self.win_pos.get(id) orelse return null;
+            id = pos.anchor_grid;
+        }
+        return null;
+    }
+
+    fn isExternalSurface(self: *const Grid, grid_id: i64) bool {
+        const surface = self.surfaceForGrid(grid_id) orelse return false;
+        return surface != 1;
+    }
+
+    /// Dirty the owning root's old pixel coverage, not an intermediate float
+    /// or an unrelated main-surface row. Grid-local contents remain separate.
     fn dirtyCompositedRow(self: *Grid, p: GridPos, row: u32) void {
-        if (self.external_grids.get(p.anchor_grid)) |ext| {
+        const surface = self.surfaceForGrid(p.anchor_grid) orelse return;
+        if (self.external_grids.get(surface)) |ext| {
             // win_pos.row for ext-anchored floats is stored in GLOBAL grid
             // units (redraw_handler adds ext start_row before setWinFloatPos),
-            // while the ext composite recomposes anchor-LOCAL rows via
-            // `float_pos.row - start_row` (flush.zig ext overlay). Translate
-            // the same way here: marking the global row would dirty rows
+            // while the root's damage uses surface-local rows. Translate
+            // here: marking the global row would dirty rows
             // offset by start_row (or nothing at all) and leave the truly
             // composited rows stale. An anchor with no position of its own
             // had that base of 0 applied at the write site too.
             const origin_row = externalCompositeOriginRow(ext);
-            if (self.sub_grids.getPtr(p.anchor_grid)) |asg| {
+            if (self.sub_grids.getPtr(surface)) |asg| {
                 asg.dirty = true;
                 const local: i64 = @as(i64, p.row) + @as(i64, row) - @as(i64, origin_row);
                 if (local >= 0 and local < @as(i64, @intCast(asg.dirty_rows.bit_length))) {
@@ -2560,7 +2572,7 @@ pub const Grid = struct {
                 };
             }
             if (self.win_pos.get(grid_id)) |p| {
-                if (self.external_grids.contains(p.anchor_grid)) {
+                if (self.isExternalSurface(p.anchor_grid)) {
                     // Float anchored to an EXTERNAL grid: it composites into
                     // that grid's own window, not the main grid. Dirty the
                     // scrolled region on the anchor (anchor-local rows via
@@ -2695,7 +2707,7 @@ pub const Grid = struct {
         if (grid_id == 1) {
             self.content_rev +%= 1;
         } else if (self.win_pos.get(grid_id)) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
+            if (self.isExternalSurface(p.anchor_grid)) {
                 if (self.sub_grids.getPtr(p.anchor_grid)) |asg| asg.dirty = true;
             } else {
                 self.content_rev +%= 1;
@@ -2718,7 +2730,7 @@ pub const Grid = struct {
             // actual target surface (main or an external anchor).
             if (self.win_pos.get(grid_id)) |p| {
                 const h: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-                if (self.external_grids.contains(p.anchor_grid)) {
+                if (self.isExternalSurface(p.anchor_grid)) {
                     var r: u32 = 0;
                     while (r < h) : (r += 1) {
                         self.dirtyCompositedRow(p, r);
@@ -2777,7 +2789,7 @@ pub const Grid = struct {
         _ = self.ext_windows_grids.remove(grid_id);
 
         if (old_pos) |p| {
-            if (self.external_grids.contains(p.anchor_grid)) {
+            if (self.isExternalSurface(p.anchor_grid)) {
                 // Float anchored to an external grid: composites into that
                 // grid's own window (same reasoning as clearGrid/hideWin/
                 // resizeGrid above). markAllDirty() only touches the MAIN
@@ -2992,7 +3004,7 @@ pub const Grid = struct {
             const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
             // Affects the main composite unless anchored to an external grid
             // (those float over a separate top-level window, not the main grid).
-            if (!self.external_grids.contains(old_pos.anchor_grid)) {
+            if (!self.isExternalSurface(old_pos.anchor_grid)) {
                 self.markDirtyRect(old_pos.row, old_pos.row +| h_old);
                 affects_main = true;
             } else {
@@ -3020,7 +3032,7 @@ pub const Grid = struct {
         // (e.g. bufpos, anchor_grid>1) alike — both are composited into the main
         // grid, so creating/moving them must trigger a recompose.
         const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-        if (!self.external_grids.contains(anchor_grid)) {
+        if (!self.isExternalSurface(anchor_grid)) {
             self.markDirtyRect(row, row +| h_new);
             affects_main = true;
         } else {
@@ -3065,7 +3077,7 @@ pub const Grid = struct {
         // Only bump content_rev when win_pos existed (grid was composited);
         // external-only grids don't affect global grid composition.
         if (self.win_pos.get(grid_id)) |pos| {
-            if (self.external_grids.contains(pos.anchor_grid)) {
+            if (self.isExternalSurface(pos.anchor_grid)) {
                 // Float anchored to an external grid: it composites into
                 // that grid's own window, not the main grid (same reasoning
                 // as dirtyCompositedRow/setWinFloatPos). Dirtying the main
