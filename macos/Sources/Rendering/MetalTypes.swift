@@ -2463,6 +2463,73 @@ func submitSurfaceRowVertices(
     return true
 }
 
+/// The scroll entry that displaces `gridId` this frame, or nil when nothing
+/// does. `offsets` is sorted by grid_id, which updateScrollOffsets guarantees
+/// and the shader's own per-vertex lookup already relies on.
+func surfaceScrollOffset(
+    gridId: Int64,
+    offsets: [MetalTerminalRenderer.ScrollOffset]
+) -> MetalTerminalRenderer.ScrollOffset? {
+    let key = Int32(truncatingIfNeeded: gridId)
+    var lo = 0
+    var hi = offsets.count
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2
+        if offsets[mid].grid_id < key { lo = mid + 1 } else { hi = mid }
+    }
+    guard lo < offsets.count, offsets[lo].grid_id == key else { return nil }
+    return offsets[lo]
+}
+
+/// Where a bodily-moved layer actually lands.
+///
+/// `move_all` translates every one of a layer's vertices, so the layer can be
+/// drawn at a shifted origin instead, with no scroll offset bound at all. Clip
+/// and geometry then live in one space: the scissor stays the layer's own size
+/// and cannot reach a neighbouring layer, which matters because floats stack
+/// edge to edge and a layer's background pass overwrites under blur.
+/// ExternalGridView.drawHostedLayers does the same for its hosted grids.
+///
+/// `offset_y` is NDC against the cell-snapped viewport the layer transform maps
+/// into, so `viewportHeightPx` recovers pixels exactly; +y is down in the pixel
+/// space the core emits, hence the negation.
+func displacedLayerOriginPx(
+    originPx: simd_float2,
+    offset: MetalTerminalRenderer.ScrollOffset,
+    viewportHeightPx: Float
+) -> simd_float2 {
+    guard viewportHeightPx > 0, offset.offset_y.isFinite else { return originPx }
+    return simd_float2(originPx.x, originPx.y - offset.offset_y * viewportHeightPx / 2)
+}
+
+/// A float's two running counters as they stood when its debt was last zero.
+struct FloatDebtBaseline: Equatable {
+    var anchorRowsUp: Int
+    var placementRowsUp: Int
+}
+
+/// Rows of scroll compensation a float is carrying that its own placement has
+/// not performed.
+///
+/// A landing hands the anchor a compensation cancelling the rows its content
+/// just moved, so the picture does not jump when the flush lands. A float
+/// following that anchor inherits the compensation, but Neovim re-places the
+/// float through win_float_pos, which need not reach the frontend in the same
+/// commit. Between the two the float carries a compensation for a step it has
+/// not taken, and is drawn that many rows away from where it belongs.
+///
+/// Both counters run from whenever their grid first appeared, so they are only
+/// comparable against a common zero: `baseline` is where the two agreed.
+/// The result is zero whenever the pair arrives together, which is the case
+/// that already worked and must stay untouched.
+func floatDebtRowsUp(
+    anchorRowsUp: Int,
+    placementRowsUp: Int,
+    baseline: FloatDebtBaseline
+) -> Int {
+    (anchorRowsUp - baseline.anchorRowsUp) - (placementRowsUp - baseline.placementRowsUp)
+}
+
 /// Clip a layer rect to the render target. Returns nil when nothing of it is
 /// visible, so the caller can skip the draw entirely.
 func clampScissor(

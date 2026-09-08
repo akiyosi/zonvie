@@ -1017,6 +1017,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Protected by `lock`; an entry is created when a grid first submits a row
     /// or a scroll and released when the grid is destroyed.
     private var layerDrawStates: [Int64: LayerDrawState] = [:]
+    /// Rows each layer's committed placement has travelled upwards since the
+    /// surface began, in the same units and direction as on_grid_scroll's
+    /// rowsDelta. Only commitFlush writes it; copyPlacementRowsUp reads it.
+    /// Protected by `lock`.
+    private var layerPlacementRowsUp: [Int64: Int] = [:]
+
+    /// Hand the float ledger the placement travel it needs, into storage the
+    /// caller owns, so the per-frame read costs one lock and no allocation.
+    func copyPlacementRowsUp(into out: inout [Int64: Int]) {
+        lock.lock()
+        defer { lock.unlock() }
+        out.removeAll(keepingCapacity: true)
+        for (gridId, rows) in layerPlacementRowsUp { out[gridId] = rows }
+    }
+
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
     /// does not allocate.
     private var commitGridIdScratch: [Int64] = []
@@ -1898,6 +1913,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // registry has its own lock and the established order is
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
+        // Also taken before `lock`: the accessor locks to read linespacePx, so
+        // reading it inside the region below would deadlock on this thread.
+        let ledgerCellHeightPx = cellHeightPx
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -1914,8 +1932,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // else now, and a shift computed for the old rectangle would move
             // the wrong pixels.
             for layer in staged where layer.gridId != 1 {
-                guard let state = layerDrawStates[layer.gridId] else { continue }
                 let previous = committedSurfaceLayers.first { $0.gridId == layer.gridId }
+                // How far this layer's committed placement has travelled, in
+                // rows, counted upwards to match on_grid_scroll's rowsDelta.
+                // The float ledger pairs the two: a float must not be handed
+                // the compensation for a scroll step its own placement has not
+                // performed yet. Accumulated here because this is the only
+                // point a placement change is a discrete, known event.
+                if let previous, ledgerCellHeightPx > 0 {
+                    let rowsUp = Int(((previous.originPx.y - layer.originPx.y) / ledgerCellHeightPx).rounded())
+                    if rowsUp != 0 {
+                        layerPlacementRowsUp[layer.gridId, default: 0] += rowsUp
+                    }
+                }
+                guard let state = layerDrawStates[layer.gridId] else { continue }
                 let unchanged = previous.map {
                     $0.originPx == layer.originPx && $0.rows == layer.rows && $0.cols == layer.cols
                 } ?? false
@@ -1926,6 +1956,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
             committedSurfaceLayers = staged
             pendingSurfaceLayers = nil
+            // A destroyed grid's travel describes a layer that no longer
+            // exists, and its id is reused by the next float a scroll creates.
+            if layerPlacementRowsUp.count > staged.count {
+                layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
+                    staged.contains { $0.gridId == entry.key }
+                }
+            }
         }
         if didCursorWrite {
             committedCursorLayerGridId = pendingCursorLayerGridId
@@ -3746,19 +3783,43 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // draw state, which is treated as owing everything.
                     let st = layerStateSnapshot[li]
 
+                    // A layer this frame displaces bodily (move_all: a float
+                    // following its anchor's smooth scroll) is drawn at a
+                    // shifted origin with no offset bound, so its clip and its
+                    // geometry share one space. Widening the scissor instead
+                    // would reach into the neighbouring float — they stack edge
+                    // to edge, an ease runs to more than two cells, and a
+                    // layer's background pass overwrites under blur. A layer
+                    // the shader displaces per-row keeps the offset: its
+                    // content clip holds those rows inside this same rect.
+                    let layerOffset = surfaceScrollOffset(gridId: layer.gridId, offsets: scrollSnapshot)
+                    let bodilyMoved = (layerOffset?.move_all ?? 0) != 0
+                    let drawOriginPx = bodilyMoved
+                        ? displacedLayerOriginPx(
+                            originPx: layer.originPx,
+                            offset: layerOffset!,
+                            viewportHeightPx: viewportMetrics.fragmentHeight)
+                        : layer.originPx
                     bindLayerTransform(
                         encoder: enc,
                         LayerTransform(
-                            originPx: layer.originPx,
+                            originPx: drawOriginPx,
                             extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
                         )
                     )
-                    let originX = Int(layer.originPx.x.rounded(.down))
-                    let originY = Int(layer.originPx.y.rounded(.down))
+                    // Only this layer's vertices are in this pass, so one entry
+                    // is all the shader can match — and none at all once the
+                    // origin already carries the displacement.
+                    bindSingleSurfaceScrollOffset(encoder: enc, offset: bodilyMoved ? nil : layerOffset)
+                    let originX = Int(drawOriginPx.x.rounded(.down))
+                    let originY = Int(drawOriginPx.y.rounded(.down))
                     let widthPx = layer.cols * Int(cellWi)
                     let heightPx = rowCount * Int(cellHi)
+                    // A displaced origin is fractional mid-ease; cover the row
+                    // of pixels the flooring above would otherwise clip.
+                    let scissorPadY = drawOriginPx.y == drawOriginPx.y.rounded(.down) ? 0 : 1
                     if let rect = clampScissor(
-                        x: originX, y: originY, width: widthPx, height: heightPx,
+                        x: originX, y: originY, width: widthPx, height: heightPx + scissorPadY,
                         targetWidth: backTex.width, targetHeight: backTex.height
                     ) {
                         enc.setScissorRect(rect)
@@ -3897,7 +3958,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     x: originX,
                                     y: originY + row * Int(cellHi),
                                     width: widthPx,
-                                    height: Int(cellHi),
+                                    height: Int(cellHi) + scissorPadY,
                                     targetWidth: backTex.width,
                                     targetHeight: backTex.height
                                 )
@@ -3914,10 +3975,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     // overwritten empty ones); a quiet layer encodes none.
                     // blit=1 means a GPU scroll copy shifted this layer, so
                     // rows= counts only what the shift left stale.
-                    ZonvieCore.appLog("[layer_draw] gridId=\(layer.gridId) rows=\(encodedRows) of=\(rowCount) blit=\(st?.drawBlitClearBand != nil ? 1 : 0)")
+                    // committedY is where the core placed this layer; drawY is
+                    // where this frame puts it. Logged for the GUI harness, the
+                    // way [renderer] scroll offset carries the margin band:
+                    // float_stack_scroll_continuity asserts drawY never jumps a
+                    // whole cell between frames, which is the only way a float
+                    // teleporting for one frame can be caught without a person
+                    // watching it.
+                    ZonvieCore.appLog("[layer_draw] gridId=\(layer.gridId) rows=\(encodedRows) of=\(rowCount) blit=\(st?.drawBlitClearBand != nil ? 1 : 0) committedY=\(layer.originPx.y) drawY=\(drawOriginPx.y) moved=\(bodilyMoved ? 1 : 0)")
                 }
-                // Restore the surface's own pixel space for the cursor pass.
+                // Restore the surface's own pixel space and the full offset set
+                // for the cursor pass: the loop above narrowed both to whatever
+                // the last layer needed.
                 bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
+                bindSurfaceScrollOffsets(
+                    encoder: enc,
+                    offsets: scrollSnapshot,
+                    device: device,
+                    scratchBuffer: &committed.scrollOffsetBuffer,
+                    scratchCapacity: &committed.scrollOffsetBufferCap
+                )
             }
 
             // === PERF LOG: encode_rows → encode_finalize boundary ===

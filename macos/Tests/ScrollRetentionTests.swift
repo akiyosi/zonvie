@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import simd
 
 // Minimal collaborators required when MetalTypes.swift is compiled as a
 // standalone test executable. Same shape as SurfaceRowProvisionTests', and for
@@ -492,6 +493,149 @@ private enum ScrollRetentionTests {
         )
     }
 
+    /// A layer the vertex stage moves bodily is drawn at a shifted origin with
+    /// no offset bound, so its clip travels with it. The scissor must stay the
+    /// layer's own size: floats stack edge to edge, so a widened one would
+    /// reach the next float, whose background pass overwrites under blur.
+    private static func verifyBodilyMovedLayerShiftsItsOrigin() {
+        let height: Float = 1760
+        // updateScrollOffsets: offset_y = -offsetYPx * 2 / viewportHeight.
+        func ndc(_ px: Float) -> Float { -px * 2 / height }
+        let follower = MetalTerminalRenderer.ScrollOffset(
+            grid_id: 15, offset_y: ndc(88),
+            content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
+
+        // Floats in the failing case sat at y = 40, 160, 280 ... exactly three
+        // rows apart and three rows tall, so an 88px ease is more than two
+        // cells and lands the layer squarely over its neighbour's committed
+        // rect. Shifting the origin is what keeps the two apart.
+        let moved = displacedLayerOriginPx(
+            originPx: simd_float2(0, 160), offset: follower, viewportHeightPx: height)
+        require(abs(moved.y - 248) < 0.001,
+                "a followed layer's origin carries the displacement (got \(moved.y))")
+        requireEqual(moved.x, 0, "displacement is vertical only")
+
+        // The clip is the layer's own extent at the shifted origin: 3 rows of
+        // 40px, not one pixel more.
+        guard let rect = clampScissor(
+            x: 0, y: Int(moved.y), width: 300, height: 120,
+            targetWidth: 3348, targetHeight: 1760
+        ) else {
+            require(false, "a displaced layer still has visible pixels")
+            return
+        }
+        requireEqual(rect.y, 248, "the scissor follows the shifted origin")
+        requireEqual(rect.height, 120, "the scissor stays the layer's own height")
+        // The float stacked below is displaced by the same amount, so the two
+        // must still tile exactly: this scissor ends where that one begins.
+        let neighbour = displacedLayerOriginPx(
+            originPx: simd_float2(0, 280), offset: follower, viewportHeightPx: height)
+        requireEqual(Float(rect.y + rect.height), neighbour.y,
+                     "the scissor ends where the float stacked below begins")
+
+        // A sub-pixel ease step: the origin is fractional, and the caller pads
+        // one pixel so flooring cannot clip the layer's leading edge.
+        let easing = MetalTerminalRenderer.ScrollOffset(
+            grid_id: 15, offset_y: ndc(3.90125),
+            content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
+        let sub = displacedLayerOriginPx(
+            originPx: simd_float2(0, 160), offset: easing, viewportHeightPx: height)
+        require(abs(sub.y - 163.90125) < 0.001, "a sub-pixel step moves by less than a cell")
+        require(sub.y != sub.y.rounded(.down), "the ease leaves a fractional origin to pad for")
+
+        // An undisplaced layer must not move at all.
+        let still = MetalTerminalRenderer.ScrollOffset(
+            grid_id: 15, offset_y: 0, content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
+        requireEqual(
+            displacedLayerOriginPx(originPx: simd_float2(0, 160), offset: still,
+                                   viewportHeightPx: height).y,
+            160, "a still layer keeps its committed origin")
+    }
+
+    /// Which entry a layer's pass binds. A grid with none is not displaced, and
+    /// a per-row (non-move_all) grid keeps its entry so the shader still clips
+    /// its scrolled rows to its content band.
+    private static func verifyScrollOffsetLookup() {
+        let offsets = [
+            MetalTerminalRenderer.ScrollOffset(
+                grid_id: 2, offset_y: -0.1,
+                content_top_y: 0.954, content_bottom_y: -0.954),
+            MetalTerminalRenderer.ScrollOffset(
+                grid_id: 15, offset_y: -0.1,
+                content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1),
+        ]
+        requireEqual(surfaceScrollOffset(gridId: 15, offsets: offsets)?.move_all, 1,
+                     "a following float is bodily moved")
+        requireEqual(surfaceScrollOffset(gridId: 2, offsets: offsets)?.move_all, 0,
+                     "a window keeps the per-row path")
+        require(surfaceScrollOffset(gridId: 22, offsets: offsets) == nil,
+                "a fixed float past the last entry is not displaced")
+        // A missing id BETWEEN two entries is where a lower bound that forgets
+        // to check equality hands back its neighbour's displacement.
+        require(surfaceScrollOffset(gridId: 10, offsets: offsets) == nil,
+                "a fixed float between two entries is not displaced")
+        require(surfaceScrollOffset(gridId: 15, offsets: []) == nil,
+                "an idle frame displaces nothing")
+    }
+
+    /// A float inherits its anchor's landing compensation, but Neovim re-places
+    /// the float through its own event, which need not reach the frontend in
+    /// the same commit. The debt is what it is carrying in between.
+    private static func verifyFloatDebtLedger() {
+        // The case that already worked: both halves land together, so nothing
+        // is withheld and the existing behaviour is untouched.
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 3, placementRowsUp: 3,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 0, placementRowsUp: 0)),
+            0, "a step that lands with its placement is owed nothing")
+
+        // The anchor landed three rows; the float has not been re-placed yet,
+        // so it is carrying three rows of compensation it did not earn.
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 3, placementRowsUp: 0,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 0, placementRowsUp: 0)),
+            3, "an anchor that landed first leaves the float three rows in debt")
+
+        // The placement arrived first: the float moved before the compensation
+        // that pays for it, which is the same defect with the sign reversed.
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 0, placementRowsUp: 3,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 0, placementRowsUp: 0)),
+            -3, "a placement that landed first leaves the float three rows ahead")
+
+        // The debt settles once the other half arrives, whichever order.
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 3, placementRowsUp: 3,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 0, placementRowsUp: 0)),
+            0, "the debt retires when the pair completes")
+
+        // Both counters run from whenever their own grid appeared, so only the
+        // baseline makes them comparable. A float created mid-scroll must start
+        // square instead of inheriting the whole history it was absent for.
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 41, placementRowsUp: 5,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 41, placementRowsUp: 5)),
+            0, "a float seeded mid-scroll starts out of debt")
+        requireEqual(
+            floatDebtRowsUp(anchorRowsUp: 44, placementRowsUp: 5,
+                            baseline: FloatDebtBaseline(anchorRowsUp: 41, placementRowsUp: 5)),
+            3, "and accrues only what happens after it was seeded")
+
+        // A whole gesture of paired steps must not drift.
+        var anchor = 0, placement = 0
+        let baseline = FloatDebtBaseline(anchorRowsUp: 0, placementRowsUp: 0)
+        for _ in 0..<20 {
+            anchor += 3
+            require(floatDebtRowsUp(anchorRowsUp: anchor, placementRowsUp: placement,
+                                    baseline: baseline) == 3,
+                    "the split frame owes exactly one step")
+            placement += 3
+            require(floatDebtRowsUp(anchorRowsUp: anchor, placementRowsUp: placement,
+                                    baseline: baseline) == 0,
+                    "and settles on the next")
+        }
+    }
+
     /// The depth is what the ease can reach, so it bounds a single step.
     private static func verifyDepthClamp(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
@@ -511,6 +655,9 @@ private enum ScrollRetentionTests {
         verifyRingOutlivesTheLiveSet()
         verifyCreditRule()
         verifyBoundWindowStartsFromTheDriver()
+        verifyBodilyMovedLayerShiftsItsOrigin()
+        verifyScrollOffsetLookup()
+        verifyFloatDebtLedger()
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             // Headless CI without a GPU: the arithmetic above still ran.

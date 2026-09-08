@@ -229,6 +229,30 @@ final class MetalTerminalView: MTKView {
     /// jitter without reading as an animation.
     private static let smoothScrollDecayPerFrame: CGFloat = 0.5
 
+    /// Rows each scrolled window's content has travelled upwards, accumulated
+    /// from on_grid_scroll. Paired with the renderer's per-layer placement
+    /// travel to tell a float what it has actually performed.
+    ///
+    /// A landing hands the anchor a compensation that cancels the rows its
+    /// content just moved, so the picture does not jump when the flush lands
+    /// and the finger consumes the compensation instead. A float following
+    /// that anchor inherits the compensation, but Neovim re-places the float
+    /// through win_float_pos, which need not reach the frontend in the same
+    /// commit. In the frames between, the float carries a compensation for a
+    /// step it has not taken — the debt this ledger measures.
+    /// Guarded by scrollOffsetLock.
+    private var anchorLandedRowsUp: [Int64: Int] = [:]
+
+    /// Where each following float's debt was last known to be zero: the two
+    /// counters above as they stood when the float began following. Without a
+    /// common zero the running totals, which start whenever each grid first
+    /// appears, would never agree. Guarded by scrollOffsetLock.
+    private var floatDebtBaseline: [Int64: FloatDebtBaseline] = [:]
+
+    /// The renderer's placement travel, copied once per frame into storage this
+    /// view owns. Main thread only, used inside updateScrollShaderOffset.
+    private var placementRowsUpScratch: [Int64: Int] = [:]
+
     /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
     /// a trackpad gesture). Guarded by scrollOffsetLock.
     private var smoothScrollGrids: Set<Int64> = []
@@ -1957,6 +1981,9 @@ final class MetalTerminalView: MTKView {
         // + manual insert loops) instead of grids.map + Dictionary(uniqueKeysWithValues:)
         // + Set(...) — this runs in the pre-draw path on every scrolled frame.
         let grids = core.getVisibleGridsCached()
+        // The float ledger's other half, read once per frame under the
+        // renderer's lock rather than per float.
+        renderer.copyPlacementRowsUp(into: &placementRowsUpScratch)
         gridInfoMapScratch.removeAll(keepingCapacity: true)
         for g in grids { gridInfoMapScratch[g.gridId] = g }
         let gridInfoMap = gridInfoMapScratch
@@ -1976,6 +2003,22 @@ final class MetalTerminalView: MTKView {
         for key in scrollOffsetStaleKeysScratch {
             scrollOffsetPx.removeValue(forKey: key)
             scrollEdgeBlocked.removeValue(forKey: key)
+        }
+        // A destroyed grid's ledger describes a float that no longer exists,
+        // and its id is reused by the next float a scroll creates.
+        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
+        for key in floatDebtBaseline.keys where !visibleGridIdsScratch.contains(key) {
+            scrollOffsetStaleKeysScratch.append(key)
+        }
+        for key in scrollOffsetStaleKeysScratch {
+            floatDebtBaseline.removeValue(forKey: key)
+        }
+        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
+        for key in anchorLandedRowsUp.keys where !visibleGridIdsScratch.contains(key) {
+            scrollOffsetStaleKeysScratch.append(key)
+        }
+        for key in scrollOffsetStaleKeysScratch {
+            anchorLandedRowsUp.removeValue(forKey: key)
         }
 
         let ndcScale: Float = 2.0 / drawableHeight
@@ -2780,6 +2823,13 @@ final class MetalTerminalView: MTKView {
 
         scrollOffsetLock.lock()
         for (gridId, rowsDelta) in pending {
+            // The content this window owns has now moved, and the branches
+            // below hand it the compensation that cancels the move. A float
+            // following this window inherits that compensation, so record the
+            // distance here: until the float's own placement travels the same
+            // way, it is carrying a compensation for a step it has not taken.
+            anchorLandedRowsUp[gridId, default: 0] += rowsDelta
+
             // grid_scroll received — reset stale tracking for this grid.
             // A response also proves the grid is not blocked at a buffer edge.
             scrollStaleSince.removeValue(forKey: gridId)
@@ -3288,11 +3338,13 @@ final class MetalTerminalView: MTKView {
             //    alone cannot tell a buffer-tracking editor float from a fixed one,
             //    so this case keeps the overlap heuristic.
             var followedOffsetYPx: Float?
+            var followedGridId: Int64?
             if floatGrid.anchorGrid > 1 {
                 for i in 0..<windowCount where offsets[i].gridId == floatGrid.anchorGrid {
                     // Only follow when the anchor is itself a scrolled window.
                     if let aw = gridInfoMap[offsets[i].gridId], aw.zindex <= 0 {
                         followedOffsetYPx = offsets[i].offsetYPx
+                        followedGridId = offsets[i].gridId
                     }
                     break
                 }
@@ -3310,10 +3362,15 @@ final class MetalTerminalView: MTKView {
                     if overlap > bestOverlap {
                         bestOverlap = overlap
                         followedOffsetYPx = offsets[i].offsetYPx
+                        followedGridId = offsets[i].gridId
                     }
                 }
             }
-            guard let offsetYPx = followedOffsetYPx else { continue }
+            guard let offsetYPx = followedOffsetYPx, let followedGridId else { continue }
+            // Withhold the part of the anchor's compensation that stands for
+            // scroll steps this float has not been re-placed for yet.
+            let debtRows = floatDebtRows(gridId: floatGrid.gridId, anchorGridId: followedGridId)
+            let effectiveOffsetYPx = offsetYPx - Float(debtRows) * cellHeightPx
             // A partial offset set can split a float from its anchor. Signal
             // overflow so the caller disables the whole transform for this
             // frame instead of silently truncating semantic state.
@@ -3323,7 +3380,7 @@ final class MetalTerminalView: MTKView {
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
             offsets.append(MetalTerminalRenderer.ScrollOffsetInfo(
                 gridId: floatGrid.gridId,
-                offsetYPx: offsetYPx,
+                offsetYPx: effectiveOffsetYPx,
                 gridTopYNDC: gridTopYNDC,
                 gridRows: floatGrid.rows,
                 marginTop: 0,
@@ -3333,6 +3390,31 @@ final class MetalTerminalView: MTKView {
             ))
         }
         return true
+    }
+
+    /// Rows of the anchor's compensation this float has not been re-placed
+    /// for. Seeds the baseline on the float's first frame of following, so a
+    /// float that appears mid-scroll starts square rather than inheriting the
+    /// whole history of a scroll it was not present for.
+    ///
+    /// Takes `scrollOffsetLock`: processPendingScrollClears writes the anchor
+    /// counter from the core thread. placementRowsUpScratch is main-thread
+    /// only, refreshed once per frame by updateScrollShaderOffset.
+    private func floatDebtRows(gridId: Int64, anchorGridId: Int64) -> Int {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        let anchorRowsUp = anchorLandedRowsUp[anchorGridId] ?? 0
+        let placementRowsUp = placementRowsUpScratch[gridId] ?? 0
+        guard let baseline = floatDebtBaseline[gridId] else {
+            floatDebtBaseline[gridId] = FloatDebtBaseline(
+                anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
+            return 0
+        }
+        return floatDebtRowsUp(
+            anchorRowsUp: anchorRowsUp,
+            placementRowsUp: placementRowsUp,
+            baseline: baseline
+        )
     }
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
