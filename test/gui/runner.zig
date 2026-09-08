@@ -111,6 +111,18 @@ test "gui:main_margin_scroll_flicker" {
     }
 }
 
+test "gui:float_stack_scroll_continuity" {
+    // macOS only: it drives real trackpad pixel gestures, which Windows has
+    // no equivalent for (its wheel synthesis is notch-only, so there is no
+    // sub-cell ease to be discontinuous within).
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/float_stack_scroll_continuity.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:main_float_margin_scroll_flicker" {
     // macOS only: a bordered float composited into the main window is the
     // one configuration with a real BOTTOM margin row there.
