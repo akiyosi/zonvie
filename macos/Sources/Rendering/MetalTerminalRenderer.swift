@@ -1072,6 +1072,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // --- Post-process bloom (neon glow, Dual Kawase) ---
     // Pipelines and sampler are internal so ExternalGridView can share them.
     private(set) var glowExtractPipeline: MTLRenderPipelineState?
+    /// Attenuates extracted glow by a layer's background coverage, so a glyph
+    /// behind an opaque layer does not bloom through it.
+    private(set) var glowOccludePipeline: MTLRenderPipelineState?
     private(set) var kawaseDownPipeline: MTLRenderPipelineState?
     private(set) var kawaseUpPipeline: MTLRenderPipelineState?
     private(set) var glowCompositePipeline: MTLRenderPipelineState?
@@ -3418,6 +3421,66 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
 
+            // Rows every layer repaints over the layers above it. A layer owns
+            // the whole rectangle of each row it draws, so drawing one erases
+            // what a layer over it had there, and that layer draws nothing this
+            // frame unless it is marked too. An accepted blit is already handled
+            // above; this covers the rest — a refused one, and any ordinary
+            // dirty-row or whole-layer repaint. Back to front, so a mark lands
+            // before the layer carrying it becomes the source of the next one.
+            func markLayersOverBand(
+                _ li: Int,
+                _ leftPx: Int,
+                _ rightPx: Int,
+                _ bandTopPx: Int,
+                _ bandBottomPx: Int
+            ) {
+                let rowHeightPx = Int(cellHi)
+                guard rowHeightPx > 0 else { return }
+                for mi in (li + 1)..<layerSnapshot.count {
+                    let above = layerSnapshot[mi]
+                    guard let aboveState = layerStateSnapshot[mi],
+                          above.rows > 0, above.cols > 0 else { continue }
+                    let aLeftPx = Int(above.originPx.x.rounded(.down))
+                    let aRightPx = aLeftPx + above.cols * Int(cellWi)
+                    guard aLeftPx < rightPx, aRightPx > leftPx else { continue }
+                    let aTopPx = Int(above.originPx.y.rounded(.down))
+                    let aBottomPx = aTopPx + above.rows * rowHeightPx
+                    guard aTopPx < bandBottomPx, aBottomPx > bandTopPx else { continue }
+                    let aFirstRow = max(0, (max(aTopPx, bandTopPx) - aTopPx) / rowHeightPx)
+                    let aLastRow = min(above.rows - 1, (min(aBottomPx, bandBottomPx) - 1 - aTopPx) / rowHeightPx)
+                    if aLastRow >= aFirstRow {
+                        aboveState.drawRows.append(contentsOf: aFirstRow...aLastRow)
+                    }
+                }
+            }
+            if layerSnapshot.count > 1, Int(cellHi) > 0 {
+                let rowHeightPx = Int(cellHi)
+                for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                    guard let state = layerStateSnapshot[li],
+                          layer.rows > 0, layer.cols > 0 else { continue }
+                    let leftPx = Int(layer.originPx.x.rounded(.down))
+                    let rightPx = leftPx + layer.cols * Int(cellWi)
+                    let topPx = Int(layer.originPx.y.rounded(.down))
+                    // `loadActionIsClear: false` for the same reason the blit
+                    // ladder passes it: a frame that does clear redraws every
+                    // layer whole anyway, so the disagreement cannot lose a row.
+                    if layerNeedsAllRows(
+                        state: state,
+                        rowCount: layerResolvableRowCount(li, layer),
+                        retainedRowCount: collectLayerRetainedRows(layer.gridId),
+                        loadActionIsClear: false
+                    ) {
+                        markLayersOverBand(li, leftPx, rightPx, topPx, topPx + layer.rows * rowHeightPx)
+                        continue
+                    }
+                    for row in state.drawRows where row >= 0 && row < layer.rows {
+                        let bandTopPx = topPx + row * rowHeightPx
+                        markLayersOverBand(li, leftPx, rightPx, bandTopPx, bandTopPx + rowHeightPx)
+                    }
+                }
+            }
+
             // Both producers above append to lists the core already filled, and
             // the draw loop encodes one row at a time, so drop the duplicates.
             for state in layerStateSnapshot {
@@ -4059,6 +4122,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         enc.setFragmentTexture(tex, index: 0)
                     }
                     enc.setFragmentSamplerState(sampler!, index: 0)
+                    // ps_glow_occlude reads the same background alpha the main
+                    // pass paints with, so the two agree on what a layer hides.
+                    if let alphaBuf = backgroundAlphaBuffer {
+                        enc.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
+                    }
 
                     var extractScrollCount = UInt32(scrollSnapshot.count)
                     if !scrollSnapshot.isEmpty {
@@ -4104,19 +4172,32 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
                                 )
                             )
-                            for row in 0..<rowCount {
-                                let slot = set.rowLogicalToSlot[row]
-                                guard slot >= 0, slot < set.rowState.buffers.count,
-                                      let vb = set.rowState.buffers[slot],
-                                      set.rowState.counts[slot] > 0
-                                else { continue }
-                                let sourceRow = slot < set.rowSlotSourceRows.count
-                                    ? set.rowSlotSourceRows[slot]
-                                    : row
-                                var rt = Float(row - sourceRow) * Float(cellHi)
-                                enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
-                                enc.setVertexBuffer(vb, offset: 0, index: 0)
-                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: set.rowState.counts[slot])
+                            // Pass 0 attenuates what the layers below already
+                            // extracted by this layer's background coverage,
+                            // pass 1 adds this layer's own light. Back to front
+                            // over the layer list, which is the screen order the
+                            // extract pass otherwise has no way to honour.
+                            for pass in 0..<2 {
+                                if pass == 0 {
+                                    guard let occludePipe = glowOccludePipeline else { continue }
+                                    enc.setRenderPipelineState(occludePipe)
+                                } else {
+                                    enc.setRenderPipelineState(extractPipe)
+                                }
+                                for row in 0..<rowCount {
+                                    let slot = set.rowLogicalToSlot[row]
+                                    guard slot >= 0, slot < set.rowState.buffers.count,
+                                          let vb = set.rowState.buffers[slot],
+                                          set.rowState.counts[slot] > 0
+                                    else { continue }
+                                    let sourceRow = slot < set.rowSlotSourceRows.count
+                                        ? set.rowSlotSourceRows[slot]
+                                        : row
+                                    var rt = Float(row - sourceRow) * Float(cellHi)
+                                    enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
+                                    enc.setVertexBuffer(vb, offset: 0, index: 0)
+                                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: set.rowState.counts[slot])
+                                }
                             }
                         }
                     }
@@ -4876,6 +4957,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("WARNING: Missing ps_glow_extract shader (bloom disabled)")
             return
         }
+        guard let fsOcclude = lib.makeFunction(name: "ps_glow_occlude") else {
+            ZonvieCore.appLog("WARNING: Missing ps_glow_occlude shader (bloom disabled)")
+            return
+        }
         guard let fsKawaseDown = lib.makeFunction(name: "ps_kawase_down") else {
             ZonvieCore.appLog("WARNING: Missing ps_kawase_down shader (bloom disabled)")
             return
@@ -4906,6 +4991,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             a.sourceRGBBlendFactor = .one
             a.destinationRGBBlendFactor = .oneMinusSourceAlpha
             a.sourceAlphaBlendFactor = .one
+            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        }
+
+        // Glow occlude: same vertex layout as extract, and the destination is
+        // scaled by the background's alpha instead of adding to it.
+        let occludeDesc = MTLRenderPipelineDescriptor()
+        occludeDesc.vertexFunction = vs
+        occludeDesc.fragmentFunction = fsOcclude
+        occludeDesc.vertexDescriptor = vertexDesc
+        occludeDesc.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = occludeDesc.colorAttachments[0] {
+            a.isBlendingEnabled = true
+            a.rgbBlendOperation = .add
+            a.alphaBlendOperation = .add
+            a.sourceRGBBlendFactor = .zero
+            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            a.sourceAlphaBlendFactor = .zero
             a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
         }
 
@@ -4946,6 +5048,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         do {
             glowExtractPipeline = try device.makeRenderPipelineState(descriptor: extractDesc)
+            glowOccludePipeline = try device.makeRenderPipelineState(descriptor: occludeDesc)
             kawaseDownPipeline = try device.makeRenderPipelineState(descriptor: kawaseDownDesc)
             kawaseUpPipeline = try device.makeRenderPipelineState(descriptor: kawaseUpDesc)
             glowCompositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)

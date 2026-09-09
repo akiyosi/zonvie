@@ -3451,6 +3451,10 @@ pub const LayerFramePlanParams = struct {
     /// The root grid's rows this paint redraws. Each paints its own band over
     /// whatever sits under it.
     rows_to_draw: []const u32,
+    /// The rectangle the root's GPU scroll copied, in back_tex pixels, or null
+    /// when the root did not shift. Every pixel inside it moved, including the
+    /// layers drawn there, while the root only redraws the band it vacated.
+    root_scroll_rect: ?c.RECT = null,
     log_enabled: bool,
 };
 
@@ -3499,6 +3503,36 @@ fn refuseLayerBlit(
         row_h_px,
     ) orelse return;
     markDrawRows(state, rows[0], rows[1]);
+}
+
+/// Mark the rows of every layer above `li` that `band` covers. Only a layer
+/// whose columns overlap the one at `li` can lose pixels to it.
+fn markLayersOverBand(
+    app: *App,
+    layers: []const SurfaceLayer,
+    li: usize,
+    band_top_px: i32,
+    band_bottom_px: i32,
+    p: LayerFramePlanParams,
+) void {
+    const src = layers[li];
+    const left = src.x_px;
+    const right = left + @as(i32, @intCast(src.cols)) * p.cell_w_px;
+    for (layers[li + 1 ..]) |above| {
+        const above_state = app.layer_grids.get(above.grid_id) orelse continue;
+        if (above_state.draw_all) continue;
+        const a_left = above.x_px;
+        const a_right = a_left + @as(i32, @intCast(above.cols)) * p.cell_w_px;
+        if (a_right <= left or a_left >= right) continue;
+        const rows = render_pipeline_helpers.bandLayerRows(
+            band_top_px,
+            band_bottom_px,
+            above.y_px,
+            above.rows,
+            p.row_h_px,
+        ) orelse continue;
+        markDrawRows(above_state, rows[0], @as(usize, rows[1]) + 1);
+    }
 }
 
 /// Decide which rows of each non-root layer this paint has to draw, and shift
@@ -3550,6 +3584,25 @@ pub fn planLayerFrame(
             const rows = render_pipeline_helpers.bandLayerRows(
                 band_top,
                 band_top + p.row_h_px,
+                layer.y_px,
+                layer.rows,
+                p.row_h_px,
+            ) orelse continue;
+            markDrawRows(state, rows[0], @as(usize, rows[1]) + 1);
+        }
+    }
+
+    // 2b. Rows the root's own GPU scroll displaced. The copy moved every pixel
+    //     of its rectangle, a layer sitting inside it included, but the root
+    //     redraws only the band it vacated -- so the rest of that layer keeps
+    //     the pixels the copy dragged it to. The region is always full width.
+    if (p.root_scroll_rect) |sr| {
+        for (layers[1..n]) |layer| {
+            const state = app.layer_grids.get(layer.grid_id) orelse continue;
+            if (state.draw_all) continue;
+            const rows = render_pipeline_helpers.bandLayerRows(
+                sr.top - p.y_offset,
+                sr.bottom - p.y_offset,
                 layer.y_px,
                 layer.rows,
                 p.row_h_px,
@@ -3676,6 +3729,34 @@ pub fn planLayerFrame(
         }
 
         state.draw_blit_rect = pl.blitRectPx();
+    }
+
+    // 4. Rows every layer repaints over the layers above it. A layer owns the
+    //    whole rectangle of each row it draws, so drawing one erases what a
+    //    layer over it had there, and that layer draws nothing this paint
+    //    unless it is marked too. Back to front, so a mark lands before the
+    //    layer carrying it is itself the source of the next one.
+    for (layers[1..n], 1..) |layer, li| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
+        if (row_limit == 0) continue;
+        if (state.draw_all) {
+            markLayersOverBand(
+                app,
+                layers,
+                li,
+                layer.y_px,
+                layer.y_px + @as(i32, @intCast(row_limit)) * p.row_h_px,
+                p,
+            );
+            continue;
+        }
+        var it = state.draw_rows.iterator(.{});
+        while (it.next()) |ri| {
+            if (ri >= row_limit) break;
+            const top = layer.y_px + @as(i32, @intCast(ri)) * p.row_h_px;
+            markLayersOverBand(app, layers, li, top, top + p.row_h_px, p);
+        }
     }
 }
 
@@ -4128,16 +4209,24 @@ fn drawBloomRowBuffers(
                 const origin_x: f32 = @floatFromInt(layer.x_px);
                 const origin_y: f32 = @floatFromInt(layer.y_px);
                 const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
-                for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
-                    if (rv.verts.items.len == 0) continue;
-                    // Only a buffer holding this row's current vertices is
-                    // safe to draw: the layer pass skips a row whose upload
-                    // failed and leaves uploaded_gen behind.
-                    if (rv.uploaded_gen != rv.gen) continue;
-                    const vb = rv.vb orelse continue;
-                    const row_dy = layerRowShiftPx(state, ri, ctx.row_h_px);
-                    g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px);
-                    g.drawVB(vb, rv.verts.items.len) catch {};
+                // Pass 0 attenuates what the layers below already extracted by
+                // this layer's background coverage, pass 1 adds this layer's
+                // own light. Back to front over the layer list, which is the
+                // screen order the extract pass otherwise has no way to honour.
+                var pass: u8 = 0;
+                while (pass < 2) : (pass += 1) {
+                    if (!g.setBloomOccludePass(d3d_ctx, pass == 0)) continue;
+                    for (state.rows_buf.items[0..row_limit], 0..) |*rv, ri| {
+                        if (rv.verts.items.len == 0) continue;
+                        // Only a buffer holding this row's current vertices is
+                        // safe to draw: the layer pass skips a row whose upload
+                        // failed and leaves uploaded_gen behind.
+                        if (rv.uploaded_gen != rv.gen) continue;
+                        const vb = rv.vb orelse continue;
+                        const row_dy = layerRowShiftPx(state, ri, ctx.row_h_px);
+                        g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px);
+                        g.drawVB(vb, rv.verts.items.len) catch {};
+                    }
                 }
             }
             // Restore the surface's own pixel space for the cursor draw that

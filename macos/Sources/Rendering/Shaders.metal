@@ -749,6 +749,31 @@ fragment float4 ps_glow_extract(VSOut in [[stage_in]],
     return float4(in.color.rgb * cov, cov);
 }
 
+/// Glow occlusion: a layer's background attenuates the light already extracted
+/// from whatever it covers. The main pass gets this from drawing back to front;
+/// the extract pass has no such ordering of its own, because ps_glow_extract
+/// discards every background quad, so a glyph hidden behind an opaque float
+/// would still bloom through it.
+///
+/// Only background quads take part (glyph quads are the light sources), and the
+/// pipeline blends them as (zero, one_minus_source_alpha): the destination is
+/// scaled by the coverage the background would have painted over it, which
+/// erases it under an opaque layer and dims it under a translucent one.
+fragment float4 ps_glow_occlude(VSOut in [[stage_in]],
+                                constant float& backgroundAlpha [[buffer(1)]]) {
+    if (in.uv.x >= 0.0) discard_fragment();
+    // Only plain background quads: a decoration sits on top of one, and
+    // attenuating twice over the same pixel would square the factor.
+    if (in.deco_flags & DECO_VISUAL_MASK) discard_fragment();
+    // Exactly ps_main's background rules. The Zig-side vertex alpha is a
+    // transport value that pass ignores -- under blur the core stamps 0.5 on
+    // the default background while the screen shows the configured opacity --
+    // so occluding by it would leave light under a background painted opaque.
+    if (backgroundAlpha >= 1.0) return float4(0.0, 0.0, 0.0, 1.0);
+    if (backgroundAlpha <= 0.0) return float4(0.0);
+    return float4(0.0, 0.0, 0.0, backgroundAlpha);
+}
+
 /// Dual Kawase downsample (5 taps).
 /// Each pass halves resolution, progressively eliminating grid patterns.
 fragment float4 ps_kawase_down(CopyVSOut in [[stage_in]],
