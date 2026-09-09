@@ -54,6 +54,12 @@ SamplerState samp0 : register(s0);
 #define DECO_UNDERDOTTED   (1u << 3)
 #define DECO_UNDERDASHED   (1u << 4)
 #define DECO_STRIKETHROUGH (1u << 5)
+#define DECO_CURSOR        (1u << 6)
+// Transport-only: marks a vertex as being in the scrollable content area
+// rather than a margin. The core sets it on ordinary body BACKGROUND quads
+// too, so anything testing "is this a decoration" must mask the visual flags
+// rather than compare deco_flags against 0.
+#define DECO_SCROLLABLE    (1u << 7)
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
@@ -62,6 +68,11 @@ SamplerState samp0 : register(s0);
 // this frontend never fades foreground quads. Declared so the flag is not
 // mistaken for an unknown bit by the next reader.
 #define DECO_SOLID_GLYPH   (1u << 11)
+
+// Visual decoration flags, excluding the transport-only ones (SCROLLABLE) and
+// the ones that only pick a sampling mode (GLOW, COLOR_EMOJI). Mirrors
+// DECO_VISUAL_MASK in Shaders.metal.
+#define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE | DECO_SOLID_GLYPH)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -328,6 +339,28 @@ CustomPostVSOut VSCustomPost(uint id : SV_VertexID) {
     o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
     o.vUV = uv;
     return o;
+}
+
+// Glow occlusion: a layer's background attenuates the light already extracted
+// from whatever it covers. The main pass gets this from drawing back to front;
+// the extract pass has no such ordering of its own, because PSGlowExtract
+// discards every background quad, so a glyph hidden behind an opaque float
+// would still bloom through it.
+//
+// Only background quads take part (glyph quads are the light sources), and the
+// pipeline blends them as (ZERO, INV_SRC_ALPHA): the destination is scaled by
+// the coverage the background would have painted over it, which erases it under
+// an opaque layer and dims it under a translucent one.
+float4 PSGlowOcclude(VSOut i) : SV_Target {
+    if (i.uv.x >= 0.0) discard;
+    // Only plain background quads: a decoration sits on top of one, and
+    // attenuating twice over the same pixel would square the factor. Icons
+    // (uv.x <= -1.9) are frontend chrome, never a layer's background.
+    if ((i.deco_flags & DECO_VISUAL_MASK) || i.uv.x <= ICON_CIRCLE + 0.1) discard;
+    // PSMain returns premultiply(i.col) for a background, so its own alpha is
+    // exactly the coverage it paints -- unlike macOS, which overrides it with
+    // a uniform.
+    return float4(0.0, 0.0, 0.0, i.col.a);
 }
 
 // Glow extract: render only DECO_GLOW glyphs with original foreground color.

@@ -3431,6 +3431,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         }
                         continue
                     }
+                    // Attenuate what this surface already extracted under the
+                    // layer before adding the layer's own light, so a glyph
+                    // hidden behind a float here does not bloom through it --
+                    // the same two-pass order the main surface uses.
+                    if glow, let occludePipe = mainTerminalView?.renderer.glowOccludePipeline {
+                        _ = encodeSurfaceRowDraws(
+                            encoder: encoder, rows: 0..<rows,
+                            resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
+                            pipeline: occludePipe,
+                            backgroundPipeline: nil, glyphPipeline: nil, useTwoPass: false
+                        )
+                    }
                     _ = encodeSurfaceRowDraws(
                         encoder: encoder, rows: 0..<rows,
                         resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
@@ -3486,11 +3498,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     intensity: intensity
                     ) { enc in
                     // Set up atlas and scroll offsets for extract pass.
-                    // NOTE: the shared helper binds no fragment buffer, and none is
-                    // needed: ps_glow_extract takes only texture(0) + sampler(0).
+                    // ps_glow_extract takes only texture(0) + sampler(0), but the
+                    // occlusion pass drawHostedLayers runs reads the background
+                    // alpha at fragment buffer(1) -- the same one the main pass
+                    // paints with, so the two agree on what a layer hides.
                     // The helper does bind the layer transform (vertex buffer 4).
                     enc.setFragmentTexture(atlasTex, index: 0)
                     enc.setFragmentSamplerState(self.sampler!, index: 0)
+                    if let alphaBuf = self.backgroundAlphaBuffer {
+                        enc.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
+                    }
 
                     bindSingleSurfaceScrollOffset(encoder: enc, offset: scrollOffsetSnapshot)
                     var zeroTranslation: Float = 0
