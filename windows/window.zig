@@ -3249,6 +3249,7 @@ pub export fn WndProc(
                                 .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
                                 .last_cursor_row = app.last_painted_cursor_row,
                                 .rows_to_draw = rows_to_draw.items,
+                                .root_scroll_rect = scroll_shift_result.scroll_rect,
                                 .log_enabled = log_enabled,
                             });
                             app.mu.unlock(core.clock.io());

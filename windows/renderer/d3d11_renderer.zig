@@ -251,6 +251,10 @@ pub const Renderer = struct {
     /// that SPIRV-Cross generates for `layout(location=0) in vec2 vUV`.
     vs_custom_post: ?*c.ID3D11VertexShader = null,
     ps_glow_extract: ?*c.ID3D11PixelShader = null,
+    /// Attenuates extracted glow by a layer's background coverage, so a glyph
+    /// behind an opaque layer does not bloom through it.
+    ps_glow_occlude: ?*c.ID3D11PixelShader = null,
+    occlude_blend: ?*c.ID3D11BlendState = null,
     ps_kawase_down: ?*c.ID3D11PixelShader = null,
     ps_kawase_up: ?*c.ID3D11PixelShader = null,
     ps_glow_composite: ?*c.ID3D11PixelShader = null,
@@ -570,6 +574,8 @@ pub const Renderer = struct {
         safeRelease(&self.vs_fullscreen);
         safeRelease(&self.vs_custom_post);
         safeRelease(&self.ps_glow_extract);
+        safeRelease(&self.ps_glow_occlude);
+        safeRelease(&self.occlude_blend);
         safeRelease(&self.ps_kawase_down);
         safeRelease(&self.ps_kawase_up);
         safeRelease(&self.ps_glow_composite);
@@ -3223,12 +3229,13 @@ pub const Renderer = struct {
     fn bloomShadersReady(self: *const Renderer) bool {
         return self.vs_fullscreen != null and
             self.ps_glow_extract != null and
+            self.ps_glow_occlude != null and
             self.ps_kawase_down != null and
             self.ps_kawase_up != null and
             self.ps_glow_composite != null;
     }
 
-    /// Compile the five bloom shaders before a glow-enabled paint is queued.
+    /// Compile the bloom shaders before a glow-enabled paint is queued.
     /// No-op once built. Keeping this opt-in avoids the ~50 ms cost for
     /// configs that never enable glow without charging the first WM_PAINT.
     /// Returns `true` when every shader is ready to use.
@@ -3250,12 +3257,13 @@ pub const Renderer = struct {
         const bloom_entries = [_]BloomEntry{
             .{ .entry = "VSFullscreen", .target = "vs_5_0" },
             .{ .entry = "PSGlowExtract", .target = "ps_5_0" },
+            .{ .entry = "PSGlowOcclude", .target = "ps_5_0" },
             .{ .entry = "PSKawaseDown", .target = "ps_5_0" },
             .{ .entry = "PSKawaseUp", .target = "ps_5_0" },
             .{ .entry = "PSGlowComposite", .target = "ps_5_0" },
         };
 
-        var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{ null, null, null, null, null };
+        var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{null} ** bloom_entries.len;
         defer for (&bloom_blobs) |*b| blobRelease(b.*);
 
         for (bloom_entries, 0..) |be, idx| {
@@ -3279,7 +3287,7 @@ pub const Renderer = struct {
             self.vs_fullscreen = vs_fs;
         }
 
-        inline for (.{ 1, 2, 3, 4 }, .{ &self.ps_glow_extract, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
+        inline for (.{ 1, 2, 3, 4, 5 }, .{ &self.ps_glow_extract, &self.ps_glow_occlude, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
             if (field.* == null) {
                 const bp = blobPtr(bloom_blobs[idx]) orelse return false;
                 const bs = blobSize(bloom_blobs[idx]);
@@ -3926,6 +3934,28 @@ pub const Renderer = struct {
     }
 
     /// Execute post-process bloom: extract → Dual Kawase downsample/upsample → composite.
+    /// Switch the extract pass between adding a layer's own light (`false`)
+    /// and scaling the light under it by that layer's background coverage
+    /// (`true`). Returns false when occlusion is unavailable, in which case
+    /// nothing was bound and the caller must skip that sub-pass.
+    pub fn setBloomOccludePass(self: *Renderer, ctx: *c.ID3D11DeviceContext, occlude: bool) bool {
+        const vt = ctx.*.lpVtbl;
+        const ps_set = vt.*.PSSetShader orelse return false;
+        const om_blend = vt.*.OMSetBlendState orelse return false;
+        var bf: [4]f32 = .{ 0, 0, 0, 0 };
+        if (occlude) {
+            const ps = self.ps_glow_occlude orelse return false;
+            const bl = self.occlude_blend orelse return false;
+            ps_set(ctx, ps, null, 0);
+            om_blend(ctx, bl, &bf, 0xFFFFFFFF);
+            return true;
+        }
+        const ps = self.ps_glow_extract orelse return false;
+        ps_set(ctx, ps, null, 0);
+        om_blend(ctx, self.blend, &bf, 0xFFFFFFFF);
+        return true;
+    }
+
     pub const BloomRowsDrawFn = *const fn (
         ?*const anyopaque,
         *Renderer,
@@ -4534,6 +4564,28 @@ pub const Renderer = struct {
             const hr_ab = create_blend(dev, &abd, &ab);
             if (c.FAILED(hr_ab) or ab == null) return error.D3DCreateBlendFailed;
             self.additive_blend = ab;
+        }
+
+        // --- Glow occlusion blend (ZERO, INV_SRC_ALPHA) ---
+        // Scales the extracted light already in the target by the coverage a
+        // layer's background paints over it, instead of adding to it.
+        {
+            const create_blend = dev_vtbl.*.CreateBlendState orelse return error.D3DCreateBlendFailed;
+
+            var obd: c.D3D11_BLEND_DESC = std.mem.zeroes(c.D3D11_BLEND_DESC);
+            obd.RenderTarget[0].BlendEnable = c.TRUE;
+            obd.RenderTarget[0].SrcBlend = c.D3D11_BLEND_ZERO;
+            obd.RenderTarget[0].DestBlend = c.D3D11_BLEND_INV_SRC_ALPHA;
+            obd.RenderTarget[0].BlendOp = c.D3D11_BLEND_OP_ADD;
+            obd.RenderTarget[0].SrcBlendAlpha = c.D3D11_BLEND_ZERO;
+            obd.RenderTarget[0].DestBlendAlpha = c.D3D11_BLEND_INV_SRC_ALPHA;
+            obd.RenderTarget[0].BlendOpAlpha = c.D3D11_BLEND_OP_ADD;
+            obd.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+
+            var ob: ?*c.ID3D11BlendState = null;
+            const hr_ob = create_blend(dev, &obd, &ob);
+            if (c.FAILED(hr_ob) or ob == null) return error.D3DCreateBlendFailed;
+            self.occlude_blend = ob;
         }
 
         // --- Bilinear sampler for bloom blur ---
