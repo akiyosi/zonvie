@@ -2248,6 +2248,41 @@ func remapSurfaceRowSlots(
     }
 }
 
+/// Carry a grid's pending redraw rows with the content a row shift moved.
+///
+/// `remapSurfaceRowSlots` rotates logical rows onto other slots, so a row marked
+/// before the shift describes content that is no longer there: with the GPU blit
+/// accepted, the row it moved TO is never repainted and keeps what the copy
+/// dragged into it. `rowsDelta > 0` means content moved up, so what was row
+/// `r + rowsDelta` is now row `r`.
+///
+/// The vacated band is marked, not cleared: those rows lost their vertices and
+/// have to be repainted regardless. Mirrors Windows `shiftRowBits`, including
+/// its no-op guards -- the core never stages a shift at or past the region
+/// height, and `remapSurfaceRowSlots` declines the same ones.
+func shiftSurfaceRowIndices(
+    _ rows: inout IndexSet,
+    rowStart: Int,
+    rowEnd: Int,
+    rowsDelta: Int
+) {
+    guard rowsDelta != 0, rowEnd > rowStart, rowStart >= 0 else { return }
+    let shift = abs(rowsDelta)
+    guard shift < rowEnd - rowStart else { return }
+
+    let region = rowStart..<rowEnd
+    var moved = IndexSet()
+    for row in rows.intersection(IndexSet(integersIn: region)) {
+        let destination = row - rowsDelta
+        if region.contains(destination) { moved.insert(destination) }
+    }
+    rows.remove(integersIn: region)
+    rows.formUnion(moved)
+
+    let vacatedStart = rowsDelta > 0 ? rowEnd - shift : rowStart
+    rows.insert(integersIn: vacatedStart..<(vacatedStart + shift))
+}
+
 /// Copy buffer set state from source to destination for the start of a new flush.
 /// Before copying src's buffer references into dst's independently-owned Array,
 /// dst's own buffers are saved into the detach pool. On buffer detach, pool buffers
