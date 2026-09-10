@@ -5089,6 +5089,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Otherwise we consume the cursor state before the grid window is created.
     // Always update cursor rev to prevent stale changed=true accumulation.
     const has_external_grids = self.known_external_grids.count() > 0;
+    // A grid composited as a LAYER has no host window, so external windows are
+    // the wrong thing to wait for: with none of them, last_ext_cursor_grid
+    // stayed 1 while a float owned the cursor, and the owning grid never got
+    // the empty CURSOR set that hiding the cursor (busy_start) needs. Its
+    // vertices come from emit_grid_ids below, which is built from sub_grids,
+    // so a cursor sitting on one is safe to consume here.
+    const cursor_grid_is_emitted = cursor_grid == 1 or self.grid.sub_grids.contains(cursor_grid);
     // Hold off consuming the cursor grid while the cursor sits on an external
     // grid whose host window is not created yet (in external_grids but not yet
     // known_external_grids). Consuming it lets grid_changed go false on the next
@@ -5104,7 +5111,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         // whole bracket — skip syncing so cursor_changed/cursor_grid_changed
         // still read true next call and the cancelled update is resent.
         if (!self.flush_aborted and !ext_cursor_retry_required) {
-            if (has_external_grids and !cursor_grid_pending) {
+            if ((has_external_grids or cursor_grid_is_emitted) and !cursor_grid_pending) {
                 self.last_ext_cursor_grid = cursor_grid;
             }
             self.last_ext_cursor_rev = cursor_rev;
@@ -15226,4 +15233,80 @@ test "an overflowing same-region accumulation fails closed instead of shifting" 
     // No shift hint, and the whole grid is regenerated instead.
     try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
     try std.testing.expectEqual(@as(u32, 10), state.rows_emitted);
+}
+
+test "busy_start clears the cursor on the grid that owns it" {
+    // busy_start hides the cursor without moving it. The grid that owns the
+    // cursor has to receive the empty CURSOR set: a frontend merging grid
+    // cursors into one overlay tracks the owning grid and ignores a clear
+    // naming a different one (zonvie_core.h, on_vertices_row CURSOR contract),
+    // so nothing else can take the cursor off the screen.
+    const State = struct {
+        shown: u32 = 0,
+        cleared: u32 = 0,
+        root_cleared: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = total_rows;
+            _ = total_cols;
+            if (flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) {
+                if (vert_count == 0) self.root_cleared += 1;
+                return;
+            }
+            if (grid_id != 2) return;
+            if (vert_count == 0) self.cleared += 1 else self.shown += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 4;
+    core.cell_h_px = 2;
+    core.drawable_w_px = 8;
+    core.drawable_h_px = 4;
+    try core.grid.resize(2, 2);
+    try core.grid.resizeGrid(2, 2, 2);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    core.grid.putCellGrid(2, 0, 0, 'B', 0);
+    core.grid.setCursor(2, 0, 0);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    StubGlyphCallbacks.install(&core);
+
+    // The whole flush, the way a real one runs.
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 2);
+    try std.testing.expect(state.shown >= 1);
+    try std.testing.expectEqual(@as(u32, 0), state.cleared);
+
+    // Exactly what redraw_handler does for busy_start.
+    core.grid.cursor_visible = false;
+    core.grid.cursor_rev +%= 1;
+
+    try flush_ctx.onFlush(2, 2);
+
+    // Control: the flush did run its cursor handling, and it did produce a
+    // clear -- addressed to grid 1, which owns nothing here. Without this a
+    // flush that emitted no cursor callback at all would look the same.
+    try std.testing.expect(state.root_cleared >= 1);
+    try std.testing.expect(!core.grid.cursor_visible);
+
+    try std.testing.expect(state.cleared >= 1);
 }
