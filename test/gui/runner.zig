@@ -134,6 +134,16 @@ test "gui:main_float_margin_scroll_flicker" {
     }
 }
 
+test "gui:extwin_keyboard_scroll_eases" {
+    // macOS only: the external-window smooth-scroll path is macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_keyboard_scroll_eases.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extfloat_move_cursor_shader" {
     // macOS only: the shader cursor plumbing lives in the macOS frontend.
     if (comptime builtin.os.tag == .macos) {

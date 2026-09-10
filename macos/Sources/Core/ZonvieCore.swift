@@ -126,6 +126,33 @@ final class ZonvieCore {
         return externalGridViews[gridId]
     }
 
+    /// Snapshot buffer for the seed drain below. Its own, not shared with
+    /// pendingCapacityScratch: that one is owned by the flush path, and this
+    /// runs on the main thread's ease tick.
+    private var smoothScrollSeedScratch: [ExternalGridView] = []
+
+    /// Drain every external window's sub-row ease seeds into `out`. The offsets
+    /// those seeds feed live in the main view's shared per-grid store, so one
+    /// tick spends every surface's. Snapshots under the map lock and releases
+    /// it before asking any view, so externalGridViewsLock is never held across
+    /// a surface lock.
+    func appendExternalSmoothScrollSeeds(into out: inout [(gridId: Int64, rowsDelta: Int)]) {
+        externalGridViewsLock.lock()
+        smoothScrollSeedScratch.removeAll(keepingCapacity: true)
+        smoothScrollSeedScratch.append(contentsOf: externalGridViews.values)
+        externalGridViewsLock.unlock()
+        defer { smoothScrollSeedScratch.removeAll(keepingCapacity: true) }
+        for view in smoothScrollSeedScratch {
+            // Real external windows only. A negative id is a Zonvie-managed
+            // surface (ext_cmdline, ext_messages), which handleScrollInput
+            // already keeps out of pixel smooth scrolling: seeding one
+            // displaces a grid the user never scrolls, and the cursor shader
+            // uniform follows that displacement away from the real cursor.
+            guard view.gridId > 1 else { continue }
+            out.append(contentsOf: view.takeSmoothScrollSeeds())
+        }
+    }
+
     /// True while any surface still owes a row-capacity provisioning pass.
     /// Snapshots under the map lock and releases it before asking any view, so
     /// externalGridViewsLock is never held across a surface lock.

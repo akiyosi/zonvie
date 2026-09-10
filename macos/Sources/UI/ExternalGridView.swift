@@ -524,6 +524,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// over by the grid_scroll callback. Summed because several notifications
     /// can land before a bracket opens. Guarded by `pendingGridScrollLock`.
     private var pendingGridScrollRows = 0
+    /// Sub-row ease seeds for the steps this window's row-shift fast path
+    /// opened, published by commitFlush with the vertices they belong to.
+    /// Deliberately a copy of the main renderer's pair rather than something
+    /// ScrollRetention owns: staging inside beginStep also seeds the
+    /// grid_scroll capture, whose scrolls a gesture already compensates, and
+    /// that displaced grids that were square (it misplaced the cursor shader
+    /// uniform in a split).
+    private var stagedSmoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
+    private var smoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
     /// The scrollable row span of this window: the grid minus its viewport
     /// margins (a winbar makes marginTop 1, and its row does not scroll).
     /// Armed on the main thread as each gesture scroll is sent, because
@@ -1218,6 +1227,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // capture what this flush's scroll is about to take off the edge,
         // while the committed set still holds the on-screen rows.
         retention.beginFlush()
+        pendingGridScrollLock.lock()
+        stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
+        pendingGridScrollLock.unlock()
         captureRetainedRowsForPendingScroll()
         // Clear stale scroll staging from a previous bracket on this set
         // (mirrors MetalTerminalRenderer.beginFlush's dst.pendingScroll = nil).
@@ -1426,7 +1438,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // would draw the same line twice. Same for the cursor rect the
             // shader uniforms carry — it describes this bracket's cursor
             // vertices, which only reach the screen now.
-            retention.commit()
+            if retention.commit() {
+                pendingGridScrollLock.lock()
+                smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
+                stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
+                pendingGridScrollLock.unlock()
+            }
             mainTerminalView?.renderer.publishCursorShaderState()
             // The distance this bracket captured against is only spent now
             // that its vertices are the committed ones; a cancelled bracket
@@ -1628,11 +1645,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // edge stretch have the band rather than retain the wrong rows.
         guard let bounds else { return }
         let rows = Int(committedGridRows > 0 ? committedGridRows : gridRows)
+        // Seeding is decided by who compensates the scroll, not by which path
+        // captured the rows: this same capture serves a trackpad gesture (which
+        // compensates through the finger and owes no seed) and a keyboard
+        // scroll that only reached here because an ease was already holding an
+        // offset — that one owes one.
         captureRetainedRows(
             ws: bufferSets[flushSourceSetIndex],
             rowStart: bounds.top,
             rowEnd: min(bounds.bottomEx, rows),
-            rowsDelta: rowsDelta
+            rowsDelta: rowsDelta,
+            seedsEase: !(mainTerminalView?.gestureOwnsScroll(gridId: gridId) ?? false)
         )
     }
 
@@ -1649,7 +1672,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// let those escape the offset shift and the content clip, landing them
     /// on the margin rows. Called from inside the flush bracket, before the
     /// slot remap.
-    private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int) {
+    /// `seedsEase` mirrors the main renderer's split: the row-shift fast path
+    /// owes a seed, the grid_scroll hand-over does not — a gesture compensates
+    /// through the finger and seeding it as well would pay twice.
+    private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int, seedsEase: Bool) {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         guard ws.rowState.usingRowBuffers else { return }
         guard let plan = ScrollRetention.plan(
@@ -1662,6 +1688,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let capturedCellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
         guard capturedCellHeightPx > 0 else { return }
         var stepOpened = false
+        defer {
+            if seedsEase, stepOpened, abs(rowsDelta) == 1 {
+                pendingGridScrollLock.lock()
+                stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
+                pendingGridScrollLock.unlock()
+            }
+        }
         for i in 0..<plan.count {
             let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
             guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { continue }
@@ -1724,12 +1757,34 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // grid.
 
         let ws = bufferSets[writeSetIndex]
-        // No retention capture here. This runs only when the core takes the
-        // row-scroll fast path, but the grid_scroll callback has already
-        // handed the same distance to captureRetainedRowsForPendingScroll,
-        // which ran at bracket open — and ZonvieCore opens the bracket
-        // immediately before calling this. Capturing again would stage the
-        // same rows twice and shift the first copy a second time.
+        // Capture the outgoing rows when the grid_scroll callback handed over
+        // no distance of its own. That hand-over is gated to gesture-owned
+        // scrolls, so a keyboard or Neovim-initiated scroll arrives here with
+        // nothing retained and no ease seed — the main surface takes both from
+        // captureLayerScrollStep on this same fast path, which is what gives it
+        // the animation an external window was missing. Guarded on the pending
+        // distance, because capturing what the bracket-open capture already
+        // staged would shift the same rows a second time.
+        // Only a hand-over the bracket-open capture can actually USE counts as
+        // one. It needs the scrollable span, and that is armed by the trackpad
+        // input path alone — so a keyboard scroll arriving while an ease is
+        // still running hands over a distance nothing can capture: the
+        // grid_scroll gate fires on the offset that ease is holding, this guard
+        // saw the distance and stood down, and the row went uncompensated.
+        pendingGridScrollLock.lock()
+        let handedOverByGridScroll = pendingGridScrollRows != 0 && scrollCaptureBounds != nil
+        pendingGridScrollLock.unlock()
+        if !handedOverByGridScroll {
+            // The source set still holds the on-screen rows: this runs before
+            // the remap below, the same ordering captureLayerScrollStep keeps.
+            captureRetainedRows(
+                ws: bufferSets[flushSourceSetIndex],
+                rowStart: rowStart,
+                rowEnd: rowEnd,
+                rowsDelta: rowsDelta,
+                seedsEase: !(mainTerminalView?.gestureOwnsScroll(gridId: gridId) ?? false)
+            )
+        }
         flushHasStructuralRowChange = true
         remapSurfaceRowSlots(
             bufferSet: ws,
@@ -2830,6 +2885,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 activateDrawLoop()
             }
 
+            // Same for the sub-row ease: the last step of a scroll produces no
+            // further flushes, so without this the animation stops on whatever
+            // frame the input happened to end on.
+            if mainTerminalView?.isSmoothScrollActive(gridId: gridId) == true {
+                activateDrawLoop()
+            }
+
             if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling && !shaderAnimates {
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // If a visual commit occurred recently, a timing race likely caused
@@ -3801,6 +3863,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// Uses shared scroll offset info and computation from MetalTerminalRenderer.
     /// Returns true if a non-zero scroll offset is active.
     @discardableResult
+    /// Drain the ease seeds this surface's steps committed. Spent by the main
+    /// view's tick, which owns the per-grid offsets they feed.
+    func takeSmoothScrollSeeds() -> [(gridId: Int64, rowsDelta: Int)] {
+        guard MetalTerminalRenderer.smoothScrollEnabled else { return [] }
+        pendingGridScrollLock.lock()
+        defer { pendingGridScrollLock.unlock() }
+        guard !smoothScrollSeeds.isEmpty else { return [] }
+        let taken = smoothScrollSeeds
+        smoothScrollSeeds.removeAll(keepingCapacity: true)
+        return taken
+    }
+
     private func updateScrollShaderOffset() -> Bool {
         guard let main = mainTerminalView else { return false }
 
