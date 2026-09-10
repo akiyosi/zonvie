@@ -3454,38 +3454,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
                 }
             }
-            if layerSnapshot.count > 1, Int(cellHi) > 0 {
-                let rowHeightPx = Int(cellHi)
-                for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                    guard let state = layerStateSnapshot[li],
-                          layer.rows > 0, layer.cols > 0 else { continue }
-                    let leftPx = Int(layer.originPx.x.rounded(.down))
-                    let rightPx = leftPx + layer.cols * Int(cellWi)
-                    let topPx = Int(layer.originPx.y.rounded(.down))
-                    // `loadActionIsClear: false` for the same reason the blit
-                    // ladder passes it: a frame that does clear redraws every
-                    // layer whole anyway, so the disagreement cannot lose a row.
-                    if layerNeedsAllRows(
-                        state: state,
-                        rowCount: layerResolvableRowCount(li, layer),
-                        retainedRowCount: collectLayerRetainedRows(layer.gridId),
-                        loadActionIsClear: false
-                    ) {
-                        markLayersOverBand(li, leftPx, rightPx, topPx, topPx + layer.rows * rowHeightPx)
-                        continue
-                    }
-                    for row in state.drawRows where row >= 0 && row < layer.rows {
-                        let bandTopPx = topPx + row * rowHeightPx
-                        markLayersOverBand(li, leftPx, rightPx, bandTopPx, bandTopPx + rowHeightPx)
-                    }
-                }
-            }
-
-            // Both producers above append to lists the core already filled, and
-            // the draw loop encodes one row at a time, so drop the duplicates.
-            for state in layerStateSnapshot {
-                guard let state else { continue }
+            // Back to front, and each layer is normalized before it becomes a
+            // source: only lower layers write to a higher one, so a layer's
+            // list is final by the time its turn comes. Propagating it with
+            // duplicates still in it would copy every duplicate into every
+            // layer above, doubling the count per overlapping layer. The
+            // frontmost layer marks nothing but is normalized here too, so no
+            // separate pass follows.
+            for (li, layer) in layerSnapshot.enumerated().dropFirst() {
+                guard let state = layerStateSnapshot[li] else { continue }
                 surfaceSortAndDeduplicateRows(&state.drawRows)
+                guard layer.rows > 0, layer.cols > 0, bandRowHeightPx > 0 else { continue }
+                let leftPx = Int(layer.originPx.x.rounded(.down))
+                let rightPx = leftPx + layer.cols * Int(cellWi)
+                let topPx = Int(layer.originPx.y.rounded(.down))
+                // `loadActionIsClear: false` for the same reason the blit
+                // ladder passes it: a frame that does clear redraws every
+                // layer whole anyway, so the disagreement cannot lose a row.
+                if layerNeedsAllRows(
+                    state: state,
+                    rowCount: layerResolvableRowCount(li, layer),
+                    retainedRowCount: collectLayerRetainedRows(layer.gridId),
+                    loadActionIsClear: false
+                ) {
+                    markLayersOverBand(li, leftPx, rightPx, topPx, topPx + layer.rows * bandRowHeightPx)
+                    continue
+                }
+                for row in state.drawRows where row >= 0 && row < layer.rows {
+                    let bandTopPx = topPx + row * bandRowHeightPx
+                    markLayersOverBand(li, leftPx, rightPx, bandTopPx, bandTopPx + bandRowHeightPx)
+                }
             }
 
             // --- 1) Render into back buffer (partial redraw is valid here) ---
