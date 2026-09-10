@@ -2047,8 +2047,10 @@ pub export fn WndProc(
                         "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
                         .{
                             @intFromBool(begin_hdc != null),
-                            ps.rcPaint.left,   ps.rcPaint.top,
-                            ps.rcPaint.right,  ps.rcPaint.bottom,
+                            ps.rcPaint.left,
+                            ps.rcPaint.top,
+                            ps.rcPaint.right,
+                            ps.rcPaint.bottom,
                             @intFromBool(ps.fErase != 0),
                             @intFromBool(app.wm_paint_reinvalidate_all),
                         },
@@ -2828,12 +2830,10 @@ pub export fn WndProc(
                         // root grid's. The grid id comes from the same
                         // transaction as the cursor vertices.
                         const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
-                        var cursor_layer_rows: u32 = 0;
                         const cursor_layer_origin: [2]f32 = blk: {
                             if (cursor_grid == 1) break :blk .{ 0, 0 };
                             for (tbs_snapshot.layers.slice()) |l| {
                                 if (l.grid_id == cursor_grid) {
-                                    cursor_layer_rows = l.rows;
                                     break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
                                 }
                             }
@@ -3341,8 +3341,14 @@ pub export fn WndProc(
                                     var claimed = true;
                                     for (cursor_erase_rows) |maybe_row| {
                                         const r = maybe_row orelse continue;
-                                        if (!app_mod.markLayerCursorRow(state, cursor_layer_rows, r))
-                                            claimed = false;
+                                        if (!app_mod.markLayerCursorRow(
+                                            app,
+                                            tbs_snapshot.layers.slice(),
+                                            cursor_grid,
+                                            r,
+                                            @intCast(@max(1, app.cell_w_px)),
+                                            row_h_px,
+                                        )) claimed = false;
                                     }
                                     cursor_row_redrawn = claimed;
                                 }
