@@ -45,6 +45,9 @@ final class MetalTerminalView: MTKView {
     // --- Scroll state for smooth scrolling ---
     // Per-grid accumulated scroll offset in pixels (for sub-cell smooth scrolling)
     private var scrollOffsetPx: [Int64: CGFloat] = [:]
+    /// Reused by tickSmoothScroll to collect the external surfaces' seeds
+    /// without allocating on the per-frame path.
+    private var externalSeedScratch: [(gridId: Int64, rowsDelta: Int)] = []
     // Persistent scratch buffers for updateScrollShaderOffset, reused via
     // removeAll(keepingCapacity: true) instead of building fresh arrays
     // (compactMap/etc.) every call — this runs in the pre-draw path on
@@ -227,7 +230,18 @@ final class MetalTerminalView: MTKView {
     /// it forward turns that into fractional motion. Steady-state lag is
     /// h * d / (1 - d) — one row at 0.5, which is the price of covering the
     /// jitter without reading as an animation.
-    private static let smoothScrollDecayPerFrame: CGFloat = 0.5
+    ///
+    /// `ZONVIE_SMOOTH_SCROLL_DECAY` overrides it (0 < d < 1) so the ease can be
+    /// slowed until it is visible — at 0.5 it is deliberately too fast to read
+    /// as motion, which makes "is it animating at all?" impossible to answer by
+    /// eye. Values near 0.9 make one step take about half a second. The offset
+    /// is still clamped to what the retention ring covers, so a very slow decay
+    /// holds at that ceiling rather than easing from further away.
+    private static let smoothScrollDecayPerFrame: CGFloat = {
+        guard let raw = ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL_DECAY"],
+              let d = Double(raw), d > 0, d < 1 else { return 0.5 }
+        return CGFloat(d)
+    }()
 
     /// Rows each scrolled window's content has travelled upwards, accumulated
     /// from on_grid_scroll. Paired with the renderer's per-layer placement
@@ -3007,6 +3021,15 @@ final class MetalTerminalView: MTKView {
         for seed in renderer.takeSmoothScrollSeeds() {
             seedScratch[seed.gridId, default: 0] += seed.rowsDelta
         }
+        // An external window opens its steps on its own surface, so its seeds
+        // are held by its own retention. The offsets they feed are this view's
+        // shared per-grid store, so they are spent here alongside the main
+        // surface's rather than on a second, competing decay clock.
+        externalSeedScratch.removeAll(keepingCapacity: true)
+        core?.appendExternalSmoothScrollSeeds(into: &externalSeedScratch)
+        for seed in externalSeedScratch {
+            seedScratch[seed.gridId, default: 0] += seed.rowsDelta
+        }
 
         // A trackpad gesture asks Neovim for a row before the finger has
         // travelled it, and the row arrives back here as an ordinary row scroll.
@@ -3106,7 +3129,50 @@ final class MetalTerminalView: MTKView {
     /// onPreDraw hook every frame.
     func serviceSharedScrollStateForExternalView() {
         processPendingScrollClears()
+        // Hand 'smoothscroll' back once the gesture is over, and advance the
+        // sub-row ease. Both are frame-driven and both were previously reached
+        // only through the main view's onPreDraw, so a grid living in an
+        // external window never eased at all -- its steps seeded an offset
+        // nothing spent, and the picture jumped a whole row. Running them from
+        // every surface's frame also means a paused or occluded main window
+        // cannot stall an external window's animation. Calling twice in one
+        // frame is harmless: the decay is wall-clock based, so the second call
+        // advances it by ~0.
+        tickGestureSmoothScroll()
+        tickSmoothScroll()
         tickScrollEdgeBounce()
+    }
+
+    /// Whether a trackpad gesture is compensating this grid's scrolls through
+    /// the finger, in which case an arriving row owes no ease seed.
+    ///
+    /// Mirrors the first three terms of the grid_scroll handler's gate and
+    /// deliberately drops its fourth, `abs(offset) >= epsilon`. That term means
+    /// "something is displaced", which an ease in flight also satisfies — so a
+    /// key struck mid-ease read as gesture-owned and its row lost the seed that
+    /// would have carried it.
+    func gestureOwnsScroll(gridId: Int64) -> Bool {
+        pendingSentScrollLock.lock()
+        let sent = pendingSentScroll[gridId] ?? 0
+        pendingSentScrollLock.unlock()
+        if sent > 0 { return true }
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        if gestureLookaheadGrids.contains(gridId) { return true }
+        guard gestureScrollGridId != nil, gridId != 1 else { return false }
+        return scrollGestureTouching
+            || scrollMomentumRunning
+            || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
+    }
+
+    /// True while a sub-row ease is running (for the given grid, or any grid
+    /// when nil). Views use this to keep their draw loop alive while the ease
+    /// settles, the way `isScrollEdgeBounceActive` does for the bounce.
+    func isSmoothScrollActive(gridId: Int64? = nil) -> Bool {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        if let gridId { return smoothScrollGrids.contains(gridId) }
+        return !smoothScrollGrids.isEmpty
     }
 
     /// True while an edge bounce is held or animating (for the given grid, or
