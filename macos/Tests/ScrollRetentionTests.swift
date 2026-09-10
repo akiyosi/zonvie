@@ -649,6 +649,53 @@ private enum ScrollRetentionTests {
         requireEqual(retention.publishedCount(gridId: 2), 2, "a step keeps at most depth rows")
     }
 
+    private static func verifyDirtyRowsTravelWithTheShift() {
+        // Content moves UP by one: the mark on row 10 describes what is now
+        // row 9, and row 9 is what the blit leaves stale.
+        var up: IndexSet = [10]
+        shiftSurfaceRowIndices(&up, rowStart: 0, rowEnd: 20, rowsDelta: 1)
+        require(up.contains(9), "a mark follows its content up the region")
+        require(!up.contains(10), "the mark does not stay at the pre-shift row")
+
+        // Content moves DOWN by two.
+        var down: IndexSet = [4]
+        shiftSurfaceRowIndices(&down, rowStart: 0, rowEnd: 20, rowsDelta: -2)
+        require(down.contains(6), "a mark follows its content down the region")
+        require(!down.contains(4), "the mark does not stay at the pre-shift row")
+
+        // The band the shift vacated is always redrawn: those rows lost their
+        // vertices. Upward shift vacates the bottom, downward the top.
+        var vacatedUp = IndexSet()
+        shiftSurfaceRowIndices(&vacatedUp, rowStart: 0, rowEnd: 20, rowsDelta: 3)
+        requireEqual(vacatedUp.count, 3, "an upward shift vacates three rows")
+        require(vacatedUp.contains(17) && vacatedUp.contains(19), "vacated band sits at the bottom")
+        var vacatedDown = IndexSet()
+        shiftSurfaceRowIndices(&vacatedDown, rowStart: 0, rowEnd: 20, rowsDelta: -3)
+        require(vacatedDown.contains(0) && vacatedDown.contains(2), "vacated band sits at the top")
+
+        // A mark carried out of the region is dropped, not wrapped onto a row
+        // that never held it.
+        var leaving: IndexSet = [1]
+        shiftSurfaceRowIndices(&leaving, rowStart: 0, rowEnd: 20, rowsDelta: 3)
+        // Nothing but the vacated band survives: row 1 leaves through the top.
+        requireEqual(leaving.count, 3, "a mark leaving the region is dropped, not wrapped")
+        require(leaving.contains(17), "and what is left is the vacated band")
+
+        // Rows outside the scrolled region describe content that did not move.
+        var outside: IndexSet = [2, 25]
+        shiftSurfaceRowIndices(&outside, rowStart: 10, rowEnd: 20, rowsDelta: 1)
+        require(outside.contains(2) && outside.contains(25), "rows outside the region are untouched")
+
+        // The guards the core's own staging shares: no delta, empty region, and
+        // a shift that covers the whole region leave the set alone.
+        var untouched: IndexSet = [5]
+        shiftSurfaceRowIndices(&untouched, rowStart: 0, rowEnd: 20, rowsDelta: 0)
+        shiftSurfaceRowIndices(&untouched, rowStart: 10, rowEnd: 10, rowsDelta: 2)
+        shiftSurfaceRowIndices(&untouched, rowStart: 0, rowEnd: 20, rowsDelta: 20)
+        requireEqual(untouched.count, 1, "a declined shift changes nothing")
+        require(untouched.contains(5), "and leaves the original mark where it was")
+    }
+
     static func main() {
         verifyPlan()
         verifyCoversBand()
@@ -658,6 +705,7 @@ private enum ScrollRetentionTests {
         verifyBodilyMovedLayerShiftsItsOrigin()
         verifyScrollOffsetLookup()
         verifyFloatDebtLedger()
+        verifyDirtyRowsTravelWithTheShift()
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             // Headless CI without a GPU: the arithmetic above still ran.

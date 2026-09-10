@@ -211,6 +211,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             rowEnd: rowEnd,
             rowsDelta: rowsDelta
         )
+        // The marks have to travel with the rows they describe. The remap below
+        // moves a row's vertices to another logical row; a mark left at the
+        // pre-shift index names content that is no longer there, and with the
+        // blit accepted the row it moved to is never repainted.
+        // Only this bracket's marks here: pendingDirtyRows carries marks a
+        // cancelled bracket must keep as they are, so commitFlush shifts those
+        // instead, against the shift it actually publishes.
+        shiftSurfaceRowIndices(
+            &layerDrawState(gridId: gridId).flushDirtyRows,
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta
+        )
         remapSurfaceRowSlots(
             bufferSet: sets[writeSetIndex],
             rowStart: rowStart,
@@ -2003,6 +2016,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if didMainWrite,
                let sets = gridBuffers.existingSets(for: gridId),
                let ps = sets[ws].pendingScroll {
+                // Marks an earlier bracket left, that no draw has consumed,
+                // still name pre-shift rows: this bracket rotated the slots
+                // under them. Before the branches below, which mark rows that
+                // already describe post-remap content, and before
+                // flushDirtyRows is merged in -- those were shifted as they
+                // were made.
+                shiftSurfaceRowIndices(
+                    &state.pendingDirtyRows,
+                    rowStart: ps.rowStart,
+                    rowEnd: ps.rowEnd,
+                    rowsDelta: ps.rowsDelta
+                )
                 if let existing = state.pendingScrollAccum,
                    existing.rowStart == ps.rowStart,
                    existing.rowEnd == ps.rowEnd {
