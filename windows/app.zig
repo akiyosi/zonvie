@@ -3467,15 +3467,35 @@ fn markDrawRows(state: *LayerGridState, row_start: usize, row_end: usize) void {
     state.draw_rows.setRangeValue(.{ .start = start, .end = end }, true);
 }
 
-/// Add the cursor's row to a layer's redraw set, after planLayerFrame settled
-/// it and before drawSurfaceLayers consumes it. False means this frame will
-/// not draw that row, so the caller cannot promise the overlay it was
+/// Add the cursor's row to its layer's redraw set, after planLayerFrame
+/// settled it and before drawSurfaceLayers consumes it. False means this frame
+/// will not draw that row, so the caller cannot promise the overlay it was
 /// repainted. Caller must hold `app.mu`.
-pub fn markLayerCursorRow(state: *LayerGridState, layer_rows: u32, row: u32) bool {
+///
+/// The row arrives too late for planLayerFrame's own propagation, so it
+/// carries its own: drawing it rewrites the whole row rectangle, so a layer
+/// over it loses those pixels and has to be marked as well -- and so does a
+/// layer over THAT one, which is why this replays the same back-to-front walk
+/// rather than marking the overlapping layers once.
+pub fn markLayerCursorRow(
+    app: *App,
+    layers: []const SurfaceLayer,
+    cursor_grid: i64,
+    row: u32,
+    cell_w_px: i32,
+    row_h_px: i32,
+) bool {
+    if (layers.len <= 1 or row_h_px <= 0) return false;
+    const li = for (layers[1..], 1..) |layer, i| {
+        if (layer.grid_id == cursor_grid) break i;
+    } else return false;
+    const state = app.layer_grids.get(cursor_grid) orelse return false;
+    // A layer redrawing whole already propagated in planLayerFrame.
     if (state.draw_all) return true;
-    const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer_rows));
+    const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layers[li].rows));
     if (row >= row_limit or row >= state.draw_rows.bit_length) return false;
     state.draw_rows.set(row);
+    propagateLayerRedraw(app, layers, li, cell_w_px, row_h_px);
     return true;
 }
 
@@ -3513,23 +3533,24 @@ fn markLayersOverBand(
     li: usize,
     band_top_px: i32,
     band_bottom_px: i32,
-    p: LayerFramePlanParams,
+    cell_w_px: i32,
+    row_h_px: i32,
 ) void {
     const src = layers[li];
     const left = src.x_px;
-    const right = left + @as(i32, @intCast(src.cols)) * p.cell_w_px;
+    const right = left + @as(i32, @intCast(src.cols)) * cell_w_px;
     for (layers[li + 1 ..]) |above| {
         const above_state = app.layer_grids.get(above.grid_id) orelse continue;
         if (above_state.draw_all) continue;
         const a_left = above.x_px;
-        const a_right = a_left + @as(i32, @intCast(above.cols)) * p.cell_w_px;
+        const a_right = a_left + @as(i32, @intCast(above.cols)) * cell_w_px;
         if (a_right <= left or a_left >= right) continue;
         const rows = render_pipeline_helpers.bandLayerRows(
             band_top_px,
             band_bottom_px,
             above.y_px,
             above.rows,
-            p.row_h_px,
+            row_h_px,
         ) orelse continue;
         markDrawRows(above_state, rows[0], @as(usize, rows[1]) + 1);
     }
@@ -3734,9 +3755,25 @@ pub fn planLayerFrame(
     // 4. Rows every layer repaints over the layers above it. A layer owns the
     //    whole rectangle of each row it draws, so drawing one erases what a
     //    layer over it had there, and that layer draws nothing this paint
-    //    unless it is marked too. Back to front, so a mark lands before the
-    //    layer carrying it is itself the source of the next one.
-    for (layers[1..n], 1..) |layer, li| {
+    //    unless it is marked too.
+    propagateLayerRedraw(app, layers, 1, p.cell_w_px, p.row_h_px);
+}
+
+/// Carry each layer's redraw rows into the layers above it, from `start_li` up.
+/// Back to front, because a layer marked by a lower one has to be the source of
+/// the next step: a layer that overlaps none of the marked rows' columns can
+/// still sit over one that does, and it loses its pixels to that one's row.
+/// Idempotent -- the sets are bitsets, so a second run over the same layers
+/// only adds what the first could not see. Caller must hold `app.mu`.
+fn propagateLayerRedraw(
+    app: *App,
+    layers: []const SurfaceLayer,
+    start_li: usize,
+    cell_w_px: i32,
+    row_h_px: i32,
+) void {
+    if (start_li >= layers.len) return;
+    for (layers[start_li..], start_li..) |layer, li| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
         if (row_limit == 0) continue;
@@ -3746,16 +3783,17 @@ pub fn planLayerFrame(
                 layers,
                 li,
                 layer.y_px,
-                layer.y_px + @as(i32, @intCast(row_limit)) * p.row_h_px,
-                p,
+                layer.y_px + @as(i32, @intCast(row_limit)) * row_h_px,
+                cell_w_px,
+                row_h_px,
             );
             continue;
         }
         var it = state.draw_rows.iterator(.{});
         while (it.next()) |ri| {
             if (ri >= row_limit) break;
-            const top = layer.y_px + @as(i32, @intCast(ri)) * p.row_h_px;
-            markLayersOverBand(app, layers, li, top, top + p.row_h_px, p);
+            const top = layer.y_px + @as(i32, @intCast(ri)) * row_h_px;
+            markLayersOverBand(app, layers, li, top, top + row_h_px, cell_w_px, row_h_px);
         }
     }
 }
@@ -4508,7 +4546,6 @@ pub const App = struct {
     // Checked and cleared by onFlushEnd to decide whether to InvalidateRect.
     // Skips InvalidateRect for flushes with no visual changes (e.g. msg_showcmd-only).
     flush_needs_invalidate: bool = false,
-
 
     // Set (under app.mu) by vertex callbacks that hit OOM mid-flush, paired
     // with zonvie_core_abort_flush (which makes the CORE keep its dirty
@@ -5864,4 +5901,162 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
             .{ rows, cols, cw, ch, w, h },
         );
     }
+}
+
+test "a layer's cursor row is repainted over the layers above it" {
+    // A float sits over the rows the cursor's own grid owns. Repainting the
+    // cursor's row rewrites the whole row rectangle, float pixels included, so
+    // the float has to be marked for those rows or it keeps the hole until
+    // something else redraws it. The cursor row is claimed after
+    // planLayerFrame settles the redraw set, which is where the mark has to
+    // reach the layers above.
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+    const cell_w_px: i32 = 8;
+
+    var under = LayerGridState{};
+    defer {
+        under.rows_buf.deinit(alloc);
+        under.dirty_rows.deinit(alloc);
+        under.draw_rows.deinit(alloc);
+    }
+    try under.rows_buf.appendNTimes(alloc, .{}, 5);
+    under.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 5);
+    under.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 5);
+    under.last_drawn_rows = 5;
+
+    var over = LayerGridState{};
+    defer {
+        over.rows_buf.deinit(alloc);
+        over.dirty_rows.deinit(alloc);
+        over.draw_rows.deinit(alloc);
+    }
+    try over.rows_buf.appendNTimes(alloc, .{}, 2);
+    over.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 2);
+    over.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 2);
+    over.last_drawn_rows = 2;
+
+    // Row 0 of the lower layer is dirty; the float covers rows 2 and 3, so
+    // nothing propagates to it from the core's own dirty set.
+    under.dirty_rows.set(0);
+
+    var app: App = undefined;
+    app.alloc = alloc;
+    app.layer_grids = .{};
+    defer app.layer_grids.deinit(alloc);
+    try app.layer_grids.put(alloc, 2, &under);
+    try app.layer_grids.put(alloc, 3, &over);
+
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 20, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 0, .y_px = 2 * row_h_px, .rows = 2, .cols = 10, .z = 2, .follows_scroll = false },
+    };
+
+    var g: d3d11.Renderer = undefined;
+    g.height = 1000;
+
+    planLayerFrame(&g, &app, &layers, .{
+        .x_offset = 0,
+        .y_offset = 0,
+        .content_right = 20 * cell_w_px,
+        .content_height = 5 * row_h_px,
+        .row_h_px = row_h_px,
+        .cell_w_px = cell_w_px,
+        .preserve_back = true,
+        .paint_full = false,
+        .cursor_grid = 2,
+        .last_cursor_row = 2,
+        .rows_to_draw = &.{},
+        .log_enabled = false,
+    });
+
+    // Control: the plan really ran -- step 1 moves the core's dirty set into
+    // draw_rows, so a failure below cannot be an early return going unnoticed.
+    try std.testing.expect(under.draw_rows.isSet(0));
+    try std.testing.expect(!under.dirty_rows.isSet(0));
+
+    // Precondition: the float owes nothing yet.
+    try std.testing.expect(!over.draw_all);
+    try std.testing.expect(!over.draw_rows.isSet(0));
+
+    // The stationary cursor's row is claimed after the plan, e.g. so a blink
+    // can erase the previous cursor from that row.
+    try std.testing.expect(markLayerCursorRow(&app, &layers, 2, 2, cell_w_px, row_h_px));
+    try std.testing.expect(under.draw_rows.isSet(2));
+
+    // Lower-layer row 2 starts at y=20, which is the float's own row 0.
+    try std.testing.expect(over.draw_rows.isSet(0));
+}
+
+test "a layer's cursor row reaches a float that only overlaps the float above it" {
+    // Columns, with the cursor's own grid at the bottom:
+    //   A (cursor)  0..80
+    //   B          40..120   overlaps A
+    //   C          90..110   over B, overlapping B only
+    // B repaints its whole row rectangle, so C loses its pixels to B even
+    // though C never touches A. The mark has to walk the stack, not just the
+    // layers that overlap the row's own grid.
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+    const cell_w_px: i32 = 10;
+
+    var states: [3]LayerGridState = .{ .{}, .{}, .{} };
+    const rows_each = [3]usize{ 5, 2, 2 };
+    defer for (&states) |*st| {
+        st.rows_buf.deinit(alloc);
+        st.dirty_rows.deinit(alloc);
+        st.draw_rows.deinit(alloc);
+    };
+    for (&states, rows_each) |*st, n| {
+        try st.rows_buf.appendNTimes(alloc, .{}, n);
+        st.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
+        st.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, n);
+        st.last_drawn_rows = n;
+    }
+
+    var app: App = undefined;
+    app.alloc = alloc;
+    app.layer_grids = .{};
+    defer app.layer_grids.deinit(alloc);
+    try app.layer_grids.put(alloc, 2, &states[0]);
+    try app.layer_grids.put(alloc, 3, &states[1]);
+    try app.layer_grids.put(alloc, 4, &states[2]);
+
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 5, .cols = 8, .z = 1, .follows_scroll = false },
+        .{ .grid_id = 3, .anchor_grid = 1, .x_px = 40, .y_px = 2 * row_h_px, .rows = 2, .cols = 8, .z = 2, .follows_scroll = false },
+        .{ .grid_id = 4, .anchor_grid = 1, .x_px = 90, .y_px = 2 * row_h_px, .rows = 2, .cols = 2, .z = 3, .follows_scroll = false },
+    };
+
+    var g: d3d11.Renderer = undefined;
+    g.height = 1000;
+
+    planLayerFrame(&g, &app, &layers, .{
+        .x_offset = 0,
+        .y_offset = 0,
+        .content_right = 200,
+        .content_height = 5 * row_h_px,
+        .row_h_px = row_h_px,
+        .cell_w_px = cell_w_px,
+        .preserve_back = true,
+        .paint_full = false,
+        .cursor_grid = 2,
+        .last_cursor_row = 2,
+        .rows_to_draw = &.{},
+        .log_enabled = false,
+    });
+
+    // Control: nothing owes a row before the cursor claims one.
+    for (&states) |*st| {
+        try std.testing.expect(!st.draw_all);
+        try std.testing.expect(st.draw_rows.count() == 0);
+    }
+
+    try std.testing.expect(markLayerCursorRow(&app, &layers, 2, 2, cell_w_px, row_h_px));
+
+    // B is directly over the cursor's row; C is only over B.
+    try std.testing.expect(states[1].draw_rows.isSet(0));
+    try std.testing.expect(states[2].draw_rows.isSet(0));
 }
