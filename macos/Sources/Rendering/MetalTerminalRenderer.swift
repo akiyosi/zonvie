@@ -4175,6 +4175,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             // pass 1 adds this layer's own light. Back to front
                             // over the layer list, which is the screen order the
                             // extract pass otherwise has no way to honour.
+                            // The rows this layer's own smooth scroll retained
+                            // are drawn with its others (see resolveLayerRow),
+                            // so they light the same way. Glow forces .clear, so
+                            // a row missing here has no previous frame and no
+                            // root-side extraction to fall back on: the root
+                            // pass takes only gridId == 1 retained rows.
+                            let retainedForGlowCount = collectLayerRetainedRows(layer.gridId)
                             for pass in 0..<2 {
                                 if pass == 0 {
                                     guard let occludePipe = glowOccludePipeline else { continue }
@@ -4195,6 +4202,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
                                     enc.setVertexBuffer(vb, offset: 0, index: 0)
                                     enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: set.rowState.counts[slot])
+                                }
+                                for i in 0..<retainedForGlowCount {
+                                    let r = retainedSnapshot[retainedIndexScratch[i]]
+                                    guard r.count > 0 else { continue }
+                                    var rt = Float(r.targetRow - r.sourceRow) * Float(cellHi)
+                                    enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
+                                    enc.setVertexBuffer(r.buffer, offset: 0, index: 0)
+                                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: r.count)
                                 }
                             }
                         }
