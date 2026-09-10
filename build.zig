@@ -212,6 +212,37 @@ pub fn build(b: *std.Build) !void {
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
+    // Unit tests for the layer draw planner in windows/app.zig. It reaches
+    // Win32 through the renderer, so it builds only for a Windows target and
+    // runs only on a Windows host.
+    if (target.result.os.tag == .windows) {
+        const app_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("windows/app.zig"),
+            .imports = &.{
+                .{ .name = "zonvie_core", .module = core_mod },
+                .{ .name = "toml", .module = zig_toml.module("toml") },
+            },
+        });
+        app_test_mod.linkLibrary(core_lib);
+        for ([_][]const u8{
+            "user32", "gdi32",   "kernel32", "imm32",    "dwrite",
+            "d2d1",   "ole32",   "d3d11",    "dxgi",     "d3dcompiler_47",
+            "dcomp",  "dwmapi",  "credui",   "advapi32", "shell32",
+            "winmm",  "msimg32", "comdlg32",
+        }) |name| app_test_mod.linkSystemLibrary(name, .{});
+        const app_tests = b.addTest(.{
+            .name = "zonvie-app-test",
+            .root_module = app_test_mod,
+        });
+        const app_test_step = b.step("windows-app-test", "Build the Windows app unit tests");
+        app_test_step.dependOn(&b.addInstallArtifact(app_tests, .{
+            .dest_dir = .{ .override = .{ .custom = "../windows/zig-out" } },
+        }).step);
+    }
+
     // Win32 contract test for the top-level HWND wake cookie storage. Compile
     // it with every Windows frontend build; execute it when the build host can
     // create a real Win32 window.
