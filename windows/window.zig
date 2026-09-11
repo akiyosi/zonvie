@@ -3365,15 +3365,17 @@ pub export fn WndProc(
                             cursor_row_redrawn = claimed;
                         }
 
-                        // Layer rows that never reached back_tex. Their plan
-                        // is consumed by the draw, so the frame must not be
-                        // presented: !render_ok re-arms every layer below.
-                        var layer_failed_rows: u32 = 0;
+                        // Rows that never reached back_tex, and a plan the core
+                        // republished under. Either spends the layers' redraw
+                        // plan without producing the frame it named, so the
+                        // frame must not be presented: !render_ok re-arms every
+                        // layer below.
+                        var layer_outcome = app_mod.LayerDrawOutcome{};
                         // Non-root layers on top of the root grid, before the
                         // cursor so the cursor stays on top of everything.
                         if (tbs_snapshot.layers.len > 1) {
                             app.mu.lockUncancelable(core.clock.io());
-                            layer_failed_rows = app_mod.drawSurfaceLayers(
+                            layer_outcome = app_mod.drawSurfaceLayers(
                                 g,
                                 app,
                                 tbs_snapshot.layers.slice(),
@@ -3552,7 +3554,7 @@ pub export fn WndProc(
                             // back_tex. Treat the whole paint as failed so the
                             // common recovery path requeues a full redraw.
                             if (failed_rows != 0) break :blk false;
-                            if (layer_failed_rows != 0) break :blk false;
+                            if (layer_outcome.incomplete()) break :blk false;
                             if (cursor_overlay_failed) break :blk false;
 
                             // When seed_clear is true, we must present to sync the cleared back buffer
