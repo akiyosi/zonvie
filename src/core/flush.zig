@@ -5729,6 +5729,20 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
                     if (self.flush_aborted) return;
 
+                    // The frontend keeps drawing this cursor from its own copy
+                    // for as long as the cursor does not move, so the atlas
+                    // collector has to see its glyph across later flushes. A
+                    // cursor-only glyph (a styled variant, or the standalone
+                    // glyph a ligature cell resolves to under the block) sits
+                    // in a shelf the row mirror never recorded. cursor_verts is
+                    // the buffer the collector already scans, and the main path
+                    // leaves it empty whenever the cursor is not on grid 1.
+                    self.cursor_verts.clearRetainingCapacity();
+                    self.cursor_verts.appendSlice(self.alloc, ext_verts.items) catch {
+                        self.flush_aborted = true;
+                        return;
+                    };
+
                     traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, ext_verts.items.len });
                     row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                     self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
@@ -15309,4 +15323,88 @@ test "busy_start clears the cursor on the grid that owns it" {
     try std.testing.expect(!core.grid.cursor_visible);
 
     try std.testing.expect(state.cleared >= 1);
+}
+
+test "a layer's cursor glyph is mirrored into cursor_verts for the atlas collector" {
+    const State = struct {
+        cursor_uv_y: f32 = 0,
+        cursor_sends: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id != 2 or (flags & c_api.VERT_UPDATE_CURSOR) == 0) return;
+            self.cursor_sends += 1;
+            const slice = (verts orelse return)[0..vert_count];
+            for (slice) |v| {
+                if (v.texCoord[1] > 0) self.cursor_uv_y = v.texCoord[1];
+            }
+        }
+
+        fn onEnsureGlyph(
+            ctx: ?*anyopaque,
+            cp: u32,
+            out: ?*c_api.GlyphEntry,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = cp;
+            const e = out orelse return 0;
+            e.* = std.mem.zeroes(c_api.GlyphEntry);
+            e.bbox_size_px = .{ 6, 10 };
+            e.ascent_px = 8;
+            e.uv_min = .{ 0.25, 0.5 };
+            e.uv_max = .{ 0.5, 0.75 };
+            e.bytes_per_pixel = 1;
+            return 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 8;
+    core.cell_h_px = 16;
+    try core.grid.resize(4, 8);
+    try core.grid.resizeGrid(2, 2, 4);
+    try core.grid.setWinPos(2, 101, 1, 1);
+
+    // A layer cell under a block cursor, whose glyph the row mirror does not
+    // necessarily cover: the collector has to learn it from cursor_verts.
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    sg.cells[0].cp = 'A';
+    core.grid.cursor_grid = 2;
+    core.grid.cursor_row = 0;
+    core.grid.cursor_col = 0;
+    core.grid.cursor_valid = true;
+    core.grid.cursor_visible = true;
+    core.grid.cursor_shape = .block;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_atlas_ensure_glyph = State.onEnsureGlyph;
+
+    sendExternalGridVertices(&core, true);
+
+    try std.testing.expectEqual(@as(u32, 1), state.cursor_sends);
+    // The glyph really made it into the dispatched cursor payload.
+    try std.testing.expectEqual(@as(f32, 0.75), state.cursor_uv_y);
+    // And the collector's own view of the cursor layer carries it.
+    var mirrored_uv_y: f32 = 0;
+    for (core.cursor_verts.items) |v| {
+        if (v.texCoord[1] > 0) mirrored_uv_y = v.texCoord[1];
+    }
+    try std.testing.expectEqual(state.cursor_uv_y, mirrored_uv_y);
 }
