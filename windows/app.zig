@@ -3810,14 +3810,22 @@ pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
     }
 }
 
-/// One layer row: scissor, background overwrite, upload, draw. Returns whether
-/// anything was encoded for it, which both arms count for `[layer_draw]`.
+/// What one layer row's draw produced: whether anything was encoded for it
+/// (both arms count that for `[layer_draw]`), and whether a GPU step failed, so
+/// the row never reached back_tex. A failure has to travel out to the paint,
+/// exactly as a root row's does: this row's plan is about to be consumed.
+const LayerRowOutcome = struct {
+    encoded: bool,
+    failed: bool = false,
+};
+
+/// One layer row: scissor, background overwrite, upload, draw.
 fn drawLayerRow(
     g: *d3d11.Renderer,
     state: *LayerGridState,
     ri: usize,
     d: LayerRowDrawCtx,
-) bool {
+) LayerRowOutcome {
     const rv = &state.rows_buf.items[ri];
     if (d.rs_set_sc_fn) |f| {
         const top = d.y_offset + d.layer.y_px + @as(i32, @intCast(ri)) * d.row_h_px;
@@ -3827,7 +3835,7 @@ fn drawLayerRow(
             .right = @min(d.content_right, d.x_offset + d.layer.x_px + d.layer_w_px),
             .bottom = top + d.row_h_px,
         };
-        if (sc.right <= sc.left or sc.bottom <= sc.top) return false;
+        if (sc.right <= sc.left or sc.bottom <= sc.top) return .{ .encoded = false };
         f(d.ctx_ptr, 1, &sc);
     }
 
@@ -3841,24 +3849,27 @@ fn drawLayerRow(
     // repaints the columns this layer's row no longer covers.
     var encoded = false;
     if (g.opacity < 1.0 or g.blur_enabled or rv.verts.items.len == 0) {
-        g.drawClearRowOverwrite() catch return encoded;
+        g.drawClearRowOverwrite() catch return .{ .encoded = encoded, .failed = true };
         encoded = true;
     }
-    if (rv.verts.items.len == 0) return encoded;
+    if (rv.verts.items.len == 0) return .{ .encoded = encoded };
 
     const need_bytes = rv.verts.items.len * @sizeOf(Vertex);
-    g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch return encoded;
-    const vb = rv.vb orelse return encoded;
+    g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes) catch
+        return .{ .encoded = encoded, .failed = true };
+    const vb = rv.vb orelse return .{ .encoded = encoded, .failed = true };
     if (rv.uploaded_gen != rv.gen) {
-        g.uploadVertsToVB(vb, rv.verts.items) catch return encoded;
+        g.uploadVertsToVB(vb, rv.verts.items) catch
+            return .{ .encoded = encoded, .failed = true };
         rv.uploaded_gen = rv.gen;
     }
     // A row-shift hint moves an array between rows without rewriting its
     // pixels, so offset it by the distance it moved.
     const row_dy: f32 = layerRowShiftPx(state, ri, d.row_h_px);
     g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h);
-    g.drawVB(vb, rv.verts.items.len) catch return encoded;
-    return true;
+    g.drawVB(vb, rv.verts.items.len) catch
+        return .{ .encoded = encoded, .failed = true };
+    return .{ .encoded = true };
 }
 
 /// Everything drawLayerRow needs that is the same for every row of a layer.
@@ -3880,6 +3891,10 @@ const LayerRowDrawCtx = struct {
 /// Each layer gets its own pixel space and is clipped to its own rect. A layer
 /// whose grid has no rows yet draws nothing, which is what the core's layout
 /// contract requires. Caller must hold `app.mu`.
+///
+/// Returns how many layer rows failed a GPU step. The caller must refuse to
+/// present a frame with a non-zero count: the rows that failed never reached
+/// back_tex, and the plan that named them is spent by the time this returns.
 pub fn drawSurfaceLayers(
     g: *d3d11.Renderer,
     app: *App,
@@ -3892,8 +3907,9 @@ pub fn drawSurfaceLayers(
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     log_enabled: bool,
-) void {
-    if (layers.len <= 1 or row_h_px <= 0) return;
+) u32 {
+    if (layers.len <= 1 or row_h_px <= 0) return 0;
+    var failed_rows: u32 = 0;
     for (layers[1..]) |layer| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
@@ -3924,7 +3940,9 @@ pub fn drawSurfaceLayers(
         var band_drawn = false;
         if (state.draw_all) {
             for (0..row_limit) |ri| {
-                if (drawLayerRow(g, state, ri, d)) encoded += 1;
+                const out = drawLayerRow(g, state, ri, d);
+                if (out.encoded) encoded += 1;
+                if (out.failed) failed_rows += 1;
             }
         } else {
             // The band this layer's GPU copy vacated, before the rows: the
@@ -3941,23 +3959,28 @@ pub fn drawSurfaceLayers(
                         f(ctx_ptr, 1, &sc);
                         if (g.drawClearRowOverwrite()) |_| {
                             band_drawn = true;
-                        } else |_| {}
+                        } else |_| {
+                            failed_rows += 1;
+                        }
                     }
                 }
             }
             var it = state.draw_rows.iterator(.{});
             while (it.next()) |ri| {
                 if (ri >= row_limit) break;
-                if (drawLayerRow(g, state, ri, d)) encoded += 1;
+                const out = drawLayerRow(g, state, ri, d);
+                if (out.encoded) encoded += 1;
+                if (out.failed) failed_rows += 1;
             }
         }
         if (log_enabled) applog.appLog(
-            "[layer_draw] gridId={d} rows={d} of={d} blit={d}\n",
-            .{ layer.grid_id, encoded, row_limit, @as(u32, @intFromBool(band_drawn)) },
+            "[layer_draw] gridId={d} rows={d} of={d} blit={d} failed={d}\n",
+            .{ layer.grid_id, encoded, row_limit, @as(u32, @intFromBool(band_drawn)), failed_rows },
         );
     }
     // Restore the surface's own pixel space for whatever draws next.
     g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
+    return failed_rows;
 }
 
 pub const CursorOverlayParams = struct {
