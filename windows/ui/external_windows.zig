@@ -807,14 +807,15 @@ fn drawNormalExternalSurfaceRowMode(
     }
     if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
 
-    // Layer rows that never reached back_tex, counted like the root rows above.
-    var layer_failed_rows: u32 = 0;
+    // Rows that never reached back_tex, and a plan the core republished under,
+    // counted like the root rows above.
+    var layer_outcome = app_mod.LayerDrawOutcome{};
     {
         const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
         if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
         defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
         if (has_layers) {
-            layer_failed_rows = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
+            layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
                 .x = 0,
                 .y = 0,
                 .w = @floatFromInt(app_mod.rowModeViewportWidth(g, draw_params)),
@@ -873,10 +874,10 @@ fn drawNormalExternalSurfaceRowMode(
         });
     }
 
-    // A layer row failed its GPU step, so this frame is incomplete: fail the
-    // paint the same way a root row does, rather than present missing rows and
-    // let the consumed redraw plan make them permanent.
-    if (layer_failed_rows != 0) return error.RowVBRenderFailed;
+    // This frame is incomplete: fail the paint the same way a root row does,
+    // rather than present missing or mismatched rows and let the consumed
+    // redraw plan make them permanent.
+    if (layer_outcome.incomplete()) return error.RowVBRenderFailed;
 
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip

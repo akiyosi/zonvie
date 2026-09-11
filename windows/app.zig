@@ -1937,13 +1937,25 @@ pub const LayerGridState = struct {
     /// Rows the core changed since the last paint. Sized by applyStaged.
     dirty_rows: std.DynamicBitSetUnmanaged = .{},
     needs_full_redraw: bool = false,
-    /// The four fields below belong to the paint thread for the duration of
+    /// Bumped by every applyStaged that publishes anything, so the paint can
+    /// tell that `rows_buf`/`origin_rows` are no longer the frame it planned
+    /// against. The paint plans and draws under two separate `App.mu` holds --
+    /// the GPU row copy has to land before the root rows paint over the band it
+    /// moves, and the layers themselves have to draw after those rows -- so a
+    /// flush committing in between is a normal event, not a bug. Drawing
+    /// through it is: the newer rows would go on top of the older frame's copy,
+    /// and the next plan would copy the rows already advanced, leaving a row
+    /// drawn twice.
+    content_gen: u64 = 0,
+    /// The five fields below belong to the paint thread for the duration of
     /// one frame, taken from the three above under `App.mu`.
     draw_rows: std.DynamicBitSetUnmanaged = .{},
     draw_all: bool = false,
     /// Layer-local, like everything the layer transform draws.
     blit_clear_band: ?struct { top_px: i32, bottom_px: i32 } = null,
     last_drawn_rows: usize = 0,
+    /// `content_gen` as it stood when planLayerFrame settled this frame.
+    plan_content_gen: u64 = 0,
 
     /// Ops of the open flush. `staged.items` never shrinks, so entries and
     /// their vertex capacity survive across flushes; `staged_len` is the live
@@ -2127,6 +2139,9 @@ pub const LayerGridState = struct {
                 },
             }
         }
+        // Rows and origins both moved; any plan taken before this point was
+        // made against a frame that no longer exists.
+        self.content_gen +%= 1;
         return true;
     }
 
@@ -3592,6 +3607,9 @@ pub fn planLayerFrame(
         state.draw_scroll = state.pending_scroll;
         state.draw_blit_rect = null;
         state.pending_scroll = null;
+        // The row data this whole plan -- redraw set, GPU copy, clear band --
+        // is built for. drawSurfaceLayers refuses the frame if it moved.
+        state.plan_content_gen = state.content_gen;
     }
 
     // 2. Rows a root dirty band overpaints. A root row that resolves to
@@ -3798,6 +3816,21 @@ fn propagateLayerRedraw(
     }
 }
 
+/// Layers whose row data was republished after planLayerFrame settled this
+/// frame. Re-arms every layer, because the plan's redraw set is consumed
+/// either way: step 1 of the next plan swaps `draw_rows` out and clears it, so
+/// an unconsumed set is lost rather than carried. Caller must hold `app.mu`.
+fn staleLayerPlans(app: *App, layers: []const SurfaceLayer) u32 {
+    if (layers.len <= 1) return 0;
+    var stale: u32 = 0;
+    for (layers[1..]) |layer| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        if (state.content_gen != state.plan_content_gen) stale += 1;
+    }
+    if (stale != 0) rearmLayerDraw(app, layers);
+    return stale;
+}
+
 /// Put back what planLayerFrame consumed when the frame that consumed it never
 /// reached the screen. A full redraw is a correct superset either way: the
 /// committed vertices are already post-shift. Caller must hold `app.mu`.
@@ -3817,6 +3850,18 @@ pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
 const LayerRowOutcome = struct {
     encoded: bool,
     failed: bool = false,
+};
+
+/// What a surface's whole layer draw produced. A frame is incomplete when rows
+/// are missing from back_tex, or when the plan and the row data it drew came
+/// from different flushes; either way it must not be presented.
+pub const LayerDrawOutcome = struct {
+    failed_rows: u32 = 0,
+    stale_layers: u32 = 0,
+
+    pub fn incomplete(self: LayerDrawOutcome) bool {
+        return self.failed_rows != 0 or self.stale_layers != 0;
+    }
 };
 
 /// One layer row: scissor, background overwrite, upload, draw.
@@ -3892,9 +3937,7 @@ const LayerRowDrawCtx = struct {
 /// whose grid has no rows yet draws nothing, which is what the core's layout
 /// contract requires. Caller must hold `app.mu`.
 ///
-/// Returns how many layer rows failed a GPU step. The caller must refuse to
-/// present a frame with a non-zero count: the rows that failed never reached
-/// back_tex, and the plan that named them is spent by the time this returns.
+/// The caller must refuse to present a frame the outcome calls incomplete.
 pub fn drawSurfaceLayers(
     g: *d3d11.Renderer,
     app: *App,
@@ -3907,8 +3950,16 @@ pub fn drawSurfaceLayers(
     ctx_ptr: ?*c.ID3D11DeviceContext,
     rs_set_sc_fn: ?RSSetScissorRectsFn,
     log_enabled: bool,
-) u32 {
-    if (layers.len <= 1 or row_h_px <= 0) return 0;
+) LayerDrawOutcome {
+    if (layers.len <= 1 or row_h_px <= 0) return .{};
+    // Before any GPU work: a plan made against row data the core has since
+    // republished cannot produce this frame, and a partly drawn one would be
+    // discarded anyway.
+    const stale = staleLayerPlans(app, layers);
+    if (stale != 0) {
+        if (log_enabled) applog.appLog("[layer_draw] stale_plans={d}\n", .{stale});
+        return .{ .stale_layers = stale };
+    }
     var failed_rows: u32 = 0;
     for (layers[1..]) |layer| {
         const state = app.layer_grids.get(layer.grid_id) orelse continue;
@@ -3980,7 +4031,7 @@ pub fn drawSurfaceLayers(
     }
     // Restore the surface's own pixel space for whatever draws next.
     g.setLayerTransform(0, 0, base_vp.w, base_vp.h);
-    return failed_rows;
+    return .{ .failed_rows = failed_rows };
 }
 
 pub const CursorOverlayParams = struct {
@@ -6082,4 +6133,96 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
     // B is directly over the cursor's row; C is only over B.
     try std.testing.expect(states[1].draw_rows.isSet(0));
     try std.testing.expect(states[2].draw_rows.isSet(0));
+}
+
+test "a layer plan is refused once the core republishes the rows under it" {
+    // planLayerFrame and drawSurfaceLayers run under two separate App.mu
+    // holds, so a flush can commit in between. The plan's GPU copy and redraw
+    // set belong to the frame it was made for; the rows it would draw no
+    // longer do.
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+    const cell_w_px: i32 = 8;
+
+    var state = LayerGridState{};
+    defer state.deinit(alloc);
+    try state.rows_buf.appendNTimes(alloc, .{}, 3);
+    try state.origin_rows.appendSlice(alloc, &.{ 0, 1, 2 });
+    state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
+    state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
+    state.last_drawn_rows = 3;
+    state.rows = 3;
+    state.cols = 4;
+    state.dirty_rows.set(1);
+
+    var app: App = undefined;
+    app.alloc = alloc;
+    app.layer_grids = .{};
+    defer app.layer_grids.deinit(alloc);
+    try app.layer_grids.put(alloc, 2, &state);
+
+    const layers = [_]SurfaceLayer{
+        .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 0, .follows_scroll = false },
+        .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 1, .follows_scroll = false },
+    };
+
+    var g: d3d11.Renderer = undefined;
+    g.height = 1000;
+
+    const plan_params = LayerFramePlanParams{
+        .x_offset = 0,
+        .y_offset = 0,
+        .content_right = 4 * cell_w_px,
+        .content_height = 3 * row_h_px,
+        .row_h_px = row_h_px,
+        .cell_w_px = cell_w_px,
+        .preserve_back = true,
+        .paint_full = false,
+        .cursor_grid = 1,
+        .last_cursor_row = null,
+        .rows_to_draw = &.{},
+        .log_enabled = false,
+    };
+
+    planLayerFrame(&g, &app, &layers, plan_params);
+    // Control: the plan ran and took the core's dirty row.
+    try std.testing.expect(state.draw_rows.isSet(1));
+    // Nothing has republished, so the frame is drawable.
+    try std.testing.expectEqual(@as(u32, 0), staleLayerPlans(&app, &layers));
+
+    // The core commits the next flush in the gap between plan and draw.
+    try std.testing.expect(state.stageRow(alloc, 1, &.{}, 3, 4));
+    try std.testing.expect(state.prepareCommit(alloc));
+    try std.testing.expect(state.applyStaged(alloc));
+
+    try std.testing.expectEqual(@as(u32, 1), staleLayerPlans(&app, &layers));
+    // And the plan it spent is put back for the next paint.
+    try std.testing.expect(state.needs_full_redraw);
+    try std.testing.expect(state.dirty);
+
+    // What the paint actually gates on: the draw reports the frame incomplete
+    // and reaches no GPU call at all -- `g` here has nothing a draw could use,
+    // so a guard that stopped running would not survive this.
+    const outcome = drawSurfaceLayers(
+        &g,
+        &app,
+        &layers,
+        .{ .x = 0, .y = 0, .w = 4 * @as(f32, @floatFromInt(cell_w_px)), .h = 3 * @as(f32, @floatFromInt(row_h_px)) },
+        0,
+        0,
+        4 * cell_w_px,
+        row_h_px,
+        null,
+        null,
+        false,
+    );
+    try std.testing.expectEqual(@as(u32, 1), outcome.stale_layers);
+    try std.testing.expectEqual(@as(u32, 0), outcome.failed_rows);
+    try std.testing.expect(outcome.incomplete());
+    // Nothing was drawn, so the row bookkeeping is untouched.
+    try std.testing.expectEqual(@as(usize, 3), state.last_drawn_rows);
+
+    // The next plan takes the new generation and is drawable again.
+    planLayerFrame(&g, &app, &layers, plan_params);
+    try std.testing.expectEqual(@as(u32, 0), staleLayerPlans(&app, &layers));
 }
