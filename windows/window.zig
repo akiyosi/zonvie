@@ -3235,23 +3235,34 @@ pub export fn WndProc(
                         // renderer context is held by the enclosing defer;
                         // app.mu was released above, so take it here, in the
                         // lockContext -> app.mu order the layer draw uses.
+                        var layer_layout_stale = false;
                         if (tbs_snapshot.layers.len > 1 and row_h_px > 0) {
                             app.mu.lockUncancelable(core.clock.io());
-                            app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
-                                .x_offset = content_x_offset_i32,
-                                .y_offset = content_y_offset_i32,
-                                .content_right = content_right_i32,
-                                .content_height = @intCast(content_height),
-                                .row_h_px = row_h_px,
-                                .cell_w_px = @intCast(@max(1, app.cell_w_px)),
-                                .preserve_back = preserve_back,
-                                .paint_full = paint_full_snapshot,
-                                .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
-                                .last_cursor_row = app.last_painted_cursor_row,
-                                .rows_to_draw = rows_to_draw.items,
-                                .root_scroll_rect = scroll_shift_result.scroll_rect,
-                                .log_enabled = log_enabled,
-                            });
+                            layer_layout_stale = app_mod.layerLayoutMoved(&app.tbs, tbs_snapshot);
+                            if (layer_layout_stale) {
+                                // Nothing is planned or drawn at a placement the
+                                // core has already replaced. The frame is refused
+                                // below, which re-arms every layer; the commit
+                                // that replaced the placement already owes the
+                                // repaint that draws it.
+                                if (log_enabled) applog.appLog("[layer_draw] stale_layout gen={d}\n", .{tbs_snapshot.layout_gen});
+                            } else {
+                                app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
+                                    .x_offset = content_x_offset_i32,
+                                    .y_offset = content_y_offset_i32,
+                                    .content_right = content_right_i32,
+                                    .content_height = @intCast(content_height),
+                                    .row_h_px = row_h_px,
+                                    .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                                    .preserve_back = preserve_back,
+                                    .paint_full = paint_full_snapshot,
+                                    .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
+                                    .last_cursor_row = app.last_painted_cursor_row,
+                                    .rows_to_draw = rows_to_draw.items,
+                                    .root_scroll_rect = scroll_shift_result.scroll_rect,
+                                    .log_enabled = log_enabled,
+                                });
+                            }
                             app.mu.unlock(core.clock.io());
                         }
 
@@ -3370,10 +3381,10 @@ pub export fn WndProc(
                         // plan without producing the frame it named, so the
                         // frame must not be presented: !render_ok re-arms every
                         // layer below.
-                        var layer_outcome = app_mod.LayerDrawOutcome{};
+                        var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale };
                         // Non-root layers on top of the root grid, before the
                         // cursor so the cursor stays on top of everything.
-                        if (tbs_snapshot.layers.len > 1) {
+                        if (tbs_snapshot.layers.len > 1 and !layer_layout_stale) {
                             app.mu.lockUncancelable(core.clock.io());
                             layer_outcome = app_mod.drawSurfaceLayers(
                                 g,
