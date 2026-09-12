@@ -2634,11 +2634,12 @@ pub export fn ExternalWndProc(
             }
         },
 
-        // --- Scrollbar mouse handling for external windows ---
-        c.WM_LBUTTONDOWN => {
+        // --- Scrollbar and grid mouse handling for external windows ---
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2650,12 +2651,43 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    // Claim the press so the copy button's release is not
-                    // interpreted as a scrollbar or grid interaction.
-                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
-                    if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
-                        return 0;
+                    // The window's own chrome claims the press first, so the
+                    // copy button's release is not interpreted as a scrollbar
+                    // or grid interaction. Left button only: the others have
+                    // no chrome meaning and go straight to the editor.
+                    if (msg == c.WM_LBUTTONDOWN) {
+                        if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
+                        if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
+                            return 0;
+                        }
                     }
+
+                    // Only a real window grid is an editor target. The cmdline,
+                    // popupmenu and message surfaces carry sentinel grid ids
+                    // the core forwards to Neovim unchanged, which resolves
+                    // them against the screen instead: a click on a message
+                    // moved the cursor in the buffer behind it, and a middle
+                    // click pasted there.
+                    if (classifyExternalSurface(grid_id.?) != .normal) return 0;
+
+                    // Capture so a drag that leaves the window keeps arriving.
+                    _ = c.SetCapture(hwnd);
+                    const button: [*:0]const u8 = switch (msg) {
+                        c.WM_RBUTTONDOWN => blk: {
+                            app.mouse_button_held = 2;
+                            break :blk "right";
+                        },
+                        c.WM_MBUTTONDOWN => blk: {
+                            app.mouse_button_held = 3;
+                            break :blk "middle";
+                        },
+                        else => blk: {
+                            app.mouse_button_held = 1;
+                            break :blk "left";
+                        },
+                    };
+                    input.sendMouseButton(hwnd, app, grid_id.?, button, .press, x, y, wParam);
+                    return 0;
                 }
             }
         },
@@ -2665,6 +2697,9 @@ pub export fn ExternalWndProc(
             // only place the scrollbar track repeat is killed — without this it
             // keeps issuing page scrolls indefinitely.
             if (app_mod.getApp(hwnd)) |app| {
+                // Same reason the editor drag must end: a held button left set
+                // here turns every later hover into a drag.
+                app.mouse_button_held = 0;
                 app.mu.lockUncancelable(core.clock.io());
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
@@ -2690,10 +2725,14 @@ pub export fn ExternalWndProc(
             return 0;
         },
 
-        c.WM_LBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
+
+                const held = app.mouse_button_held;
+                app.mouse_button_held = 0;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2704,7 +2743,24 @@ pub export fn ExternalWndProc(
                 }
                 app.mu.unlock(core.clock.io());
 
+                // ReleaseCapture posts WM_CAPTURECHANGED to this window
+                // synchronously, and that handler drops scrollbar_dragging and
+                // the pending line with it. Release only after the scrollbar
+                // has committed its final position below, or a drag ends where
+                // it started.
+                defer _ = c.ReleaseCapture();
+
                 if (grid_id != null and ext_window != null) {
+                    // Mirrors the press gate: a sentinel-grid surface never
+                    // sent a press, so it must not send a release either.
+                    const editor_target = classifyExternalSurface(grid_id.?) == .normal;
+                    if (msg != c.WM_LBUTTONUP) {
+                        if (editor_target) {
+                            const button: [*:0]const u8 = if (msg == c.WM_RBUTTONUP) "right" else "middle";
+                            input.sendMouseButton(hwnd, app, grid_id.?, button, .release, x, y, wParam);
+                        }
+                        return 0;
+                    }
                     if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
                         if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
                             // Brief acknowledgement so the click has visible
@@ -2722,15 +2778,24 @@ pub export fn ExternalWndProc(
                         }
                         return 0;
                     }
+                    const was_dragging_scrollbar = ext_window.?.scrollbar_dragging;
                     scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
+                    // A press the scrollbar claimed never reached the editor,
+                    // so its release must not either -- Neovim would see a
+                    // release with no press and move the cursor there.
+                    if (editor_target and !was_dragging_scrollbar and held == 1) {
+                        input.sendMouseButton(hwnd, app, grid_id.?, "left", .release, x, y, wParam);
+                    }
+                    return 0;
                 }
             }
         },
 
         c.WM_MOUSEMOVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2788,6 +2853,16 @@ pub export fn ExternalWndProc(
                         .dwHoverTime = 0,
                     };
                     _ = c.TrackMouseEvent(&tme);
+
+                    // A held button makes this a drag. The scrollbar drag
+                    // returned above, so anything reaching here belongs to the
+                    // editor's own selection -- on a real window grid only,
+                    // for the reason the press gate states.
+                    if (classifyExternalSurface(grid_id.?) == .normal) {
+                        if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
+                            input.sendMouseButton(hwnd, app, grid_id.?, button, .drag, x, y, wParam);
+                        }
+                    }
                 }
             }
         },
