@@ -1147,7 +1147,14 @@ pub const GridPos = struct {
     row: u32,
     col: u32,
     anchor_grid: i64 = 1, // which grid this float is anchored to (1 = global grid)
-    follows_scroll: bool = false, // float has been repositioned (row changed) after creation
+    /// Whether this float tracks the buffer, so a frontend may shift its pixels
+    /// with the parent's smooth scroll. Re-derived from each redraw batch that
+    /// carried a scroll: a float Neovim repositions in that batch follows it, a
+    /// float it leaves alone does not.
+    follows_scroll: bool = false,
+    /// Whether this batch moved the float vertically. The evidence
+    /// settleFloatScrollFollowing reads; cleared with the batch.
+    moved_in_batch: bool = false,
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -2654,12 +2661,43 @@ pub const Grid = struct {
         return 0;
     }
 
+    /// Whether this redraw batch carried a scroll on any grid.
+    pub fn batchScrolled(self: *const Grid) bool {
+        return self.main_scroll_notify_pending or
+            self.scrolled_grid_count != 0 or
+            self.scrolled_grid_overflow;
+    }
+
+    /// Re-derive which floats track the buffer, from what this batch did.
+    ///
+    /// Neovim repositions a buffer-tracking float in the same batch as the
+    /// scroll that moved it, and leaves a fixed one alone. So a batch that
+    /// scrolled is a measurement of every float at once: the ones it moved
+    /// follow, the ones it did not do not. Without this the flag only ever
+    /// latched on, and one reposition made a float pixel-follow every later
+    /// scroll it was never part of -- a shift with nothing behind it, snapping
+    /// back when the gesture settled.
+    ///
+    /// Batches with no scroll measure nothing and leave the answer alone.
+    pub fn settleFloatScrollFollowing(self: *Grid) void {
+        if (!self.batchScrolled()) return;
+        var it = self.win_pos.iterator();
+        while (it.next()) |entry| {
+            // Floats only: a split's placement is not a scroll follower and
+            // win_pos never sets these fields for one.
+            if (!self.win_layer.contains(entry.key_ptr.*)) continue;
+            entry.value_ptr.follows_scroll = entry.value_ptr.moved_in_batch;
+        }
+    }
+
     /// Clear scrolled grid tracking (called after flush notification).
     pub fn clearScrolledGrids(self: *Grid) void {
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
         self.main_scroll_notify_pending = false;
         self.main_scroll_notify_rows = 0;
+        var pos_it = self.win_pos.valueIterator();
+        while (pos_it.next()) |pos| pos.moved_in_batch = false;
         var sg_it = self.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
             sg.scroll_notify_pending = false;
@@ -2943,6 +2981,10 @@ pub const Grid = struct {
             old_pos_before.?.anchor_grid != anchor_grid or old_layer_before == null or
             old_layer_before.?.zindex != zindex or old_layer_before.?.compindex != compindex;
 
+        const moved_in_batch = if (old_pos_before) |old_pos|
+            old_pos.moved_in_batch or (old_pos.row != row)
+        else
+            false;
         const follows_scroll = if (old_pos_before) |old_pos|
             old_pos.follows_scroll or (old_pos.row != row)
         else
@@ -2952,6 +2994,7 @@ pub const Grid = struct {
             .col = col,
             .anchor_grid = anchor_grid,
             .follows_scroll = follows_scroll,
+            .moved_in_batch = moved_in_batch,
         };
 
         const grid_win_is_new = win_id > 0 and !self.grid_win_ids.contains(grid_id);

@@ -335,6 +335,7 @@ typedef void (*zonvie_on_external_window_close_fn)(
 /* One grid placed on one surface. A surface is a single drawable: the main
    window, or one external window. Its surface_id is the id of its root grid
    (1 for the main window). layers[0] is always the root grid at (0,0). */
+/* This float tracks the buffer: see zonvie_grid_info.follows_scroll. */
 #define ZONVIE_LAYER_FOLLOWS_SCROLL (1u << 0)
 
 typedef struct zonvie_layer {
@@ -1196,8 +1197,10 @@ typedef struct zonvie_grid_info {
      * Lets a frontend route smooth-scroll following: a window-anchored float
      * follows only that window, not any window it merely overlaps. */
     int64_t anchor_grid;
-    /* 1 if this float has been repositioned (row changed) since creation, i.e. it
-     * tracks the buffer on scroll. A fixed float stays 0 and must not pixel-shift. */
+    /* 1 if this float tracks the buffer, so it may pixel-shift with the parent's
+     * smooth scroll. Re-derived from every redraw batch that carried a scroll:
+     * a float Neovim repositioned in that batch follows, one it left alone does
+     * not. A fixed float stays 0 and must not pixel-shift. */
     int32_t follows_scroll;
     /* 1 if this grid is an external (separate top-level) window. Such grids are
      * reported with start (0,0) and must be excluded from main-window hit-testing. */

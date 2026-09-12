@@ -4593,6 +4593,11 @@ pub fn notifySurfaceLayouts(self: *Core) void {
 fn publishSurfaceLayouts(self: *Core) void {
     if (self.flush_aborted) return;
 
+    // Before the layers are read: this batch's scroll, if it had one, is the
+    // evidence for which floats track the buffer. It is still pending here --
+    // clearScrolledGrids runs at transaction end, after this.
+    self.grid.settleFloatScrollFollowing();
+
     if (self.cb.on_surface_layout != null) {
         if (!emitSurfaceLayout(self, 1)) return;
         var ext_it = self.grid.external_grids.keyIterator();
