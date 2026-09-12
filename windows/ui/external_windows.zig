@@ -83,6 +83,33 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
     };
 }
 
+/// Client-pixel origin of a decorated external surface's content inside its own
+/// window: past the cmdline's icon strip and padding, or a message surface's
+/// padding. Normal and popupmenu surfaces draw at their client origin.
+///
+/// The companion of externalSurfaceInsetsPx, and it has the same rule: every
+/// site that places core content for a decorated surface goes through this.
+/// The cursor-shader forwarding path did not exist when the draw branches were
+/// written and re-derived nothing at all, so it translated the cmdline's cursor
+/// by the client origin alone -- leaving cursor shaders burning one padding
+/// above and one icon strip left of the cursor they were tracking.
+pub const DecoratedContentOrigin = struct { x: f32, y: f32 };
+
+pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedContentOrigin {
+    return switch (kind) {
+        .cmdline => .{
+            .x = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT +
+                app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT),
+            .y = @floatFromInt(app_mod.CMDLINE_PADDING),
+        },
+        .msg_show, .msg_history => blk: {
+            const pad: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            break :blk .{ .x = pad, .y = pad };
+        },
+        .normal, .popupmenu => .{ .x = 0, .y = 0 },
+    };
+}
+
 /// The cmdline may not grow past the work area of the monitor the main window
 /// is on. Other surfaces are returned unchanged.
 pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_int {
@@ -368,8 +395,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
-            const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -498,8 +526,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -3369,9 +3398,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         // cell (multi-row prompt / padding), so sizing from
                         // the drawable would render the cursor SDF at the
                         // drawable's height instead of the cell height.
-                        // Core vertices are grid-local pixels, y down.
-                        const center_x = off_x + (minx_c + maxx_c) * 0.5;
-                        const center_y = off_y + (miny_c + maxy_c) * 0.5;
+                        // Core vertices are grid-local pixels, y down, and a
+                        // decorated surface does not draw them at its client
+                        // origin: the cmdline's grid starts past the icon strip
+                        // and its padding. off_x/off_y reach the window, this
+                        // reaches the content inside it.
+                        const content_origin = decoratedContentOriginPx(app, surface_kind);
+                        const center_x = off_x + content_origin.x + (minx_c + maxx_c) * 0.5;
+                        const center_y = off_y + content_origin.y + (miny_c + maxy_c) * 0.5;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
                         const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;
