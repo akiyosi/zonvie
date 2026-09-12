@@ -598,6 +598,9 @@ pub const PaintSnapshot = struct {
     /// Which grid owns the cursor in this committed set, from the same
     /// transaction as the cursor vertices themselves.
     cursor_layer_grid_id: i64 = 1,
+    /// The placement generation the two fields above were taken from, so the
+    /// paint can tell that the core has published a newer one since.
+    layout_gen: u64 = 0,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -669,6 +672,11 @@ pub const TripleBufferedSurface = struct {
     /// callback and promoted with the cursor set.
     flush_cursor_layer_grid_id: ?i64 = null,
     committed_cursor_layer_grid_id: i64 = 1,
+    /// Bumped by every commit that promotes either of the two fields above.
+    /// A paint pins them at acquireForPaint but reads the rows they place
+    /// later, under app.mu, so this is what tells it the two came from
+    /// different flushes.
+    layout_publish_gen: u64 = 0,
 
     // Pending scroll state (rotation_mu protected).
     // Merged from flush_scroll_* at commitFlush, consumed at acquireForPaint.
@@ -924,10 +932,12 @@ pub const TripleBufferedSurface = struct {
             self.committed_layers = staged;
             self.flush_layers = null;
             self.pending_paint_full = true;
+            self.layout_publish_gen +%= 1;
         }
         if (self.flush_cursor_layer_grid_id) |staged_grid| {
             self.committed_cursor_layer_grid_id = staged_grid;
             self.flush_cursor_layer_grid_id = null;
+            self.layout_publish_gen +%= 1;
         }
 
         // Cursor and rows publish while holding the same lock. A paint can
@@ -1160,6 +1170,7 @@ pub const TripleBufferedSurface = struct {
             .paint_full = paint_full,
             .layers = self.committed_layers.retain(),
             .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
+            .layout_gen = self.layout_publish_gen,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -3853,16 +3864,33 @@ const LayerRowOutcome = struct {
 };
 
 /// What a surface's whole layer draw produced. A frame is incomplete when rows
-/// are missing from back_tex, or when the plan and the row data it drew came
-/// from different flushes; either way it must not be presented.
+/// are missing from back_tex, when the plan and the row data it drew came from
+/// different flushes, or when the placement it would have drawn at is older
+/// than those rows; none of the three may be presented.
 pub const LayerDrawOutcome = struct {
     failed_rows: u32 = 0,
     stale_layers: u32 = 0,
+    stale_layout: bool = false,
 
     pub fn incomplete(self: LayerDrawOutcome) bool {
-        return self.failed_rows != 0 or self.stale_layers != 0;
+        return self.failed_rows != 0 or self.stale_layers != 0 or self.stale_layout;
     }
 };
+
+/// Whether the core has published a placement newer than the one this paint
+/// pinned. A paint takes layers and cursor ownership from the TBS snapshot
+/// under rotation_mu, but reads the rows they place later, under app.mu. The
+/// core publishes both halves inside one app.mu hold, so a commit landing in
+/// that gap hands the paint one flush's rows at another flush's origins.
+///
+/// plan_content_gen cannot see this: it is stamped after such a commit, so the
+/// rows and the plan agree even though the placement no longer does.
+///
+/// Caller holds app.mu, which is what makes the plain read of the counter
+/// sound: commitFlush bumps it inside an app.mu hold of its own.
+pub fn layerLayoutMoved(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) bool {
+    return tbs.layout_publish_gen != snapshot.layout_gen;
+}
 
 /// One layer row: scissor, background overwrite, upload, draw.
 fn drawLayerRow(
@@ -6225,4 +6253,71 @@ test "a layer plan is refused once the core republishes the rows under it" {
     // The next plan takes the new generation and is drawable again.
     planLayerFrame(&g, &app, &layers, plan_params);
     try std.testing.expectEqual(@as(u32, 0), staleLayerPlans(&app, &layers));
+}
+
+test "a layer frame is refused once the core republishes the placement under it" {
+    // A paint pins layers and cursor ownership at acquireForPaint, under
+    // rotation_mu, but reads the rows they place later, under app.mu. The core
+    // publishes both halves inside one app.mu hold, so a commit landing in that
+    // gap gives the paint one flush's rows at another flush's origins.
+    const alloc = std.testing.allocator;
+
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    const Probe = struct {
+        fn placeLayerAt(t: *TripleBufferedSurface, a: std.mem.Allocator, b: *core.render_layout.Budget, y_px: i32) !void {
+            var staged = try t.prepareLayers(a, b, 2);
+            staged.items[0] = .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 4, .cols = 8, .z = 0, .follows_scroll = false };
+            staged.items[1] = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = y_px, .rows = 2, .cols = 8, .z = 1, .follows_scroll = false };
+            t.stageLayers(staged);
+        }
+
+        fn unpin(t: *TripleBufferedSurface, snapshot: *PaintSnapshot) void {
+            snapshot.layers.deinit();
+            _ = t.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
+        }
+    };
+
+    try Probe.placeLayerAt(&tbs, alloc, &budget, 0);
+    tbs.commitFlush(alloc);
+
+    {
+        var pinned = tbs.acquireForPaint(alloc);
+        defer Probe.unpin(&tbs, &pinned);
+        // Control: nothing has been published since, so this paint may draw.
+        try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+
+        // The core moves the layer and commits, in the gap this paint leaves
+        // open between pinning the placement and reading the rows.
+        try Probe.placeLayerAt(&tbs, alloc, &budget, 40);
+        tbs.commitFlush(alloc);
+
+        try std.testing.expect(layerLayoutMoved(&tbs, pinned));
+        // What the paint gates on: the layer draw never runs, and the frame it
+        // would have produced is refused.
+        try std.testing.expect((LayerDrawOutcome{ .stale_layout = true }).incomplete());
+    }
+
+    {
+        var pinned = tbs.acquireForPaint(alloc);
+        defer Probe.unpin(&tbs, &pinned);
+        try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+
+        // A cursor owner moving is the same divergence, and the one the
+        // layout's own pending_paint_full does not already cover. It reaches
+        // commitFlush the way the cursor callback does: storeMainCursor is
+        // what opens the bracket that promotes it.
+        try std.testing.expect(tbs.storeMainCursor(alloc, &.{}, null));
+        tbs.stageCursorLayerGrid(2);
+        tbs.commitFlush(alloc);
+
+        try std.testing.expect(layerLayoutMoved(&tbs, pinned));
+    }
+
+    // A paint that pins the placement after the commit is drawable again.
+    var fresh = tbs.acquireForPaint(alloc);
+    defer Probe.unpin(&tbs, &fresh);
+    try std.testing.expect(!layerLayoutMoved(&tbs, fresh));
 }

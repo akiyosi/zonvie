@@ -767,10 +767,17 @@ fn drawNormalExternalSurfaceRowMode(
         }
     }
 
+    var layer_layout_stale = false;
     if (has_layers) {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
+        layer_layout_stale = app_mod.layerLayoutMoved(&ext_win.tbs, tbs_snap);
+        if (layer_layout_stale) {
+            // The placement this paint pinned is no longer the published one.
+            // Re-arm and let the repaint the commit already owes draw it.
+            if (log_enabled) applog.appLog("[layer_draw] stale_layout grid_id={d} gen={d}\n", .{ grid_id, tbs_snap.layout_gen });
+            app_mod.rearmLayerDraw(app, tbs_snap.layers.slice());
+        } else app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
             .x_offset = 0,
             .y_offset = 0,
             .content_right = content_right,
@@ -809,12 +816,12 @@ fn drawNormalExternalSurfaceRowMode(
 
     // Rows that never reached back_tex, and a plan the core republished under,
     // counted like the root rows above.
-    var layer_outcome = app_mod.LayerDrawOutcome{};
+    var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale };
     {
         const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
         if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
         defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
-        if (has_layers) {
+        if (has_layers and !layer_layout_stale) {
             layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
                 .x = 0,
                 .y = 0,
