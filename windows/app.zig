@@ -3389,8 +3389,9 @@ pub const RowModeDrawParams = struct {
     sidebar_right_width: ?u32 = null,
     tabbar_bg_color: ?[4]f32 = null,
     /// Layers to include in the bloom extract pass. Null for a surface that
-    /// places none; the caller must hold `app.mu` across the bloom call when
-    /// it is set, because the extract reads live layer row storage.
+    /// places none. The extract reads live layer row storage, so when this is
+    /// set drawBloomRowsOverlay takes `app.mu` itself — the caller must NOT
+    /// hold it across the bloom call.
     bloom_layers: ?BloomLayerSource = null,
 
     /// Compute bloom viewport from these params.
@@ -3886,35 +3887,47 @@ pub const LayerDrawOutcome = struct {
     }
 };
 
-/// Whether the core has published a placement newer than the one this paint
-/// pinned. A paint takes layers and cursor ownership from the TBS snapshot
-/// under rotation_mu, but reads the rows they place later, under app.mu. The
-/// core publishes both halves inside one app.mu hold, so a commit landing in
-/// that gap hands the paint one flush's rows at another flush's origins.
+/// Both reasons a paint may no longer draw the layer frame it pinned.
 ///
-/// plan_content_gen cannot see this: it is stamped after such a commit, so the
-/// rows and the plan agree even though the placement no longer does.
+/// A paint takes layers, cursor ownership and the root's committed index from
+/// the TBS snapshot under rotation_mu, but reads the rows they place later,
+/// under app.mu. The core publishes all of it inside one app.mu hold, so a
+/// commit landing in that gap hands the paint one flush's rows at another
+/// flush's origins -- or beside another flush's root rows.
 ///
-/// Caller holds app.mu, which is what makes the plain read of the counter
-/// sound: commitFlush bumps it inside an app.mu hold of its own.
-pub fn layerLayoutMoved(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) bool {
-    return tbs.layout_publish_gen != snapshot.layout_gen;
-}
+/// plan_content_gen cannot see either: it is stamped after such a commit, so
+/// the rows and the plan agree even though the frame no longer does.
+///
+/// Answered together on purpose. A driver that knew only half the list drew
+/// the other half's stale frame, and a reason added here reaches every surface
+/// without a second edit.
+///
+/// Caller holds app.mu, which is what makes the plain reads sound: commitFlush
+/// bumps both counters inside an app.mu hold of its own.
+pub const LayerFrameStaleness = struct {
+    /// The placement or cursor owner was republished (layout_publish_gen).
+    layout: bool = false,
+    /// The root's committed set rotated away from the index the snapshot froze
+    /// (commit_rev), while the layer rows drawn beside it were republished in
+    /// place -- the case that moves neither the placement nor the cursor owner,
+    /// so `layout` stays clear. The frame would pair one flush's chrome with
+    /// another flush's window text; under ext_multigrid the root carries the
+    /// statusline, tabline and separators, which describe what the layers show.
+    ///
+    /// A flush that publishes no root rows leaves committed_index alone and
+    /// does not bump commit_rev, so a layers-only commit is not refused.
+    commit: bool = false,
 
-/// Whether the core has committed a flush since this paint pinned its root
-/// rows. The same gap layerLayoutMoved covers, for the case that moves neither
-/// the placement nor the cursor owner: the root's committed set rotates away
-/// from the index the snapshot froze, while the layer rows drawn beside it are
-/// republished in place. The frame would then pair one flush's chrome with
-/// another flush's window text -- under ext_multigrid the root carries the
-/// statusline, tabline and separators, which describe what the layers show.
-///
-/// A flush that publishes no root rows leaves committed_index alone and does
-/// not bump this, so a layers-only commit is not refused.
-///
-/// Caller holds app.mu, for the reason layerLayoutMoved states.
-pub fn surfaceCommitMoved(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) bool {
-    return tbs.commit_rev != snapshot.commit_rev;
+    pub fn any(self: LayerFrameStaleness) bool {
+        return self.layout or self.commit;
+    }
+};
+
+pub fn layerFrameStaleness(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) LayerFrameStaleness {
+    return .{
+        .layout = tbs.layout_publish_gen != snapshot.layout_gen,
+        .commit = tbs.commit_rev != snapshot.commit_rev,
+    };
 }
 
 /// One layer row: scissor, background overwrite, upload, draw.
@@ -4422,6 +4435,15 @@ pub fn drawBloomRowsOverlay(
     glow_intensity: f32,
     draw_params: RowModeDrawParams,
 ) void {
+    // The extract pass reads live layer row storage, which the core thread
+    // resizes in applyStaged and frees outright when a grid is destroyed, both
+    // under app.mu. Taking it here rather than at the call sites is what stops
+    // a surface from forgetting: bloom_layers is the only thing that reaches
+    // that storage, and it carries the App the lock belongs to.
+    // Callers must NOT hold app.mu -- std.Io.Mutex is not reentrant.
+    if (draw_params.bloom_layers) |src| src.app.mu.lockUncancelable(core.clock.io());
+    defer if (draw_params.bloom_layers) |src| src.app.mu.unlock(core.clock.io());
+
     var has_rows = false;
     for (row_map, 0..) |mapping, row_index| {
         if (row_index >= row_vbs.len or mapping.slot == SLOT_NONE or row_vbs[row_index].vb == null) continue;
@@ -6322,14 +6344,14 @@ test "a layer frame is refused once the core republishes the placement under it"
         var pinned = tbs.acquireForPaint(alloc);
         defer Probe.unpin(&tbs, &pinned);
         // Control: nothing has been published since, so this paint may draw.
-        try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+        try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
 
         // The core moves the layer and commits, in the gap this paint leaves
         // open between pinning the placement and reading the rows.
         try Probe.placeLayerAt(&tbs, alloc, &budget, 40);
         tbs.commitFlush(alloc);
 
-        try std.testing.expect(layerLayoutMoved(&tbs, pinned));
+        try std.testing.expect(layerFrameStaleness(&tbs, pinned).layout);
         // What the paint gates on: the layer draw never runs, and the frame it
         // would have produced is refused.
         try std.testing.expect((LayerDrawOutcome{ .stale_layout = true }).incomplete());
@@ -6338,7 +6360,7 @@ test "a layer frame is refused once the core republishes the placement under it"
     {
         var pinned = tbs.acquireForPaint(alloc);
         defer Probe.unpin(&tbs, &pinned);
-        try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+        try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
 
         // A cursor owner moving is the same divergence, and the one the
         // layout's own pending_paint_full does not already cover. It reaches
@@ -6348,13 +6370,13 @@ test "a layer frame is refused once the core republishes the placement under it"
         tbs.stageCursorLayerGrid(2);
         tbs.commitFlush(alloc);
 
-        try std.testing.expect(layerLayoutMoved(&tbs, pinned));
+        try std.testing.expect(layerFrameStaleness(&tbs, pinned).layout);
     }
 
     // A paint that pins the placement after the commit is drawable again.
     var fresh = tbs.acquireForPaint(alloc);
     defer Probe.unpin(&tbs, &fresh);
-    try std.testing.expect(!layerLayoutMoved(&tbs, fresh));
+    try std.testing.expect(!layerFrameStaleness(&tbs, fresh).layout);
 }
 
 test "a layer frame is refused once the core republishes the root rows beside it" {
@@ -6363,9 +6385,9 @@ test "a layer frame is refused once the core republishes the root rows beside it
     // from the index this paint pinned (app.zig, commitFlush) while the layer
     // rows drawn beside it are republished in place by applyStaged, so the
     // frame would pair one flush's chrome with another flush's window text.
-    // Neither layerLayoutMoved nor plan_content_gen can see that: the first
-    // watches a counter this commit does not bump, the second is stamped after
-    // it. surfaceCommitMoved is what closes it.
+    // Neither `layout` nor plan_content_gen can see that: the first watches a
+    // counter this commit does not bump, the second is stamped after it.
+    // `commit` is what closes it.
     const alloc = std.testing.allocator;
     const row_h_px: i32 = 10;
     const cell_w_px: i32 = 8;
@@ -6480,8 +6502,8 @@ test "a layer frame is refused once the core republishes the root rows beside it
     try std.testing.expect(!pinned.paint_full);
     try std.testing.expect(tbs.paint_dirty_snapshot.isSet(0));
     // Control: nothing published since, so this paint may draw.
-    try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
-    try std.testing.expect(!surfaceCommitMoved(&tbs, pinned));
+    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
+    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).commit);
 
     // --- Flush N+1 lands in the gap, ordered the way onFlushEnd orders it:
     //     the layers' applyStaged first, then the surface commit, one hold.
@@ -6498,7 +6520,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
 
     // Neither existing guard sees it.
     try std.testing.expectEqual(layout_gen_n, tbs.layout_publish_gen);
-    try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+    try std.testing.expect(!layerFrameStaleness(&tbs, pinned).layout);
     planLayerFrame(&g, &app, pinned.layers.slice(), .{
         .x_offset = 0,
         .y_offset = 0,
@@ -6516,7 +6538,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
     try std.testing.expectEqual(state.content_gen, state.plan_content_gen);
 
     // What the paint gates on: the frame is refused.
-    try std.testing.expect(surfaceCommitMoved(&tbs, pinned));
+    try std.testing.expect(layerFrameStaleness(&tbs, pinned).commit);
     try std.testing.expect((LayerDrawOutcome{ .stale_commit = true }).incomplete());
 
     // The release asks for the repaint that draws the frame properly.
@@ -6526,7 +6548,7 @@ test "a layer frame is refused once the core republishes the root rows beside it
     {
         var fresh = tbs.acquireForPaint(alloc);
         defer _ = Probe.unpin(&tbs, &fresh);
-        try std.testing.expect(!surfaceCommitMoved(&tbs, fresh));
+        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
 
         // And it is not over-broad: a flush that publishes only layer rows
         // leaves committed_index alone, so the frame this paint pinned is
@@ -6534,6 +6556,6 @@ test "a layer frame is refused once the core republishes the root rows beside it
         try Probe.publishLayerRow(&state, alloc, 3.0);
         tbs.commitFlush(alloc);
         try std.testing.expectEqual(@as(f32, 3.0), Probe.layerMarker(&state));
-        try std.testing.expect(!surfaceCommitMoved(&tbs, fresh));
+        try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
     }
 }
