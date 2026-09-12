@@ -8434,15 +8434,19 @@ pub fn hideMsgHistory(self: *Core) void {
     self.log.write("[msg_history] hide\n", .{});
 }
 
-/// Look up overflow extras for a composited column.
+/// Look up overflow extras for a cell of the row being generated.
 /// First checks the ephemeral float overlay buffer (for ext grid composites),
 /// then falls back to the persistent overflow map.
-pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, comp_col: u32) ?[]const u32 {
+///
+/// `row`/`col` are the row's own coordinates, which are grid-local: the
+/// grids that are not grid 1 compose their rows in their own space, and
+/// cell_overflow is keyed the same way.
+pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, row: u32, col: u32) ?[]const u32 {
     // Check ephemeral float overlay map first (set during ext grid flush).
     // A hit means a float occupies this cell: value non-null = float has overflow,
     // value null = float shadows base (no overflow). Either way, do NOT fall back.
     if (core.flush_float_overlay) |map| {
-        const key = FloatOverlayKey{ .row = comp_row, .col = comp_col };
+        const key = FloatOverlayKey{ .row = row, .col = col };
         // Single lookup instead of contains()+get(): the map's value type is
         // itself optional (null = float shadows base with no overflow), so
         // unwrapping one Optional level here yields exactly that inner value.
@@ -8452,17 +8456,9 @@ pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, comp_row: u32, co
     // Fall back to persistent overflow map (no float overlay at this cell).
     // The grid-local count avoids a cell-key hash when only another grid owns
     // overflow clusters.
-    const gid = rc.grid_ids.items[@intCast(comp_col)];
+    const gid = rc.grid_ids.items[@intCast(col)];
     if (core.grid.overflowCountForGrid(gid) == 0) return null;
-    const src_row: u32 = if (gid == 1) comp_row else blk: {
-        if (core.grid.win_pos.get(gid)) |pos| break :blk comp_row -| pos.row;
-        break :blk comp_row;
-    };
-    const src_col: u32 = if (gid == 1) comp_col else blk: {
-        if (core.grid.win_pos.get(gid)) |pos| break :blk comp_col -| pos.col;
-        break :blk comp_col;
-    };
-    return core.grid.getOverflow(gid, src_row, src_col);
+    return core.grid.getOverflow(gid, row, col);
 }
 
 /// Check if a composited cell's overflow contains emoji-significant codepoints
@@ -15407,4 +15403,102 @@ test "a layer's cursor glyph is mirrored into cursor_verts for the atlas collect
         if (v.texCoord[1] > 0) mirrored_uv_y = v.texCoord[1];
     }
     try std.testing.expectEqual(state.cursor_uv_y, mirrored_uv_y);
+}
+
+test "a layer's combining tail is read at the cell that owns it, not at the window's screen position" {
+    const State = struct {
+        shape_calls: u32 = 0,
+        seen_len: usize = 0,
+        seen: [16]u32 = .{0} ** 16,
+
+        fn bitmap() c_api.GlyphBitmap {
+            return .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+        }
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shape_calls += 1;
+            self.seen_len = @min(scalar_count, self.seen.len);
+            @memcpy(self.seen[0..self.seen_len], scalars[0..self.seen_len]);
+            if (out_cap < 1) return 1;
+            out_glyph_ids[0] = 42;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 64;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn rasterById(_: ?*anyopaque, _: u32, _: u32, out: *c_api.GlyphBitmap) callconv(.c) c_int {
+            out.* = bitmap();
+            return 1;
+        }
+
+        fn rasterScalar(_: ?*anyopaque, _: u32, _: u32, out: *c_api.GlyphBitmap) callconv(.c) c_int {
+            out.* = bitmap();
+            return 1;
+        }
+
+        fn upload(_: ?*anyopaque, _: u32, _: u32, _: u32, _: u32, _: *const c_api.GlyphBitmap) callconv(.c) void {}
+        fn create(_: ?*anyopaque, _: u32, _: u32) callconv(.c) void {}
+        fn onRow(_: ?*anyopaque, _: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, _: u32, _: u32, _: u32) callconv(.c) void {}
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 8;
+    core.cell_h_px = 16;
+    try core.grid.resize(10, 20);
+    try core.grid.resizeGrid(2, 4, 8);
+    // Both offsets non-zero: the old screen-position subtraction moved the
+    // lookup in each axis independently.
+    try core.grid.setWinPos(2, 101, 3, 5);
+
+    const acute = [_]u32{0x0301};
+    try core.grid.putCellGridCluster(2, 1, 1, 'e', 0, &acute);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.rasterById;
+    core.cb.on_rasterize_glyph = State.rasterScalar;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+    try core.initGlyphCache();
+
+    sendExternalGridVertices(&core, true);
+
+    // Only the row holding the cluster has ink, so it is the only shaped run.
+    try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
+    // The accent sits right after its own base cell, and nowhere else: a
+    // shifted lookup either drops it or hands it to the cell at col + 5.
+    try std.testing.expectEqualSlices(
+        u32,
+        &.{ ' ', 'e', 0x0301, ' ', ' ', ' ', ' ', ' ', ' ' },
+        state.seen[0..state.seen_len],
+    );
 }
