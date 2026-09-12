@@ -4137,7 +4137,17 @@ fn redrawCursorRowContent(
     const slot_verts_len: usize = if (mapping.slot != SLOT_NONE) p.pool.slotPtrConst(mapping.slot).verts.items.len else 0;
     if (rvb.vb) |row_vb| {
         if (slot_verts_len > 0) {
-            g.setLayerTransform(0, 0, layer_w, layer_h);
+            // A scroll moves a row's pixels with a GPU copy and its buffer
+            // with shiftRowVBs, leaving the vertices inside built for the row
+            // they were generated at. The row draw pays for that by offsetting
+            // the viewport (drawSurfaceRowsVBFromSlots), and the layer branch
+            // above by cursor_layer_row_dy_px. This branch did not: under this
+            // row's scissor the stale vertices landed nowhere, so the band the
+            // erase above cleared stayed empty -- the whole row blank, but only
+            // once something had scrolled.
+            const origin_row: i32 = @intCast(p.pool.slotPtrConst(mapping.slot).origin_row);
+            const row_dy: f32 = @floatFromInt((@as(i32, @intCast(cursor_row)) - origin_row) * p.row_h_px);
+            g.setLayerTransform(0, row_dy, layer_w, layer_h);
             try g.drawVB(row_vb, slot_verts_len);
         }
     } else if (slot_verts_len > 0) {
