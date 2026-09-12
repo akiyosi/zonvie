@@ -5595,6 +5595,7 @@ pub export fn WndProc(
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
+                    new_renderer.blur_enabled = app.config.window.blur;
                     new_renderer.loadCustomShaderPipelines(&app.config);
                     if (app.corep) |corep| {
                         if (core.zonvie_core_get_glow_enabled(corep)) {
