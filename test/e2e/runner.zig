@@ -89,6 +89,11 @@ test "e2e:float_move_recompose" {
     try @import("scenarios/float_move_recompose.zig").run(testing.allocator);
 }
 
+test "e2e:float_fixed_after_move" {
+    try requireNvim();
+    try @import("scenarios/float_fixed_after_move.zig").run(testing.allocator);
+}
+
 test "e2e:ime_preedit_extmark" {
     try requireNvim();
     try @import("scenarios/ime_preedit_extmark.zig").run(testing.allocator);
