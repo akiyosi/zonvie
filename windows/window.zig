@@ -3236,16 +3236,27 @@ pub export fn WndProc(
                         // app.mu was released above, so take it here, in the
                         // lockContext -> app.mu order the layer draw uses.
                         var layer_layout_stale = false;
-                        if (tbs_snapshot.layers.len > 1 and row_h_px > 0) {
+                        var layer_commit_stale = false;
+                        // Gated on the layer count alone, which is what the
+                        // draw below gates on: planLayerFrame refuses a
+                        // non-positive row height itself, and a frame drawn
+                        // without a staleness verdict is the one outcome
+                        // neither gate may produce.
+                        if (tbs_snapshot.layers.len > 1) {
                             app.mu.lockUncancelable(core.clock.io());
                             layer_layout_stale = app_mod.layerLayoutMoved(&app.tbs, tbs_snapshot);
-                            if (layer_layout_stale) {
+                            layer_commit_stale = app_mod.surfaceCommitMoved(&app.tbs, tbs_snapshot);
+                            if (layer_layout_stale or layer_commit_stale) {
                                 // Nothing is planned or drawn at a placement the
-                                // core has already replaced. The frame is refused
+                                // core has already replaced, or beside root rows
+                                // it has already replaced. The frame is refused
                                 // below, which re-arms every layer; the commit
-                                // that replaced the placement already owes the
-                                // repaint that draws it.
-                                if (log_enabled) applog.appLog("[layer_draw] stale_layout gen={d}\n", .{tbs_snapshot.layout_gen});
+                                // that replaced them already owes the repaint
+                                // that draws them.
+                                if (log_enabled) applog.appLog(
+                                    "[layer_draw] stale_layout={d} stale_commit={d} gen={d} rev={d}\n",
+                                    .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), tbs_snapshot.layout_gen, tbs_snapshot.commit_rev },
+                                );
                             } else {
                                 app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
                                     .x_offset = content_x_offset_i32,
@@ -3381,10 +3392,10 @@ pub export fn WndProc(
                         // plan without producing the frame it named, so the
                         // frame must not be presented: !render_ok re-arms every
                         // layer below.
-                        var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale };
+                        var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
                         // Non-root layers on top of the root grid, before the
                         // cursor so the cursor stays on top of everything.
-                        if (tbs_snapshot.layers.len > 1 and !layer_layout_stale) {
+                        if (tbs_snapshot.layers.len > 1 and !layer_layout_stale and !layer_commit_stale) {
                             app.mu.lockUncancelable(core.clock.io());
                             layer_outcome = app_mod.drawSurfaceLayers(
                                 g,

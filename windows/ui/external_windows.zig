@@ -797,14 +797,20 @@ fn drawNormalExternalSurfaceRowMode(
     }
 
     var layer_layout_stale = false;
+    var layer_commit_stale = false;
     if (has_layers) {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
         layer_layout_stale = app_mod.layerLayoutMoved(&ext_win.tbs, tbs_snap);
-        if (layer_layout_stale) {
-            // The placement this paint pinned is no longer the published one.
-            // Re-arm and let the repaint the commit already owes draw it.
-            if (log_enabled) applog.appLog("[layer_draw] stale_layout grid_id={d} gen={d}\n", .{ grid_id, tbs_snap.layout_gen });
+        layer_commit_stale = app_mod.surfaceCommitMoved(&ext_win.tbs, tbs_snap);
+        if (layer_layout_stale or layer_commit_stale) {
+            // The placement this paint pinned, or the root rows it drew beside
+            // these layers, is no longer the published one. Re-arm and let the
+            // repaint the commit already owes draw it.
+            if (log_enabled) applog.appLog(
+                "[layer_draw] stale_layout={d} stale_commit={d} grid_id={d} gen={d} rev={d}\n",
+                .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), grid_id, tbs_snap.layout_gen, tbs_snap.commit_rev },
+            );
             app_mod.rearmLayerDraw(app, tbs_snap.layers.slice());
         } else app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
             .x_offset = 0,
@@ -845,12 +851,12 @@ fn drawNormalExternalSurfaceRowMode(
 
     // Rows that never reached back_tex, and a plan the core republished under,
     // counted like the root rows above.
-    var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale };
+    var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
     {
         const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
         if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
         defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
-        if (has_layers and !layer_layout_stale) {
+        if (has_layers and !layer_layout_stale and !layer_commit_stale) {
             layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
                 .x = 0,
                 .y = 0,
