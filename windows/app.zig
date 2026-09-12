@@ -601,6 +601,11 @@ pub const PaintSnapshot = struct {
     /// The placement generation the two fields above were taken from, so the
     /// paint can tell that the core has published a newer one since.
     layout_gen: u64 = 0,
+    /// The commit this snapshot pinned `committed_index` from. A later commit
+    /// rotates that index away while the layer rows this paint draws beside it
+    /// advance in place, so the paint has to tell that the two halves it holds
+    /// are no longer from one flush.
+    commit_rev: u64 = 0,
 };
 
 /// Triple-buffered surface: lock-free vertex handoff from core thread to UI thread.
@@ -1171,6 +1176,7 @@ pub const TripleBufferedSurface = struct {
             .layers = self.committed_layers.retain(),
             .cursor_layer_grid_id = self.committed_cursor_layer_grid_id,
             .layout_gen = self.layout_publish_gen,
+            .commit_rev = self.commit_rev,
             .scroll_rect = scroll_rect,
             .scroll_dy_px = scroll_dy_px,
             .vb_shift = vb_shift,
@@ -3865,15 +3871,18 @@ const LayerRowOutcome = struct {
 
 /// What a surface's whole layer draw produced. A frame is incomplete when rows
 /// are missing from back_tex, when the plan and the row data it drew came from
-/// different flushes, or when the placement it would have drawn at is older
-/// than those rows; none of the three may be presented.
+/// different flushes, when the placement it would have drawn at is older than
+/// those rows, or when the root rows it drew beside them are; none of the four
+/// may be presented.
 pub const LayerDrawOutcome = struct {
     failed_rows: u32 = 0,
     stale_layers: u32 = 0,
     stale_layout: bool = false,
+    stale_commit: bool = false,
 
     pub fn incomplete(self: LayerDrawOutcome) bool {
-        return self.failed_rows != 0 or self.stale_layers != 0 or self.stale_layout;
+        return self.failed_rows != 0 or self.stale_layers != 0 or
+            self.stale_layout or self.stale_commit;
     }
 };
 
@@ -3890,6 +3899,22 @@ pub const LayerDrawOutcome = struct {
 /// sound: commitFlush bumps it inside an app.mu hold of its own.
 pub fn layerLayoutMoved(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) bool {
     return tbs.layout_publish_gen != snapshot.layout_gen;
+}
+
+/// Whether the core has committed a flush since this paint pinned its root
+/// rows. The same gap layerLayoutMoved covers, for the case that moves neither
+/// the placement nor the cursor owner: the root's committed set rotates away
+/// from the index the snapshot froze, while the layer rows drawn beside it are
+/// republished in place. The frame would then pair one flush's chrome with
+/// another flush's window text -- under ext_multigrid the root carries the
+/// statusline, tabline and separators, which describe what the layers show.
+///
+/// A flush that publishes no root rows leaves committed_index alone and does
+/// not bump this, so a layers-only commit is not refused.
+///
+/// Caller holds app.mu, for the reason layerLayoutMoved states.
+pub fn surfaceCommitMoved(tbs: *const TripleBufferedSurface, snapshot: PaintSnapshot) bool {
+    return tbs.commit_rev != snapshot.commit_rev;
 }
 
 /// One layer row: scissor, background overwrite, upload, draw.
@@ -6330,4 +6355,185 @@ test "a layer frame is refused once the core republishes the placement under it"
     var fresh = tbs.acquireForPaint(alloc);
     defer Probe.unpin(&tbs, &fresh);
     try std.testing.expect(!layerLayoutMoved(&tbs, fresh));
+}
+
+test "a layer frame is refused once the core republishes the root rows beside it" {
+    // The sibling of the test above, for the commit that moves neither the
+    // placement nor the cursor owner. It still rotates committed_index away
+    // from the index this paint pinned (app.zig, commitFlush) while the layer
+    // rows drawn beside it are republished in place by applyStaged, so the
+    // frame would pair one flush's chrome with another flush's window text.
+    // Neither layerLayoutMoved nor plan_content_gen can see that: the first
+    // watches a counter this commit does not bump, the second is stamped after
+    // it. surfaceCommitMoved is what closes it.
+    const alloc = std.testing.allocator;
+    const row_h_px: i32 = 10;
+    const cell_w_px: i32 = 8;
+
+    var budget = core.render_layout.Budget{};
+    var tbs = TripleBufferedSurface{};
+    defer tbs.deinit(alloc);
+
+    var state = LayerGridState{};
+    defer state.deinit(alloc);
+    try state.rows_buf.appendNTimes(alloc, .{}, 3);
+    try state.origin_rows.appendSlice(alloc, &.{ 0, 1, 2 });
+    state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
+    state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
+    state.last_drawn_rows = 3;
+    state.rows = 3;
+    state.cols = 4;
+
+    var app: App = undefined;
+    app.alloc = alloc;
+    app.layer_grids = .{};
+    defer app.layer_grids.deinit(alloc);
+    try app.layer_grids.put(alloc, 2, &state);
+
+    var g: d3d11.Renderer = undefined;
+    g.height = 1000;
+
+    const Probe = struct {
+        fn marker(value: f32) Vertex {
+            return .{
+                .position = .{ value, value },
+                .texCoord = .{ 0, 0 },
+                .color = .{ 0, 0, 0, 1 },
+                .grid_id = 1,
+                .deco_flags = 0,
+                .deco_phase = 0,
+            };
+        }
+
+        /// One root row, written the way onVerticesRow writes it.
+        fn writeRootRow(t: *TripleBufferedSurface, a: std.mem.Allocator, value: f32) !void {
+            try std.testing.expect(t.beginFlush(a));
+            const ws = t.writeSet();
+            ws.row_mode = true;
+            ws.rows = 1;
+            ws.cols = 1;
+            try std.testing.expect(ws.ensureRowStorage(a, 0));
+            try std.testing.expect(t.prepareRowSyncTracking(a, 1));
+            const slot = t.cowDetachRow(a, 0) orelse return error.SlotDetachFailed;
+            slot.verts.clearRetainingCapacity();
+            try slot.verts.append(a, marker(value));
+            slot.origin_row = 0;
+            slot.ver +%= 1;
+            try std.testing.expect(t.markFlushRowChanged(0));
+        }
+
+        /// What the root draw reads out of one set: row 0's first vertex.
+        fn rootMarker(t: *TripleBufferedSurface, set_index: u8) f32 {
+            const set = &t.sets[set_index];
+            return t.pool.slotPtrConst(set.row_map.items[0].slot).verts.items[0].position[0];
+        }
+
+        /// One layer row, staged and published the way onFlushEnd publishes it.
+        fn publishLayerRow(s: *LayerGridState, a: std.mem.Allocator, value: f32) !void {
+            try std.testing.expect(s.stageRow(a, 0, &.{marker(value)}, 3, 4));
+            try std.testing.expect(s.prepareCommit(a));
+            try std.testing.expect(s.applyStaged(a));
+        }
+
+        fn layerMarker(s: *const LayerGridState) f32 {
+            return s.rows_buf.items[0].verts.items[0].position[0];
+        }
+
+        fn unpin(t: *TripleBufferedSurface, snapshot: *PaintSnapshot) bool {
+            snapshot.layers.deinit();
+            return t.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
+        }
+    };
+
+    // --- Flush A: the placement, plus a first generation of rows. ---
+    try Probe.writeRootRow(&tbs, alloc, 0.0);
+    {
+        var staged = try tbs.prepareLayers(alloc, &budget, 2);
+        staged.items[0] = .{ .grid_id = 1, .anchor_grid = 0, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 0, .follows_scroll = false };
+        staged.items[1] = .{ .grid_id = 2, .anchor_grid = 1, .x_px = 0, .y_px = 0, .rows = 3, .cols = 4, .z = 1, .follows_scroll = false };
+        tbs.stageLayers(staged);
+    }
+    try Probe.publishLayerRow(&state, alloc, 0.0);
+    tbs.commitFlush(alloc);
+
+    // Drain the full-paint flag that staging a placement sets, so the frame
+    // under test is an ordinary partial redraw -- which is what makes the
+    // stale root row actually reach the screen.
+    {
+        var warmup = tbs.acquireForPaint(alloc);
+        _ = Probe.unpin(&tbs, &warmup);
+    }
+
+    // --- Flush N: row content only, both grids. No placement, no cursor. ---
+    try Probe.writeRootRow(&tbs, alloc, 1.0);
+    try Probe.publishLayerRow(&state, alloc, 1.0);
+    tbs.commitFlush(alloc);
+
+    const root_set_n = tbs.committed_index;
+    const layout_gen_n = tbs.layout_publish_gen;
+
+    // --- The paint pins flush N. ---
+    var pinned = tbs.acquireForPaint(alloc);
+    try std.testing.expectEqual(root_set_n, pinned.committed_index);
+    // A partial redraw whose redraw set contains the root's row 0: this frame
+    // would draw that row, from the set it just pinned.
+    try std.testing.expect(!pinned.paint_full);
+    try std.testing.expect(tbs.paint_dirty_snapshot.isSet(0));
+    // Control: nothing published since, so this paint may draw.
+    try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+    try std.testing.expect(!surfaceCommitMoved(&tbs, pinned));
+
+    // --- Flush N+1 lands in the gap, ordered the way onFlushEnd orders it:
+    //     the layers' applyStaged first, then the surface commit, one hold.
+    try Probe.writeRootRow(&tbs, alloc, 2.0);
+    try Probe.publishLayerRow(&state, alloc, 2.0);
+    tbs.commitFlush(alloc);
+
+    // The skew is real: the pinned set still holds flush N's root row while
+    // the layer rows this paint would draw beside it are at N+1.
+    try std.testing.expect(tbs.committed_index != root_set_n);
+    try std.testing.expectEqual(@as(f32, 1.0), Probe.rootMarker(&tbs, pinned.committed_index));
+    try std.testing.expectEqual(@as(f32, 2.0), Probe.rootMarker(&tbs, tbs.committed_index));
+    try std.testing.expectEqual(@as(f32, 2.0), Probe.layerMarker(&state));
+
+    // Neither existing guard sees it.
+    try std.testing.expectEqual(layout_gen_n, tbs.layout_publish_gen);
+    try std.testing.expect(!layerLayoutMoved(&tbs, pinned));
+    planLayerFrame(&g, &app, pinned.layers.slice(), .{
+        .x_offset = 0,
+        .y_offset = 0,
+        .content_right = 4 * cell_w_px,
+        .content_height = 3 * row_h_px,
+        .row_h_px = row_h_px,
+        .cell_w_px = cell_w_px,
+        .preserve_back = true,
+        .paint_full = pinned.paint_full,
+        .cursor_grid = pinned.cursor_layer_grid_id,
+        .last_cursor_row = null,
+        .rows_to_draw = &[_]u32{0},
+        .log_enabled = false,
+    });
+    try std.testing.expectEqual(state.content_gen, state.plan_content_gen);
+
+    // What the paint gates on: the frame is refused.
+    try std.testing.expect(surfaceCommitMoved(&tbs, pinned));
+    try std.testing.expect((LayerDrawOutcome{ .stale_commit = true }).incomplete());
+
+    // The release asks for the repaint that draws the frame properly.
+    try std.testing.expect(Probe.unpin(&tbs, &pinned));
+
+    // A paint that pins after the commit is drawable again.
+    {
+        var fresh = tbs.acquireForPaint(alloc);
+        defer _ = Probe.unpin(&tbs, &fresh);
+        try std.testing.expect(!surfaceCommitMoved(&tbs, fresh));
+
+        // And it is not over-broad: a flush that publishes only layer rows
+        // leaves committed_index alone, so the frame this paint pinned is
+        // still whole and must not be refused.
+        try Probe.publishLayerRow(&state, alloc, 3.0);
+        tbs.commitFlush(alloc);
+        try std.testing.expectEqual(@as(f32, 3.0), Probe.layerMarker(&state));
+        try std.testing.expect(!surfaceCommitMoved(&tbs, fresh));
+    }
 }
