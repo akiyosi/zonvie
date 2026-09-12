@@ -218,6 +218,11 @@ pub fn isSpecialVk(vk: u32) bool {
 /// already has them in hand from the same locked read as the other metrics.
 pub const CellPos = struct { row: i32, col: i32 };
 
+/// `allow_negative` keeps a position above or left of the grid as a negative
+/// cell instead of clamping it to 0. A drag needs that: Neovim scrolls the
+/// window while the pointer is held past its edge, and row 0 reads as "at the
+/// first line", which stops the scroll. Everything else clamps, because a
+/// press cannot land outside the grid it was captured in.
 pub fn clientPxToCell(
     app: *App,
     is_main_window: bool,
@@ -225,12 +230,13 @@ pub fn clientPxToCell(
     y: i32,
     cell_w: u32,
     row_h: u32,
+    allow_negative: bool,
 ) CellPos {
     // Single early return rather than an is_main_window term inside each
     // offset: this way removing the guard makes the parameter unused, which
     // Zig rejects. An external window silently taking the main window's
     // chrome offsets is otherwise invisible until someone clicks.
-    if (!is_main_window) return cellAt(x, y, cell_w, row_h);
+    if (!is_main_window) return cellAt(x, y, cell_w, row_h, allow_negative);
 
     const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
         x - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
@@ -240,14 +246,21 @@ pub fn clientPxToCell(
         y - @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         y;
-    return cellAt(content_x, content_y, cell_w, row_h);
+    return cellAt(content_x, content_y, cell_w, row_h, allow_negative);
 }
 
-fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32) CellPos {
+fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32, allow_negative: bool) CellPos {
     return .{
-        .col = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0,
-        .row = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0,
+        .col = axisCell(content_x, cell_w, allow_negative),
+        .row = axisCell(content_y, row_h, allow_negative),
     };
+}
+
+fn axisCell(px: i32, size_px: u32, allow_negative: bool) i32 {
+    if (size_px == 0) return 0;
+    const size: i32 = @intCast(size_px);
+    // Floor, not trunc: -1px is the row above, not row 0.
+    return if (allow_negative) @divFloor(px, size) else @divTrunc(@max(0, px), size);
 }
 
 /// Clear the shared IME composition state. `end` additionally lowers
@@ -455,6 +468,83 @@ pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
     return mod_buf;
 }
 
+/// Client-area mouse position out of an lParam. The two halves are SIGNED:
+/// a drag that leaves the window reports negative coordinates, and reading
+/// them as unsigned turns a few pixels above the top edge into ~65500.
+pub fn mousePosFromLParam(lParam: c.LPARAM) struct { x: i32, y: i32 } {
+    const packed_bits: usize = @bitCast(lParam);
+    const x: i16 = @bitCast(@as(u16, @truncate(packed_bits)));
+    const y: i16 = @bitCast(@as(u16, @truncate(packed_bits >> 16)));
+    return .{ .x = @intCast(x), .y = @intCast(y) };
+}
+
+/// The name Neovim knows a held button by, from the code stored in
+/// `App.mouse_button_held`. Null for "no button held", which is what tells a
+/// move it is not a drag.
+pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
+    return switch (held) {
+        1 => "left",
+        2 => "right",
+        3 => "middle",
+        4 => "x1",
+        5 => "x2",
+        else => null,
+    };
+}
+
+/// Shared press/release/drag delivery for the main window and external
+/// windows. Both resolve the cell the same way handleMouseWheel does: the
+/// content offsets (titlebar tabline, left sidebar) belong to the main window
+/// only, and an external window passes its own grid_id with window-local
+/// coordinates, so the caller never has to know which convention it is in.
+pub const MouseAction = enum {
+    press,
+    release,
+    drag,
+
+    fn name(self: MouseAction) [*:0]const u8 {
+        return switch (self) {
+            .press => "press",
+            .release => "release",
+            .drag => "drag",
+        };
+    }
+};
+
+pub fn sendMouseButton(
+    hwnd: c.HWND,
+    app: *App,
+    grid_id: i64,
+    button: [*:0]const u8,
+    action: MouseAction,
+    x: i32,
+    y: i32,
+    wParam: c.WPARAM,
+) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const cell_w = app.cell_w_px;
+    const row_h = app.rowHeightPx();
+    app.mu.unlock(core.clock.io());
+
+    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
+    const drag = action == .drag;
+    const cell = clientPxToCell(app, is_main_window, x, y, cell_w, row_h, drag);
+    const mod_buf = buildMouseModifiers(wParam);
+
+    // Where the mini window anchors itself next.
+    app.last_mouse_grid_id = grid_id;
+
+    core.zonvie_core_send_mouse_input(
+        app.corep,
+        button,
+        action.name(),
+        @as([*:0]const u8, @ptrCast(&mod_buf)),
+        grid_id,
+        if (drag) cell.row else @max(0, cell.row),
+        if (drag) cell.col else @max(0, cell.col),
+    );
+}
+
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
 /// external windows.
 pub fn handleMouseWheel(
@@ -489,7 +579,7 @@ pub fn handleMouseWheel(
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h);
+    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h, false);
     const col = cell.col;
     const row = cell.row;
 

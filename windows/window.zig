@@ -6296,8 +6296,9 @@ pub export fn WndProc(
         c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // Check tabline/sidebar area first (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
@@ -6352,34 +6353,7 @@ pub export fn WndProc(
                     else => "left",
                 };
 
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                // Track mouse grid for mini window positioning (main window = grid 1)
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }
@@ -6388,8 +6362,9 @@ pub export fn WndProc(
         c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam (needed for tabline check)
-                const x_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos_x_up = input.mousePosFromLParam(lParam);
+                const x_up = pos_x_up.x;
+                const y_up = pos_x_up.y;
 
                 // Check tabline/sidebar drag end or area click
                 if (app.ext_tabline_enabled) {
@@ -6443,34 +6418,11 @@ pub export fn WndProc(
                 app.mouse_button_held = 0;
 
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }
@@ -6480,8 +6432,9 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 _ = c.SetCapture(hwnd);
 
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
                 const x_button: u16 = @truncate(wParam >> 16);
@@ -6493,30 +6446,7 @@ pub export fn WndProc(
                     break :blk "x2";
                 };
 
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
 
                 // WM_XBUTTONDOWN requires returning TRUE
                 return 1;
@@ -6527,36 +6457,16 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 _ = c.ReleaseCapture();
 
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 const x_button: u16 = @truncate(wParam >> 16);
                 const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
 
                 app.mouse_button_held = 0;
 
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
 
                 // WM_XBUTTONUP requires returning TRUE
                 return 1;
@@ -6666,8 +6576,9 @@ pub export fn WndProc(
         c.WM_MOUSEMOVE => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // Handle tabline/sidebar drag or hover (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
@@ -6746,42 +6657,10 @@ pub export fn WndProc(
                 }
 
                 // Only send drag events if a button is held
-                if (app.mouse_button_held == 0) return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+                const button = input.heldMouseButtonName(app.mouse_button_held) orelse
+                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 
-                const button: [*:0]const u8 = switch (app.mouse_button_held) {
-                    1 => "left",
-                    2 => "right",
-                    3 => "middle",
-                    4 => "x1",
-                    5 => "x2",
-                    else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
-                };
-
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "drag",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .drag, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }
