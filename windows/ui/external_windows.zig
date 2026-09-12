@@ -985,6 +985,11 @@ fn drawNormalExternalSurfaceRowMode(
     // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
     if (glow_enabled) {
         const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
+        // The extract pass reads live layer row storage, which the core thread
+        // can resize -- and whose LayerGridState it can free outright. Hold
+        // app.mu for it exactly as the main window does.
+        const bloom_locked = draw_params.bloom_layers != null;
+        if (bloom_locked) app.mu.lockUncancelable(core.clock.io());
         app_mod.drawBloomRowsOverlay(
             g,
             tbs_committed.row_map.items,
@@ -994,6 +999,7 @@ fn drawNormalExternalSurfaceRowMode(
             glow_intensity,
             draw_params,
         );
+        if (bloom_locked) app.mu.unlock(core.clock.io());
     }
 
     // Scrollbar overlay. Capture the clean, fully-composited strip after
