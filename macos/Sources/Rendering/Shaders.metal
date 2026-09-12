@@ -60,6 +60,16 @@ struct ScrollOffset {
                             // — a float scrolling above its own backdrop must keep drawing.
 };
 
+// Maps one layer's incoming vertex space to clip space. The core emits row
+// vertices in grid-local pixels (origin top-left, +y down), so the surface
+// binds scale = (2/extent_w, -2/extent_h) and offset = (-1, +1). Everything
+// downstream of the multiply -- row translation, scroll offsets, edge pinning
+// -- stays in NDC and is unchanged by this.
+struct LayerTransform {
+    float2 scale;
+    float2 offset;
+};
+
 // Drawable size for NDC conversion in fragment shader
 struct DrawableSize {
     float width;
@@ -69,16 +79,22 @@ struct DrawableSize {
 vertex VSOut vs_main(VertexIn in [[stage_in]],
                      constant ScrollOffset* scrollOffsets [[buffer(1)]],
                      constant uint& scrollOffsetCount [[buffer(2)]],
-                     constant float& rowTranslationY [[buffer(3)]]) {
+                     constant float& rowTranslationY [[buffer(3)]],
+                     constant LayerTransform& layer [[buffer(4)]]) {
     VSOut o;
-    float2 pos = in.position;
+    // Row translation is in the same grid-local pixels the vertices arrive in:
+    // it moves a row-slot's vertices to the row they must appear at after a
+    // row-shift hint remapped the slots without rewriting them. Applying it
+    // before the transform also means the scroll boundary pin checks below
+    // compare against the logical row position, not the source row position;
+    // without that, remapped rows fail the content_top_y / content_bottom_y
+    // test during smooth scrolling and edge rows are clipped instead of
+    // stretched.
+    float2 pos_px = in.position;
+    pos_px.y += rowTranslationY;
 
-    // Apply row translation first so scroll boundary pin checks compare
-    // against the logical row position, not the source row position.
-    // Without this, remapped rows (from on_main_row_scroll) fail the
-    // content_top_y / content_bottom_y pin test during smooth scrolling,
-    // causing edge rows to be clipped instead of stretched.
-    pos.y += rowTranslationY;
+    // Grid-local pixels -> NDC. Everything below this line works in NDC.
+    float2 pos = pos_px * layer.scale + layer.offset;
 
     // Default: no clipping needed (content bounds cover entire screen)
     o.content_top_y = 2.0;     // Above screen
@@ -350,6 +366,11 @@ fragment float4 ps_main(VSOut in [[stage_in]],
         if (backgroundAlpha >= 1.0) {
             return float4(in.color.rgb, 1.0);
         }
+        // Premultiplied, as in ps_background: a colour kept at alpha 0 is added
+        // over the backdrop a second time and haloes glyph edges.
+        if (backgroundAlpha <= 0.0) {
+            return float4(0.0);
+        }
         // Blur enabled: use config opacity directly (ignore Zig-side alpha)
         return float4(in.color.rgb, backgroundAlpha);
     }
@@ -411,9 +432,11 @@ fragment float4 ps_background(VSOut in [[stage_in]],
 
     // A partial redraw can load old glyph pixels. Overwrite them with a fully
     // transparent background instead of discarding, while still allowing the
-    // underlying NSVisualEffectView/paddingView to show through.
+    // underlying NSVisualEffectView/paddingView to show through. Premultiplied:
+    // keeping the colour at alpha 0 makes CoreAnimation add it on top of the
+    // backdrop again, which haloes every antialiased glyph edge.
     if (backgroundAlpha <= 0.0) {
-        return float4(in.color.rgb, 0.0);
+        return float4(0.0);
     }
 
     // Regular solid color background
@@ -571,7 +594,7 @@ fragment float4 ps_unified_blur(VSOut in [[stage_in]],
         if (backgroundAlpha <= 0.0) {
             // Do not preserve a loaded glyph pixel. A zero-alpha overwrite
             // remains transparent to the underlying NSVisualEffectView.
-            return float4(in.color.rgb, 0.0);
+            return float4(0.0);
         }
         if (backgroundAlpha >= 1.0) {
             return float4(in.color.rgb, 1.0);
@@ -724,6 +747,31 @@ fragment float4 ps_glow_extract(VSOut in [[stage_in]],
 
     float cov = tex.sample(samp, in.uv).r;
     return float4(in.color.rgb * cov, cov);
+}
+
+/// Glow occlusion: a layer's background attenuates the light already extracted
+/// from whatever it covers. The main pass gets this from drawing back to front;
+/// the extract pass has no such ordering of its own, because ps_glow_extract
+/// discards every background quad, so a glyph hidden behind an opaque float
+/// would still bloom through it.
+///
+/// Only background quads take part (glyph quads are the light sources), and the
+/// pipeline blends them as (zero, one_minus_source_alpha): the destination is
+/// scaled by the coverage the background would have painted over it, which
+/// erases it under an opaque layer and dims it under a translucent one.
+fragment float4 ps_glow_occlude(VSOut in [[stage_in]],
+                                constant float& backgroundAlpha [[buffer(1)]]) {
+    if (in.uv.x >= 0.0) discard_fragment();
+    // Only plain background quads: a decoration sits on top of one, and
+    // attenuating twice over the same pixel would square the factor.
+    if (in.deco_flags & DECO_VISUAL_MASK) discard_fragment();
+    // Exactly ps_main's background rules. The Zig-side vertex alpha is a
+    // transport value that pass ignores -- under blur the core stamps 0.5 on
+    // the default background while the screen shows the configured opacity --
+    // so occluding by it would leave light under a background painted opaque.
+    if (backgroundAlpha >= 1.0) return float4(0.0, 0.0, 0.0, 1.0);
+    if (backgroundAlpha <= 0.0) return float4(0.0);
+    return float4(0.0, 0.0, 0.0, backgroundAlpha);
 }
 
 /// Dual Kawase downsample (5 taps).

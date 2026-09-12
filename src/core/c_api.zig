@@ -15,6 +15,7 @@ pub const clock = @import("clock.zig");
 pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
+pub const render_layout = @import("render_layout.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -56,6 +57,30 @@ pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, 
 // geometrically rather than rasterized. Tells the frontend not to treat them
 // as background, which would fade them under a translucent/blurred window.
 pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
+
+/// One grid placed on one surface. Mirrors `zonvie_layer` in
+/// include/zonvie_core.h.
+pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
+
+pub const Layer = extern struct {
+    grid_id: i64,
+    /// Grid this float is anchored to; == surface_id for the root layer.
+    anchor_grid: i64,
+    /// Surface-local, top-left origin.
+    x_px: i32,
+    y_px: i32,
+    rows: u32,
+    cols: u32,
+    /// Back-to-front index; 0 == root grid.
+    z: i32,
+    flags: u32,
+
+    comptime {
+        if (@sizeOf(Layer) != 40) {
+            @compileError("Layer struct size mismatch! Expected 40 bytes.");
+        }
+    }
+};
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -312,8 +337,89 @@ pub const PopupmenuColors = extern struct {
     pmenu_sel_fg: u32,
 };
 
+/// Layout version of Callbacks, mirroring ZONVIE_CALLBACKS_ABI_VERSION in
+/// include/zonvie_core.h. Bump it whenever a field is removed, reordered, or
+/// has its signature changed. Appending a new callback at the end stays
+/// backward compatible through callbacks_size and must NOT bump it.
+pub const CALLBACKS_ABI_VERSION: u32 = 1;
+
+/// Every field of Callbacks and the byte offset it must keep. Bump
+/// CALLBACKS_ABI_VERSION and update this table together: removing, reordering
+/// or retyping a field moves every offset after it while @sizeOf(Callbacks)
+/// can stay the same, so callbacks_size cannot see it. Appending a callback
+/// only adds a row here and keeps the version.
+const callbacks_layout = [_]struct { []const u8, usize }{
+    .{ "abi_version", 0 },
+    .{ "on_vertices_row", 8 },
+    .{ "on_atlas_ensure_glyph", 16 },
+    .{ "on_atlas_ensure_glyph_styled", 24 },
+    .{ "on_log", 32 },
+    .{ "on_guifont", 40 },
+    .{ "on_linespace", 48 },
+    .{ "on_exit", 56 },
+    .{ "on_set_title", 64 },
+    .{ "on_external_window", 72 },
+    .{ "on_external_window_close", 80 },
+    .{ "on_cursor_grid_changed", 88 },
+    .{ "on_cmdline_show", 96 },
+    .{ "on_cmdline_hide", 104 },
+    .{ "on_cmdline_pos", 112 },
+    .{ "on_cmdline_special_char", 120 },
+    .{ "on_cmdline_block_show", 128 },
+    .{ "on_cmdline_block_append", 136 },
+    .{ "on_cmdline_block_hide", 144 },
+    .{ "on_popupmenu_show", 152 },
+    .{ "on_popupmenu_hide", 160 },
+    .{ "on_popupmenu_select", 168 },
+    .{ "on_msg_show", 176 },
+    .{ "on_msg_clear", 184 },
+    .{ "on_msg_showmode", 192 },
+    .{ "on_msg_showcmd", 200 },
+    .{ "on_msg_ruler", 208 },
+    .{ "on_msg_history_show", 216 },
+    .{ "on_clipboard_get", 224 },
+    .{ "on_clipboard_set", 232 },
+    .{ "on_ssh_auth_prompt", 240 },
+    .{ "on_tabline_update", 248 },
+    .{ "on_tabline_hide", 256 },
+    .{ "on_grid_scroll", 264 },
+    .{ "on_ime_off", 272 },
+    .{ "on_quit_requested", 280 },
+    .{ "on_rasterize_glyph", 288 },
+    .{ "on_atlas_upload", 296 },
+    .{ "on_atlas_create", 304 },
+    .{ "on_flush_begin", 312 },
+    .{ "on_flush_end", 320 },
+    .{ "on_default_colors_set", 328 },
+    .{ "on_win_move", 336 },
+    .{ "on_win_exchange", 344 },
+    .{ "on_win_rotate", 352 },
+    .{ "on_win_resize_equal", 360 },
+    .{ "on_win_move_cursor", 368 },
+    .{ "on_shape_text_run", 376 },
+    .{ "on_rasterize_glyph_by_id", 384 },
+    .{ "on_get_ascii_table", 392 },
+    .{ "on_grid_row_scroll", 400 },
+    .{ "on_restart", 408 },
+    .{ "on_connect", 416 },
+    .{ "on_agent_status", 424 },
+    .{ "on_main_grid_size", 432 },
+    .{ "on_surface_layout", 440 },
+    .{ "on_grid_destroy", 448 },
+};
+
 pub const Callbacks = extern struct {
-    on_vertices_partial: ?OnVerticesPartialFn = null,
+    /// Must equal CALLBACKS_ABI_VERSION; zonvie_core_create returns null
+    /// otherwise. callbacks_size can only report that the struct's LENGTH
+    /// changed, never that its LAYOUT did: commit 935bdc0 removed two
+    /// callbacks and appended two, so a consumer built before it passes a
+    /// callbacks_size equal to the current @sizeOf while every pointer from
+    /// on_vertices_row onward sits at the wrong offset. The field is first on
+    /// purpose -- a stale build has a function pointer at that offset and
+    /// cannot match the version by accident. It defaults to the current
+    /// version because any Zig caller is compiled against this very layout.
+    abi_version: u32 = CALLBACKS_ABI_VERSION,
+
     on_vertices_row: ?OnVerticesRowFn = null,
 
     on_atlas_ensure_glyph: ?AtlasEnsureGlyphFn = null,
@@ -502,16 +608,6 @@ pub const Callbacks = extern struct {
     on_get_ascii_table: ?GetAsciiTableFn = null,
 
     // Main row-buffer scroll fast path notification (optional)
-    on_main_row_scroll: ?*const fn (
-        ctx: ?*anyopaque,
-        row_start: u32,
-        row_end: u32,
-        col_start: u32,
-        col_end: u32,
-        rows_delta: i32,
-        total_rows: u32,
-        total_cols: u32,
-    ) callconv(.c) void = null,
 
     // External grid (sub-grid) row-buffer scroll fast path notification (optional)
     on_grid_row_scroll: ?*const fn (
@@ -549,6 +645,43 @@ pub const Callbacks = extern struct {
     // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
     // Appended at the end for ABI compat (see on_restart note).
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    // Per-surface layer placement, and grid buffer lifetime.
+    // Appended at the end for ABI compat.
+    on_surface_layout: ?*const fn (
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void = null,
+    on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+
+    // No total-size assertion: appending a callback is a legal, ABI-compatible
+    // change. What must hold is that the version stays readable at offset 0 by
+    // any caller, whatever the rest of the struct grows into.
+    comptime {
+        if (@offsetOf(Callbacks, "abi_version") != 0) {
+            @compileError("Callbacks.abi_version offset mismatch! Expected 0.");
+        }
+        if (@sizeOf(@FieldType(Callbacks, "abi_version")) != 4) {
+            @compileError("Callbacks.abi_version size mismatch! Expected 4 bytes.");
+        }
+        @setEvalBranchQuota(20000);
+        const fields = @typeInfo(Callbacks).@"struct".fields;
+        for (fields[0..@min(fields.len, callbacks_layout.len)], 0..) |f, i| {
+            if (!std.mem.eql(u8, f.name, callbacks_layout[i][0]) or
+                @offsetOf(Callbacks, f.name) != callbacks_layout[i][1])
+            {
+                @compileError("Callbacks layout changed at field '" ++ f.name ++
+                    "': bump CALLBACKS_ABI_VERSION (and ZONVIE_CALLBACKS_ABI_VERSION in include/zonvie_core.h) and update callbacks_layout together.");
+            }
+        }
+        if (fields.len != callbacks_layout.len) {
+            @compileError("Callbacks field count changed: add each appended callback to callbacks_layout; a removal must also bump CALLBACKS_ABI_VERSION.");
+        }
+    }
 };
 
 pub const zonvie_core = opaque {};
@@ -578,6 +711,18 @@ fn asBox(p: *zonvie_core) *CoreBox {
 }
 
 pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, ctx: ?*anyopaque) ?*zonvie_core {
+    // Refuse a consumer built against a different callbacks layout before
+    // anything else is read from it. Only abi_version is touched here: every
+    // other field, on_log included, may sit at the wrong offset, so the
+    // refusal cannot be logged. A zero callbacks_size still means "install no
+    // callbacks at all", so nothing can be mis-wired and no version is read.
+    if (cb) |p| {
+        if (callbacks_size != 0) {
+            if (callbacks_size < @sizeOf(u32)) return null;
+            if (p.abi_version != CALLBACKS_ABI_VERSION) return null;
+        }
+    }
+
     // Eagerly initialize the shared Io before any worker threads spawn.
     clock.init();
 
@@ -610,7 +755,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
     // Build core.Callbacks from the C-facing callback struct.
     const cb_core: core.Callbacks = .{
-        .on_vertices_partial = box.cb.on_vertices_partial,
         .on_vertices_row = box.cb.on_vertices_row,
 
         .on_atlas_ensure_glyph = box.cb.on_atlas_ensure_glyph,
@@ -668,6 +812,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Neovim-initiated main grid resize
         .on_main_grid_size = box.cb.on_main_grid_size,
 
+        // Per-surface layer placement and grid buffer lifetime
+        .on_surface_layout = box.cb.on_surface_layout,
+        .on_grid_destroy = box.cb.on_grid_destroy,
+
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
 
@@ -704,7 +852,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_get_ascii_table = box.cb.on_get_ascii_table,
 
         // Main row-buffer scroll fast path notification
-        .on_main_row_scroll = box.cb.on_main_row_scroll,
 
         // External grid row-buffer scroll fast path notification
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
@@ -793,6 +940,21 @@ test "retry entry points reject work after stop is requested" {
     zonvie_core_retry_flush(p);
     zonvie_core_retry_flush_locked(p);
     try std.testing.expectEqual(@as(u32, 0), state.callback_count);
+}
+
+test "core creation refuses a callbacks struct from a different ABI version" {
+    // A stale consumer can pass a callbacks_size equal to the current
+    // @sizeOf while its layout differs, so the size check alone lets it
+    // through; only abi_version can reject it.
+    var stale: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION + 1 };
+    try std.testing.expect(zonvie_core_create(&stale, @sizeOf(Callbacks), null) == null);
+
+    var zeroed: Callbacks = .{ .abi_version = 0 };
+    try std.testing.expect(zonvie_core_create(&zeroed, @sizeOf(Callbacks), null) == null);
+
+    var current: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION };
+    const p = zonvie_core_create(&current, @sizeOf(Callbacks), null) orelse return error.OutOfMemory;
+    zonvie_core_destroy(p);
 }
 
 test "grid text extraction trims blanks and reports the size a short buffer needs" {
@@ -2411,8 +2573,8 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     if (box.core.isPhase2Atlas()) {
         box.core.resetCoreAtlas();
     }
-    // Scroll cache stores vertices with atlas UVs; invalidate after atlas reset.
-    box.core.invalidateScrollCache();
+    // The mirrored frame holds atlas UVs; invalidate after atlas reset.
+    box.core.invalidateMirroredFrameState();
     box.core.grid.markAllDirty();
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).
@@ -2465,6 +2627,9 @@ pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void
 // cursor_col), so one cursor_rev bump covers whichever grid currently
 // owns it, main or external.
 fn forceResendAll(cp: *core.Core) void {
+    // A newly registered surface needs placement as well as retained rows.
+    var layout_it = cp.last_surface_layout.valueIterator();
+    while (layout_it.next()) |layout| layout.valid = false;
     cp.grid.markAllDirty();
     var sub_it = cp.grid.sub_grids.iterator();
     while (sub_it.next()) |entry| {

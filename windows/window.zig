@@ -1468,7 +1468,10 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 // =========================================================================
 fn makeCoreCbs() core.Callbacks {
     return .{
-        .on_vertices_partial = callbacks.onVerticesPartial,
+        // Declares the callbacks layout this frontend was built against; the
+        // core refuses a mismatch. Set explicitly to document the contract,
+        // even though the Zig struct already defaults to it.
+        .abi_version = core.CALLBACKS_ABI_VERSION,
         .on_vertices_row = callbacks.onVerticesRow,
         // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
         // purpose. They are the Phase 1 (frontend-managed atlas) entry points,
@@ -1518,8 +1521,9 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
-        .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
+        .on_surface_layout = callbacks.onSurfaceLayout,
+        .on_grid_destroy = callbacks.onGridDestroy,
     };
 }
 
@@ -1606,7 +1610,7 @@ fn loadConfigAndApplyCoreOptions(app: *App) void {
         }
     } else |_| {}
 
-    setLogEnabledViaCore(app, app.config.log.enabled);
+    setLogEnabledViaCore(app, app.config.log.enabled or applog.isForced());
     if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
     if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
     if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
@@ -2036,8 +2040,22 @@ pub export fn WndProc(
                 }
 
                 var ps: c.PAINTSTRUCT = undefined;
-                _ = c.BeginPaint(hwnd, &ps);
+                const begin_hdc = c.BeginPaint(hwnd, &ps);
                 defer _ = c.EndPaint(hwnd, &ps);
+                if (log_enabled) {
+                    applog.appLog(
+                        "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
+                        .{
+                            @intFromBool(begin_hdc != null),
+                            ps.rcPaint.left,
+                            ps.rcPaint.top,
+                            ps.rcPaint.right,
+                            ps.rcPaint.bottom,
+                            @intFromBool(ps.fErase != 0),
+                            @intFromBool(app.wm_paint_reinvalidate_all),
+                        },
+                    );
+                }
 
                 // While minimized, GetClientRect returns the iconic size
                 // (e.g. 160x28); letting drawEx → resize run would shrink
@@ -2160,6 +2178,8 @@ pub export fn WndProc(
                 // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
                 const tbs_snapshot = app.tbs.acquireForPaint(app.alloc);
                 defer {
+                    var layers = tbs_snapshot.layers;
+                    layers.deinit();
                     const needs_reinvalidate = app.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
                     if (app.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
                         // A successful atlas-reset transaction repaints every
@@ -2565,14 +2585,36 @@ pub export fn WndProc(
                         // relying on those flags alone leaves a window where back_tex is
                         // cleared but only dirty rows are drawn — non-dirty rows show the
                         // clear color until Neovim re-sends grid_line.
+                        //
+                        // An empty ps.rcPaint is not a redraw-all request. Every
+                        // Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so the
+                        // paint DC has no visible region and BeginPaint clips
+                        // rcPaint to nothing on every paint. The app's own damage
+                        // (tbs.pending_dirty -> dirty_row_keys, plus
+                        // paint_full_snapshot) is what computeRowsToDraw reads.
                         const force_full_rows =
                             did_need_seed or
-                            (dirty == null) or
                             paint_full_snapshot or
                             seed_clear_pending_snapshot or
                             (seed_pending_snapshot and !back_tex_valid_snapshot) or
                             glow_enabled or
                             (g.opacity < 1.0);
+
+                        if (log_enabled) {
+                            applog.appLog(
+                                "[win] force_full_rows={d} seed={d} nodirty={d} paintfull={d} seedclear={d} seedpend_notex={d} glow={d} opacity={d}\n",
+                                .{
+                                    @intFromBool(force_full_rows),
+                                    @intFromBool(did_need_seed),
+                                    @intFromBool(dirty == null),
+                                    @intFromBool(paint_full_snapshot),
+                                    @intFromBool(seed_clear_pending_snapshot),
+                                    @intFromBool(seed_pending_snapshot and !back_tex_valid_snapshot),
+                                    @intFromBool(glow_enabled),
+                                    @intFromBool(g.opacity < 1.0),
+                                },
+                            );
+                        }
 
                         const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                         const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
@@ -2648,9 +2690,26 @@ pub export fn WndProc(
 
                         // Compute cursor rect directly from NDC vertices using viewport
                         // dimensions (content_height etc.) to match the D3D11 viewport's
-                        // NDC-to-pixel mapping. Using the client rect (as rectFromCursorVerts
+                        // NDC-to-pixel mapping. Using the client rect (as rectFromVerts
                         // does) causes cumulative position drift because the viewport is
                         // snapped to cell boundaries, which is smaller than the client area.
+                        // Core vertices are grid-local pixels. The root grid's
+                        // layer sits at the surface origin, but a cursor in
+                        // any other grid the surface draws as a layer needs
+                        // that layer's origin added before its position means
+                        // anything in screen space.
+                        var cursor_layer_x_px: f32 = 0;
+                        var cursor_layer_y_px: f32 = 0;
+                        if (cursor_verts_snapshot.len != 0 and cursor_verts_snapshot[0].grid_id != 1) {
+                            for (tbs_snapshot.layers.slice()) |layer| {
+                                if (layer.grid_id == cursor_verts_snapshot[0].grid_id) {
+                                    cursor_layer_x_px = @floatFromInt(layer.x_px);
+                                    cursor_layer_y_px = @floatFromInt(layer.y_px);
+                                    break;
+                                }
+                            }
+                        }
+
                         const cursor_rc_opt: ?c.RECT = if (cursor_verts_snapshot.len != 0) blk: {
                             var minx: f32 = cursor_verts_snapshot[0].position[0];
                             var maxx: f32 = minx;
@@ -2671,15 +2730,15 @@ pub export fn WndProc(
                             const vp_w: u32 = if (base_w > vp_x + sidebar_w) base_w - vp_x - sidebar_w else 1;
                             const vp_h: u32 = content_height;
 
-                            const w_f: f32 = @floatFromInt(vp_w);
-                            const h_f: f32 = @floatFromInt(vp_h);
-                            const x_off_f: f32 = @floatFromInt(vp_x);
-                            const y_off_f: f32 = @floatFromInt(vp_y);
+                            _ = vp_w;
+                            _ = vp_h;
+                            const x_off_f: f32 = @as(f32, @floatFromInt(vp_x)) + cursor_layer_x_px;
+                            const y_off_f: f32 = @as(f32, @floatFromInt(vp_y)) + cursor_layer_y_px;
 
-                            const l_f = x_off_f + (minx + 1.0) * 0.5 * w_f;
-                            const r_f = x_off_f + (maxx + 1.0) * 0.5 * w_f;
-                            const t_f = y_off_f + (1.0 - maxy) * 0.5 * h_f;
-                            const b_f = y_off_f + (1.0 - miny) * 0.5 * h_f;
+                            const l_f = x_off_f + minx;
+                            const r_f = x_off_f + maxx;
+                            const t_f = y_off_f + miny;
+                            const b_f = y_off_f + maxy;
 
                             var l: i32 = @intFromFloat(@floor(l_f));
                             var r: i32 = @intFromFloat(@ceil(r_f));
@@ -2725,15 +2784,18 @@ pub export fn WndProc(
                                         base_w_sh - vp_x_sh - sidebar_w_sh
                                     else
                                         1;
-                                const vp_h_sh: u32 = content_height;
-                                const wf_sh: f32 = @floatFromInt(vp_w_sh);
-                                const hf_sh: f32 = @floatFromInt(vp_h_sh);
-                                const xo_sh: f32 = @floatFromInt(vp_x_sh);
-                                const yo_sh: f32 = @floatFromInt(vp_y_sh);
-                                const left_sh = xo_sh + (minx_sh + 1.0) * 0.5 * wf_sh;
-                                const right_sh = xo_sh + (maxx_sh + 1.0) * 0.5 * wf_sh;
-                                const top_sh = yo_sh + (1.0 - maxy_sh) * 0.5 * hf_sh;
-                                const bottom_sh = yo_sh + (1.0 - miny_sh) * 0.5 * hf_sh;
+                                _ = vp_w_sh;
+                                // The shader reads the cursor uniform in
+                                // screen space, so the layer origin belongs
+                                // here too: without it a cursor shader keeps
+                                // drawing over the top-left window whichever
+                                // split holds the cursor.
+                                const xo_sh: f32 = @as(f32, @floatFromInt(vp_x_sh)) + cursor_layer_x_px;
+                                const yo_sh: f32 = @as(f32, @floatFromInt(vp_y_sh)) + cursor_layer_y_px;
+                                const left_sh = xo_sh + minx_sh;
+                                const right_sh = xo_sh + maxx_sh;
+                                const top_sh = yo_sh + miny_sh;
+                                const bottom_sh = yo_sh + maxy_sh;
                                 // Ghostty's cursor shaders interpret the y
                                 // component as the BOTTOM edge of the
                                 // cursor rect (center is computed as
@@ -2761,6 +2823,44 @@ pub export fn WndProc(
                                 "[win] WM_PAINT(row) row_h_px adjust rows={d} client_h={d} fallback={d} row_h={d}\n",
                                 .{ rows_for_layout, client.bottom, fallback_row_h, row_h_px_u32 },
                             );
+                        }
+
+                        // Where the cursor's own layer sits, so the overlay is
+                        // placed with that layer's transform rather than the
+                        // root grid's. The grid id comes from the same
+                        // transaction as the cursor vertices.
+                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
+                        const cursor_layer_origin: [2]f32 = blk: {
+                            if (cursor_grid == 1) break :blk .{ 0, 0 };
+                            for (tbs_snapshot.layers.slice()) |l| {
+                                if (l.grid_id == cursor_grid) {
+                                    break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
+                                }
+                            }
+                            break :blk .{ 0, 0 };
+                        };
+
+                        // The rows the cursor overlay would otherwise erase:
+                        // where the previous cursor was baked into back_tex,
+                        // and where this one lands. Both are grid-local rows of
+                        // the cursor's own grid. Repainting them from that
+                        // grid's vertices is what removes the previous cursor,
+                        // so the overlay's blink-off clear — a full-content-
+                        // width band it can only refill from one grid — never
+                        // has to run.
+                        const cursor_erase_rows: [2]?u32 = .{
+                            app.last_painted_cursor_row,
+                            if (cursor_verts_snapshot.len != 0 and row_h_px > 0)
+                                app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px)
+                            else
+                                null,
+                        };
+                        if (cursor_grid == 1) {
+                            for (cursor_erase_rows) |maybe_row| {
+                                const r = maybe_row orelse continue;
+                                if (r >= max_valid_row) continue;
+                                _ = render_helpers.insertSortedRow(app.alloc, rows_to_draw, r);
+                            }
                         }
 
                         // Use persistent buffer to avoid per-frame alloc/free.
@@ -2880,6 +2980,38 @@ pub export fn WndProc(
 
                         if (cursor_rc_opt) |cr| {
                             present_rects.append(app.alloc, cr) catch {};
+                        }
+
+                        // Track in each grid whether this paint built a present rect.
+                        // The core thread can make a layer dirty after the loop
+                        // below has run; that layer's band is drawn but not
+                        // presented, so only the layers recorded here may have
+                        // their dirty flag consumed.
+
+                        // Layers paint whole; present each one that changed.
+                        // Their rows are not in rows_to_draw, which only
+                        // covers the root grid's own dirty rows.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                                state.paint_has_present_rect = false;
+                                if (!state.dirty) continue;
+                                const l: i32 = @max(0, content_x_offset_i32 + layer.x_px);
+                                const t: i32 = @max(0, content_y_offset_i32 + layer.y_px);
+                                const rc: c.RECT = .{
+                                    .left = l,
+                                    .top = t,
+                                    .right = @min(client.right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
+                                    .bottom = @min(client.bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
+                                };
+                                if (rc.right > rc.left and rc.bottom > rc.top) {
+                                    present_rects.append(app.alloc, rc) catch continue;
+                                    state.paint_has_present_rect = true;
+                                }
+                            }
                         }
 
                         // Clamp first, then compact in place with O(n log n)
@@ -3018,11 +3150,25 @@ pub export fn WndProc(
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
                             .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
+                            .root_rows_may_be_empty = tbs_snapshot.layers.len > 1,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
                             .content_x_offset = content_x_offset,
                             .sidebar_right_width = sidebar_right_width,
                             .tabbar_bg_color = tabbar_bg_color,
+                            // The root layer drives the pixel space core
+                            // vertices arrive in. It sits at the surface origin
+                            // today; an anchored float will carry its own
+                            // offset once the core emits multi-layer layouts.
+                            .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+                            .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+                            // Under ext_multigrid the root grid carries only
+                            // chrome, so the glow pass has to extract the
+                            // layers as well or the buffer text never lights.
+                            .bloom_layers = if (tbs_snapshot.layers.len > 1)
+                                app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
+                            else
+                                null,
                         };
 
                         // Ensure row_vbs array covers committed set's row count.
@@ -3082,6 +3228,56 @@ pub export fn WndProc(
                             }
                         }
 
+                        // Per-layer dirty gating and GPU row scroll, in the
+                        // same slot as the root's applyScrollShift above and
+                        // for the same reason: the copy has to land before the
+                        // rows below paint over the band it moves. The
+                        // renderer context is held by the enclosing defer;
+                        // app.mu was released above, so take it here, in the
+                        // lockContext -> app.mu order the layer draw uses.
+                        var layer_layout_stale = false;
+                        var layer_commit_stale = false;
+                        // Gated on the layer count alone, which is what the
+                        // draw below gates on: planLayerFrame refuses a
+                        // non-positive row height itself, and a frame drawn
+                        // without a staleness verdict is the one outcome
+                        // neither gate may produce.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            const staleness = app_mod.layerFrameStaleness(&app.tbs, tbs_snapshot);
+                            layer_layout_stale = staleness.layout;
+                            layer_commit_stale = staleness.commit;
+                            if (staleness.any()) {
+                                // Nothing is planned or drawn at a placement the
+                                // core has already replaced, or beside root rows
+                                // it has already replaced. The frame is refused
+                                // below, which re-arms every layer; the commit
+                                // that replaced them already owes the repaint
+                                // that draws them.
+                                if (log_enabled) applog.appLog(
+                                    "[layer_draw] stale_layout={d} stale_commit={d} gen={d} rev={d}\n",
+                                    .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), tbs_snapshot.layout_gen, tbs_snapshot.commit_rev },
+                                );
+                            } else {
+                                app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
+                                    .x_offset = content_x_offset_i32,
+                                    .y_offset = content_y_offset_i32,
+                                    .content_right = content_right_i32,
+                                    .content_height = @intCast(content_height),
+                                    .row_h_px = row_h_px,
+                                    .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                                    .preserve_back = preserve_back,
+                                    .paint_full = paint_full_snapshot,
+                                    .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
+                                    .last_cursor_row = app.last_painted_cursor_row,
+                                    .rows_to_draw = rows_to_draw.items,
+                                    .root_scroll_rect = scroll_shift_result.scroll_rect,
+                                    .log_enabled = log_enabled,
+                                });
+                            }
+                            app.mu.unlock(core.clock.io());
+                        }
+
                         // TBS lock-free draw: committed set is protected by refcount,
                         // no app.mu needed during VB upload + draw.
                         var row_vb_budget_exceeded = false;
@@ -3103,6 +3299,13 @@ pub export fn WndProc(
                         };
                         if (row_vb_budget_exceeded) {
                             app.row_vb_budget_failed = true;
+                            // Nothing reaches drawSurfaceLayers on this path,
+                            // so the plan taken above is never paid for.
+                            if (tbs_snapshot.layers.len > 1) {
+                                app.mu.lockUncancelable(core.clock.io());
+                                app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
+                                app.mu.unlock(core.clock.io());
+                            }
                             if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
                             return 0;
                         }
@@ -3136,8 +3339,128 @@ pub export fn WndProc(
                             }
                         }
 
+                        // The cursor's own row in its layer. Blink-off redraws
+                        // this instead of the root's row, which is empty under
+                        // ext_multigrid.
+                        // Only plain values are carried out of this block: a
+                        // pointer into rows_buf would dangle once the lock is
+                        // released, so the row is re-resolved below.
+                        var cursor_layer_row_index: ?usize = null;
+                        // What row_already_redrawn promises drawCursorOverlay:
+                        // this frame repainted the cursor's OWN grid's row, so
+                        // blink-on needs only the cursor quad and blink-off
+                        // needs nothing. A layer's rows have to be claimed here,
+                        // after planLayerFrame settled the redraw set and before
+                        // drawSurfaceLayers' defer clears it.
+                        var cursor_row_redrawn = force_full_rows;
+                        if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            if (app.layer_grids.get(cursor_grid)) |state| {
+                                const local_row: usize =
+                                    app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px);
+                                if (local_row < state.rows_buf.items.len) cursor_layer_row_index = local_row;
+                                if (!cursor_row_redrawn) {
+                                    var claimed = true;
+                                    for (cursor_erase_rows) |maybe_row| {
+                                        const r = maybe_row orelse continue;
+                                        if (!app_mod.markLayerCursorRow(
+                                            app,
+                                            tbs_snapshot.layers.slice(),
+                                            cursor_grid,
+                                            r,
+                                            @intCast(@max(1, app.cell_w_px)),
+                                            row_h_px,
+                                        )) claimed = false;
+                                    }
+                                    cursor_row_redrawn = claimed;
+                                }
+                            }
+                        } else if (cursor_grid == 1 and !cursor_row_redrawn) {
+                            // Both rows went into rows_to_draw above, unless one
+                            // fell outside the committed row set.
+                            var claimed = true;
+                            for (cursor_erase_rows) |maybe_row| {
+                                const r = maybe_row orelse continue;
+                                if (std.mem.indexOfScalar(u32, rows_to_draw.items, r) == null)
+                                    claimed = false;
+                            }
+                            cursor_row_redrawn = claimed;
+                        }
+
+                        // Rows that never reached back_tex, and a plan the core
+                        // republished under. Either spends the layers' redraw
+                        // plan without producing the frame it named, so the
+                        // frame must not be presented: !render_ok re-arms every
+                        // layer below.
+                        var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
+                        // Non-root layers on top of the root grid, before the
+                        // cursor so the cursor stays on top of everything.
+                        if (tbs_snapshot.layers.len > 1 and !layer_layout_stale and !layer_commit_stale) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            layer_outcome = app_mod.drawSurfaceLayers(
+                                g,
+                                app,
+                                tbs_snapshot.layers.slice(),
+                                .{
+                                    .x = @floatFromInt(content_x_offset orelse 0),
+                                    .y = @floatFromInt(content_y_offset orelse 0),
+                                    .w = @floatFromInt(app_mod.rowModeViewportWidth(g, row_draw_params)),
+                                    .h = @floatFromInt(content_height),
+                                },
+                                content_x_offset_i32,
+                                content_y_offset_i32,
+                                content_right_i32,
+                                row_h_px,
+                                ctx_ptr,
+                                rs_set_sc_fn,
+                                log_enabled,
+                            );
+                            // Their pixels are in back_tex now; the present
+                            // rects for this frame were already built above.
+                            // Only a layer that got one of those rects has its
+                            // dirty flag consumed here — a layer the core made
+                            // dirty after the rect loop has no rect covering
+                            // it, so it keeps the flag and is presented by the
+                            // next paint. The clear stays inside the same lock
+                            // as the draw so a store landing between the two
+                            // cannot be dropped; a present that then fails
+                            // re-arms these flags below.
+                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
+                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                                if (state.paint_has_present_rect) state.dirty = false;
+                            }
+                            app.mu.unlock(core.clock.io());
+                        }
+
                         // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
                         var cursor_overlay_failed = false;
+                        // cursor_layer_row points into a layer's row storage,
+                        // which the core thread can resize; hold app.mu for as
+                        // long as the overlay dereferences it. The pointer is
+                        // resolved under this lock — between the capture above
+                        // and here the core thread can have resized rows_buf or
+                        // destroyed the grid, and a null falls back to the
+                        // root grid's row.
+                        if (cursor_layer_row_index != null) app.mu.lockUncancelable(core.clock.io());
+                        var cursor_layer_row: ?*app_mod.RowVerts = null;
+                        // Read with the row itself, so a blink-off redraw uses
+                        // the shift the layer draw above applied.
+                        var cursor_layer_row_dy_px: f32 = 0;
+                        if (cursor_layer_row_index) |local_row| {
+                            if (app.layer_grids.get(cursor_grid)) |state| {
+                                if (local_row < state.rows_buf.items.len) {
+                                    cursor_layer_row = &state.rows_buf.items[local_row];
+                                    const origin_row: u32 = if (local_row < state.origin_rows.items.len)
+                                        state.origin_rows.items[local_row]
+                                    else
+                                        @intCast(local_row);
+                                    cursor_layer_row_dy_px = @floatFromInt(
+                                        (@as(i32, @intCast(local_row)) - @as(i32, @intCast(origin_row))) * row_h_px,
+                                    );
+                                }
+                            }
+                        }
                         app_mod.drawCursorOverlay(g, .{
                             .cursor_verts = cursor_verts_snapshot,
                             .cursor_row = committed_cursor.last_cursor_row,
@@ -3150,16 +3473,22 @@ pub export fn WndProc(
                             .x_offset = content_x_offset_i32,
                             .y_offset = content_y_offset_i32,
                             .content_right = content_right_i32,
+                            .content_width = app_mod.rowModeViewportWidth(g, row_draw_params),
                             .content_height = content_height,
                             .row_h_px = row_h_px,
+                            .cursor_layer_origin_x_px = cursor_layer_origin[0],
+                            .cursor_layer_origin_y_px = cursor_layer_origin[1],
+                            .cursor_layer_row = cursor_layer_row,
+                            .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
                             .ctx_ptr = ctx_ptr,
                             .rs_set_sc_fn = rs_set_sc_fn,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
-                            .row_already_redrawn = force_full_rows,
+                            .row_already_redrawn = cursor_row_redrawn,
                         }) catch |e| {
                             cursor_overlay_failed = true;
                             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
                         };
+                        if (cursor_layer_row_index != null) app.mu.unlock(core.clock.io());
 
                         // Post-process bloom (neon glow) for row-mode
                         if (glow_enabled) {
@@ -3167,6 +3496,8 @@ pub export fn WndProc(
                                 cursor_verts_snapshot
                             else
                                 &[_]core.Vertex{};
+                            // drawBloomRowsOverlay takes app.mu itself for the
+                            // layer storage it reads; app.mu must be free here.
                             app_mod.drawBloomRowsOverlay(
                                 g,
                                 committed.row_map.items,
@@ -3242,6 +3573,7 @@ pub export fn WndProc(
                             // back_tex. Treat the whole paint as failed so the
                             // common recovery path requeues a full redraw.
                             if (failed_rows != 0) break :blk false;
+                            if (layer_outcome.incomplete()) break :blk false;
                             if (cursor_overlay_failed) break :blk false;
 
                             // When seed_clear is true, we must present to sync the cleared back buffer
@@ -3304,6 +3636,25 @@ pub export fn WndProc(
                         if (scroll_shift_result.scroll_rect) |sr| {
                             present_rects.append(app.alloc, sr) catch {};
                         }
+
+                        if (log_enabled) applog.appLog(
+                            "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
+                            .{
+                                allow_present,
+                                seed_pending_snapshot,
+                                preserve_back,
+                                back_tex_valid_snapshot,
+                                rows_mismatch,
+                                effective_rows,
+                                effective_row_valid_count,
+                                skipped_empty,
+                                failed_rows,
+                                row_draw_result.metrics.empty_rows,
+                                rows_to_draw.items.len,
+                                force_full_rows,
+                                tbs_snapshot.layers.len,
+                            },
+                        );
 
                         if (allow_present) {
                             present_frame: {
@@ -3457,6 +3808,18 @@ pub export fn WndProc(
                                     resize_age_ms,
                                 },
                             );
+                        }
+
+                        // Nothing was submitted (the present failed, or
+                        // allow_present refused this frame), so the dirty
+                        // state consumed with the layer draw was never paid
+                        // for: put it back. recoverMainPaintFailure re-arms a
+                        // full paint below on the failure path, and this keeps
+                        // the layer present rects on whichever paint runs next.
+                        if (!render_ok and tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
+                            app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled) {
@@ -3924,7 +4287,18 @@ pub export fn WndProc(
                 // cursor grid actually changes, so no is_grid_change guard
                 // is needed in the UI handler.
                 app.mu.lockUncancelable(core.clock.io());
-                const ext_hwnd = if (app.external_windows.get(grid_id)) |ext_win| ext_win.hwnd else null;
+                const ext_hwnd = blk: {
+                    if (app.external_windows.get(grid_id)) |ext_win| break :blk ext_win.hwnd;
+                    var ext_it = app.external_windows.valueIterator();
+                    while (ext_it.next()) |entry| {
+                        const ext = entry.*;
+                        if (ext.is_pending_close) continue;
+                        for (ext.tbs.committed_layers.slice()) |layer| {
+                            if (layer.grid_id == grid_id) break :blk ext.hwnd;
+                        }
+                    }
+                    break :blk null;
+                };
                 app.mu.unlock(core.clock.io());
 
                 if (ext_hwnd) |eh| {
@@ -3943,7 +4317,7 @@ pub export fn WndProc(
                 } else {
                     // Cursor moved to global grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
-                    // Only invalidate if no paint is already pending from on_vertices_row/partial.
+                    // Only invalidate if no paint is already pending from on_vertices_row.
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
                     // will handle cursor rendering as part of the normal draw.
                     app.mu.lockUncancelable(core.clock.io());
@@ -5074,9 +5448,9 @@ pub export fn WndProc(
                     hwnd;
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, new_d3d_device.?, new_d3d_ctx.?) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?) catch null;
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity) catch null;
+                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
                 if (recovered_gpu) |*r| {
                     // Complete the generation before publication: shader
@@ -5220,7 +5594,7 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity) catch {
+                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity, app.config.window.blur) catch {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
@@ -5611,12 +5985,12 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
+                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
                         if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
                         return 0;
                     };
@@ -5922,8 +6296,9 @@ pub export fn WndProc(
         c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // Check tabline/sidebar area first (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
@@ -5978,34 +6353,7 @@ pub export fn WndProc(
                     else => "left",
                 };
 
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                // Track mouse grid for mini window positioning (main window = grid 1)
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }
@@ -6014,8 +6362,9 @@ pub export fn WndProc(
         c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam (needed for tabline check)
-                const x_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos_x_up = input.mousePosFromLParam(lParam);
+                const x_up = pos_x_up.x;
+                const y_up = pos_x_up.y;
 
                 // Check tabline/sidebar drag end or area click
                 if (app.ext_tabline_enabled) {
@@ -6069,34 +6418,11 @@ pub export fn WndProc(
                 app.mouse_button_held = 0;
 
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }
@@ -6106,8 +6432,9 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 _ = c.SetCapture(hwnd);
 
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
                 const x_button: u16 = @truncate(wParam >> 16);
@@ -6119,30 +6446,7 @@ pub export fn WndProc(
                     break :blk "x2";
                 };
 
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
 
                 // WM_XBUTTONDOWN requires returning TRUE
                 return 1;
@@ -6153,36 +6457,16 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 _ = c.ReleaseCapture();
 
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 const x_button: u16 = @truncate(wParam >> 16);
                 const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
 
                 app.mouse_button_held = 0;
 
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
 
                 // WM_XBUTTONUP requires returning TRUE
                 return 1;
@@ -6292,8 +6576,9 @@ pub export fn WndProc(
         c.WM_MOUSEMOVE => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 // Handle tabline/sidebar drag or hover (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
@@ -6372,42 +6657,10 @@ pub export fn WndProc(
                 }
 
                 // Only send drag events if a button is held
-                if (app.mouse_button_held == 0) return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+                const button = input.heldMouseButtonName(app.mouse_button_held) orelse
+                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 
-                const button: [*:0]const u8 = switch (app.mouse_button_held) {
-                    1 => "left",
-                    2 => "right",
-                    3 => "middle",
-                    4 => "x1",
-                    5 => "x2",
-                    else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
-                };
-
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "drag",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                input.sendMouseButton(hwnd, app, 1, button, .drag, @as(i32, x), @as(i32, y), wParam);
 
                 return 0;
             }

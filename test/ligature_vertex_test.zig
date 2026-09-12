@@ -221,8 +221,6 @@ fn genParams(cols: u32, cell_w: f32) flush_mod.RowGenParams {
     return .{
         .row = 0,
         .cols = cols,
-        .vw = 800.0,
-        .vh = 600.0,
         .cell_w = cell_w,
         .cell_h = 34.0,
         .top_pad = 0,

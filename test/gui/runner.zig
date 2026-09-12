@@ -48,6 +48,11 @@ test "gui:external_window" {
     try @import("scenarios/common/external_window.zig").run(testing.allocator);
 }
 
+test "gui:render_trace" {
+    try requirePrereqs();
+    try @import("scenarios/common/render_trace.zig").run(testing.allocator);
+}
+
 test "gui:set_columns_lines" {
     try requirePrereqs();
     try @import("scenarios/common/set_columns_lines.zig").run(testing.allocator);
@@ -106,12 +111,34 @@ test "gui:main_margin_scroll_flicker" {
     }
 }
 
+test "gui:float_stack_scroll_continuity" {
+    // macOS only: it drives real trackpad pixel gestures, which Windows has
+    // no equivalent for (its wheel synthesis is notch-only, so there is no
+    // sub-cell ease to be discontinuous within).
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/float_stack_scroll_continuity.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:main_float_margin_scroll_flicker" {
     // macOS only: a bordered float composited into the main window is the
     // one configuration with a real BOTTOM margin row there.
     if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/macos/main_float_margin_scroll_flicker.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_keyboard_scroll_eases" {
+    // macOS only: the external-window smooth-scroll path is macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_keyboard_scroll_eases.zig").run(testing.allocator);
     } else {
         return error.SkipZigTest;
     }
@@ -190,6 +217,24 @@ test "gui:visual_split" {
     }
 }
 
+test "gui:visual_split_divider_survives_layer_redraw" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/split_divider_survives_layer_redraw.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_statusline_survives_layer_redraw" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/statusline_survives_layer_redraw.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_float" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
@@ -253,6 +298,25 @@ test "gui:visual_cmdline_cursor_animation" {
     }
 }
 
+test "gui:visual_continuous_j_scroll_matches_jump" {
+    // macOS only: counts the macOS frontend's [layer_row_scroll] line.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/continuous_j_scroll_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_incremental_scroll_matches_jump" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/incremental_scroll_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_scroll_then_cursor_move" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
@@ -262,10 +326,98 @@ test "gui:visual_scroll_then_cursor_move" {
     }
 }
 
+test "gui:visual_scrolled_layer_row_gating" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/scrolled_layer_row_gating.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_float_over_scrolled_split" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/float_over_scrolled_split.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_extfloat_over_scrolled_anchor" {
+    // macOS only: enumerates the app's OS windows to find the external one
+    // and captures that window rather than the main one.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_extfloat_opaque_partial" {
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extfloat_over_scrolled_anchor.zig").runOpaque(testing.allocator);
+    } else return error.SkipZigTest;
+}
+
+test "gui:visual_extfloat_over_born_external_anchor" {
+    // macOS only: enumerates the app's OS windows to find the external one
+    // and captures that window rather than the main one.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extfloat_over_born_external_anchor.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_scrollbind_layers_blit_matches_jump" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/scrollbind_layers_blit_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_proportional_font_support" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
         try @import("scenarios/visual/proportional_font_support.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_shader_covers_all_grids" {
+    // macOS only: reads the macOS frontend's [resizeExternalWindows] line.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/shader_covers_all_grids.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:cmdline_cursor_shader_rect" {
+    // macOS only: the shader cursor plumbing and the window enumeration this
+    // uses live in the macOS frontend and macos_window.zig.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/cmdline_cursor_shader_rect.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:visual_decorated_surface_background_alpha" {
+    // macOS only: enumerates the app's OS windows to find the ext-cmdline
+    // one and screenshots the desktop composite under it.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/decorated_surface_background_alpha.zig").run(testing.allocator);
     } else {
         return error.SkipZigTest;
     }

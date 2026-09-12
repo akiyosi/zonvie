@@ -83,6 +83,33 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
     };
 }
 
+/// Client-pixel origin of a decorated external surface's content inside its own
+/// window: past the cmdline's icon strip and padding, or a message surface's
+/// padding. Normal and popupmenu surfaces draw at their client origin.
+///
+/// The companion of externalSurfaceInsetsPx, and it has the same rule: every
+/// site that places core content for a decorated surface goes through this.
+/// The cursor-shader forwarding path did not exist when the draw branches were
+/// written and re-derived nothing at all, so it translated the cmdline's cursor
+/// by the client origin alone -- leaving cursor shaders burning one padding
+/// above and one icon strip left of the cursor they were tracking.
+pub const DecoratedContentOrigin = struct { x: f32, y: f32 };
+
+pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedContentOrigin {
+    return switch (kind) {
+        .cmdline => .{
+            .x = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT +
+                app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT),
+            .y = @floatFromInt(app_mod.CMDLINE_PADDING),
+        },
+        .msg_show, .msg_history => blk: {
+            const pad: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            break :blk .{ .x = pad, .y = pad };
+        },
+        .normal, .popupmenu => .{ .x = 0, .y = 0 },
+    };
+}
+
 /// The cmdline may not grow past the work area of the monitor the main window
 /// is on. Other surfaces are returned unchanged.
 pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_int {
@@ -95,9 +122,13 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
     return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
 }
 
-/// Map a decorated surface's content rect to the NDC scale and offset the
-/// vertex shader applies. The cmdline and message paths differ only in where
-/// the content starts; the conversion itself was identical.
+/// Map a decorated surface's content rect to the scale and offset that take a
+/// core vertex from grid-local pixels to this window's clip space. The cmdline
+/// and message paths differ only in where the content starts.
+///
+/// A decorated surface mixes core content and frontend chrome in one vertex
+/// array and one draw, so the content is transformed on the CPU here and the
+/// whole array is submitted under the identity layer transform.
 const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
 
 fn decoratedContentNdcTransform(
@@ -108,15 +139,13 @@ fn decoratedContentNdcTransform(
     window_w: f32,
     window_h: f32,
 ) ContentNdcTransform {
-    const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-    const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-    const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-    const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+    _ = content_w;
+    _ = content_h;
     return .{
-        .scale_x = (right_ndc - left_ndc) / 2.0,
-        .scale_y = (top_ndc - bottom_ndc) / 2.0,
-        .offset_x = (right_ndc + left_ndc) / 2.0,
-        .offset_y = (top_ndc + bottom_ndc) / 2.0,
+        .scale_x = 2.0 / window_w,
+        .scale_y = -2.0 / window_h,
+        .offset_x = content_left / window_w * 2.0 - 1.0,
+        .offset_y = 1.0 - content_top / window_h * 2.0,
     };
 }
 
@@ -366,8 +395,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
-            const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -442,7 +472,17 @@ fn drawDecoratedExternalSurface(
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const pum_verts = scratch.items;
-            @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
+            // Core vertices are grid-local pixels, and this draw path binds
+            // the identity transform for the frontend's own clip-space
+            // chrome (the border appended below). Map them here as the
+            // cmdline and message branches do; the popupmenu has no insets,
+            // so its content starts at the window's top-left.
+            const ndc = decoratedContentNdcTransform(0, 0, window_w, window_h, window_w, window_h);
+            for (verts[0..vert_count], 0..) |v, i| {
+                pum_verts[i] = v;
+                pum_verts[i].position[0] = v.position[0] * ndc.scale_x + ndc.offset_x;
+                pum_verts[i].position[1] = v.position[1] * ndc.scale_y + ndc.offset_y;
+            }
 
             app.mu.lockUncancelable(core.clock.io());
             const border_r = app.cmdline_border_color[0];
@@ -486,8 +526,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -667,7 +708,8 @@ fn drawNormalExternalSurfaceRowMode(
     // premultiplied alpha blending accumulates alpha on redrawn rows
     // unless back_tex is cleared first, which requires force_full to
     // set preserve_back=false → should_clear=true in drawEx.
-    const force_full_rows = force_full or
+    const has_layers = tbs_snap.layers.len > 1;
+    const force_full_rows = force_full or has_layers or
         glow_enabled or
         (g.opacity < 1.0);
 
@@ -702,6 +744,10 @@ fn drawNormalExternalSurfaceRowMode(
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = !force_full_rows,
+        // The root layer drives the pixel space core vertices arrive in.
+        .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+        .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+        .bloom_layers = if (has_layers) .{ .app = app, .layers = tbs_snap.layers.slice() } else null,
     };
 
     // Ensure row_vbs array covers committed set's row count.
@@ -750,6 +796,39 @@ fn drawNormalExternalSurfaceRowMode(
         }
     }
 
+    var layer_layout_stale = false;
+    var layer_commit_stale = false;
+    if (has_layers) {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        const staleness = app_mod.layerFrameStaleness(&ext_win.tbs, tbs_snap);
+        layer_layout_stale = staleness.layout;
+        layer_commit_stale = staleness.commit;
+        if (staleness.any()) {
+            // The placement this paint pinned, or the root rows it drew beside
+            // these layers, is no longer the published one. Re-arm and let the
+            // repaint the commit already owes draw it.
+            if (log_enabled) applog.appLog(
+                "[layer_draw] stale_layout={d} stale_commit={d} grid_id={d} gen={d} rev={d}\n",
+                .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), grid_id, tbs_snap.layout_gen, tbs_snap.commit_rev },
+            );
+            app_mod.rearmLayerDraw(app, tbs_snap.layers.slice());
+        } else app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
+            .x_offset = 0,
+            .y_offset = 0,
+            .content_right = content_right,
+            .content_height = @intCast(draw_params.content_height),
+            .row_h_px = row_h_px,
+            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+            .preserve_back = !force_full_rows,
+            .paint_full = force_full_rows,
+            .cursor_grid = tbs_snap.cursor_layer_grid_id,
+            .last_cursor_row = ext_win.last_painted_cursor_row,
+            .rows_to_draw = rows_to_draw.items,
+            .log_enabled = log_enabled,
+        });
+    }
+
     // TBS lock-free draw: committed set is protected by refcount,
     // no app.mu needed during VB upload + draw.
     const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
@@ -771,29 +850,77 @@ fn drawNormalExternalSurfaceRowMode(
     }
     if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
 
-    // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-    try app_mod.drawCursorOverlay(g, .{
-        .cursor_verts = tbs_cursor.verts.items,
-        .cursor_row = tbs_cursor.last_cursor_row,
-        .cursor_vb = &ext_win.cursor_vb,
-        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
-        .row_vbs = ext_win.row_vbs.items,
-        .row_map = tbs_committed.row_map.items,
-        .pool = &ext_win.tbs.pool,
-        .blink_visible = cursor_blink_visible,
-        .content_right = content_right,
-        .content_height = draw_params.content_height,
-        .row_h_px = row_h_px,
-        .ctx_ptr = result.ctx_ptr,
-        .rs_set_sc_fn = result.rs_set_sc_fn,
-        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-        // External windows preserve back_tex and may not redraw the cursor row on
-        // an in-place shape change, so erase the stale overlay before redrawing.
-        // A full-row frame already cleared the back texture and redrew every row;
-        // clearing again would accumulate alpha on the cursor row when transparent.
-        .erase_cursor_row = !force_full_rows,
-        .row_already_redrawn = force_full_rows,
-    });
+    // Rows that never reached back_tex, and a plan the core republished under,
+    // counted like the root rows above.
+    var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
+    {
+        const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
+        if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
+        defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
+        if (has_layers and !layer_layout_stale and !layer_commit_stale) {
+            layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
+                .x = 0,
+                .y = 0,
+                .w = @floatFromInt(app_mod.rowModeViewportWidth(g, draw_params)),
+                .h = @floatFromInt(draw_params.content_height),
+            }, 0, 0, content_right, row_h_px, result.ctx_ptr, result.rs_set_sc_fn, log_enabled);
+        }
+        var cursor_origin_x: f32 = 0;
+        var cursor_origin_y: f32 = 0;
+        var cursor_layer_row: ?*app_mod.RowVerts = null;
+        var cursor_row_dy_px: f32 = 0;
+        if (tbs_snap.cursor_layer_grid_id != grid_id) {
+            for (tbs_snap.layers.slice()) |layer| {
+                if (layer.grid_id != tbs_snap.cursor_layer_grid_id) continue;
+                cursor_origin_x = @floatFromInt(layer.x_px);
+                cursor_origin_y = @floatFromInt(layer.y_px);
+                if (app.layer_grids.get(layer.grid_id)) |state| {
+                    if (tbs_cursor.last_cursor_row) |row| {
+                        if (row < state.rows_buf.items.len) {
+                            cursor_layer_row = &state.rows_buf.items[row];
+                            if (row < state.origin_rows.items.len) {
+                                cursor_row_dy_px = @floatFromInt((@as(i32, @intCast(row)) - @as(i32, @intCast(state.origin_rows.items[row]))) * row_h_px);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
+        try app_mod.drawCursorOverlay(g, .{
+            .cursor_verts = tbs_cursor.verts.items,
+            .cursor_row = tbs_cursor.last_cursor_row,
+            .cursor_vb = &ext_win.cursor_vb,
+            .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
+            .row_vbs = ext_win.row_vbs.items,
+            .row_map = tbs_committed.row_map.items,
+            .pool = &ext_win.tbs.pool,
+            .blink_visible = cursor_blink_visible,
+            .content_right = content_right,
+            .content_width = app_mod.rowModeViewportWidth(g, draw_params),
+            .content_height = draw_params.content_height,
+            .row_h_px = row_h_px,
+            .ctx_ptr = result.ctx_ptr,
+            .rs_set_sc_fn = result.rs_set_sc_fn,
+            .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
+            // External windows preserve back_tex and may not redraw the cursor row on
+            // an in-place shape change, so erase the stale overlay before redrawing.
+            // A full-row frame already cleared the back texture and redrew every row;
+            // clearing again would accumulate alpha on the cursor row when transparent.
+            .erase_cursor_row = !force_full_rows,
+            .row_already_redrawn = force_full_rows,
+            .cursor_layer_origin_x_px = cursor_origin_x,
+            .cursor_layer_origin_y_px = cursor_origin_y,
+            .cursor_layer_row = cursor_layer_row,
+            .cursor_layer_row_dy_px = cursor_row_dy_px,
+        });
+    }
+
+    // This frame is incomplete: fail the paint the same way a root row does,
+    // rather than present missing or mismatched rows and let the consumed
+    // redraw plan make them permanent.
+    if (layer_outcome.incomplete()) return error.RowVBRenderFailed;
 
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
@@ -865,6 +992,8 @@ fn drawNormalExternalSurfaceRowMode(
     // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
     if (glow_enabled) {
         const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
+        // drawBloomRowsOverlay takes app.mu itself for the layer storage it
+        // reads; app.mu must be free here.
         app_mod.drawBloomRowsOverlay(
             g,
             tbs_committed.row_map.items,
@@ -1642,7 +1771,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     _ = c.ShowWindow(hwnd, 8);
 
     // Initialize D3D11 renderer for external window (with transparency if enabled)
-    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
+    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
         _ = c.DestroyWindow(hwnd);
         return .retry;
@@ -1842,6 +1971,12 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     }
 
     app.mu.unlock(core.clock.io());
+
+    // Layout and rows may have arrived before this HWND was registered.
+    // Never acquire the core lock while holding app.mu (callbacks take the
+    // locks in the opposite direction).
+    core.zonvie_core_force_resend(app.corep);
+    if (app.corep) |corep| app_mod.zonvie_core_retry_flush(corep);
 
     // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
     // call and must not run with app.mu held. Registration is what makes the
@@ -2499,11 +2634,12 @@ pub export fn ExternalWndProc(
             }
         },
 
-        // --- Scrollbar mouse handling for external windows ---
-        c.WM_LBUTTONDOWN => {
+        // --- Scrollbar and grid mouse handling for external windows ---
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2515,12 +2651,43 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    // Claim the press so the copy button's release is not
-                    // interpreted as a scrollbar or grid interaction.
-                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
-                    if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
-                        return 0;
+                    // The window's own chrome claims the press first, so the
+                    // copy button's release is not interpreted as a scrollbar
+                    // or grid interaction. Left button only: the others have
+                    // no chrome meaning and go straight to the editor.
+                    if (msg == c.WM_LBUTTONDOWN) {
+                        if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
+                        if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
+                            return 0;
+                        }
                     }
+
+                    // Only a real window grid is an editor target. The cmdline,
+                    // popupmenu and message surfaces carry sentinel grid ids
+                    // the core forwards to Neovim unchanged, which resolves
+                    // them against the screen instead: a click on a message
+                    // moved the cursor in the buffer behind it, and a middle
+                    // click pasted there.
+                    if (classifyExternalSurface(grid_id.?) != .normal) return 0;
+
+                    // Capture so a drag that leaves the window keeps arriving.
+                    _ = c.SetCapture(hwnd);
+                    const button: [*:0]const u8 = switch (msg) {
+                        c.WM_RBUTTONDOWN => blk: {
+                            app.mouse_button_held = 2;
+                            break :blk "right";
+                        },
+                        c.WM_MBUTTONDOWN => blk: {
+                            app.mouse_button_held = 3;
+                            break :blk "middle";
+                        },
+                        else => blk: {
+                            app.mouse_button_held = 1;
+                            break :blk "left";
+                        },
+                    };
+                    input.sendMouseButton(hwnd, app, grid_id.?, button, .press, x, y, wParam);
+                    return 0;
                 }
             }
         },
@@ -2530,6 +2697,9 @@ pub export fn ExternalWndProc(
             // only place the scrollbar track repeat is killed — without this it
             // keeps issuing page scrolls indefinitely.
             if (app_mod.getApp(hwnd)) |app| {
+                // Same reason the editor drag must end: a held button left set
+                // here turns every later hover into a drag.
+                app.mouse_button_held = 0;
                 app.mu.lockUncancelable(core.clock.io());
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
@@ -2555,10 +2725,14 @@ pub export fn ExternalWndProc(
             return 0;
         },
 
-        c.WM_LBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
+
+                const held = app.mouse_button_held;
+                app.mouse_button_held = 0;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2569,7 +2743,24 @@ pub export fn ExternalWndProc(
                 }
                 app.mu.unlock(core.clock.io());
 
+                // ReleaseCapture posts WM_CAPTURECHANGED to this window
+                // synchronously, and that handler drops scrollbar_dragging and
+                // the pending line with it. Release only after the scrollbar
+                // has committed its final position below, or a drag ends where
+                // it started.
+                defer _ = c.ReleaseCapture();
+
                 if (grid_id != null and ext_window != null) {
+                    // Mirrors the press gate: a sentinel-grid surface never
+                    // sent a press, so it must not send a release either.
+                    const editor_target = classifyExternalSurface(grid_id.?) == .normal;
+                    if (msg != c.WM_LBUTTONUP) {
+                        if (editor_target) {
+                            const button: [*:0]const u8 = if (msg == c.WM_RBUTTONUP) "right" else "middle";
+                            input.sendMouseButton(hwnd, app, grid_id.?, button, .release, x, y, wParam);
+                        }
+                        return 0;
+                    }
                     if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
                         if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
                             // Brief acknowledgement so the click has visible
@@ -2587,15 +2778,24 @@ pub export fn ExternalWndProc(
                         }
                         return 0;
                     }
+                    const was_dragging_scrollbar = ext_window.?.scrollbar_dragging;
                     scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
+                    // A press the scrollbar claimed never reached the editor,
+                    // so its release must not either -- Neovim would see a
+                    // release with no press and move the cursor there.
+                    if (editor_target and !was_dragging_scrollbar and held == 1) {
+                        input.sendMouseButton(hwnd, app, grid_id.?, "left", .release, x, y, wParam);
+                    }
+                    return 0;
                 }
             }
         },
 
         c.WM_MOUSEMOVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2653,6 +2853,16 @@ pub export fn ExternalWndProc(
                         .dwHoverTime = 0,
                     };
                     _ = c.TrackMouseEvent(&tme);
+
+                    // A held button makes this a drag. The scrollbar drag
+                    // returned above, so anything reaching here belongs to the
+                    // editor's own selection -- on a real window grid only,
+                    // for the reason the press gate states.
+                    if (classifyExternalSurface(grid_id.?) == .normal) {
+                        if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
+                            input.sendMouseButton(hwnd, app, grid_id.?, button, .drag, x, y, wParam);
+                        }
+                    }
                 }
             }
         },
@@ -3191,6 +3401,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // TBS: acquire committed set for painting (lock-free vertex reads).
     const tbs_snapshot = ext_win.tbs.acquireForPaint(app.alloc);
     defer {
+        var layers = tbs_snapshot.layers;
+        layers.deinit();
         const needs_reinvalidate = ext_win.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
         if (ext_win.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
             if (!app.atlas_reset_active.load(.seq_cst)) {
@@ -3249,7 +3461,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 // forward its rect into the main renderer's shader
                 // cursor state so cursor shaders track the visible
                 // cursor instead of the main grid's stale cursor. The
-                // ext verts are in this view's local NDC; translate
+                // ext verts are this grid's local pixels; translate
                 // to main-window drawable px using the offset above.
                 const ext_cursor_verts = tbs_cursor.verts.items;
                 if (ext_cursor_verts.len != 0) {
@@ -3264,19 +3476,20 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                             if (v.position[1] < miny_c) miny_c = v.position[1];
                             if (v.position[1] > maxy_c) maxy_c = v.position[1];
                         }
-                        const ext_w_f: f32 = @floatFromInt(g_sh.width);
-                        const ext_h_f: f32 = @floatFromInt(g_sh.height);
-                        // Position the cursor at the NDC center, but
-                        // size it using main grid's cell metrics. ext
-                        // cmdline / popupmenu drawables are often
-                        // taller than a single cell (multi-row
-                        // prompt / padding) and cursor verts span the
-                        // full NDC y = -1..+1, so translating that
-                        // across the full ext drawable height makes
-                        // the cursor SDF render at the drawable's
-                        // height instead of the actual cell height.
-                        const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
-                        const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
+                        // Position the cursor at its centre, but size it
+                        // using the main grid's cell metrics. ext cmdline /
+                        // popupmenu drawables are often taller than a single
+                        // cell (multi-row prompt / padding), so sizing from
+                        // the drawable would render the cursor SDF at the
+                        // drawable's height instead of the cell height.
+                        // Core vertices are grid-local pixels, y down, and a
+                        // decorated surface does not draw them at its client
+                        // origin: the cmdline's grid starts past the icon strip
+                        // and its padding. off_x/off_y reach the window, this
+                        // reaches the content inside it.
+                        const content_origin = decoratedContentOriginPx(app, surface_kind);
+                        const center_x = off_x + content_origin.x + (minx_c + maxx_c) * 0.5;
+                        const center_y = off_y + content_origin.y + (miny_c + maxy_c) * 0.5;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
                         const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;
@@ -3397,7 +3610,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
     ext_win.surface.paint_full = false;
 
-    // Check if renderer resize is needed (deferred from onExternalVertices to avoid deadlock)
+    // Check if renderer resize is needed (deferred from onVerticesRow to avoid deadlock)
     const needs_resize = ext_win.needs_renderer_resize;
     if (needs_resize) {
         ext_win.needs_renderer_resize = false;

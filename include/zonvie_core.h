@@ -167,6 +167,12 @@ typedef struct zonvie_cursor {
 #define ZONVIE_DECO_SOLID_GLYPH   (1u << 11)
 
 typedef struct __attribute__((aligned(16))) zonvie_vertex {
+    /* Grid-local pixels: the origin is the top-left of the grid this vertex
+       belongs to and +y points down. The frontend converts to clip space with
+       its own layer transform (scale 2/extent, -2/extent; offset -1, +1),
+       where extent is cols*cell_w_px by rows*cell_h_px. Frontend-authored
+       chrome may still be submitted in clip space under an identity layer
+       transform. */
     float position[2];
     float texCoord[2];
     float color[4] __attribute__((aligned(16)));  /* 16-byte aligned to match Swift simd_float4 */
@@ -175,7 +181,7 @@ typedef struct __attribute__((aligned(16))) zonvie_vertex {
     float deco_phase;     /* phase offset for undercurl (cell column position) */
 } zonvie_vertex;
 
-/* Which buffers are included in on_vertices_partial */
+/* Which layer an on_vertices_row callback carries */
 enum {
     ZONVIE_VERT_UPDATE_MAIN   = 1u << 0,
     ZONVIE_VERT_UPDATE_CURSOR = 1u << 1,
@@ -193,41 +199,28 @@ typedef void (*zonvie_on_vertices_row_fn)(
     uint32_t total_cols       // current grid total cols
 );
 
-/* on_vertices_row layers are independent, like on_vertices_partial:
+/* on_vertices_row layers are independent:
    - When MAIN is not set, existing row contents must be retained.
    - CURSOR set carries the complete cursor layer for that grid; vert_count=0
      clears it. A cursor-only callback must not replace row contents.
+     Updates for different grids have no ordering guarantee. Consumers that
+     merge grid cursors into one surface overlay must track its owning grid:
+     clearing a different grid must not clear the current owner's cursor.
    A MAIN callback with row_count=0, verts=NULL, and vert_count=0 publishes
    a layout-only zero-cell transition. total_rows/total_cols are authoritative,
    and at least one is zero. It clears the logical MAIN surface without
    treating a nonexistent row as row content. */
 
-/* Main row-buffer scroll fast path notification.
-   The core calls this when it can preserve previously submitted main-row content
-   by shifting existing row buffers instead of resubmitting every reused row.
-   row_start/row_end are global-grid row indices in [row_start, row_end), cols are
-   a column range in [col_start, col_end), and rows_delta follows Neovim grid_scroll
-   semantics (positive = content moves up, negative = content moves down).
-   After this callback, the frontend should expect on_vertices_row only for
-   vacated / regenerated rows within the scrolled region. */
-typedef void (*zonvie_on_main_row_scroll_fn)(
-    void* ctx,
-    uint32_t row_start,
-    uint32_t row_end,
-    uint32_t col_start,
-    uint32_t col_end,
-    int32_t rows_delta,
-    uint32_t total_rows,
-    uint32_t total_cols
-);
-
-/* External grid (sub-grid) row scroll notification.
-   Notifies the frontend that a sub-grid received a grid_scroll event.
-   Fired once per grid per flush batch, only when a single scroll occurred
-   in that batch (multiple scrolls in one batch are suppressed).
-   This is a best-effort hint — the consumer MUST perform its own eligibility
-   checks (e.g. abs(rows_delta) == 1, full-width region, no horizontal scroll)
-   before applying any fast-path optimization such as row remapping or GPU blit.
+/* Grid row-shift notification.
+   Fired once per grid per flush batch when that grid's rows can be carried by
+   shifting them. The core then sends ONLY the rows the shift vacated through
+   on_vertices_row, so the consumer MUST apply the shift: rows_delta may be any
+   value up to half the region's height (same-region scrolls in one batch are
+   summed), and a consumer that cannot apply it must request a full resend
+   (zonvie_core_force_resend) rather than ignore the call.
+   The region is always full width; a partial-width scroll, two different
+   regions in one batch, or a shift past half the region is refused here and
+   the grid is regenerated instead.
    Fired after abort check, before clearDirty. */
 typedef void (*zonvie_on_grid_row_scroll_fn)(
     void* ctx,
@@ -239,18 +232,6 @@ typedef void (*zonvie_on_grid_row_scroll_fn)(
     int32_t rows_delta,
     uint32_t total_rows,
     uint32_t total_cols
-);
-
-/*
-  Partial vertices update:
-  - If (flags & ZONVIE_VERT_UPDATE_MAIN) == 0, the frontend MUST keep previous main vertices.
-  - If (flags & ZONVIE_VERT_UPDATE_CURSOR) == 0, the frontend MUST keep previous cursor vertices.
-*/
-typedef void (*zonvie_on_vertices_partial_fn)(
-    void* ctx,
-    const zonvie_vertex* main_verts, size_t main_count,
-    const zonvie_vertex* cursor_verts, size_t cursor_count,
-    uint32_t flags
 );
 
 /* Modifier bitmask for zonvie_core_send_key_event.mods */
@@ -347,6 +328,51 @@ typedef void (*zonvie_on_external_window_fn)(
 /* Called when an external grid is closed (win_hide/win_close for external grid).
    Frontend should destroy the corresponding window. */
 typedef void (*zonvie_on_external_window_close_fn)(
+    void* ctx,
+    int64_t grid_id
+);
+
+/* One grid placed on one surface. A surface is a single drawable: the main
+   window, or one external window. Its surface_id is the id of its root grid
+   (1 for the main window). layers[0] is always the root grid at (0,0). */
+/* This float tracks the buffer: see zonvie_grid_info.follows_scroll. */
+#define ZONVIE_LAYER_FOLLOWS_SCROLL (1u << 0)
+
+typedef struct zonvie_layer {
+    int64_t  grid_id;
+    int64_t  anchor_grid;  /* grid this float is anchored to; == surface_id for the root */
+    int32_t  x_px;         /* surface-local, top-left origin */
+    int32_t  y_px;
+    uint32_t rows;
+    uint32_t cols;
+    int32_t  z;            /* back-to-front index; 0 == root grid */
+    uint32_t flags;        /* ZONVIE_LAYER_* */
+} zonvie_layer;
+
+/* Full replacement of the layer list for one surface. Fired inside the flush
+   bracket, after on_external_window for a new surface, and only when the list
+   changed. For the ROOT surface it may arrive after that flush's row vertices
+   and row-shift hints, so consumers must not depend on layout-before-rows
+   ordering — only on both being visible together at on_flush_end. A grid
+   missing from every surface keeps its buffers until on_grid_destroy; the
+   frontend must tolerate a layer whose grid has no committed rows yet, and
+   rows arriving for a grid that is in no layer. A surface cursor overlay must
+   stop displaying a removed layer's cursor when this layout commits, even
+   if no subsequent cursor callback names that removed grid. */
+typedef void (*zonvie_on_surface_layout_fn)(
+    void* ctx,
+    int64_t surface_id,
+    const zonvie_layer* layers,
+    size_t count,
+    uint32_t surface_rows,
+    uint32_t surface_cols
+);
+
+/* Stage destruction of a grid inside the flush bracket. Release its buffers
+   only after successful on_flush_end publication and after any readers have
+   released them. A cancelled flush keeps the previous frame and retries this
+   notification; hiding a grid does not destroy its buffers. */
+typedef void (*zonvie_on_grid_destroy_fn)(
     void* ctx,
     int64_t grid_id
 );
@@ -684,8 +710,25 @@ typedef int (*zonvie_on_clipboard_set_fn)(
     size_t len
 );
 
+/* Layout version of zonvie_callbacks. Bump it whenever a field is removed,
+   reordered, or has its signature changed. Appending a new callback at the
+   end stays backward compatible through callbacks_size and must NOT bump it.
+   Enforced by `callbacks_layout` in src/core/c_api.zig: it pins the name and
+   byte offset of every field, so a layout change fails to compile until this
+   version and that table are updated together. */
+#define ZONVIE_CALLBACKS_ABI_VERSION 1
+
 typedef struct zonvie_callbacks {
-    zonvie_on_vertices_partial_fn on_vertices_partial;
+    /* Must be set to ZONVIE_CALLBACKS_ABI_VERSION; zonvie_core_create returns
+       NULL otherwise. It exists because callbacks_size can only report that
+       the struct's LENGTH changed, never that its LAYOUT did: commit 935bdc0
+       removed two callbacks and appended two, so a consumer built before it
+       passes a callbacks_size equal to the current sizeof while every pointer
+       from on_vertices_row onward sits at the wrong offset. This field is
+       first on purpose -- it is the one offset a stale consumer cannot match
+       by accident, because a stale build has a function pointer there. */
+    uint32_t abi_version;
+
     zonvie_on_vertices_row_fn on_vertices_row;
     zonvie_atlas_ensure_glyph_fn on_atlas_ensure_glyph;
     zonvie_atlas_ensure_glyph_styled_fn on_atlas_ensure_glyph_styled;
@@ -814,14 +857,8 @@ typedef struct zonvie_callbacks {
     /* ASCII fast path table callback (NULL = no fast path, always use shaping). */
     zonvie_get_ascii_table_fn on_get_ascii_table;
 
-    /* Main row-buffer scroll fast path notification.
-       Optional optimization used by row-mode frontends to shift existing main-row
-       buffers instead of receiving cached rows one by one via on_vertices_row. */
-    zonvie_on_main_row_scroll_fn on_main_row_scroll;
-
-    /* External grid (sub-grid) row scroll notification (best-effort hint).
-       Suppressed when multiple scrolls occur in the same batch.
-       Consumer must validate eligibility before applying optimizations. */
+    /* Grid row-shift notification: a mandatory shift, after which only the
+       vacated rows are sent. See zonvie_on_grid_row_scroll_fn. */
     zonvie_on_grid_row_scroll_fn on_grid_row_scroll;
 
     /* Restart UI event observer (informational; core handles reconnect).
@@ -848,6 +885,17 @@ typedef struct zonvie_callbacks {
        blocking window work inline (post/dispatch to the UI thread instead).
        Appended at the end for ABI compat. */
     void (*on_main_grid_size)(void* ctx, uint32_t rows, uint32_t cols);
+
+    /* Per-surface layer placement, and grid buffer lifetime.
+       Added with per-grid rendering, which also REMOVED on_vertices_partial
+       and on_main_row_scroll from the front and middle of this struct. The
+       two removals and these two additions cancel out in sizeof, so
+       callbacks_size cannot detect the change: this struct is NOT layout
+       compatible with a consumer built before it, even though the size
+       matches. Both in-tree frontends were updated in the same commit, and
+       abi_version above is what lets the core refuse such a consumer. */
+    zonvie_on_surface_layout_fn on_surface_layout;
+    zonvie_on_grid_destroy_fn on_grid_destroy;
 } zonvie_callbacks;
 
 void zonvie_core_set_log_enabled(zonvie_core *core, int enabled);
@@ -955,7 +1003,11 @@ void zonvie_core_set_atlas_size(zonvie_core *core, unsigned size);
                    against an older (smaller) struct layout.
                    Must be non-zero when cb is non-NULL: a zero size cannot
                    bound the read, so the core installs no callbacks at all.
-   ctx:            opaque frontend context forwarded to all callbacks. */
+                   It cannot detect a layout change -- see abi_version.
+   ctx:            opaque frontend context forwarded to all callbacks.
+   Returns NULL when cb is non-NULL and cb->abi_version is not
+   ZONVIE_CALLBACKS_ABI_VERSION. Nothing is logged in that case: on_log lives
+   in the very struct whose layout is in doubt. */
 zonvie_core *zonvie_core_create(zonvie_callbacks *cb, size_t callbacks_size, void *ctx);
 /* Must be called from a lifecycle thread which is not currently executing a
    Zonvie callback. Calling destroy re-entrantly from a callback only requests
@@ -1145,8 +1197,10 @@ typedef struct zonvie_grid_info {
      * Lets a frontend route smooth-scroll following: a window-anchored float
      * follows only that window, not any window it merely overlaps. */
     int64_t anchor_grid;
-    /* 1 if this float has been repositioned (row changed) since creation, i.e. it
-     * tracks the buffer on scroll. A fixed float stays 0 and must not pixel-shift. */
+    /* 1 if this float tracks the buffer, so it may pixel-shift with the parent's
+     * smooth scroll. Re-derived from every redraw batch that carried a scroll:
+     * a float Neovim repositioned in that batch follows, one it left alone does
+     * not. A fixed float stays 0 and must not pixel-shift. */
     int32_t follows_scroll;
     /* 1 if this grid is an external (separate top-level) window. Such grids are
      * reported with start (0,0) and must be excluded from main-window hit-testing. */

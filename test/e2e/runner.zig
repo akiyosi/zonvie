@@ -89,6 +89,11 @@ test "e2e:float_move_recompose" {
     try @import("scenarios/float_move_recompose.zig").run(testing.allocator);
 }
 
+test "e2e:float_fixed_after_move" {
+    try requireNvim();
+    try @import("scenarios/float_fixed_after_move.zig").run(testing.allocator);
+}
+
 test "e2e:ime_preedit_extmark" {
     try requireNvim();
     try @import("scenarios/ime_preedit_extmark.zig").run(testing.allocator);
@@ -249,6 +254,16 @@ test "e2e:message_state_corruption" {
     try @import("scenarios/message_state_corruption.zig").run(testing.allocator);
 }
 
+test "e2e:scrollbind_layers_fast_path" {
+    try requireNvim();
+    try @import("scenarios/scrollbind_layers_fast_path.zig").run(testing.allocator);
+}
+
+test "e2e:ext_anchor_scroll_under_float" {
+    try requireNvim();
+    try @import("scenarios/ext_anchor_scroll_under_float.zig").run(testing.allocator);
+}
+
 test "e2e:agent_status_notify" {
     try requireNvim();
     try @import("scenarios/agent_status_notify.zig").run(testing.allocator);
@@ -350,4 +365,9 @@ test "e2e:msg_backoff_delivery" {
 test "e2e:msg_split_payload_ceiling" {
     try requireNvim();
     try @import("scenarios/msg_split_payload_ceiling.zig").run(testing.allocator);
+}
+
+test "e2e:born_external_anchor_float" {
+    try requireNvim();
+    try @import("scenarios/born_external_anchor_float.zig").run(testing.allocator);
 }

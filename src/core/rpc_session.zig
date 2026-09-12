@@ -1602,7 +1602,6 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
             if (promote_target) |p| {
                 try self.grid.promoteExternalToWinPos(p.grid_id, p.win_id, p.row, p.col);
                 _ = self.grid.ext_windows_grids.remove(p.grid_id);
-                _ = self.grid.external_grid_target_sizes.remove(p.grid_id);
                 _ = self.grid.pending_ext_window_grids.remove(p.grid_id);
                 try self.grid.resizeGrid(p.grid_id, self.grid.rows, self.grid.cols);
                 try self.requestTryResizeGridInternal(p.grid_id, self.grid.rows, self.grid.cols);
@@ -3042,11 +3041,11 @@ test "pre-flush grid 2 fallback is present in the same committed vertices" {
             _ = row_count;
             _ = total_rows;
             _ = total_cols;
-            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
+            // Every grid emits its own rows now, so grid 2's content arrives
+            // under grid 2 rather than inside grid 1's composited rows.
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0 or verts == null) return;
             const self: *@This() = @ptrCast(@alignCast(ctx.?));
-            for (verts.?[0..vert_count]) |vertex| {
-                if (vertex.grid_id == 2) self.saw_grid_2 = true;
-            }
+            if (vert_count != 0) self.saw_grid_2 = true;
         }
     };
 
@@ -3171,6 +3170,245 @@ test "pre-flush glow resolution affects the same committed vertices" {
     try std.testing.expect(core.glow_enabled.load(.acquire));
     try flush_ctx.onFlush(1, 1);
     try std.testing.expect(state.saw_glow);
+}
+
+/// Run one redraw batch exactly as `handleRpcNotification` does, so a test can
+/// reach the flush through the real event handlers instead of poking core state.
+const RedrawDriver = struct {
+    fn run(fctx: *flush.FlushCtx, arena: std.mem.Allocator, events: []mp.Value) !void {
+        const core = fctx.core;
+        try redraw.handleRedraw(
+            &core.grid,
+            &core.hl,
+            arena,
+            events,
+            &core.log,
+            fctx,
+            prepareRenderStateForFlush,
+            flush.FlushCtx.onFlush,
+            fctx,
+            flush.FlushCtx.onGuifont,
+            fctx,
+            flush.FlushCtx.onLinespace,
+            flush.FlushCtx.onSetTitle,
+            flush.FlushCtx.onDefaultColors,
+            flush.FlushCtx.onRestart,
+            flush.FlushCtx.onConnect,
+        );
+    }
+};
+
+test "a grid that stops being external publishes its real row count" {
+    // Drives the transition through the core's own redraw handling: an
+    // external window is resized, converted back to a float by
+    // `win_float_pos` (which drops it from `external_grids`), then resized
+    // again. The surface size the row callback publishes must follow the grid
+    // across the transition, or the window renders truncated to a size it
+    // last had while external.
+    const FLOAT_GRID: i64 = 5;
+    const FLOAT_WIN: i64 = 500;
+    const FLOAT_COLS: i64 = 10;
+    const FLOAT_ROWS_BEFORE: i64 = 20;
+    const FLOAT_ROWS_AFTER: i64 = 40;
+
+    const State = struct {
+        published_rows: u32 = 0,
+        published_cols: u32 = 0,
+        row_calls: u32 = 0,
+        max_row: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            if (grid_id != FLOAT_GRID) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.published_rows = total_rows;
+            self.published_cols = total_cols;
+            self.row_calls += 1;
+            self.max_row = @max(self.max_row, row_start);
+        }
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 40;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var fctx = flush.FlushCtx{ .core = &core };
+
+    // 1. The float grid is created and promoted to its own top-level window.
+    var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
+    var resize_new = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = 5 } };
+    var ext_pos = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_WIN } };
+    var ev_resize_main = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_main } };
+    var ev_resize_new = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_new } };
+    var ev_ext_pos = [_]mp.Value{ .{ .str = "win_external_pos" }, .{ .arr = &ext_pos } };
+    var batch1 = [_]mp.Value{
+        .{ .arr = &ev_resize_main },
+        .{ .arr = &ev_resize_new },
+        .{ .arr = &ev_ext_pos },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch1);
+    try std.testing.expect(core.grid.external_grids.contains(FLOAT_GRID));
+
+    // 2. Resizing the external window stores the entry.
+    var resize_ext = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = FLOAT_ROWS_BEFORE } };
+    var ev_resize_ext = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_ext } };
+    var batch2 = [_]mp.Value{.{ .arr = &ev_resize_ext }};
+    try RedrawDriver.run(&fctx, arena, &batch2);
+
+    // 3. `nvim_win_set_config(w, {relative='editor'})` turns it back into a
+    //    float, which drops it from `external_grids`.
+    var float_pos = [_]mp.Value{
+        .{ .int = FLOAT_GRID }, .{ .int = FLOAT_WIN }, .{ .str = "NW" }, .{ .int = 1 },
+        .{ .int = 0 },          .{ .int = 0 },         .{ .bool = true }, .{ .int = 50 },
+    };
+    var ev_float_pos = [_]mp.Value{ .{ .str = "win_float_pos" }, .{ .arr = &float_pos } };
+    var batch3 = [_]mp.Value{.{ .arr = &ev_float_pos }};
+    try RedrawDriver.run(&fctx, arena, &batch3);
+    try std.testing.expect(!core.grid.external_grids.contains(FLOAT_GRID));
+    try std.testing.expect(!core.grid.ext_windows_grids.contains(FLOAT_GRID));
+
+    // 4. `nvim_win_set_height(w, 40)` grows the grid while it is in neither
+    //    set, then the batch is presented.
+    var resize_float = [_]mp.Value{ .{ .int = FLOAT_GRID }, .{ .int = FLOAT_COLS }, .{ .int = FLOAT_ROWS_AFTER } };
+    var ev_resize_float = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_float } };
+    var ev_flush = [_]mp.Value{.{ .str = "flush" }};
+    var batch4 = [_]mp.Value{ .{ .arr = &ev_resize_float }, .{ .arr = &ev_flush } };
+    try RedrawDriver.run(&fctx, arena, &batch4);
+
+    const sg = core.grid.sub_grids.get(FLOAT_GRID).?;
+    try std.testing.expectEqual(@as(u32, FLOAT_ROWS_AFTER), sg.rows);
+    try std.testing.expect(state.row_calls > 0);
+    // The surface size published to the frontend must be the grid's real size.
+    try std.testing.expectEqual(sg.rows, state.published_rows);
+    try std.testing.expectEqual(sg.cols, state.published_cols);
+    // ...and every row of the grid must actually be submitted.
+    try std.testing.expectEqual(sg.rows - 1, state.max_row);
+}
+
+test "a grid resized while hidden publishes its real row count when shown again" {
+    // The other exit from external tracking: `win_hide` (sent for every window
+    // of a non-current tab) drops the grid from `external_grids` too, so the
+    // `grid_resize` that lands while it is hidden arrives while the grid is
+    // in neither tracking set.
+    const HIDDEN_GRID: i64 = 6;
+    const HIDDEN_WIN: i64 = 600;
+    const HIDDEN_COLS: i64 = 10;
+    const ROWS_BEFORE_HIDE: i64 = 20;
+    const ROWS_WHILE_HIDDEN: i64 = 40;
+
+    const State = struct {
+        published_rows: u32 = 0,
+        published_cols: u32 = 0,
+        row_calls: u32 = 0,
+        max_row: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            if (grid_id != HIDDEN_GRID) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.published_rows = total_rows;
+            self.published_cols = total_cols;
+            self.row_calls += 1;
+            self.max_row = @max(self.max_row, row_start);
+        }
+    };
+
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 16;
+    core.drawable_h_px = 40;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    var fctx = flush.FlushCtx{ .core = &core };
+
+    var resize_main = [_]mp.Value{ .{ .int = 1 }, .{ .int = 16 }, .{ .int = 40 } };
+    var resize_new = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_COLS }, .{ .int = ROWS_BEFORE_HIDE } };
+    var ext_pos = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_WIN } };
+    var ev_resize_main = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_main } };
+    var ev_resize_new = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_new } };
+    var ev_ext_pos = [_]mp.Value{ .{ .str = "win_external_pos" }, .{ .arr = &ext_pos } };
+    var batch1 = [_]mp.Value{
+        .{ .arr = &ev_resize_main },
+        .{ .arr = &ev_resize_new },
+        .{ .arr = &ev_ext_pos },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch1);
+
+    // Resize while external.
+    var batch2 = [_]mp.Value{.{ .arr = &ev_resize_new }};
+    try RedrawDriver.run(&fctx, arena, &batch2);
+
+    // Switch away: every window of the leaving tab is hidden.
+    var hide = [_]mp.Value{.{ .int = HIDDEN_GRID }};
+    var ev_hide = [_]mp.Value{ .{ .str = "win_hide" }, .{ .arr = &hide } };
+    var batch3 = [_]mp.Value{.{ .arr = &ev_hide }};
+    try RedrawDriver.run(&fctx, arena, &batch3);
+    try std.testing.expect(!core.grid.external_grids.contains(HIDDEN_GRID));
+    try std.testing.expect(!core.grid.ext_windows_grids.contains(HIDDEN_GRID));
+
+    // The window grows while hidden, then the tab is switched back.
+    var resize_hidden = [_]mp.Value{ .{ .int = HIDDEN_GRID }, .{ .int = HIDDEN_COLS }, .{ .int = ROWS_WHILE_HIDDEN } };
+    var ev_resize_hidden = [_]mp.Value{ .{ .str = "grid_resize" }, .{ .arr = &resize_hidden } };
+    var ev_flush = [_]mp.Value{.{ .str = "flush" }};
+    var batch4 = [_]mp.Value{
+        .{ .arr = &ev_resize_hidden },
+        .{ .arr = &ev_ext_pos },
+        .{ .arr = &ev_flush },
+    };
+    try RedrawDriver.run(&fctx, arena, &batch4);
+
+    const sg = core.grid.sub_grids.get(HIDDEN_GRID).?;
+    try std.testing.expectEqual(@as(u32, ROWS_WHILE_HIDDEN), sg.rows);
+    try std.testing.expect(state.row_calls > 0);
+    try std.testing.expectEqual(sg.rows, state.published_rows);
+    try std.testing.expectEqual(sg.cols, state.published_cols);
+    try std.testing.expectEqual(sg.rows - 1, state.max_row);
 }
 
 test "child reaper does not wait for inherited stderr EOF" {

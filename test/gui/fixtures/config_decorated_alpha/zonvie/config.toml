@@ -1,0 +1,8 @@
+# Fixture for the decorated-surface (ext-cmdline / messages) alpha convention.
+# blur = true is what drives those surfaces' backgroundAlpha to 0, which is
+# the case under test. opacity = 1.0 keeps the MAIN window opaque so the
+# cmdline's blur backdrop is a flat theme colour rather than the desktop
+# wallpaper, whose gradient would otherwise land in the measured histogram.
+[window]
+blur = true
+opacity = 1.0
