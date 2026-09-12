@@ -3244,9 +3244,10 @@ pub export fn WndProc(
                         // neither gate may produce.
                         if (tbs_snapshot.layers.len > 1) {
                             app.mu.lockUncancelable(core.clock.io());
-                            layer_layout_stale = app_mod.layerLayoutMoved(&app.tbs, tbs_snapshot);
-                            layer_commit_stale = app_mod.surfaceCommitMoved(&app.tbs, tbs_snapshot);
-                            if (layer_layout_stale or layer_commit_stale) {
+                            const staleness = app_mod.layerFrameStaleness(&app.tbs, tbs_snapshot);
+                            layer_layout_stale = staleness.layout;
+                            layer_commit_stale = staleness.commit;
+                            if (staleness.any()) {
                                 // Nothing is planned or drawn at a placement the
                                 // core has already replaced, or beside root rows
                                 // it has already replaced. The frame is refused
@@ -3495,11 +3496,8 @@ pub export fn WndProc(
                                 cursor_verts_snapshot
                             else
                                 &[_]core.Vertex{};
-                            // The extract pass reads live layer row storage,
-                            // which the core thread can resize; hold app.mu
-                            // for it exactly as the layer draw above does.
-                            const bloom_locked = row_draw_params.bloom_layers != null;
-                            if (bloom_locked) app.mu.lockUncancelable(core.clock.io());
+                            // drawBloomRowsOverlay takes app.mu itself for the
+                            // layer storage it reads; app.mu must be free here.
                             app_mod.drawBloomRowsOverlay(
                                 g,
                                 committed.row_map.items,
@@ -3509,7 +3507,6 @@ pub export fn WndProc(
                                 glow_intensity,
                                 row_draw_params,
                             );
-                            if (bloom_locked) app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {
@@ -5451,17 +5448,14 @@ pub export fn WndProc(
                     hwnd;
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, new_d3d_device.?, new_d3d_ctx.?) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?) catch null;
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity) catch null;
+                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
                 if (recovered_gpu) |*r| {
                     // Complete the generation before publication: shader
                     // pipelines, current client size, and current atlas size
                     // must all belong to the same renderer generation.
-                    // Mirrors the same config flag the core was given in
-                    // loadConfigAndApplyCoreOptions.
-                    r.blur_enabled = app.config.window.blur;
                     r.loadCustomShaderPipelines(&app.config);
                     if (app.corep) |corep| {
                         if (core.zonvie_core_get_glow_enabled(corep)) {
@@ -5600,13 +5594,12 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity) catch {
+                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity, app.config.window.blur) catch {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
-                    new_renderer.blur_enabled = app.config.window.blur;
                     new_renderer.loadCustomShaderPipelines(&app.config);
                     if (app.corep) |corep| {
                         if (core.zonvie_core_get_glow_enabled(corep)) {
@@ -5992,12 +5985,12 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
+                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
                         if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
                         return 0;
                     };
@@ -6020,9 +6013,6 @@ pub export fn WndProc(
                 // because compilation + pixel-shader creation need the
                 // live D3D11 device.
                 if (app.renderer) |*r| {
-                    // Mirrors the same config flag the core was given in
-                    // loadConfigAndApplyCoreOptions.
-                    r.blur_enabled = app.config.window.blur;
                     r.loadCustomShaderPipelines(&app.config);
                     if (r.any_custom_shader_needs_animation) {
                         // Kick continuous-redraw ticker. Runs ~60Hz until

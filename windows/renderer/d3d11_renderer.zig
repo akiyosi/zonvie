@@ -352,6 +352,9 @@ pub const Renderer = struct {
     // opacity (src/core/flush.zig), and on a main surface with layers it
     // drops that run entirely (skip_default_bg), so the row draw has to
     // overwrite each band itself even at opacity 1.0.
+    // Set from init's `blur` parameter, not assigned afterwards: a surface
+    // that forgot the assignment rendered the alpha-0.5 rows over its own
+    // previous frame and ghosted, and nothing failed to build.
     blur_enabled: bool = false,
 
     // Neovim default background color (0x00RRGGBB), used for the
@@ -422,7 +425,7 @@ pub const Renderer = struct {
     }
 
     /// Initialize with a pre-created D3D11 device (from createDeviceOnly).
-    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext) !Renderer {
+    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext) !Renderer {
         // Take our own COM reference on the App-owned device/context so this
         // renderer's deinit() can Release() without over-releasing the App's
         // reference. App creates this device via createDeviceOnly() and
@@ -434,6 +437,7 @@ pub const Renderer = struct {
             .alloc = alloc,
             .hwnd = hwnd,
             .opacity = opacity,
+            .blur_enabled = blur,
             .device = device,
             .ctx = device_ctx,
         };
@@ -483,11 +487,12 @@ pub const Renderer = struct {
         return self;
     }
 
-    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32) !Renderer {
+    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool) !Renderer {
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
             .opacity = opacity,
+            .blur_enabled = blur,
         };
         // Five `try` fail points follow (createDeviceAndSwapchain/
         // createBackTargets/createPipeline/ensureVertexBuffer/
