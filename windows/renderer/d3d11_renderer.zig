@@ -347,12 +347,11 @@ pub const Renderer = struct {
     // Background transparency (0.0-1.0, 1.0 = opaque)
     opacity: f32 = 1.0,
 
-    // Mirrors config [window] blur for this renderer's surface. The core
-    // drops the root grid's default-background run when the main surface has
-    // layers AND blur is on (src/core/flush.zig, skip_default_bg), so the row
-    // draw has to overwrite each band itself in that case even at opacity
-    // 1.0. Only the main window sets this; external windows keep their own
-    // default background run.
+    // Mirrors config [window] blur for this renderer's surface. Under blur
+    // the core emits every default-background run at alpha 0.5 whatever the
+    // opacity (src/core/flush.zig), and on a main surface with layers it
+    // drops that run entirely (skip_default_bg), so the row draw has to
+    // overwrite each band itself even at opacity 1.0.
     blur_enabled: bool = false,
 
     // Neovim default background color (0x00RRGGBB), used for the

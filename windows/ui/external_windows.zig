@@ -1767,6 +1767,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
+    // This surface preserves its back texture between paints, so it needs the
+    // same per-row band overwrite the main window does: under blur the core
+    // sends default-background runs at alpha 0.5 even at opacity 1.0, and a
+    // redrawn row blended over the previous frame leaves it showing through.
+    renderer.blur_enabled = app.config.window.blur;
     // Load the same custom post-process shaders the main window uses,
     // so cmdline/popupmenu/msg/etc. overlay get the same shader effect
     // applied through their own back_tex.
