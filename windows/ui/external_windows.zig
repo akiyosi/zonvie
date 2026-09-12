@@ -801,9 +801,10 @@ fn drawNormalExternalSurfaceRowMode(
     if (has_layers) {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        layer_layout_stale = app_mod.layerLayoutMoved(&ext_win.tbs, tbs_snap);
-        layer_commit_stale = app_mod.surfaceCommitMoved(&ext_win.tbs, tbs_snap);
-        if (layer_layout_stale or layer_commit_stale) {
+        const staleness = app_mod.layerFrameStaleness(&ext_win.tbs, tbs_snap);
+        layer_layout_stale = staleness.layout;
+        layer_commit_stale = staleness.commit;
+        if (staleness.any()) {
             // The placement this paint pinned, or the root rows it drew beside
             // these layers, is no longer the published one. Re-arm and let the
             // repaint the commit already owes draw it.
@@ -991,11 +992,8 @@ fn drawNormalExternalSurfaceRowMode(
     // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
     if (glow_enabled) {
         const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
-        // The extract pass reads live layer row storage, which the core thread
-        // can resize -- and whose LayerGridState it can free outright. Hold
-        // app.mu for it exactly as the main window does.
-        const bloom_locked = draw_params.bloom_layers != null;
-        if (bloom_locked) app.mu.lockUncancelable(core.clock.io());
+        // drawBloomRowsOverlay takes app.mu itself for the layer storage it
+        // reads; app.mu must be free here.
         app_mod.drawBloomRowsOverlay(
             g,
             tbs_committed.row_map.items,
@@ -1005,7 +1003,6 @@ fn drawNormalExternalSurfaceRowMode(
             glow_intensity,
             draw_params,
         );
-        if (bloom_locked) app.mu.unlock(core.clock.io());
     }
 
     // Scrollbar overlay. Capture the clean, fully-composited strip after
@@ -1774,16 +1771,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     _ = c.ShowWindow(hwnd, 8);
 
     // Initialize D3D11 renderer for external window (with transparency if enabled)
-    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
+    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
-    // This surface preserves its back texture between paints, so it needs the
-    // same per-row band overwrite the main window does: under blur the core
-    // sends default-background runs at alpha 0.5 even at opacity 1.0, and a
-    // redrawn row blended over the previous frame leaves it showing through.
-    renderer.blur_enabled = app.config.window.blur;
     // Load the same custom post-process shaders the main window uses,
     // so cmdline/popupmenu/msg/etc. overlay get the same shader effect
     // applied through their own back_tex.
