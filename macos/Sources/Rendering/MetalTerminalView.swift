@@ -2,6 +2,11 @@ import Cocoa
 import CoreVideo
 import MetalKit
 
+/// A view that can hold a key for repeat synthesis: this one, or an external
+/// window's grid view. The synthesizer needs nothing from it but its window
+/// and its IME state.
+typealias KeyRepeatOwner = NSView & NSTextInputClient
+
 final class MetalTerminalView: MTKView {
     var renderer: MetalTerminalRenderer!
 
@@ -364,6 +369,15 @@ final class MetalTerminalView: MTKView {
     /// held-`j` scrolling), and silently dropped extras when keys arrived
     /// faster than vsync.
     private func sendInputNow(_ text: String) {
+        sendInputForHeldKey(text)
+        // Keep the active draw loop alive so the response is drawn promptly.
+        activeDrawIdleFrames = 0
+    }
+
+    /// Send committed text and record it for repeat synthesis. An external
+    /// window's grid view sends through here so a key held over it is
+    /// replayable by the same synthesizer.
+    func sendInputForHeldKey(_ text: String) {
         // Record what a fresh keyDown actually sent, so synthesized repeats
         // can replay exactly the same input (see Key Repeat Synthesis below).
         if keyRepeatCaptureActive {
@@ -371,8 +385,6 @@ final class MetalTerminalView: MTKView {
             keyRepeatCapturedCount += 1
         }
         core?.sendInput(text)
-        // Keep the active draw loop alive so the response is drawn promptly.
-        activeDrawIdleFrames = 0
     }
 
     // MARK: - Key Repeat Synthesis
@@ -416,6 +428,11 @@ final class MetalTerminalView: MTKView {
     private var keyRepeatLock = os_unfair_lock()
     private var heldKeyCode: UInt16? = nil
     private var heldKeyAction: HeldKeyAction? = nil
+    /// The view the held key was pressed in. The safety net below must ask
+    /// THAT window whether it is still the key window: while an external
+    /// window holds focus this one is not, and checking itself would disarm
+    /// every repeat the external window starts.
+    private weak var heldKeyOwner: KeyRepeatOwner? = nil
     private var synthRepeatActive = false
     /// Bumped by disarmKeyRepeatSynthesis. The display-link tick snapshots it
     /// under the lock and replayHeldKeyOffMain re-validates it immediately
@@ -445,7 +462,8 @@ final class MetalTerminalView: MTKView {
     }
 
     /// Record the held key after a fresh keyDown was processed.
-    private func armHeldKey(code: UInt16, action: HeldKeyAction) {
+    private func armHeldKey(owner: KeyRepeatOwner, code: UInt16, action: HeldKeyAction) {
+        heldKeyOwner = owner
         heldKeyCode = code
         heldKeyAction = action
     }
@@ -457,6 +475,7 @@ final class MetalTerminalView: MTKView {
         keyRepeatGeneration &+= 1
         heldKeyCode = nil
         heldKeyAction = nil
+        heldKeyOwner = nil
         os_unfair_lock_unlock(&keyRepeatLock)
         if wasActive {
             ZonvieCore.appLogScrollMode("[keyRepeat] disarm (\(reason))")
@@ -465,7 +484,13 @@ final class MetalTerminalView: MTKView {
     }
 
     /// First OS auto-repeat observed for the held key: take over the cadence.
-    private func takeOverKeyRepeat() {
+    private func takeOverKeyRepeat(owner: KeyRepeatOwner) {
+        // The repeats are arriving at `owner`, which need not be the view the
+        // key was pressed in: focus can move during the ~0.5s before the first
+        // one (a cmdline window closing on its own last Backspace, say). The
+        // safety net has to follow the view actually receiving them, or it
+        // reads the departed window's key status and disarms immediately.
+        heldKeyOwner = owner
         // NSEvent.keyRepeatInterval mirrors the user's key-repeat setting.
         // Clamp defensively; 0 would spin and >1s is nonsense for repeats.
         let interval = max(1.0 / 120.0, min(1.0, NSEvent.keyRepeatInterval))
@@ -619,10 +644,87 @@ final class MetalTerminalView: MTKView {
         os_unfair_lock_unlock(&keyRepeatLock)
         guard active else { return }
         // Safety net: lost keyUps (Cmd-Tab etc.) and IME activation must
-        // never leave a key repeating forever.
-        if hasMarkedText() || window?.isKeyWindow != true {
+        // never leave a key repeating forever. Asked of the view holding the
+        // key, which is an external window's whenever one started the repeat.
+        // An owner that has gone away cannot deliver the keyUp that would end
+        // this, so its disappearance is itself a reason to stop; every arm
+        // records an owner, so nil here means deallocated, not unset.
+        guard let owner = heldKeyOwner else {
+            disarmKeyRepeatSynthesis("owner gone")
+            return
+        }
+        if owner.hasMarkedText() || owner.window?.isKeyWindow != true {
             disarmKeyRepeatSynthesis("safety")
         }
+    }
+
+    /// The repeat gate every grid view's keyDown runs first. True means
+    /// synthesis owns this key's cadence and the caller must drop the event.
+    ///
+    /// External windows come through here too. Their keyDowns reach Neovim
+    /// via this view's core, so without the gate a key held over one runs on
+    /// the OS repeat timer and beats against the display: measured 2.2
+    /// stalled frames/s, against 0.33/s for the same grid driven by
+    /// synthesis.
+    func keyRepeatSwallowsOSRepeat(_ event: NSEvent, owner: KeyRepeatOwner) -> Bool {
+        if event.isARepeat {
+            if synthRepeatActive && event.keyCode == heldKeyCode {
+                return true  // synthesis owns this key's cadence; swallow OS repeats
+            }
+            if !synthRepeatActive, event.keyCode == heldKeyCode,
+               heldKeyAction != nil, !owner.hasMarkedText()
+            {
+                takeOverKeyRepeat(owner: owner)
+                return true
+            }
+            // Unknown repeat state: stay transparent, process normally.
+            return false
+        }
+        // Fresh press (also rollover to another key): previous synthesis
+        // no longer matches reality.
+        disarmKeyRepeatSynthesis("new keyDown")
+        return false
+    }
+
+    /// Record a held key an external grid view sent with sendKeyEvent.
+    func armHeldKeyEvent(
+        owner: KeyRepeatOwner,
+        code: UInt16,
+        mods: UInt32,
+        characters: String?,
+        charactersIgnoringModifiers: String?
+    ) {
+        armHeldKey(owner: owner, code: code, action: .keyEvent(
+            mods: mods,
+            characters: characters,
+            charactersIgnoringModifiers: charactersIgnoringModifiers
+        ))
+    }
+
+    /// Open the capture window around an external grid view's keyDown so the
+    /// text it ends up sending through sendInputForHeldKey is recorded.
+    func beginHeldKeyCapture(isRepeat: Bool) {
+        keyRepeatCaptureActive = !isRepeat
+        keyRepeatCapturedText = nil
+        keyRepeatCapturedCount = 0
+    }
+
+    /// Close it, arming the key only for a clean single-send press.
+    func endHeldKeyCapture(owner: KeyRepeatOwner, code: UInt16) {
+        guard keyRepeatCaptureActive else { return }
+        keyRepeatCaptureActive = false
+        guard keyRepeatCapturedCount == 1, let t = keyRepeatCapturedText,
+              !owner.hasMarkedText() else { return }
+        armHeldKey(owner: owner, code: code, action: .text(t))
+    }
+
+    /// Disarm from an external grid view's keyUp or flagsChanged. A nil `code`
+    /// means "whatever is held": any modifier change invalidates the recorded
+    /// input (e.g. j -> C-j).
+    func disarmKeyRepeat(ifHeld code: UInt16?, reason: String) {
+        guard let held = heldKeyCode else { return }
+        if let code, code != held { return }
+        disarmKeyRepeatSynthesis(reason)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -1734,22 +1836,7 @@ final class MetalTerminalView: MTKView {
         ZonvieCore.appLogScrollMode("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
 
         // --- Key repeat synthesis (see MARK above) ---
-        if event.isARepeat {
-            if synthRepeatActive && event.keyCode == heldKeyCode {
-                return  // synthesis owns this key's cadence; swallow OS repeats
-            }
-            if !synthRepeatActive, event.keyCode == heldKeyCode,
-               heldKeyAction != nil, !hasMarkedText()
-            {
-                takeOverKeyRepeat()
-                return
-            }
-            // Unknown repeat state: stay transparent, process normally below.
-        } else {
-            // Fresh press (also rollover to another key): previous synthesis
-            // no longer matches reality.
-            disarmKeyRepeatSynthesis("new keyDown")
-        }
+        if keyRepeatSwallowsOSRepeat(event, owner: self) { return }
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
@@ -1786,7 +1873,7 @@ final class MetalTerminalView: MTKView {
             // Cmd shortcuts must not synthesize repeats; everything else
             // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
             if !event.isARepeat && !m.contains(.command) {
-                armHeldKey(code: event.keyCode, action: .keyEvent(
+                armHeldKey(owner: self, code: event.keyCode, action: .keyEvent(
                     mods: mods,
                     characters: chars,
                     charactersIgnoringModifiers: event.charactersIgnoringModifiers
@@ -1811,7 +1898,7 @@ final class MetalTerminalView: MTKView {
             if keyRepeatCaptureActive {
                 keyRepeatCaptureActive = false
                 if keyRepeatCapturedCount == 1 {
-                    armHeldKey(code: event.keyCode, action: .text(swapped))
+                    armHeldKey(owner: self, code: event.keyCode, action: .text(swapped))
                 }
             }
             return
@@ -1829,7 +1916,7 @@ final class MetalTerminalView: MTKView {
                 if keyRepeatCapturedCount == 1, let t = keyRepeatCapturedText,
                    !hasMarkedText()
                 {
-                    armHeldKey(code: event.keyCode, action: .text(t))
+                    armHeldKey(owner: self, code: event.keyCode, action: .text(t))
                 }
             }
         }

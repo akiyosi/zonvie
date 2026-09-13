@@ -1415,6 +1415,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// Called from core thread (thread-safe via tripleBufferLock).
     func commitFlush() {
         guard isInFlush else { return }
+        FrameTracer.trace(.commitFlush, seq: UInt32(truncatingIfNeeded: gridId))
         let hadContent = flushHadContent
         var shouldScheduleGrowth = false
         if hadContent {
@@ -2438,8 +2439,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         autoreleasepool {
+            FrameTracer.trace(.drawBegin, seq: UInt32(truncatingIfNeeded: gridId))
             var finishedRedraw = false
             defer {
+                FrameTracer.trace(.drawEnd, seq: UInt32(truncatingIfNeeded: gridId))
                 if !finishedRedraw {
                     redrawScheduler.didDrawFrame()
                 }
@@ -2512,6 +2515,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if inflightSemaphore.wait(timeout: .now()) != .success {
                 // GPU still processing previous frame. Skip this draw but
                 // schedule a retry so the frame is not permanently lost.
+                FrameTracer.trace(.drawSkipSemaphore, seq: UInt32(truncatingIfNeeded: gridId))
                 redrawScheduler.didDrawFrame()
                 finishedRedraw = true
                 DispatchQueue.main.async { [weak self] in
@@ -2550,6 +2554,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
                 let terminal = rowCapacityHardFailure
                 tripleBufferLock.unlock()
+                FrameTracer.trace(.drawSkipRowCapacity, seq: UInt32(truncatingIfNeeded: gridId))
                 inflightSemaphore.signal()
                 redrawScheduler.didDrawFrame()
                 finishedRedraw = true
@@ -2893,6 +2898,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             if rowMode && hasPresentedOnce && !blinkStateChanged && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling && !shaderAnimates {
+                FrameTracer.trace(.drawSkipNoChange, a: 2, seq: UInt32(truncatingIfNeeded: gridId))
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
                 // If a visual commit occurred recently, a timing race likely caused
                 // this idle frame. Don't count toward deactivation.
@@ -3627,12 +3633,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // where an invisible window used to cost ~1s per frame.
             var tAcquire: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled { tAcquire = CFAbsoluteTimeGetCurrent() }
+            FrameTracer.trace(.drawableAcquireBegin, seq: UInt32(truncatingIfNeeded: gridId))
             let acquired = view.currentDrawable
+            FrameTracer.trace(.drawableAcquireEnd, seq: UInt32(truncatingIfNeeded: gridId))
             if ZonvieCore.appLogEnabled {
                 let us = (CFAbsoluteTimeGetCurrent() - tAcquire) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] ext_acquire_drawable gridId=\(gridId) us=\(String(format: "%.1f", us)) got=\(acquired != nil)")
             }
             guard let drawable = acquired else {
+                FrameTracer.trace(.drawSkipNoDrawable, seq: UInt32(truncatingIfNeeded: gridId))
                 // Capture semaphore and lock directly so the signal fires even
                 // if the view is deallocated before the GPU finishes.
                 let sem = inflightSemaphore
@@ -3817,6 +3826,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 cursorEnc.endEncoding()
             }
 
+            if FrameTracer.enabled {
+                let submitNs = FrameTracer.nowNs()
+                let traceSeq = UInt32(truncatingIfNeeded: gridId)
+                drawable.addPresentedHandler { d in
+                    let t = d.presentedTime
+                    let presentedNs = t > 0 ? UInt64(t * 1_000_000_000.0) : 0
+                    FrameTracer.trace(.presented, a: presentedNs, b: submitNs, seq: traceSeq)
+                }
+            }
+            FrameTracer.trace(.presentCall, seq: UInt32(truncatingIfNeeded: gridId))
             cmd.present(drawable)
             // Capture semaphore and lock directly so the signal fires even
             // if the view is deallocated before the GPU finishes.
@@ -4117,7 +4136,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard let main = mainTerminalView, let core = main.core else {
             return
         }
-
         let m = event.modifierFlags
 
         // Check if Option key should be treated as Meta (Alt) based on config.
@@ -4128,6 +4146,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             optionAsMeta: core.getOptionAsMeta()
         )
         let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
+
+        // Key repeat synthesis. This view's keys reach Neovim through the main
+        // view's core, so they have to run on the same paced cadence: left on
+        // the OS repeat timer they beat against the display and the picture
+        // stalls a frame at a time. State and pacing live in MetalTerminalView
+        // (see its Key Repeat Synthesis mark); this view only supplies itself
+        // as the owner, being the one whose window and IME state decide when a
+        // repeat must stop.
+        let swallowed = main.keyRepeatSwallowsOSRepeat(event, owner: self)
+        if FrameTracer.enabled {
+            FrameTracer.trace(
+                .inputSend,
+                a: UInt64(event.keyCode),
+                b: (event.isARepeat ? 1 : 0) | (swallowed ? 2 : 0),
+                seq: UInt32(truncatingIfNeeded: gridId)
+            )
+        }
+        if swallowed { return }
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
@@ -4161,6 +4197,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 characters: chars,
                 charactersIgnoringModifiers: event.charactersIgnoringModifiers
             )
+            // Cmd shortcuts must not synthesize repeats; everything else
+            // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
+            if !event.isARepeat && !m.contains(.command) {
+                main.armHeldKeyEvent(
+                    owner: self,
+                    code: event.keyCode,
+                    mods: mods,
+                    characters: chars,
+                    charactersIgnoringModifiers: event.charactersIgnoringModifiers
+                )
+            }
             return
         }
 
@@ -4169,9 +4216,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
            let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
         {
-            core.sendInput(swapped)
+            main.beginHeldKeyCapture(isRepeat: event.isARepeat)
+            main.sendInputForHeldKey(swapped)
+            main.endHeldKeyCapture(owner: self, code: event.keyCode)
             return
         }
+
+        // Plain key: capture what this keyDown sends (via IME insertText ->
+        // imeSendCommitted -> sendInputForHeldKey) so repeats can replay it.
+        main.beginHeldKeyCapture(isRepeat: event.isARepeat)
+        defer { main.endHeldKeyCapture(owner: self, code: event.keyCode) }
 
         // Let the system handle IME input.
         if let ctx = inputContext, ctx.handleEvent(event) {
@@ -4182,11 +4236,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     override func keyUp(with event: NSEvent) {
+        mainTerminalView?.disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
         // Key up events typically not needed for terminal input
     }
 
     override func flagsChanged(with event: NSEvent) {
-        // Modifier-only events typically not needed for terminal input
+        // Modifier-only events typically not needed for terminal input, but a
+        // modifier change invalidates a recorded held key (e.g. j -> C-j).
+        mainTerminalView?.disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
     }
 
     // MARK: - Scroll Event Handling
@@ -4301,7 +4358,7 @@ extension ExternalGridView: IMEPreeditHost {
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 
-    func imeSendCommitted(_ text: String) { mainTerminalView?.core?.sendInput(text) }
+    func imeSendCommitted(_ text: String) { mainTerminalView?.sendInputForHeldKey(text) }
 }
 
 // MARK: - NSTextInputClient (IME support)
