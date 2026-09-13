@@ -61,6 +61,7 @@ pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
 /// One grid placed on one surface. Mirrors `zonvie_layer` in
 /// include/zonvie_core.h.
 pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
+pub const LAYER_MOUSE_ENABLED: u32 = 1 << 1;
 
 pub const Layer = extern struct {
     grid_id: i64,

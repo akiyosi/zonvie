@@ -450,6 +450,10 @@ pub const SurfaceLayer = struct {
     cols: u32,
     z: i32,
     follows_scroll: bool,
+    /// The layer accepts mouse input. A hit test must skip a layer without
+    /// it -- Neovim refuses an event addressed to such a window rather than
+    /// passing it to what is behind.
+    mouse_enabled: bool = true,
 };
 
 /// Immutable while retained by a paint; capacity is reused after retirement.
@@ -4870,6 +4874,11 @@ pub const App = struct {
     // Mouse button tracking for drag events
     // 0 = none, 1 = left, 2 = right, 3 = middle, 4 = x1, 5 = x2
     mouse_button_held: u8 = 0,
+    /// The grid the press resolved to, held for the drag and release that
+    /// follow it. Re-resolving per event would retarget a selection the
+    /// moment the pointer leaves the float it started in. Zero means the
+    /// press did not resolve to a layer and the surface's own grid stands.
+    mouse_press_grid_id: i64 = 0,
 
     // Track last cursor grid to detect transitions from external windows
     last_cursor_grid: i64 = 1,

@@ -77,6 +77,10 @@ final class ZonvieCore {
     static var appLogVerbose = false
     // Core callback thread only; shared with every surface in this bracket.
     private var renderTraceFlushId: UInt64 = 0
+    /// Whether a core flush bracket is open. A destroy that arrives outside one
+    /// has no on_flush_end to publish against and would be cleared by the next
+    /// begin, so it is released immediately instead of staged.
+    private var coreFlushActive = false
 
     static func renderTrace(_ message: @autoclosure () -> String) {
         guard appLogEnabled && appLogVerbose && !appLogPerfOnly && !appLogScrollOnly else { return }
@@ -585,9 +589,19 @@ final class ZonvieCore {
                     let tr = Int(totalRows)
                     let tc = Int(totalCols)
 
+                    // The owner map decides, not the view registry. The core
+                    // un-externalizes a grid and resends all of its rows in ONE
+                    // flush, and it publishes the new layout first, so by the
+                    // time these rows arrive the owner is already the main
+                    // surface. externalGridViews still holds the old view until
+                    // the close's main-queue hop runs, so consulting it first
+                    // routed a grid moving back into the main window to a view
+                    // about to be torn down, and the main renderer never saw
+                    // those rows. Both reads happen under one hold, so there is
+                    // no window between deciding and acting.
                     core.externalGridViewsLock.lock()
-                    let gridView = core.externalGridViews[gridId]
                     let ownerId = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gridId]
+                    let gridView = (ownerId == nil || ownerId == gridId) ? core.externalGridViews[gridId] : nil
                     let hostView = ownerId.flatMap { core.externalGridViews[$0] }
                     core.externalGridViewsLock.unlock()
 
@@ -999,6 +1013,7 @@ final class ZonvieCore {
                 me.extViewsScratch.removeAll(keepingCapacity: true)
                 me.externalFlushAborted = false
                 me.pendingGridDestroys.removeAll(keepingCapacity: true)
+                me.coreFlushActive = true
                 me.externalGridViewsLock.lock()
                 me.pendingGridSurfaceOwners = nil
                 me.externalGridViewsLock.unlock()
@@ -1041,6 +1056,11 @@ final class ZonvieCore {
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 defer {
+                    // Every exit, not just the committed one: an aborted flush
+                    // that returns early used to leave this set, and a session
+                    // reset arriving before the next successful flush then
+                    // staged its destroys into a list the next begin clears.
+                    me.coreFlushActive = false
                     let aborted = me.core.map { zonvie_core_flush_was_aborted($0) } ?? true
                     ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=end outcome=\(aborted ? "abort" : "commit") destroyed_pending=\(me.pendingGridDestroys.count) metadata_budget=enforcement_pending")
                     me.externalGridViewsLock.lock()
@@ -1289,9 +1309,15 @@ final class ZonvieCore {
                 ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_shift_receive grid=\(gid) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
                 // Call applyRowScroll directly from core thread — it operates
                 // on the write set (owned by flush bracket) under tripleBufferLock.
+                // Owner-first, for the reason the row path states: a grid moving
+                // back into the main window still has its old view registered
+                // until the close's main-queue hop, and shifting that view's
+                // rows leaves the real destination holding pre-scroll content
+                // with only the vacated rows filled in.
                 core.externalGridViewsLock.lock()
-                let view = core.externalGridViews[gid]
-                let host = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gid].flatMap { core.externalGridViews[$0] }
+                let owner = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gid]
+                let view = (owner == nil || owner == gid) ? core.externalGridViews[gid] : nil
+                let host = owner.flatMap { core.externalGridViews[$0] }
                 core.externalGridViewsLock.unlock()
                 if view == nil, let host {
                     guard core.beginExternalFlushIfNeeded(host) else { return }
@@ -1384,6 +1410,15 @@ final class ZonvieCore {
             on_grid_destroy: { ctx, gridId in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+                // Outside a flush bracket there is no on_flush_end to publish
+                // against, and the next begin clears this list -- a staged
+                // destroy would be thrown away. The core uses that form on
+                // session reset, where the storage has to go now or never.
+                guard me.coreFlushActive else {
+                    ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=destroy_now grid=\(gridId)")
+                    me.onGridDestroy(gridId: gridId)
+                    return
+                }
                 ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=destroy_stage grid=\(gridId)")
                 me.pendingGridDestroys.append(gridId)
             }

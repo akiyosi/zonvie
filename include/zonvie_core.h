@@ -337,6 +337,11 @@ typedef void (*zonvie_on_external_window_close_fn)(
    (1 for the main window). layers[0] is always the root grid at (0,0). */
 /* This float tracks the buffer: see zonvie_grid_info.follows_scroll. */
 #define ZONVIE_LAYER_FOLLOWS_SCROLL (1u << 0)
+/* This layer accepts mouse input (win_float_pos' mouse_enabled; always set for
+   the root and for splits). A frontend hit test MUST skip a layer without it:
+   Neovim rejects an event addressed to such a window and does not re-resolve
+   against what is behind it, so choosing it swallows the click. */
+#define ZONVIE_LAYER_MOUSE_ENABLED (1u << 1)
 
 typedef struct zonvie_layer {
     int64_t  grid_id;

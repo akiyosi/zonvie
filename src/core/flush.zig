@@ -4452,7 +4452,8 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
             .rows = sg.rows,
             .cols = sg.cols,
             .z = @intCast(self.layout_scratch.items.len),
-            .flags = if (pos.follows_scroll) c_api.LAYER_FOLLOWS_SCROLL else 0,
+            .flags = (if (pos.follows_scroll) c_api.LAYER_FOLLOWS_SCROLL else 0) |
+                (if (pos.mouse_enabled) c_api.LAYER_MOUSE_ENABLED else 0),
         }) catch |err| {
             failSurfaceLayout(self, err);
             return &.{};
@@ -10028,7 +10029,7 @@ test "external anchored float keeps its own viewport margin flags" {
         .start_col = 0,
     });
     try core.grid.resizeGrid(3, 1, 3);
-    try core.grid.setWinFloatPos(3, 43, 0, 1, 10, 0, 2);
+    try core.grid.setWinFloatPos(3, 43, 0, 1, 10, 0, 2, true);
     try core.grid.setViewportMargins(3, 0, 0, 1, 1);
     core.cell_w_px = 1;
     core.cell_h_px = 1;
@@ -10184,7 +10185,7 @@ test "external scroll without row-shift callback regenerates every retained row"
     // what composition forced and what per-grid rows removed.
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try core.grid.resizeGrid(3, 1, 1);
-    try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2);
+    try core.grid.setWinFloatPos(3, 43, 100, 0, 10, 0, 2, true);
     core.cb.on_grid_row_scroll = State.onRowScroll;
     core.sendExternalGridVertices(true);
     state = .{};
@@ -11568,8 +11569,8 @@ test "external float row index sorts once and buckets visible intersections" {
     try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 10, .start_col = 20 });
     try core.grid.resizeGrid(20, 2, 2);
     try core.grid.resizeGrid(21, 2, 2);
-    try core.grid.setWinFloatPos(20, 20, 10, 20, 20, 0, 10);
-    try core.grid.setWinFloatPos(21, 21, 11, 21, 10, 0, 10);
+    try core.grid.setWinFloatPos(20, 20, 10, 20, 20, 0, 10, true);
+    try core.grid.setWinFloatPos(21, 21, 11, 21, 10, 0, 10, true);
 
     try buildExternalFloatAnchorIndex(&core);
     const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 10);
@@ -11642,7 +11643,7 @@ test "external float anchor index groups many anchors after one map scan" {
             .start_col = 0,
         });
         try core.grid.resizeGrid(float_id, 1, 1);
-        try core.grid.setWinFloatPos(float_id, float_id, @intCast(i * 2), 0, @intCast(i), 0, anchor_id);
+        try core.grid.setWinFloatPos(float_id, float_id, @intCast(i * 2), 0, @intCast(i), 0, anchor_id, true);
     }
 
     try buildExternalFloatAnchorIndex(&core);
@@ -11672,7 +11673,7 @@ test "external float anchor scratch reserves only matching placements" {
     }
     try core.grid.resizeGrid(5000, 1, 1);
     try core.grid.putSyntheticExternal(5000, .{ .win = 5000, .start_row = 0, .start_col = 0 });
-    try core.grid.setWinFloatPos(5001, 0, 0, 0, 10, 0, 5000);
+    try core.grid.setWinFloatPos(5001, 0, 0, 0, 10, 0, 5000, true);
 
     try buildExternalFloatAnchorIndex(&core);
     try std.testing.expectEqual(@as(usize, 129), core.grid.win_pos.count());
@@ -11687,11 +11688,11 @@ test "external float visible scratch excludes invisible entries and releases hos
     try core.grid.resizeGrid(10, 4, 5);
     try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
     try core.grid.resizeGrid(20, 1, 1);
-    try core.grid.setWinFloatPos(20, 20, 0, 0, 100, 0, 10);
+    try core.grid.setWinFloatPos(20, 20, 0, 0, 100, 0, 10, true);
     for (0..32) |i| {
         const float_id: i64 = @intCast(100 + i);
         try core.grid.resizeGrid(float_id, 1, 1);
-        try core.grid.setWinFloatPos(float_id, float_id, @intCast(100 + i), 0, @intCast(i), 0, 10);
+        try core.grid.setWinFloatPos(float_id, float_id, @intCast(100 + i), 0, @intCast(i), 0, 10, true);
     }
 
     try buildExternalFloatAnchorIndex(&core);
@@ -13330,7 +13331,7 @@ test "an external grid and its anchored float glow per cell" {
 
             // A float anchored on the external grid, same split.
             try core.grid.resizeGrid(3, 1, 2);
-            try core.grid.setWinFloatPos(3, 43, 0, 2, 10, 0, 2);
+            try core.grid.setWinFloatPos(3, 43, 0, 2, 10, 0, 2, true);
             core.grid.putCellGrid(3, 0, 0, 'G', 42);
             core.grid.putCellGrid(3, 0, 1, 'N', 7);
 
@@ -14421,7 +14422,7 @@ test "surface layout retains all grids beyond the former 64 layer limit" {
     for (2..129) |id| {
         const gid: i64 = @intCast(id);
         try core.grid.resizeGrid(gid, 1, 1);
-        try core.grid.setWinFloatPos(gid, gid + 100, 0, 0, @intCast(id), 0, 1);
+        try core.grid.setWinFloatPos(gid, gid + 100, 0, 0, @intCast(id), 0, 1, true);
         if (id == 63 or id == 64 or id == 65 or id == 128) {
             notifySurfaceLayouts(&core);
             try std.testing.expect(!core.flush_aborted);
@@ -14472,7 +14473,7 @@ test "an external surface publishes its root and anchored float layers" {
     try std.testing.expect(try core.grid.setWinExternalPosAt(2, 42, 4, 8));
     // Float content is independent of its external anchor's row contents.
     try core.grid.resizeGrid(3, 2, 4);
-    try core.grid.setWinFloatPos(3, 43, 6, 11, 50, 0, 2);
+    try core.grid.setWinFloatPos(3, 43, 6, 11, 50, 0, 2, true);
 
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.seen_ext);
@@ -14497,9 +14498,9 @@ test "surface ownership follows nested anchors and rejects unresolved or cyclic 
     try core.grid.resizeGrid(2, 5, 20);
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
     try core.grid.resizeGrid(3, 2, 4);
-    try core.grid.setWinFloatPos(3, 43, 1, 2, 50, 0, 2);
+    try core.grid.setWinFloatPos(3, 43, 1, 2, 50, 0, 2, true);
     try core.grid.resizeGrid(4, 1, 2);
-    try core.grid.setWinFloatPos(4, 44, 2, 3, 60, 0, 3);
+    try core.grid.setWinFloatPos(4, 44, 2, 3, 60, 0, 3, true);
     try std.testing.expectEqual(@as(?i64, 2), surfaceForGrid(&core.grid, 4));
     const layers = collectSurfaceLayers(&core, 2);
     try std.testing.expectEqual(@as(usize, 3), layers.len);
@@ -14531,18 +14532,18 @@ test "surface migration resends unchanged nested grids but same-surface movement
     _ = try core.grid.setWinExternalPos(2, 20);
     try core.grid.resizeGrid(3, 4, 8);
     try core.grid.resizeGrid(4, 4, 8);
-    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 1);
-    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3);
+    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 1, true);
+    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3, true);
     notifySurfaceLayouts(&core);
     core.grid.sub_grids.getPtr(3).?.clearDirty();
     core.grid.sub_grids.getPtr(4).?.clearDirty();
 
-    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 1);
+    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 1, true);
     notifySurfaceLayouts(&core);
     try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
     try std.testing.expect(!core.grid.sub_grids.getPtr(4).?.dirty);
 
-    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 2);
+    try core.grid.setWinFloatPos(3, 30, 3, 1, 50, 0, 2, true);
     notifySurfaceLayouts(&core);
     for ([_]i64{ 3, 4 }) |id| {
         const sg = core.grid.sub_grids.getPtr(id).?;
@@ -14557,7 +14558,7 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     defer core.deinitForTest();
     try core.grid.resize(20, 40);
     try core.grid.resizeGrid(3, 4, 8);
-    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 99);
+    try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 99, true);
     core.grid.main_buf.clearDirty();
     const revision = core.grid.content_rev;
     core.grid.noteGridLine(3, 1);
@@ -14576,7 +14577,7 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     try std.testing.expectEqual(@as(usize, 2), collectSurfaceLayers(&core, 99).len);
 
     try core.grid.resizeGrid(4, 2, 4);
-    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3);
+    try core.grid.setWinFloatPos(4, 40, 2, 2, 60, 0, 3, true);
     core.grid.sub_grids.getPtr(3).?.clearDirty();
     core.grid.noteGridLine(4, 2);
     try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty);
@@ -14619,7 +14620,7 @@ test "surface layout places splits and floats as ordered layers" {
     try core.grid.resizeGrid(2, 4, 20);
     try core.grid.setWinPos(2, 100, 2, 5);
     try core.grid.resizeGrid(3, 2, 6);
-    try core.grid.setWinFloatPos(3, 101, 1, 3, 50, 0, 1);
+    try core.grid.setWinFloatPos(3, 101, 1, 3, 50, 0, 1, true);
 
     notifySurfaceLayouts(&core);
     try std.testing.expectEqual(@as(i64, 1), state.surface);
@@ -14706,7 +14707,7 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     // shifting the split's rows cannot move the float's pixels.
     core.grid.sub_grids.getPtr(2).?.clearScrollState();
     try core.grid.resizeGrid(4, 3, 8);
-    try core.grid.setWinFloatPos(4, 103, 2, 2, 50, 0, 1);
+    try core.grid.setWinFloatPos(4, 103, 2, 2, 50, 0, 1, true);
     core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 2));
     try std.testing.expectEqual(@as(u32, 3), state.calls);
@@ -14927,7 +14928,7 @@ test "scrollbound splits and a centred float all shift in one batch and resend o
     try core.grid.resizeGrid(3, 12, 30);
     try core.grid.setWinPos(3, 102, 0, 30);
     try core.grid.resizeGrid(4, 8, 20);
-    try core.grid.setWinFloatPos(4, 103, 2, 20, 50, 0, 1);
+    try core.grid.setWinFloatPos(4, 103, 2, 20, 50, 0, 1, true);
     for (0..12) |r| {
         core.grid.putCellGrid(2, @intCast(r), 0, 'A' + @as(u32, @intCast(r)), 0);
         core.grid.putCellGrid(3, @intCast(r), 0, 'a' + @as(u32, @intCast(r)), 0);
