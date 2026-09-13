@@ -1155,6 +1155,11 @@ pub const GridPos = struct {
     /// Whether this batch moved the float vertically. The evidence
     /// settleFloatScrollFollowing reads; cleared with the batch.
     moved_in_batch: bool = false,
+    /// win_float_pos' mouse_enabled. A float that refuses mouse input must not
+    /// win a frontend hit test: Neovim rejects an event addressed to it and
+    /// does NOT retry against what is behind it, so picking it swallows the
+    /// click instead of passing it through. Splits are always true.
+    mouse_enabled: bool = true,
 };
 
 /// Info for an external grid (displayed in a separate window).
@@ -2969,6 +2974,7 @@ pub const Grid = struct {
         zindex: i64,
         compindex: i64,
         anchor_grid: i64,
+        mouse_enabled: bool,
     ) !void {
         if (grid_id == 1) return;
         if (!gridCoordFitsFrontend(row) or !gridCoordFitsFrontend(col)) return;
@@ -2995,6 +3001,7 @@ pub const Grid = struct {
             .anchor_grid = anchor_grid,
             .follows_scroll = follows_scroll,
             .moved_in_batch = moved_in_batch,
+            .mouse_enabled = mouse_enabled,
         };
 
         const grid_win_is_new = win_id > 0 and !self.grid_win_ids.contains(grid_id);
@@ -4352,7 +4359,7 @@ test "grid line coverage is dirtied once per redraw epoch while order advances" 
 
     try grid.resizeGrid(1, 6, 8);
     try grid.resizeGrid(2, 2, 3);
-    try grid.setWinFloatPos(2, 42, 2, 1, 10, 0, 1);
+    try grid.setWinFloatPos(2, 42, 2, 1, 10, 0, 1, true);
     grid.clearDirty();
 
     const epoch = grid.beginRedrawBatch();
@@ -4426,7 +4433,7 @@ test "window placements are bounded independently of grid cells" {
     try grid.resizeGrid(1, 1, 1);
     // A placement with no corresponding sub-grid still consumes the bounded
     // placement maps; it must not be coupled to aggregate cell accounting.
-    try grid.setWinFloatPos(2, 0, 0, 0, 10, 0, 1);
+    try grid.setWinFloatPos(2, 0, 0, 0, 10, 0, 1, true);
     try std.testing.expectEqual(@as(usize, 1), grid.win_pos.count());
     try std.testing.expectEqual(@as(usize, 1), grid.win_layer.count());
     try std.testing.expectEqual(@as(usize, 1), grid.total_grid_cells);
@@ -4493,7 +4500,7 @@ test "grid position setters reject frontend-unrepresentable coordinates" {
 
     try grid.setWinPos(2, 42, 1, 1);
     const old_pos = grid.win_pos.get(2).?;
-    try grid.setWinFloatPos(2, 42, std.math.maxInt(u32), 1, 10, 0, 1);
+    try grid.setWinFloatPos(2, 42, std.math.maxInt(u32), 1, 10, 0, 1, true);
     try std.testing.expectEqual(old_pos, grid.win_pos.get(2).?);
     try std.testing.expect(!grid.win_layer.contains(2));
 }

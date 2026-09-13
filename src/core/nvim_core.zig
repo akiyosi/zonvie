@@ -1505,6 +1505,36 @@ pub const Core = struct {
         self.grid.pending_win_ops.clearRetainingCapacity();
         self.grid.pending_main_grid_size = null;
 
+        // The frontends key per-grid render storage by grid_id and release it
+        // only on on_grid_destroy -- the ABI says a grid that merely leaves the
+        // layout keeps its buffers. resetForNewSession frees the sub-grids
+        // outright and drops destroyed_pending with them, so without this the
+        // storage for every id the NEW session never reaches is stranded for
+        // the life of the process, GPU buffers included. Neovim restarts its
+        // grid_id counter per server, so a long session that ended high leaves
+        // a tail no short session reclaims.
+        //
+        // Fired here, before the sub-grids go, for the same reason the external
+        // windows above are closed here: this is the last moment the old ids
+        // are still known, and the frontend must hear about them while its own
+        // maps still match.
+        // Fired outside a flush bracket on purpose: there is no transaction to
+        // publish against here, and the frontends treat that form as "release
+        // now" rather than staging it into a list the next flush would clear.
+        // A grid already removed from sub_grids still owes its destroy, so the
+        // pending list is drained here too -- resetForNewSession is about to
+        // discard it.
+        if (self.cb.on_grid_destroy) |cb| {
+            var sg_it = self.grid.sub_grids.keyIterator();
+            while (sg_it.next()) |grid_id_ptr| {
+                cb(self.ctx, grid_id_ptr.*);
+            }
+            for (self.grid.destroyed_pending.items) |grid_id| {
+                if (self.grid.sub_grids.contains(grid_id)) continue;
+                cb(self.ctx, grid_id);
+            }
+        }
+
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
         self.grid.resetForNewSession();
