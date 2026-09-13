@@ -2670,6 +2670,23 @@ pub export fn ExternalWndProc(
                     // click pasted there.
                     if (classifyExternalSurface(grid_id.?) != .normal) return 0;
 
+                    // A float anchored inside this window is one of its layers,
+                    // not a window of its own, so the press has to say which
+                    // grid it landed on -- Neovim trusts the id it is given.
+                    const target = blk: {
+                        app.mu.lockUncancelable(core.clock.io());
+                        defer app.mu.unlock(core.clock.io());
+                        break :blk input.resolveMouseTarget(
+                            ext_window.?.tbs.committed_layers.slice(),
+                            grid_id.?,
+                            x,
+                            y,
+                            app.cell_w_px,
+                            app.rowHeightPx(),
+                        );
+                    };
+                    app.mouse_press_grid_id = target.grid_id;
+
                     // Capture so a drag that leaves the window keeps arriving.
                     _ = c.SetCapture(hwnd);
                     const button: [*:0]const u8 = switch (msg) {
@@ -2686,7 +2703,7 @@ pub export fn ExternalWndProc(
                             break :blk "left";
                         },
                     };
-                    input.sendMouseButton(hwnd, app, grid_id.?, button, .press, x, y, wParam);
+                    input.sendMouseButton(hwnd, app, target.grid_id, button, .press, target.x, target.y, wParam);
                     return 0;
                 }
             }
@@ -2700,6 +2717,7 @@ pub export fn ExternalWndProc(
                 // Same reason the editor drag must end: a held button left set
                 // here turns every later hover into a drag.
                 app.mouse_button_held = 0;
+                app.mouse_press_grid_id = 0;
                 app.mu.lockUncancelable(core.clock.io());
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
@@ -2732,7 +2750,9 @@ pub export fn ExternalWndProc(
                 const y = pos.y;
 
                 const held = app.mouse_button_held;
+                const press_grid = app.mouse_press_grid_id;
                 app.mouse_button_held = 0;
+                app.mouse_press_grid_id = 0;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2754,10 +2774,24 @@ pub export fn ExternalWndProc(
                     // Mirrors the press gate: a sentinel-grid surface never
                     // sent a press, so it must not send a release either.
                     const editor_target = classifyExternalSurface(grid_id.?) == .normal;
+                    // The press chose the grid; the release must not re-choose
+                    // it, or letting go outside the float ends the selection in
+                    // the window behind it.
+                    const up_target = blk: {
+                        app.mu.lockUncancelable(core.clock.io());
+                        defer app.mu.unlock(core.clock.io());
+                        break :blk input.rebaseToGrid(
+                            ext_window.?.tbs.committed_layers.slice(),
+                            grid_id.?,
+                            press_grid,
+                            x,
+                            y,
+                        );
+                    };
                     if (msg != c.WM_LBUTTONUP) {
                         if (editor_target) {
                             const button: [*:0]const u8 = if (msg == c.WM_RBUTTONUP) "right" else "middle";
-                            input.sendMouseButton(hwnd, app, grid_id.?, button, .release, x, y, wParam);
+                            input.sendMouseButton(hwnd, app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
                         }
                         return 0;
                     }
@@ -2784,7 +2818,7 @@ pub export fn ExternalWndProc(
                     // so its release must not either -- Neovim would see a
                     // release with no press and move the cursor there.
                     if (editor_target and !was_dragging_scrollbar and held == 1) {
-                        input.sendMouseButton(hwnd, app, grid_id.?, "left", .release, x, y, wParam);
+                        input.sendMouseButton(hwnd, app, up_target.grid_id, "left", .release, up_target.x, up_target.y, wParam);
                     }
                     return 0;
                 }
@@ -2860,7 +2894,18 @@ pub export fn ExternalWndProc(
                     // for the reason the press gate states.
                     if (classifyExternalSurface(grid_id.?) == .normal) {
                         if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
-                            input.sendMouseButton(hwnd, app, grid_id.?, button, .drag, x, y, wParam);
+                            const drag_target = blk: {
+                                app.mu.lockUncancelable(core.clock.io());
+                                defer app.mu.unlock(core.clock.io());
+                                break :blk input.rebaseToGrid(
+                                    ext_win.tbs.committed_layers.slice(),
+                                    grid_id.?,
+                                    app.mouse_press_grid_id,
+                                    x,
+                                    y,
+                                );
+                            };
+                            input.sendMouseButton(hwnd, app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
                         }
                     }
                 }

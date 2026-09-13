@@ -863,7 +863,14 @@ pub fn onVerticesRow(
         const owns = blk: {
             app.mu.lockUncancelable(core.clock.io());
             defer app.mu.unlock(core.clock.io());
-            if (app.external_windows.get(grid_id) != null) break :blk false;
+            // A window already closing is not a registration, for the reason
+            // the row path states: the grid may be moving back into the main
+            // window, and the cursor has to follow its rows there. Without
+            // this the cursor was refused here, then refused again as
+            // pending-close on the external path, and dropped.
+            if (app.external_windows.get(grid_id)) |w| {
+                if (!w.is_pending_close) break :blk false;
+            }
             break :blk mainSurfaceOwnsGridLocked(app, grid_id);
         };
         if (owns) {
@@ -1007,7 +1014,19 @@ pub fn onVerticesRow(
         // lives in the main window, not its own -- is stored per grid and
         // drawn on top of the root grid. Cursor rows keep the external path,
         // which already owns the cursor layer.
-        if ((flags & 2) == 0 and app.external_windows.get(grid_id) == null) {
+        //
+        // A window already closing does not count as a registration. The core
+        // un-externalizes a grid and re-sends all of its rows in ONE flush
+        // (flush.zig, the newly-hosted markAllDirty), while this map is only
+        // cleared later by the UI thread -- so a grid moving back into the
+        // main window as a float was routed to the dead window, refused there
+        // for closing, and parked in pending_external_verts, which nothing
+        // drains unless that id becomes an external window again. The layer
+        // route is the correct one the moment the close is staged: the new
+        // layout is already published, and the ABI requires tolerating rows
+        // for a grid that is in no layer yet.
+        const ext_registered = if (app.external_windows.get(grid_id)) |w| !w.is_pending_close else false;
+        if ((flags & 2) == 0 and !ext_registered) {
             const row_verts: []const app_mod.Vertex =
                 if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
             if (storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols)) {
@@ -1042,7 +1061,19 @@ pub fn onVerticesRow(
         }
         const live_ext_win = blk: {
             if (has_pending_capture) break :blk null;
-            const ext_win = app.external_windows.get(grid_id) orelse externalSurfaceForGridLocked(app, grid_id) orelse break :blk null;
+            // The grid's own window only counts while it is not closing. A
+            // grid moving into a float hosted by ANOTHER external window still
+            // matches the stale entry here, and taking it meant the update was
+            // refused as pending-close instead of falling through to the host
+            // that now owns it -- the content rows found their way there, the
+            // cursor did not.
+            const own_win = blk_own: {
+                if (app.external_windows.get(grid_id)) |w| {
+                    if (!w.is_pending_close) break :blk_own w;
+                }
+                break :blk_own null;
+            };
+            const ext_win = own_win orelse externalSurfaceForGridLocked(app, grid_id) orelse break :blk null;
             // A closing HWND belongs to the old lifecycle. Capture updates for
             // the replacement lifecycle instead of letting the core consume
             // them as successful writes to a window that will be destroyed.
@@ -3202,6 +3233,7 @@ pub fn onSurfaceLayout(
             .cols = l.cols,
             .z = l.z,
             .follows_scroll = (l.flags & core.LAYER_FOLLOWS_SCROLL) != 0,
+            .mouse_enabled = (l.flags & core.LAYER_MOUSE_ENABLED) != 0,
         };
     }
     tbs.stageLayers(staged);
@@ -3253,6 +3285,18 @@ pub fn onGridDestroy(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
+    // Outside a flush bracket there is no on_flush_end to publish against, and
+    // onFlushBegin clears this list -- a staged destroy would simply be thrown
+    // away. The core uses that form on session reset, where the grids are
+    // already gone and the storage has to be released now or never.
+    if (!app.core_flush_active.load(.acquire)) {
+        traceRender(app, "event=destroy_now grid={d}\n", .{grid_id});
+        if (app.layer_grids.fetchRemove(grid_id)) |kv| {
+            kv.value.deinit(app.alloc);
+            app.alloc.destroy(kv.value);
+        }
+        return;
+    }
     traceRender(app, "event=destroy_stage grid={d}\n", .{grid_id});
     app.pending_grid_destroys.append(app.alloc, grid_id) catch {
         failFlush(app);

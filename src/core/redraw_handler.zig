@@ -1868,6 +1868,9 @@ pub fn handleRedraw(
                         zindex,
                         compindex,
                         anchor_grid,
+                        // t[6] is mouse_enabled in every observed form. A float
+                        // that refuses the mouse must not win a hit test.
+                        if (t[6] == .bool) t[6].bool else true,
                     ) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("[win_float_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
@@ -1932,7 +1935,7 @@ pub fn handleRedraw(
                     const row = checkedGridCoord(row_i) orelse continue;
                     const col: u32 = 0;
                     // msg_set_pos has no win handle; pass 0 (no window mapping stored)
-                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1) catch |err| switch (err) {
+                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1, true) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("msg_set_pos rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
                             return error.TooManyWindowPlacements;
