@@ -107,6 +107,10 @@ pub const Options = struct {
     /// empty shared fixtures dir; scenarios that need a config.toml ship
     /// their own fixture dir (<dir>/zonvie/config.toml layout).
     config_dir: []const u8 = "test/gui/fixtures/config",
+    /// Extra environment for the app, as {name, value} pairs. For settings the
+    /// app reads from the environment rather than from config.toml, which a
+    /// fixture cannot reach.
+    app_env: []const [2][]const u8 = &.{},
 };
 
 pub const Gui = struct {
@@ -199,6 +203,10 @@ pub const Gui = struct {
         const fixtures_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), opts.config_dir, alloc);
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
+
+        for (opts.app_env) |pair| {
+            try g.app_env.put(pair[0], pair[1]);
+        }
 
         // Optional home isolation (persisted app state, frame autosave).
         if (opts.home_dir) |home| {

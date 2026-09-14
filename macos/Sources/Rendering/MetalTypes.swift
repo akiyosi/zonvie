@@ -2283,6 +2283,39 @@ func shiftSurfaceRowIndices(
     rows.insert(integersIn: vacatedStart..<(vacatedStart + shift))
 }
 
+/// Carry the marks a published row shift moved, for a surface whose in-bracket
+/// marks land in `pending` as well as in its own flush set.
+///
+/// A shift is published by the commit, not by the callback that staged it: a
+/// bracket that cancels leaves the committed rows where they were, so marks an
+/// earlier bracket left have to be shifted against the shift that actually
+/// reached the screen. But the core dispatches every row-shift hint before it
+/// generates any vertices for that flush (`dispatchGridRowScroll` in
+/// src/core/flush.zig runs ahead of the vertex passes), so marks this bracket
+/// made already name post-shift rows and must be left alone.
+///
+/// The two groups are told apart by `carried`, a snapshot of `pending` taken
+/// when the bracket opened — NOT by subtracting this bracket's marks. A row
+/// number can be in both groups at once and mean different rows: with one
+/// scroll between them, an old mark on row 7 describes content now at row 6
+/// while a new mark on row 7 describes what was just drawn there, and both
+/// rows have to be repainted. Deriving one group from the other collapses that
+/// pair into a single mark and leaves row 6 stale.
+func mergePublishedScrollDirtyRows(
+    pending: inout IndexSet,
+    carried: IndexSet,
+    rowStart: Int,
+    rowEnd: Int,
+    rowsDelta: Int
+) {
+    var shifted = carried
+    shiftSurfaceRowIndices(&shifted, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta)
+    // The carried marks name pre-shift rows and are replaced by where their
+    // content went; anything else in `pending` is this bracket's and stays.
+    pending.subtract(carried)
+    pending.formUnion(shifted)
+}
+
 /// Copy buffer set state from source to destination for the start of a new flush.
 /// Before copying src's buffer references into dst's independently-owned Array,
 /// dst's own buffers are saved into the detach pool. On buffer detach, pool buffers
