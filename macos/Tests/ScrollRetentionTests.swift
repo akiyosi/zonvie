@@ -696,6 +696,53 @@ private enum ScrollRetentionTests {
         require(untouched.contains(5), "and leaves the original mark where it was")
     }
 
+    /// A surface whose in-bracket row marks land in the pending set as well as
+    /// in its own flush set, which is what ExternalGridView's
+    /// submitVerticesRowRaw does. Its commit has to move one of those groups
+    /// and not the other, told apart by the snapshot the bracket opened with.
+    private static func verifyOnlyCarriedMarksAreShiftedAtCommit() {
+        // Row 10 was marked by an EARLIER bracket and no draw consumed it.
+        // Row 3 was marked by THIS bracket, after the core had already sent
+        // the shift hint, so it names a post-shift row already.
+        let carried: IndexSet = [10]
+        var pending: IndexSet = [10, 3]
+        mergePublishedScrollDirtyRows(
+            pending: &pending,
+            carried: carried,
+            rowStart: 0,
+            rowEnd: 20,
+            rowsDelta: 1
+        )
+        require(pending.contains(9), "a mark carried from an earlier bracket follows its content")
+        require(!pending.contains(10), "and does not stay at the pre-shift row")
+        require(pending.contains(3), "a mark made after the hint stays where it was made")
+        require(
+            !pending.contains(2),
+            "and is not shifted again onto the row above it"
+        )
+        // The vacated band still has to be redrawn: those rows lost their
+        // vertices whoever marked what.
+        require(pending.contains(19), "the vacated band is marked")
+
+        // The same row number in BOTH groups names two different rows: the old
+        // mark's content moved up one, the new mark's content is what was just
+        // drawn there. Both need painting, so neither may swallow the other.
+        // Deriving the carried group by subtraction loses the first of them.
+        let bothCarried: IndexSet = [7]
+        var both: IndexSet = [7]
+        mergePublishedScrollDirtyRows(
+            pending: &both,
+            carried: bothCarried,
+            rowStart: 0,
+            rowEnd: 20,
+            rowsDelta: 1
+        )
+        // commitFlush merges this bracket's own marks back in afterwards.
+        both.formUnion([7])
+        require(both.contains(6), "the carried mark's content is followed to its new row")
+        require(both.contains(7), "and this bracket's own mark still names the row it drew")
+    }
+
     static func main() {
         verifyPlan()
         verifyCoversBand()
@@ -706,6 +753,7 @@ private enum ScrollRetentionTests {
         verifyScrollOffsetLookup()
         verifyFloatDebtLedger()
         verifyDirtyRowsTravelWithTheShift()
+        verifyOnlyCarriedMarksAreShiftedAtCommit()
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             // Headless CI without a GPU: the arithmetic above still ran.

@@ -308,6 +308,17 @@ test "gui:visual_continuous_j_scroll_matches_jump" {
     }
 }
 
+test "gui:visual_extwin_continuous_j_scroll_matches_jump" {
+    // macOS only: it drives the macOS external-window surface and reads that
+    // frontend's [ext_applyRowScroll] line.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extwin_continuous_j_scroll_matches_jump.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_incremental_scroll_matches_jump" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
@@ -407,6 +418,28 @@ test "gui:cmdline_cursor_shader_rect" {
     if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/macos/cmdline_cursor_shader_rect.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extfloat_hosted_cursor_shader_rect" {
+    // macOS only: the shader cursor plumbing and the window enumeration this
+    // uses live in the macOS frontend and macos_window.zig.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extfloat_hosted_cursor_shader_rect.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_shader_preserves_alpha" {
+    // macOS only: the two-variant custom shader chain (decorated vs editor)
+    // exists in the macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_shader_preserves_alpha.zig").run(testing.allocator);
     } else {
         return error.SkipZigTest;
     }
