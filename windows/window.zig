@@ -2592,11 +2592,25 @@ pub export fn WndProc(
                         // rcPaint to nothing on every paint. The app's own damage
                         // (tbs.pending_dirty -> dirty_row_keys, plus
                         // paint_full_snapshot) is what computeRowsToDraw reads.
+                        // A cursor that moved to another grid forces one too.
+                        // cursor_erase_rows below carries the row the LAST paint
+                        // drew the cursor on, and that row belongs to whichever
+                        // grid held the cursor then; everything that places it
+                        // — the rows_to_draw insert, markLayerCursorRow — uses
+                        // the grid holding it now. Under ext_multigrid every
+                        // window is a layer, so a cursor leaving one would have
+                        // its old row repainted in the wrong window and the old
+                        // block would stay. A window switch is a user action and
+                        // already repaints most of the surface. Same reasoning,
+                        // and the same fix, as drawNormalExternalSurfaceRowMode.
+                        const cursor_grid_changed =
+                            tbs_snapshot.cursor_layer_grid_id != app.last_painted_cursor_grid;
                         const force_full_rows =
                             did_need_seed or
                             paint_full_snapshot or
                             seed_clear_pending_snapshot or
                             (seed_pending_snapshot and !back_tex_valid_snapshot) or
+                            cursor_grid_changed or
                             glow_enabled or
                             (g.opacity < 1.0);
 
@@ -3488,6 +3502,10 @@ pub export fn WndProc(
                             cursor_overlay_failed = true;
                             if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
                         };
+                        // Paired with the row drawCursorOverlay just recorded, so
+                        // the next paint can tell whether that row is one it can
+                        // still place. See cursor_grid_changed above.
+                        app.last_painted_cursor_grid = cursor_grid;
                         if (cursor_layer_row_index != null) app.mu.unlock(core.clock.io());
 
                         // Post-process bloom (neon glow) for row-mode

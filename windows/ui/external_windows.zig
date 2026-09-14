@@ -708,8 +708,25 @@ fn drawNormalExternalSurfaceRowMode(
     // premultiplied alpha blending accumulates alpha on redrawn rows
     // unless back_tex is cleared first, which requires force_full to
     // set preserve_back=false → should_clear=true in drawEx.
+    // Layers do NOT force full rows: they carry their own per-layer redraw
+    // plan (planLayerFrame / drawSurfaceLayers), the same one the main window
+    // runs, and forcing every row here skipped the root's pixel-copy scroll
+    // and the plan's own partial redraw for the sake of a float sitting on the
+    // surface.
     const has_layers = tbs_snap.layers.len > 1;
-    const force_full_rows = force_full or has_layers or
+    // The cursor moving to another grid does force one, though. The row left
+    // over from the last paint is that grid's own row, and the only origin
+    // this frame knows is the one the cursor is on NOW: a cursor leaving a
+    // float at surface row 11 would have row 1 repainted instead, and the old
+    // block would sit in the float until something else happened to redraw it.
+    // A window switch is a user action, and the frames around one are already
+    // repainting most of the surface, so buying correctness with a full paint
+    // costs little. Placing each remembered row with its own grid would be the
+    // narrower fix; it needs the surface coordinates of a grid that may no
+    // longer be placed, which is more machinery than the case is worth.
+    const cursor_grid_changed = tbs_snap.cursor_layer_grid_id != ext_win.last_painted_cursor_grid;
+    const force_full_rows = force_full or
+        cursor_grid_changed or
         glow_enabled or
         (g.opacity < 1.0);
 
@@ -726,17 +743,65 @@ fn drawNormalExternalSurfaceRowMode(
         ext_rows, // max_valid_row = total rows (no row_verts_len / rows mismatch on ext)
     )) return error.OutOfMemory;
 
+    const cursor_row_before = ext_win.last_painted_cursor_row;
+
+    // The rows the cursor overlay would otherwise erase: where the previous
+    // cursor was baked into back_tex, and where this one lands. Repainting
+    // them from their own grid's vertices is what removes the previous cursor,
+    // so the overlay's blink-off clear — a full-content-width band that would
+    // wipe the layers drawn over this row — never has to run. Same two rows
+    // the main window collects (window.zig's cursor_erase_rows).
+    const cursor_erase_rows: [2]?u32 = .{
+        cursor_row_before,
+        tbs_cursor.last_cursor_row,
+    };
+    const cursor_on_root = tbs_snap.cursor_layer_grid_id == grid_id;
+    // Where the cursor's own grid sits inside this surface. Its rows are that
+    // grid's local rows, so everything that turns one into a surface rectangle
+    // — the overlay draw and the present damage alike — has to add this.
+    var cursor_layer_x_px: i32 = 0;
+    var cursor_layer_y_px: i32 = 0;
+    if (!cursor_on_root) {
+        for (tbs_snap.layers.slice()) |layer| {
+            if (layer.grid_id != tbs_snap.cursor_layer_grid_id) continue;
+            cursor_layer_x_px = layer.x_px;
+            cursor_layer_y_px = layer.y_px;
+            break;
+        }
+    }
+    if (cursor_on_root and has_layers and !force_full_rows) {
+        for (cursor_erase_rows) |maybe_row| {
+            const r = maybe_row orelse continue;
+            if (r >= ext_rows) continue;
+            _ = render_pipeline_helpers.insertSortedRow(app.alloc, rows_to_draw, r);
+        }
+    }
+
     const has_cursor = tbs_cursor.verts.items.len > 0;
     const has_scrollbar_work = scrollbar_alpha > 0.001 or
         restored_scrollbar_rect != null or
         g.hasScrollbarUnderlay();
-    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and !has_scrollbar_work) {
+    // A layer's own rows can be the only thing that changed: the host was
+    // invalidated for exactly that, and grid 1 holds no cells under
+    // ext_multigrid, so rows_to_draw is empty and the layer would never draw.
+    const any_layer_dirty = blk_dirty: {
+        if (!has_layers) break :blk_dirty false;
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        for (tbs_snap.layers.slice()[1..]) |layer| {
+            const state = app.layer_grids.get(layer.grid_id) orelse continue;
+            if (state.dirty) break :blk_dirty true;
+        }
+        break :blk_dirty false;
+    };
+    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
+        !has_scrollbar_work and !any_layer_dirty)
+    {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
         ext_win.paint_present_rects.clearRetainingCapacity();
         return false;
     }
 
-    const cursor_row_before = ext_win.last_painted_cursor_row;
     var scroll_damage: ?c.RECT = null;
 
     const draw_params = app_mod.RowModeDrawParams{
@@ -786,6 +851,44 @@ fn drawNormalExternalSurfaceRowMode(
             );
             if (!shift_result.rows_complete) return error.OutOfMemory;
             scroll_damage = shift_result.scroll_rect;
+
+            // scrollBackTex moved every pixel of the region, a layer composited
+            // into it included. planLayerFrame repaints each layer at its own
+            // placement, which restores where the layer IS — but the rows its
+            // pixels were dragged ONTO belong to the root, and the root only
+            // redraws the band the scroll vacated. A fixed float at rows 10-14
+            // scrolled up one leaves a strip of itself on row 9 that nobody
+            // owns.
+            //
+            // Mark the root rows each layer's pixels can have reached. The span
+            // is taken in both directions rather than from the sign of the
+            // shift: it costs one extra band height, and getting the direction
+            // wrong would leave exactly the ghost this is here to remove. The
+            // rows are marked before planLayerFrame, so its own step 2 also
+            // repaints the layers sitting over them.
+            //
+            // The main window never needs this: under ext_multigrid its root
+            // grid holds no cells and does not scroll, and without multigrid it
+            // has no layers.
+            if (has_layers and row_h_px > 0 and tbs_snap.scroll_dy_px != 0) {
+                const shift_rows: u32 = @intCast(@abs(@divTrunc(tbs_snap.scroll_dy_px, row_h_px)));
+                for (tbs_snap.layers.slice()[1..]) |layer| {
+                    const span = render_pipeline_helpers.rootRowsLayerScrollReached(
+                        layer.y_px,
+                        layer.rows,
+                        shift_rows,
+                        row_h_px,
+                        ext_rows,
+                    ) orelse continue;
+                    if (!render_pipeline_helpers.mergeSortedRowsWithRange(
+                        app.alloc,
+                        rows_to_draw,
+                        &ext_win.scroll_rows_merge_scratch,
+                        span[0],
+                        span[1],
+                    )) return error.OutOfMemory;
+                }
+            }
         }
     } else {
         // Consume pending shift state to avoid stale accumulation.
@@ -795,6 +898,16 @@ fn drawNormalExternalSurfaceRowMode(
             app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, tbs_snap.scroll_row_start, tbs_snap.scroll_row_end, ext_win.row_vbs_shift_scratch.items);
         }
     }
+
+    // Damage for this frame. Reserved for every row span plus one rectangle
+    // per layer; the layer rectangles are appended under the same lock as the
+    // plan below, and the row spans after the draws.
+    const present_rects = &ext_win.paint_present_rects;
+    present_rects.clearRetainingCapacity();
+    present_rects.ensureTotalCapacity(
+        app.alloc,
+        rows_to_draw.items.len + 5 + tbs_snap.layers.len,
+    ) catch return error.OutOfMemory;
 
     var layer_layout_stale = false;
     var layer_commit_stale = false;
@@ -825,8 +938,37 @@ fn drawNormalExternalSurfaceRowMode(
             .cursor_grid = tbs_snap.cursor_layer_grid_id,
             .last_cursor_row = ext_win.last_painted_cursor_row,
             .rows_to_draw = rows_to_draw.items,
+            // The blit moved every layer inside the region, not only the rows
+            // it vacated; the plan repaints those. Without this a scrolled
+            // surface dragged its floats with the copied pixels.
+            .root_scroll_rect = scroll_damage,
             .log_enabled = log_enabled,
         });
+
+        // Layers paint whole; present each one that changed. Their rows are
+        // not in rows_to_draw, which only covers the root grid's own dirty
+        // rows. Under the same lock as the plan and the draw, so a store
+        // landing between them cannot have its flag dropped below.
+        const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
+        const client_right: i32 = @intCast(g.width);
+        const client_bottom: i32 = @intCast(draw_params.content_height);
+        for (tbs_snap.layers.slice()[1..]) |layer| {
+            const state = app.layer_grids.get(layer.grid_id) orelse continue;
+            state.paint_has_present_rect = false;
+            if (!state.dirty) continue;
+            const l: i32 = @max(0, layer.x_px);
+            const t: i32 = @max(0, layer.y_px);
+            const rc: c.RECT = .{
+                .left = l,
+                .top = t,
+                .right = @min(client_right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
+                .bottom = @min(client_bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
+            };
+            if (rc.right > rc.left and rc.bottom > rc.top) {
+                present_rects.appendAssumeCapacity(rc);
+                state.paint_has_present_rect = true;
+            }
+        }
     }
 
     // TBS lock-free draw: committed set is protected by refcount,
@@ -857,6 +999,37 @@ fn drawNormalExternalSurfaceRowMode(
         const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
         if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
         defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
+
+        // What row_already_redrawn promises drawCursorOverlay: this frame
+        // repainted the cursor's OWN grid's row, so blink-on needs only the
+        // cursor quad and blink-off needs nothing. A layer's rows have to be
+        // claimed here, after planLayerFrame settled the redraw set and before
+        // drawSurfaceLayers' defer clears it; the root's went into rows_to_draw
+        // above, so membership decides there.
+        var cursor_row_redrawn = force_full_rows;
+        if (has_layers and !force_full_rows and !layer_layout_stale and !layer_commit_stale) {
+            var claimed = true;
+            if (cursor_on_root) {
+                for (cursor_erase_rows) |maybe_row| {
+                    const r = maybe_row orelse continue;
+                    if (std.mem.indexOfScalar(u32, rows_to_draw.items, r) == null) claimed = false;
+                }
+            } else {
+                for (cursor_erase_rows) |maybe_row| {
+                    const r = maybe_row orelse continue;
+                    if (!app_mod.markLayerCursorRow(
+                        app,
+                        tbs_snap.layers.slice(),
+                        tbs_snap.cursor_layer_grid_id,
+                        r,
+                        @intCast(@max(1, app.cell_w_px)),
+                        row_h_px,
+                    )) claimed = false;
+                }
+            }
+            cursor_row_redrawn = claimed;
+        }
+
         if (has_layers and !layer_layout_stale and !layer_commit_stale) {
             layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
                 .x = 0,
@@ -864,27 +1037,31 @@ fn drawNormalExternalSurfaceRowMode(
                 .w = @floatFromInt(app_mod.rowModeViewportWidth(g, draw_params)),
                 .h = @floatFromInt(draw_params.content_height),
             }, 0, 0, content_right, row_h_px, result.ctx_ptr, result.rs_set_sc_fn, log_enabled);
+            // Only a layer that got one of the rectangles published above has
+            // its dirty flag consumed: one the core made dirty after that loop
+            // has no rect covering it, so it keeps the flag and the next paint
+            // presents it. A present that then fails re-arms these.
+            for (tbs_snap.layers.slice()[1..]) |layer| {
+                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                if (state.paint_has_present_rect) state.dirty = false;
+            }
         }
         var cursor_origin_x: f32 = 0;
         var cursor_origin_y: f32 = 0;
         var cursor_layer_row: ?*app_mod.RowVerts = null;
         var cursor_row_dy_px: f32 = 0;
-        if (tbs_snap.cursor_layer_grid_id != grid_id) {
-            for (tbs_snap.layers.slice()) |layer| {
-                if (layer.grid_id != tbs_snap.cursor_layer_grid_id) continue;
-                cursor_origin_x = @floatFromInt(layer.x_px);
-                cursor_origin_y = @floatFromInt(layer.y_px);
-                if (app.layer_grids.get(layer.grid_id)) |state| {
-                    if (tbs_cursor.last_cursor_row) |row| {
-                        if (row < state.rows_buf.items.len) {
-                            cursor_layer_row = &state.rows_buf.items[row];
-                            if (row < state.origin_rows.items.len) {
-                                cursor_row_dy_px = @floatFromInt((@as(i32, @intCast(row)) - @as(i32, @intCast(state.origin_rows.items[row]))) * row_h_px);
-                            }
+        if (!cursor_on_root) {
+            cursor_origin_x = @floatFromInt(cursor_layer_x_px);
+            cursor_origin_y = @floatFromInt(cursor_layer_y_px);
+            if (app.layer_grids.get(tbs_snap.cursor_layer_grid_id)) |state| {
+                if (tbs_cursor.last_cursor_row) |row| {
+                    if (row < state.rows_buf.items.len) {
+                        cursor_layer_row = &state.rows_buf.items[row];
+                        if (row < state.origin_rows.items.len) {
+                            cursor_row_dy_px = @floatFromInt((@as(i32, @intCast(row)) - @as(i32, @intCast(state.origin_rows.items[row]))) * row_h_px);
                         }
                     }
                 }
-                break;
             }
         }
         // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
@@ -908,13 +1085,25 @@ fn drawNormalExternalSurfaceRowMode(
             // an in-place shape change, so erase the stale overlay before redrawing.
             // A full-row frame already cleared the back texture and redrew every row;
             // clearing again would accumulate alpha on the cursor row when transparent.
-            .erase_cursor_row = !force_full_rows,
-            .row_already_redrawn = force_full_rows,
+            //
+            // With layers the erase is forbidden whatever it would fix: it
+            // clears a band the full content width and can refill it from one
+            // grid only, so it would wipe the layers just drawn over that row.
+            // The claim above repaints the row from its own grid instead, which
+            // is what removes the previous cursor. The main window works the
+            // same way and never erases.
+            .erase_cursor_row = !force_full_rows and !has_layers,
+            .row_already_redrawn = cursor_row_redrawn,
             .cursor_layer_origin_x_px = cursor_origin_x,
             .cursor_layer_origin_y_px = cursor_origin_y,
             .cursor_layer_row = cursor_layer_row,
             .cursor_layer_row_dy_px = cursor_row_dy_px,
         });
+        // Paired with the row drawCursorOverlay just recorded: the next paint
+        // reads both to decide whether the remembered row is still one it can
+        // place. Set even when the overlay recorded no row, so a blink-off
+        // frame cannot leave the pair naming different paints.
+        ext_win.last_painted_cursor_grid = tbs_snap.cursor_layer_grid_id;
     }
 
     // This frame is incomplete: fail the paint the same way a root row does,
@@ -933,11 +1122,9 @@ fn drawNormalExternalSurfaceRowMode(
     // taking pre-reserved capacity would turn the main path's tolerant catch
     // into a panic on a short reservation. Reviewed under the 2026-08-25 audit,
     // observation 1, finding 332; left duplicated on purpose. The tail is
-    // already shared through compactDamageRects.
-    const present_rects = &ext_win.paint_present_rects;
-    present_rects.clearRetainingCapacity();
-    present_rects.ensureTotalCapacity(app.alloc, rows_to_draw.items.len + 5) catch return error.OutOfMemory;
-
+    // already shared through compactDamageRects. Cleared and reserved before
+    // the layer plan above, which publishes each drawn layer's rectangle into
+    // it; only the row spans are appended here.
     var span_start: ?u32 = null;
     var span_end: u32 = 0;
     for (rows_to_draw.items) |row| {
@@ -970,20 +1157,29 @@ fn drawNormalExternalSurfaceRowMode(
 
     // Cursor shape/blink changes can clear/redraw a row even when no content
     // row was dirty. Include both the old and new overlay rows.
+    //
+    // Both are rows of the cursor's OWN grid, so a cursor inside a layer needs
+    // that layer's origin added to reach the surface row it was drawn on —
+    // the same term drawCursorOverlay draws it with. Without it a float's
+    // cursor was drawn at one row and presented at another, so a cursor-only
+    // update or a blink tick could reach back_tex and never reach the screen.
+    // (The main window builds this rect from the cursor vertices plus the same
+    // origin; see window.zig's cursor_rc_opt.)
+    const cursor_rect_top_px: i32 = cursor_layer_y_px;
     if (cursor_row_before) |row| {
         present_rects.appendAssumeCapacity(.{
             .left = 0,
-            .top = @as(i32, @intCast(row)) * row_h_px,
+            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(row + 1)) * row_h_px,
+            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
     }
     if (ext_win.last_painted_cursor_row) |row| {
         present_rects.appendAssumeCapacity(.{
             .left = 0,
-            .top = @as(i32, @intCast(row)) * row_h_px,
+            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(row + 1)) * row_h_px,
+            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
     }
 
@@ -3533,8 +3729,24 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         // and its padding. off_x/off_y reach the window, this
                         // reaches the content inside it.
                         const content_origin = decoratedContentOriginPx(app, surface_kind);
-                        const center_x = off_x + content_origin.x + (minx_c + maxx_c) * 0.5;
-                        const center_y = off_y + content_origin.y + (miny_c + maxy_c) * 0.5;
+                        // A cursor on a grid this surface draws as a LAYER is
+                        // in that layer's pixels, and the layer sits at its own
+                        // origin inside the surface. The overlay draw above
+                        // already adds it; without the same term here the
+                        // shader burned at the window's top-left corner
+                        // whenever the cursor was inside a hosted float.
+                        var layer_x: f32 = 0;
+                        var layer_y: f32 = 0;
+                        if (tbs_snapshot.cursor_layer_grid_id != grid_id) {
+                            for (tbs_snapshot.layers.slice()) |layer| {
+                                if (layer.grid_id != tbs_snapshot.cursor_layer_grid_id) continue;
+                                layer_x = @floatFromInt(layer.x_px);
+                                layer_y = @floatFromInt(layer.y_px);
+                                break;
+                            }
+                        }
+                        const center_x = off_x + content_origin.x + layer_x + (minx_c + maxx_c) * 0.5;
+                        const center_y = off_y + content_origin.y + layer_y + (miny_c + maxy_c) * 0.5;
                         const cell_w: f32 = @floatFromInt(app.cell_w_px);
                         const cell_h: f32 = @floatFromInt(app.rowHeightPx());
                         const left_main = center_x - cell_w * 0.5;
@@ -3855,6 +4067,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
                 app.row_vb_budget_failed = true;
+                // Unlike every other failure here, this one does not requeue a
+                // full paint, so nothing would restore the per-layer redraw set
+                // planLayerFrame already swapped out. The main window re-arms
+                // on its own budget failure for the same reason.
+                if (tbs_snapshot.layers.len > 1) {
+                    app.mu.lockUncancelable(core.clock.io());
+                    app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
+                    app.mu.unlock(core.clock.io());
+                }
                 if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
                 return;
             }

@@ -1039,6 +1039,40 @@ test "a root dirty band marks the layer rows it overpaints" {
     try std.testing.expect(helpers.bandLayerRows(400, 420, 100, 2, row_h_px) == null);
 }
 
+test "the root repaints the rows its scroll copy dragged a layer onto" {
+    // row_h_px is 20 here, so a float at y=200 covers rows 10..14.
+    // A one-row scroll can carry its pixels to row 9 (up) or row 15 (down),
+    // and the root owns both: the layer only repaints rows 10..14.
+    try std.testing.expectEqual(
+        [2]u32{ 9, 16 },
+        helpers.rootRowsLayerScrollReached(200, 5, 1, row_h_px, 40).?,
+    );
+    // A three-row scroll reaches three rows either side.
+    try std.testing.expectEqual(
+        [2]u32{ 7, 18 },
+        helpers.rootRowsLayerScrollReached(200, 5, 3, row_h_px, 40).?,
+    );
+    // No scroll: the layer's own band, which the layer repaints anyway. Marking
+    // it costs a redraw, never a ghost.
+    try std.testing.expectEqual(
+        [2]u32{ 10, 15 },
+        helpers.rootRowsLayerScrollReached(200, 5, 0, row_h_px, 40).?,
+    );
+    // Clamped at both edges of the surface rather than wrapping or going
+    // negative: a float at the very top scrolled up reaches no further.
+    try std.testing.expectEqual(
+        [2]u32{ 0, 4 },
+        helpers.rootRowsLayerScrollReached(0, 2, 2, row_h_px, 40).?,
+    );
+    try std.testing.expectEqual(
+        [2]u32{ 36, 40 },
+        helpers.rootRowsLayerScrollReached(760, 2, 2, row_h_px, 40).?,
+    );
+    // A layer with no rows owns nothing, and neither does a zero-row surface.
+    try std.testing.expect(helpers.rootRowsLayerScrollReached(200, 0, 1, row_h_px, 40) == null);
+    try std.testing.expect(helpers.rootRowsLayerScrollReached(200, 5, 1, row_h_px, 0) == null);
+}
+
 test "layer scrolls in one flush accumulate per region and saturate" {
     const first: helpers.LayerScroll =
         .{ .row_start = 2, .row_end = 20, .rows_delta = 3, .total_rows = 20, .total_cols = 80 };

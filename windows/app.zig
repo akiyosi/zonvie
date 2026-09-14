@@ -2341,6 +2341,11 @@ pub const ExternalWindow = struct {
     // Scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.
     last_painted_cursor_row: ?u32 = null,
+    /// Which grid the row above belongs to. A surface draws one cursor, but the
+    /// grid that owns it changes as the user moves between windows, and the row
+    /// is that grid's OWN row — so a row remembered from the last paint cannot
+    /// be placed with the grid holding the cursor now.
+    last_painted_cursor_grid: i64 = 0,
 
     // Scrollbar state for external windows
     scrollbar_visible: bool = false,
@@ -4682,6 +4687,8 @@ pub const App = struct {
     // Row index where cursor was last painted into back_tex.
     // Used by scrollBackTex to erase cursor ghost before shifting.
     last_painted_cursor_row: ?u32 = null,
+    /// Which grid the row above belongs to; see the same field on ExternalWindow.
+    last_painted_cursor_grid: i64 = 0,
 
     // Scratch buffer for WM_PAINT(row): per-row vertex copy.
     // Reused to avoid per-paint alloc/free.
