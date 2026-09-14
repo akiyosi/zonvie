@@ -851,6 +851,21 @@ pub fn onVerticesRow(
         if (grid_id == 1) {
             if (vert_count == 0 and app.tbs.cursorLayerGridIdInFlush() != grid_id) {
                 traceRender(app, "event=cursor_ignore surface=1 grid={d} owner={d} reason=empty_nonowner\n", .{ grid_id, app.tbs.cursorLayerGridIdInFlush() });
+                // This empty callback carries the blink refresh: the core sends
+                // it on every cursor_rev bump (mode_change / mode_info_set)
+                // even when the cursor lives on another surface, and
+                // onVerticesPartial's post below the return is the only thing
+                // that asks the UI thread to re-read guicursor. Returning
+                // without it left blinkon/blinkoff stale for as long as the
+                // cursor stayed in an external window.
+                const hwnd_for_blink = blk_hwnd: {
+                    app.mu.lockUncancelable(core.clock.io());
+                    defer app.mu.unlock(core.clock.io());
+                    break :blk_hwnd app.hwnd;
+                };
+                if (hwnd_for_blink) |hwnd| {
+                    _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
+                }
                 return;
             }
             app.tbs.stageCursorLayerGrid(1);

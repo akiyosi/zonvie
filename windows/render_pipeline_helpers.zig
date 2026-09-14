@@ -983,6 +983,37 @@ pub fn bandLayerRows(
     return .{ @intCast(first), @intCast(last) };
 }
 
+/// The ROOT rows a layer's pixels can occupy after the root's own scroll copy
+/// moved them, as a half-open [from, to) clamped to `surface_rows`.
+///
+/// The copy shifts every pixel of its region, the layer composited into it
+/// included, but the root only redraws the band the scroll vacated — so the
+/// rows the layer was dragged onto keep a strip of it that nothing else owns.
+/// Those rows have to be repainted from the root.
+///
+/// The span reaches `shift_rows` in BOTH directions instead of following the
+/// sign of the shift. It costs one extra band height, and a sign taken the
+/// wrong way would leave exactly the ghost this exists to remove.
+///
+/// Null when the layer has no rows or nothing of the span is on the surface.
+pub fn rootRowsLayerScrollReached(
+    origin_y_px: i32,
+    layer_rows: u32,
+    shift_rows: u32,
+    row_h_px: i32,
+    surface_rows: u32,
+) ?[2]u32 {
+    if (row_h_px <= 0 or layer_rows == 0 or surface_rows == 0) return null;
+    const h: i64 = row_h_px;
+    const band_top: i64 = @divFloor(@as(i64, origin_y_px), h);
+    const band_bottom: i64 = band_top + @as(i64, layer_rows);
+    const reach: i64 = @as(i64, shift_rows);
+    const from: i64 = @max(0, band_top - reach);
+    const to: i64 = @min(@as(i64, surface_rows), band_bottom + reach);
+    if (to <= from) return null;
+    return .{ @intCast(from), @intCast(to) };
+}
+
 /// One layer grid's pending row scroll, accumulated across a flush.
 pub const LayerScroll = struct {
     row_start: u32,
