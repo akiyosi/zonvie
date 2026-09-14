@@ -52,8 +52,21 @@ pub fn openWithLog(alloc: std.mem.Allocator, log_path: []const u8) !*Gui {
 }
 
 pub fn openWithLogAndConfig(alloc: std.mem.Allocator, log_path: []const u8, config_dir: []const u8) !*Gui {
+    return openWithLogConfigAndEnv(alloc, log_path, config_dir, &.{});
+}
+
+pub fn openWithLogConfigAndEnv(
+    alloc: std.mem.Allocator,
+    log_path: []const u8,
+    config_dir: []const u8,
+    app_env: []const [2][]const u8,
+) !*Gui {
     try requireScreenAccess();
-    var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path }, .config_dir = config_dir });
+    var g = try Gui.init(alloc, .{
+        .app_args = &.{ "--log", log_path },
+        .config_dir = config_dir,
+        .app_env = app_env,
+    });
     errdefer g.deinit();
     // Pin the window to a fixed screen position so subpixel (ClearType)
     // rendering is identical run-to-run; the OS otherwise places the window
