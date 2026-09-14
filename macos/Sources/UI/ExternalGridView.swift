@@ -1646,10 +1646,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// shader needs then.
     private func cursorScrollOffsetPxForShader() -> Float? {
         // The cursor rect is shared with the main surface and every other
-        // external window. Only displace it when it is this grid's cursor;
-        // otherwise say nothing and let the owner's value stand.
+        // external window. Only displace it when the cursor is on a grid THIS
+        // surface draws — its own, or one it hosts as a layer; otherwise say
+        // nothing and let the owner's value stand.
+        let owner = lastForwardedCursorGridId
         guard let renderer = mainTerminalView?.renderer,
-              renderer.shaderCursorBelongs(toGrid: gridId) else { return nil }
+              renderer.shaderCursorBelongs(toGrid: owner) else { return nil }
+        // A hosted layer moves with this surface's scroll only when it tracks
+        // the buffer: drawHostedLayers displaces `followsScroll` layers by the
+        // root's offset and leaves the rest where they are, and the cursor
+        // overlay follows the same rule. A fixed float's cursor is drawn at a
+        // standstill, so its effect has to stand still with it.
+        if owner != gridId {
+            tripleBufferLock.lock()
+            let follows = (pendingSurfaceLayers ?? committedSurfaceLayers)
+                .first { $0.gridId == owner }?.followsScroll ?? false
+            tripleBufferLock.unlock()
+            if !follows { return 0 }
+        }
         lock.lock()
         let offset = scrollOffsetActive ? scrollOffsetData : nil
         lock.unlock()
@@ -2366,19 +2380,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let botPx = offY + vpOriginY + cursorOrigin.y + local.maxY
         // Ghostty's cursor shaders treat iCurrentCursor.y as the
         // BOTTOM edge of the cursor rect (rect spans y-h..y).
-        // Tag the rect with this window's grid so the shader-cursor position
-        // follows its smooth-scroll displacement the same way the main
-        // window's does. Omitting it does not just leave this window
-        // uncorrected: the cursor shader state is shared with the main view
-        // (renderer is mainView.renderer), so a default of "no grid" would
-        // switch the main window's correction off too.
+        // Tag the rect with the grid the cursor is actually ON, which is this
+        // surface's root for its own cursor and the layer's grid for a float it
+        // hosts. That id is what decides which scroll displacement the shader
+        // cursor is given, so tagging a hosted float's cursor with the surface
+        // would hand it the ROOT's displacement and slide the effect away from
+        // a cursor that never moved. The main renderer tags with the cursor
+        // vertex's own grid_id for the same reason. It must never be left
+        // unset: the cursor shader state is shared with the main view (renderer
+        // is mainView.renderer), so a default of "no grid" would switch the
+        // main window's correction off too.
+        let owner = lastForwardedCursorGridId
         let rect = (leftPx, botPx, rightPx - leftPx, botPx - topPx)
         if reanchor {
             // Window move: no commit will come to publish a staged value, and
             // the cursor has not moved relative to its text.
-            renderer.reanchorCursorShaderState(rect: rect, gridId: gridId)
+            renderer.reanchorCursorShaderState(rect: rect, gridId: owner)
         } else {
-            renderer.setCursorShaderState(rect: rect, color: color, gridId: gridId)
+            renderer.setCursorShaderState(rect: rect, color: color, gridId: owner)
         }
     }
 

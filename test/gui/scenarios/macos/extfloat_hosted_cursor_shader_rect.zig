@@ -125,9 +125,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
     const before_count = before.len;
 
-    // The host: an ordinary editor window given a window of its own.
+    // The host: an ordinary editor window given a window of its own. Its buffer
+    // carries more lines than the window shows, or phase two's <C-e> has
+    // nothing to scroll and that phase guards nothing.
     try g.exec(
-        \\luaeval('(function() _G.z_anchor = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, {external=true, width=60, height=20}) return 1 end)()')
+        \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 200 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
     const ext_win = try waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
@@ -251,5 +253,79 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.CursorShaderRectMisprojected;
     }
 
+    // Phase two: the host scrolls underneath a float that does not track the
+    // buffer. Such a float stays where it is — drawHostedLayers displaces only
+    // `followsScroll` layers — so the cursor inside it is drawn at a standstill
+    // and its effect has to stand still too.
+    //
+    // The rect carries the grid it is on, and that id is what picks the scroll
+    // displacement the shader cursor is given. Tagging a hosted float's cursor
+    // with the SURFACE handed it the root's displacement: the effect slid a
+    // cell up the window while the cursor it tracks never moved.
+    //
+    // Counted over the whole run rather than sampled mid-animation: the ease
+    // decays back to zero, so the settled rect matches in either build and only
+    // the frames in between tell them apart. The log keeps them all.
+    const t2 = try app_log.nowMs(alloc, log_path);
+    const settled_y = at_b.y;
+    // A real <C-e> in the host's own context. winrestview moves the view
+    // without going through the scroll fast path, and seeds no ease — the gate
+    // below caught that. The cursor stays in the float throughout, which is the
+    // configuration under test.
+    try g.exec(
+        \\luaeval('(function() vim.api.nvim_win_call(_G.z_anchor, function() vim.cmd("normal! " .. vim.api.nvim_replace_termcodes("<C-e>", true, false, true)) end) return 1 end)()')
+    );
+    gui_io.sleepNs(1200 * std.time.ns_per_ms);
+
+    // Gate: the host really did ease. Without a live offset neither build
+    // displaces anything and the count below is zero for the wrong reason.
+    const eased = try app_log.countLinesSince(alloc, log_path, "[ExternalGridView] scroll offset:", t2);
+    std.debug.print("[gui] host scroll offset frames: {d}\n", .{eased});
+    if (eased == 0) {
+        std.debug.print("[gui] the host never displaced its grid, so this phase would guard nothing\n", .{});
+        return error.HostDidNotScroll;
+    }
+
+    const moved = try countRectsWithOtherY(alloc, t2, at_b.x, settled_y);
+    std.debug.print(
+        "[gui] shader cursor rects at a different y while the host eased: {d} (settled y={d:.0})\n",
+        .{ moved, settled_y },
+    );
+    if (moved != 0) {
+        std.debug.print(
+            "[gui] the cursor effect moved with the HOST's scroll although the float it sits in is fixed\n",
+            .{},
+        );
+        return error.FixedFloatCursorFollowedHostScroll;
+    }
+
     std.debug.print("[gui] PASS: the hosted float's cursor reaches the shader at the float's own origin\n", .{});
+}
+
+/// How many shader cursor rects published since `since_ms` sit at the float's
+/// cursor column but at a y other than `settled_y`. The cursor did not move, so
+/// each one is the effect being displaced by a scroll that is not its own.
+///
+/// Selected by x rather than by the logged grid: the grid tag is the thing
+/// under test here, so a build with the defect would be filtered by the very
+/// value the fix corrects. The host's own cursor sits in another column and is
+/// excluded by that alone — it is published while the win_call below runs.
+fn countRectsWithOtherY(
+    alloc: std.mem.Allocator,
+    since_ms: f64,
+    float_x: f64,
+    settled_y: f64,
+) !usize {
+    const blob = try app_log.linesSince(alloc, log_path, marker, since_ms);
+    defer alloc.free(blob);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, blob, '\n');
+    while (it.next()) |line| {
+        const x = app_log.field(line, "x") orelse continue;
+        if (@abs(x - float_x) > tolerance_px) continue;
+        const y = app_log.field(line, "y") orelse continue;
+        if (@abs(y - settled_y) <= tolerance_px) continue;
+        n += 1;
+    }
+    return n;
 }
