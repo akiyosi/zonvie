@@ -44,7 +44,9 @@ pub const capture = switch (builtin.os.tag) {
 };
 
 pub const default_app_rel_path = switch (builtin.os.tag) {
-    .windows => "windows/zig-out/bin/zonvie.exe",
+    // build.zig installs the Windows exe directly into windows/zig-out, with
+    // no bin/ subdirectory.
+    .windows => "windows/zig-out/zonvie.exe",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
 };
 
@@ -105,6 +107,10 @@ pub const Options = struct {
     /// empty shared fixtures dir; scenarios that need a config.toml ship
     /// their own fixture dir (<dir>/zonvie/config.toml layout).
     config_dir: []const u8 = "test/gui/fixtures/config",
+    /// Extra environment for the app, as {name, value} pairs. For settings the
+    /// app reads from the environment rather than from config.toml, which a
+    /// fixture cannot reach.
+    app_env: []const [2][]const u8 = &.{},
 };
 
 pub const Gui = struct {
@@ -159,8 +165,15 @@ pub const Gui = struct {
         errdefer alloc.free(g.listen_addr);
 
         // 1. Shared nvim server (headless, clean).
+        //
+        // `-n` disables swap files ('noswapfile'), for the same reason
+        // test/e2e/harness.zig passes it: every scenario spawns an nvim and
+        // kills it, so each one leaves a swap file behind in the user's real
+        // state directory. They accumulate across runs until nvim answers
+        // E325 "swap file exists" with a |hit-enter| prompt — in the user's
+        // own editor, not just in the tests. A harness never needs swap.
         g.nvim_child = try std.process.spawn(gui_io.io(), .{
-            .argv = &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
+            .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
@@ -190,6 +203,10 @@ pub const Gui = struct {
         const fixtures_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), opts.config_dir, alloc);
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
+
+        for (opts.app_env) |pair| {
+            try g.app_env.put(pair[0], pair[1]);
+        }
 
         // Optional home isolation (persisted app state, frame autosave).
         if (opts.home_dir) |home| {

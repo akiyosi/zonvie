@@ -29,8 +29,8 @@ private enum RowScrollBlitPlanTests {
     ) -> RowScrollBlitPlan? {
         RowScrollBlitPlan.make(
             rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta,
-            textureWidthPx: texWidthPx, textureHeightPx: texRows * rowHeightPx,
-            drawableWidthPx: texWidthPx, rowHeightPx: rowHeightPx
+            widthPx: texWidthPx, textureWidthPx: texWidthPx,
+            textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
         )
     }
 
@@ -129,16 +129,16 @@ private enum RowScrollBlitPlanTests {
         require(
             RowScrollBlitPlan.make(
                 rowStart: 0, rowEnd: 44, rowsDelta: 1,
-                textureWidthPx: texWidthPx, textureHeightPx: 44 * rowHeightPx,
-                drawableWidthPx: 0, rowHeightPx: rowHeightPx
+                widthPx: 0, textureWidthPx: texWidthPx,
+                textureHeightPx: 44 * rowHeightPx, rowHeightPx: rowHeightPx
             ) == nil,
             "a zero-width drawable"
         )
         require(
             RowScrollBlitPlan.make(
                 rowStart: 0, rowEnd: 44, rowsDelta: 1,
-                textureWidthPx: texWidthPx, textureHeightPx: 44 * rowHeightPx,
-                drawableWidthPx: texWidthPx, rowHeightPx: 0
+                widthPx: texWidthPx, textureWidthPx: texWidthPx,
+                textureHeightPx: 44 * rowHeightPx, rowHeightPx: 0
             ) == nil,
             "a zero row height"
         )
@@ -148,8 +148,8 @@ private enum RowScrollBlitPlanTests {
     private static func verifyCopyWidth() {
         let narrow = RowScrollBlitPlan.make(
             rowStart: 0, rowEnd: 44, rowsDelta: 1,
-            textureWidthPx: 500, textureHeightPx: 44 * rowHeightPx,
-            drawableWidthPx: 800, rowHeightPx: rowHeightPx
+            widthPx: 800, textureWidthPx: 500,
+            textureHeightPx: 44 * rowHeightPx, rowHeightPx: rowHeightPx
         )
         requireEqual(narrow?.copyWidthPx, 500, "a drawable wider than the texture copies the texture width")
     }
@@ -238,6 +238,114 @@ private enum RowScrollBlitPlanTests {
         )
     }
 
+    /// A layer's rectangle inside the shared back texture: every pixel value
+    /// slides down by the layer's origin, the copy starts at its left edge,
+    /// and the dirty rows stay grid-local -- they number rows within the
+    /// scroll region, not pixels, so the origin must not touch them.
+    private static func verifyLayerOrigin() {
+        let originYPx = 5 * rowHeightPx
+        let originXPx = 400
+        guard let base = plan(rowStart: 0, rowEnd: 20, rowsDelta: 3),
+              let p = RowScrollBlitPlan.make(
+                  rowStart: 0, rowEnd: 20, rowsDelta: 3,
+                  originXPx: originXPx, originYPx: originYPx,
+                  widthPx: 400, textureWidthPx: texWidthPx,
+                  textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
+              )
+        else {
+            require(false, "a layer at an origin produced no plan")
+            return
+        }
+        requireEqual(p.srcYPx, base.srcYPx + originYPx, "the layer origin shifts the read down")
+        requireEqual(p.dstYPx, base.dstYPx + originYPx, "the layer origin shifts the write down")
+        requireEqual(p.clearTopPx, base.clearTopPx + originYPx, "the vacated band starts at the layer")
+        requireEqual(p.clearBottomPx, base.clearBottomPx + originYPx, "the vacated band ends at the layer")
+        requireEqual(p.dirtyRows, base.dirtyRows, "dirty rows are grid-local, the origin does not move them")
+        requireEqual(p.originXPx, originXPx, "the left edge is carried for the encoder")
+        requireEqual(p.copyWidthPx, 400, "the copy spans the layer, not the drawable")
+        // Under a layer transform the caller's pixel space starts at the origin.
+        requireEqual(
+            p.localClearBand().clearTopPx, base.clearTopPx,
+            "the local band drops back to the layer's own space"
+        )
+        requireEqual(
+            p.localClearBand().clearBottomPx, base.clearBottomPx,
+            "the local band drops back to the layer's own space"
+        )
+    }
+
+    /// A layer narrower than the texture copies its own width, and one whose
+    /// left edge sits inside the texture is clamped by what is left of it.
+    private static func verifyNarrowLayer() {
+        let inside = RowScrollBlitPlan.make(
+            rowStart: 0, rowEnd: 44, rowsDelta: 1,
+            widthPx: 300, textureWidthPx: 800,
+            textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
+        )
+        requireEqual(inside?.copyWidthPx, 300, "a narrow layer copies only its own width")
+        let offset = RowScrollBlitPlan.make(
+            rowStart: 0, rowEnd: 44, rowsDelta: 1,
+            originXPx: 600, widthPx: 300, textureWidthPx: 800,
+            textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
+        )
+        requireEqual(offset?.copyWidthPx, 200, "the copy stops at the texture's right edge")
+    }
+
+    /// A layer whose origin is past the bottom of the texture has no rows at
+    /// all: no blit, and nothing to redraw either.
+    private static func verifyLayerFullyOutside() {
+        require(
+            RowScrollBlitPlan.make(
+                rowStart: 0, rowEnd: 20, rowsDelta: 2,
+                originYPx: 50 * rowHeightPx, widthPx: texWidthPx, textureWidthPx: texWidthPx,
+                textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
+            ) == nil,
+            "a layer below the texture has nothing to blit"
+        )
+        require(
+            RowScrollBlitPlan.dirtyRowsWithoutBlit(
+                rowStart: 0, rowEnd: 20, originYPx: 50 * rowHeightPx,
+                textureHeightPx: texRows * rowHeightPx, rowHeightPx: rowHeightPx
+            ) == nil,
+            "a layer below the texture has nothing to redraw"
+        )
+    }
+
+    /// A layer low enough that its own rows run off the bottom: only the rows
+    /// below the origin exist, so rowEnd clamps to those and the copy, the
+    /// dirty rows, and the no-blit fallback all stop at the same row.
+    private static func verifyLayerBottomClamp() {
+        let originYPx = 30 * rowHeightPx
+        let texHeightPx = texRows * rowHeightPx
+        guard let p = RowScrollBlitPlan.make(
+            rowStart: 0, rowEnd: 20, rowsDelta: 2,
+            originYPx: originYPx, widthPx: texWidthPx, textureWidthPx: texWidthPx,
+            textureHeightPx: texHeightPx, rowHeightPx: rowHeightPx
+        ) else {
+            require(false, "a clamped layer produced no plan")
+            return
+        }
+        requireEqual(p.clampedRowEnd, 14, "rowEnd clamps to the rows below the origin")
+        requireEqual(p.dirtyRows, 10..<14, "the dirty expansion stops at the clamped row")
+        require(
+            p.srcYPx + p.copyHeightPx <= texHeightPx,
+            "the read stays inside the texture (got \(p.srcYPx + p.copyHeightPx), texture \(texHeightPx))"
+        )
+        require(
+            p.dstYPx + p.copyHeightPx <= texHeightPx,
+            "the write stays inside the texture (got \(p.dstYPx + p.copyHeightPx), texture \(texHeightPx))"
+        )
+        requireEqual(p.clearBottomPx, texHeightPx, "the vacated band ends at the clamped row")
+        requireEqual(
+            RowScrollBlitPlan.dirtyRowsWithoutBlit(
+                rowStart: 0, rowEnd: 20, originYPx: originYPx,
+                textureHeightPx: texHeightPx, rowHeightPx: rowHeightPx
+            ),
+            0..<14,
+            "the fallback region clamps to the same row as the blit"
+        )
+    }
+
     /// A tiny rgba8 texture, each row filled with its own index, run through
     /// the real blit. After a scroll down by two, rows 0..<6 hold what rows
     /// 2..<8 held, and the vacated bottom two rows are untouched: clearing
@@ -269,8 +377,8 @@ private enum RowScrollBlitPlanTests {
 
         guard let plan = RowScrollBlitPlan.make(
             rowStart: 0, rowEnd: rows, rowsDelta: 2,
-            textureWidthPx: widthPx, textureHeightPx: rows * rowPx,
-            drawableWidthPx: widthPx, rowHeightPx: rowPx
+            widthPx: widthPx, textureWidthPx: widthPx,
+            textureHeightPx: rows * rowPx, rowHeightPx: rowPx
         ) else {
             require(false, "the device case produced no plan")
             return
@@ -312,6 +420,10 @@ private enum RowScrollBlitPlanTests {
         verifyCopyWidth()
         verifySweepInvariants()
         verifyDirtyRowsWithoutBlit()
+        verifyLayerOrigin()
+        verifyNarrowLayer()
+        verifyLayerFullyOutside()
+        verifyLayerBottomClamp()
 
         guard let device = MTLCreateSystemDefaultDevice() else {
             // Headless CI without a GPU: the arithmetic above still ran.

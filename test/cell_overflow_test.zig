@@ -316,11 +316,16 @@ test "scrollGrid normalizes extreme delta and clears subgrid overflow with cells
         try std.testing.expectEqual(@as(u32, 0), cell.hl);
     }
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 2));
-    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.top);
-    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.bot);
-    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.left);
-    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.right);
-    try std.testing.expectEqual(@as(i32, -4), g.pending_scroll.?.rows);
+    // The normalized region is recorded on the grid that scrolled. A
+    // main-surface window grid draws as its own layer, so its scroll no
+    // longer writes grid 1's pending_scroll.
+    const op = g.sub_grids.get(2).?.last_scroll_op.?;
+    try std.testing.expectEqual(@as(u32, 0), op.top);
+    try std.testing.expectEqual(@as(u32, 4), op.bot);
+    try std.testing.expectEqual(@as(u32, 0), op.left);
+    try std.testing.expectEqual(@as(u32, 4), op.right);
+    try std.testing.expectEqual(@as(i32, -4), op.rows);
+    try std.testing.expect(g.pending_scroll == null);
 }
 
 test "scrollGrid rejects reversed normalized region without touching overflow" {

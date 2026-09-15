@@ -685,8 +685,7 @@ pub fn main() u8 {
 
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
-        applog.setLogPath(path);
-        applog.setEnabled(true);
+        applog.forceEnabled(path);
     } else if (config.log.enabled) {
         applog.setLogPath(config.log.path);
         applog.setEnabled(true);

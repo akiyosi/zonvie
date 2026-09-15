@@ -218,6 +218,11 @@ pub fn isSpecialVk(vk: u32) bool {
 /// already has them in hand from the same locked read as the other metrics.
 pub const CellPos = struct { row: i32, col: i32 };
 
+/// `allow_negative` keeps a position above or left of the grid as a negative
+/// cell instead of clamping it to 0. A drag needs that: Neovim scrolls the
+/// window while the pointer is held past its edge, and row 0 reads as "at the
+/// first line", which stops the scroll. Everything else clamps, because a
+/// press cannot land outside the grid it was captured in.
 pub fn clientPxToCell(
     app: *App,
     is_main_window: bool,
@@ -225,12 +230,13 @@ pub fn clientPxToCell(
     y: i32,
     cell_w: u32,
     row_h: u32,
+    allow_negative: bool,
 ) CellPos {
     // Single early return rather than an is_main_window term inside each
     // offset: this way removing the guard makes the parameter unused, which
     // Zig rejects. An external window silently taking the main window's
     // chrome offsets is otherwise invisible until someone clicks.
-    if (!is_main_window) return cellAt(x, y, cell_w, row_h);
+    if (!is_main_window) return cellAt(x, y, cell_w, row_h, allow_negative);
 
     const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
         x - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
@@ -240,14 +246,21 @@ pub fn clientPxToCell(
         y - @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         y;
-    return cellAt(content_x, content_y, cell_w, row_h);
+    return cellAt(content_x, content_y, cell_w, row_h, allow_negative);
 }
 
-fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32) CellPos {
+fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32, allow_negative: bool) CellPos {
     return .{
-        .col = if (cell_w > 0) @divTrunc(@max(0, content_x), @as(i32, @intCast(cell_w))) else 0,
-        .row = if (row_h > 0) @divTrunc(@max(0, content_y), @as(i32, @intCast(row_h))) else 0,
+        .col = axisCell(content_x, cell_w, allow_negative),
+        .row = axisCell(content_y, row_h, allow_negative),
     };
+}
+
+fn axisCell(px: i32, size_px: u32, allow_negative: bool) i32 {
+    if (size_px == 0) return 0;
+    const size: i32 = @intCast(size_px);
+    // Floor, not trunc: -1px is the row above, not row 0.
+    return if (allow_negative) @divFloor(px, size) else @divTrunc(@max(0, px), size);
 }
 
 /// Clear the shared IME composition state. `end` additionally lowers
@@ -455,8 +468,165 @@ pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
     return mod_buf;
 }
 
+/// Client-area mouse position out of an lParam. The two halves are SIGNED:
+/// a drag that leaves the window reports negative coordinates, and reading
+/// them as unsigned turns a few pixels above the top edge into ~65500.
+pub fn mousePosFromLParam(lParam: c.LPARAM) struct { x: i32, y: i32 } {
+    const packed_bits: usize = @bitCast(lParam);
+    const x: i16 = @bitCast(@as(u16, @truncate(packed_bits)));
+    const y: i16 = @bitCast(@as(u16, @truncate(packed_bits >> 16)));
+    return .{ .x = @intCast(x), .y = @intCast(y) };
+}
+
+/// The name Neovim knows a held button by, from the code stored in
+/// `App.mouse_button_held`. Null for "no button held", which is what tells a
+/// move it is not a drag.
+pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
+    return switch (held) {
+        1 => "left",
+        2 => "right",
+        3 => "middle",
+        4 => "x1",
+        5 => "x2",
+        else => null,
+    };
+}
+
+/// Shared press/release/drag delivery for the main window and external
+/// windows. Both resolve the cell the same way handleMouseWheel does: the
+/// content offsets (titlebar tabline, left sidebar) belong to the main window
+/// only, and an external window passes its own grid_id with window-local
+/// coordinates, so the caller never has to know which convention it is in.
+/// Which grid a surface-local point belongs to, and the point rebased into it.
+pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
+
+/// Resolve a surface-local pixel against the layers that surface composites,
+/// back to front, so a click on a float reaches the float.
+///
+/// Neovim does no z-order test of its own once the UI names a grid: for a
+/// grid > 1 it looks the window up by handle and CLAMPS the position into it
+/// (nvim mouse.c, mouse_find_grid_win). Only grid 0 is hit-tested by the
+/// compositor. So a surface that composites layers has to answer the question
+/// itself or every click lands in the window behind the one under the pointer.
+///
+/// `layers` is the surface's committed layer list, root first, back to front;
+/// the last containing layer wins. Caller holds app.mu, which is what the
+/// layer list is protected by.
+pub fn resolveMouseTarget(
+    layers: []const app_mod.SurfaceLayer,
+    root_grid_id: i64,
+    x: i32,
+    y: i32,
+    cell_w: u32,
+    row_h: u32,
+) MouseTarget {
+    var target = MouseTarget{ .grid_id = root_grid_id, .x = x, .y = y };
+    if (cell_w == 0 or row_h == 0 or layers.len <= 1) return target;
+    const cw: i32 = @intCast(cell_w);
+    const rh: i32 = @intCast(row_h);
+    for (layers[1..]) |layer| {
+        // A float that refuses the mouse is not a target and does not shadow
+        // one: Neovim rejects an event addressed to it without re-resolving,
+        // so picking it would swallow the click instead of letting it through
+        // to the window it is drawn over.
+        if (!layer.mouse_enabled) continue;
+        const w: i32 = @as(i32, @intCast(layer.cols)) * cw;
+        const h: i32 = @as(i32, @intCast(layer.rows)) * rh;
+        if (x < layer.x_px or x >= layer.x_px + w) continue;
+        if (y < layer.y_px or y >= layer.y_px + h) continue;
+        target = .{ .grid_id = layer.grid_id, .x = x - layer.x_px, .y = y - layer.y_px };
+    }
+    return target;
+}
+
+/// Rebase a surface-local point into the layer a press already chose, for the
+/// drag and release that follow it. The layer's CURRENT origin is used, so a
+/// float that moves mid-drag keeps receiving the right cells. A layer that has
+/// gone falls back to the surface's own grid.
+pub fn rebaseToGrid(
+    layers: []const app_mod.SurfaceLayer,
+    root_grid_id: i64,
+    grid_id: i64,
+    x: i32,
+    y: i32,
+) MouseTarget {
+    if (grid_id == root_grid_id or grid_id == 0 or layers.len <= 1) {
+        return .{ .grid_id = root_grid_id, .x = x, .y = y };
+    }
+    for (layers[1..]) |layer| {
+        if (layer.grid_id != grid_id) continue;
+        return .{ .grid_id = grid_id, .x = x - layer.x_px, .y = y - layer.y_px };
+    }
+    return .{ .grid_id = root_grid_id, .x = x, .y = y };
+}
+
+pub const MouseAction = enum {
+    press,
+    release,
+    drag,
+
+    fn name(self: MouseAction) [*:0]const u8 {
+        return switch (self) {
+            .press => "press",
+            .release => "release",
+            .drag => "drag",
+        };
+    }
+};
+
+pub fn sendMouseButton(
+    hwnd: c.HWND,
+    app: *App,
+    grid_id: i64,
+    button: [*:0]const u8,
+    action: MouseAction,
+    x: i32,
+    y: i32,
+    wParam: c.WPARAM,
+) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const cell_w = app.cell_w_px;
+    const row_h = app.rowHeightPx();
+    app.mu.unlock(core.clock.io());
+
+    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
+    const drag = action == .drag;
+    const cell = clientPxToCell(app, is_main_window, x, y, cell_w, row_h, drag);
+    const mod_buf = buildMouseModifiers(wParam);
+
+    // Where the mini window anchors itself next.
+    app.last_mouse_grid_id = grid_id;
+
+    core.zonvie_core_send_mouse_input(
+        app.corep,
+        button,
+        action.name(),
+        @as([*:0]const u8, @ptrCast(&mod_buf)),
+        grid_id,
+        if (drag) cell.row else @max(0, cell.row),
+        if (drag) cell.col else @max(0, cell.col),
+    );
+}
+
+/// Whether a float captures scroll at all. One that already shows every line
+/// of its buffer does not: the event falls through to the window it is drawn
+/// over, the same rule the macOS resolution applies
+/// (MetalTerminalView.isFloatLogicallyScrollable). A grid the cached snapshot
+/// does not carry is treated as not capturing, so a layer whose viewport has
+/// not been reported yet shadows nothing.
+fn layerCapturesScroll(grids: []const app_mod.GridInfo, grid_id: i64) bool {
+    for (grids) |g| {
+        if (g.grid_id != grid_id) continue;
+        const content_rows: i64 = @max(0, @as(i64, g.rows) - @as(i64, g.margin_top) - @as(i64, g.margin_bottom));
+        return g.line_count > content_rows;
+    }
+    return false;
+}
+
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
-/// external windows.
+/// external windows. `ext_window` is the surface this hwnd draws, or null for
+/// the main window; it is what carries the layer list a scroll is resolved
+/// against.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -464,6 +634,7 @@ pub fn handleMouseWheel(
     app: *App,
     grid_id: i64,
     horizontal: bool,
+    ext_window: ?*app_mod.ExternalWindow,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
@@ -489,16 +660,18 @@ pub fn handleMouseWheel(
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h);
+    const px: i32 = @intCast(pt.x);
+    const py: i32 = @intCast(pt.y);
+    const cell = clientPxToCell(app, is_main_window, px, py, cell_w, row_h, false);
     const col = cell.col;
     const row = cell.row;
 
     // Resolve the scroll target on the main window: hit-test visible grids so
     // a wheel event over a composited grid (float/split) targets that grid
     // with grid-local coordinates, matching the URL-hover hit-test and macOS
-    // resolveScrollTarget. External windows already receive their own grid_id
-    // and window-local coordinates. Uses the non-blocking cached query, so no
-    // lock contention is added to the input path.
+    // resolveScrollTarget. An external window resolves against its own layer
+    // list instead, below. Uses the non-blocking cached query, so no lock
+    // contention is added to the input path.
     var target_grid_id: i64 = grid_id;
     var target_row: i32 = row;
     var target_col: i32 = col;
@@ -516,6 +689,35 @@ pub fn handleMouseWheel(
                     target_row = row - g.start_row;
                     target_col = col - g.start_col;
                 }
+            }
+        }
+    } else if (ext_window) |ew| {
+        // A float anchored inside this window is one of its layers, not a
+        // window of its own. Neovim does no z-order test once the UI names a
+        // grid -- it looks the window up by handle and clamps the position
+        // into it (mouse.c, mouse_find_grid_win) -- so a scroll over such a
+        // float has to name it here, or it scrolls the window behind it. Same
+        // back-to-front resolution the press path does (resolveMouseTarget),
+        // with the extra rule that a float showing all of its content lets the
+        // scroll through.
+        const grids: []const app_mod.GridInfo = if (corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        const layers = ew.tbs.committed_layers.slice();
+        if (layers.len > 1 and cell_w != 0 and row_h != 0) {
+            const cw: i32 = @intCast(cell_w);
+            const rh: i32 = @intCast(row_h);
+            for (layers[1..]) |layer| {
+                if (!layer.mouse_enabled) continue;
+                const w: i32 = @as(i32, @intCast(layer.cols)) * cw;
+                const h: i32 = @as(i32, @intCast(layer.rows)) * rh;
+                if (px < layer.x_px or px >= layer.x_px + w) continue;
+                if (py < layer.y_px or py >= layer.y_px + h) continue;
+                if (!layerCapturesScroll(grids, layer.grid_id)) continue;
+                const local = clientPxToCell(app, false, px - layer.x_px, py - layer.y_px, cell_w, row_h, false);
+                target_grid_id = layer.grid_id;
+                target_row = local.row;
+                target_col = local.col;
             }
         }
     }
@@ -1152,14 +1354,14 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
         // Update external windows blink state
         updateExternalWindowsBlinkState(app);
 
-        // Request repaint for cursor area
+        // Request repaint for cursor area. No rect means this window holds no
+        // cursor (it is in an external window), so a blink toggle changes no
+        // pixel here; a whole-window invalidate would present the full frame.
         app.mu.lockUncancelable(core.clock.io());
         const cursor_rect_snapshot = app.last_cursor_rect_px;
         app.mu.unlock(core.clock.io());
         if (cursor_rect_snapshot) |rect| {
             _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
-        } else {
-            _ = c.InvalidateRect(hwnd, null, c.FALSE);
         }
 
         // Schedule next blink

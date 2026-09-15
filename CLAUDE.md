@@ -46,7 +46,7 @@ See `README.md` for product overview and `DEVELOPMENT.md` for detailed build/set
 
 - For behavior that is not fully specified in `include/zonvie_core.h`, verify the corresponding Zig core implementation and both frontend consumers.
 - If you change callback semantics, layout behavior, or vertex submission behavior, update all affected frontends in the same change.
-- For `on_vertices_partial(...)`, buffers not included in `flags` must keep their previous contents.
+- For `on_vertices_row(...)`, a cursor-only callback must not replace row contents, and rows not resent must keep their previous contents.
 - For row updates, preserve partial redraw correctness over micro-optimizations.
 - Do not change exported C ABI signatures, struct layouts, callback signatures, or enum values unless the change is coordinated across consumers.
 

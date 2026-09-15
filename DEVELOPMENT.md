@@ -174,6 +174,86 @@ Windows frontend:
 
 ## Core ↔ Frontend Contract
 
+### Per-grid rendering diagnostics
+
+Enable the existing debug log and verbose tier in `zonvie/config.toml`:
+
+```toml
+[log]
+enabled = true
+verbose = true
+perf_only = false
+scroll_only = false
+```
+
+Launch the newly built app with `--log <output-path>`. Capture from startup
+through the reproduction; keep the complete log, reproduction steps, source
+revision plus uncommitted diff, and a screenshot or recording of the issue.
+Filter `[render_trace]` for the new rendering diagnostics.
+These records contain IDs, geometry, counts, and state, not buffer text.
+Other existing verbose records may contain buffer text; inspect before sharing.
+
+- `flush`: frontend callback sequence number, including rejected attempts.
+  The frontend stamps core records with the same ID; no C ABI change is needed.
+  IDs are local to one frontend instance/run, not globally unique. The core's
+  `budget_transaction` field describes vertex-budget accounting, not the
+  frontend bracket: mirrored glyph storage is released after that accounting
+  closes. Standalone core submissions outside a callback bracket carry the
+  last callback ID; use the `begin`/`end` records to distinguish them.
+- `side=core`: `layout_stage` and per-grid `placement`, `row_send`,
+  `cursor_send`, `row_shift_send`, `destroy_stage`, `destroy_release`, and the
+  final `end outcome=commit|abort`. A retry has a new flush ID.
+- `side=macos|windows`: row receipt/routing, hosted row staging, cursor routing
+  or `cursor_ignore reason=empty_nonowner`, layout staging or deferral,
+  surface commit/abort, destruction staging/release, and the bracket outcome.
+  A receive/route record alone does not prove successful publication; check
+  the matching frontend and core `end` records. These are CPU transaction
+  diagnostics, not proof of GPU completion or correct on-screen pixels.
+- `metadata_bytes` / `metadata_limit_bytes`: tracked layout storage in the
+  core and Windows frontend, including retained list allocations. This is
+  not total process/GPU memory. macOS currently reports
+  `metadata_budget=enforcement_pending`; its metadata budget is not yet enforced.
+
+Run `zig build test -Dtest-filter='render trace'` for gating and aborted-flush
+destruction ordering, and `zig build gui-test -Dtest-filter=gui:render_trace`
+to verify matching core/frontend IDs in a real external-window lifecycle.
+
+Verbose tracing adds formatting and file I/O and is for correctness diagnosis,
+not performance comparisons. Disable `verbose` for timing measurements. With
+tracing disabled, the added paths do not format strings, traverse layer lists
+for diagnostics, allocate buffers, or create GPU resources.
+
+Rendering review follow-up (2026-09-07): external hosted layers can retain
+their back texture for unchanged, non-glow blink frames. The verbose
+`event=retained_content_reuse` record reports zero root/hosted row draws for
+that path. This is an operation-count diagnostic, not a measured frame-time
+improvement. Release before/after GPU timings remain outstanding. Windows
+still conservatively redraws all rows when hosted layers are present, and
+macOS uses dirty surface bands for opaque, non-glow hosted content updates
+without layout changes or active root scrolling. Blur, glow, layout changes,
+and animated frames still use full recomposition; hosted GPU pixel copies
+remain disabled.
+
+Hosted rows use the existing synchronous row-buffer growth and reuse path,
+just like root rows. Ordinary capacity growth must not abort a flush and
+enter the asynchronous retry backoff. The Metal regression test submits
+new grids and growing row contents across all three write sets without a
+provision/retry round trip. The withdrawn asynchronous layer provisioning
+caused three capacity-driven aborts and 112 ms of retry timers in a user
+trace (about 320 ms from float placement to CPU commit, not GPU presentation).
+After withdrawal, the Debug opaque-hosted GUI scenario recorded placement
+to frontend commit in 11.7 ms on the main surface and 5.7 ms on the external
+surface, both in the first submitting flush. These are verbose-log CPU
+timings from a different scene, not a before/after speedup or GPU latency.
+No Release frame-time or Windows hardware performance measurements have
+been made for this follow-up; GUI image comparisons validate correctness,
+not latency.
+The opaque hosted-row GUI scenario observed a six-row damage band on a
+20-row external surface and matched the resulting image against a full
+redraw. This is a damage-count observation, not a frame-time measurement.
+
+### ABI reference
+
 The public ABI is defined in `include/zonvie_core.h`.
 
 Important contract areas:
@@ -181,8 +261,11 @@ Important contract areas:
 - exported C API functions
 - callback struct layout
 - vertex update modes:
-  - `on_vertices_partial`
   - `on_vertices_row`
+  - `on_grid_row_scroll`
+- per-surface layer placement:
+  - `on_surface_layout`
+  - `on_grid_destroy`
 - flush bracketing callbacks:
   - `on_flush_begin`
   - `on_flush_end`

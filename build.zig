@@ -22,6 +22,22 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const host_os = @import("builtin").os.tag;
 
+    // Run only the tests whose name contains this substring, e.g.
+    // `zig build e2e -Dtest-filter=scrollbind`. Wired into the three
+    // multi-scenario binaries: `test`, `e2e` and `gui-test`. A binary whose
+    // names all miss the filter simply runs nothing and passes.
+    //
+    // This exists so that iterating on one scenario never means editing a
+    // shared registration file: commenting out or deleting other scenarios to
+    // go faster loses them silently, because the build still succeeds.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose name contains this substring (test, e2e, gui-test)",
+    );
+    const test_filters: []const []const u8 =
+        if (test_filter) |f| &.{f} else &.{};
+
     // TOML parser dependency
     const zig_toml = b.dependency("zig-toml", .{
         .target = target,
@@ -196,6 +212,37 @@ pub fn build(b: *std.Build) !void {
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
+    // Unit tests for the layer draw planner in windows/app.zig. It reaches
+    // Win32 through the renderer, so it builds only for a Windows target and
+    // runs only on a Windows host.
+    if (target.result.os.tag == .windows) {
+        const app_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("windows/app.zig"),
+            .imports = &.{
+                .{ .name = "zonvie_core", .module = core_mod },
+                .{ .name = "toml", .module = zig_toml.module("toml") },
+            },
+        });
+        app_test_mod.linkLibrary(core_lib);
+        for ([_][]const u8{
+            "user32", "gdi32",   "kernel32", "imm32",    "dwrite",
+            "d2d1",   "ole32",   "d3d11",    "dxgi",     "d3dcompiler_47",
+            "dcomp",  "dwmapi",  "credui",   "advapi32", "shell32",
+            "winmm",  "msimg32", "comdlg32",
+        }) |name| app_test_mod.linkSystemLibrary(name, .{});
+        const app_tests = b.addTest(.{
+            .name = "zonvie-app-test",
+            .root_module = app_test_mod,
+        });
+        const app_test_step = b.step("windows-app-test", "Build the Windows app unit tests");
+        app_test_step.dependOn(&b.addInstallArtifact(app_tests, .{
+            .dest_dir = .{ .override = .{ .custom = "../windows/zig-out" } },
+        }).step);
+    }
+
     // Win32 contract test for the top-level HWND wake cookie storage. Compile
     // it with every Windows frontend build; execute it when the build host can
     // create a real Win32 window.
@@ -326,6 +373,7 @@ pub fn build(b: *std.Build) !void {
     // as a separate module do not execute the dependency module's own tests.
     const core_tests = b.addTest(.{
         .root_module = core_mod,
+        .filters = test_filters,
     });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
@@ -400,21 +448,6 @@ pub fn build(b: *std.Build) !void {
         .root_module = cursor_style_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(cursor_style_tests).step);
-
-    // Scroll fast path tests
-    const scroll_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/scroll_fast_path_test.zig"),
-        .imports = &.{
-            .{ .name = "zonvie_core", .module = core_mod },
-            .{ .name = "toml", .module = zig_toml.module("toml") },
-        },
-    });
-    const scroll_tests = b.addTest(.{
-        .root_module = scroll_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
 
     // Message routing tests. msg_route.zig is std-only, so it is exposed as a
     // standalone module rather than pulled in through zonvie_core.
@@ -584,6 +617,7 @@ pub fn build(b: *std.Build) !void {
     });
     const e2e_tests = b.addTest(.{
         .root_module = e2e_mod,
+        .filters = test_filters,
     });
     const e2e_run = b.addRunArtifact(e2e_tests);
     // Force rerun — results depend on the external nvim binary.
@@ -613,6 +647,7 @@ pub fn build(b: *std.Build) !void {
         }
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
+            .filters = test_filters,
         });
         const gui_run = b.addRunArtifact(gui_tests);
         // Force rerun — results depend on the external app and nvim.

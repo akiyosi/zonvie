@@ -1425,15 +1425,6 @@ pub fn handleRedraw(
                         return err;
                     };
 
-                    // Update external grid target size so NDC viewport matches the actual grid.
-                    // Only for grids that are actual external windows (ext_windows splits
-                    // or UI-extension grids like popupmenu/messages). Float windows
-                    // (e.g. Telescope) must NOT get entries here — they render on the
-                    // global grid and their NDC uses sg.rows/sg.cols directly.
-                    if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
-                        try grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width });
-                    }
-
                     // Record the global grid size so core can detect a
                     // Neovim-initiated resize (`:set columns=` / `:set lines=`)
                     // after the batch completes.
@@ -1693,7 +1684,6 @@ pub fn handleRedraw(
                     // On hide (tab switch), keep tracking so win_pos can restore.
                     if (is_close) {
                         _ = grid.ext_windows_grids.remove(grid_id);
-                        _ = grid.external_grid_target_sizes.remove(grid_id);
                     }
                 }
             },
@@ -1878,6 +1868,9 @@ pub fn handleRedraw(
                         zindex,
                         compindex,
                         anchor_grid,
+                        // t[6] is mouse_enabled in every observed form. A float
+                        // that refuses the mouse must not win a hit test.
+                        if (t[6] == .bool) t[6].bool else true,
                     ) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("[win_float_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
@@ -1942,7 +1935,7 @@ pub fn handleRedraw(
                     const row = checkedGridCoord(row_i) orelse continue;
                     const col: u32 = 0;
                     // msg_set_pos has no win handle; pass 0 (no window mapping stored)
-                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1) catch |err| switch (err) {
+                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1, true) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("msg_set_pos rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
                             return error.TooManyWindowPlacements;

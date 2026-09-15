@@ -24,6 +24,12 @@ enum FrameTraceTag: UInt32 {
     case drawSkipNoDrawable = 9
     case drawSkipRowCapacity = 10
     case commitFlush = 11
+    /// a = key code. The main view emits one per input it actually sends,
+    /// seq 0. An external grid view emits one per keyDown it RECEIVES, seq =
+    /// grid id, which includes the OS repeats synthesis then swallows and
+    /// never sends: b bit 0 is "OS calls it a repeat", bit 1 "swallowed,
+    /// nothing sent". So the two streams describe different things and must
+    /// not be summed.
     case inputSend = 12
     case encodeEnd = 13
     case gpuSubmit = 14

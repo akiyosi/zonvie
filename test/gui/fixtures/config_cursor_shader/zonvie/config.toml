@@ -1,0 +1,11 @@
+# Fixture for the shader coverage / cursor-uniform scenario. The probe
+# shader marks the pixels the custom shader chain processed and draws a
+# band at the cursor uniform, so both must be measurable without any
+# window transparency confusing the color test.
+[window]
+blur = false
+opacity = 1.0
+
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/cursor_probe.glsl"]

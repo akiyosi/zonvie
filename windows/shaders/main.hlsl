@@ -2,8 +2,20 @@
 // Compile with: fxc /T vs_5_0 /E VSMain /Fo vs_main.cso main.hlsl
 //               fxc /T ps_5_0 /E PSMain /Fo ps_main.cso main.hlsl
 
+// Maps one layer's incoming vertex space to clip space. The core emits row
+// vertices in grid-local pixels (origin top-left, +y down), so the surface
+// binds scale = (2/extent_w, -2/extent_h) and offset = (-1, +1). Chrome this
+// frontend builds itself is submitted in clip space under the identity
+// transform (scale 1, offset 0).
+cbuffer LayerTransform : register(b0) {
+    float2 layer_scale;
+    float2 layer_offset;
+    float2 layer_origin_px;   // layer top-left in surface pixels
+    float2 layer_pad;
+};
+
 struct VSIn {
-    float2 pos : POSITION;   // NDC (-1..1)
+    float2 pos : POSITION;   // grid-local pixels, or clip space under identity
     float2 uv  : TEXCOORD0;
     float4 col : COLOR0;
     int2 grid_id : BLENDINDICES0;  // i64 as int2
@@ -17,11 +29,15 @@ struct VSOut {
     float4 col : COLOR0;
     uint deco_flags : BLENDINDICES0;
     float deco_phase : TEXCOORD1;
+    // Layer origin in surface pixels, so pattern decorations can phase from
+    // the layer's own left edge instead of the window's.
+    float2 layer_origin : TEXCOORD2;
 };
 
 VSOut VSMain(VSIn i) {
     VSOut o;
-    o.pos = float4(i.pos.xy, 0.0, 1.0);
+    o.pos = float4(i.pos.xy * layer_scale + layer_offset, 0.0, 1.0);
+    o.layer_origin = layer_origin_px;
     o.uv  = i.uv;
     o.col = i.col;
     o.deco_flags = i.deco_flags;
@@ -38,6 +54,12 @@ SamplerState samp0 : register(s0);
 #define DECO_UNDERDOTTED   (1u << 3)
 #define DECO_UNDERDASHED   (1u << 4)
 #define DECO_STRIKETHROUGH (1u << 5)
+#define DECO_CURSOR        (1u << 6)
+// Transport-only: marks a vertex as being in the scrollable content area
+// rather than a margin. The core sets it on ordinary body BACKGROUND quads
+// too, so anything testing "is this a decoration" must mask the visual flags
+// rather than compare deco_flags against 0.
+#define DECO_SCROLLABLE    (1u << 7)
 #define DECO_OVERLINE      (1u << 8)
 #define DECO_GLOW          (1u << 9)
 #define DECO_COLOR_EMOJI   (1u << 10)
@@ -46,6 +68,11 @@ SamplerState samp0 : register(s0);
 // this frontend never fades foreground quads. Declared so the flag is not
 // mistaken for an unknown bit by the next reader.
 #define DECO_SOLID_GLYPH   (1u << 11)
+
+// Visual decoration flags, excluding the transport-only ones (SCROLLABLE) and
+// the ones that only pick a sampling mode (GLOW, COLOR_EMOJI). Mirrors
+// DECO_VISUAL_MASK in Shaders.metal.
+#define DECO_VISUAL_MASK (DECO_UNDERCURL | DECO_UNDERLINE | DECO_UNDERDOUBLE | DECO_UNDERDOTTED | DECO_UNDERDASHED | DECO_STRIKETHROUGH | DECO_CURSOR | DECO_OVERLINE | DECO_SOLID_GLYPH)
 
 // Icon type markers (special uv.x values)
 #define ICON_CIRCLE      (-2.0)
@@ -203,7 +230,7 @@ float4 PSMain(VSOut i) : SV_Target {
                 float wave_freq = 3.14159265 * 2.0;
                 float wave_amp = 0.35;  // Normalized amplitude (0-1 range for quad height)
                 float cell_width = 8.0;
-                float wave_x = (i.pos.x / cell_width) + i.deco_phase;
+                float wave_x = ((i.pos.x - i.layer_origin.x) / cell_width) + i.deco_phase;
                 float wave_y = sin(wave_x * wave_freq) * wave_amp;
                 // Local Y from UV (0.0 at top, 1.0 at bottom), wave center at 0.5
                 float local_y = i.uv.y;
@@ -218,7 +245,7 @@ float4 PSMain(VSOut i) : SV_Target {
             }
             // Underdotted: dotted pattern
             if (i.deco_flags & DECO_UNDERDOTTED) {
-                float x_mod = fmod(i.pos.x, 4.0);
+                float x_mod = fmod(i.pos.x - i.layer_origin.x, 4.0);
                 if (x_mod >= 2.0) {
                     discard;
                 }
@@ -226,7 +253,7 @@ float4 PSMain(VSOut i) : SV_Target {
             }
             // Underdashed: dashed pattern
             if (i.deco_flags & DECO_UNDERDASHED) {
-                float x_mod = fmod(i.pos.x, 8.0);
+                float x_mod = fmod(i.pos.x - i.layer_origin.x, 8.0);
                 if (x_mod >= 5.0) {
                     discard;
                 }
@@ -312,6 +339,28 @@ CustomPostVSOut VSCustomPost(uint id : SV_VertexID) {
     o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
     o.vUV = uv;
     return o;
+}
+
+// Glow occlusion: a layer's background attenuates the light already extracted
+// from whatever it covers. The main pass gets this from drawing back to front;
+// the extract pass has no such ordering of its own, because PSGlowExtract
+// discards every background quad, so a glyph hidden behind an opaque float
+// would still bloom through it.
+//
+// Only background quads take part (glyph quads are the light sources), and the
+// pipeline blends them as (ZERO, INV_SRC_ALPHA): the destination is scaled by
+// the coverage the background would have painted over it, which erases it under
+// an opaque layer and dims it under a translucent one.
+float4 PSGlowOcclude(VSOut i) : SV_Target {
+    if (i.uv.x >= 0.0) discard;
+    // Only plain background quads: a decoration sits on top of one, and
+    // attenuating twice over the same pixel would square the factor. Icons
+    // (uv.x <= -1.9) are frontend chrome, never a layer's background.
+    if ((i.deco_flags & DECO_VISUAL_MASK) || i.uv.x <= ICON_CIRCLE + 0.1) discard;
+    // PSMain returns premultiply(i.col) for a background, so its own alpha is
+    // exactly the coverage it paints -- unlike macOS, which overrides it with
+    // a uniform.
+    return float4(0.0, 0.0, 0.0, i.col.a);
 }
 
 // Glow extract: render only DECO_GLOW glyphs with original foreground color.
