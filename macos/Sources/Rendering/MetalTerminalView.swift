@@ -1940,6 +1940,11 @@ final class MetalTerminalView: MTKView {
 
     override func scrollWheel(with event: NSEvent) {
         noteScrollGesturePhase(event)
+        // A gesture's .began carries no delta, so it is dropped by the check
+        // below before the lock is consulted. Retire the previous gesture's
+        // target here or the first .changed event finds a stale lock and the
+        // whole new gesture drives the grid the last one did.
+        if event.phase.contains(.began) { lockedScrollTarget = nil }
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
         if deltaY == 0 && deltaX == 0 { return }
@@ -3272,6 +3277,16 @@ final class MetalTerminalView: MTKView {
         return !scrollEdgeBlocked.isEmpty
     }
 
+    /// The clamped visual offset one grid's content is currently drawn at, in
+    /// drawable pixels: displayed Y == static Y + this. An external view maps a
+    /// pointer event back onto the rows the frame actually shows with it, the
+    /// way hitTestGrid does for the main window.
+    func visualScrollOffsetPx(gridId: Int64, cellHeightPx: CGFloat) -> CGFloat {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: cellHeightPx)
+    }
+
     /// Scroll offset info for one grid, for an external window's shader update.
     /// nil when the grid is gone or its offset has settled.
     func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> MetalTerminalRenderer.ScrollOffsetInfo? {
@@ -3379,10 +3394,16 @@ final class MetalTerminalView: MTKView {
             let adjustedGlobalRow = Int32(adjustedPxY / cellH)
             let adjustedLocalRow = adjustedGlobalRow - grid.startRow
 
-            // Only apply adjustment within the scrollable content area (not margins)
+            // Only apply adjustment within the scrollable content area (not
+            // margins) — and only when the pixel was on a content row to begin
+            // with. Margin rows carry no DECO_SCROLLABLE, so the shader left
+            // them where they statically belong while the content eased past
+            // them; undoing an ease such a row never took would name a content
+            // row the user did not click.
             let contentTop = grid.marginTop
             let contentBottom = grid.rows - grid.marginBottom
-            if adjustedLocalRow >= contentTop && adjustedLocalRow < contentBottom {
+            if localRow >= contentTop, localRow < contentBottom,
+               adjustedLocalRow >= contentTop, adjustedLocalRow < contentBottom {
                 localRow = adjustedLocalRow
             }
         }
@@ -3396,7 +3417,7 @@ final class MetalTerminalView: MTKView {
     /// content must not capture smooth scroll — it falls through to the window
     /// beneath them (req #1). Uses the cached grid info (line_count) so the input
     /// path never makes a blocking viewport query into the core.
-    private func isFloatLogicallyScrollable(_ grid: ZonvieCore.GridInfo) -> Bool {
+    func isFloatLogicallyScrollable(_ grid: ZonvieCore.GridInfo) -> Bool {
         // Content rows = grid height minus border/winbar margins. Logical
         // scrollability is position-independent: the buffer simply has more
         // lines than fit in the visible content area.

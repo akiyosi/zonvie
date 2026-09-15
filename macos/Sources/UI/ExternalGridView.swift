@@ -4557,19 +4557,187 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
     }
 
+    /// Which grid a pointer event at `pointPx` (surface content pixels,
+    /// top-origin) targets, and the point in that grid's own cells. A float
+    /// this surface hosts sits above the root, so it takes the event wherever
+    /// it covers the point; `requireScrollable` drops floats that already show
+    /// all of their content, which stay transparent to scrolling the way the
+    /// main window's resolution does.
+    ///
+    /// Two corrections the static layer geometry does not carry, both on the
+    /// rule the main window's hit test uses -- displayed Y == static Y +
+    /// offsetPx:
+    ///  - a layer that follows its anchor is DRAWN at an origin the root's
+    ///    offset displaced (drawHostedLayers shifts it bodily), so the
+    ///    containment test has to use the displaced origin;
+    ///  - a grid easing in its own right has its ROWS displaced inside a frame
+    ///    that stays put, so the row a pixel names is the one the ease moved
+    ///    there.
+    private func resolveInputTarget(
+        pointPx: CGPoint,
+        requireScrollable: Bool
+    ) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let main = mainTerminalView else { return (gridId, 0, 0) }
+        let cellW = CGFloat(main.renderer.cellWidthPx)
+        let cellH = CGFloat(main.renderer.cellHeightPx)
+        guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
+
+        let grids = main.core?.getVisibleGridsCached() ?? []
+        let rootOffsetPx = main.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
+
+        tripleBufferLock.lock()
+        let layers = committedSurfaceLayers
+        tripleBufferLock.unlock()
+
+        var best: (gridId: Int64, row: Int32, col: Int32)?
+        var bestZ = Int.min
+        for layer in layers where layer.gridId != gridId {
+            // A float that refuses the mouse is not a target and does not
+            // shadow one: Neovim rejects an event addressed to it without
+            // re-resolving, so picking it would swallow the event instead of
+            // letting it through to the window it is drawn over.
+            guard layer.mouseEnabled else { continue }
+            guard let local = layerLocalPoint(layer, pointPx: pointPx, rootOffsetPx: rootOffsetPx,
+                                              cellW: cellW, cellH: cellH, main: main)
+            else { continue }
+            let info = grids.first { $0.gridId == layer.gridId }
+            if requireScrollable {
+                guard let info, main.isFloatLogicallyScrollable(info) else { continue }
+            }
+            guard best == nil || layer.z > bestZ else { continue }
+            bestZ = layer.z
+            best = (
+                layer.gridId,
+                scrolledRow(local.y, offsetPx: local.ownOffsetPx, cellH: cellH, info: info),
+                Int32(local.x / cellW)
+            )
+        }
+        return best ?? resolveRootTarget(pointPx: pointPx)
+    }
+
+    /// A surface point inside one layer, as that layer's own pixels, or nil
+    /// when the point is outside the rectangle the layer is DRAWN in.
+    private func layerLocalPoint(
+        _ layer: SurfaceLayer,
+        pointPx: CGPoint,
+        rootOffsetPx: CGFloat,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        main: MetalTerminalView
+    ) -> (x: CGFloat, y: CGFloat, ownOffsetPx: CGFloat)? {
+        let ownOffsetPx = main.visualScrollOffsetPx(gridId: layer.gridId, cellHeightPx: cellH)
+        // drawHostedLayers moves the whole layer with the root only when the
+        // layer has no ease of its own; otherwise its frame stays put and the
+        // shader displaces the rows inside it.
+        let originY = CGFloat(layer.originPx.y)
+            + (ownOffsetPx == 0 && layer.followsScroll ? rootOffsetPx : 0)
+        let x = pointPx.x - CGFloat(layer.originPx.x)
+        let y = pointPx.y - originY
+        guard x >= 0, y >= 0,
+              x < CGFloat(layer.cols) * cellW,
+              y < CGFloat(layer.rows) * cellH
+        else { return nil }
+        return (x, y, ownOffsetPx)
+    }
+
+    /// The grid row a grid-local pixel names, undoing the sub-row ease the
+    /// frame drew with. Left alone outside the scrollable content area, the
+    /// way the main window's hit test leaves its margin rows alone.
+    private func scrolledRow(
+        _ localY: CGFloat,
+        offsetPx: CGFloat,
+        cellH: CGFloat,
+        info: ZonvieCore.GridInfo?
+    ) -> Int32 {
+        let row = Int32(localY / cellH)
+        guard abs(offsetPx) > 0.001, let info else { return row }
+        // Margin rows (winbar, border) carry no DECO_SCROLLABLE, so the vertex
+        // shader left them where they statically belong while the content eased
+        // past them. A pixel ON one names that row: undoing an ease it never
+        // took would hand back a content row the user did not click.
+        guard row >= info.marginTop, row < info.rows - info.marginBottom else { return row }
+        let adjusted = Int32((localY - offsetPx) / cellH)
+        guard adjusted >= info.marginTop, adjusted < info.rows - info.marginBottom else { return row }
+        return adjusted
+    }
+
+    /// The grid a press claimed. Neovim keeps a drag on the window the press
+    /// chose, so re-resolving mid-drag switches coordinate spaces and jumps the
+    /// selection by the float's placement; the release must not re-choose it
+    /// either, or letting go outside the float ends the selection in the window
+    /// behind it. Windows keeps the same pin (app.mouse_press_grid_id).
+    private var pressGridId: Int64?
+
+    /// Rebase a surface point into the grid a press already chose, using that
+    /// layer's CURRENT drawn origin so a float that moves mid-drag keeps
+    /// receiving the right cells. A layer that has gone falls back to this
+    /// surface's own grid rather than re-resolving.
+    private func rebaseToPressGrid(pointPx: CGPoint, pressed: Int64)
+        -> (gridId: Int64, row: Int32, col: Int32)
+    {
+        guard let main = mainTerminalView, pressed != gridId else {
+            return resolveRootTarget(pointPx: pointPx)
+        }
+        let cellW = CGFloat(main.renderer.cellWidthPx)
+        let cellH = CGFloat(main.renderer.cellHeightPx)
+        guard cellW > 0, cellH > 0 else { return resolveRootTarget(pointPx: pointPx) }
+
+        tripleBufferLock.lock()
+        let layer = committedSurfaceLayers.first { $0.gridId == pressed }
+        tripleBufferLock.unlock()
+        guard let layer else { return resolveRootTarget(pointPx: pointPx) }
+
+        let rootOffsetPx = main.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
+        let ownOffsetPx = main.visualScrollOffsetPx(gridId: pressed, cellHeightPx: cellH)
+        let originY = CGFloat(layer.originPx.y)
+            + (ownOffsetPx == 0 && layer.followsScroll ? rootOffsetPx : 0)
+        let info = main.core?.getVisibleGridsCached().first { $0.gridId == pressed }
+        // Deliberately unclamped to the layer rectangle: a drag that leaves the
+        // float still belongs to it, and Neovim clamps the position into the
+        // window it was addressed to.
+        return (
+            pressed,
+            scrolledRow(pointPx.y - originY, offsetPx: ownOffsetPx, cellH: cellH, info: info),
+            Int32((pointPx.x - CGFloat(layer.originPx.x)) / cellW)
+        )
+    }
+
+    /// This surface's own grid at `pointPx`, with the ease its rows were drawn
+    /// with undone.
+    private func resolveRootTarget(pointPx: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let main = mainTerminalView else { return (gridId, 0, 0) }
+        let cellW = CGFloat(main.renderer.cellWidthPx)
+        let cellH = CGFloat(main.renderer.cellHeightPx)
+        guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
+        let info = main.core?.getVisibleGridsCached().first { $0.gridId == gridId }
+        let offsetPx = main.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
+        return (gridId, scrolledRow(pointPx.y, offsetPx: offsetPx, cellH: cellH, info: info),
+                Int32(pointPx.x / cellW))
+    }
+
     private func sendMouseEvent(button: String, action: String, event: NSEvent) {
         guard let main = mainTerminalView, let core = main.core else { return }
 
         let scale = window?.backingScaleFactor ?? 2.0
-        let cellWidthPx = CGFloat(main.renderer.cellWidthPx)
-        let cellHeightPx = CGFloat(main.renderer.cellHeightPx)
-
         let location = convert(event.locationInWindow, from: nil)
 
         // Convert to cell coordinates (flip Y)
-        let col = Int32(location.x * scale / cellWidthPx)
-        let viewHeightPx = bounds.height * scale
-        let row = Int32((viewHeightPx - location.y * scale) / cellHeightPx)
+        let pointPx = CGPoint(x: location.x * scale,
+                              y: bounds.height * scale - location.y * scale)
+        // A float this surface hosts is drawn above the root, so a press inside
+        // it has to name that grid; naming the root applies the press to the
+        // window underneath instead. The drag and release that follow stay on
+        // the grid the press chose -- see pressGridId.
+        let target: (gridId: Int64, row: Int32, col: Int32)
+        if action == "press" {
+            target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
+            pressGridId = target.gridId
+        } else if let pressed = pressGridId {
+            target = rebaseToPressGrid(pointPx: pointPx, pressed: pressed)
+            if action == "release" { pressGridId = nil }
+        } else {
+            target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
+        }
 
         // Build modifier string (same format as MetalTerminalView)
         let mods = event.modifierFlags
@@ -4579,9 +4747,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if mods.contains(.option)  { modStr += "A" }
         if mods.contains(.command) { modStr += "D" }
 
-        ZonvieCore.appLog("[ExternalGridView mouseEvent] button=\(button) action=\(action) gridId=\(gridId) row=\(row) col=\(col)")
+        ZonvieCore.appLog("[ExternalGridView mouseEvent] button=\(button) action=\(action) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
 
-        core.sendMouseInput(button: button, action: action, modifier: modStr, gridId: gridId, row: row, col: col)
+        core.sendMouseInput(button: button, action: action, modifier: modStr,
+                            gridId: target.gridId, row: target.row, col: target.col)
     }
 
     // MARK: - Key Event Handling with IME Support
@@ -4704,9 +4873,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     // MARK: - Scroll Event Handling
 
+    /// The grid a trackpad gesture claimed at its start, held through momentum.
+    private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
+
     override func scrollWheel(with event: NSEvent) {
         guard let main = mainTerminalView else { return }
         main.noteScrollGesturePhase(event)
+
+        // A gesture's .began carries no delta, so it is dropped by the check
+        // below before the lock is consulted. Retire the previous gesture's
+        // target here or the first .changed event finds a stale lock and the
+        // whole new gesture drives the grid the last one did.
+        if event.phase.contains(.began) { lockedScrollTarget = nil }
 
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
@@ -4714,23 +4892,36 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         let location = convert(event.locationInWindow, from: nil)
         let scale = window?.backingScaleFactor ?? 2.0
-        let cellWidthPx = CGFloat(main.renderer.cellWidthPx)
-        let cellHeightPx = CGFloat(main.renderer.cellHeightPx)
 
-        let col = Int32(location.x * scale / cellWidthPx)
         // Flip Y coordinate (view origin is bottom-left, grid origin is top-left)
-        let viewHeightPx = bounds.height * scale
-        let row = Int32((viewHeightPx - location.y * scale) / cellHeightPx)
+        let pointPx = CGPoint(x: location.x * scale,
+                              y: bounds.height * scale - location.y * scale)
+
+        // Resolve which grid this scroll drives. A trackpad gesture resolves
+        // once at its start and keeps that target through its momentum, so a
+        // pointer drifting across a float's edge mid-gesture cannot hand the
+        // rest of the scroll to another grid; a wheel resolves per event.
+        let target: (gridId: Int64, row: Int32, col: Int32)
+        let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        if event.hasPreciseScrollingDeltas && isGesture {
+            if lockedScrollTarget == nil {
+                lockedScrollTarget = resolveInputTarget(pointPx: pointPx, requireScrollable: true)
+            }
+            target = lockedScrollTarget ?? resolveInputTarget(pointPx: pointPx, requireScrollable: true)
+        } else {
+            lockedScrollTarget = nil
+            target = resolveInputTarget(pointPx: pointPx, requireScrollable: true)
+        }
 
         let modifier = main.buildModifierString(from: event.modifierFlags)
 
         if deltaY != 0 {
-            ZonvieCore.appLog("[ExternalGridView scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(gridId) row=\(row) col=\(col)")
+            ZonvieCore.appLog("[ExternalGridView scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
 
             let newOffset = main.handleScrollInput(
-                gridId: gridId,
-                row: row,
-                col: col,
+                gridId: target.gridId,
+                row: target.row,
+                col: target.col,
                 deltaY: deltaY,
                 scale: scale,
                 hasPrecise: event.hasPreciseScrollingDeltas,
@@ -4751,6 +4942,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
         }
 
+        // Release the lock once the gesture and its inertia are done. The
+        // gesture's own .ended is not released here so momentum keeps the same
+        // target; a fresh gesture re-locks on its .began.
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
+            || event.phase.contains(.cancelled) {
+            lockedScrollTarget = nil
+        }
     }
 
 }
