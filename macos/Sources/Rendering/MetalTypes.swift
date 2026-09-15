@@ -836,6 +836,10 @@ struct SurfaceLayer {
     var cols: Int
     var z: Int
     var followsScroll: Bool
+    /// The layer accepts mouse input. A hit test must skip a layer without it:
+    /// Neovim refuses an event addressed to such a window rather than passing
+    /// it to what is behind, so targeting one swallows the event.
+    var mouseEnabled: Bool = true
 }
 
 /// Resolve a retained row in grid-local pixels, including a prior slot shift.
