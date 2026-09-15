@@ -2939,28 +2939,8 @@ pub const FlushCtx = struct {
                     const ext_us: i64 = @intCast(@divTrunc(@max(0, clock.nowNs() - t_ext), 1000));
                     ctx.core.log.write("[perf] send_external_grids us={d} known={d}\n", .{ ext_us, ctx.core.known_external_grids.count() });
                 }
-                // sendExternalGridVertices can itself call
-                // zonvie_core_abort_flush (e.g. Windows external row-buffer
-                // OOM) after the main grid already ran clearDirty() on the
-                // assumption of a successful commit, and the frontend's
-                // on_flush_end abort cancels ALL brackets for this flush, main
-                // included. Without a full resend the main-grid update would
-                // be dropped permanently.
-                if (ctx.core.flush_aborted) {
-                    ctx.core.grid.markAllDirty();
-                    var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                    while (sg_it.next()) |sg| {
-                        sg.markAllDirty();
-                    }
-                    ctx.core.force_ext_cursor_recheck = true;
-                    // last_sent_cursor_rev was already synced to cursor_rev
-                    // earlier in this same onFlush() call (the on_vertices_row
-                    // cursor dispatch). The cancelled bracket includes the main
-                    // cursor too, so force a mismatch (wrapping, matching
-                    // cursor_rev's own +%= idiom) to make the next flush's
-                    // need_cursor check resend it.
-                    ctx.core.last_sent_cursor_rev -%= 1;
-                }
+                // An abort raised here is restored by the outer defer's dirty
+                // snapshot; a markAllDirty() would outlive that restore.
             }
             // Runs before on_flush_end: validate the completed main+external
             // state only after every row was generated, so moving vertices
@@ -4603,6 +4583,11 @@ fn publishSurfaceLayouts(self: *Core) void {
         if (!emitSurfaceLayout(self, 1)) return;
         var ext_it = self.grid.external_grids.keyIterator();
         while (ext_it.next()) |grid_id| {
+            // notifyExternalWindowChanges withholds on_external_window for a
+            // grid still awaiting its initial resize, so no frontend surface
+            // exists to receive a layout: both abort the flush for an
+            // unregistered surface, and the retry re-emits the same layout.
+            if (self.grid.pending_ext_window_grids.contains(grid_id.*)) continue;
             if (!emitSurfaceLayout(self, grid_id.*)) return;
         }
         // Surfaces that no longer exist cannot be re-sent stale signatures.
@@ -14240,6 +14225,217 @@ test "surface layout publishes one root layer per surface and only when it chang
     try std.testing.expectEqual(@as(i64, 2), state.destroyed[0]);
     notifySurfaceLayouts(&core);
     try std.testing.expectEqual(@as(usize, 1), state.destroyed_count);
+}
+
+test "a surface layout waits for the external window that receives it" {
+    const State = struct {
+        layouts: u32 = 0,
+        opens: u32 = 0,
+        saw_layout_for_2: bool = false,
+
+        fn onLayout(
+            ctx: ?*anyopaque,
+            surface_id: i64,
+            layers: [*]const c_api.Layer,
+            count: usize,
+            surface_rows: u32,
+            surface_cols: u32,
+        ) callconv(.c) void {
+            _ = layers;
+            _ = count;
+            _ = surface_rows;
+            _ = surface_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.layouts += 1;
+            if (surface_id == 2) self.saw_layout_for_2 = true;
+        }
+
+        fn onOpen(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            win: i64,
+            rows: u32,
+            cols: u32,
+            start_row: i32,
+            start_col: i32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = win;
+            _ = rows;
+            _ = cols;
+            _ = start_row;
+            _ = start_col;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.opens += 1;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 8);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_surface_layout = State.onLayout;
+    core.cb.on_external_window = State.onOpen;
+
+    // Neovim proposed a one-row window, so the core asked for a usable size
+    // and parked the grid until that resize lands.
+    try core.grid.resizeGrid(2, 1, 6);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.pending_ext_window_grids.put(core.alloc, 2, .{ .grid_id = 2, .width = 6, .height = 4 });
+
+    _ = notifyExternalWindowChanges(&core);
+    notifySurfaceLayouts(&core);
+    // Only the main surface: a layout for a surface the frontend has never
+    // been told to create aborts the flush there and retries forever.
+    try std.testing.expectEqual(@as(u32, 0), state.opens);
+    try std.testing.expectEqual(@as(u32, 1), state.layouts);
+    try std.testing.expect(!state.saw_layout_for_2);
+
+    // The requested resize lands: the open goes out first, then the layout.
+    try core.grid.resizeGrid(2, 4, 6);
+    _ = notifyExternalWindowChanges(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.opens);
+    notifySurfaceLayouts(&core);
+    try std.testing.expect(state.saw_layout_for_2);
+}
+
+test "an external row rejection owes the main grid only the rows it consumed" {
+    const ROWS: u32 = 4;
+    const COLS: u32 = 4;
+    const State = struct {
+        core: *Core,
+        reject_external: bool = false,
+        external_rows: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) return;
+            self.external_rows += 1;
+            // The external surface runs out of row storage after the main
+            // grid already published and cleared its dirty rows.
+            if (self.reject_external) self.core.flush_aborted = true;
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, ROWS, COLS);
+    try core.grid.resizeGrid(2, ROWS, COLS);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = COLS;
+    core.drawable_h_px = ROWS;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+
+    for (0..ROWS) |r| {
+        for (0..COLS) |cc| {
+            core.grid.putCell(@intCast(r), @intCast(cc), 'A', 0);
+            core.grid.putCellGrid(2, @intCast(r), @intCast(cc), 'A', 0);
+        }
+    }
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    // Settle dirty_all so the next attempt owes a single row, not the viewport.
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(ROWS, COLS);
+    try flush_ctx.onFlush(ROWS, COLS);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+
+    core.grid.putCell(1, 0, 'B', 0);
+    try std.testing.expect(core.grid.main_buf.dirty_rows.isSet(1));
+    // Give the external surface something to publish, so the rejection lands
+    // after the main rows were consumed rather than never firing.
+    core.grid.putCellGrid(2, 1, 0, 'B', 0);
+
+    state.reject_external = true;
+    state.external_rows = 0;
+    try flush_ctx.onFlush(ROWS, COLS);
+    // Without this the flush committed and the assertions below would pass
+    // for the wrong reason.
+    try std.testing.expect(state.external_rows != 0);
+
+    // The frontend keeps its committed frame, so the retry owes row 1 only.
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    try std.testing.expect(core.grid.main_buf.dirty_rows.isSet(1));
+    try std.testing.expect(!core.grid.main_buf.dirty_rows.isSet(0));
+    try std.testing.expect(!core.grid.main_buf.dirty_rows.isSet(2));
+    try std.testing.expect(!core.grid.main_buf.dirty_rows.isSet(3));
 }
 
 test "a destroyed grid retains its glyph mirror and retries destruction until flush commit" {

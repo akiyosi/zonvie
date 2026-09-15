@@ -1354,14 +1354,14 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
         // Update external windows blink state
         updateExternalWindowsBlinkState(app);
 
-        // Request repaint for cursor area
+        // Request repaint for cursor area. No rect means this window holds no
+        // cursor (it is in an external window), so a blink toggle changes no
+        // pixel here; a whole-window invalidate would present the full frame.
         app.mu.lockUncancelable(core.clock.io());
         const cursor_rect_snapshot = app.last_cursor_rect_px;
         app.mu.unlock(core.clock.io());
         if (cursor_rect_snapshot) |rect| {
             _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
-        } else {
-            _ = c.InvalidateRect(hwnd, null, c.FALSE);
         }
 
         // Schedule next blink
