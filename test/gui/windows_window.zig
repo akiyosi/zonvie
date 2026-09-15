@@ -28,6 +28,10 @@ extern "user32" fn GetWindowRect(hwnd: W.HWND, rect: *RECT) callconv(.winapi) BO
 extern "user32" fn PostMessageW(hwnd: W.HWND, msg: W.UINT, wParam: WPARAM, lParam: W.LPARAM) callconv(.winapi) BOOL;
 extern "user32" fn SetForegroundWindow(hwnd: W.HWND) callconv(.winapi) BOOL;
 extern "user32" fn SetWindowPos(hwnd: W.HWND, after: ?W.HWND, x: i32, y: i32, cx: i32, cy: i32, flags: W.UINT) callconv(.winapi) BOOL;
+extern "user32" fn GetClientRect(hwnd: W.HWND, rect: *RECT) callconv(.winapi) BOOL;
+extern "user32" fn ClientToScreen(hwnd: W.HWND, pt: *POINT) callconv(.winapi) BOOL;
+
+const POINT = extern struct { x: i32, y: i32 };
 
 const SWP_NOSIZE: W.UINT = 0x0001;
 const SWP_NOZORDER: W.UINT = 0x0004;
@@ -129,6 +133,48 @@ pub fn mainWindowHandleForPid(pid: i32) ?W.HWND {
     return ctx.found;
 }
 
+const ExternalCtx = struct {
+    pid: W.DWORD,
+    min_side: i32,
+    found: ?W.HWND = null,
+};
+
+fn externalCb(hwnd: W.HWND, lparam: W.LPARAM) callconv(.winapi) BOOL {
+    const ctx: *ExternalCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    var wpid: W.DWORD = 0;
+    _ = GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != ctx.pid) return 1;
+    if (IsWindowVisible(hwnd) == 0) return 1;
+    var buf: [64]u16 = undefined;
+    if (!std.mem.eql(u16, classOf(hwnd, &buf), external_class)) return 1;
+    var r: RECT = std.mem.zeroes(RECT);
+    if (GetWindowRect(hwnd, &r) == 0) return 1;
+    // The cmdline and message surfaces are external windows too; a size floor
+    // keeps those thin strips from being mistaken for an editor window.
+    if (r.right - r.left < ctx.min_side or r.bottom - r.top < ctx.min_side) return 1;
+    ctx.found = hwnd;
+    return 0; // stop enumeration
+}
+
+/// HWND of a visible external grid window (class "ZonvieExternalWin") at
+/// least `min_side` pixels on both axes, or null.
+pub fn externalWindowHandleForPid(pid: i32, min_side: i32) ?W.HWND {
+    var ctx = ExternalCtx{ .pid = @intCast(pid), .min_side = min_side };
+    _ = EnumWindows(externalCb, @bitCast(@intFromPtr(&ctx)));
+    return ctx.found;
+}
+
+/// Centre of `hwnd`'s CLIENT area in screen pixels — where a synthesized
+/// mouse message has to be addressed, since the frame and any title bar are
+/// not part of the grid.
+pub fn clientCenterScreen(hwnd: W.HWND) ?struct { x: i32, y: i32 } {
+    var r: RECT = std.mem.zeroes(RECT);
+    if (GetClientRect(hwnd, &r) == 0) return null;
+    var pt = POINT{ .x = @divTrunc(r.right - r.left, 2), .y = @divTrunc(r.bottom - r.top, 2) };
+    if (ClientToScreen(hwnd, &pt) == 0) return null;
+    return .{ .x = pt.x, .y = pt.y };
+}
+
 const WM_MOUSEWHEEL: W.UINT = 0x020A;
 const WHEEL_DELTA: i32 = 120;
 
@@ -138,6 +184,13 @@ const WHEEL_DELTA: i32 = 120;
 /// handler runs — this exercises the input path the GUI normally drives.
 pub fn sendWheel(pid: i32, notches: i32, x_px: i32, y_px: i32) bool {
     const hwnd = mainWindowHandleForPid(pid) orelse return false;
+    return sendWheelToWindow(hwnd, notches, x_px, y_px);
+}
+
+/// The same notch, addressed to one window. Posting straight to the HWND is
+/// how a scroll on a window that is not frontmost is exercised: the message
+/// reaches the window proc without depending on z-order.
+pub fn sendWheelToWindow(hwnd: W.HWND, notches: i32, x_px: i32, y_px: i32) bool {
     _ = SetForegroundWindow(hwnd);
     const delta: i32 = notches * WHEEL_DELTA;
     // wParam: high word = wheel delta (signed), low word = key state (0).
