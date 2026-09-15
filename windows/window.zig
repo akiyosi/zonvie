@@ -6287,14 +6287,14 @@ pub export fn WndProc(
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
-                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false, null);
                 return 0;
             }
         },
 
         c.WM_MOUSEHWHEEL => {
             if (getApp(hwnd)) |app| {
-                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true, null);
                 return 0;
             }
         },
