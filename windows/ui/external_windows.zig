@@ -809,6 +809,7 @@ fn drawNormalExternalSurfaceRowMode(
         .row_h_px = row_h_px,
         .content_right = content_right,
         .preserve_back = !force_full_rows,
+        .root_rows_may_be_empty = has_layers,
         // The root layer drives the pixel space core vertices arrive in.
         .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
         .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
@@ -1966,9 +1967,24 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
-    // Initialize D3D11 renderer for external window (with transparency if enabled)
-    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
+    // Share the App device: app.layer_grids row buffers are drawn by whichever
+    // surface places the grid. Until it is published, retry rather than open
+    // on a device of our own.
+    var renderer = blk: {
+        const device = app.d3d_device orelse break :blk null;
+        const device_ctx = app.d3d_ctx orelse break :blk null;
+        break :blk d3d11.Renderer.initWithDevice(
+            app.alloc,
+            hwnd,
+            app.config.window.opacity,
+            app.config.window.blur,
+            device,
+            device_ctx,
+        ) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
+            break :blk null;
+        };
+    } orelse {
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };

@@ -467,6 +467,16 @@ test "gui:extwin_float_trackpad_scroll" {
     }
 }
 
+test "gui:extwin_cursor_move_reuses_rows" {
+    // macOS only: ExternalGridView is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_cursor_move_reuses_rows.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_float_follows_externalized_anchor" {
     // macOS only: external windows and their surface plumbing are frontend code.
     if (comptime builtin.os.tag == .macos) {
