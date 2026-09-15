@@ -1644,41 +1644,43 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// renderer's shared one, which follows the main view's draw cadence.
     /// Returns 0 when nothing is displaced, which is also what the cursor
     /// shader needs then.
-    private func cursorScrollOffsetPxForShader() -> Float? {
+    /// Every input is the frame's own, passed in rather than re-read here.
+    /// The cursor body is placed from the committed snapshot draw(in:) takes
+    /// once, under one hold; a second read taken later in the same frame can
+    /// answer a flush that has committed since — or, worse, one that has not
+    /// committed at all, which is what `pendingSurfaceLayers` would have given.
+    /// The effect would then be displaced on one generation's placement while
+    /// the cursor it tracks was drawn on another's, and a lock around each read
+    /// does nothing about that: the two reads are individually consistent and
+    /// still disagree.
+    private func cursorScrollOffsetPxForShader(
+        ownerGridId: Int64,
+        followsScroll: Bool,
+        offset: MetalTerminalRenderer.ScrollOffset?,
+        snappedRows: UInt32
+    ) -> Float? {
         // The cursor rect is shared with the main surface and every other
         // external window. Only displace it when the cursor is on a grid THIS
         // surface draws — its own, or one it hosts as a layer; otherwise say
         // nothing and let the owner's value stand.
-        let owner = lastForwardedCursorGridId
         guard let renderer = mainTerminalView?.renderer,
-              renderer.shaderCursorBelongs(toGrid: owner) else { return nil }
+              renderer.shaderCursorBelongs(toGrid: ownerGridId) else { return nil }
         // A hosted layer moves with this surface's scroll only when it tracks
         // the buffer: drawHostedLayers displaces `followsScroll` layers by the
         // root's offset and leaves the rest where they are, and the cursor
         // overlay follows the same rule. A fixed float's cursor is drawn at a
-        // standstill, so its effect has to stand still with it.
-        if owner != gridId {
-            tripleBufferLock.lock()
-            let follows = (pendingSurfaceLayers ?? committedSurfaceLayers)
-                .first { $0.gridId == owner }?.followsScroll ?? false
-            tripleBufferLock.unlock()
-            if !follows { return 0 }
-        }
-        lock.lock()
-        let offset = scrollOffsetActive ? scrollOffsetData : nil
-        lock.unlock()
+        // standstill, so its effect has to stand still with it. The root is not
+        // asked: its cursor is displaced by the scroll uniform the draw binds,
+        // not by an origin the CPU moves.
+        if ownerGridId != gridId, !followsScroll { return 0 }
         guard let offset else { return 0 }
         // Undo computeScrollOffset's NDC conversion against this window's
         // viewport height, which is the same height screenSpaceParameters maps
         // through — so the result is already in the rect's pixel space.
-        tripleBufferLock.lock()
-        let snappedRows = committedGridRows
-        tripleBufferLock.unlock()
         let cellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
         guard cellHeightPx > 0 else { return 0 }
-        let rowsForHeight = snappedRows > 0 ? snappedRows : gridRows
         let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
-        let viewportHeight = Float(rowsForHeight) * Float(cellHi)
+        let viewportHeight = Float(snappedRows) * Float(cellHi)
         guard viewportHeight > 0 else { return 0 }
         return -offset.offset_y * viewportHeight / 2.0
     }
@@ -2627,6 +2629,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // lock, so the root origin must be copied out here rather than read
             // later in the frame.
             let rootLayerOriginSnapshot: simd_float2
+            let cursorOwnerSnapshot: Int64
             let cursorLayerOriginSnapshot: simd_float2
             let cursorLayerFollowsScrollSnapshot: Bool
             let layoutDamageSnapshot: Bool
@@ -2787,11 +2790,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rootLayerOriginSnapshot = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
             layoutDamageSnapshot = pendingLayoutDamage
             pendingLayoutDamage = false
+            // One read of the committed owner, used by everything this frame
+            // places against it: the cursor body's origin, whether that origin
+            // follows the scroll, and the shader effect that has to land on the
+            // same cursor. Asking again later is how the body and the effect
+            // came to answer different flushes.
+            cursorOwnerSnapshot = committedCursorGridId ?? gridId
             cursorLayerOriginSnapshot = committedSurfaceLayers.first {
-                $0.gridId == (committedCursorGridId ?? gridId)
+                $0.gridId == cursorOwnerSnapshot
             }?.originPx ?? .zero
             cursorLayerFollowsScrollSnapshot = committedSurfaceLayers.first {
-                $0.gridId == (committedCursorGridId ?? gridId) && $0.gridId != gridId
+                $0.gridId == cursorOwnerSnapshot && $0.gridId != gridId
             }?.followsScroll ?? false
             layerDrawSnapshot.removeAll(keepingCapacity: true)
             for layer in committedSurfaceLayers where layer.gridId != gridId {
@@ -3776,7 +3785,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // view's draw cadence, and this window routinely draws a frame
                 // ahead of it — which put the cursor shader a frame of finger
                 // travel away from the cursor.
-                renderer.evaluateCursorShaderChange(scrollOffsetPx: cursorScrollOffsetPxForShader())
+                renderer.evaluateCursorShaderChange(
+                    scrollOffsetPx: cursorScrollOffsetPxForShader(
+                        ownerGridId: cursorOwnerSnapshot,
+                        followsScroll: cursorLayerFollowsScrollSnapshot,
+                        offset: scrollOffsetSnapshot,
+                        snappedRows: snapGridRows
+                    )
+                )
                 let uniforms = renderer.makeCustomShaderUniforms(
                     screenResolution: screenRes,
                     windowOffset: windowOffset,
