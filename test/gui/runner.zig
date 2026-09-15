@@ -455,3 +455,35 @@ test "gui:visual_decorated_surface_background_alpha" {
         return error.SkipZigTest;
     }
 }
+
+test "gui:extwin_float_trackpad_scroll" {
+    // macOS only: ExternalGridView's scroll path and the window enumeration
+    // this uses live in the macOS frontend and macos_window.zig.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_float_trackpad_scroll.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_float_follows_externalized_anchor" {
+    // macOS only: external windows and their surface plumbing are frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_float_follows_externalized_anchor.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_float_wheel_scroll" {
+    // Windows only: the external-window wheel path and the HWND-addressed
+    // notch this uses live in the Windows frontend and windows_window.zig.
+    if (comptime builtin.os.tag == .windows) {
+        try requirePrereqs();
+        try @import("scenarios/windows/extwin_float_wheel_scroll.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
