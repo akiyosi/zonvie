@@ -608,8 +608,25 @@ pub fn sendMouseButton(
     );
 }
 
+/// Whether a float captures scroll at all. One that already shows every line
+/// of its buffer does not: the event falls through to the window it is drawn
+/// over, the same rule the macOS resolution applies
+/// (MetalTerminalView.isFloatLogicallyScrollable). A grid the cached snapshot
+/// does not carry is treated as not capturing, so a layer whose viewport has
+/// not been reported yet shadows nothing.
+fn layerCapturesScroll(grids: []const app_mod.GridInfo, grid_id: i64) bool {
+    for (grids) |g| {
+        if (g.grid_id != grid_id) continue;
+        const content_rows: i64 = @max(0, @as(i64, g.rows) - @as(i64, g.margin_top) - @as(i64, g.margin_bottom));
+        return g.line_count > content_rows;
+    }
+    return false;
+}
+
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
-/// external windows.
+/// external windows. `ext_window` is the surface this hwnd draws, or null for
+/// the main window; it is what carries the layer list a scroll is resolved
+/// against.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -617,6 +634,7 @@ pub fn handleMouseWheel(
     app: *App,
     grid_id: i64,
     horizontal: bool,
+    ext_window: ?*app_mod.ExternalWindow,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
@@ -642,16 +660,18 @@ pub fn handleMouseWheel(
     // titlebar tabline shifts Y, left sidebar shifts X. External windows
     // (floating windows) have neither, so only apply offsets for the main window.
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
-    const cell = clientPxToCell(app, is_main_window, @intCast(pt.x), @intCast(pt.y), cell_w, row_h, false);
+    const px: i32 = @intCast(pt.x);
+    const py: i32 = @intCast(pt.y);
+    const cell = clientPxToCell(app, is_main_window, px, py, cell_w, row_h, false);
     const col = cell.col;
     const row = cell.row;
 
     // Resolve the scroll target on the main window: hit-test visible grids so
     // a wheel event over a composited grid (float/split) targets that grid
     // with grid-local coordinates, matching the URL-hover hit-test and macOS
-    // resolveScrollTarget. External windows already receive their own grid_id
-    // and window-local coordinates. Uses the non-blocking cached query, so no
-    // lock contention is added to the input path.
+    // resolveScrollTarget. An external window resolves against its own layer
+    // list instead, below. Uses the non-blocking cached query, so no lock
+    // contention is added to the input path.
     var target_grid_id: i64 = grid_id;
     var target_row: i32 = row;
     var target_col: i32 = col;
@@ -669,6 +689,35 @@ pub fn handleMouseWheel(
                     target_row = row - g.start_row;
                     target_col = col - g.start_col;
                 }
+            }
+        }
+    } else if (ext_window) |ew| {
+        // A float anchored inside this window is one of its layers, not a
+        // window of its own. Neovim does no z-order test once the UI names a
+        // grid -- it looks the window up by handle and clamps the position
+        // into it (mouse.c, mouse_find_grid_win) -- so a scroll over such a
+        // float has to name it here, or it scrolls the window behind it. Same
+        // back-to-front resolution the press path does (resolveMouseTarget),
+        // with the extra rule that a float showing all of its content lets the
+        // scroll through.
+        const grids: []const app_mod.GridInfo = if (corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        const layers = ew.tbs.committed_layers.slice();
+        if (layers.len > 1 and cell_w != 0 and row_h != 0) {
+            const cw: i32 = @intCast(cell_w);
+            const rh: i32 = @intCast(row_h);
+            for (layers[1..]) |layer| {
+                if (!layer.mouse_enabled) continue;
+                const w: i32 = @as(i32, @intCast(layer.cols)) * cw;
+                const h: i32 = @as(i32, @intCast(layer.rows)) * rh;
+                if (px < layer.x_px or px >= layer.x_px + w) continue;
+                if (py < layer.y_px or py >= layer.y_px + h) continue;
+                if (!layerCapturesScroll(grids, layer.grid_id)) continue;
+                const local = clientPxToCell(app, false, px - layer.x_px, py - layer.y_px, cell_w, row_h, false);
+                target_grid_id = layer.grid_id;
+                target_row = local.row;
+                target_col = local.col;
             }
         }
     }
