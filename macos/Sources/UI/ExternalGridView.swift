@@ -123,6 +123,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // 2-pass rendering pipelines for blur support
     private var backgroundPipeline: MTLRenderPipelineState?
     private var glyphPipeline: MTLRenderPipelineState?
+    // Single-pass replacement for the pair above; nil falls back to them.
+    private var unifiedBlurPipeline: MTLRenderPipelineState?
 
     private let lock = NSLock()
 
@@ -172,6 +174,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     func submitLayerRow(gridId id: Int64, rowStart: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, totalRows: Int, totalCols: Int) {
         guard isInFlush, id != gridId else { return }
+        guard prepareRowWriteState() else {
+            flushFailed = true
+            return
+        }
         let sets = gridBuffers.sets(for: id)
         // Match root rows: reuse buffers, then grow synchronously if needed.
         // Deferring ordinary growth aborts the whole flush into retry backoff.
@@ -218,9 +224,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=\(gridId) grid=\(id) vertices=\(count)")
-        if !writeCursorVertices(into: bufferSets[writeSetIndex], ptr: ptr, count: count) {
-            flushFailed = true
-        }
+        writeBracketCursorVertices(ptr: ptr, count: count)
         pendingCursorGridId = id
         flushHadContent = true
         // The surface's own cursor path forwards its rect to the shared cursor
@@ -239,7 +243,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     func applyLayerRowScroll(gridId id: Int64, rowStart: Int, rowEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_shift surface=\(gridId) grid=\(id) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
-        guard isInFlush, let sets = gridBuffers.existingSets(for: id),
+        guard isInFlush, prepareRowWriteState(),
+              let sets = gridBuffers.existingSets(for: id),
               rowStart >= 0, rowEnd <= sets[writeSetIndex].rowLogicalToSlot.count,
               rowEnd > rowStart, rowsDelta != 0 else {
             flushFailed = true
@@ -251,7 +256,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         flushHadContent = true
         markHostedDamage(gridId: id, rowStart: rowStart, rowEnd: rowEnd)
     }
-    private var writeSetIndex: Int = 0            // Main thread only (during flush)
+    private var writeSetIndex: Int = -1           // Main thread only (during flush)
+    /// Whether this bracket has acquired `writeSetIndex`. A bracket that writes
+    /// no rows never does, and commits without rotating the row triple.
+    private var rowWritePrepared: Bool = false
     private var flushSourceSetIndex: Int = 0      // Main thread only (during flush)
     private var committedSetIndex: Int = 0        // Protected by tripleBufferLock
     private var gpuInFlightCount: [Int] = [0, 0, 0] // Protected by tripleBufferLock
@@ -528,6 +536,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // to avoid shared MTLBuffer GPU/CPU race.
     private var scrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var scrollOffsetActive: Bool = false
+    /// One offset per hosted grid that is scrolling in its own right, sorted by
+    /// grid id for `surfaceScrollOffset`'s binary search. The root's own offset
+    /// stays in `scrollOffsetData`: that is the one the surface-wide passes
+    /// bind. Published under `lock`, like `scrollOffsetData`.
+    private var hostedScrollOffsetData: [MetalTerminalRenderer.ScrollOffset] = []
+    /// Built outside `lock` (resolving an offset takes the main view's own
+    /// locks) and copied in, so neither lock is ever held while taking the
+    /// other. Persistent, so a scrolled frame does no heap work for it.
+    private var hostedScrollOffsetScratch: [MetalTerminalRenderer.ScrollOffset] = []
+    /// What `markScrollOffsetStatePresented` last froze, for the end-of-ease
+    /// comparison the root's own `lastPresentedScrollOffsetData` makes.
+    private var lastPresentedHostedScrollOffsetData: [MetalTerminalRenderer.ScrollOffset] = []
+    private var hostedLayerOriginScratch: [(gridId: Int64, originYPx: Float)] = []
     private var lastPresentedScrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var lastPresentedScrollOffsetActive: Bool = false
     /// Rows scrolled off this window's edge, kept alive so the band the
@@ -633,18 +654,40 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var lastKnownCursorRow: Int = -1
 
     // Separate cursor vertex buffer (not part of row buffers, immune to GPU scroll copy).
-    // The buffer/count themselves live per-set on SurfaceBufferSet (see beginFlush's
-    // cursor copy-forward and submitVerticesRowRaw's write side) so a GPU-in-flight
-    // read of the committed set never races a CPU write into the same MTLBuffer.
     private var cursorDirty: Bool = false
 
+    /// One published cursor, independent of the row triple.
+    ///
+    /// The cursor used to live on `SurfaceBufferSet`, which tied publishing a
+    /// cursor to rotating a row set: plain cursor motion — the commonest flush
+    /// an external window sees — had to find a free row set, resynchronize the
+    /// root's and every hosted grid's row state into it, and rotate, or be
+    /// dropped when all three were GPU-in-flight. Cursor callbacks replace the
+    /// cursor outright, so a slot needs no copy-forward; three of them are
+    /// enough for the committed one plus the frames in flight, and
+    /// `cursorStaging` still covers the case where they are all busy.
+    /// Mirrors MetalTerminalRenderer's cursor triple.
+    private final class SurfaceCursorSlot {
+        var vertexBuffer: MTLBuffer? = nil
+        var vertexBufferCap: Int = 0
+        var vertexCount: Int = 0
+    }
+    /// All four guarded by `tripleBufferLock`, like the row triple's own state.
+    private var cursorSlots: [SurfaceCursorSlot] = [
+        SurfaceCursorSlot(), SurfaceCursorSlot(), SurfaceCursorSlot()
+    ]
+    private var committedCursorSetIndex: Int = 0
+    private var cursorGpuInFlightCount: [Int] = [0, 0, 0]
+    /// The slot this bracket wrote, or -1 when it has written no cursor. Only a
+    /// bracket that wrote one rotates `committedCursorSetIndex` at commit.
+    private var cursorWriteSetIndex: Int = -1
+
     // Staged out-of-bracket cursor update awaiting a safe apply point.
-    // Written by submitVerticesRowRaw's out-of-bracket cursor path when the
-    // committed set is GPU-in-flight (writing its cursorVertexBuffer in place
-    // would race the in-flight read); applied by draw() once the set is idle
-    // and mirrored into the write set by beginFlush(). cursorStagingCount:
-    // -1 = none pending, 0 = clear cursor, >0 = vertex count in cursorStaging.
-    // Protected by tripleBufferLock.
+    // Written by submitVerticesRowRaw's out-of-bracket cursor path when every
+    // cursor slot is GPU-in-flight (writing one in place would race the
+    // in-flight read); applied by draw() once a slot frees up.
+    // cursorStagingCount: -1 = none pending, 0 = clear cursor, >0 = vertex
+    // count in cursorStaging. Protected by tripleBufferLock.
     private var cursorStaging: [zonvie_vertex] = []
     private var cursorStagingCount: Int = -1
 
@@ -789,6 +832,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     ///   - sharedPipeline: Shared render pipeline from main renderer
     ///   - sharedBackgroundPipeline: Shared 2-pass background pipeline (for blur)
     ///   - sharedGlyphPipeline: Shared 2-pass glyph pipeline (for blur)
+    ///   - sharedUnifiedBlurPipeline: Shared single-pass blur pipeline, when built
     ///   - sharedSampler: Shared sampler state
     ///   - blurEnabled: Whether blur effect is enabled
     ///   - isDecoratedSurface: Whether this grid uses a decorated special-window shell
@@ -802,6 +846,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
           sharedPipeline: MTLRenderPipelineState,
           sharedBackgroundPipeline: MTLRenderPipelineState?,
           sharedGlyphPipeline: MTLRenderPipelineState?,
+          sharedUnifiedBlurPipeline: MTLRenderPipelineState?,
           sharedSampler: MTLSamplerState,
           blurEnabled: Bool = false,
           isDecoratedSurface: Bool = false) {
@@ -816,6 +861,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         self.pipeline = sharedPipeline
         self.backgroundPipeline = sharedBackgroundPipeline
         self.glyphPipeline = sharedGlyphPipeline
+        self.unifiedBlurPipeline = sharedUnifiedBlurPipeline
         self.sampler = sharedSampler
 
         super.init(frame: .zero, device: device)
@@ -962,6 +1008,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             bs.mainVertexBuffer = nil
             bs.cursorVertexBuffer = nil
+        }
+        for slot in cursorSlots {
+            slot.vertexBuffer = nil
+            slot.vertexBufferCap = 0
+            slot.vertexCount = 0
         }
 
         backBuffer = nil
@@ -1205,18 +1256,65 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         stageFontChanged(generation: generation)
     }
 
-    /// Begin flush bracket — pick a free buffer set and copy committed buffer references.
-    /// Called on main thread before vertex submission during a flush cycle.
-    /// Returns false if the flush bracket could not be opened (no free buffer
-    /// set) — the caller must then tell the core to abort this flush, exactly
-    /// as MetalTerminalRenderer.beginFlush()'s `.dropped` result does.
+    /// Begin flush bracket. Cheap by design: a flush that turns out to carry no
+    /// rows — plain cursor motion, the commonest one an external window sees —
+    /// must not pay for a row set, nor be dropped because none is free. The row
+    /// side is acquired by `prepareRowWriteState()` on the first row mutation,
+    /// mirroring MetalTerminalRenderer.prepareMainWriteState().
+    ///
+    /// Always returns true now; the return stays so ZonvieCore's abort path
+    /// keeps its shape, and so a future gate here can still refuse a bracket.
     @discardableResult
     func beginFlush() -> Bool {
         tripleBufferLock.lock()
+        flushDirtyRows.removeAll()
+        // What the pending set held before this bracket added anything. Only
+        // these marks describe pre-shift rows, and a row number this bracket
+        // marks again does not make them the same mark — see
+        // mergePublishedScrollDirtyRows.
+        carriedDirtyRows = pendingDirtyRows
+        let srcIdx = committedSetIndex
+        writeSetIndex = -1
+        rowWritePrepared = false
+        cursorWriteSetIndex = -1
+        flushSourceSetIndex = srcIdx
+        flushFontGeneration = fontResetState.beginFlushGeneration(
+            sourceGeneration: bufferSets[srcIdx].fontGeneration
+        )
+        flushGeneratedTotalRows = bufferSets[srcIdx].knownTotalRows
+        flushGeneratedTotalCols = bufferSets[srcIdx].knownTotalCols
+        flushGeneratedRows.removeAll()
+        flushChangedRows.removeAll()
+        flushHasStructuralRowChange = false
+        // Publish "bracket open" BEFORE any unlocked committed-set copy:
+        // main-thread out-of-bracket writers check this under the same lock and
+        // stage instead of mutating the committed set, which makes
+        // prepareRowWriteState's unlocked copySurfaceBufferSetRowState reads
+        // safe (no concurrent committed-set mutation can start once this is
+        // set).
+        bracketOpen = true
+        tripleBufferLock.unlock()
+
+        isInFlush = true
+        flushHadContent = false
+        pendingCursorGridId = committedCursorGridId
+        return true
+    }
+
+    /// Acquire and synchronize the row write set, once, on the first row
+    /// mutation of a bracket. Returns false when no set is free or a capacity
+    /// worker owns the row state; the caller latches `flushFailed`, which
+    /// ZonvieCore escalates into an abort at flush end — the same contract
+    /// MetalTerminalRenderer.prepareMainWriteState() has.
+    @discardableResult
+    private func prepareRowWriteState() -> Bool {
+        if rowWritePrepared { return true }
+        guard isInFlush else { return false }
+
+        tripleBufferLock.lock()
         if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
             tripleBufferLock.unlock()
-            isInFlush = false
-            ZonvieCore.appLog("[ExternalGridView] beginFlush: waiting for row capacity provisioning gridId=\(gridId)")
+            ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row capacity provisioning gridId=\(gridId)")
             return false
         }
         if rowHistoryGrowthWaitingForBracket {
@@ -1225,17 +1323,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // window; otherwise a high-frequency core stream can starve it by
             // opening a new bracket before every attempt.
             tripleBufferLock.unlock()
-            isInFlush = false
-            ZonvieCore.appLog("[ExternalGridView] beginFlush: waiting for row-history growth gridId=\(gridId)")
+            ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row-history growth gridId=\(gridId)")
             return false
         }
-        flushDirtyRows.removeAll()
-        // What the pending set held before this bracket added anything. Only
-        // these marks describe pre-shift rows, and a row number this bracket
-        // marks again does not make them the same mark — see
-        // mergePublishedScrollDirtyRows.
-        carriedDirtyRows = pendingDirtyRows
-        let srcIdx = committedSetIndex
+        let srcIdx = flushSourceSetIndex
         let picked = pickFreeBufferSetIndex(
             count: 3,
             committedIndex: srcIdx,
@@ -1244,37 +1335,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if picked == -1 {
             let inf = gpuInFlightCount
             tripleBufferLock.unlock()
-            isInFlush = false
-            ZonvieCore.appLog("[ExternalGridView] beginFlush: no free buffer set, dropping flush gridId=\(gridId) committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+            ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: no free buffer set, dropping flush gridId=\(gridId) committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
             return false
         }
         writeSetIndex = picked
-        flushSourceSetIndex = srcIdx
-        flushFontGeneration = fontResetState.beginFlushGeneration(
-            sourceGeneration: bufferSets[srcIdx].fontGeneration
-        )
-        flushGeneratedTotalRows = bufferSets[srcIdx].knownTotalRows
-        flushGeneratedTotalCols = bufferSets[srcIdx].knownTotalCols
-        flushGeneratedRows.removeAll()
-        // Publish "bracket open" BEFORE the unlocked committed-set copies
-        // below: main-thread out-of-bracket writers check this under the
-        // same lock and stage instead of mutating the committed set, which
-        // makes the unlocked copySurfaceBufferSetRowState / cursor
-        // carry-forward reads safe (no concurrent committed-set mutation
-        // can start once this is set).
-        bracketOpen = true
+        rowWritePrepared = true
         tripleBufferLock.unlock()
 
-        isInFlush = true
-        flushHadContent = false
-        pendingCursorGridId = committedCursorGridId
         gridBuffers.copyGridIds(into: &layerGridIdScratch)
         for id in layerGridIdScratch where id != gridId {
             let sets = gridBuffers.sets(for: id)
             copySurfaceBufferSetRowState(from: sets[srcIdx], to: sets[picked])
         }
-        flushChangedRows.removeAll()
-        flushHasStructuralRowChange = false
         // Discard retention staged by a bracket that aborted instead of
         // committing; publication only ever happens from commitFlush. Then
         // capture what this flush's scroll is about to take off the edge,
@@ -1312,42 +1384,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let elapsedUsString = String(format: "%.1f", elapsedUs)
             ZonvieCore.appLogPerf("[perf] external_begin_prepare gridId=\(gridId) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(elapsedUsString)")
         }
-        // Carry the committed set's cursor forward into the write set.
-        // copySurfaceBufferSetRowState copies NO cursor state; without this,
-        // a flush that commits without a cursor resubmission would rotate
-        // committedSetIndex onto a stale/nil cursor slot. Copy into dst's OWN
-        // buffer (allocate only on capacity growth), never COW-share — same
-        // as MetalTerminalRenderer's per-set cursor copy (lines 996-1009).
-        let cursorSrc = src
-        let cursorDst = dst
-        let cursorBytes = cursorSrc.cursorVertexCount * MemoryLayout<Vertex>.stride
-        if cursorSrc.cursorVertexCount > 0, let srcBuf = cursorSrc.cursorVertexBuffer {
-            if cursorDst.cursorVertexBuffer == nil || cursorDst.cursorVertexBufferCap < cursorBytes {
-                let newCap = max(cursorBytes, 48 * MemoryLayout<Vertex>.stride)
-                cursorDst.cursorVertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
-                cursorDst.cursorVertexBufferCap = cursorDst.cursorVertexBuffer != nil ? newCap : 0
-                if cursorDst.cursorVertexBuffer == nil { flushFailed = true }
-            }
-            if let dstBuf = cursorDst.cursorVertexBuffer {
-                memcpy(dstBuf.contents(), srcBuf.contents(), cursorBytes)
-            }
-        }
-        cursorDst.cursorVertexCount = cursorSrc.cursorVertexCount
-        // A staged out-of-bracket cursor update (see submitVerticesRowRaw) is
-        // newer than the committed cursor copied above — overwrite the write
-        // set with it so a commit without cursor resubmission publishes it.
-        // Do NOT clear the staging: if this flush ends without content the
-        // committed set never rotates, and draw() still needs to apply the
-        // staging there once idle (re-applying identical data is idempotent).
+        // No cursor carry-forward: the cursor lives on its own triple now, and
+        // a row-set rotation neither publishes nor invalidates it. A staged
+        // cursor is left alone too — draw() publishes it into a free slot
+        // without needing this bracket to reach a commit.
         tripleBufferLock.lock()
-        if cursorStagingCount >= 0 {
-            let stagedCount = cursorStagingCount
-            cursorStaging.withUnsafeBufferPointer { stagedBuf in
-                if !writeCursorVertices(into: cursorDst, ptr: stagedBuf.baseAddress, count: stagedCount) {
-                    flushFailed = true
-                }
-            }
-        }
         // Fold staged out-of-bracket ROW updates into the write set (never
         // GPU-in-flight, so this is always safe). Moved into rowStagingFolded
         // (not dropped): commitFlush clears them once published, while
@@ -1376,7 +1417,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // sweep into an app-wide abort_flush. requirePreparedRowCapacity
                     // now only records a real allocation failure for recovery.
                     if !submitSurfaceRowVertices(
-                        target: cursorDst,
+                        target: dst,
                         sourceSet: src,
                         device: mtlDevice,
                         rowStart: row,
@@ -1448,10 +1489,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         tripleBufferLock.lock()
         pendingSurfaceLayers = nil
         pendingCursorGridId = nil
-        if bracketOpen {
+        // Only a bracket that acquired a row set left one half-written.
+        if bracketOpen, rowWritePrepared, writeSetIndex >= 0 {
             rowStateNeedsFullSync[writeSetIndex] = true
             staleRowsBySet[writeSetIndex].removeAll()
         }
+        rowWritePrepared = false
+        writeSetIndex = -1
+        // An abandoned bracket publishes no cursor. The slot it wrote is simply
+        // released; the committed one is still whatever was last published.
+        cursorWriteSetIndex = -1
         restoreFoldedRowStagingLocked()
         flushChangedRows.removeAll()
         flushGeneratedRows.removeAll()
@@ -1470,13 +1517,41 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard isInFlush else { return }
         FrameTracer.trace(.commitFlush, seq: UInt32(truncatingIfNeeded: gridId))
         let hadContent = flushHadContent
+        // Captured before the bracket's state is reset below; -1 names a commit
+        // that published no rows.
+        let tracedWriteSet = rowWritePrepared ? writeSetIndex : -1
         var shouldScheduleGrowth = false
         if hadContent {
-            let layoutContracted =
-                bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[writeSetIndex].knownTotalRows
-                || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[writeSetIndex].knownTotalCols
+            // What this bracket actually published. A flush that only moved the
+            // cursor took no row set and rotates none: it must not bump the
+            // commit revision either, or draw() reads a new commit with no dirty
+            // row, fails its cursor-only test and clears the whole surface to
+            // redraw content that did not change.
+            let publishedRows = rowWritePrepared
+            let publishedLayers = pendingSurfaceLayers != nil
+            let cursorOnlyCommit = !publishedRows && !publishedLayers
+            let layoutContracted = publishedRows
+                && (bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[writeSetIndex].knownTotalRows
+                    || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[writeSetIndex].knownTotalCols)
             tripleBufferLock.lock()
-            committedSetIndex = writeSetIndex
+            if publishedRows {
+                committedSetIndex = writeSetIndex
+            }
+            // The cursor this bracket wrote becomes visible with the rows it
+            // belongs to. A bracket that wrote none leaves the published slot
+            // where it is — nothing about a row rotation ages the cursor.
+            if cursorWriteSetIndex != -1 {
+                committedCursorSetIndex = cursorWriteSetIndex
+                cursorWriteSetIndex = -1
+                // Arm the redraw in the same lock that publishes the slot, the
+                // way flushDirtyRows is re-published for rows. Two ways this
+                // frame would otherwise never be drawn: a draw() that
+                // interleaved between the submit and this commit already
+                // consumed the flag the submit set, and submitLayerCursor never
+                // sets one at all. Neither is covered by the commit revision
+                // any more — a cursor-only commit deliberately leaves it alone.
+                cursorDirty = true
+            }
             committedGridRows = gridRows
             committedGridCols = gridCols
             committedCursorGridId = pendingCursorGridId
@@ -1492,27 +1567,35 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // would draw the same line twice. Same for the cursor rect the
             // shader uniforms carry — it describes this bracket's cursor
             // vertices, which only reach the screen now.
-            if retention.commit() {
+            // Retention and the scroll distance it was captured against belong
+            // to the row side: only a bracket that published rows spends them.
+            if publishedRows {
+                if retention.commit() {
+                    pendingGridScrollLock.lock()
+                    smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
+                    stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
+                    pendingGridScrollLock.unlock()
+                }
+                // The distance this bracket captured against is only spent now
+                // that its vertices are the committed ones; a cancelled bracket
+                // leaves it for the next (see captureRetainedRowsForPendingScroll).
                 pendingGridScrollLock.lock()
-                smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
-                stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
+                pendingGridScrollRows = 0
                 pendingGridScrollLock.unlock()
             }
             mainTerminalView?.renderer.publishCursorShaderState()
-            // The distance this bracket captured against is only spent now
-            // that its vertices are the committed ones; a cancelled bracket
-            // leaves it for the next (see captureRetainedRowsForPendingScroll).
-            pendingGridScrollLock.lock()
-            pendingGridScrollRows = 0
-            pendingGridScrollLock.unlock()
-            commitRevision &+= 1
-            serviceSurfaceRowStorageRetirement(
-                bufferSets: bufferSets,
-                gpuInFlightCount: gpuInFlightCount,
-                committedSetIndex: committedSetIndex,
-                layoutContracted: layoutContracted,
-                state: &rowStorageRetirement
-            )
+            if !cursorOnlyCommit {
+                commitRevision &+= 1
+            }
+            if publishedRows {
+                serviceSurfaceRowStorageRetirement(
+                    bufferSets: bufferSets,
+                    gpuInFlightCount: gpuInFlightCount,
+                    committedSetIndex: committedSetIndex,
+                    layoutContracted: layoutContracted,
+                    state: &rowStorageRetirement
+                )
+            }
             // Freeze the atlas texture reference into the SAME buffer set
             // as this commit's vertex data — see SurfaceBufferSet.atlasTextureSnapshot
             // for why draw(in:) must read both from one consistent
@@ -1520,12 +1603,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // a later point. Safe to call here: ZonvieCore's on_flush_end
             // always commits the main renderer (which commits the atlas)
             // before calling this function, both on the core/RPC thread.
-            bufferSets[writeSetIndex].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+            //
+            // A cursor-only commit rotates no set, so it refreshes the standing
+            // one — and only while no frame is reading it, because draw() takes
+            // this reference outside the lock. A cursor glyph that missed the
+            // refresh still draws: within one atlas generation the texture
+            // object does not change, and a generation change is caught by
+            // committedFontIsCurrent instead.
+            if publishedRows {
+                bufferSets[writeSetIndex].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+            } else if gpuInFlightCount[committedSetIndex] == 0 {
+                bufferSets[committedSetIndex].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+            }
             // Merge the write set's staged scroll into the global accumulator.
             // Done here (under lock, after committedSetIndex update) so draw()
             // never sees a scroll delta that precedes the matching vertex data
             // (mirrors MetalTerminalRenderer.commitFlush).
-            if let ps = bufferSets[writeSetIndex].pendingScroll {
+            if publishedRows, let ps = bufferSets[writeSetIndex].pendingScroll {
                 // Marks an earlier bracket left, that no draw has consumed,
                 // still name pre-shift rows: this bracket rotated the slots
                 // under them. This bracket's own marks are left where they are,
@@ -1576,30 +1670,34 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // interleaved (mirrors MetalTerminalRenderer.commitFlush).
             pendingDirtyRows.formUnion(flushDirtyRows)
             flushDirtyRows.removeAll()
-            // Folded staged rows are published with this commit — drop them.
-            rowStagingFolded.removeAll(keepingCapacity: true)
-            let committed = bufferSets[writeSetIndex]
-            let generatedRowCount = flushGeneratedTotalRows == committed.knownTotalRows
-                && flushGeneratedTotalCols == committed.knownTotalCols
-                ? flushGeneratedRows.rows.count
-                : 0
-            committed.fontGeneration = fontResetState.commitGeneration(
-                sourceGeneration: committed.fontGeneration,
-                flushGeneration: flushFontGeneration,
-                regeneratedRows: generatedRowCount,
-                totalRows: committed.knownTotalRows
-            )
-            recordCommittedRowMutationLocked(
-                committedIndex: writeSetIndex,
-                rows: flushChangedRows.rows.lazy.map(Int.init),
-                structural: flushHasStructuralRowChange
-            )
+            if publishedRows {
+                // Folded staged rows are published with this commit — drop them.
+                rowStagingFolded.removeAll(keepingCapacity: true)
+                let committed = bufferSets[writeSetIndex]
+                let generatedRowCount = flushGeneratedTotalRows == committed.knownTotalRows
+                    && flushGeneratedTotalCols == committed.knownTotalCols
+                    ? flushGeneratedRows.rows.count
+                    : 0
+                committed.fontGeneration = fontResetState.commitGeneration(
+                    sourceGeneration: committed.fontGeneration,
+                    flushGeneration: flushFontGeneration,
+                    regeneratedRows: generatedRowCount,
+                    totalRows: committed.knownTotalRows
+                )
+                recordCommittedRowMutationLocked(
+                    committedIndex: writeSetIndex,
+                    rows: flushChangedRows.rows.lazy.map(Int.init),
+                    structural: flushHasStructuralRowChange
+                )
+            }
             if !pendingDirtyRows.isEmpty || pendingScrollAccum != nil {
                 lastCommitTime = mach_absolute_time()
             }
             flushChangedRows.removeAll()
             flushGeneratedRows.removeAll()
             flushHasStructuralRowChange = false
+            rowWritePrepared = false
+            writeSetIndex = -1
             bracketOpen = false
             shouldScheduleGrowth = scheduleWaitingRowHistoryGrowthLocked()
             tripleBufferLock.unlock()
@@ -1608,10 +1706,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // and put any folded staged rows back (unreachable in practice —
             // folding sets flushHadContent — kept for robustness).
             tripleBufferLock.lock()
+            cursorWriteSetIndex = -1
             restoreFoldedRowStagingLocked()
             flushChangedRows.removeAll()
             flushGeneratedRows.removeAll()
             flushHasStructuralRowChange = false
+            rowWritePrepared = false
+            writeSetIndex = -1
             bracketOpen = false
             shouldScheduleGrowth = scheduleWaitingRowHistoryGrowthLocked()
             tripleBufferLock.unlock()
@@ -1621,7 +1722,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             enqueueRowHistoryGrowth()
         }
         if hadContent {
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_commit surface=\(gridId) write_set=\(writeSetIndex)")
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_commit surface=\(gridId) write_set=\(tracedWriteSet)")
             activateDrawLoop()
         }
     }
@@ -1655,7 +1756,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// still disagree.
     private func cursorScrollOffsetPxForShader(
         ownerGridId: Int64,
-        followsScroll: Bool,
         offset: MetalTerminalRenderer.ScrollOffset?,
         viewportHeightPx: Float
     ) -> Float? {
@@ -1665,14 +1765,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // nothing and let the owner's value stand.
         guard let renderer = mainTerminalView?.renderer,
               renderer.shaderCursorBelongs(toGrid: ownerGridId) else { return nil }
-        // A hosted layer moves with this surface's scroll only when it tracks
-        // the buffer: drawHostedLayers displaces `followsScroll` layers by the
-        // root's offset and leaves the rest where they are, and the cursor
-        // overlay follows the same rule. A fixed float's cursor is drawn at a
-        // standstill, so its effect has to stand still with it. The root is not
-        // asked: its cursor is displaced by the scroll uniform the draw binds,
-        // not by an origin the CPU moves.
-        if ownerGridId != gridId, !followsScroll { return 0 }
+        // `offset` is the owner grid's EFFECTIVE displacement, resolved by the
+        // caller the same way drawHostedLayers resolves a layer's: the grid's
+        // own offset when it scrolls in its own right, the root's when it only
+        // follows the buffer, and nil when it stands still. A fixed float's
+        // cursor is drawn at a standstill, so its effect stands still with it.
         guard let offset else { return 0 }
         // Undo computeScrollOffset's NDC conversion against the viewport height
         // THIS frame drew with -- the caller's own
@@ -1841,6 +1938,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // per-view sweep) aborted the whole app's flush including the main
         // grid.
 
+        guard prepareRowWriteState() else {
+            flushFailed = true
+            return
+        }
         let ws = bufferSets[writeSetIndex]
         // Capture the outgoing rows when the grid_scroll callback handed over
         // no distance of its own. That hand-over is gated to gesture-owned
@@ -1937,28 +2038,99 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     /// Write cursor vertices into a buffer set's dedicated cursor buffer
     /// (allocate only on capacity growth; count == 0 clears the cursor).
-    /// Caller must guarantee the set is not GPU-in-flight: the write set
-    /// inside a flush bracket, or the committed set with
-    /// gpuInFlightCount == 0 while holding tripleBufferLock.
+    /// Caller must guarantee the slot is not GPU-in-flight — `pickCursorSlot`
+    /// answers that, under tripleBufferLock.
     @discardableResult
-    private func writeCursorVertices(into targetSet: SurfaceBufferSet, ptr: UnsafePointer<zonvie_vertex>?, count: Int) -> Bool {
+    private func writeCursorVertices(into slot: SurfaceCursorSlot, ptr: UnsafePointer<zonvie_vertex>?, count: Int) -> Bool {
         if count > 0, let validPtr = ptr {
             let byteCount = count * MemoryLayout<Vertex>.stride
-            if targetSet.cursorVertexBuffer == nil || targetSet.cursorVertexBufferCap < byteCount {
+            if slot.vertexBuffer == nil || slot.vertexBufferCap < byteCount {
                 let newCap = max(byteCount, 48 * MemoryLayout<Vertex>.stride)
-                targetSet.cursorVertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
-                targetSet.cursorVertexBufferCap = targetSet.cursorVertexBuffer != nil ? newCap : 0
+                slot.vertexBuffer = mtlDevice.makeBuffer(length: newCap, options: .storageModeShared)
+                slot.vertexBufferCap = slot.vertexBuffer != nil ? newCap : 0
             }
-            if let buf = targetSet.cursorVertexBuffer {
+            if let buf = slot.vertexBuffer {
                 memcpy(buf.contents(), validPtr, byteCount)
-                targetSet.cursorVertexCount = count
+                slot.vertexCount = count
             } else {
                 return false
             }
         } else {
-            targetSet.cursorVertexCount = 0
+            slot.vertexCount = 0
         }
         return true
+    }
+
+    /// Write a cursor from inside a flush bracket into a slot of this
+    /// bracket's own, rotated in at commit. Reusing the slot already picked
+    /// keeps a bracket that writes the cursor twice from consuming two.
+    ///
+    /// A failure — every slot being read by a frame in flight, or a buffer that
+    /// cannot be grown — fails the flush, exactly as the row side does. It must
+    /// NOT fall back to `cursorStaging`: that channel is published by draw() the
+    /// moment a slot frees, with no regard for whether this bracket ever
+    /// committed, so a cursor from an uncommitted or aborted flush would be
+    /// drawn against the previous content and layout.
+    private func writeBracketCursorVertices(ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
+        tripleBufferLock.lock()
+        defer { tripleBufferLock.unlock() }
+        if cursorWriteSetIndex == -1 {
+            cursorWriteSetIndex = pickCursorSlotLocked()
+        }
+        let target = cursorWriteSetIndex
+        if target != -1, writeCursorVertices(into: cursorSlots[target], ptr: ptr, count: count) {
+            cursorStagingCount = -1  // this write supersedes any staged update
+            return
+        }
+        cursorWriteSetIndex = -1
+        let inf = cursorGpuInFlightCount
+        ZonvieCore.appLog("[ExternalGridView] cursor write failed gridId=\(gridId) committed=\(committedCursorSetIndex) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+        flushFailed = true
+    }
+
+    /// A cursor slot that is neither published, nor being read by the GPU, nor
+    /// `reserved` — the slot an open bracket is going to rotate in. Handing
+    /// that one to an out-of-bracket publish would put a live cursor in a slot
+    /// the core thread still writes into. -1 when nothing is free.
+    /// Caller holds `tripleBufferLock`.
+    private func pickCursorSlotLocked(excluding reserved: Int = -1) -> Int {
+        for index in 0..<cursorSlots.count
+        where index != committedCursorSetIndex
+            && index != reserved
+            && cursorGpuInFlightCount[index] == 0 {
+            return index
+        }
+        return -1
+    }
+
+    /// Publish `count` cursor vertices into a free slot and make it committed.
+    /// Returns false when no slot was free or the write failed — the caller
+    /// then stages CPU-side. Caller holds `tripleBufferLock`.
+    private func publishCursorVerticesLocked(ptr: UnsafePointer<zonvie_vertex>?, count: Int) -> Bool {
+        let picked = pickCursorSlotLocked(excluding: cursorWriteSetIndex)
+        guard picked != -1 else { return false }
+        guard writeCursorVertices(into: cursorSlots[picked], ptr: ptr, count: count) else { return false }
+        committedCursorSetIndex = picked
+        return true
+    }
+
+    /// Release one protected GPU read of a cursor slot. Caller holds
+    /// `tripleBufferLock`. Unlike the row triple there is no storage
+    /// retirement to service: a slot owns exactly one buffer.
+    /// Release both halves of one frame's protected reads: the row set it drew
+    /// and the cursor slot it drew over it. draw() takes them together, so
+    /// every bail and every completion handler has to give both back.
+    private func completeSurfaceFrameReadLocked(rowSet: Int, cursorSlot: Int) {
+        completeSurfaceGpuReadLocked(rowSet)
+        completeSurfaceCursorGpuReadLocked(cursorSlot)
+    }
+
+    private func completeSurfaceCursorGpuReadLocked(_ slotIndex: Int) {
+        guard slotIndex >= 0,
+              slotIndex < cursorGpuInFlightCount.count,
+              cursorGpuInFlightCount[slotIndex] > 0
+        else { return }
+        cursorGpuInFlightCount[slotIndex] -= 1
     }
 
     /// Submit vertices for one row into the write set during a flush bracket.
@@ -2003,14 +2175,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             cursorDirty = true
             tripleBufferLock.unlock()
             if !outOfBracket && isInFlush {
-                // Write set: never GPU-in-flight (pickFreeBufferSetIndex).
-                if writeCursorVertices(into: bufferSets[writeSetIndex], ptr: ptr, count: count) {
-                    tripleBufferLock.lock()
-                    cursorStagingCount = -1 // this write supersedes any staged update
-                    tripleBufferLock.unlock()
-                } else {
-                    flushFailed = true
-                }
+                // A slot of this bracket's own, rotated in at commit. Reusing
+                // the one already picked keeps a bracket that writes the cursor
+                // twice from consuming two slots.
+                writeBracketCursorVertices(ptr: ptr, count: count)
                 // A cursor update IS flush content: without this, a
                 // cursor-only flush (plain cursor movement — no row changed)
                 // never rotates committedSetIndex, the cursor written above
@@ -2019,31 +2187,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // j-repeat on external windows).
                 flushHadContent = true
             } else {
-                // Out-of-bracket: the committed set may still be read by a
-                // GPU command buffer from a previous draw(); writing its
-                // cursorVertexBuffer in place would race that read — the
-                // exact hazard the per-set buffers exist to prevent. Write
-                // directly only when provably idle (gpuInFlightCount == 0
-                // while holding tripleBufferLock — draw() increments under
-                // the same lock); otherwise stage CPU-side for draw() /
-                // beginFlush() to apply at the next safe point.
+                // Out-of-bracket: publish into a slot no frame is reading. An
+                // open bracket is no longer a reason to hold back — the cursor
+                // no longer rides the row set a commit rotates, so nothing this
+                // write lands in can be discarded by one. When every slot is
+                // busy, stage CPU-side for draw() to publish.
                 tripleBufferLock.lock()
-                let csi = committedSetIndex
-                if !bracketOpen && !rowCapacityProvisioning && gpuInFlightCount[csi] == 0 {
-                    // No open bracket (a bracket's commit would rotate onto a
-                    // write set copied BEFORE this write, discarding it) and
-                    // the set is idle: safe to write directly.
-                    if writeCursorVertices(into: bufferSets[csi], ptr: ptr, count: count) {
-                        cursorStagingCount = -1
-                        // Out-of-bracket publication has no commitFlush() to
-                        // freeze the atlas alongside this committed set.
-                        bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
-                    } else {
-                        cursorStaging.removeAll(keepingCapacity: true)
-                        if count > 0, let validPtr = ptr {
-                            cursorStaging.append(contentsOf: UnsafeBufferPointer(start: validPtr, count: count))
-                        }
-                        cursorStagingCount = count
+                if publishCursorVerticesLocked(ptr: ptr, count: count) {
+                    cursorStagingCount = -1
+                    // Out-of-bracket publication has no commitFlush() to freeze
+                    // the atlas alongside the rows this cursor is drawn over.
+                    // Only while the committed set is idle, as before: draw()
+                    // reads this reference outside the lock, so an in-flight
+                    // frame must not have it changed under it.
+                    let csi = committedSetIndex
+                    if !bracketOpen && gpuInFlightCount[csi] == 0 {
+                        bufferSets[csi].atlasTextureSnapshot =
+                            mainTerminalView?.renderer.committedAtlasSnapshot()
                     }
                 } else {
                     cursorStaging.removeAll(keepingCapacity: true)
@@ -2074,8 +2234,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
 
         if rowCount == 0 {
+            // A zero-cell layout rewrites the write set's row state, so it owes
+            // the same acquisition an ordinary row does.
             guard !outOfBracket,
                   count == 0,
+                  prepareRowWriteState(),
                   applySurfaceZeroCellLayout(
                     bufferSet: bufferSets[writeSetIndex],
                     totalRows: totalRows,
@@ -2101,6 +2264,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         if !outOfBracket && isInFlush {
             // In-bracket (core thread): write set is never GPU-in-flight.
+            guard prepareRowWriteState() else {
+                flushFailed = true
+                return
+            }
             let sourceSet = bufferSets[flushSourceSetIndex]
             let structural = !sourceSet.rowState.usingRowBuffers
                 || totalRows != sourceSet.knownTotalRows
@@ -2456,7 +2623,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     ) -> (
         clearTopPx: Int,
         clearBottomPx: Int,
-        dirtyRows: Range<Int>
+        dirtyRows: Range<Int>,
+        clampedRowEnd: Int
     )? {
         guard drawableWidthPx > 0, rowHeightPx > 0 else { return nil }
         guard let plan = RowScrollBlitPlan.make(
@@ -2476,7 +2644,36 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratch, plan: plan)
         blit.endEncoding()
 
-        return (plan.clearTopPx, plan.clearBottomPx, plan.dirtyRows)
+        return (plan.clearTopPx, plan.clearBottomPx, plan.dirtyRows, plan.clampedRowEnd)
+    }
+
+    /// The root rows a full-width scroll blit filled with hosted-layer pixels:
+    /// every row a layer covers inside the scrolled region, and the rows those
+    /// pixels were dragged into. Grid-local rows, like the plan's own dirty
+    /// range. Appends without allocating while the caller's scratch keeps its
+    /// capacity; a surface holds a handful of layers at most.
+    private func appendRowsDraggedByLayers(
+        into rows: inout [Int],
+        regionStart: Int,
+        regionEnd: Int,
+        rowsDelta: Int,
+        rowHeightPx: Int
+    ) {
+        guard rowHeightPx > 0, regionEnd > regionStart else { return }
+        for (layer, _) in layerDrawSnapshot {
+            guard layer.rows > 0, layer.cols > 0 else { continue }
+            let topPx = Int(layer.originPx.y.rounded(.down))
+            let bottomPx = topPx + layer.rows * rowHeightPx
+            guard bottomPx > 0 else { continue }
+            let firstRow = max(regionStart, topPx / rowHeightPx)
+            let lastRow = min(regionEnd - 1, (bottomPx - 1) / rowHeightPx)
+            guard lastRow >= firstRow else { continue }
+            for row in firstRow...lastRow {
+                rows.append(row)
+                let dragged = row - rowsDelta
+                if dragged >= regionStart, dragged < regionEnd { rows.append(dragged) }
+            }
+        }
     }
 
 
@@ -2610,6 +2807,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             // --- Snapshot committed state under lock (same pattern as MetalTerminalRenderer) ---
             let csi: Int
+            let cci: Int
             let currentCommitRevision: UInt64
             let pendingScroll: SurfaceRowScroll?
             var submittedDirtyRows: [Int] = []
@@ -2754,30 +2952,36 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             currentCommitRevision = commitRevision
             snappedGridRows = committedGridRows
             snappedGridCols = committedGridCols
-            // Apply a staged out-of-bracket cursor update (see
-            // submitVerticesRowRaw) now if this set is idle and no bracket
-            // is open — must happen BEFORE the gpuInFlightCount increment
-            // below marks it busy. Re-arm cursorDirty: an EARLIER draw may
-            // already have consumed it while the staging could not yet be
-            // applied (set busy), and without it the retry draw that finally
-            // applies the staging would take the idle early-exit and never
-            // present the freshly written cursor.
-            if cursorStagingCount >= 0 && !bracketOpen && gpuInFlightCount[csi] == 0 {
+            // Publish a staged cursor update (see submitVerticesRowRaw) now
+            // that a slot may have freed — must happen BEFORE the in-flight
+            // increments below mark slots busy. Re-arm cursorDirty: an EARLIER
+            // draw may already have consumed it while every slot was still
+            // busy, and without it the retry draw that finally publishes the
+            // staging would take the idle early-exit and never present the
+            // freshly written cursor.
+            if cursorStagingCount >= 0 {
                 let stagedCount = cursorStagingCount
                 var submitted = false
                 cursorStaging.withUnsafeBufferPointer { stagedBuf in
-                    submitted = writeCursorVertices(into: bufferSets[csi], ptr: stagedBuf.baseAddress, count: stagedCount)
+                    submitted = publishCursorVerticesLocked(ptr: stagedBuf.baseAddress, count: stagedCount)
                 }
                 if submitted {
                     cursorStagingCount = -1
                     cursorDirty = true
-                    bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+                    if !bracketOpen && gpuInFlightCount[csi] == 0 {
+                        bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+                    }
                 }
             }
             committedFontIsCurrent = fontResetState.isCurrent(
                 committedGeneration: bufferSets[csi].fontGeneration
             )
             gpuInFlightCount[csi] += 1  // Prevent beginFlush from reusing this set
+            // The cursor rotates on its own index, so it is snapshotted and
+            // protected on its own: this frame may draw a cursor published
+            // after the row set it draws it over.
+            cci = committedCursorSetIndex
+            cursorGpuInFlightCount[cci] += 1
             pendingScroll = pendingScrollAccum ?? bufferSets[csi].pendingScroll
             pendingScrollAccum = nil
             swap(&submittedDirtyRows, &submittedDirtyRowsScratch)
@@ -2903,12 +3107,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 if !gpuSubmitted {
                     inflightSemaphore.signal()
                     tripleBufferLock.lock()
-                    completeSurfaceGpuReadLocked(csi)
+                    completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                     tripleBufferLock.unlock()
                 }
             }
 
             let committed = bufferSets[csi]
+            // The cursor this frame draws, held against reuse by the in-flight
+            // count taken with it. Its slot is independent of `committed`.
+            let committedCursor = cursorSlots[cci]
             let rowMode = committed.rowState.usingRowBuffers
             // Use committed grid dimensions (snapped at commitFlush) to guarantee
             // viewport matches the NDC coordinates baked into committed vertices.
@@ -3054,13 +3261,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             // Check glow early — it disables partial-redraw optimizations to
             // prevent additive bloom composite from accumulating brightness.
-            let glowEnabled = mainTerminalView?.core?.isGlowEnabled() ?? false
+            // It is also disabled for transient smooth-scroll frames that carry
+            // a float staying put: the bloom pass blurs a flattened surface and
+            // cannot keep the z-order boundary between shifted content and a
+            // fixed float. The main renderer suppresses glow on the same terms.
+            let configuredGlowEnabled = mainTerminalView?.core?.isGlowEnabled() ?? false
+            let hasFixedFloat = layerDrawSnapshot.contains { !$0.0.followsScroll }
+            let glowEnabled = configuredGlowEnabled && !(smoothScrolling && hasFixedFloat)
 
             let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
 
             let useGpuScrollCopy = rowMode
                 && !layoutDamageSnapshot
-                && layerDrawSnapshot.isEmpty
                 && committedFontIsCurrent
                 && hasNewCommit
                 && pendingScroll != nil
@@ -3183,14 +3395,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // --- GPU scroll blit (shift pixels in back buffer) ---
-            // A root scroll without pixel copy requires full redraw. Hosted
-            // content changes without a root scroll can use their surface
-            // damage bands without moving any retained pixels.
+            // A root scroll without pixel copy requires full redraw. Any content
+            // change without a root scroll — hosted or the root's own rows —
+            // can use its surface damage bands without moving retained pixels.
             var scrollClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
             var dirtyRows: [Int] = []
             swap(&dirtyRows, &dirtyRowsScratch)
             dirtyRows.removeAll(keepingCapacity: true)
-            if useGpuScrollCopy || (!layerDrawSnapshot.isEmpty && !hasPendingScroll) {
+            if useGpuScrollCopy || !hasPendingScroll {
                 dirtyRows.append(contentsOf: submittedDirtyRows)
             }
             defer {
@@ -3211,6 +3423,22 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         clearBottomPx: scrollCopy.clearBottomPx
                     )
                     dirtyRows.append(contentsOf: scrollCopy.dirtyRows)
+                    // A hosted layer's pixels sit inside the rectangle this blit
+                    // moved: the copy is the surface's full width and cannot tell
+                    // them from the root's. They landed `rowsDelta` rows against
+                    // the scroll, so the root rows they were dragged into hold
+                    // layer pixels now — redraw those from the root's vertices,
+                    // and the rows they came from as well, since a layer off the
+                    // cell grid straddles a row boundary at both ends. Each layer
+                    // then puts itself back on top: `drawHostedLayers` redraws
+                    // every row of it while a scroll is pending.
+                    appendRowsDraggedByLayers(
+                        into: &dirtyRows,
+                        regionStart: scroll.rowStart,
+                        regionEnd: scrollCopy.clampedRowEnd,
+                        rowsDelta: scroll.rowsDelta,
+                        rowHeightPx: Int(cellHi)
+                    )
                 } else {
                     // The blit never ran (scratch texture or blit encoder
                     // creation failed, or a degenerate copy height — see
@@ -3267,10 +3495,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 && !dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
                 && !layoutDamageSnapshot && !hasPendingScroll && !drawableSizeChanged
                 && !scrollOffsetChanged && !smoothScrolling && !shaderAnimates
-                && !glowEnabled && !blurEnabled && !isDecoratedSurface
+                && !glowEnabled && !isDecoratedSurface
+                // Under blur the recompose is only safe as the two passes the
+                // root uses: the background pass overwrites, so a band redrawn
+                // over `.load` cannot accumulate alpha. Fail closed to a full
+                // redraw if those pipelines could not be created.
+                && (!blurEnabled || use2Pass)
             if partialHostedContents {
                 ZonvieCore.renderTrace("event=hosted_partial surface=\(gridId) dirty_rows=\(dirtyRows.count)")
             }
+            // Blur can still redraw dirty-only with .load because the 2-pass
+            // background pass overwrites, so alpha does not accumulate — that
+            // avoids a full redraw on every content update under blur.
+            let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
+                && hasPresentedOnce && !smoothScrolling && !drawableSizeChanged && !glowEnabled
+                && !isDecoratedSurface && committedFontIsCurrent && !layoutDamageSnapshot
             // Decorated surfaces (ext-cmdline) always clear: their viewport origin offset
             // means scissor rects for partial redraw don't align correctly.
             let shouldReusePreviousContents = committedFontIsCurrent
@@ -3278,7 +3517,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 && (layerDrawSnapshot.isEmpty || reuseHostedContents || partialHostedContents)
                 && !isDecoratedSurface
                 && !glowEnabled
-                && (partialHostedContents || reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || (!smoothScrolling && hasAnyDirtyInRowMode))
+                && (partialHostedContents || reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || canDirtyOnlyWithBlur || (!smoothScrolling && hasAnyDirtyInRowMode))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnce,
@@ -3288,7 +3527,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     && !layoutDamageSnapshot
                     && !isDecoratedSurface
                     && !glowEnabled
-                    && (reuseHostedContents || canBlinkFastPath || useGpuScrollCopy)
+                    && (reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
             )
             rpd.colorAttachments[0].clearColor = gridClearColor
 
@@ -3305,7 +3544,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
+                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                     tbLock.unlock()
                     sem.signal()
                 }
@@ -3324,15 +3563,30 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             enc.setFragmentSamplerState(sampler, index: 0)
 
             // Bind scroll offset data via shared helper (no GPU/CPU race)
-            let scrollOffsetSnapshot: MetalTerminalRenderer.ScrollOffset? = {
+            let scrollOffsetSnapshot: MetalTerminalRenderer.ScrollOffset?
+            let hostedScrollOffsetSnapshot: [MetalTerminalRenderer.ScrollOffset]
+            do {
                 lock.lock()
-                defer { lock.unlock() }
-                if scrollOffsetActive { return scrollOffsetData }
-                return nil
-            }()
+                scrollOffsetSnapshot = scrollOffsetActive ? scrollOffsetData : nil
+                hostedScrollOffsetSnapshot = hostedScrollOffsetData  // Value-type copy
+                lock.unlock()
+            }
             bindSingleSurfaceScrollOffset(encoder: enc, offset: scrollOffsetSnapshot)
+            // What displaces the cursor's own grid, resolved exactly as
+            // drawHostedLayers resolves a layer's: its own offset when it is
+            // scrolling in its own right, the root's when it merely follows,
+            // and nothing at all when it stands still. The body and the cursor
+            // have to answer the same offset or they are drawn a row apart.
+            let cursorOwnerOffset: MetalTerminalRenderer.ScrollOffset? = cursorOwnerSnapshot == gridId
+                ? scrollOffsetSnapshot
+                : (surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
+                    ?? (cursorLayerFollowsScrollSnapshot ? scrollOffsetSnapshot : nil))
             var cursorDrawOrigin = cursorLayerOriginSnapshot
-            if cursorLayerFollowsScrollSnapshot, let offset = scrollOffsetSnapshot {
+            // A layer with an offset of its own keeps its origin: the shader
+            // displaces its rows inside it. Only a follower is moved bodily.
+            if cursorLayerFollowsScrollSnapshot,
+               surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot) == nil,
+               let offset = scrollOffsetSnapshot {
                 cursorDrawOrigin.y -= offset.offset_y * viewportMetrics.fragmentHeight / 2
             }
 
@@ -3420,6 +3674,51 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     )
                 }
 
+                // Blur's dirty-row path. Under .load a dirty row that does not
+                // repaint every pixel it owns keeps the previous frame's, and
+                // the core drops the root's default-background runs while the
+                // surface has layers (flush.zig `skip_default_bg`): an empty row
+                // is skipped entirely, and a row that still carries a glyph
+                // emits no background quad under it and creeps toward opaque.
+                // So band every dirty row with backgroundPipeline first; the
+                // row's own background quads then overwrite the band where it
+                // has any. Same shape as MetalTerminalRenderer's blur branch.
+                func drawScissoredDirtyRowsTwoPass() {
+                    let bandWidth = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
+                    let bandHeight = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
+                    let bgRGB = extractRGBFromClearColor(gridClearColor)
+                    enc.setRenderPipelineState(backgroundPipeline!)
+                    for row in dirtyRows {
+                        let topPx = row * cellH
+                        drawBackgroundClearBand(
+                            enc,
+                            clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
+                            drawableWidth: bandWidth,
+                            drawableHeight: bandHeight,
+                            bgRGB: bgRGB
+                        )
+                    }
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: Int(cellHi),
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
+                        },
+                        pipeline: pipeline,
+                        backgroundPipeline: backgroundPipeline,
+                        glyphPipeline: glyphPipeline,
+                        useTwoPass: true,
+                        unifiedBlurPipeline: unifiedBlurPipeline
+                    )
+                }
+
                 if use2Pass {
                     if canBlinkFastPath {
                         let cursorRow = lastKnownCursorRowSnapshot
@@ -3433,18 +3732,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             renderTargetHeight_px: backTex.height
                         ) {
                             enc.setScissorRect(scissor)
-                            // Pass 1: Background (overwrite blending — erases old cursor)
-                            enc.setRenderPipelineState(backgroundPipeline!)
                             var rowTranslation = resolved.translationY
-                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                            enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
-                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+                            if let unified = unifiedBlurPipeline {
+                                enc.setRenderPipelineState(unified)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+                            } else {
+                                // Pass 1: Background (overwrite blending — erases old cursor)
+                                enc.setRenderPipelineState(backgroundPipeline!)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
 
-                            // Pass 2: Glyph (alpha blending — redraws text/decorations)
-                            enc.setRenderPipelineState(glyphPipeline!)
-                            enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                            enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
-                            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+                                // Pass 2: Glyph (alpha blending — redraws text/decorations)
+                                enc.setRenderPipelineState(glyphPipeline!)
+                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+                                enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+                            }
                         }
                     } else if useGpuScrollCopy {
                         // The back texture is loaded after the pixel shift, so all
@@ -3463,37 +3769,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                                 bgRGB: bgRGB
                             )
                         }
-                        // encodeSurfaceRowDraws skips rows without vertices. Those
-                        // rows still need an overwrite when this pass uses .load,
-                        // including dirty rows outside the vacated scroll band.
-                        for row in dirtyRows where resolvedRowState(row) == nil {
-                            let topPx = row * cellH
-                            drawBackgroundClearBand(
-                                enc,
-                                clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                                drawableWidth: scrollDrawableW,
-                                drawableHeight: scrollDrawableH,
-                                bgRGB: bgRGB
-                            )
-                        }
-                        _ = encodeSurfaceRowDraws(
-                            encoder: enc,
-                            rows: dirtyRows,
-                            resolve: resolvedRowState,
-                            scissor: { row in
-                                makeRowScissorRect(
-                                    row: row,
-                                    cellHeight_px: Int(cellHi),
-                                    drawableWidth_px: drawableW,
-                                    renderTargetWidth_px: backTex.width,
-                                    renderTargetHeight_px: backTex.height
-                                )
-                            },
-                            pipeline: pipeline,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
-                            useTwoPass: true
-                        )
+                        // The dirty rows themselves, banded then redrawn: rows
+                        // without vertices need the overwrite this pass's .load
+                        // would otherwise skip, including dirty rows outside the
+                        // vacated scroll band.
+                        drawScissoredDirtyRowsTwoPass()
+                    } else if canDirtyOnlyWithBlur, rpd.colorAttachments[0].loadAction == .load {
+                        // Only when the pass actually preserved the clean rows.
+                        // Every reason this surface clears instead — layout
+                        // damage, a font generation behind, a first frame —
+                        // would leave every row this frame does not draw blank.
+                        drawScissoredDirtyRowsTwoPass()
                     } else {
                         // 2-pass full redraw (same as MetalTerminalRenderer),
                         // including the rows retained across a scroll step.
@@ -3504,7 +3790,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             pipeline: pipeline,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
-                            useTwoPass: true
+                            useTwoPass: true,
+                            unifiedBlurPipeline: unifiedBlurPipeline
                         )
                     }
                 } else if smoothScrolling {
@@ -3560,22 +3847,36 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let rows = min(layer.rows, set.rowLogicalToSlot.count)
                     guard rows > 0 else { continue }
                     var origin = layer.originPx
-                    // Clip and draw in the same translated coordinate space.
-                    if layer.followsScroll, let offset = scrollOffsetSnapshot {
+                    // A layer scrolled in its own right eases inside its own
+                    // frame: the shader displaces its rows against this offset,
+                    // clipped to the layer's content bounds. A layer that only
+                    // follows its anchor has no offset of its own and moves
+                    // bodily with the root instead — the same split the main
+                    // window's layer pass makes between a per-row offset and a
+                    // `move_all` origin shift. Either way clip and geometry end
+                    // up in one coordinate space.
+                    let layerOffset = surfaceScrollOffset(
+                        gridId: layer.gridId, offsets: hostedScrollOffsetSnapshot)
+                    if layerOffset == nil, layer.followsScroll, let offset = scrollOffsetSnapshot {
                         origin.y -= offset.offset_y * extent.y / 2
                     }
                     let ratio: Float = glow ? 0.5 : 1
+                    // A displaced origin is fractional mid-ease; floor it and
+                    // cover the row of pixels that flooring would otherwise
+                    // clip, as the main renderer's layer pass does.
+                    let scissorTopPx = (Float(vpOriginY) + origin.y) * ratio
+                    let scissorPadY = scissorTopPx == scissorTopPx.rounded(.down) ? 0 : 1
                     guard let scissor = clampScissor(
-                        x: Int((Float(vpOriginX) + origin.x) * ratio),
-                        y: Int((Float(vpOriginY) + origin.y) * ratio),
+                        x: Int(((Float(vpOriginX) + origin.x) * ratio).rounded(.down)),
+                        y: Int(scissorTopPx.rounded(.down)),
                         width: Int(Float(layer.cols * Int(cellWi)) * ratio),
-                        height: Int(Float(rows * Int(cellHi)) * ratio),
+                        height: Int(Float(rows * Int(cellHi)) * ratio) + scissorPadY,
                         targetWidth: glow ? max(1, backTex.width / 2) : backTex.width,
                         targetHeight: glow ? max(1, backTex.height / 2) : backTex.height
                     ) else { continue }
                     encoder.setScissorRect(scissor)
                     bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
-                    bindSingleSurfaceScrollOffset(encoder: encoder, offset: nil)
+                    bindSingleSurfaceScrollOffset(encoder: encoder, offset: layerOffset)
                     if partialHostedContents && !glow {
                         // Recompose each dirty surface band back-to-front.
                         // Every layer is clipped to the band the root erased,
@@ -3591,7 +3892,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             guard first < end else { continue }
                             _ = encodeSurfaceRowDraws(encoder: encoder, rows: first..<end,
                                 resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
-                                pipeline: pipeline, backgroundPipeline: nil, glyphPipeline: nil, useTwoPass: false)
+                                pipeline: pipeline, backgroundPipeline: backgroundPipeline,
+                                glyphPipeline: glyphPipeline, useTwoPass: use2Pass,
+                                unifiedBlurPipeline: unifiedBlurPipeline)
                         }
                         continue
                     }
@@ -3612,7 +3915,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
                         pipeline: glow ? mainTerminalView!.renderer.glowExtractPipeline! : pipeline,
                         backgroundPipeline: backgroundPipeline, glyphPipeline: glyphPipeline,
-                        useTwoPass: !glow && use2Pass
+                        useTwoPass: !glow && use2Pass,
+                        unifiedBlurPipeline: unifiedBlurPipeline
                     )
                 }
                 bindLayerTransform(encoder: encoder, viewportMetrics.layerTransform)
@@ -3693,14 +3997,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // Cursor vertices for cursor glow
                     if committedFontIsCurrent,
                        cursorBlinkStateSnapshot,
-                       committed.cursorVertexCount > 0,
-                       let cvb = committed.cursorVertexBuffer {
+                       committedCursor.vertexCount > 0,
+                       let cvb = committedCursor.vertexBuffer {
                         bindLayerTransform(encoder: enc, LayerTransform(originPx: cursorDrawOrigin,
                             extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)))
+                        // drawHostedLayers left the surface-wide offset bound.
+                        bindSingleSurfaceScrollOffset(encoder: enc, offset: cursorOwnerOffset)
                         var ct: Float = 0
                         enc.setVertexBytes(&ct, length: MemoryLayout<Float>.size, index: 3)
                         enc.setVertexBuffer(cvb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: committed.cursorVertexCount)
+                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: committedCursor.vertexCount)
                     }
                     }
                 }
@@ -3711,7 +4017,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
+                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                     tbLock.unlock()
                     sem.signal()
                     atlasReadRenderer?.endAtlasExternalRead()
@@ -3744,7 +4050,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
+                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                     tbLock.unlock()
                     sem.signal()
                     // Paired with beginAtlasExternalRead() above. Uses the
@@ -3790,8 +4096,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 renderer.evaluateCursorShaderChange(
                     scrollOffsetPx: cursorScrollOffsetPxForShader(
                         ownerGridId: cursorOwnerSnapshot,
-                        followsScroll: cursorLayerFollowsScrollSnapshot,
-                        offset: scrollOffsetSnapshot,
+                        offset: cursorOwnerOffset,
                         viewportHeightPx: viewportMetrics.fragmentHeight
                     )
                 )
@@ -3857,7 +4162,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let tbLock = tripleBufferLock
                 cmd.addCompletedHandler { [weak self] _ in
                     tbLock.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
+                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                     tbLock.unlock()
                     sem.signal()
                     atlasReadRenderer?.endAtlasExternalRead()
@@ -3874,8 +4179,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // don't shift stale cursor pixels (same as MetalTerminalRenderer).
             if committedFontIsCurrent,
                cursorBlinkStateSnapshot,
-               committed.cursorVertexCount > 0,
-               let cursorBuf = committed.cursorVertexBuffer {
+               committedCursor.vertexCount > 0,
+               let cursorBuf = committedCursor.vertexBuffer {
                 let cursorRPD = MTLRenderPassDescriptor()
                 cursorRPD.colorAttachments[0].texture = drawable.texture
                 cursorRPD.colorAttachments[0].loadAction = .load
@@ -3886,7 +4191,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let tbLock = tripleBufferLock
                     cmd.addCompletedHandler { [weak self] _ in
                         tbLock.lock()
-                        self?.completeSurfaceGpuReadLocked(csi)
+                        self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                         tbLock.unlock()
                         sem.signal()
                         atlasReadRenderer?.endAtlasExternalRead()
@@ -3911,7 +4216,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 cursorEnc.setFragmentTexture(atlasTex, index: 0)
                 cursorEnc.setFragmentSamplerState(sampler, index: 0)
 
-                bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: scrollOffsetSnapshot)
+                bindSingleSurfaceScrollOffset(encoder: cursorEnc, offset: cursorOwnerOffset)
                 bindSurfaceFragmentState(
                     encoder: cursorEnc,
                     viewportMetrics: viewportMetrics,
@@ -3922,7 +4227,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 var zeroTranslation: Float = 0
                 cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
                 cursorEnc.setVertexBuffer(cursorBuf, offset: 0, index: 0)
-                cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: committed.cursorVertexCount)
+                cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: committedCursor.vertexCount)
                 cursorEnc.endEncoding()
             }
 
@@ -3943,7 +4248,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let tbLock = tripleBufferLock
             cmd.addCompletedHandler { [weak self] completed in
                 tbLock.lock()
-                self?.completeSurfaceGpuReadLocked(csi)
+                self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
                 tbLock.unlock()
                 sem.signal()
                 // Paired with beginAtlasExternalRead() at atlas-bind time
@@ -4022,6 +4327,38 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // on that path, so take it from the same source here.
         retention.setDepthRows(main.core?.getMouseScrollVer() ?? 0)
 
+        let vpOriginYPxForGridTop = Float(viewportOriginPx.y)
+            * Float(self.window?.backingScaleFactor ?? 2.0)
+
+        // Resolve every hosted grid's own offset, the way the main window's
+        // layer pass does. Without this a float inside an external window only
+        // ever moves when the root scrolls, and a float scrolled on its own
+        // stands still. Its grid top is the origin this surface placed it at —
+        // the main window's startRow describes a position this view never uses.
+        tripleBufferLock.lock()
+        hostedLayerOriginScratch.removeAll(keepingCapacity: true)
+        for layer in committedSurfaceLayers where layer.gridId != gridId {
+            hostedLayerOriginScratch.append((gridId: layer.gridId, originYPx: layer.originPx.y))
+        }
+        tripleBufferLock.unlock()
+
+        hostedScrollOffsetScratch.removeAll(keepingCapacity: true)
+        for hosted in hostedLayerOriginScratch {
+            guard var info = main.getScrollOffsetInfo(
+                gridId: hosted.gridId,
+                drawableHeight: viewportHeight,
+                cellHeightPx: cellHeightPx
+            ) else { continue }
+            info.gridTopYNDC = 1.0 - (vpOriginYPxForGridTop + hosted.originYPx) * (2.0 / viewportHeight)
+            hostedScrollOffsetScratch.append(MetalTerminalRenderer.computeScrollOffset(
+                info: info,
+                viewportHeight: viewportHeight,
+                cellHeightPx: cellHeightPx
+            ))
+        }
+        hostedScrollOffsetScratch.sort { $0.grid_id < $1.grid_id }
+        let hasHostedOffset = !hostedScrollOffsetScratch.isEmpty
+
         // Get scroll offset info from the main view's shared scroll state.
         if var info = main.getScrollOffsetInfo(gridId: gridId, drawableHeight: viewportHeight, cellHeightPx: cellHeightPx) {
             // No second clamp here. getScrollOffsetInfo already applied the
@@ -4042,9 +4379,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // for undecorated surfaces, giving gridTopYNDC = 1.0, i.e. the
             // top of the viewport — correct for a grid filling its own
             // window).
-            let originScale = Float(self.window?.backingScaleFactor ?? 2.0)
-            let vpOriginYPx = Float(viewportOriginPx.y) * originScale
-            info.gridTopYNDC = 1.0 - vpOriginYPx * (2.0 / viewportHeight)
+            info.gridTopYNDC = 1.0 - vpOriginYPxForGridTop * (2.0 / viewportHeight)
 
             // Use the grid-snapped viewport coordinate space, matching the
             // fragment shader's screen-space clipping for this surface (see
@@ -4074,6 +4409,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             scrollOffsetData = scrollOffset
             scrollOffsetActive = true
+            hostedScrollOffsetData.removeAll(keepingCapacity: true)
+            hostedScrollOffsetData.append(contentsOf: hostedScrollOffsetScratch)
             return true  // Scroll offset is active
         } else {
             // No offset. A retained row is only meaningful while the grid is
@@ -4086,7 +4423,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
             scrollOffsetData = nil
             scrollOffsetActive = false
-            return false  // No scroll offset
+            hostedScrollOffsetData.removeAll(keepingCapacity: true)
+            hostedScrollOffsetData.append(contentsOf: hostedScrollOffsetScratch)
+            // A hosted grid easing on its own keeps this surface in a smooth
+            // scroll even with the root standing still, exactly as any grid's
+            // offset does for the main renderer.
+            return hasHostedOffset
         }
     }
 
@@ -4115,6 +4457,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if scrollOffsetActive != lastPresentedScrollOffsetActive {
             return true
         }
+        // A hosted grid easing while the root stands still changes this
+        // surface's picture just as much. Without this the frame that puts a
+        // hosted float back at zero reads as "nothing changed" and is skipped,
+        // leaving the last displaced image on screen until something else
+        // redraws.
+        if lastPresentedHostedScrollOffsetData.count != hostedScrollOffsetData.count {
+            return true
+        }
+        for (index, offset) in hostedScrollOffsetData.enumerated()
+        where !scrollOffsetsEqual(offset, lastPresentedHostedScrollOffsetData[index]) {
+            return true
+        }
         if !scrollOffsetActive {
             return false
         }
@@ -4124,7 +4478,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private func wasScrollOffsetActiveInLastPresentedFrame() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return lastPresentedScrollOffsetActive
+        return lastPresentedScrollOffsetActive || !lastPresentedHostedScrollOffsetData.isEmpty
     }
 
     private func markScrollOffsetStatePresented() {
@@ -4133,6 +4487,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         lastPresentedScrollOffsetActive = scrollOffsetActive
         lastPresentedScrollOffsetData = scrollOffsetData
+        lastPresentedHostedScrollOffsetData.removeAll(keepingCapacity: true)
+        lastPresentedHostedScrollOffsetData.append(contentsOf: hostedScrollOffsetData)
     }
 
     // MARK: - Mouse Input

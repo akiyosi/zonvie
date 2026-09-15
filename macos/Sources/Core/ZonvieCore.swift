@@ -4720,6 +4720,7 @@ final class ZonvieCore {
                 sharedPipeline: sharedPipeline,
                 sharedBackgroundPipeline: renderer.sharedBackgroundPipeline,
                 sharedGlyphPipeline: renderer.sharedGlyphPipeline,
+                sharedUnifiedBlurPipeline: renderer.sharedUnifiedBlurPipeline,
                 sharedSampler: sharedSampler,
                 blurEnabled: blurEnabledForGrid,
                 isDecoratedSurface: isSpecialWindow

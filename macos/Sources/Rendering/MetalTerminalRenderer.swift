@@ -806,6 +806,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Expose 2-pass glyph pipeline for blur support.
     var sharedGlyphPipeline: MTLRenderPipelineState? { glyphPipeline }
 
+    /// Expose the single-pass blur pipeline that supersedes the 2-pass pair.
+    /// nil when the shader or the pipeline build failed; the surface then
+    /// falls back to the two passes, exactly as this renderer does.
+    var sharedUnifiedBlurPipeline: MTLRenderPipelineState? { unifiedBlurPipeline }
+
     /// Expose sampler for external grid views.
     var sharedSampler: MTLSamplerState? { sampler }
 
