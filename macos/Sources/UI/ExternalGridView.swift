@@ -243,10 +243,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     func applyLayerRowScroll(gridId id: Int64, rowStart: Int, rowEnd: Int, rowsDelta: Int, totalRows: Int, totalCols: Int) {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=row_shift surface=\(gridId) grid=\(id) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
+        guard rowsDelta != 0 else { return }
+        // No capacity pre-check: shift hints precede the rows that grow a
+        // layer, and remapSurfaceRowSlots grows the storage itself.
         guard isInFlush, prepareRowWriteState(),
               let sets = gridBuffers.existingSets(for: id),
-              rowStart >= 0, rowEnd <= sets[writeSetIndex].rowLogicalToSlot.count,
-              rowEnd > rowStart, rowsDelta != 0 else {
+              rowStart >= 0, rowEnd > rowStart else {
             flushFailed = true
             return
         }
@@ -2696,14 +2698,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // layer transform divides by, so this band lands exactly where the
         // NDC form used to.
         _ = drawableHeight
+        // The vertex stage binary-searches scrollOffsets by grid_id, so the
+        // band carries this surface's root id, not the main window's.
         let tl = Vertex(position: simd_float2(0, Float(top)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
         let tr = Vertex(position: simd_float2(drawableWidth, Float(top)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
         let bl = Vertex(position: simd_float2(0, Float(bottom)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
         let br = Vertex(position: simd_float2(drawableWidth, Float(bottom)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: 1, deco_flags: 0, deco_phase: 0)
+                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
         // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
         // (no heap) instead of building a fresh [Vertex] array every scroll frame.
         withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
@@ -3491,6 +3495,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if reuseHostedContents {
                 ZonvieCore.renderTrace("side=macos event=retained_content_reuse surface=\(gridId) root_row_draws=0 hosted_row_draws=0")
             }
+            // Same deal without hosted layers: the cursor lives on the
+            // drawable, not the back texture, so a cursor move or a blink
+            // toggle needs no root row redrawn. Without this the branch
+            // ladder below falls through to the full-redraw arm and
+            // re-encodes every row per keystroke, where the main surface
+            // skips its whole pass (MetalTerminalRenderer's skipMainPass).
+            let reuseRootContents = rowMode && layerDrawSnapshot.isEmpty
+                && cursorOnlyFrame && committedFontIsCurrent && hasPresentedOnce
+                && !layoutDamageSnapshot && !hasDirtyContent && !hasPendingScroll
+                && !drawableSizeChanged && !scrollOffsetChanged
+                && !smoothScrolling && !shaderAnimates && !glowEnabled
+                && !isDecoratedSurface
             let partialHostedContents = rowMode && !layerDrawSnapshot.isEmpty
                 && !dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
                 && !layoutDamageSnapshot && !hasPendingScroll && !drawableSizeChanged
@@ -3517,7 +3533,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 && (layerDrawSnapshot.isEmpty || reuseHostedContents || partialHostedContents)
                 && !isDecoratedSurface
                 && !glowEnabled
-                && (partialHostedContents || reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || canDirtyOnlyWithBlur || (!smoothScrolling && hasAnyDirtyInRowMode))
+                && (partialHostedContents || reuseHostedContents || reuseRootContents || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame || canDirtyOnlyWithBlur || (!smoothScrolling && hasAnyDirtyInRowMode))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnce,
@@ -3527,7 +3543,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     && !layoutDamageSnapshot
                     && !isDecoratedSurface
                     && !glowEnabled
-                    && (reuseHostedContents || canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
+                    && (reuseHostedContents || reuseRootContents || canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
             )
             rpd.colorAttachments[0].clearColor = gridClearColor
 
@@ -3603,7 +3619,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             enc.setVertexBytes(&zeroRowTranslation, length: MemoryLayout<Float>.size, index: 3)
 
             // --- Row-mode rendering branches — match MetalTerminalRenderer structure ---
-            if rowMode && !reuseHostedContents {
+            if rowMode && reuseRootContents {
+                // Traced here, not where the flag is computed: the claim being
+                // made is that the ladder below did not run.
+                ZonvieCore.renderTrace("side=macos event=retained_content_reuse surface=\(gridId) root_row_draws=0 hosted_row_draws=0")
+            }
+            if rowMode && !reuseHostedContents && !reuseRootContents {
                 if ZonvieCore.appLogEnabled {
                     // Debug: log translationY for all rows to detect slot remap drift
                     var nonZeroTranslations: [(Int, Float, Int, Int)] = []

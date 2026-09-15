@@ -1327,6 +1327,20 @@ fn releaseMainRecoveryBuffers(app: *App) void {
     }
 }
 
+/// Layer-grid row buffers belong to no surface; see detachOneLayerGridVB.
+fn releaseLayerGridRecoveryBuffers(app: *App) void {
+    while (true) {
+        app.mu.lockUncancelable(core.clock.io());
+        const vb = app_mod.detachOneLayerGridVB(&app.layer_grids);
+        app.mu.unlock(core.clock.io());
+        if (vb) |buffer| {
+            _ = buffer.lpVtbl.*.Release.?(buffer);
+        } else {
+            return;
+        }
+    }
+}
+
 fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.ExternalWindow) bool {
     while (true) {
         app.mu.lockUncancelable(core.clock.io());
@@ -5418,6 +5432,7 @@ pub export fn WndProc(
                     app.d3d_device = null;
                 }
                 releaseMainRecoveryBuffers(app);
+                releaseLayerGridRecoveryBuffers(app);
                 if (old_cursor_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
                 if (old_scrollbar_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
                 // releaseD2DDeviceObjects drops its own mutex before COM;
@@ -5550,7 +5565,7 @@ pub export fn WndProc(
                     app.tbs.rotation_mu.unlock(core.clock.io());
                 }
 
-                // 5. External windows own independent (equally lost) devices.
+                // 5. External windows share the App device rebuilt above.
                 // Snapshot grid_ids and pin each via paint_ref_count under
                 // app.mu first — mirroring presentShaderAnimationFrame's
                 // pattern above. d3d11.Renderer.init below runs unlocked
@@ -5612,7 +5627,18 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity, app.config.window.blur) catch {
+                    var new_renderer = blk_ext: {
+                        const device = app.d3d_device orelse break :blk_ext null;
+                        const device_ctx = app.d3d_ctx orelse break :blk_ext null;
+                        break :blk_ext d3d11.Renderer.initWithDevice(
+                            app.alloc,
+                            ext_win.hwnd,
+                            app.config.window.opacity,
+                            app.config.window.blur,
+                            device,
+                            device_ctx,
+                        ) catch null;
+                    } orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
@@ -6013,6 +6039,19 @@ pub export fn WndProc(
                         return 0;
                     };
                 };
+                // External windows only open on the App device, so publish
+                // the fallback renderer's own device rather than leave them
+                // retrying forever. App.deinit releases this reference.
+                if (app.d3d_device == null) {
+                    if (gpu.device) |dev| {
+                        if (gpu.ctx) |ctx| {
+                            _ = dev.lpVtbl.*.AddRef.?(dev);
+                            _ = ctx.lpVtbl.*.AddRef.?(ctx);
+                            app.d3d_device = dev;
+                            app.d3d_ctx = ctx;
+                        }
+                    }
+                }
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
                     const d3d_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);

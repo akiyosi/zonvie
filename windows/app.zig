@@ -3217,6 +3217,27 @@ pub fn detachOneSurfaceGpuVB(surface: *SurfaceState) ?*c.ID3D11Buffer {
     return null;
 }
 
+/// Detach one device-bound row buffer held by a grid drawn as a layer. These
+/// live outside every SurfaceState because the grid can be drawn by whichever
+/// surface places it, so device-loss recovery has to walk them separately or
+/// the next paint maps a buffer created on the dead device.
+pub fn detachOneLayerGridVB(
+    layer_grids: *std.AutoHashMapUnmanaged(i64, *LayerGridState),
+) ?*c.ID3D11Buffer {
+    var it = layer_grids.valueIterator();
+    while (it.next()) |state| {
+        for (state.*.rows_buf.items) |*rv| {
+            if (rv.vb) |vb| {
+                rv.vb = null;
+                rv.vb_bytes = 0;
+                rv.uploaded_gen = 0;
+                return vb;
+            }
+        }
+    }
+    return null;
+}
+
 /// Device-loss recovery: release row-slot GPU buffers and reset their upload
 /// bookkeeping (slot mappings stay valid — they index the CPU-side pool).
 pub fn releaseRowVBs(
