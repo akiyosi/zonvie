@@ -1657,7 +1657,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         ownerGridId: Int64,
         followsScroll: Bool,
         offset: MetalTerminalRenderer.ScrollOffset?,
-        snappedRows: UInt32
+        viewportHeightPx: Float
     ) -> Float? {
         // The cursor rect is shared with the main surface and every other
         // external window. Only displace it when the cursor is on a grid THIS
@@ -1674,15 +1674,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // not by an origin the CPU moves.
         if ownerGridId != gridId, !followsScroll { return 0 }
         guard let offset else { return 0 }
-        // Undo computeScrollOffset's NDC conversion against this window's
-        // viewport height, which is the same height screenSpaceParameters maps
-        // through — so the result is already in the rect's pixel space.
-        let cellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
-        guard cellHeightPx > 0 else { return 0 }
-        let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
-        let viewportHeight = Float(snappedRows) * Float(cellHi)
-        guard viewportHeight > 0 else { return 0 }
-        return -offset.offset_y * viewportHeight / 2.0
+        // Undo computeScrollOffset's NDC conversion against the viewport height
+        // THIS frame drew with -- the caller's own
+        // SurfaceViewportMetrics.fragmentHeight, which is the value the cursor
+        // body displaces itself by. Deriving it here from the renderer's cell
+        // height instead would recompute the same formula against a linespace
+        // the core may have changed since the frame measured it, and the effect
+        // would convert the offset on one height while the cursor it tracks was
+        // placed on another. Taking the number rather than its ingredients is
+        // what makes the two unable to disagree.
+        guard viewportHeightPx > 0 else { return 0 }
+        return -offset.offset_y * viewportHeightPx / 2.0
     }
 
     /// Tell this window which of its rows actually scroll. Called from the
@@ -3790,7 +3792,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         ownerGridId: cursorOwnerSnapshot,
                         followsScroll: cursorLayerFollowsScrollSnapshot,
                         offset: scrollOffsetSnapshot,
-                        snappedRows: snapGridRows
+                        viewportHeightPx: viewportMetrics.fragmentHeight
                     )
                 )
                 let uniforms = renderer.makeCustomShaderUniforms(
