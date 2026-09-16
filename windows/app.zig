@@ -2346,6 +2346,19 @@ pub const ExternalWindow = struct {
     /// is that grid's OWN row — so a row remembered from the last paint cannot
     /// be placed with the grid holding the cursor now.
     last_painted_cursor_grid: i64 = 0,
+    /// Whether this surface's committed cursor set holds any vertices, recorded
+    /// at paint. The blink timer needs to know whether a toggle changes a pixel
+    /// here, and `last_painted_cursor_row` cannot answer that: it is cleared on
+    /// every blink-off, so gating on it would leave the cursor off for good.
+    /// Vertex presence is independent of blink state, which is what makes it
+    /// the right gate. The main window answers the same question with
+    /// `App.last_cursor_rect_px`.
+    ///
+    /// Defaults to true and is only ever narrowed by the normal row-mode paint:
+    /// a decorated surface (cmdline, msg_show, msg_history) draws through
+    /// `drawDecoratedExternalSurface`, which never reaches that point, so it
+    /// keeps the unconditional behaviour rather than silently losing its blink.
+    has_committed_cursor: bool = true,
 
     // Scrollbar state for external windows
     scrollbar_visible: bool = false,
@@ -5931,15 +5944,26 @@ pub fn addChevronIconVerts(
 // Layout helpers (shared by main.zig and callbacks.zig)
 // =========================================================================
 
-/// Get effective content width (subtracts scrollbar width in "always" mode)
-pub fn getEffectiveContentWidth(app: *App, client_width: u32) u32 {
+/// Get effective content width (subtracts scrollbar width in "always" mode).
+///
+/// `dpi_scale` is an argument because the two surfaces answer it differently:
+/// the main window uses `app.dpi_scale`, an external one uses its own
+/// `ext_win.dpi_scale`, which is also the scale its scrollbar is drawn at. The
+/// rule itself is the same, and was applied on the main window only — an
+/// external window drew a permanently visible scrollbar over its own rightmost
+/// text column.
+pub fn effectiveContentWidthAt(app: *App, client_width: u32, dpi_scale: f32) u32 {
     if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways()) {
-        const scrollbar_reserved: u32 = @intFromFloat(scrollbarReservedWidth(app.dpi_scale));
+        const scrollbar_reserved: u32 = @intFromFloat(scrollbarReservedWidth(dpi_scale));
         if (client_width > scrollbar_reserved) {
             return client_width - scrollbar_reserved;
         }
     }
     return client_width;
+}
+
+pub fn getEffectiveContentWidth(app: *App, client_width: u32) u32 {
+    return effectiveContentWidthAt(app, client_width, app.dpi_scale);
 }
 
 /// Terminal content area in pixels (client rect minus sidebar/scrollbar/tabbar chrome).

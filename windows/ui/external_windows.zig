@@ -699,7 +699,12 @@ fn drawNormalExternalSurfaceRowMode(
     const log_enabled = applog.isEnabled();
     const fallback_row_h = row_h_px_snapshot;
     const row_h_px: i32 = @intCast(fallback_row_h);
-    const content_right: i32 = @intCast(g.width);
+    // Reserve the scrollbar strip in "always" mode, as the main window's paint
+    // does. An external window shows a permanently visible scrollbar in that
+    // mode too (scrollbar.zig's isAlways branches are on the external helpers),
+    // but its content width was the raw client width, so the rightmost column
+    // was drawn under the track.
+    const content_right: i32 = @intCast(app_mod.effectiveContentWidthAt(app, g.width, ext_win.dpi_scale));
 
     // back_tex is persistent, so we only need to redraw dirty rows. Present
     // queues the resulting damage for every FLIP_SEQUENTIAL buffer; each
@@ -778,6 +783,10 @@ fn drawNormalExternalSurfaceRowMode(
     }
 
     const has_cursor = tbs_cursor.verts.items.len > 0;
+    // Publish it for the blink timer, which must not invalidate a surface whose
+    // pixels a toggle cannot change. Recorded before the early-out below so a
+    // surface that just lost its cursor stops being invalidated immediately.
+    ext_win.has_committed_cursor = has_cursor;
     const has_scrollbar_work = scrollbar_alpha > 0.001 or
         restored_scrollbar_rect != null or
         g.hasScrollbarUnderlay();
@@ -2746,6 +2755,14 @@ pub export fn ExternalWndProc(
             }
         },
         c.WM_SIZE => {
+            // SIZE_MINIMIZED: an iconic window keeps reporting a non-zero
+            // client rect, so deriving rows/cols from it and asking Neovim to
+            // resize would hand it a one-row split and destroy the layout. A
+            // normal external window carries a minimize box, so this is
+            // reachable. The main window's handler has always returned here.
+            const SIZE_MINIMIZED = 1;
+            if (wParam == SIZE_MINIMIZED) return 0;
+
             if (app_mod.getApp(hwnd)) |app| {
                 // See WM_DPICHANGED's identical guard above — device-lost
                 // recovery can reenter this handler on the same UI thread
@@ -2770,14 +2787,20 @@ pub export fn ExternalWndProc(
                 // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
                 var suppress = false;
+                var surface_dpi_scale: f32 = app.dpi_scale;
                 if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
                     grid_id = hit.grid_id;
                     suppress = hit.win.suppress_resize_callback;
+                    surface_dpi_scale = hit.win.dpi_scale;
                 }
 
                 const cell_w = app.cell_w_px;
                 const cell_h = app.rowHeightPx();
                 const corep = app.corep;
+                // Same reservation the paint applies, and the same one the main
+                // window's grid-size derivation has always applied: in "always"
+                // mode the scrollbar owns a strip that is not text.
+                const content_w = app_mod.effectiveContentWidthAt(app, client_w, surface_dpi_scale);
 
                 app.mu.unlock(core.clock.io());
 
@@ -2787,7 +2810,7 @@ pub export fn ExternalWndProc(
 
                 if (grid_id) |gid| {
                     if (cell_w > 0 and cell_h > 0) {
-                        const new_cols: u32 = client_w / cell_w;
+                        const new_cols: u32 = content_w / cell_w;
                         const new_rows: u32 = client_h / cell_h;
 
                         if (new_rows > 0 and new_cols > 0) {
@@ -3593,6 +3616,18 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     _ = c.BeginPaint(hwnd, &ps);
     defer _ = c.EndPaint(hwnd, &ps);
 
+    // While minimized, GetClientRect returns the iconic size, and the deferred
+    // resize below derives `size_mismatch` from exactly that — so the swapchain
+    // and back_tex would be rebuilt at icon size and their contents discarded,
+    // leaving the next restore to present an empty surface. A normal external
+    // window is WS_OVERLAPPEDWINDOW and carries a minimize box, and it is
+    // invalidated from onFlushEnd and finishActiveOperation regardless of
+    // iconic state. The main window has always returned here; BeginPaint above
+    // has already consumed the paint region, so Windows stops re-issuing it.
+    // The SIZE_MINIMIZED guard in WM_SIZE protects the grid resize; this one
+    // protects the surface.
+    if (c.IsIconic(hwnd) != 0) return;
+
     // Read core-owned render settings before entering the atlas reader
     // transaction. Keeping core calls outside minimizes reader lifetime and
     // avoids needless non-blocking atlas-reset abort/retry cycles.
@@ -3993,12 +4028,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         // Upload atlas to external window's D3D context.
         // Uses since-based cursor so each window independently tracks its
         // position in the append-only pending_uploads queue.
+        var ext_atlas_uploaded = false;
         if (atlas_ptr) |a| {
             if (need_full_atlas_upload) {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
             }
             const upload = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
             if (upload.success) {
+                if (upload.cursor != ext_win.atlas_upload_cursor) ext_atlas_uploaded = true;
                 ext_win.atlas_upload_cursor = upload.cursor;
                 if (need_full_atlas_upload) {
                     ext_win.atlas_reset_generation = current_atlas_reset_generation;
@@ -4110,6 +4147,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
 
         if (!force_full_present and ext_win.paint_present_rects.items.len == 0) {
+            // Glyphs uploaded for rows this frame did not draw become visible
+            // only at the next unrelated repaint, so ask for one — the main
+            // driver has always done this on the same condition.
+            if (ext_atlas_uploaded) {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: atlas uploaded with nothing drawn, repainting\n", .{});
+                requeueExternalFullPaint(app, grid_id, hwnd);
+                return;
+            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
             completeExternalPaintRetry(ext_win);
             return;
