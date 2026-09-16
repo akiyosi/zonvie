@@ -1450,6 +1450,15 @@ fn applyMainDpiState(app: *App, new_dpi: u32) void {
     if (app.row_valid.bit_length != 0) app.row_valid.unsetAll();
     app.back_tex_valid = false;
     app.last_cursor_rect_px = null;
+    // Every surface draws from the one atlas, so a DPI change re-rasterizes at
+    // the new cell size for external windows too — but only the main window's
+    // pixel geometry was re-derived above, leaving each external HWND at its
+    // old size with larger (or smaller) cells drawn into it until something
+    // else resized it. The guifont and linespace paths already fan the new
+    // metrics out to every surface; this one owed the same.
+    if (metrics != null) {
+        callbacks.queueExternalWindowResizes(app, app.hwnd, app.cell_w_px, app.rowHeightPx(), "applyMainDpiState");
+    }
     app.mu.unlock(core.clock.io());
 }
 
@@ -3735,6 +3744,17 @@ pub export fn WndProc(
                                 const present_rects_slice: []const c.RECT =
                                     if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
+                                // NOTE: an empty rect list here is read by the
+                                // renderer as whole-surface damage, so this
+                                // paint costs a full CopyResource + Present1.
+                                // Skipping it instead is WRONG: main's damage
+                                // bookkeeping covers grid rows and the cursor
+                                // only, while the tabline, its close/new-tab
+                                // buttons and the caption buttons are redrawn
+                                // into back_tex from hover state that produces
+                                // no rect at all. Skipping left every one of
+                                // those hovers invisible.
+
                                 // Present1 scroll params: disabled for now.
                                 // back_tex pixel shift (scrollBackTex) already handles the retained
                                 // content shift. Adding pScrollRect/pScrollOffset to Present1 would
@@ -3868,6 +3888,19 @@ pub export fn WndProc(
                                 .{ snapshot_us, atlas_us, rows_to_draw.items.len, vb_upload_us, draw_vb_us, row_us, present_us, total_us },
                             );
                         }
+                    }
+                }
+
+                // A Present that failed with a device-removed code sets
+                // `device_lost` on the renderer and still returns normally, so a
+                // paint can report success on a device that is already gone. The
+                // external driver tests this right after its own present; main
+                // did not, and left recovery to whatever woke the next WM_PAINT.
+                // With no external window and a cursor that does not blink,
+                // nothing does until Neovim redraws, so the window sat frozen.
+                if (render_ok) {
+                    if (app.renderer) |*r| {
+                        if (r.device_lost) render_ok = false;
                     }
                 }
 

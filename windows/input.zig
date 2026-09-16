@@ -1439,7 +1439,16 @@ pub fn updateExternalWindowsBlinkState(app: *App) void {
     var it = app.external_windows.iterator();
     while (it.next()) |entry| {
         const ext_win = entry.value_ptr.*;
+        // Every surface tracks the state, because the one that gains the cursor
+        // next must draw it in the phase the rest are in.
         ext_win.cursor_blink_state = app.cursor_blink_state;
+        // Only the surface that actually holds a cursor repaints. A toggle
+        // changes no pixel on the others, and the whole-window invalidate cost
+        // each of them a no-op WM_PAINT — app.mu, a layer scan and a snapshot
+        // acquire/release — twice a second, scaling with the window count. The
+        // main window has always skipped its own invalidate the same way, on a
+        // null `last_cursor_rect_px`.
+        if (!ext_win.has_committed_cursor) continue;
         if (ext_win.hwnd) |ext_hwnd| {
             _ = c.InvalidateRect(ext_hwnd, null, c.FALSE);
         }
