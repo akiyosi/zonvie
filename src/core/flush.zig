@@ -871,15 +871,25 @@ inline fn cellGlow(glow_all: bool, glow_hl_ids: ?*std.AutoHashMap(u32, void), hl
     return @intFromBool(ids.contains(hl));
 }
 
-/// Compose one main-grid row into `dst`, run-length batched by hl_id.
-/// `row_start` is the row's first cell index in the main grid; `dst` is a
+/// Compose one grid row into `dst`, run-length batched by hl_id.
+/// `row_start` is the row's first cell index in `grid_cells`; `dst` is a
 /// row-local buffer filled from 0.
+///
+/// `grid_cells` and `grid_id` are arguments because every surface composes the
+/// same way. This was written against `core.grid.main_buf` alone, so under
+/// ext_multigrid the run-batched SIMD path ran over the empty container while
+/// every split, float and external window went cell by cell.
+///
+/// A row shorter than `cols` is tolerated the way the per-cell path did it:
+/// the missing tail composes as blanks at hl 0.
 ///
 /// `inline` on purpose: this is per-row on the flush path, and inlining lets
 /// the slice bases and the comptime `count_hl_cache` branch fold away.
-inline fn composeMainRowRuns(
+inline fn composeRowRuns(
     core: *Core,
     dst: *RenderCells,
+    grid_cells: []const grid_mod.Cell,
+    grid_id: i64,
     row_start: usize,
     cols: u32,
     hl_cache: []highlight.ResolvedAttrWithStyles,
@@ -892,16 +902,23 @@ inline fn composeMainRowRuns(
     hl_hits: *u32,
     hl_misses: *u32,
 ) void {
-    const grid_cells = core.grid.main_buf.cells;
+    // Cells this row actually has. Anything past it is blank at hl 0, which is
+    // what the per-cell composer substituted.
+    const present: u32 = if (row_start >= grid_cells.len)
+        0
+    else
+        @intCast(@min(@as(usize, cols), grid_cells.len - row_start));
+
     var c: u32 = 0;
     while (c < cols) {
-        const run_hl = grid_cells[row_start + @as(usize, c)].hl;
+        const run_hl: u32 = if (c < present) grid_cells[row_start + @as(usize, c)].hl else 0;
 
         // Find run of consecutive cells with same hl_id.
         // This reduces hl_cache lookups from O(cols) to O(unique_hl_ids).
         var run_end: u32 = c + 1;
         while (run_end < cols) : (run_end += 1) {
-            if (grid_cells[row_start + @as(usize, run_end)].hl != run_hl) break;
+            const next_hl: u32 = if (run_end < present) grid_cells[row_start + @as(usize, run_end)].hl else 0;
+            if (next_hl != run_hl) break;
         }
 
         // Get resolved attributes once for the entire run
@@ -914,19 +931,27 @@ inline fn composeMainRowRuns(
         @memset(dst.fg_rgbs.items[ds..de], a.fg);
         @memset(dst.bg_rgbs.items[ds..de], a.bg);
         @memset(dst.sp_rgbs.items[ds..de], a.sp);
-        @memset(dst.grid_ids.items[ds..de], 1);
+        @memset(dst.grid_ids.items[ds..de], grid_id);
         @memset(dst.style_flags_arr.items[ds..de], a.style_flags);
         @memset(dst.overline_arr.items[ds..de], @intFromBool(a.overline));
         if (glow_enabled) {
             const has_glow: u8 = cellGlow(glow_all, glow_hl_ids, run_hl);
             @memset(dst.glow_arr.items[ds..de], has_glow);
         }
-        // SIMD stride-2 extraction: Cell{cp,hl} -> cp only
-        simdExtractCp(
-            grid_cells.ptr + row_start + @as(usize, c),
-            dst.scalars.items.ptr + ds,
-            @as(usize, run_end - c),
-        );
+        // SIMD stride-2 extraction: Cell{cp,hl} -> cp only, for the part of the
+        // run the grid actually has; the rest is the blank the per-cell path
+        // substituted.
+        const run_present: u32 = if (c >= present) 0 else @min(run_end, present) - c;
+        if (run_present != 0) {
+            simdExtractCp(
+                grid_cells.ptr + row_start + @as(usize, c),
+                dst.scalars.items.ptr + ds,
+                @as(usize, run_present),
+            );
+        }
+        if (run_present != run_end - c) {
+            @memset(dst.scalars.items[ds + @as(usize, run_present) .. de], ' ');
+        }
 
         c = run_end;
     }
@@ -3726,9 +3751,11 @@ pub const FlushCtx = struct {
                                     cols,
                                     main_margins,
                                 );
-                                composeMainRowRuns(
+                                composeRowRuns(
                                     ctx.core,
                                     row_cells,
+                                    ctx.core.grid.main_buf.cells,
+                                    1,
                                     row_start,
                                     cols,
                                     hl_cache,
@@ -5548,20 +5575,29 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     self.row_cells.setLen(sg.cols);
 
                     // Resolve the base external-grid row directly into the row
-                    // scratch; clean rows never copy or scan their cells.
+                    // scratch; clean rows never copy or scan their cells. Same
+                    // run-batched composer the main grid uses — it was written
+                    // against main_buf, so under ext_multigrid the SIMD path ran
+                    // over the empty container and every real window went cell
+                    // by cell.
                     const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
-                    for (0..sg.cols) |c| {
-                        const cell_idx = row_start + c;
-                        const cell: grid_mod.Cell = if (cell_idx < sg.cells.len)
-                            sg.cells[cell_idx]
-                        else
-                            .{ .cp = ' ', .hl = 0 };
-                        const attr = cache.getAttr(&self.hl, cell.hl);
-                        self.row_cells.set(c, cell.cp, attr.fg, attr.bg, attr.sp, grid_id, attr.style_flags, @intFromBool(attr.overline));
-                        if (ext_glow_enabled) {
-                            self.row_cells.glow_arr.items[c] = cellGlow(ext_glow_all, ext_glow_hl_ids, cell.hl);
-                        }
-                    }
+                    composeRowRuns(
+                        self,
+                        &self.row_cells,
+                        sg.cells,
+                        grid_id,
+                        row_start,
+                        sg.cols,
+                        cache.hl_cache_buf,
+                        cache.hl_valid_buf,
+                        @intCast(cache.hl_valid_buf.len),
+                        ext_glow_enabled,
+                        ext_glow_all,
+                        ext_glow_hl_ids,
+                        true,
+                        &cache.perf_hl_cache_hits,
+                        &cache.perf_hl_cache_misses,
+                    );
                     setViewportRowDecoFlags(
                         self.row_cells.deco_base_flags.items[0..sg.cols],
                         row,
@@ -13131,7 +13167,7 @@ test "every routed view reaches the msg_show callback as the matching ABI view" 
     }
 }
 
-test "composeMainRowRuns writes one row's attributes, scalars and glow" {
+test "composeRowRuns writes one row's attributes, scalars and glow" {
     // The flush-level tests reach this body only through whatever the row
     // path happens to emit, so a fault inside it can hide behind them. This
     // drives the body directly.
@@ -13164,9 +13200,11 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
 
     var hits: u32 = 0;
     var misses: u32 = 0;
-    composeMainRowRuns(
+    composeRowRuns(
         &core,
         &dst,
+        core.grid.main_buf.cells,
+        1,
         0,
         cols,
         hl_cache,
@@ -13202,7 +13240,7 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
 
     // Glow is opt-in: left alone when disabled, filled when enabled.
     @memset(dst.glow_arr.items[0..cols], 0);
-    composeMainRowRuns(&core, &dst, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
+    composeRowRuns(&core, &dst, core.grid.main_buf.cells, 1, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, true, null, false, &hits, &misses);
     for (0..cols) |i| try std.testing.expectEqual(@as(u8, 1), dst.glow_arr.items[i]);
 
     // The other glow branch: with glow_all off, only the runs whose hl is in
@@ -13212,7 +13250,7 @@ test "composeMainRowRuns writes one row's attributes, scalars and glow" {
     defer ids.deinit();
     try ids.put(7, {});
     @memset(dst.glow_arr.items[0..cols], 0xFF);
-    composeMainRowRuns(&core, &dst, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
+    composeRowRuns(&core, &dst, core.grid.main_buf.cells, 1, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), true, false, &ids, false, &hits, &misses);
     for (0..cols) |i| {
         const expected: u8 = if (hls[i] == 7) 1 else 0;
         try std.testing.expectEqual(expected, dst.glow_arr.items[i]);
@@ -16174,4 +16212,63 @@ test "a cursor leaving an external window for a live grid does not regenerate it
     try flush_ctx.onFlush(ROWS, COLS);
     try std.testing.expectEqual(@as(u32, 1), state.ext_cursor_clears);
     try std.testing.expectEqual(@as(u32, 0), state.ext_content_rows);
+}
+
+test "composeRowRuns composes any grid's cells, and blanks a short row's tail" {
+    // The composer was written against main_buf and hardcoded grid id 1. Both
+    // are arguments now, so this drives it with a SUB-GRID's cells — the shape
+    // every window has under ext_multigrid — and with a row that runs past the
+    // end of the buffer, which the per-cell composer it replaced answered by
+    // substituting a blank at hl 0.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.hl.setDefaults(0x111111, 0x222222, null);
+    try core.hl.define(5, 0xAA0000, 0xBB0000, 0xCC0000, false, 0, .{ .bold = true }, false);
+
+    const cols: u32 = 8;
+    try core.grid.resize(4, 40);
+    try core.grid.resizeGrid(2, 2, cols);
+    for (0..2) |r| {
+        for (0..cols) |c| core.grid.putCellGrid(2, @intCast(r), @intCast(c), 'Z', 5);
+    }
+
+    try core.initHlCache();
+    const hl_cache: []highlight.ResolvedAttrWithStyles = core.hl_cache_buf orelse &.{};
+    const hl_valid: []bool = core.hl_valid_buf orelse &.{};
+    @memset(hl_valid, false);
+
+    var dst: RenderCells = .{};
+    defer dst.deinit(core.alloc);
+    try dst.ensureTotalCapacity(core.alloc, cols);
+    dst.setLen(cols);
+
+    var hits: u32 = 0;
+    var misses: u32 = 0;
+    const sg = core.grid.sub_grids.getPtr(2).?;
+    composeRowRuns(&core, &dst, sg.cells, 2, 0, cols, hl_cache, hl_valid, @intCast(hl_valid.len), false, false, null, false, &hits, &misses);
+
+    const a5 = core.hl.getWithStyles(5);
+    for (0..cols) |c| {
+        try std.testing.expectEqual(@as(u32, 'Z'), dst.scalars.items[c]);
+        try std.testing.expectEqual(a5.fg, dst.fg_rgbs.items[c]);
+        try std.testing.expectEqual(a5.bg, dst.bg_rgbs.items[c]);
+        // The grid id is the surface's, not a hardcoded 1.
+        try std.testing.expectEqual(@as(i64, 2), dst.grid_ids.items[c]);
+    }
+
+    // A row whose cells run past the end of the buffer: the tail composes as a
+    // blank at hl 0, exactly as the per-cell path substituted.
+    @memset(hl_valid, false);
+    const short_start: usize = sg.cells.len - 3;
+    composeRowRuns(&core, &dst, sg.cells, 2, short_start, cols, hl_cache, hl_valid, @intCast(hl_valid.len), false, false, null, false, &hits, &misses);
+    const a0 = core.hl.getWithStyles(0);
+    for (0..3) |c| {
+        try std.testing.expectEqual(@as(u32, 'Z'), dst.scalars.items[c]);
+    }
+    for (3..cols) |c| {
+        try std.testing.expectEqual(@as(u32, ' '), dst.scalars.items[c]);
+        try std.testing.expectEqual(a0.fg, dst.fg_rgbs.items[c]);
+        try std.testing.expectEqual(a0.bg, dst.bg_rgbs.items[c]);
+        try std.testing.expectEqual(@as(i64, 2), dst.grid_ids.items[c]);
+    }
 }
