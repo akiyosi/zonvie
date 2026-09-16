@@ -6898,6 +6898,19 @@ pub fn sendPopupmenuShow(self: *Core) bool {
         if (self.grid.win_pos.get(anchor_grid)) |pos| {
             start_row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row);
             start_col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col);
+        } else if (self.grid.external_grids.get(anchor_grid)) |ext| {
+            // An external grid is never in win_pos — setWinExternalPos drops it
+            // — so without this the completion popup anchored to a window that
+            // lives in an external window was published with that window's
+            // LOCAL row and column treated as global coordinates. The sibling
+            // conversion in redraw_handler.zig has always had this branch.
+            if (ext.start_row >= 0 and ext.start_col >= 0) {
+                start_row = anchor_row +| ext.start_row;
+                start_col = anchor_col +| ext.start_col;
+            } else {
+                start_row = anchor_row;
+                start_col = anchor_col;
+            }
         } else {
             start_row = anchor_row;
             start_col = anchor_col;

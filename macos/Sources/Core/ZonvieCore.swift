@@ -130,6 +130,24 @@ final class ZonvieCore {
         return externalGridViews[gridId]
     }
 
+    /// Tell every external surface which font generation its rows must match.
+    ///
+    /// Any bump of the atlas's font generation owes this: the external views
+    /// gate their committed rows on it (`committedFontIsCurrent`), so a
+    /// generation they were never told about leaves them drawing stale rows
+    /// against a rebuilt atlas. guifont was the only caller, which left the
+    /// backing-scale rebuild — same field, same clearCaches — unannounced.
+    @discardableResult
+    func stageFontGenerationOnExternalSurfaces(_ generation: UInt64) -> [ExternalGridView] {
+        externalGridViewsLock.lock()
+        let views = Array(externalGridViews.values)
+        externalGridViewsLock.unlock()
+        for gridView in views {
+            gridView.stageFontChanged(generation: generation)
+        }
+        return views
+    }
+
     /// Which surface owns one grid's per-flush work.
     enum GridRoute {
         /// Grid 1, the main window's own root.
@@ -3577,12 +3595,7 @@ final class ZonvieCore {
         // submit/commit external rows. The main-queue presentation callback
         // below may run after that commit, so it must not be the first place
         // the generation transition becomes visible to external grids.
-        externalGridViewsLock.lock()
-        let externalViews = Array(externalGridViews.values)
-        externalGridViewsLock.unlock()
-        for gridView in externalViews {
-            gridView.stageFontChanged(generation: fontGeneration)
-        }
+        let externalViews = stageFontGenerationOnExternalSurfaces(fontGeneration)
 
         // Notify core of new cell dimensions so vertex positions match
         // the new glyph metrics. We hold grid_mu either via handleRedraw

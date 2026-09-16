@@ -1742,7 +1742,8 @@ pub fn onGridRowScroll(
     // this grid's own storage. The route comes from the one resolver the row
     // and cursor paths use, so a window already closing no longer counts as a
     // registration here either.
-    const is_external_root = switch (resolveGridRouteLocked(app, grid_id)) {
+    const row_route = resolveGridRouteLocked(app, grid_id);
+    const is_external_root = switch (row_route) {
         .external_root => true,
         .main_root, .main_layer, .external_layer, .unplaced => false,
     };
@@ -1752,6 +1753,16 @@ pub fn onGridRowScroll(
                 core.zonvie_core_force_resend_locked(app.corep);
                 failFlush(app);
             } else {
+                // onFlushEnd invalidates an external HWND exclusively from its
+                // own needs_redraw, so a float this surface hosts that only
+                // SHIFTS rows scheduled a repaint of the main window and none
+                // of its actual host. The row-store route one function away has
+                // always set it. Usually masked, because the core sends the
+                // vacated rows right after the shift and those take that route.
+                switch (row_route) {
+                    .external_layer => |host| host.needs_redraw = true,
+                    .main_root, .main_layer, .external_root, .unplaced => {},
+                }
                 app.flush_needs_invalidate = true;
                 if (applog.isEnabled()) applog.appLog(
                     "[layer_row_scroll] gridId={d} rowStart={d} rowEnd={d} rowsDelta={d}\n",

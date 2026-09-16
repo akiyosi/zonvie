@@ -1502,7 +1502,16 @@ final class MetalTerminalView: MTKView {
             ?? 2.0
         guard scale.isFinite, scale > 0 else { return }
 
+        let generationBefore = renderer.glyphAtlas.fontGenerationSnapshot()
         renderer.setBackingScale(scale)
+        // A backing-scale change rebuilds the font and clears the atlas caches,
+        // bumping the same generation guifont bumps. The external surfaces gate
+        // their committed rows on it, so without this fan-out they kept naming
+        // the old generation and drew stale rows against the rebuilt atlas.
+        let generationAfter = renderer.glyphAtlas.fontGenerationSnapshot()
+        if generationAfter != generationBefore {
+            core?.stageFontGenerationOnExternalSurfaces(generationAfter)
+        }
 
         let pw = bw * scale
         let ph = bh * scale
