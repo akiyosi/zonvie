@@ -878,15 +878,10 @@ pub fn onVerticesRow(
         const owns = blk: {
             app.mu.lockUncancelable(core.clock.io());
             defer app.mu.unlock(core.clock.io());
-            // A window already closing is not a registration, for the reason
-            // the row path states: the grid may be moving back into the main
-            // window, and the cursor has to follow its rows there. Without
-            // this the cursor was refused here, then refused again as
-            // pending-close on the external path, and dropped.
-            if (app.external_windows.get(grid_id)) |w| {
-                if (!w.is_pending_close) break :blk false;
-            }
-            break :blk mainSurfaceOwnsGridLocked(app, grid_id);
+            break :blk switch (resolveGridRouteLocked(app, grid_id)) {
+                .main_root, .main_layer => true,
+                .external_root, .external_layer, .unplaced => false,
+            };
         };
         if (owns) {
             if (vert_count == 0 and app.tbs.cursorLayerGridIdInFlush() != grid_id) {
@@ -1040,11 +1035,15 @@ pub fn onVerticesRow(
         // route is the correct one the moment the close is staged: the new
         // layout is already published, and the ABI requires tolerating rows
         // for a grid that is in no layer yet.
-        const ext_registered = if (app.external_windows.get(grid_id)) |w| !w.is_pending_close else false;
+        const row_route = resolveGridRouteLocked(app, grid_id);
+        const ext_registered = switch (row_route) {
+            .external_root => true,
+            .main_root, .main_layer, .external_layer, .unplaced => false,
+        };
         if ((flags & 2) == 0 and !ext_registered) {
             const row_verts: []const app_mod.Vertex =
                 if (verts_ptr) |vp| vp[0..vert_count] else &[_]app_mod.Vertex{};
-            if (storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols)) {
+            if (storeMainSurfaceLayerRowLocked(app, grid_id, row_start, row_verts, total_rows, total_cols, row_route)) {
                 // Request a paint, but do NOT dirty the root rows underneath:
                 // grid 1 holds no cells under ext_multigrid, so the root row
                 // loop would draw its empty-row background fill over the whole
@@ -1737,10 +1736,17 @@ pub fn onGridRowScroll(
         return;
     }
 
-    // A grid the main surface places as a layer shifts its own rows here. The
-    // core sends only the vacated ones afterwards, so the survivors have to be
-    // carried by moving them within this grid's own storage.
-    if (app.external_windows.get(grid_id) == null) {
+    // A grid the main surface, or another external surface, places as a layer
+    // shifts its own rows here. The core sends only the vacated ones
+    // afterwards, so the survivors have to be carried by moving them within
+    // this grid's own storage. The route comes from the one resolver the row
+    // and cursor paths use, so a window already closing no longer counts as a
+    // registration here either.
+    const is_external_root = switch (resolveGridRouteLocked(app, grid_id)) {
+        .external_root => true,
+        .main_root, .main_layer, .external_layer, .unplaced => false,
+    };
+    if (!is_external_root) {
         if (app.layer_grids.get(grid_id)) |state| {
             if (!state.stageShift(app.alloc, row_start, row_end, rows_delta, total_rows, total_cols)) {
                 core.zonvie_core_force_resend_locked(app.corep);
@@ -3159,13 +3165,14 @@ pub fn onSSHAuthPrompt(
 /// AdjustWindowRectEx stays here rather than moving into the shared helper:
 /// this path must read the window's actual style, while the creation path
 /// knows the style it is about to apply.
-fn queueExternalWindowResizes(
+pub fn queueExternalWindowResizes(
     app: *App,
     hwnd: ?c.HWND,
     cell_w: u32,
     cell_h: u32,
     log_tag: []const u8,
 ) void {
+    // Caller must hold `app.mu`.
     var ext_it = app.external_windows.iterator();
     while (ext_it.next()) |entry| {
         const grid_id = entry.key_ptr.*;
@@ -3348,6 +3355,41 @@ fn externalSurfaceForGridLocked(app: *App, grid_id: i64) ?*app_mod.ExternalWindo
     return null;
 }
 
+/// Which surface owns one grid's per-flush work.
+pub const GridRoute = union(enum) {
+    /// Grid 1, the main window's own root.
+    main_root,
+    /// A float or split the main window places as a layer.
+    main_layer,
+    /// The grid is rendered as its own external surface.
+    external_root: *app_mod.ExternalWindow,
+    /// Another external surface places this grid as a layer.
+    external_layer: *app_mod.ExternalWindow,
+    /// No surface places this grid yet; the ABI requires tolerating it.
+    unplaced,
+};
+
+/// Resolve `grid_id` to the surface that owns its work right now.
+/// Caller must hold `app.mu`.
+///
+/// Rows, cursor and row shifts each asked this separately and the answers
+/// drifted: the row and cursor paths treat a window that is closing as
+/// unregistered so a grid moving out of its own window follows its work to
+/// whichever surface now places it, while the shift path consulted the window
+/// map alone, handed such a grid to the external path, and had it refused there
+/// as pending-close — failing the whole flush once per fast-path scroll until
+/// the UI thread drained the close. One rule, every caller.
+fn resolveGridRouteLocked(app: *App, grid_id: i64) GridRoute {
+    if (grid_id == 1) return .main_root;
+    if (app.external_windows.get(grid_id)) |w| {
+        if (!w.is_pending_close) return .{ .external_root = w };
+    }
+    // Main before host, matching the order the row path's layer store uses.
+    if (mainSurfaceOwnsGridLocked(app, grid_id)) return .main_layer;
+    if (externalSurfaceForGridLocked(app, grid_id)) |host| return .{ .external_layer = host };
+    return .unplaced;
+}
+
 /// Store one row for a grid the main surface draws as a non-root layer.
 /// Returns true when the row was consumed here. Caller must hold `app.mu`;
 /// onVerticesRow already does, and `std.Io.Mutex` is not reentrant.
@@ -3358,10 +3400,16 @@ fn storeMainSurfaceLayerRowLocked(
     verts: []const app_mod.Vertex,
     total_rows: u32,
     total_cols: u32,
+    route: GridRoute,
 ) bool {
-    const on_main = mainSurfaceOwnsGridLocked(app, grid_id);
-    const ext = if (on_main) null else externalSurfaceForGridLocked(app, grid_id);
-    if (!on_main and ext == null) return false;
+    // The route is resolved once per row by the caller; re-deriving it here
+    // would rescan the main surface's layers and every external surface's a
+    // second time on the row hot path.
+    const ext: ?*app_mod.ExternalWindow = switch (route) {
+        .external_layer => |host| host,
+        .main_root, .main_layer => null,
+        .external_root, .unplaced => return false,
+    };
     traceRender(app, "event=row_route surface={d} grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ if (ext) |host| traceExternalSurfaceId(host, grid_id) else @as(i64, 1), grid_id, row, verts.len, total_rows, total_cols });
     if (ext) |host| host.needs_redraw = true;
 
