@@ -593,6 +593,36 @@ test "slot backing is retained until the layout has produced a row" {
     try std.testing.expect(!helpers.shouldRetireSlotBacking(std.math.maxInt(usize), 0));
 }
 
+test "present rect clamping drops rects that clamp away and keeps the rest" {
+    var rects = [_]Rect{
+        .{ .left = -5, .top = -5, .right = 40, .bottom = 40 },
+        .{ .left = 200, .top = 10, .right = 300, .bottom = 20 },
+        .{ .left = 10, .top = 10, .right = 30, .bottom = 30 },
+    };
+
+    const len = helpers.clampPresentRects(Rect, &rects, 100, 100);
+    try std.testing.expectEqual(@as(usize, 2), len);
+    // The out-of-bounds rect is gone; the survivors are clamped in place.
+    var saw_clamped = false;
+    var saw_interior = false;
+    for (rects[0..len]) |r| {
+        if (std.meta.eql(r, Rect{ .left = 0, .top = 0, .right = 40, .bottom = 40 })) saw_clamped = true;
+        if (std.meta.eql(r, Rect{ .left = 10, .top = 10, .right = 30, .bottom = 30 })) saw_interior = true;
+    }
+    try std.testing.expect(saw_clamped);
+    try std.testing.expect(saw_interior);
+}
+
+test "present rect clamping trims a rect that overhangs the target" {
+    var rects = [_]Rect{
+        .{ .left = 80, .top = 80, .right = 500, .bottom = 500 },
+    };
+
+    const len = helpers.clampPresentRects(Rect, &rects, 100, 100);
+    try std.testing.expectEqual(@as(usize, 1), len);
+    try std.testing.expectEqual(Rect{ .left = 80, .top = 80, .right = 100, .bottom = 100 }, rects[0]);
+}
+
 test "damage compaction merges row spans and contained cursor damage" {
     var rects = [_]Rect{
         .{ .left = 40, .top = 12, .right = 50, .bottom = 18 },
