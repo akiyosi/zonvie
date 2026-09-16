@@ -3,48 +3,6 @@ import Metal
 import MetalKit
 import simd
 
-/// Sparse row history for one external surface. Capacity grows only when a
-/// structural row count is observed, then redraw/flush operations reuse that
-/// high-water allocation.
-private final class ExternalStaleRowSet {
-    private(set) var rows: [UInt32] = []
-    private var membership: [UInt64] = []
-    private let rowLimit: Int
-    private var preparedRowCount = 0
-
-    init(rowLimit: Int) {
-        self.rowLimit = rowLimit
-    }
-
-    func prepare(rowCount: Int) {
-        let target = min(rowLimit, max(0, rowCount))
-        guard target > preparedRowCount else { return }
-        let targetWords = (target + 63) / 64
-        if targetWords > membership.count {
-            membership.append(contentsOf: repeatElement(0, count: targetWords - membership.count))
-        }
-        rows.reserveCapacity(target)
-        preparedRowCount = target
-    }
-
-    func insert(_ row: Int) {
-        guard row >= 0, row < preparedRowCount else { return }
-        let word = row >> 6
-        let mask = UInt64(1) << UInt64(row & 63)
-        guard membership[word] & mask == 0 else { return }
-        membership[word] |= mask
-        rows.append(UInt32(row))
-    }
-
-    func removeAll() {
-        for storedRow in rows {
-            let row = Int(storedRow)
-            membership[row >> 6] &= ~(UInt64(1) << UInt64(row & 63))
-        }
-        rows.removeAll(keepingCapacity: true)
-    }
-}
-
 /// Compute the screen-space parameters (custom shader uniforms) for an
 /// external MTKView relative to the main terminal view. `screenResolution`
 /// is the main MTKView's drawable size in pixels; `windowOffset` is the
@@ -300,17 +258,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // carries rows changed since it last committed; scroll/resize/abort use a
     // full-copy barrier. This mirrors MetalTerminalRenderer and keeps a one-row
     // external flush O(changed rows) instead of O(total rows).
-    private var staleRowsBySet: [ExternalStaleRowSet] = [
-        ExternalStaleRowSet(rowLimit: 20_000),
-        ExternalStaleRowSet(rowLimit: 20_000),
-        ExternalStaleRowSet(rowLimit: 20_000),
+    private var staleRowsBySet: [SparseRowSet] = [
+        SparseRowSet(rowLimit: 20_000),
+        SparseRowSet(rowLimit: 20_000),
+        SparseRowSet(rowLimit: 20_000),
     ]
-    private var flushChangedRows = ExternalStaleRowSet(rowLimit: 20_000)
+    private var flushChangedRows = SparseRowSet(rowLimit: 20_000)
     // Rows regenerated after the most recent font-generation transition in
     // this bracket. A commit may advance its set's font generation only when
     // every logical row was regenerated; cursor-only and partial commits keep
     // the older generation and are suppressed by the draw-generation gate.
-    private var flushGeneratedRows = ExternalStaleRowSet(rowLimit: 20_000)
+    private var flushGeneratedRows = SparseRowSet(rowLimit: 20_000)
     // Capacity is prepared before publication. A later structural growth is
     // staged onto the main thread; the current core flush aborts instead of
     // allocating while a row callback or flush bracket holds rendering state.
@@ -335,10 +293,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Fixed-size capacity ledger. The core callback only raises entries;
     // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
     // bracket closes, before retrying the core flush.
-    private var rowCapacityRequiredRows = 0
-    private var rowCapacityRequiredVertexCounts = [Int](repeating: 0, count: 20_000)
-    private var rowCapacityProvisioning = false // Protected by tripleBufferLock
-    private var rowCapacityHardFailure = false // Protected by tripleBufferLock
+    private let rowCapacity = SurfaceRowCapacityLedger(maxRowBuffers: 20_000)
 
     /// Read and clear flushFailed. Called once per flush from on_flush_end.
     func consumeFlushFailed() -> Bool {
@@ -373,9 +328,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
             if !lockHeld { tripleBufferLock.lock() }
-            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
-            rowCapacityRequiredVertexCounts[capacityRow] = max(
-                rowCapacityRequiredVertexCounts[capacityRow],
+            rowCapacity.requiredRows = max(rowCapacity.requiredRows, requiredRows)
+            rowCapacity.requiredVertexCounts[capacityRow] = max(
+                rowCapacity.requiredVertexCounts[capacityRow],
                 neededVertexCount
             )
             if !lockHeld { tripleBufferLock.unlock() }
@@ -387,7 +342,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// True while this surface still owes a provisioning pass, or is in the
     /// middle of one. The scheduled flush retry is that pass's only driver, so
     /// a commit elsewhere must not disarm the retry while this holds.
-    /// `rowCapacityProvisioning` has to count: the provisioner zeroes the
+    /// `rowCapacity.provisioning` has to count: the provisioner zeroes the
     /// ledger before it allocates outside the lock, and a commit landing in
     /// that window would otherwise see nothing owed and cancel the very retry
     /// that is doing the work — after which an allocation failure restores the
@@ -395,91 +350,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     var hasPendingRowCapacityWork: Bool {
         tripleBufferLock.lock()
         defer { tripleBufferLock.unlock() }
-        return rowCapacityRequiredRows > 0 || rowCapacityProvisioning
+        return rowCapacity.requiredRows > 0 || rowCapacity.provisioning
     }
 
     /// Called from the flush-retry queue before it acquires core grid_mu.
     func provisionPendingRowCapacity() -> SurfaceRowProvisionStatus {
-        tripleBufferLock.lock()
-        if rowCapacityHardFailure {
-            tripleBufferLock.unlock()
-            return .hardFailure
-        }
-        // Nothing owed: answer ready regardless of what this surface is
-        // currently doing. Asked before the busy check because a float
-        // presenting at refresh rate almost always has a frame in flight, and
-        // the caller folds any one surface's .retry into an app-wide verdict —
-        // an idle ledger would otherwise keep the whole retry re-arming.
-        guard rowCapacityRequiredRows > 0 else {
-            tripleBufferLock.unlock()
-            return .ready
-        }
-        if bracketOpen || rowCapacityProvisioning ||
-            gpuInFlightCount.contains(where: { $0 != 0 }) {
-            tripleBufferLock.unlock()
-            return .retry
-        }
-        rowCapacityProvisioning = true
-        let requiredRows = rowCapacityRequiredRows
-        let requiredVertexCounts = Array(rowCapacityRequiredVertexCounts[0..<requiredRows])
-        for row in 0..<requiredRows {
-            rowCapacityRequiredVertexCounts[row] = 0
-        }
-        rowCapacityRequiredRows = 0
-        tripleBufferLock.unlock()
-
-        let planResult = makeSurfaceRowProvisionPlan(
+        provisionSurfaceRowCapacity(
+            ledger: rowCapacity,
+            lock: tripleBufferLock,
             bufferSets: bufferSets,
             device: mtlDevice,
-            requiredRowCount: requiredRows,
-            requiredVertexCounts: requiredVertexCounts,
-            maxRowBuffers: maxRowBuffers
+            maxRowBuffers: maxRowBuffers,
+            logLabel: "ExternalGridView:\(gridId)",
+            isBusyLocked: { bracketOpen || gpuInFlightCount.contains(where: { $0 != 0 }) },
+            busyLogDetailLocked: { "bracketOpen=\(bracketOpen) gpuInFlight=\(gpuInFlightCount)" }
         )
-
-        tripleBufferLock.lock()
-        defer {
-            rowCapacityProvisioning = false
-            tripleBufferLock.unlock()
-        }
-        switch planResult {
-        case .overBudget:
-            rowCapacityHardFailure = true
-            return .hardFailure
-        case .allocationFailed(let partialPlan):
-            let metrics = partialPlan.metrics
-            ZonvieCore.appLog(
-                "[ExternalGridView] row provisioning allocation failed gridId=\(gridId) " +
-                "attempt=\(metrics.allocationAttemptCount) created=\(metrics.createdBufferCount) " +
-                "createdBytes=\(metrics.createdBufferBytes) planned=\(metrics.plannedReplacementCount) " +
-                "plannedBytes=\(metrics.plannedReplacementBytes) live=\(metrics.liveBufferCount) " +
-                "liveBytes=\(metrics.liveBufferBytes)"
-            )
-            // Publish only successful private-pool capacities. Committed row
-            // buffers and their counts remain transactionally unchanged.
-            applySurfaceRowProvisionPlan(
-                partialPlan,
-                to: bufferSets,
-                maxRowBuffers: maxRowBuffers
-            )
-            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
-            for row in 0..<requiredRows {
-                rowCapacityRequiredVertexCounts[row] = max(
-                    rowCapacityRequiredVertexCounts[row],
-                    requiredVertexCounts[row]
-                )
-            }
-            return .retry
-        case .ready(let plan):
-            if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
-                ZonvieCore.appLogPerf(
-                    "[perf] external_row_provision gridId=\(gridId) created=\(plan.metrics.createdBufferCount) " +
-                    "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
-                    "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
-                )
-            }
-            applySurfaceRowProvisionPlan(plan, to: bufferSets, maxRowBuffers: maxRowBuffers)
-        }
-        return rowCapacityRequiredRows == 0 ? .ready : .retry
     }
 
     /// Same-slot buffers of the sets currently GPU in-flight (up to two —
@@ -628,10 +513,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private let shaderTiming = MetalTerminalRenderer.ShaderViewTimingState()
     /// Ping-pong render targets for multi-pass custom shader chains.
     /// Allocated lazily inside draw() when pipelines.count > 1.
-    private var customShaderPong: [MTLTexture?] = [nil, nil]
-    private var customShaderPongSize: CGSize = .zero
-    private var scrollScratchTexture: MTLTexture? = nil
-    private var scrollScratchSize: CGSize = .zero
+    private let customShaderPong = SurfacePingPongTextures()
+    private let scrollScratch = SurfaceScrollScratchTexture()
 
     // Blur transparency support
     private let blurEnabled: Bool
@@ -1029,7 +912,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         backBuffer = nil
-        scrollScratchTexture = nil
+        scrollScratch.invalidate()
         backgroundAlphaBuffer = nil
         cursorBlinkBuffer = nil
 
@@ -1178,12 +1061,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // core hot path. Sparse history can be discarded safely by publishing
         // a full-sync barrier for all three sets at the atomic swap below.
         let replacementStaleRows = [
-            ExternalStaleRowSet(rowLimit: maxRowBuffers),
-            ExternalStaleRowSet(rowLimit: maxRowBuffers),
-            ExternalStaleRowSet(rowLimit: maxRowBuffers),
+            SparseRowSet(rowLimit: maxRowBuffers),
+            SparseRowSet(rowLimit: maxRowBuffers),
+            SparseRowSet(rowLimit: maxRowBuffers),
         ]
-        let replacementChangedRows = ExternalStaleRowSet(rowLimit: maxRowBuffers)
-        let replacementGeneratedRows = ExternalStaleRowSet(rowLimit: maxRowBuffers)
+        let replacementChangedRows = SparseRowSet(rowLimit: maxRowBuffers)
+        let replacementGeneratedRows = SparseRowSet(rowLimit: maxRowBuffers)
         for rows in replacementStaleRows {
             rows.prepare(rowCount: target)
         }
@@ -1325,7 +1208,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard isInFlush else { return false }
 
         tripleBufferLock.lock()
-        if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
             tripleBufferLock.unlock()
             ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row capacity provisioning gridId=\(gridId)")
             return false
@@ -2052,29 +1935,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // mis-shifted frame, and a permanent one if the bracket was then
         // cancelled (cancelFlush) so the vertices never rotated. Mirrors
         // MetalTerminalRenderer's beginFlush-stage/commitFlush-merge split.
-        if let staged = ws.pendingScroll,
-           staged.rowStart == rowStart,
-           staged.rowEnd == rowEnd {
-            ws.pendingScroll = SurfaceRowScroll(
-                rowStart: rowStart, rowEnd: rowEnd,
-                colStart: colStart, colEnd: colEnd,
-                rowsDelta: clampRowsDelta(staged.rowsDelta &+ rowsDelta),
-                totalRows: totalRows, totalCols: totalCols
-            )
-        } else {
-            // Region change within one bracket: the older staged blit can no
-            // longer be represented, but its row-slot remap already happened —
-            // dirty its rows so they redraw from the (post-remap) vertices.
-            if let staged = ws.pendingScroll, staged.rowEnd > staged.rowStart {
-                flushDirtyRows.insert(integersIn: staged.rowStart..<staged.rowEnd)
+        stageSurfaceRowScroll(
+            on: ws,
+            rowStart: rowStart, rowEnd: rowEnd,
+            colStart: colStart, colEnd: colEnd,
+            rowsDelta: rowsDelta,
+            totalRows: totalRows, totalCols: totalCols,
+            dirtySupersededRows: { start, end in
+                flushDirtyRows.insert(integersIn: start..<end)
             }
-            ws.pendingScroll = SurfaceRowScroll(
-                rowStart: rowStart, rowEnd: rowEnd,
-                colStart: colStart, colEnd: colEnd,
-                rowsDelta: rowsDelta,
-                totalRows: totalRows, totalCols: totalCols
-            )
-        }
+        )
 
         // Do NOT mark the entire scroll region as dirty here.
         // GPU scroll copy (blit) handles pixel shift; only vacated rows need redraw.
@@ -2394,7 +2264,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         let csi = committedSetIndex
         let allIdle = gpuInFlightCount[0] == 0 && gpuInFlightCount[1] == 0 && gpuInFlightCount[2] == 0
         var stagedForRetry = false
-        if !bracketOpen && !rowCapacityProvisioning && allIdle {
+        if !bracketOpen && !rowCapacity.provisioning && allIdle {
             // Locked variant: tripleBufferLock is held (NSLock is
             // non-recursive) — and with all sets idle there are no in-flight
             // aliases anyway.
@@ -2499,9 +2369,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         backBuffer = mtlDevice.makeTexture(descriptor: desc)
         backBufferSize = drawableSize
         // Drop ping-pong too — it must match the drawable.
-        customShaderPong[0] = nil
-        customShaderPong[1] = nil
-        customShaderPongSize = .zero
+        customShaderPong.invalidate()
         hasPresentedOnce = false
     }
 
@@ -2621,40 +2489,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     /// Allocate the two ping-pong textures used by multi-pass custom
     /// shader chains applied to this external view's backTex.
-    private func ensureExternalCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
-        if customShaderPong[0] != nil,
-           customShaderPong[1] != nil,
-           customShaderPongSize == size {
-            return
-        }
-        let w = max(1, Int(size.width))
-        let h = max(1, Int(size.height))
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: w,
-            height: h,
-            mipmapped: false
-        )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
-        customShaderPong[0] = mtlDevice.makeTexture(descriptor: desc)
-        customShaderPong[1] = mtlDevice.makeTexture(descriptor: desc)
-        customShaderPongSize = size
-    }
-
-    private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
-        if scrollScratchTexture != nil, scrollScratchSize == drawableSize { return }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: max(1, Int(drawableSize.width)),
-            height: max(1, Int(drawableSize.height)),
-            mipmapped: false
-        )
-        desc.storageMode = .private
-        scrollScratchTexture = mtlDevice.makeTexture(descriptor: desc)
-        scrollScratchSize = drawableSize
-    }
-
     /// Shift the back texture's pixels for a committed row scroll, and report
     /// the band to clear plus the rows the caller must redraw. The arithmetic
     /// and its texture clamps are `RowScrollBlitPlan`'s, shared with the main
@@ -2684,8 +2518,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rowHeightPx: rowHeightPx
         ) else { return nil }
 
-        ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
-        guard let scratch = scrollScratchTexture,
+        scrollScratch.ensure(device: mtlDevice, drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
+        guard let scratch = scrollScratch.texture,
               let blit = commandBuffer.makeBlitCommandEncoder()
         else { return nil }
         encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratch, plan: plan)
@@ -2725,47 +2559,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
 
 
-    private func drawBackgroundClearBand(
-        _ encoder: MTLRenderCommandEncoder,
-        clearBand: (clearTopPx: Int, clearBottomPx: Int),
-        drawableWidth: Float,
-        drawableHeight: Float,
-        bgRGB: UInt32
-    ) {
-        let top = max(0, clearBand.clearTopPx)
-        let bottom = max(top, clearBand.clearBottomPx)
-        guard bottom > top else { return }
-        let r = Float((bgRGB >> 16) & 0xFF) / 255.0
-        let g = Float((bgRGB >> 8) & 0xFF) / 255.0
-        let b = Float(bgRGB & 0xFF) / 255.0
-        let color = simd_float4(r, g, b, 1.0)
-        // Surface pixels: drawableWidth/Height are the viewport extent the
-        // layer transform divides by, so this band lands exactly where the
-        // NDC form used to.
-        _ = drawableHeight
-        // The vertex stage binary-searches scrollOffsets by grid_id, so the
-        // band carries this surface's root id, not the main window's.
-        let tl = Vertex(position: simd_float2(0, Float(top)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let tr = Vertex(position: simd_float2(drawableWidth, Float(top)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let bl = Vertex(position: simd_float2(0, Float(bottom)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let br = Vertex(position: simd_float2(drawableWidth, Float(bottom)),
-                        texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
-        // (no heap) instead of building a fresh [Vertex] array every scroll frame.
-        withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
-            buffer[0] = tl
-            buffer[1] = bl
-            buffer[2] = tr
-            buffer[3] = tr
-            buffer[4] = bl
-            buffer[5] = br
-            encoder.setVertexBytes(buffer.baseAddress!, length: MemoryLayout<Vertex>.stride * 6, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        }
-    }
 
     func draw(in view: MTKView) {
         autoreleasepool {
@@ -2899,8 +2692,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let hasScrollOffset = updateScrollShaderOffset()
 
             tripleBufferLock.lock()
-            if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
-                let terminal = rowCapacityHardFailure
+            if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+                let terminal = rowCapacity.hardFailure
                 tripleBufferLock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity, seq: UInt32(truncatingIfNeeded: gridId))
                 inflightSemaphore.signal()
@@ -2917,7 +2710,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             csi = committedSetIndex
             retainedSnapshot = retention.snapshotPublished()
-            // Set when the staged replay below raises rowCapacityRequiredRows, so
+            // Set when the staged replay below raises rowCapacity.requiredRows, so
             // provisioning can be driven after tripleBufferLock is released.
             var recordedRowCapacityShortfall = false
             // Apply staged out-of-bracket ROW updates once ALL sets are idle
@@ -2980,12 +2773,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         if capacityRow >= 0, capacityRow < maxRowBuffers,
                            rowStagingTotalRows >= 0, rowStagingTotalRows <= maxRowBuffers,
                            surfaceSafeNeededBytes(vertexCount: max(0, verts.count)) != nil {
-                            rowCapacityRequiredRows = max(
-                                max(rowCapacityRequiredRows, rowStagingTotalRows),
+                            rowCapacity.requiredRows = max(
+                                max(rowCapacity.requiredRows, rowStagingTotalRows),
                                 capacityRow + 1
                             )
-                            rowCapacityRequiredVertexCounts[capacityRow] = max(
-                                rowCapacityRequiredVertexCounts[capacityRow],
+                            rowCapacity.requiredVertexCounts[capacityRow] = max(
+                                rowCapacity.requiredVertexCounts[capacityRow],
                                 max(0, verts.count)
                             )
                             // A raised ledger gates the top of draw(), so it needs
@@ -3868,21 +3661,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // fragment backgroundAlpha is 1.0 without blur, including
                     // decorated grids' viewport (their padding remains governed
                     // by the transparent render-pass clear outside the viewport).
-                    func clearEmptyDirtyRowsNonBlur(_ rows: [Int]) {
-                        enc.setRenderPipelineState(pipeline)
-                        let width = Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width))
-                        let height = Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height))
-                        let bgRGB = extractRGBFromClearColor(gridClearColor)
-                        for row in rows where resolvedRowState(row) == nil {
-                            let topPx = row * cellH
-                            drawBackgroundClearBand(
-                                enc,
-                                clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                                drawableWidth: width,
-                                drawableHeight: height,
-                                bgRGB: bgRGB
-                            )
-                        }
+                    func clearDirtyRowsNonBlur(_ rows: [Int]) {
+                        encodeSurfaceDirtyRowBands(
+                            encoder: enc,
+                            rows: rows,
+                            pipeline: pipeline,
+                            cellHeightPx: cellH,
+                            widthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                            heightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                            bgRGB: extractRGBFromClearColor(gridClearColor),
+                            gridId: gridId
+                        )
                     }
 
                     // The scissored single-pass dirty-row draw that both the
@@ -3890,7 +3679,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // perform, verbatim: overwrite the dirty rows that carry no
                     // vertices, then draw the dirty rows one scissor rect each.
                     func drawScissoredDirtyRows() {
-                        clearEmptyDirtyRowsNonBlur(dirtyRows)
+                        clearDirtyRowsNonBlur(dirtyRows)
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
                             rows: dirtyRows,
@@ -3927,12 +3716,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         enc.setRenderPipelineState(backgroundPipeline!)
                         for row in dirtyRows {
                             let topPx = row * cellH
-                            drawBackgroundClearBand(
+                            drawSurfaceBackgroundClearBand(
                                 enc,
                                 clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                                drawableWidth: bandWidth,
+                                xRangePx: (leftPx: 0, rightPx: bandWidth),
                                 drawableHeight: bandHeight,
-                                bgRGB: bgRGB
+                                bgRGB: bgRGB,
+                                gridId: gridId
                             )
                         }
                         _ = encodeSurfaceRowDraws(
@@ -3998,12 +3788,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             let scrollDrawableH = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
                             let bgRGB = extractRGBFromClearColor(gridClearColor)
                             if let clearBand = scrollClearBand {
-                                drawBackgroundClearBand(
+                                drawSurfaceBackgroundClearBand(
                                     enc,
                                     clearBand: clearBand,
-                                    drawableWidth: scrollDrawableW,
+                                    xRangePx: (leftPx: 0, rightPx: scrollDrawableW),
                                     drawableHeight: scrollDrawableH,
-                                    bgRGB: bgRGB
+                                    bgRGB: bgRGB,
+                                    gridId: gridId
                                 )
                             }
                             // The dirty rows themselves, banded then redrawn: rows
@@ -4045,12 +3836,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     } else if useGpuScrollCopy {
                         if let clearBand = scrollClearBand {
                             let bgRGB = extractRGBFromClearColor(gridClearColor)
-                            drawBackgroundClearBand(
+                            drawSurfaceBackgroundClearBand(
                                 enc,
                                 clearBand: clearBand,
-                                drawableWidth: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                                xRangePx: (leftPx: 0, rightPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width))),
                                 drawableHeight: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
-                                bgRGB: bgRGB
+                                bgRGB: bgRGB,
+                                gridId: gridId
                             )
                         }
                         drawScissoredDirtyRows()
@@ -4233,8 +4025,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // backTex -> drawable copy when configured in `.afterBloom`
             // mode. The shader samples backTex (which already contains
             // main render + optional bloom) and writes directly to the
-            // drawable, replacing the normal blit. Phase 2 applies a
-            // single shader; multi-pass chaining is Phase 5's scope.
+            // drawable, replacing the normal blit. The chain itself is
+            // encoded by the same helper the main surface drives; only the
+            // uniforms differ, because this window's screen-space origin does.
             var customShaderHandled = false
             if let renderer = mainTerminalView?.renderer,
                !surfaceCustomShaderPipelines(renderer).isEmpty,
@@ -4269,52 +4062,33 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     windowSize: view.drawableSize,
                     timing: shaderTiming
                 )
-                let pipelines = surfaceCustomShaderPipelines(renderer)
-                if pipelines.count > 1 {
-                    ensureExternalCustomShaderPong(
-                        size: view.drawableSize,
-                        pixelFormat: drawable.texture.pixelFormat
-                    )
-                }
-                let pongsReady =
-                    pipelines.count <= 1
-                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
-                if pongsReady {
-                    var allPassesEncoded = true
-                    for (i, pipeline) in pipelines.enumerated() {
-                        let isLast = (i == pipelines.count - 1)
-                        let inputTex: MTLTexture =
-                            (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
-                        let outputTex: MTLTexture =
-                            isLast ? drawable.texture : customShaderPong[i % 2]!
-                        if !pipeline.encode(
-                            cmd: cmd,
-                            input: inputTex,
-                            output: outputTex,
-                            copyVertexBuffer: copyVB,
-                            sampler: bilinSamp,
-                            uniforms: uniforms
-                        ) {
-                            allPassesEncoded = false
-                            break
-                        }
-                    }
-                    customShaderHandled = allPassesEncoded
-                }
+                customShaderHandled = encodeSurfaceCustomShaderChain(
+                    cmd: cmd,
+                    pipelines: surfaceCustomShaderPipelines(renderer),
+                    input: backTex,
+                    output: drawable.texture,
+                    pong: customShaderPong,
+                    pongSize: view.drawableSize,
+                    copyVertexBuffer: copyVB,
+                    sampler: bilinSamp,
+                    uniforms: uniforms
+                )
             }
             var finalCopyEncoded = customShaderHandled
-            if !customShaderHandled, let blitEnc = cmd.makeBlitCommandEncoder() {
-                let w = min(backTex.width, drawable.texture.width)
-                let h = min(backTex.height, drawable.texture.height)
-                blitEnc.copy(
-                    from: backTex, sourceSlice: 0, sourceLevel: 0,
-                    sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                    sourceSize: MTLSize(width: w, height: h, depth: 1),
-                    to: drawable.texture, destinationSlice: 0, destinationLevel: 0,
-                    destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            if !customShaderHandled,
+               let copyRenderer = mainTerminalView?.renderer,
+               let copyPipe = copyRenderer.copyPipeline,
+               let copyVB = copyRenderer.copyVertexBuffer,
+               let copySamp = copyRenderer.sampler {
+                finalCopyEncoded = encodeSurfaceDrawableCopy(
+                    cmd: cmd,
+                    input: backTex,
+                    output: drawable.texture,
+                    pipeline: copyPipe,
+                    copyVertexBuffer: copyVB,
+                    sampler: copySamp,
+                    prepare: { _ in }
                 )
-                blitEnc.endEncoding()
-                finalCopyEncoded = true
             }
 
             guard finalCopyEncoded else {
