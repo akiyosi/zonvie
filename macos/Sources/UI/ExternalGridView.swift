@@ -1776,7 +1776,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // would convert the offset on one height while the cursor it tracks was
         // placed on another. Taking the number rather than its ingredients is
         // what makes the two unable to disagree.
-        guard viewportHeightPx > 0 else { return 0 }
+        // Both terms of the shared `displacedLayerOriginPx` guard, for the same
+        // reason: this result is consumed as pixel geometry, and a non-finite
+        // offset propagates into a rounding that traps.
+        guard viewportHeightPx > 0, offset.offset_y.isFinite else { return 0 }
         return -offset.offset_y * viewportHeightPx / 2.0
     }
 
@@ -3605,7 +3608,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             if cursorLayerFollowsScrollSnapshot,
                surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot) == nil,
                let offset = scrollOffsetSnapshot {
-                cursorDrawOrigin.y -= offset.offset_y * viewportMetrics.fragmentHeight / 2
+                // The shared helper the main renderer uses, rather than the same
+                // expression written out again: it also refuses a non-finite
+                // offset or a zero viewport, and this result reaches
+                // `Int(scissorTopPx.rounded(.down))` below, where a NaN traps.
+                cursorDrawOrigin = displacedLayerOriginPx(
+                    originPx: cursorDrawOrigin,
+                    offset: offset,
+                    viewportHeightPx: viewportMetrics.fragmentHeight
+                )
             }
 
             func drawHostedLayers(_ encoder: MTLRenderCommandEncoder, glow: Bool = false) {
@@ -3626,7 +3637,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let layerOffset = surfaceScrollOffset(
                         gridId: layer.gridId, offsets: hostedScrollOffsetSnapshot)
                     if layerOffset == nil, layer.followsScroll, let offset = scrollOffsetSnapshot {
-                        origin.y -= offset.offset_y * extent.y / 2
+                        origin = displacedLayerOriginPx(
+                            originPx: origin,
+                            offset: offset,
+                            viewportHeightPx: extent.y
+                        )
                     }
                     let ratio: Float = glow ? 0.5 : 1
                     // A displaced origin is fractional mid-ease; floor it and
