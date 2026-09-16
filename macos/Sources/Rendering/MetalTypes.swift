@@ -1316,6 +1316,70 @@ func surfaceRowSlotIsReady(
     return !surfaceCapacityIsOversized(capacity, neededBytes: neededBytes)
 }
 
+/// What one row's capacity check owes the surface that asked.
+enum SurfaceRowCapacityVerdict: Equatable {
+    /// Storage already covers the row; it may be written.
+    case ready
+    /// Arguments out of range. The caller fails the flush but must NOT latch
+    /// `rowCapacityHardFailure`: that flag is never cleared, so latching it on
+    /// a soft condition permanently stops the surface from presenting. The
+    /// terminal case is the provisioner's `.overBudget`, which pairs with the
+    /// documented-terminal `zonvie_core_fail_render_budget`.
+    case invalid
+    /// Storage has to grow first. The caller folds these into its ledger under
+    /// its own lock and fails the flush so the retry drives provisioning.
+    case needsProvisioning(capacityRow: Int, requiredRows: Int, vertexCount: Int)
+}
+
+/// Decide what one row's capacity check owes, touching no surface state.
+///
+/// Both surfaces carried their own copy of this decision. The copies already
+/// agreed on every term but the physical-row mapping — the main surface can be
+/// asked about a row that is already physical, an external one never is — so
+/// the difference is an argument, not a second implementation.
+///
+/// `mappingSetIndex` is the set whose logical→slot mapping places the row:
+/// the write set while a flush is staging into it, the flush source otherwise.
+func surfaceRowCapacityVerdict(
+    bufferSets: [SurfaceBufferSet],
+    row: Int,
+    vertexCount: Int,
+    totalRows: Int,
+    maxRowBuffers: Int,
+    mappingSetIndex: Int,
+    rowIsPhysical: Bool
+) -> SurfaceRowCapacityVerdict {
+    let capacityRow: Int
+    if !rowIsPhysical,
+       mappingSetIndex >= 0,
+       mappingSetIndex < bufferSets.count {
+        capacityRow = surfacePhysicalCapacityRow(
+            logicalRow: row,
+            logicalToSlot: bufferSets[mappingSetIndex].rowLogicalToSlot
+        )
+    } else {
+        capacityRow = row
+    }
+    if surfaceRowCapacityIsPrepared(
+        bufferSets: bufferSets,
+        row: capacityRow,
+        vertexCount: vertexCount,
+        totalRows: totalRows,
+        maxRowBuffers: maxRowBuffers
+    ) {
+        return .ready
+    }
+    guard capacityRow >= 0, capacityRow < maxRowBuffers,
+          totalRows >= 0, totalRows <= maxRowBuffers,
+          surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
+    else { return .invalid }
+    return .needsProvisioning(
+        capacityRow: capacityRow,
+        requiredRows: max(totalRows, capacityRow + 1),
+        vertexCount: max(0, vertexCount)
+    )
+}
+
 func surfaceRowCapacityIsPrepared(
     bufferSets: [SurfaceBufferSet],
     row: Int,
@@ -2819,6 +2883,59 @@ func bindSingleSurfaceScrollOffset(
 
 /// Bind fragment-side state shared by all surface draw passes:
 /// drawable size, background alpha buffer, and cursor blink buffer.
+/// One surface's fixed-float mask: the rectangles scrolled content must not
+/// bleed over, kept in the band/interval form the fragment shader binary-
+/// searches, and rebuilt only when the rectangles actually change.
+///
+/// Every surface that hosts layers owes one. The main renderer was the only
+/// one that kept it, so `bindSurfaceFragmentState` fell back to its zero-band
+/// default on every external surface and the shader guard was dead there —
+/// even though an external window hosts floats and eases its own scrolls.
+final class SurfaceFixedFloatMask {
+    /// One entry beyond this selects the cell-aligned fallback instead of a
+    /// partial mask, which would let shifted content bleed through an omitted
+    /// float.
+    static let maxRects = 16
+
+    private(set) var bands: [MetalTerminalRenderer.FixedFloatBand] = []
+    private(set) var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+    private var input: [MetalTerminalRenderer.FixedFloatRect] = []
+    private var overflowed = false
+    private var yEdgesScratch: [Float] = []
+    private var xEdgesScratch: [Float] = []
+    private var coveringScratch: [MetalTerminalRenderer.FixedFloatRect] = []
+
+    /// False when the union cannot be represented. A partial transform is
+    /// visibly wrong, so the caller must drop the whole scroll transform rather
+    /// than mask part of it.
+    @discardableResult
+    func update(_ rects: [MetalTerminalRenderer.FixedFloatRect]) -> Bool {
+        if rects.count > Self.maxRects {
+            if !overflowed {
+                input.removeAll(keepingCapacity: true)
+                bands.removeAll(keepingCapacity: true)
+                intervals.removeAll(keepingCapacity: true)
+                yEdgesScratch.removeAll(keepingCapacity: true)
+                overflowed = true
+            }
+            return false
+        }
+        if !overflowed && rects == input { return true }
+        overflowed = false
+        input.removeAll(keepingCapacity: true)
+        input.append(contentsOf: rects)
+        buildSurfaceFixedFloatMask(
+            rects: rects,
+            bands: &bands,
+            intervals: &intervals,
+            yEdgesScratch: &yEdgesScratch,
+            xEdgesScratch: &xEdgesScratch,
+            coveringScratch: &coveringScratch
+        )
+        return true
+    }
+}
+
 func bindSurfaceFragmentState(
     encoder: MTLRenderCommandEncoder,
     viewportMetrics: SurfaceViewportMetrics,

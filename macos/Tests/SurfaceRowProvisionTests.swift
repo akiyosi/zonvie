@@ -642,6 +642,97 @@ private enum SurfaceRowProvisionTests {
         }
     }
 
+    /// The row-capacity gate is one rule both surfaces ask, so the physical-row
+    /// mapping has to be an argument rather than a second implementation. The
+    /// main surface can be asked about a row that is already physical; an
+    /// external one never is, and passes `rowIsPhysical: false`.
+    private static func verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: MTLDevice) {
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+
+        // Nothing is provisioned yet, so a legal row owes provisioning, and the
+        // ledger values it names are what both callers fold in.
+        let needs = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 3,
+            vertexCount: 120,
+            totalRows: 8,
+            maxRowBuffers: 16,
+            mappingSetIndex: -1,
+            rowIsPhysical: true
+        )
+        guard case .needsProvisioning(let capacityRow, let requiredRows, let vc) = needs else {
+            require(false, "unprovisioned row did not ask for provisioning")
+            return
+        }
+        require(capacityRow == 3, "physical row was remapped when it should not be")
+        require(requiredRows == 8, "required rows must cover the whole grid")
+        require(vc == 120, "vertex demand was not carried to the ledger")
+
+        // A row past the buffer ceiling is an argument error, never a
+        // provisioning request: latching a hard failure on it would stop the
+        // surface presenting forever.
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 99,
+                vertexCount: 1,
+                totalRows: 8,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range row was not rejected as invalid"
+        )
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 0,
+                vertexCount: 1,
+                totalRows: 99,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range total rows was not rejected as invalid"
+        )
+
+        // The logical row is mapped through the naming set's slot table, which
+        // is what makes a scrolled row ask about the slot it actually occupies.
+        sets[0].rowLogicalToSlot = [4, 5, 6, 7]
+        let mapped = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: false
+        )
+        guard case .needsProvisioning(let mappedRow, let mappedRequired, _) = mapped else {
+            require(false, "mapped row did not ask for provisioning")
+            return
+        }
+        require(mappedRow == 5, "logical row was not mapped through the slot table")
+        require(mappedRequired == 6, "required rows must reach past the mapped slot")
+
+        // Same row, declared physical: the mapping is skipped.
+        guard case .needsProvisioning(let unmappedRow, _, _) = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: true
+        ) else {
+            require(false, "physical row did not ask for provisioning")
+            return
+        }
+        require(unmappedRow == 1, "physical row must skip the slot mapping")
+
+        _ = device
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
@@ -651,6 +742,7 @@ private enum SurfaceRowProvisionTests {
         verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
+        verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: device)
 
         // Both production owners call the same durable state transition from
         // commit and from every GPU completion path.

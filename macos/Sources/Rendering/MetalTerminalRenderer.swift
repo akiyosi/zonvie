@@ -432,53 +432,38 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowIsPhysical: Bool = false,
         useWriteMapping: Bool = false
     ) -> Bool {
-        let capacityRow: Int
-        let mappingSetIndex = useWriteMapping ? writeSetIndex : flushSourceSetIndex
-        if !rowIsPhysical,
-           mappingSetIndex >= 0,
-           mappingSetIndex < bufferSets.count {
-            capacityRow = surfacePhysicalCapacityRow(
-                logicalRow: row,
-                logicalToSlot: bufferSets[mappingSetIndex].rowLogicalToSlot
-            )
-        } else {
-            capacityRow = row
-        }
-        if surfaceRowCapacityIsPrepared(
+        switch surfaceRowCapacityVerdict(
             bufferSets: bufferSets,
-            row: capacityRow,
+            row: row,
             vertexCount: vertexCount,
             totalRows: totalRows,
-            maxRowBuffers: maxRowBuffers
+            maxRowBuffers: maxRowBuffers,
+            mappingSetIndex: useWriteMapping ? writeSetIndex : flushSourceSetIndex,
+            rowIsPhysical: rowIsPhysical
         ) {
+        case .ready:
             return true
-        }
-        guard capacityRow >= 0, capacityRow < maxRowBuffers,
-              totalRows >= 0, totalRows <= maxRowBuffers,
-              surfaceSafeNeededBytes(vertexCount: max(0, vertexCount)) != nil
-        else {
-            // Argument validation only. Fail this flush, but do not latch
-            // rowCapacityHardFailure: that flag is never cleared, so latching it
-            // on a soft condition permanently stops the surface from presenting.
-            // The terminal case is .overBudget below, which pairs with the
-            // documented-terminal zonvie_core_fail_render_budget.
+
+        case .invalid:
+            flushFailed = true
+            return false
+
+        case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
+            lock.lock()
+            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
+            rowCapacityRequiredVertexCounts[capacityRow] = max(
+                rowCapacityRequiredVertexCounts[capacityRow],
+                neededVertexCount
+            )
+            let newRequiredRows = rowCapacityRequiredRows
+            lock.unlock()
+            ZonvieCore.appLogScrollMode(
+                "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
+                "vertexCount=\(vertexCount) totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
+            )
             flushFailed = true
             return false
         }
-        lock.lock()
-        rowCapacityRequiredRows = max(max(rowCapacityRequiredRows, totalRows), capacityRow + 1)
-        rowCapacityRequiredVertexCounts[capacityRow] = max(
-            rowCapacityRequiredVertexCounts[capacityRow],
-            max(0, vertexCount)
-        )
-        let newRequiredRows = rowCapacityRequiredRows
-        lock.unlock()
-        ZonvieCore.appLogScrollMode(
-            "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
-            "vertexCount=\(vertexCount) totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
-        )
-        flushFailed = true
-        return false
     }
 
     /// True while this surface still owes a provisioning pass, or is in the
@@ -756,6 +741,31 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var lastCellWidthPx: Float = 0
     private var lastCellHeightPx: Float = 0
 
+    /// Fan a cell-metric change out to every surface, at most once per change.
+    ///
+    /// Both `draw(in:)` and the callbacks that change the metrics (guifont,
+    /// linespace) call this; whichever observes the change first does the work.
+    /// It used to live inline in `draw(in:)` alone, past the occlusion
+    /// early-return, so a minimized or covered main window left every external
+    /// window at the old size while the core had already regenerated their rows
+    /// at the new one.
+    ///
+    /// `cellWidthPx` / `cellHeightPx` take the atlas lock and `lock`
+    /// respectively, so they are read before `lock` is taken here.
+    func notifyCellMetricsIfChanged() {
+        let cw = cellWidthPx
+        let ch = cellHeightPx
+        lock.lock()
+        let changed = cw != lastCellWidthPx || ch != lastCellHeightPx
+        if changed {
+            lastCellWidthPx = cw
+            lastCellHeightPx = ch
+        }
+        lock.unlock()
+        guard changed, let cb = onCellMetricsChanged else { return }
+        DispatchQueue.main.async { cb(cw, ch) }
+    }
+
     func setBackingScale(_ s: CGFloat) {
         lock.lock()
         backingScale = s
@@ -867,13 +877,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // Exact union of fixed, non-following float rects, represented as disjoint
     // horizontal intervals inside disjoint vertical bands. The fragment shader
     // binary-searches both levels instead of scanning every float per pixel.
-    private var fixedFloatBandData: [FixedFloatBand] = []
-    private var fixedFloatIntervalData: [FixedFloatInterval] = []
-    private var fixedFloatRectInputData: [FixedFloatRect] = []
-    private var fixedFloatMaskOverflowed = false
-    private var fixedFloatYEdgesScratch: [Float] = []
-    private var fixedFloatXEdgesScratch: [Float] = []
-    private var fixedFloatCoveringScratch: [FixedFloatRect] = []
+    /// This surface's fixed-float mask. Shared with the external surfaces,
+    /// which own one each; see SurfaceFixedFloatMask.
+    private let fixedFloatMask = SurfaceFixedFloatMask()
+    private var fixedFloatBandData: [FixedFloatBand] { fixedFloatMask.bands }
+    private var fixedFloatIntervalData: [FixedFloatInterval] { fixedFloatMask.intervals }
     // setFragmentBytes is limited to 4096 bytes. Sixteen arbitrary rectangles
     // produce at most 31 bands and 496 intervals, fitting both buffers. When
     // this limit is exceeded the caller disables smooth scrolling for the
@@ -979,32 +987,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        if rects.count > Self.maxFixedFloatRects {
-            if !fixedFloatMaskOverflowed {
-                fixedFloatRectInputData.removeAll(keepingCapacity: true)
-                fixedFloatBandData.removeAll(keepingCapacity: true)
-                fixedFloatIntervalData.removeAll(keepingCapacity: true)
-                fixedFloatYEdgesScratch.removeAll(keepingCapacity: true)
-                fixedFloatMaskOverflowed = true
-            }
-            return false
-        }
-        if !fixedFloatMaskOverflowed && rects == fixedFloatRectInputData {
-            return true
-        }
-        fixedFloatMaskOverflowed = false
-        fixedFloatRectInputData.removeAll(keepingCapacity: true)
-        fixedFloatRectInputData.append(contentsOf: rects)
-
-        buildSurfaceFixedFloatMask(
-            rects: rects,
-            bands: &fixedFloatBandData,
-            intervals: &fixedFloatIntervalData,
-            yEdgesScratch: &fixedFloatYEdgesScratch,
-            xEdgesScratch: &fixedFloatXEdgesScratch,
-            coveringScratch: &fixedFloatCoveringScratch
-        )
-        return true
+        return fixedFloatMask.update(rects)
     }
 
     // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
@@ -2714,6 +2697,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // Taken under `lock` with the layer list and per-layer buffer sets:
             // the core thread replaces both while this frame is being encoded.
             let cursorLayerOriginSnapshot: simd_float2
+            let cursorOwnerGridSnapshot: Int64
 
             let snappedBgRGB: UInt32
             let snappedCommittedDrawableW: UInt32
@@ -2791,6 +2775,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 layerStateSnapshot.append(state)
             }
             cursorLayerOriginSnapshot = committedCursorLayerOriginPx
+            cursorOwnerGridSnapshot = committedCursorLayerGridId
             snappedBgRGB = defaultBgRGB
             snappedCommittedDrawableW = committedDrawableW
             snappedCommittedDrawableH = committedDrawableH
@@ -2862,15 +2847,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let hasPresentedOnceSnapshot = renderStateSnapshot.hasPresented
             let cursorBlinkStateSnapshot = renderStateSnapshot.cursorBlink
 
+            notifyCellMetricsIfChanged()
             let cw = cellWidthPx
             let ch = cellHeightPx
-            if cw != lastCellWidthPx || ch != lastCellHeightPx {
-                lastCellWidthPx = cw
-                lastCellHeightPx = ch
-                if let cb = onCellMetricsChanged {
-                    DispatchQueue.main.async { cb(cw, ch) }
-                }
-            }
 
             // With triple buffering, counts come directly from committed set
             let currentMainCount = committedMainCount
@@ -3091,6 +3070,18 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // --- Step 4: Gate for blink fast path ---
             let canBlinkFastPath: Bool = {
                 guard isBlinkOnlyFrame && blurEnabled && rowMode && use2Pass && !glowEnabled else { return false }
+                // `cursorGridRow` came from vertices in the CURSOR GRID's own
+                // pixels, but everything below it here — the range check, the
+                // row resolve, the scissor — is the ROOT's row space. They only
+                // coincide while the cursor is on the root. Under ext_multigrid
+                // every editor window is a layer, so without this the fast path
+                // scissored and redrew a root row that was not the cursor's,
+                // and could overwrite a hosted layer's pixels in that band on a
+                // frame where no layer was being redrawn. The external surface
+                // avoids it by refusing the fast path whenever it hosts a layer
+                // at all; naming the cursor's owner is the same rule, stated
+                // precisely enough to keep the fast path on a root cursor.
+                guard cursorOwnerGridSnapshot == 1 else { return false }
                 guard cursorGridRow >= 0 && cursorGridRow < safeRowCount else { return false }
                 guard resolvedRowState(cursorGridRow) != nil else { return false }
                 return true
