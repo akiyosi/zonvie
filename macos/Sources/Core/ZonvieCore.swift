@@ -130,6 +130,52 @@ final class ZonvieCore {
         return externalGridViews[gridId]
     }
 
+    /// Which surface owns one grid's per-flush work.
+    enum GridRoute {
+        /// Grid 1, the main window's own root.
+        case mainRoot
+        /// A float or split the main window places as a layer.
+        case mainLayer
+        /// The grid is rendered as its own external surface.
+        case externalRoot(ExternalGridView)
+        /// An external surface places this grid as a layer.
+        case externalLayer(host: ExternalGridView)
+        /// The owning surface is known but its view is not registered yet. The
+        /// host's asynchronous creation schedules a full replay.
+        case deferred(surfaceId: Int64)
+        /// No surface places this grid yet; the ABI requires tolerating it.
+        case unplaced
+    }
+
+    /// Resolve `gridId` to the surface that owns its work right now.
+    ///
+    /// Every callback carrying per-grid work asked this independently and the
+    /// answers drifted: the row path defers when the owning surface has no view
+    /// yet, while the scroll path fell through to the main renderer, which has
+    /// no sets for that grid and fails the whole flush. One rule, every caller.
+    ///
+    /// The owner map decides, not the view registry. The core un-externalizes a
+    /// grid and resends all of its rows in ONE flush, publishing the new layout
+    /// first, so by the time the work arrives the owner is already the main
+    /// surface while `externalGridViews` still holds the old view until the
+    /// close's main-queue hop runs. Both reads happen under one hold, so there
+    /// is no window between deciding and acting.
+    func resolveGridRoute(gridId: Int64) -> GridRoute {
+        if gridId == 1 { return .mainRoot }
+        externalGridViewsLock.lock()
+        let ownerId = (pendingGridSurfaceOwners ?? gridSurfaceOwners)[gridId]
+        let ownView = (ownerId == nil || ownerId == gridId) ? externalGridViews[gridId] : nil
+        let hostView = ownerId.flatMap { externalGridViews[$0] }
+        externalGridViewsLock.unlock()
+        if let ownView { return .externalRoot(ownView) }
+        if let hostView { return .externalLayer(host: hostView) }
+        if let ownerId, ownerId != 1, ownerId != gridId { return .deferred(surfaceId: ownerId) }
+        // Read outside the map lock, as the callers that consulted the renderer
+        // directly did: `ownsGrid` reads layer state the core thread owns.
+        if terminalView?.renderer?.ownsGrid(gridId) == true { return .mainLayer }
+        return .unplaced
+    }
+
     /// Snapshot buffer for the seed drain below. Its own, not shared with
     /// pendingCapacityScratch: that one is owned by the flush path, and this
     /// runs on the main thread's ease tick.
@@ -563,238 +609,216 @@ final class ZonvieCore {
                     }
                 }
 
-                if gridId == 1 {
-                    // Main window
+                let rs = Int(rowStart)
+                let rc = Int(rowCount)
+                let fl = flags
+                let tr = Int(totalRows)
+                let tc = Int(totalCols)
+                let isCursorUpdate = (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
+
+                // Set by whichever route accepted the work. guicursor carries a
+                // blink cadence per mode, so a cursor update has to refresh it,
+                // and only the two main-surface routes did — the cadence stayed
+                // stale for as long as the cursor sat in an external window.
+                var delivered = false
+                defer {
+                    if isCursorUpdate && delivered {
+                        DispatchQueue.main.async { core.updateCursorBlinking() }
+                    }
+                }
+
+                switch core.resolveGridRoute(gridId: gridId) {
+                case .deferred(let surfaceId):
+                    ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(surfaceId) grid=\(gridId) reason=host_not_registered")
+
+                case .mainRoot:
                     guard let view = core.terminalView else { return }
                     view.submitVerticesRowRaw(
-                        rowStart: Int(rowStart),
-                        rowCount: Int(rowCount),
+                        rowStart: rs,
+                        rowCount: rc,
                         ptr: verts,
                         count: Int(vertCount),
-                        flags: flags,
-                        totalRows: Int(totalRows),
-                        totalCols: Int(totalCols)
+                        flags: fl,
+                        totalRows: tr,
+                        totalCols: tc
                     )
-                    if (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
-                        DispatchQueue.main.async {
-                            core.updateCursorBlinking()
-                        }
+                    delivered = true
+
+                case .mainLayer:
+                    // A grid the main surface places as a layer: a float or
+                    // split that lives in the main window, not its own.
+                    guard let renderer = core.terminalView?.renderer else { return }
+                    if isCursorUpdate {
+                        // The surface draws one cursor; remember which layer it
+                        // belongs to so it is placed with that layer's transform.
+                        renderer.submitLayerCursor(
+                            gridId: gridId,
+                            ptr: verts.map { UnsafeRawPointer($0) },
+                            count: Int(vertCount)
+                        )
+                    } else {
+                        renderer.submitLayerRow(
+                            gridId: gridId,
+                            rowStart: rs,
+                            ptr: verts.map { UnsafeRawPointer($0) },
+                            count: Int(vertCount),
+                            totalRows: tr,
+                            totalCols: tc
+                        )
                     }
-                } else {
-                    // External grid: submit vertices directly from core thread.
-                    // ExternalGridView's triple-buffered methods are thread-safe.
-                    let rs = Int(rowStart)
-                    let rc = Int(rowCount)
-                    let fl = flags
-                    let tr = Int(totalRows)
-                    let tc = Int(totalCols)
+                    delivered = true
 
-                    // The owner map decides, not the view registry. The core
-                    // un-externalizes a grid and resends all of its rows in ONE
-                    // flush, and it publishes the new layout first, so by the
-                    // time these rows arrive the owner is already the main
-                    // surface. externalGridViews still holds the old view until
-                    // the close's main-queue hop runs, so consulting it first
-                    // routed a grid moving back into the main window to a view
-                    // about to be torn down, and the main renderer never saw
-                    // those rows. Both reads happen under one hold, so there is
-                    // no window between deciding and acting.
-                    core.externalGridViewsLock.lock()
-                    let ownerId = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gridId]
-                    let gridView = (ownerId == nil || ownerId == gridId) ? core.externalGridViews[gridId] : nil
-                    let hostView = ownerId.flatMap { core.externalGridViews[$0] }
-                    core.externalGridViewsLock.unlock()
-
-                    // The host's asynchronous creation schedules a full replay.
-                    // Do not mistake a hosted float for another OS window.
-                    if gridView == nil, let ownerId, ownerId != 1 && ownerId != gridId && hostView == nil {
-                        ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(ownerId) grid=\(gridId) reason=host_not_registered")
-                        return
+                case .externalLayer(let hostView):
+                    ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=\(hostView.gridId) grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
+                    guard core.beginExternalFlushIfNeeded(hostView) else { return }
+                    if isCursorUpdate {
+                        hostView.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
+                    } else {
+                        hostView.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
+                            count: Int(vertCount), totalRows: tr, totalCols: tc)
                     }
-
-                    if gridView == nil, let hostView {
-                        ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=\(ownerId ?? 0) grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
-                        guard core.beginExternalFlushIfNeeded(hostView) else { return }
-                        if (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
-                            hostView.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
-                        } else {
-                            hostView.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
-                                count: Int(vertCount), totalRows: tr, totalCols: tc)
-                        }
-                        return
-                    }
-
-                    if gridView == nil,
-                       let renderer = core.terminalView?.renderer,
-                       renderer.ownsGrid(gridId) {
-                        // A grid the main surface places as a layer: a float or
-                        // split that lives in the main window, not its own.
-                        if (fl & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0 {
-                            // The surface draws one cursor; remember which
-                            // layer it belongs to so it is placed with that
-                            // layer's transform.
-                            renderer.submitLayerCursor(
-                                gridId: gridId,
-                                ptr: verts.map { UnsafeRawPointer($0) },
-                                count: Int(vertCount)
-                            )
-                            DispatchQueue.main.async {
-                                core.updateCursorBlinking()
-                            }
-                        } else {
-                            renderer.submitLayerRow(
-                                gridId: gridId,
-                                rowStart: rs,
-                                ptr: verts.map { UnsafeRawPointer($0) },
-                                count: Int(vertCount),
-                                totalRows: tr,
-                                totalCols: tc
-                            )
-                        }
-                        return
-                    }
-
-                    if let gridView = gridView {
-                        guard core.beginExternalFlushIfNeeded(gridView) else { return }
-                        let kind = core.classifyExternalGridKind(gridId)
-                        if kind == .normal {
-                            // Normal grid hot path: pass raw pointer directly (zero-copy).
-                            // The pointer is valid for the duration of this callback.
-                            gridView.submitVerticesRowRaw(
-                                rowStart: rs,
-                                rowCount: rc,
-                                ptr: verts,
-                                count: Int(vertCount),
-                                flags: fl,
-                                totalRows: tr,
-                                totalCols: tc
-                            )
-                            // First-row config (UI work) deferred to main thread
-                            if rs == 0 && fl & 2 == 0 {
-                                // Extract four scalar color components while the
-                                // callback pointer is valid. Copying the entire row
-                                // here allocated on the grid_mu redraw hot path and
-                                // retained that allocation in the main queue.
-                                if let background = ZonvieCore.extractExternalGridBackground(
-                                    verts: verts,
-                                    vertCount: Int(vertCount)
-                                ) {
-                                    DispatchQueue.main.async { [weak core] in
-                                        guard let core = core else { return }
-                                        core.configureExternalGridFromRow(
-                                            gridId: gridId,
-                                            gridView: gridView,
-                                            background: background,
-                                            rows: totalRows,
-                                            cols: totalCols
-                                        )
-                                    }
-                                }
-                            }
-                        } else {
-                            // Decorated grid: copy + adjust vertex colors, then submit.
-                            // Decorated grids (cmdline, popup, messages) are not scroll-critical.
-                            if let verts = verts, vertCount > 0 {
-                                let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
-                                let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
-                                prepared.vertices.withUnsafeBufferPointer { buffer in
-                                    gridView.submitVerticesRowRaw(
-                                        rowStart: rs,
-                                        rowCount: rc,
-                                        ptr: buffer.baseAddress,
-                                        count: buffer.count,
-                                        flags: fl,
-                                        totalRows: tr,
-                                        totalCols: tc
+                    delivered = true
+                case .externalRoot(let gridView):
+                    guard core.beginExternalFlushIfNeeded(gridView) else { return }
+                    let kind = core.classifyExternalGridKind(gridId)
+                    if kind == .normal {
+                        // Normal grid hot path: pass raw pointer directly (zero-copy).
+                        // The pointer is valid for the duration of this callback.
+                        gridView.submitVerticesRowRaw(
+                            rowStart: rs,
+                            rowCount: rc,
+                            ptr: verts,
+                            count: Int(vertCount),
+                            flags: fl,
+                            totalRows: tr,
+                            totalCols: tc
+                        )
+                        // First-row config (UI work) deferred to main thread
+                        if rs == 0 && fl & 2 == 0 {
+                            // Extract four scalar color components while the
+                            // callback pointer is valid. Copying the entire row
+                            // here allocated on the grid_mu redraw hot path and
+                            // retained that allocation in the main queue.
+                            if let background = ZonvieCore.extractExternalGridBackground(
+                                verts: verts,
+                                vertCount: Int(vertCount)
+                            ) {
+                                DispatchQueue.main.async { [weak core] in
+                                    guard let core = core else { return }
+                                    core.configureExternalGridFromRow(
+                                        gridId: gridId,
+                                        gridView: gridView,
+                                        background: background,
+                                        rows: totalRows,
+                                        cols: totalCols
                                     )
                                 }
-                                // Save main vertices to pending as fallback for
-                                // the hide/re-show race: the gridView found above
-                                // may belong to the previous session (close dispatch
-                                // pending on main). Skip cursor-only updates (fl & 2)
-                                // — cursor vertices carry the cursor fg color as bg,
-                                // which would overwrite the correct Normal bg in
-                                // pending config and replace main content.
-                                if fl & 2 == 0 {
-                                    let savedVerts = prepared.vertices
-                                    let savedBgColor: NSColor? = (rs == 0) ? {
-                                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                        return isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                    }() : nil
-                                    DispatchQueue.main.async { [weak core] in
-                                        guard let core = core else { return }
-                                        if var existing = core.pendingExternalVertices[gridId] {
-                                            existing.rowVertices[rs] = savedVerts
-                                            existing.rows = totalRows
-                                            existing.cols = totalCols
-                                            core.pendingExternalVertices[gridId] = existing
-                                        } else {
-                                            core.pendingExternalVertices[gridId] = (rowVertices: [rs: savedVerts], rows: totalRows, cols: totalCols)
-                                        }
-                                        if let bgColor = savedBgColor {
-                                            core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
-                                            if let window = core.externalWindows[gridId] {
-                                                core.applyExternalGridConfig(
-                                                    gridId: gridId,
-                                                    window: window,
-                                                    gridView: gridView,
-                                                    bgColor: bgColor,
-                                                    rows: totalRows,
-                                                    cols: totalCols
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            } else {
+                            }
+                        }
+                    } else {
+                        // Decorated grid: copy + adjust vertex colors, then submit.
+                        // Decorated grids (cmdline, popup, messages) are not scroll-critical.
+                        if let verts = verts, vertCount > 0 {
+                            let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                            let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
+                            prepared.vertices.withUnsafeBufferPointer { buffer in
                                 gridView.submitVerticesRowRaw(
                                     rowStart: rs,
                                     rowCount: rc,
-                                    ptr: nil,
-                                    count: 0,
+                                    ptr: buffer.baseAddress,
+                                    count: buffer.count,
                                     flags: fl,
                                     totalRows: tr,
                                     totalCols: tc
                                 )
                             }
-                        }
-                        // NOTE: do NOT call gridView.requestRedraw() here.
-                        // External grid redraws are triggered from on_flush_end,
-                        // after commitFlush() has published the committed state.
-                    } else {
-                        // No gridView yet on core thread: copy vertex data and defer
-                        // to main thread for window configuration or pending capture.
-                        // Vertex content itself is never published from this delayed
-                        // closure: its UVs belong to the source flush's atlas generation,
-                        // which may no longer be the committed generation when the main
-                        // queue runs. Window creation schedules a bracketed full resend.
-                        if let verts = verts, vertCount > 0 {
-                            let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
-                            DispatchQueue.main.async { [weak core] in
-                                guard let core = core else { return }
-                                // Window creation already scheduled a full resend. A delayed
-                                // source-flush copy must not overwrite that newer transaction.
-                                guard core.externalGridViews[gridId] == nil else { return }
-                                // Cursor geometry has no atlas-independent configuration to
-                                // preserve; the bracketed resend regenerates it with content.
-                                guard fl & 2 == 0 else { return }
-                                let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
-                                if rs == 0 {
+                            // Save main vertices to pending as fallback for
+                            // the hide/re-show race: the gridView found above
+                            // may belong to the previous session (close dispatch
+                            // pending on main). Skip cursor-only updates (fl & 2)
+                            // — cursor vertices carry the cursor fg color as bg,
+                            // which would overwrite the correct Normal bg in
+                            // pending config and replace main content.
+                            if fl & 2 == 0 {
+                                let savedVerts = prepared.vertices
+                                let savedBgColor: NSColor? = (rs == 0) ? {
                                     let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                    let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                    if let bgColor = effectiveBgColor {
+                                    return isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                }() : nil
+                                DispatchQueue.main.async { [weak core] in
+                                    guard let core = core else { return }
+                                    if var existing = core.pendingExternalVertices[gridId] {
+                                        existing.rowVertices[rs] = savedVerts
+                                        existing.rows = totalRows
+                                        existing.cols = totalCols
+                                        core.pendingExternalVertices[gridId] = existing
+                                    } else {
+                                        core.pendingExternalVertices[gridId] = (rowVertices: [rs: savedVerts], rows: totalRows, cols: totalCols)
+                                    }
+                                    if let bgColor = savedBgColor {
                                         core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                        if let window = core.externalWindows[gridId] {
+                                            core.applyExternalGridConfig(
+                                                gridId: gridId,
+                                                window: window,
+                                                gridView: gridView,
+                                                bgColor: bgColor,
+                                                rows: totalRows,
+                                                cols: totalCols
+                                            )
+                                        }
                                     }
                                 }
-                                ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
-                                if var existing = core.pendingExternalVertices[gridId] {
-                                    existing.rowVertices[rs] = prepared.vertices
-                                    existing.rows = totalRows
-                                    existing.cols = totalCols
-                                    core.pendingExternalVertices[gridId] = existing
-                                } else {
-                                    core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
+                            }
+                        } else {
+                            gridView.submitVerticesRowRaw(
+                                rowStart: rs,
+                                rowCount: rc,
+                                ptr: nil,
+                                count: 0,
+                                flags: fl,
+                                totalRows: tr,
+                                totalCols: tc
+                            )
+                        }
+                    }
+                    // NOTE: do NOT call gridView.requestRedraw() here.
+                    // External grid redraws are triggered from on_flush_end,
+                    // after commitFlush() has published the committed state.
+                    delivered = true
+                case .unplaced:
+                    // No gridView yet on core thread: copy vertex data and defer
+                    // to main thread for window configuration or pending capture.
+                    // Vertex content itself is never published from this delayed
+                    // closure: its UVs belong to the source flush's atlas generation,
+                    // which may no longer be the committed generation when the main
+                    // queue runs. Window creation schedules a bracketed full resend.
+                    if let verts = verts, vertCount > 0 {
+                        let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
+                        DispatchQueue.main.async { [weak core] in
+                            guard let core = core else { return }
+                            // Window creation already scheduled a full resend. A delayed
+                            // source-flush copy must not overwrite that newer transaction.
+                            guard core.externalGridViews[gridId] == nil else { return }
+                            // Cursor geometry has no atlas-independent configuration to
+                            // preserve; the bracketed resend regenerates it with content.
+                            guard fl & 2 == 0 else { return }
+                            let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
+                            if rs == 0 {
+                                let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                                let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
+                                if let bgColor = effectiveBgColor {
+                                    core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
                                 }
+                            }
+                            ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
+                            if var existing = core.pendingExternalVertices[gridId] {
+                                existing.rowVertices[rs] = prepared.vertices
+                                existing.rows = totalRows
+                                existing.cols = totalCols
+                                core.pendingExternalVertices[gridId] = existing
+                            } else {
+                                core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
                             }
                         }
                     }
@@ -1309,25 +1333,22 @@ final class ZonvieCore {
                 ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_shift_receive grid=\(gid) start=\(rowStart) end=\(rowEnd) delta=\(rowsDelta)")
                 // Call applyRowScroll directly from core thread — it operates
                 // on the write set (owned by flush bracket) under tripleBufferLock.
-                // Owner-first, for the reason the row path states: a grid moving
-                // back into the main window still has its old view registered
-                // until the close's main-queue hop, and shifting that view's
-                // rows leaves the real destination holding pre-scroll content
-                // with only the vacated rows filled in.
-                core.externalGridViewsLock.lock()
-                let owner = (core.pendingGridSurfaceOwners ?? core.gridSurfaceOwners)[gid]
-                let view = (owner == nil || owner == gid) ? core.externalGridViews[gid] : nil
-                let host = owner.flatMap { core.externalGridViews[$0] }
-                core.externalGridViewsLock.unlock()
-                if view == nil, let host {
-                    guard core.beginExternalFlushIfNeeded(host) else { return }
-                    host.applyLayerRowScroll(gridId: gid, rowStart: Int(rowStart), rowEnd: Int(rowEnd),
-                        rowsDelta: Int(rowsDelta), totalRows: Int(totalRows), totalCols: Int(totalCols))
-                    return
-                }
-                guard let view = view else {
+                // The route comes from the one resolver the row path uses: a
+                // grid moving back into the main window still has its old view
+                // registered until the close's main-queue hop, and shifting that
+                // view's rows leaves the real destination holding pre-scroll
+                // content with only the vacated rows filled in.
+                switch core.resolveGridRoute(gridId: gid) {
+                case .deferred(let surfaceId):
+                    // The owning surface has no view yet. The row path has always
+                    // deferred here; this one fell through to the main renderer,
+                    // which holds no sets for the grid and failed the whole flush.
+                    ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(surfaceId) grid=\(gid) reason=host_not_registered")
+
+                case .mainRoot, .mainLayer, .unplaced:
                     // A grid the main surface places as a layer shifts its own
-                    // row slots in that surface's renderer.
+                    // row slots in that surface's renderer. The call ignores
+                    // grid 1, which holds no layer sets.
                     core.terminalView?.renderer?.applyLayerRowScroll(
                         gridId: gid,
                         rowStart: Int(rowStart), rowEnd: Int(rowEnd),
@@ -1335,15 +1356,21 @@ final class ZonvieCore {
                         rowsDelta: Int(rowsDelta),
                         totalRows: Int(totalRows), totalCols: Int(totalCols)
                     )
-                    return
+
+                case .externalLayer(let host):
+                    guard core.beginExternalFlushIfNeeded(host) else { return }
+                    host.applyLayerRowScroll(gridId: gid, rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        rowsDelta: Int(rowsDelta), totalRows: Int(totalRows), totalCols: Int(totalCols))
+
+                case .externalRoot(let view):
+                    guard core.beginExternalFlushIfNeeded(view) else { return }
+                    view.applyRowScroll(
+                        rowStart: Int(rowStart), rowEnd: Int(rowEnd),
+                        colStart: Int(colStart), colEnd: Int(colEnd),
+                        rowsDelta: Int(rowsDelta),
+                        totalRows: Int(totalRows), totalCols: Int(totalCols)
+                    )
                 }
-                guard core.beginExternalFlushIfNeeded(view) else { return }
-                view.applyRowScroll(
-                    rowStart: Int(rowStart), rowEnd: Int(rowEnd),
-                    colStart: Int(colStart), colEnd: Int(colEnd),
-                    rowsDelta: Int(rowsDelta),
-                    totalRows: Int(totalRows), totalCols: Int(totalCols)
-                )
             },
             on_restart: { ctx, addrPtr, addrLen in
                 guard let ctx else { return }
@@ -3589,6 +3616,11 @@ final class ZonvieCore {
         // current grid_mu hold is released — setFrame on the main NSWindow
         // can trigger windowDidResize → updateLayoutPx, which would deadlock
         // if grid_mu were still held by this thread.
+        // Re-frame every external window from the metric change itself, for the
+        // reason onLineSpace states: leaving it to the main window's draw()
+        // skipped it entirely while that window was minimized or covered.
+        view.renderer.notifyCellMetricsIfChanged()
+
         DispatchQueue.main.async { [weak self] in
             self?.scheduleWindowSnap()
             view.requestRedraw()
@@ -3813,6 +3845,12 @@ final class ZonvieCore {
         let dh = max(1, Int(ds.height))
         updateLayoutPx(drawableW: UInt32(dw), drawableH: UInt32(dh),
                        cellW: UInt32(cw), cellH: UInt32(ch))
+
+        // Re-frame every external window from the metric change itself. Leaving
+        // it to the main window's draw() meant a minimized or covered main
+        // window never re-framed them, while the core had already regenerated
+        // their rows at the new cell size.
+        view.renderer.notifyCellMetricsIfChanged()
 
         DispatchQueue.main.async {
             view.requestRedraw(nil)
