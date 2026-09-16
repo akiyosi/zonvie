@@ -4041,6 +4041,15 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                     ext_win.atlas_reset_generation = current_atlas_reset_generation;
                 }
             } else {
+                // A full PAINT is not a full UPLOAD. flushAtlasUploads refuses
+                // a cursor below `pending_upload_base_seq`, and
+                // `snapshotAtlasPixels` advances that without bumping
+                // `atlas_reset_generation` — the only thing that makes this
+                // window ask for a full upload. Without forcing one here the
+                // next paint retried the identical incremental upload and this
+                // window stopped updating its pixels for good. The main driver
+                // promotes the same failure with `atlas_full_upload_needed`.
+                ext_win.atlas_reset_generation = 0;
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }
