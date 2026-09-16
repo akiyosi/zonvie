@@ -1277,15 +1277,38 @@ pub const ScrollOp = struct {
     win_pos_row: u32,
 };
 
-/// Main-grid dirty state remembered across one flush attempt, so a frontend
-/// rejection can restore exactly what that flush consumed.
+/// Dirty state remembered across one flush attempt, so a frontend rejection can
+/// restore exactly what that flush consumed. Covers the sub-grids as well as
+/// the main grid: under ext_multigrid the sub-grids hold every window while
+/// grid 1 is only a container, so remembering the main grid alone protected the
+/// cheapest surface.
 pub const DirtySnapshot = struct {
     dirty_all: bool = false,
     rows: std.DynamicBitSetUnmanaged = .{},
+    /// Per sub-grid, keyed by grid id. Entries and their bitsets are reused
+    /// across flushes; a steady-state flush allocates nothing here.
+    subs: std.AutoHashMapUnmanaged(i64, SubDirty) = .{},
+
+    /// `live` is cleared at the start of every snapshot, so an entry left stale
+    /// belongs to a grid destroyed since and is never restored onto a
+    /// replacement that reuses the id.
+    pub const SubDirty = struct {
+        /// The GridBuf's own `dirty` gate, which is what the external emit loop
+        /// tests. Restoring the rows without it leaves a grid that owes rows
+        /// but is never visited.
+        dirty: bool = false,
+        dirty_all: bool = false,
+        rows: std.DynamicBitSetUnmanaged = .{},
+        live: bool = false,
+    };
 
     pub fn deinit(self: *DirtySnapshot, alloc: std.mem.Allocator) void {
         self.rows.deinit(alloc);
         self.rows = .{};
+        var it = self.subs.valueIterator();
+        while (it.next()) |sub| sub.rows.deinit(alloc);
+        self.subs.deinit(alloc);
+        self.subs = .{};
     }
 };
 
@@ -2041,9 +2064,35 @@ pub const Grid = struct {
         } else if (len != 0) {
             out.rows.unsetAll();
         }
-        if (len == 0) return;
-        var it = self.main_buf.dirty_rows.iterator(.{});
-        while (it.next()) |bit| out.rows.set(bit);
+        if (len != 0) {
+            var it = self.main_buf.dirty_rows.iterator(.{});
+            while (it.next()) |bit| out.rows.set(bit);
+        }
+
+        var stale = out.subs.valueIterator();
+        while (stale.next()) |sub| sub.live = false;
+
+        var sg_it = self.sub_grids.iterator();
+        while (sg_it.next()) |e| {
+            const buf = e.value_ptr;
+            const gop = try out.subs.getOrPut(alloc, e.key_ptr.*);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            const sub = gop.value_ptr;
+            sub.live = true;
+            sub.dirty = buf.dirty;
+            sub.dirty_all = buf.dirty_all;
+            const sub_len = buf.dirty_rows.bit_length;
+            if (sub.rows.bit_length != sub_len) {
+                sub.rows.deinit(alloc);
+                sub.rows = .{};
+                sub.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, sub_len);
+            } else if (sub_len != 0) {
+                sub.rows.unsetAll();
+            }
+            if (sub_len == 0) continue;
+            var row_it = buf.dirty_rows.iterator(.{});
+            while (row_it.next()) |bit| sub.rows.set(bit);
+        }
     }
 
     /// Re-apply a snapshot on top of the current state. Bits set since the
@@ -2051,12 +2100,31 @@ pub const Grid = struct {
     /// anything that changed afterwards.
     pub fn restoreDirty(self: *Grid, snapshot: *const DirtySnapshot) void {
         if (snapshot.dirty_all) self.main_buf.dirty_all = true;
-        if (snapshot.rows.bit_length == 0 or self.main_buf.dirty_rows.bit_length == 0) return;
-        const len = @min(snapshot.rows.bit_length, self.main_buf.dirty_rows.bit_length);
-        var it = snapshot.rows.iterator(.{});
-        while (it.next()) |bit| {
-            if (bit >= len) break;
-            self.main_buf.dirty_rows.set(bit);
+        if (snapshot.rows.bit_length != 0 and self.main_buf.dirty_rows.bit_length != 0) {
+            const len = @min(snapshot.rows.bit_length, self.main_buf.dirty_rows.bit_length);
+            var it = snapshot.rows.iterator(.{});
+            while (it.next()) |bit| {
+                if (bit >= len) break;
+                self.main_buf.dirty_rows.set(bit);
+            }
+        }
+
+        var sub_it = snapshot.subs.iterator();
+        while (sub_it.next()) |e| {
+            const sub = e.value_ptr;
+            // Absent at snapshot time, or destroyed since: a grid that reuses
+            // the id starts fully dirty on its own account.
+            if (!sub.live) continue;
+            const buf = self.sub_grids.getPtr(e.key_ptr.*) orelse continue;
+            if (sub.dirty) buf.dirty = true;
+            if (sub.dirty_all) buf.dirty_all = true;
+            if (sub.rows.bit_length == 0 or buf.dirty_rows.bit_length == 0) continue;
+            const sub_len = @min(sub.rows.bit_length, buf.dirty_rows.bit_length);
+            var row_it = sub.rows.iterator(.{});
+            while (row_it.next()) |bit| {
+                if (bit >= sub_len) break;
+                buf.dirty_rows.set(bit);
+            }
         }
     }
 
@@ -2798,7 +2866,8 @@ pub const Grid = struct {
             // metadata. Reject instead of destroying.
             return;
         }
-        const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
+        const was_external = self.external_grids.contains(grid_id);
+        const was_visible = self.win_pos.contains(grid_id) or was_external;
 
         // Capture before removal below: needed to dirty the right target
         // (main grid vs. an external anchor) once grid_id's own state is gone.
@@ -2839,9 +2908,15 @@ pub const Grid = struct {
             } else {
                 self.markAllDirty();
             }
-        } else {
+        } else if (!was_external) {
             self.markAllDirty();
         }
+        // An external grid is its own surface and is never placed in the main
+        // viewport (setWinExternalPos drops its win_pos), so the main grid holds
+        // none of its pixels and owes no repaint when it goes away. Dirtying
+        // everything here made `:q` on an external window regenerate the whole
+        // main viewport, which under ext_multigrid is every split it contains.
+        // The window's own teardown releases its surface.
 
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
@@ -3114,6 +3189,12 @@ pub const Grid = struct {
     }
 
     pub fn hideWin(self: *Grid, grid_id: i64) !void {
+        // Placement is only meaningful for sub-grids, as every sibling mutator
+        // states (setWinPos, setWinFloatPos, setWinExternalPos, destroyGrid).
+        // This one lacked the guard, and a malformed `win_hide [1]` fell all
+        // the way through to the cursor invalidation at the end, blanking the
+        // main cursor until the next grid_cursor_goto.
+        if (grid_id == 1) return;
         const was_visible = self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
         // Mark the rows this grid was covering as dirty before removal,
         // so they get recomposed with the underlying grid=1 content
@@ -5089,4 +5170,27 @@ test "a session reset drops the destroys owed to the old session" {
 
     grid.resetForNewSession();
     try std.testing.expectEqual(@as(usize, 0), grid.destroyed_pending.items.len);
+}
+
+test "destroying an external grid owes the main viewport no repaint" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+
+    // A split the MAIN window places: its pixels were composited into the main
+    // viewport, so its removal still owes a repaint there.
+    try grid.resizeGrid(2, 4, 8);
+    try grid.setWinPos(2, 101, 0, 0);
+    grid.main_buf.dirty_all = false;
+    try grid.destroyGrid(2);
+    try std.testing.expect(grid.main_buf.dirty_all);
+
+    // An external grid is its own surface and was never placed in the main
+    // viewport, so closing it owes nothing there.
+    try grid.resizeGrid(3, 4, 8);
+    try std.testing.expect(try grid.setWinExternalPos(3, 42));
+    try std.testing.expect(!grid.win_pos.contains(3));
+    grid.main_buf.dirty_all = false;
+    try grid.destroyGrid(3);
+    try std.testing.expect(!grid.main_buf.dirty_all);
 }

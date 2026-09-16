@@ -470,6 +470,16 @@ pub const RedrawRecoveryState = enum {
     await_attach,
 };
 
+/// One sub-grid's vertex row ledger as it stood when a flush attempt began.
+/// `live` is cleared at the start of every snapshot, so an entry left stale
+/// belongs to a grid destroyed since and is not restored onto a replacement
+/// that reuses the id.
+pub const SubGridLedgerSnapshot = struct {
+    counts: std.ArrayListUnmanaged(usize) = .empty,
+    surface_vertex_count: usize = 0,
+    live: bool = false,
+};
+
 pub const Core = struct {
     pub const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
     const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
@@ -721,6 +731,14 @@ pub const Core = struct {
     flush_row_counts_snapshot: std.ArrayListUnmanaged(usize) = .empty,
     flush_main_vertex_count_snapshot: usize = 0,
     flush_row_ledger_snapshot_valid: bool = false,
+    /// The same ledger, per sub-grid. Only the main grid used to be remembered,
+    /// so a rejection invalidated every sub-grid's accounting and forced a full
+    /// reshape of each — and under ext_multigrid the sub-grids hold every
+    /// window while grid 1 is only a container, so the exact restore protected
+    /// the cheapest surface. Entries and their buffers are reused across
+    /// flushes; a steady-state flush allocates nothing here.
+    flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SubGridLedgerSnapshot) = .empty,
+    flush_subgrid_aggregate_snapshot: usize = 0,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -1197,6 +1215,9 @@ pub const Core = struct {
         self.row_verts.deinit(self.alloc);
         self.flush_dirty_snapshot.deinit(self.alloc);
         self.flush_row_counts_snapshot.deinit(self.alloc);
+        var subgrid_ledger_it = self.flush_subgrid_ledgers.valueIterator();
+        while (subgrid_ledger_it.next()) |entry| entry.counts.deinit(self.alloc);
+        self.flush_subgrid_ledgers.deinit(self.alloc);
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
@@ -1986,13 +2007,28 @@ pub const Core = struct {
     }
 
     /// Drop everything this core mirrors of the displayed frame (e.g. on
-    /// resize, guifont, atlas reset) and reset the main grid's vertex ledger.
+    /// resize, guifont, atlas reset) and reset every surface's vertex ledger.
+    ///
+    /// The glyph mirrors were always cleared for all grids; the ledger reset
+    /// covered the main grid alone, which is the container under ext_multigrid.
+    /// Sub-grids kept counting a frame that no longer exists, and — since the
+    /// abort path now snapshots their ledgers too — main's zeroed ledger would
+    /// be captured as "what the committed frame holds" and restored as a lie.
     pub fn invalidateMirroredFrameState(self: *Core) void {
         self.invalidateAllGlyphMirrors();
         @memset(self.grid.main_buf.vertex_row_counts, 0);
         self.flush_vertex_count_aggregate -|= self.grid.main_buf.surface_vertex_count;
         self.grid.main_buf.surface_vertex_count = 0;
         self.grid.main_buf.vertex_row_ledger_valid = true;
+
+        var sg_it = self.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| {
+            @memset(sg.vertex_row_counts, 0);
+            self.flush_vertex_count_aggregate -|= sg.surface_vertex_count;
+            sg.surface_vertex_count = 0;
+            sg.vertex_row_ledger_valid = true;
+        }
+        self.grid.subgrid_surface_vertex_count = 0;
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)
@@ -3656,7 +3692,6 @@ pub const Core = struct {
         const dw = if (drawable_w_px == 0) 1 else drawable_w_px;
         const dh = if (drawable_h_px == 0) 1 else drawable_h_px;
 
-        // NDC positions depend on both cell and drawable dimensions.
         const drawable_dims_changed = (dw != self.drawable_w_px or dh != self.drawable_h_px);
         const cell_dims_changed = (cw != self.cell_w_px or ch != self.cell_h_px);
 
@@ -3664,6 +3699,14 @@ pub const Core = struct {
         const rows = @max(@as(u32, 1), dh / ch);
         const grid_dims_changed = (rows != self.last_layout_rows or cols != self.last_layout_cols);
         const vertex_geometry_changed = drawable_dims_changed or cell_dims_changed or grid_dims_changed;
+        // What a regeneration actually owes. Vertex positions are grid-local
+        // pixels — neither `drawable_w_px` nor `drawable_h_px` is read anywhere
+        // in vertex generation — so a drawable-only resize bakes nothing new
+        // and the frontend re-renders on its own changed drawable regardless.
+        // The sub-grid branch below has always used this narrower test; main
+        // used the wide one and paid a full regeneration plus a cursor_rev bump
+        // for every pixel of a live drag-resize.
+        const vertex_content_changed = cell_dims_changed or grid_dims_changed;
 
         self.drawable_w_px = dw;
         self.drawable_h_px = dh;
@@ -3677,9 +3720,7 @@ pub const Core = struct {
         // This is done here to avoid a separate lock acquisition in setScreenCols.
         self.grid.screen_cols = cols;
 
-        // Any geometry input change invalidates baked NDC positions, including
-        // drawable-only resizes and row/column changes at the same cell size.
-        if (vertex_geometry_changed) {
+        if (vertex_content_changed) {
             self.grid.markAllDirty();
             // Cursor geometry is submitted independently of row vertices.
             self.grid.cursor_rev +%= 1;
@@ -5705,6 +5746,28 @@ test "main row ledger structural changes cannot leave stale per-row counts" {
     try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.main_buf.vertex_row_counts);
     try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
+
+    // A sub-grid's ledger is reset on the same terms. Under ext_multigrid the
+    // sub-grids hold every window while grid 1 is a container, so resetting the
+    // main ledger alone left the real surfaces counting a frame that no longer
+    // exists — and the abort path would then snapshot that stale count as the
+    // accounting the committed frame owns.
+    try core.grid.resizeGrid(2, 2, 80);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.sub_grids.getPtr(2).?.vertex_row_counts.len);
+    const sub = core.grid.sub_grids.getPtr(2).?;
+    sub.vertex_row_counts[0] = 7;
+    sub.vertex_row_counts[1] = 9;
+    sub.surface_vertex_count = 16;
+    sub.vertex_row_ledger_valid = false;
+    core.grid.subgrid_surface_vertex_count = 16;
+    core.flush_vertex_count_aggregate = 116;
+
+    core.invalidateMirroredFrameState();
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.sub_grids.getPtr(2).?.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.sub_grids.getPtr(2).?.surface_vertex_count);
+    try std.testing.expect(core.grid.sub_grids.getPtr(2).?.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
 }
 
 const AtlasFailureTestState = struct {
@@ -7389,4 +7452,38 @@ test "a row a shift vacated stays live while the frontend may still draw it" {
     var i: u8 = 0;
     while (i < retained_shadow_expiry) : (i += 1) core.ageRetainedShadows();
     try std.testing.expect(!core.departedUvIsLive(0.75));
+}
+
+test "a drawable-only resize regenerates nothing" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 10);
+    try core.grid.resizeGrid(2, 4, 10);
+    try core.grid.setWinPos(2, 102, 0, 0);
+
+    // Cell 2x2 so the drawable can grow by less than a cell without changing
+    // the derived rows/cols. 20/2 = 10 cols, 8/2 = 4 rows.
+    _ = core.updateLayoutPxLocked(20, 8, 2, 2);
+    // Without a live session the resize RPC cannot be accepted, so settle the
+    // remembered layout by hand; otherwise grid_dims_changed stays true.
+    core.last_layout_rows = 4;
+    core.last_layout_cols = 10;
+    core.grid.main_buf.dirty_all = false;
+    core.grid.sub_grids.getPtr(2).?.dirty_all = false;
+    const cursor_rev_before = core.grid.cursor_rev;
+
+    // One pixel wider: same cell size, still 10 cols and 4 rows, so no vertex
+    // changes. Positions are grid-local pixels and nothing in vertex generation
+    // reads the drawable size, which is what made the wide gate waste a full
+    // regeneration on every pixel of a live drag-resize.
+    _ = core.updateLayoutPxLocked(21, 8, 2, 2);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(2).?.dirty_all);
+    try std.testing.expectEqual(cursor_rev_before, core.grid.cursor_rev);
+
+    // A cell-size change still regenerates every surface.
+    _ = core.updateLayoutPxLocked(21, 8, 3, 3);
+    try std.testing.expect(core.grid.main_buf.dirty_all);
+    try std.testing.expect(core.grid.sub_grids.getPtr(2).?.dirty_all);
+    try std.testing.expect(core.grid.cursor_rev != cursor_rev_before);
 }
