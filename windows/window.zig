@@ -3019,6 +3019,49 @@ pub export fn WndProc(
                             present_rects.append(app.alloc, cr) catch {};
                         }
 
+                        // The chrome outside the content area — the tabline with
+                        // its close and new-tab buttons, the caption buttons, the
+                        // sidebar — is redrawn into back_tex on EVERY paint, from
+                        // hover state that produces no row damage and no paint
+                        // rect. Nothing above ever added its band here, so it
+                        // reached the screen only on a frame that happened to
+                        // present in full: the moment anything else put a rect in
+                        // this list (a blinking cursor is enough), the present
+                        // went partial and the newly drawn hover was left in
+                        // back_tex. Only widen a list that already has content —
+                        // an empty list still means "present everything", which
+                        // covers the chrome anyway.
+                        if (present_rects.items.len != 0) {
+                            if (content_y_offset_i32 > 0) {
+                                present_rects.append(app.alloc, .{
+                                    .left = 0,
+                                    .top = 0,
+                                    .right = client.right,
+                                    .bottom = content_y_offset_i32,
+                                }) catch {};
+                            }
+                            if (content_x_offset_i32 > 0) {
+                                present_rects.append(app.alloc, .{
+                                    .left = 0,
+                                    .top = 0,
+                                    .right = content_x_offset_i32,
+                                    .bottom = client.bottom,
+                                }) catch {};
+                            }
+                            if (sidebar_right_width) |rw| {
+                                const right_strip_left: i32 =
+                                    client.right - @as(i32, @intCast(rw));
+                                if (rw > 0 and right_strip_left > 0) {
+                                    present_rects.append(app.alloc, .{
+                                        .left = right_strip_left,
+                                        .top = 0,
+                                        .right = client.right,
+                                        .bottom = client.bottom,
+                                    }) catch {};
+                                }
+                            }
+                        }
+
                         // Track in each grid whether this paint built a present rect.
                         // The core thread can make a layer dirty after the loop
                         // below has run; that layer's band is drawn but not
