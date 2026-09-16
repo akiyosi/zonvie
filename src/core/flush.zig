@@ -1233,6 +1233,184 @@ pub const VH = struct {
 };
 
 /// Parameters for the unified 5-pass row vertex generation.
+/// Quad emission primitives in grid-local pixels, shared by the main-surface
+/// flush and the external grid path. The frontend applies the layer
+/// transform, so nothing here knows which surface it is building for.
+const Helpers = struct {
+    /// Quad corners in grid-local pixels: TL, TR, BL, BR. The
+    /// frontend applies the layer transform.
+    inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
+        return .{
+            .{ x0, y0 },
+            .{ x1, y0 },
+            .{ x0, y1 },
+            .{ x1, y1 },
+        };
+    }
+
+    /// SIMD-accelerated RGB→float4 conversion.
+    inline fn rgb(v: u32) [4]f32 {
+        return rgba(v, 1.0);
+    }
+
+    /// SIMD-accelerated RGBA→float4 conversion.
+    inline fn rgba(v: u32, alpha: f32) [4]f32 {
+        const V4u32 = @Vector(4, u32);
+        const V4f32 = @Vector(4, f32);
+        const vv: V4u32 = @splat(v);
+        const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
+        const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
+        var arr: [4]f32 = floats;
+        arr[3] = alpha;
+        return arr;
+    }
+
+    const solid_uv: [2]f32 = .{ -1.0, -1.0 };
+
+    fn pushSolidQuad(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        alloc: std.mem.Allocator,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        col: [4]f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) !void {
+        const pts = quadPx(x0, y0, x1, y1);
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
+
+        try out.ensureUnusedCapacity(alloc, 6);
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
+    fn pushSolidQuadAssumeCapacity(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        col: [4]f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) void {
+        const pts = quadPx(x0, y0, x1, y1);
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
+
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    fn pushGlyphQuad(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        alloc: std.mem.Allocator,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+        uv2: [2]f32,
+        uv3: [2]f32,
+        col: [4]f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) !void {
+        try out.ensureUnusedCapacity(alloc, 6);
+        pushGlyphQuadAssumeCapacity(out, x0, y0, x1, y1, uv0, uv1, uv2, uv3, col, grid_id, base_deco_flags);
+    }
+
+    /// Same as pushGlyphQuad but caller guarantees capacity.
+    fn pushGlyphQuadAssumeCapacity(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        uv0: [2]f32,
+        uv1: [2]f32,
+        uv2: [2]f32,
+        uv3: [2]f32,
+        col: [4]f32,
+        grid_id: i64,
+        base_deco_flags: u32,
+    ) void {
+        const pts = quadPx(x0, y0, x1, y1);
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
+
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+
+        v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+    }
+
+    fn pushDecoQuad(
+        out: *std.ArrayListUnmanaged(c_api.Vertex),
+        alloc: std.mem.Allocator,
+        x0: f32,
+        y0: f32,
+        x1: f32,
+        y1: f32,
+        col: [4]f32,
+        grid_id: i64,
+        deco_flags: u32,
+        deco_phase: f32,
+    ) !void {
+        const pts = quadPx(x0, y0, x1, y1);
+        const p0 = pts[0];
+        const p1 = pts[1];
+        const p2 = pts[2];
+        const p3 = pts[3];
+
+        // Decoration UV: x = -1 sentinel, y = local position within
+        // the quad (0.0 top, 1.0 bottom) for the shader.
+        const uv_top: [2]f32 = .{ -1.0, 0.0 }; // y0 vertices (top)
+        const uv_bottom: [2]f32 = .{ -1.0, 1.0 }; // y1 vertices (bottom)
+
+        try out.ensureUnusedCapacity(alloc, 6);
+        const v = out.addManyAsSliceAssumeCapacity(6);
+
+        v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+
+        v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+        v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
+    }
+};
+
 pub const RowGenParams = struct {
     row: u32,
     cols: u32,
@@ -3343,180 +3521,6 @@ pub const FlushCtx = struct {
 
             const topPad: f32 = @floatFromInt(rowTopPadPx(ctx.core.linespace_px));
 
-            const Helpers = struct {
-                /// Quad corners in grid-local pixels: TL, TR, BL, BR. The
-                /// frontend applies the layer transform.
-                inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
-                    return .{
-                        .{ x0, y0 },
-                        .{ x1, y0 },
-                        .{ x0, y1 },
-                        .{ x1, y1 },
-                    };
-                }
-
-                /// SIMD-accelerated RGB→float4 conversion.
-                inline fn rgb(v: u32) [4]f32 {
-                    return rgba(v, 1.0);
-                }
-
-                /// SIMD-accelerated RGBA→float4 conversion.
-                inline fn rgba(v: u32, alpha: f32) [4]f32 {
-                    const V4u32 = @Vector(4, u32);
-                    const V4f32 = @Vector(4, f32);
-                    const vv: V4u32 = @splat(v);
-                    const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
-                    const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
-                    var arr: [4]f32 = floats;
-                    arr[3] = alpha;
-                    return arr;
-                }
-
-                const solid_uv: [2]f32 = .{ -1.0, -1.0 };
-
-                fn pushSolidQuad(
-                    out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    alloc: std.mem.Allocator,
-                    x0: f32,
-                    y0: f32,
-                    x1: f32,
-                    y1: f32,
-                    col: [4]f32,
-                    grid_id: i64,
-                    base_deco_flags: u32,
-                ) !void {
-                    const pts = quadPx(x0, y0, x1, y1);
-                    const p0 = pts[0];
-                    const p1 = pts[1];
-                    const p2 = pts[2];
-                    const p3 = pts[3];
-
-                    try out.ensureUnusedCapacity(alloc, 6);
-                    const v = out.addManyAsSliceAssumeCapacity(6);
-
-                    v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-                    v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                }
-
-                /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
-                fn pushSolidQuadAssumeCapacity(
-                    out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    x0: f32,
-                    y0: f32,
-                    x1: f32,
-                    y1: f32,
-                    col: [4]f32,
-                    grid_id: i64,
-                    base_deco_flags: u32,
-                ) void {
-                    const pts = quadPx(x0, y0, x1, y1);
-                    const p0 = pts[0];
-                    const p1 = pts[1];
-                    const p2 = pts[2];
-                    const p3 = pts[3];
-
-                    const v = out.addManyAsSliceAssumeCapacity(6);
-
-                    v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-                    v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                }
-
-                fn pushGlyphQuad(
-                    out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    alloc: std.mem.Allocator,
-                    x0: f32,
-                    y0: f32,
-                    x1: f32,
-                    y1: f32,
-                    uv0: [2]f32,
-                    uv1: [2]f32,
-                    uv2: [2]f32,
-                    uv3: [2]f32,
-                    col: [4]f32,
-                    grid_id: i64,
-                    base_deco_flags: u32,
-                ) !void {
-                    try out.ensureUnusedCapacity(alloc, 6);
-                    pushGlyphQuadAssumeCapacity(out, x0, y0, x1, y1, uv0, uv1, uv2, uv3, col, grid_id, base_deco_flags);
-                }
-
-                /// Same as pushGlyphQuad but caller guarantees capacity.
-                fn pushGlyphQuadAssumeCapacity(
-                    out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    x0: f32,
-                    y0: f32,
-                    x1: f32,
-                    y1: f32,
-                    uv0: [2]f32,
-                    uv1: [2]f32,
-                    uv2: [2]f32,
-                    uv3: [2]f32,
-                    col: [4]f32,
-                    grid_id: i64,
-                    base_deco_flags: u32,
-                ) void {
-                    const pts = quadPx(x0, y0, x1, y1);
-                    const p0 = pts[0];
-                    const p1 = pts[1];
-                    const p2 = pts[2];
-                    const p3 = pts[3];
-
-                    const v = out.addManyAsSliceAssumeCapacity(6);
-
-                    v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-                    v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                    v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-                }
-
-                fn pushDecoQuad(
-                    out: *std.ArrayListUnmanaged(c_api.Vertex),
-                    alloc: std.mem.Allocator,
-                    x0: f32,
-                    y0: f32,
-                    x1: f32,
-                    y1: f32,
-                    col: [4]f32,
-                    grid_id: i64,
-                    deco_flags: u32,
-                    deco_phase: f32,
-                ) !void {
-                    const pts = quadPx(x0, y0, x1, y1);
-                    const p0 = pts[0];
-                    const p1 = pts[1];
-                    const p2 = pts[2];
-                    const p3 = pts[3];
-
-                    // Decoration UV: x = -1 sentinel, y = local position within
-                    // the quad (0.0 top, 1.0 bottom) for the shader.
-                    const uv_top: [2]f32 = .{ -1.0, 0.0 }; // y0 vertices (top)
-                    const uv_bottom: [2]f32 = .{ -1.0, 1.0 }; // y1 vertices (bottom)
-
-                    try out.ensureUnusedCapacity(alloc, 6);
-                    const v = out.addManyAsSliceAssumeCapacity(6);
-
-                    v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-                    v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-                    v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-
-                    v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-                    v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-                    v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-                }
-            };
 
             var sent_main_by_rows: bool = false;
             var main_retry_required: bool = false;
@@ -5283,63 +5287,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
     const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
 
-    const Helpers = struct {
-        /// Quad corners in grid-local pixels: TL, TR, BL, BR. The frontend
-        /// applies the layer transform.
-        inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
-            return .{
-                .{ x0, y0 },
-                .{ x1, y0 },
-                .{ x0, y1 },
-                .{ x1, y1 },
-            };
-        }
-
-        inline fn rgb(v: u32) [4]f32 {
-            return rgba(v, 1.0);
-        }
-
-        inline fn rgba(v: u32, alpha: f32) [4]f32 {
-            const V4u32 = @Vector(4, u32);
-            const V4f32 = @Vector(4, f32);
-            const vv: V4u32 = @splat(v);
-            const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
-            const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
-            var arr: [4]f32 = floats;
-            arr[3] = alpha;
-            return arr;
-        }
-
-        const solid_uv: [2]f32 = .{ -1.0, -1.0 };
-
-        /// Emit a solid-color quad (caller guarantees 6 vertices of capacity).
-        fn pushSolidQuadAssumeCapacity(
-            out: *std.ArrayListUnmanaged(c_api.Vertex),
-            x0: f32,
-            y0: f32,
-            x1: f32,
-            y1: f32,
-            col: [4]f32,
-            grid_id: i64,
-            base_deco_flags: u32,
-        ) void {
-            const pts = quadPx(x0, y0, x1, y1);
-            const p0 = pts[0];
-            const p1 = pts[1];
-            const p2 = pts[2];
-            const p3 = pts[3];
-
-            const v = out.addManyAsSliceAssumeCapacity(6);
-
-            v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-            v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-            v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-            v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-            v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-            v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        }
-    };
 
     const default_bg = self.hl.default_bg;
 
