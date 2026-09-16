@@ -691,6 +691,33 @@ pub fn shouldRetireSlotBacking(capacity: usize, layout_peak_verts: usize) bool {
 /// Sort rectangles in place, then merge overlapping or edge-adjacent entries.
 /// The merge may enlarge damage to a bounding rectangle, but never drops
 /// damaged pixels. This keeps the paint path allocation-free and O(n log n).
+/// Clamp present rectangles to the render target and drop the ones that clamp
+/// away to nothing, returning the surviving length.
+///
+/// Both paint drivers build their present list from grid rows, cursor damage
+/// and chrome bands, any of which can extend past the target after a resize
+/// the other side has not seen yet. Order is not preserved: an emptied slot is
+/// filled from the end, which is what keeps this a single pass.
+pub fn clampPresentRects(comptime Rect: type, rects: []Rect, max_right: i32, max_bottom: i32) usize {
+    var len = rects.len;
+    var i: usize = 0;
+    while (i < len) {
+        var r = rects[i];
+        if (r.left < 0) r.left = 0;
+        if (r.top < 0) r.top = 0;
+        if (r.right > max_right) r.right = max_right;
+        if (r.bottom > max_bottom) r.bottom = max_bottom;
+        if (r.right <= r.left or r.bottom <= r.top) {
+            rects[i] = rects[len - 1];
+            len -= 1;
+            continue;
+        }
+        rects[i] = r;
+        i += 1;
+    }
+    return len;
+}
+
 pub fn compactDamageRects(comptime Rect: type, rects: []Rect) usize {
     if (rects.len < 2) return rects.len;
 

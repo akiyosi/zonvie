@@ -3110,23 +3110,12 @@ pub export fn WndProc(
                         // alternating dirty rows on the accepted 20,000-row
                         // boundary.
                         if (present_rects.items.len != 0) {
-                            const max_r: i32 = client.right;
-                            const max_b: i32 = client.bottom;
-                            var i: usize = 0;
-                            while (i < present_rects.items.len) {
-                                var r = present_rects.items[i];
-                                if (r.left < 0) r.left = 0;
-                                if (r.top < 0) r.top = 0;
-                                if (r.right > max_r) r.right = max_r;
-                                if (r.bottom > max_b) r.bottom = max_b;
-                                if (r.right <= r.left or r.bottom <= r.top) {
-                                    present_rects.items[i] = present_rects.items[present_rects.items.len - 1];
-                                    present_rects.items.len -= 1;
-                                    continue;
-                                }
-                                present_rects.items[i] = r;
-                                i += 1;
-                            }
+                            present_rects.items.len = render_helpers.clampPresentRects(
+                                c.RECT,
+                                present_rects.items,
+                                client.right,
+                                client.bottom,
+                            );
                             present_rects.items.len = render_helpers.compactDamageRects(c.RECT, present_rects.items);
                         }
 
