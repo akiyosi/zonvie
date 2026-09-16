@@ -1759,11 +1759,15 @@ pub fn onGridRowScroll(
                 // of its actual host. The row-store route one function away has
                 // always set it. Usually masked, because the core sends the
                 // vacated rows right after the shift and those take that route.
+                // Ask the surface that actually draws this layer, and only it:
+                // a float an external window hosts is not a visual change on
+                // the main window, whose flag drives a whole-window
+                // InvalidateRect.
                 switch (row_route) {
                     .external_layer => |host| host.needs_redraw = true,
-                    .main_root, .main_layer, .external_root, .unplaced => {},
+                    .main_root, .main_layer, .unplaced => app.flush_needs_invalidate = true,
+                    .external_root => {},
                 }
-                app.flush_needs_invalidate = true;
                 if (applog.isEnabled()) applog.appLog(
                     "[layer_row_scroll] gridId={d} rowStart={d} rowEnd={d} rowsDelta={d}\n",
                     .{ grid_id, row_start, row_end, rows_delta },
@@ -3286,9 +3290,16 @@ pub fn onSurfaceLayout(
         tbs.stageCursorLayerGrid(surface_id);
     }
     traceRender(app, "event=layout_stage surface={d} layers={d} metadata_bytes={d}\n", .{ surface_id, count, app.layout_budget.live_bytes.load(.monotonic) });
-    if (app.external_windows.get(surface_id)) |ext_win| ext_win.needs_redraw = true;
-    // Layout-only updates must request paint as well as publish placement.
-    app.flush_needs_invalidate = true;
+    // Layout-only updates must request paint as well as publish placement — of
+    // the surface the layout belongs to. An external surface's layout is not a
+    // visual change on the main window, and the flag drives a whole-main-window
+    // InvalidateRect; the external ROW path has always kept out of it for the
+    // same reason. Grid 1 has no needs_redraw of its own, so it uses the flag.
+    if (app.external_windows.get(surface_id)) |ext_win| {
+        ext_win.needs_redraw = true;
+    } else {
+        app.flush_needs_invalidate = true;
+    }
 }
 
 /// Run after row publication and before placement publication, under app.mu.

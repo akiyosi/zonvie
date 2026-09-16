@@ -3660,7 +3660,11 @@ pub const FlushCtx = struct {
 
                     // Hoisted out of the row loop: placement cannot change
                     // mid-flush.
-                    const main_has_layers = mainSurfaceHasLayers(ctx.core);
+                    // Behind the blur test its only consumer already applies, as
+                    // the external root's copy of this does: with blur off the
+                    // scan's answer cannot change anything, and it walks the
+                    // whole win_pos map once per flush.
+                    const main_has_layers = ctx.core.blur_enabled and mainSurfaceHasLayers(ctx.core);
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;

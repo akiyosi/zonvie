@@ -1235,6 +1235,32 @@ fn drawNormalExternalSurfaceRowMode(
         }
     }
 
+    // Clamp before compacting, as the main paint does. The producers above can
+    // name rows past the surface — a stale `cursor_row_before` after a shrink,
+    // a scroll rect, a restored scrollbar rect — and `clampBackDamageRect`
+    // answers a rect that clamps to EMPTY by marking every swapchain buffer
+    // fully damaged for the whole frame. Dropping it here keeps the present
+    // partial.
+    if (present_rects.items.len != 0) {
+        const max_r: i32 = @intCast(g.width);
+        const max_b: i32 = @intCast(g.height);
+        var i: usize = 0;
+        while (i < present_rects.items.len) {
+            var r = present_rects.items[i];
+            if (r.left < 0) r.left = 0;
+            if (r.top < 0) r.top = 0;
+            if (r.right > max_r) r.right = max_r;
+            if (r.bottom > max_b) r.bottom = max_b;
+            if (r.right <= r.left or r.bottom <= r.top) {
+                present_rects.items[i] = present_rects.items[present_rects.items.len - 1];
+                present_rects.items.len -= 1;
+                continue;
+            }
+            present_rects.items[i] = r;
+            i += 1;
+        }
+    }
+
     if (present_rects.items.len > 1) {
         present_rects.items.len = render_pipeline_helpers.compactDamageRects(c.RECT, present_rects.items);
     }
