@@ -204,6 +204,26 @@ final class ZonvieCore {
     /// tick spends every surface's. Snapshots under the map lock and releases
     /// it before asking any view, so externalGridViewsLock is never held across
     /// a surface lock.
+    /// Merge every external surface's placement ledger into the float ledger's
+    /// per-frame scratch, after the main renderer has filled it. A float an
+    /// external window hosts travels the same way one on the main window does,
+    /// and without its half the debt correction was simply absent for it.
+    func appendExternalPlacementRowsUp(into out: inout [Int64: Int]) {
+        externalGridViewsLock.lock()
+        placementLedgerScratch.removeAll(keepingCapacity: true)
+        placementLedgerScratch.append(contentsOf: externalGridViews.values)
+        externalGridViewsLock.unlock()
+        defer { placementLedgerScratch.removeAll(keepingCapacity: true) }
+        for view in placementLedgerScratch {
+            guard view.gridId > 1 else { continue }
+            view.copyPlacementRowsUp(into: &out)
+        }
+    }
+
+    /// Snapshot buffer for the ledger merge above; its own, for the reason
+    /// smoothScrollSeedScratch states.
+    private var placementLedgerScratch: [ExternalGridView] = []
+
     func appendExternalSmoothScrollSeeds(into out: inout [(gridId: Int64, rowsDelta: Int)]) {
         externalGridViewsLock.lock()
         smoothScrollSeedScratch.removeAll(keepingCapacity: true)

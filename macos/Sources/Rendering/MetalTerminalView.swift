@@ -2099,6 +2099,10 @@ final class MetalTerminalView: MTKView {
         // The float ledger's other half, read once per frame under the
         // renderer's lock rather than per float.
         renderer.copyPlacementRowsUp(into: &placementRowsUpScratch)
+        // The external surfaces' half of the same ledger. Merged after the main
+        // renderer's, which clears the scratch; the two never name the same
+        // grid, because a grid is placed by exactly one surface.
+        core.appendExternalPlacementRowsUp(into: &placementRowsUpScratch)
         gridInfoMapScratch.removeAll(keepingCapacity: true)
         for g in grids { gridInfoMapScratch[g.gridId] = g }
         let gridInfoMap = gridInfoMapScratch
@@ -3583,6 +3587,15 @@ final class MetalTerminalView: MTKView {
     /// Takes `scrollOffsetLock`: processPendingScrollClears writes the anchor
     /// counter from the core thread. placementRowsUpScratch is main-thread
     /// only, refreshed once per frame by updateScrollShaderOffset.
+    /// The debt in pixels, for a caller that displaces a float bodily rather
+    /// than through a ScrollOffset entry. The external surfaces move a
+    /// following layer that way, so this is how they reach the same correction
+    /// the main renderer applies when it builds the float's offset.
+    func floatDebtPx(gridId: Int64, anchorGridId: Int64, cellHeightPx: Float) -> Float {
+        guard cellHeightPx > 0 else { return 0 }
+        return Float(floatDebtRows(gridId: gridId, anchorGridId: anchorGridId)) * cellHeightPx
+    }
+
     private func floatDebtRows(gridId: Int64, anchorGridId: Int64) -> Int {
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
