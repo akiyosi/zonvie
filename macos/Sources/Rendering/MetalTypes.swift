@@ -13,6 +13,53 @@ struct Vertex {
 }
 
 // DrawableSize struct matching Shaders.metal (for fragment shader clipping)
+/// Allocation-free sparse set of row indices, shared by both surfaces.
+///
+/// The row list makes synchronization O(changed rows); the bitset prevents a
+/// repeatedly updated row from growing that list. Capacity only ever grows, at
+/// a `prepare` call, so the redraw/flush hot path reuses a high-water
+/// allocation and never allocates. A surface that knows its ceiling up front
+/// passes `preparedRows` and pays for the whole set at construction instead.
+final class SparseRowSet {
+    private(set) var rows: [UInt32] = []
+    private var membership: [UInt64] = []
+    private let rowLimit: Int
+    private var preparedRowCount = 0
+
+    init(rowLimit: Int, preparedRows: Int = 0) {
+        self.rowLimit = rowLimit
+        prepare(rowCount: preparedRows)
+    }
+
+    func prepare(rowCount: Int) {
+        let target = min(rowLimit, max(0, rowCount))
+        guard target > preparedRowCount else { return }
+        let targetWords = (target + 63) / 64
+        if targetWords > membership.count {
+            membership.append(contentsOf: repeatElement(0, count: targetWords - membership.count))
+        }
+        rows.reserveCapacity(target)
+        preparedRowCount = target
+    }
+
+    func insert(_ row: Int) {
+        guard row >= 0, row < preparedRowCount else { return }
+        let word = row >> 6
+        let mask = UInt64(1) << UInt64(row & 63)
+        guard membership[word] & mask == 0 else { return }
+        membership[word] |= mask
+        rows.append(UInt32(row))
+    }
+
+    func removeAll() {
+        for storedRow in rows {
+            let row = Int(storedRow)
+            membership[row >> 6] &= ~(UInt64(1) << UInt64(row & 63))
+        }
+        rows.removeAll(keepingCapacity: true)
+    }
+}
+
 struct DrawableSize {
     var width: Float
     var height: Float
@@ -3209,3 +3256,243 @@ func encodeSurfaceBloomPasses(
 
     return true
 }
+
+// MARK: - Row Capacity Provisioning
+
+/// What a surface's flush found missing, and whether a provisioning pass is
+/// already running. Both surfaces keep exactly these fields, guarded by the
+/// surface's own triple-buffer lock — which is why the lock is handed to the
+/// provisioner rather than owned here.
+final class SurfaceRowCapacityLedger {
+    var hardFailure = false
+    var requiredRows = 0
+    var requiredVertexCounts: [Int]
+    var provisioning = false
+
+    init(maxRowBuffers: Int) {
+        requiredVertexCounts = [Int](repeating: 0, count: maxRowBuffers)
+    }
+}
+
+
+// MARK: - Background Clear Band
+
+/// Draw the solid background band a scroll blit vacated, in the pixel space of
+/// whatever layer transform is currently bound: the surface for a root-grid
+/// band, the layer's own rect for a layer's band.
+///
+/// The vertex stage binary-searches scrollOffsets by grid_id, so a band must
+/// carry the id of the grid it covers: tagging a layer's band with the root's
+/// id would move it by the root's scroll offset.
+func drawSurfaceBackgroundClearBand(
+    _ encoder: MTLRenderCommandEncoder,
+    clearBand: (clearTopPx: Int, clearBottomPx: Int),
+    xRangePx: (leftPx: Float, rightPx: Float),
+    drawableHeight: Float,
+    bgRGB: UInt32,
+    gridId: Int64
+) {
+    let top = max(0, clearBand.clearTopPx)
+    let bottom = max(top, clearBand.clearBottomPx)
+    guard bottom > top else { return }
+    let r = Float((bgRGB >> 16) & 0xFF) / 255.0
+    let g = Float((bgRGB >> 8) & 0xFF) / 255.0
+    let b = Float(bgRGB & 0xFF) / 255.0
+    let color = simd_float4(r, g, b, 1.0)
+    _ = drawableHeight
+    let x0 = xRangePx.leftPx
+    let x1 = xRangePx.rightPx
+    guard x1 > x0 else { return }
+    let y0 = Float(top)
+    let y1 = Float(bottom)
+    let tl = Vertex(position: simd_float2(x0, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+    let tr = Vertex(position: simd_float2(x1, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+    let bl = Vertex(position: simd_float2(x0, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+    let br = Vertex(position: simd_float2(x1, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
+    // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
+    // (no heap) instead of building a fresh [Vertex] array every scroll frame.
+    withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
+        buffer[0] = tl
+        buffer[1] = bl
+        buffer[2] = tr
+        buffer[3] = tr
+        buffer[4] = bl
+        buffer[5] = br
+        encoder.setVertexBytes(buffer.baseAddress!, length: MemoryLayout<Vertex>.stride * 6, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    }
+}
+
+/// Stage a row scroll on the WRITE set, merging it into one already staged for
+/// the same region.
+///
+/// Staging on the write set rather than straight onto a per-grid accumulator is
+/// what stops a draw() interleaving before commitFlush from consuming a delta
+/// whose vertices are not committed yet — and, if the bracket is then
+/// cancelled, from keeping that mis-shifted frame permanently.
+///
+/// When the region changes inside one bracket the older shift can no longer be
+/// represented, but its row slots were already remapped, so the rows it covered
+/// are handed to `dirtySupersededRows` to redraw post-remap. Each caller keeps
+/// its own guard on when staging is allowed at all.
+func stageSurfaceRowScroll(
+    on set: SurfaceBufferSet,
+    rowStart: Int,
+    rowEnd: Int,
+    colStart: Int,
+    colEnd: Int,
+    rowsDelta: Int,
+    totalRows: Int,
+    totalCols: Int,
+    dirtySupersededRows: (_ rowStart: Int, _ rowEnd: Int) -> Void
+) {
+    if let staged = set.pendingScroll,
+       staged.rowStart == rowStart,
+       staged.rowEnd == rowEnd {
+        set.pendingScroll = SurfaceRowScroll(
+            rowStart: rowStart, rowEnd: rowEnd,
+            colStart: colStart, colEnd: colEnd,
+            rowsDelta: clampRowsDelta(staged.rowsDelta &+ rowsDelta),
+            totalRows: totalRows, totalCols: totalCols
+        )
+        return
+    }
+    if let staged = set.pendingScroll, staged.rowEnd > staged.rowStart {
+        dirtySupersededRows(staged.rowStart, staged.rowEnd)
+    }
+    set.pendingScroll = SurfaceRowScroll(
+        rowStart: rowStart, rowEnd: rowEnd,
+        colStart: colStart, colEnd: colEnd,
+        rowsDelta: rowsDelta,
+        totalRows: totalRows, totalCols: totalCols
+    )
+}
+
+/// Copy `input` into `output` through a fullscreen render pass.
+///
+/// A render pass rather than an MTLBlitCommandEncoder: a blit's internal
+/// shaders cannot be cached in an MTLBinaryArchive, and the XPC compiler
+/// service is unavailable after fork() — which is exactly where this path is
+/// the last step between a finished back buffer and the screen.
+///
+/// `prepare` runs on the descriptor before the encoder is made; the main
+/// surface attaches its GPU counter samples there.
+func encodeSurfaceDrawableCopy(
+    cmd: MTLCommandBuffer,
+    input: MTLTexture,
+    output: MTLTexture,
+    pipeline: MTLRenderPipelineState,
+    copyVertexBuffer: MTLBuffer,
+    sampler: MTLSamplerState,
+    prepare: (MTLRenderPassDescriptor) -> Void
+) -> Bool {
+    let rpd = MTLRenderPassDescriptor()
+    rpd.colorAttachments[0].texture = output
+    rpd.colorAttachments[0].loadAction = .dontCare
+    rpd.colorAttachments[0].storeAction = .store
+    prepare(rpd)
+    guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
+    enc.setRenderPipelineState(pipeline)
+    enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+    enc.setFragmentTexture(input, index: 0)
+    enc.setFragmentSamplerState(sampler, index: 0)
+    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+    enc.endEncoding()
+    return true
+}
+
+/// Repaint the background band under every dirty row, before the rows
+/// themselves are drawn.
+///
+/// The band spans the whole viewport width, so it also repaints the margin
+/// strip beside the row, which the row's own vertices never cover — that strip
+/// is why a row that already has content still gets a band. The external
+/// surface used to band only rows with no resolvable content and left its
+/// margin to whatever the previous frame had.
+func encodeSurfaceDirtyRowBands(
+    encoder: MTLRenderCommandEncoder,
+    rows: [Int],
+    pipeline: MTLRenderPipelineState,
+    cellHeightPx: Int,
+    widthPx: Float,
+    heightPx: Float,
+    bgRGB: UInt32,
+    gridId: Int64
+) {
+    encoder.setRenderPipelineState(pipeline)
+    for row in rows {
+        let topPx = row * cellHeightPx
+        drawSurfaceBackgroundClearBand(
+            encoder,
+            clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellHeightPx),
+            xRangePx: (leftPx: 0, rightPx: widthPx),
+            drawableHeight: heightPx,
+            bgRGB: bgRGB,
+            gridId: gridId
+        )
+    }
+}
+
+// MARK: - Shared Off-Screen Surface Textures
+
+/// The off-screen texture pair a multi-pass custom shader chain ping-pongs
+/// between. Both surfaces size it from their own drawable, so the pair lives
+/// with this holder rather than being restated per surface class.
+final class SurfacePingPongTextures {
+    private(set) var textures: [MTLTexture?] = [nil, nil]
+    private(set) var size: CGSize = .zero
+
+    var ready: Bool { textures[0] != nil && textures[1] != nil }
+
+    subscript(index: Int) -> MTLTexture? { textures[index] }
+
+    func invalidate() {
+        textures[0] = nil
+        textures[1] = nil
+        size = .zero
+    }
+
+    /// Allocate only when the size changed. This is reached from the present
+    /// path every frame a chain is configured, so the size guard is what keeps
+    /// texture creation out of the per-frame path.
+    func ensure(device: MTLDevice, size newSize: CGSize, pixelFormat: MTLPixelFormat) {
+        if ready, size == newSize { return }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: max(1, Int(newSize.width)),
+            height: max(1, Int(newSize.height)),
+            mipmapped: false
+        )
+        desc.usage = [.renderTarget, .shaderRead]
+        desc.storageMode = .private
+        textures[0] = device.makeTexture(descriptor: desc)
+        textures[1] = device.makeTexture(descriptor: desc)
+        size = newSize
+    }
+}
+
+/// The off-screen copy of the back buffer a scroll blit reads from, so the
+/// shift cannot sample pixels it has already written.
+final class SurfaceScrollScratchTexture {
+    private(set) var texture: MTLTexture? = nil
+    private(set) var size: CGSize = .zero
+
+    func invalidate() {
+        texture = nil
+        size = .zero
+    }
+
+    func ensure(device: MTLDevice, drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
+        if texture != nil, size == drawableSize { return }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: max(1, Int(drawableSize.width)),
+            height: max(1, Int(drawableSize.height)),
+            mipmapped: false
+        )
+        desc.storageMode = .private
+        texture = device.makeTexture(descriptor: desc)
+        size = drawableSize
+    }
+}
+

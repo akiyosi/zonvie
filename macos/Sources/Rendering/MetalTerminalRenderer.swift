@@ -5,38 +5,161 @@ import simd
 
 private let metalTerminalMaxRowBuffers = 20_000
 
-/// Allocation-free sparse set used only by the core/render callback thread.
-/// The row list makes synchronization O(changed rows); the bitset prevents a
-/// repeatedly updated row from growing that list. Capacity is reserved during
-/// renderer construction, never in the redraw/flush hot path.
-private final class StaleMainRowSet {
-    private(set) var rows: [UInt32] = []
-    private var membership: [UInt64]
-    private let rowLimit: Int
+// MARK: - Surface Render Helpers Shared With ExternalGridView
+//
+// File-scope because both surfaces call them and neither owns them. They live
+// here rather than in MetalTypes.swift because they reach ZonvieCore's logging
+// and the shader C ABI, and MetalTypes.swift is compiled standalone by the
+// `zig build test` Swift targets, which have neither.
 
-    init(rowLimit: Int) {
-        self.rowLimit = rowLimit
-        membership = Array(repeating: 0, count: (rowLimit + 63) / 64)
-        rows.reserveCapacity(rowLimit)
+/// Provision the row capacity `ledger` owes, outside any flush bracket.
+///
+/// `isBusyLocked` is evaluated while the lock is held and reports whatever else
+/// the surface has in flight; the two surfaces track their flush bracket under
+/// different flags, which is the only part of this decision they do not share.
+/// `busyLogDetailLocked` is likewise read under the lock, and only when the
+/// scroll-mode log tier is on.
+func provisionSurfaceRowCapacity(
+    ledger: SurfaceRowCapacityLedger,
+    lock: NSLock,
+    bufferSets: [SurfaceBufferSet],
+    device: MTLDevice,
+    maxRowBuffers: Int,
+    logLabel: String,
+    isBusyLocked: () -> Bool,
+    busyLogDetailLocked: () -> String
+) -> SurfaceRowProvisionStatus {
+    lock.lock()
+    if ledger.hardFailure {
+        lock.unlock()
+        return .hardFailure
     }
-
-    func insert(_ row: Int) {
-        guard row >= 0, row < rowLimit else { return }
-        let word = row >> 6
-        let mask = UInt64(1) << UInt64(row & 63)
-        guard membership[word] & mask == 0 else { return }
-        membership[word] |= mask
-        rows.append(UInt32(row))
+    // Nothing owed: answer ready regardless of what this surface is currently
+    // doing. Asked before the busy check because a surface presenting at
+    // refresh rate almost always has a frame in flight, and the caller folds
+    // any one surface's .retry into an app-wide verdict — an idle ledger would
+    // otherwise keep the whole retry re-arming.
+    guard ledger.requiredRows > 0 else {
+        lock.unlock()
+        return .ready
     }
+    if ledger.provisioning || isBusyLocked() {
+        let detail = ZonvieCore.appLogEnabled ? busyLogDetailLocked() : ""
+        let provisioning = ledger.provisioning
+        lock.unlock()
+        ZonvieCore.appLogScrollMode(
+            "[scroll_debug] row_capacity_retry_blocked surface=\(logLabel) " +
+            "\(detail) provisioning=\(provisioning)"
+        )
+        return .retry
+    }
+    ledger.provisioning = true
+    let requiredRows = ledger.requiredRows
+    let requiredVertexCounts = Array(ledger.requiredVertexCounts[0..<requiredRows])
+    for row in 0..<requiredRows {
+        ledger.requiredVertexCounts[row] = 0
+    }
+    ledger.requiredRows = 0
+    lock.unlock()
 
-    func removeAll() {
-        for storedRow in rows {
-            let row = Int(storedRow)
-            let word = row >> 6
-            membership[word] &= ~(UInt64(1) << UInt64(row & 63))
+    let planResult = makeSurfaceRowProvisionPlan(
+        bufferSets: bufferSets,
+        device: device,
+        requiredRowCount: requiredRows,
+        requiredVertexCounts: requiredVertexCounts,
+        maxRowBuffers: maxRowBuffers
+    )
+
+    lock.lock()
+    defer {
+        ledger.provisioning = false
+        lock.unlock()
+    }
+    switch planResult {
+    case .overBudget:
+        ledger.hardFailure = true
+        return .hardFailure
+    case .allocationFailed(let partialPlan):
+        let metrics = partialPlan.metrics
+        ZonvieCore.appLog(
+            "[\(logLabel)] row provisioning allocation failed " +
+            "attempt=\(metrics.allocationAttemptCount) created=\(metrics.createdBufferCount) " +
+            "createdBytes=\(metrics.createdBufferBytes) planned=\(metrics.plannedReplacementCount) " +
+            "plannedBytes=\(metrics.plannedReplacementBytes) live=\(metrics.liveBufferCount) " +
+            "liveBytes=\(metrics.liveBufferBytes)"
+        )
+        // Private pool publication is independent of committed rowState.
+        // Retaining the successful prefix makes every retry monotonic without
+        // exposing a partially rendered frame.
+        applySurfaceRowProvisionPlan(
+            partialPlan,
+            to: bufferSets,
+            maxRowBuffers: maxRowBuffers
+        )
+        ledger.requiredRows = max(ledger.requiredRows, requiredRows)
+        for row in 0..<requiredRows {
+            ledger.requiredVertexCounts[row] = max(
+                ledger.requiredVertexCounts[row],
+                requiredVertexCounts[row]
+            )
         }
-        rows.removeAll(keepingCapacity: true)
+        return .retry
+    case .ready(let plan):
+        if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
+            ZonvieCore.appLogPerf(
+                "[perf] row_provision surface=\(logLabel) created=\(plan.metrics.createdBufferCount) " +
+                "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
+                "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
+            )
+        }
+        applySurfaceRowProvisionPlan(plan, to: bufferSets, maxRowBuffers: maxRowBuffers)
     }
+    return ledger.requiredRows == 0 ? .ready : .retry
+}
+
+/// Encode the user's custom post-process chain, sampling `input` and writing
+/// the last pass into `output`.
+///
+/// Intermediate passes ping-pong through `pong`, which is sized here because
+/// only a chain longer than one pass needs it. Returns false when the chain
+/// could not be fully encoded; `output` is then still untouched — every
+/// partial pass wrote into `pong` — so the caller falls back to its own copy.
+///
+/// `pongSize` is the caller's drawable size rather than `output`'s dimensions:
+/// the two surfaces each derive it from their own view, and reading it off the
+/// texture would change which value the pair is keyed on.
+func encodeSurfaceCustomShaderChain(
+    cmd: MTLCommandBuffer,
+    pipelines: [CustomShaderPipeline],
+    input: MTLTexture,
+    output: MTLTexture,
+    pong: SurfacePingPongTextures,
+    pongSize: CGSize,
+    copyVertexBuffer: MTLBuffer,
+    sampler: MTLSamplerState,
+    uniforms: zonvie_shader_uniforms
+) -> Bool {
+    guard !pipelines.isEmpty else { return false }
+    if pipelines.count > 1 {
+        pong.ensure(device: output.device, size: pongSize, pixelFormat: output.pixelFormat)
+        guard pong.ready else { return false }
+    }
+    for (i, pipeline) in pipelines.enumerated() {
+        let isLast = (i == pipelines.count - 1)
+        let inputTex: MTLTexture = (i == 0) ? input : pong[(i - 1) % 2]!
+        let outputTex: MTLTexture = isLast ? output : pong[i % 2]!
+        if !pipeline.encode(
+            cmd: cmd,
+            input: inputTex,
+            output: outputTex,
+            copyVertexBuffer: copyVertexBuffer,
+            sampler: sampler,
+            uniforms: uniforms
+        ) {
+            return false
+        }
+    }
+    return true
 }
 
 // MTLCommandBuffer rule: any command buffer created via queue.makeCommandBuffer()
@@ -55,7 +178,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     var glyphAtlas: GlyphAtlas { atlas }
 
     private var pipeline: MTLRenderPipelineState?
-    private var sampler: MTLSamplerState?
+    /// Also read by ExternalGridView for the shared back-buffer copy.
+    private(set) var sampler: MTLSamplerState?
     private var initializationError: String?
     private var pipelineNeedsBuilding = true
     private var pipelineRetryDelaySeconds: TimeInterval = 0.1
@@ -76,7 +200,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
-    private var copyPipeline: MTLRenderPipelineState?
+    private(set) var copyPipeline: MTLRenderPipelineState?
     private(set) var copyVertexBuffer: MTLBuffer?
 
     // Binary archive for caching compiled pipeline states
@@ -242,33 +366,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // destination's pendingScroll.
         let ws = sets[writeSetIndex]
         if colStart == 0, colEnd == totalCols, regionRows > 0 {
-            if let staged = ws.pendingScroll,
-               staged.rowStart == rowStart,
-               staged.rowEnd == rowEnd {
-                ws.pendingScroll = SurfaceRowScroll(
-                    rowStart: rowStart, rowEnd: rowEnd,
-                    colStart: colStart, colEnd: colEnd,
-                    rowsDelta: clampRowsDelta(staged.rowsDelta &+ rowsDelta),
-                    totalRows: totalRows, totalCols: totalCols
-                )
-            } else {
-                // Region change within one bracket: the older staged shift can
-                // no longer be represented, but its row slots were already
-                // remapped — dirty its rows so they redraw post-remap.
-                if let staged = ws.pendingScroll, staged.rowEnd > staged.rowStart {
-                    markLayerRowsDirty(
-                        gridId: gridId,
-                        rowStart: staged.rowStart,
-                        rowCount: staged.rowEnd - staged.rowStart
-                    )
+            stageSurfaceRowScroll(
+                on: ws,
+                rowStart: rowStart, rowEnd: rowEnd,
+                colStart: colStart, colEnd: colEnd,
+                rowsDelta: rowsDelta,
+                totalRows: totalRows, totalCols: totalCols,
+                dirtySupersededRows: { start, end in
+                    markLayerRowsDirty(gridId: gridId, rowStart: start, rowCount: end - start)
                 }
-                ws.pendingScroll = SurfaceRowScroll(
-                    rowStart: rowStart, rowEnd: rowEnd,
-                    colStart: colStart, colEnd: colEnd,
-                    rowsDelta: rowsDelta,
-                    totalRows: totalRows, totalCols: totalCols
-                )
-            }
+            )
             // Only the band the shift vacated needs new content; the surviving
             // rows are carried by the remapped slots. A draw that refuses the
             // blit dirties the whole region itself.
@@ -381,12 +488,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // non-committed set only needs rows changed since it last committed; this
     // avoids O(totalRows) metadata copying for a one-row flush. Structural
     // operations and aborted partial writes use the full-copy barrier.
-    private let staleMainRowsBySet: [StaleMainRowSet] = [
-        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
-        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
-        StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers),
+    private let staleMainRowsBySet: [SparseRowSet] = [
+        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
+        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
+        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
     ]
-    private let flushChangedMainRows = StaleMainRowSet(rowLimit: metalTerminalMaxRowBuffers)
+    private let flushChangedMainRows = SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers)
     private var mainRowStateNeedsFullSync = [false, false, false]
     private var flushHasStructuralMainChange = false
     // Set (core thread) when a buffer allocation fails or a mandatory row shift
@@ -403,14 +510,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
-    private var rowCapacityRequiredRows = 0
-    private var rowCapacityRequiredVertexCounts = [Int](
-        repeating: 0,
-        count: metalTerminalMaxRowBuffers
-    )
+    private let rowCapacity = SurfaceRowCapacityLedger(maxRowBuffers: metalTerminalMaxRowBuffers)
     private var rowCapacityBracketOpen = false // Protected by lock
-    private var rowCapacityProvisioning = false // Protected by lock
-    private var rowCapacityHardFailure = false // Protected by lock
 
     /// Read and clear flushFailed. Called once per flush from on_flush_end.
     func consumeFlushFailed() -> Bool {
@@ -450,12 +551,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
             lock.lock()
-            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
-            rowCapacityRequiredVertexCounts[capacityRow] = max(
-                rowCapacityRequiredVertexCounts[capacityRow],
+            rowCapacity.requiredRows = max(rowCapacity.requiredRows, requiredRows)
+            rowCapacity.requiredVertexCounts[capacityRow] = max(
+                rowCapacity.requiredVertexCounts[capacityRow],
                 neededVertexCount
             )
-            let newRequiredRows = rowCapacityRequiredRows
+            let newRequiredRows = rowCapacity.requiredRows
             lock.unlock()
             ZonvieCore.appLogScrollMode(
                 "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
@@ -469,7 +570,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// True while this surface still owes a provisioning pass, or is in the
     /// middle of one. The scheduled flush retry is that pass's only driver, so
     /// a commit elsewhere must not disarm the retry while this holds.
-    /// `rowCapacityProvisioning` has to count: the provisioner zeroes the
+    /// `rowCapacity.provisioning` has to count: the provisioner zeroes the
     /// ledger before it allocates outside the lock, and a commit landing in
     /// that window would otherwise see nothing owed and cancel the very retry
     /// that is doing the work — after which an allocation failure restores the
@@ -477,100 +578,23 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     var hasPendingRowCapacityWork: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return rowCapacityRequiredRows > 0 || rowCapacityProvisioning
+        return rowCapacity.requiredRows > 0 || rowCapacity.provisioning
     }
 
     /// Called on the retry queue before it acquires core grid_mu. Flush
     /// admission is gated while the plan is allocated and published, so row
     /// callbacks never race these metadata mutations.
     func provisionPendingRowCapacity() -> SurfaceRowProvisionStatus {
-        lock.lock()
-        if rowCapacityHardFailure {
-            lock.unlock()
-            return .hardFailure
-        }
-        // Nothing owed: answer ready regardless of what this surface is
-        // currently doing. Asked before the busy check because a surface
-        // presenting at refresh rate almost always has a frame in flight, and
-        // the caller folds any one surface's .retry into an app-wide verdict —
-        // an idle ledger would otherwise keep the whole retry re-arming.
-        guard rowCapacityRequiredRows > 0 else {
-            lock.unlock()
-            return .ready
-        }
-        if rowCapacityBracketOpen || rowCapacityProvisioning ||
-            gpuInFlightCount.contains(where: { $0 != 0 }) {
-            let bracketOpen = rowCapacityBracketOpen
-            let provisioning = rowCapacityProvisioning
-            let gpuInFlight = gpuInFlightCount
-            lock.unlock()
-            ZonvieCore.appLogScrollMode(
-                "[scroll_debug] row_capacity_retry_blocked bracketOpen=\(bracketOpen) " +
-                "provisioning=\(provisioning) gpuInFlight=\(gpuInFlight)"
-            )
-            return .retry
-        }
-        rowCapacityProvisioning = true
-        let requiredRows = rowCapacityRequiredRows
-        let requiredVertexCounts = Array(rowCapacityRequiredVertexCounts[0..<requiredRows])
-        for row in 0..<requiredRows {
-            rowCapacityRequiredVertexCounts[row] = 0
-        }
-        rowCapacityRequiredRows = 0
-        lock.unlock()
-
-        let planResult = makeSurfaceRowProvisionPlan(
+        provisionSurfaceRowCapacity(
+            ledger: rowCapacity,
+            lock: lock,
             bufferSets: bufferSets,
             device: device,
-            requiredRowCount: requiredRows,
-            requiredVertexCounts: requiredVertexCounts,
-            maxRowBuffers: maxRowBuffers
+            maxRowBuffers: maxRowBuffers,
+            logLabel: "Renderer",
+            isBusyLocked: { rowCapacityBracketOpen || gpuInFlightCount.contains(where: { $0 != 0 }) },
+            busyLogDetailLocked: { "bracketOpen=\(rowCapacityBracketOpen) gpuInFlight=\(gpuInFlightCount)" }
         )
-
-        lock.lock()
-        defer {
-            rowCapacityProvisioning = false
-            lock.unlock()
-        }
-        switch planResult {
-        case .overBudget:
-            rowCapacityHardFailure = true
-            return .hardFailure
-        case .allocationFailed(let partialPlan):
-            let metrics = partialPlan.metrics
-            ZonvieCore.appLog(
-                "[Renderer] row provisioning allocation failed attempt=\(metrics.allocationAttemptCount) " +
-                "created=\(metrics.createdBufferCount) createdBytes=\(metrics.createdBufferBytes) " +
-                "planned=\(metrics.plannedReplacementCount) plannedBytes=\(metrics.plannedReplacementBytes) " +
-                "live=\(metrics.liveBufferCount) liveBytes=\(metrics.liveBufferBytes)"
-            )
-            // Private pool publication is independent of committed rowState.
-            // Retaining the successful prefix makes every retry monotonic
-            // without exposing a partially rendered frame.
-            applySurfaceRowProvisionPlan(
-                partialPlan,
-                to: bufferSets,
-                maxRowBuffers: maxRowBuffers
-            )
-            rowCapacityRequiredRows = max(rowCapacityRequiredRows, requiredRows)
-            for row in 0..<requiredRows {
-                rowCapacityRequiredVertexCounts[row] = max(
-                    rowCapacityRequiredVertexCounts[row],
-                    requiredVertexCounts[row]
-                )
-            }
-            return .retry
-        case .ready(let plan):
-            if ZonvieCore.appLogEnabled && plan.metrics.createdBufferCount > 0 {
-                ZonvieCore.appLogPerf(
-                    "[perf] row_provision created=\(plan.metrics.createdBufferCount) " +
-                    "createdBytes=\(plan.metrics.createdBufferBytes) attempts=\(plan.metrics.allocationAttemptCount) " +
-                    "peakBytes=\(plan.metrics.liveBufferBytes + plan.metrics.plannedReplacementBytes)"
-                )
-            }
-            applySurfaceRowProvisionPlan(plan, to: bufferSets, maxRowBuffers: maxRowBuffers)
-        }
-        return rowCapacityRequiredRows == 0 ? .ready : .retry
     }
     // Per-flush row submit accumulators. Reset in beginFlush, summed in
     // submitVerticesRowRaw, dumped in commitFlush as [perf] row_submit. Surfaces
@@ -1060,8 +1084,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // --- Persistent back buffer (for correct partial redraw) ---
     private var backBuffer: MTLTexture? = nil
     private var backBufferSize: CGSize = .zero
-    private var scrollScratchTexture: MTLTexture? = nil
-    private var scrollScratchSize: CGSize = .zero
+    private let scrollScratch = SurfaceScrollScratchTexture()
 
     // --- Blur transparency support ---
     private let blurEnabled: Bool
@@ -1134,8 +1157,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var shaderDateCache: (year: Float, month: Float, day: Float, secsInDay: Float) = (0, 0, 0, 0)
     /// Ping-pong render targets for multi-pass shader chains. Allocated
     /// only when pipelines.count > 1. Size matches backBufferSize.
-    private var customShaderPong: [MTLTexture?] = [nil, nil]
-    private var customShaderPongSize: CGSize = .zero
+    private let customShaderPong = SurfacePingPongTextures()
     // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
     //
     // Held in SCREEN space — the smooth-scroll displacement already folded in
@@ -1211,41 +1233,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Allocate the two ping-pong textures used by multi-pass custom
     /// shader chains. Size/format must match the drawable so the final
     /// pass can write the same pixel format the drawable expects.
-    private func ensureCustomShaderPong(size: CGSize, pixelFormat: MTLPixelFormat) {
-        if customShaderPong[0] != nil,
-           customShaderPong[1] != nil,
-           customShaderPongSize == size {
-            return
-        }
-        let w = max(1, Int(size.width))
-        let h = max(1, Int(size.height))
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: w,
-            height: h,
-            mipmapped: false
-        )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
-        customShaderPong[0] = device.makeTexture(descriptor: desc)
-        customShaderPong[1] = device.makeTexture(descriptor: desc)
-        customShaderPongSize = size
-    }
-
-    private func ensureScrollScratchTexture(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
-        if scrollScratchTexture != nil, scrollScratchSize == drawableSize { return }
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: pixelFormat,
-            width: max(1, Int(drawableSize.width)),
-            height: max(1, Int(drawableSize.height)),
-            mipmapped: false
-        )
-        desc.storageMode = .private
-        scrollScratchTexture = device.makeTexture(descriptor: desc)
-        scrollScratchSize = drawableSize
-    }
-
     init?(view: MTKView) {
         guard let dev = view.device else {
             ZonvieCore.appLog("[Renderer] init failed: MTKView.device is nil")
@@ -1564,7 +1551,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         lock.lock()
-        if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
+        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
             lock.unlock()
             ZonvieCore.appLog("[Renderer] beginFlush: waiting for row capacity provisioning")
             return .dropped
@@ -2704,8 +2691,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let snappedCommittedDrawableH: UInt32
 
             lock.lock()
-            if rowCapacityProvisioning || rowCapacityRequiredRows > 0 || rowCapacityHardFailure {
-                let terminal = rowCapacityHardFailure
+            if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+                let terminal = rowCapacity.hardFailure
                 lock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity)
                 inflightSemaphore.signal()
@@ -3386,10 +3373,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
                 if refusalReason == nil, let p = plan {
                     if scrollBlitEncoder == nil {
-                        ensureScrollScratchTexture(drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
+                        scrollScratch.ensure(device: device, drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
                         scrollBlitEncoder = cmd.makeBlitCommandEncoder()
                     }
-                    if let blit = scrollBlitEncoder, let scratch = scrollScratchTexture {
+                    if let blit = scrollBlitEncoder, let scratch = scrollScratch.texture {
                         let t0 = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
                         encodeRowScrollBlit(blit, backTexture: backTex, scratch: scratch, plan: p)
                         useGpuScrollCopy = true
@@ -3635,20 +3622,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // pipeline suffices — backgroundAlpha is 1.0, so the solid quad
             // overwrites.
             func clearDirtyRowsNonBlur(_ rows: [Int]) {
-                enc.setRenderPipelineState(pipeline!)
-                let width = Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width))
-                let height = Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height))
-                for row in rows {
-                    let topPx = row * cellH
-                    drawBackgroundClearBand(
-                        enc,
-                        clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                        xRangePx: (leftPx: 0, rightPx: width),
-                        drawableHeight: height,
-                        bgRGB: snappedBgRGB,
-                        gridId: 1
-                    )
-                }
+                encodeSurfaceDirtyRowBands(
+                    encoder: enc,
+                    rows: rows,
+                    pipeline: pipeline!,
+                    cellHeightPx: cellH,
+                    widthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                    heightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                    bgRGB: snappedBgRGB,
+                    gridId: 1
+                )
             }
 
             // The scissored single-pass dirty-row draw that both the
@@ -3746,7 +3729,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             for row in dirtyRows {
                                 let topPx = row * cellHiI
                                 let bottomPx = topPx + cellHiI
-                                drawBackgroundClearBand(
+                                drawSurfaceBackgroundClearBand(
                                     enc,
                                     clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
                                     xRangePx: (leftPx: 0, rightPx: drawableWidthF),
@@ -3975,7 +3958,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                                     || set.rowState.buffers[slot] == nil || set.rowState.counts[slot] == 0
                                 guard empty else { continue }
                                 let topPx = row * Int(cellHi)
-                                drawBackgroundClearBand(
+                                drawSurfaceBackgroundClearBand(
                                     enc,
                                     clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
                                     xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
@@ -4009,7 +3992,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         // plan's dirty rows cover the band and must land on top.
                         if let band = st!.drawBlitClearBand {
                             enc.setRenderPipelineState(use2Pass ? (backgroundPipeline ?? pipeline!) : pipeline!)
-                            drawBackgroundClearBand(
+                            drawSurfaceBackgroundClearBand(
                                 enc,
                                 clearBand: band,
                                 xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
@@ -4028,7 +4011,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                             for row in dirtyLayerRows where resolveLayerRow(row) == nil {
                                 guard row >= 0, row < rowCount else { continue }
                                 let topPx = row * Int(cellHi)
-                                drawBackgroundClearBand(
+                                drawSurfaceBackgroundClearBand(
                                     enc,
                                     clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
                                     xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
@@ -4331,9 +4314,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // User-supplied custom post-process shaders take over the
             // backTex -> drawable step when configured in `.afterBloom`
-            // mode. See ExternalGridView.draw for the external-grid path.
-            // Multi-pass chains ping-pong between customShaderPong[0/1];
-            // the final pass writes straight into the drawable.
+            // mode. See ExternalGridView.draw for the external-grid path,
+            // which drives the same chain through the same helper.
             var customShaderHandled = false
             if !customShaderPipelines.isEmpty,
                customShaderPostProcess == .afterBloom,
@@ -4345,55 +4327,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     windowOffset: .zero,
                     windowSize: view.drawableSize
                 )
-                let pipelines = customShaderPipelines
-                if pipelines.count > 1 {
-                    ensureCustomShaderPong(size: view.drawableSize, pixelFormat: drawable.texture.pixelFormat)
-                }
-                let pongsReady =
-                    pipelines.count <= 1
-                    || (customShaderPong[0] != nil && customShaderPong[1] != nil)
-                if pongsReady {
-                    var allPassesEncoded = true
-                    for (i, pipeline) in pipelines.enumerated() {
-                        let isLast = (i == pipelines.count - 1)
-                        let inputTex: MTLTexture = (i == 0) ? backTex : customShaderPong[(i - 1) % 2]!
-                        let outputTex: MTLTexture = isLast ? drawable.texture : customShaderPong[i % 2]!
-                        if !pipeline.encode(
-                            cmd: cmd,
-                            input: inputTex,
-                            output: outputTex,
-                            copyVertexBuffer: copyVB,
-                            sampler: bilinSamp,
-                            uniforms: uniforms
-                        ) {
-                            allPassesEncoded = false
-                            break
-                        }
-                    }
-                    customShaderHandled = allPassesEncoded
-                }
+                customShaderHandled = encodeSurfaceCustomShaderChain(
+                    cmd: cmd,
+                    pipelines: customShaderPipelines,
+                    input: backTex,
+                    output: drawable.texture,
+                    pong: customShaderPong,
+                    pongSize: view.drawableSize,
+                    copyVertexBuffer: copyVB,
+                    sampler: bilinSamp,
+                    uniforms: uniforms
+                )
             }
 
             var finalCopyEncoded = customShaderHandled
             if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
-                let copyRPD = MTLRenderPassDescriptor()
-                copyRPD.colorAttachments[0].texture = drawable.texture
-                copyRPD.colorAttachments[0].loadAction = .dontCare
-                copyRPD.colorAttachments[0].storeAction = .store
-
-                // Full 4-stage sampling (vertex + fragment) on the copy pass
-                // to investigate why it measures ~2.9ms vs ~0.7ms theoretical.
-                attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
-                attachGpuStatsSamples(to: copyRPD, label: "copy")
-                if let copyEnc = cmd.makeRenderCommandEncoder(descriptor: copyRPD) {
-                    copyEnc.setRenderPipelineState(copyPipe)
-                    copyEnc.setVertexBuffer(copyVB, offset: 0, index: 0)
-                    copyEnc.setFragmentTexture(backTex, index: 0)
-                    copyEnc.setFragmentSamplerState(sampler!, index: 0)
-                    copyEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-                    copyEnc.endEncoding()
-                    finalCopyEncoded = true
-                }
+                finalCopyEncoded = encodeSurfaceDrawableCopy(
+                    cmd: cmd,
+                    input: backTex,
+                    output: drawable.texture,
+                    pipeline: copyPipe,
+                    copyVertexBuffer: copyVB,
+                    sampler: sampler!,
+                    prepare: { copyRPD in
+                        // Full 4-stage sampling (vertex + fragment) on the copy
+                        // pass to investigate why it measures ~2.9ms vs ~0.7ms
+                        // theoretical.
+                        attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
+                        attachGpuStatsSamples(to: copyRPD, label: "copy")
+                    }
+                )
             }
 
             guard finalCopyEncoded else {
@@ -5733,50 +5696,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    private func drawBackgroundClearBand(
-        _ encoder: MTLRenderCommandEncoder,
-        clearBand: (clearTopPx: Int, clearBottomPx: Int),
-        xRangePx: (leftPx: Float, rightPx: Float),
-        drawableHeight: Float,
-        bgRGB: UInt32,
-        gridId: Int64
-    ) {
-        let top = max(0, clearBand.clearTopPx)
-        let bottom = max(top, clearBand.clearBottomPx)
-        guard bottom > top else { return }
-        let r = Float((bgRGB >> 16) & 0xFF) / 255.0
-        let g = Float((bgRGB >> 8) & 0xFF) / 255.0
-        let b = Float(bgRGB & 0xFF) / 255.0
-        let color = simd_float4(r, g, b, 1.0)
-        // Pixels in whatever space the bound layer transform maps: the surface
-        // for a root-grid band, the layer's own rect for a layer's band. The
-        // band lands exactly where the NDC form used to.
-        _ = drawableHeight
-        let x0 = xRangePx.leftPx
-        let x1 = xRangePx.rightPx
-        guard x1 > x0 else { return }
-        let y0 = Float(top)
-        let y1 = Float(bottom)
-        // The vertex stage binary-searches scrollOffsets by grid_id, so a band
-        // must carry the id of the grid it covers: tagging a layer's band with
-        // the root's id would move it by the root's scroll offset.
-        let tl = Vertex(position: simd_float2(x0, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let tr = Vertex(position: simd_float2(x1, y0), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let bl = Vertex(position: simd_float2(x0, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        let br = Vertex(position: simd_float2(x1, y1), texCoord: simd_float2(-1, -1), color: color, grid_id: gridId, deco_flags: 0, deco_phase: 0)
-        // Stack-allocated scratch buffer via withUnsafeTemporaryAllocation
-        // (no heap) instead of building a fresh [Vertex] array every scroll frame.
-        withUnsafeTemporaryAllocation(of: Vertex.self, capacity: 6) { buffer in
-            buffer[0] = tl
-            buffer[1] = bl
-            buffer[2] = tr
-            buffer[3] = tr
-            buffer[4] = bl
-            buffer[5] = br
-            encoder.setVertexBytes(buffer.baseAddress!, length: MemoryLayout<Vertex>.stride * 6, index: 0)
-            encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        }
-    }
 
     /// Raise the retention to cover a band this many rows wide. Set from the
     /// scroll input path, where a wheel event's row count is known.
