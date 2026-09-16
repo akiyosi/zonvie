@@ -1836,7 +1836,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rowStart: bounds.top,
             rowEnd: min(bounds.bottomEx, rows),
             rowsDelta: rowsDelta,
-            seedsEase: !(mainTerminalView?.gestureOwnsScroll(gridId: gridId) ?? false)
+            seedsEase: true
         )
     }
 
@@ -1854,8 +1854,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// on the margin rows. Called from inside the flush bracket, before the
     /// slot remap.
     /// `seedsEase` mirrors the main renderer's split: the row-shift fast path
-    /// owes a seed, the grid_scroll hand-over does not — a gesture compensates
-    /// through the finger and seeding it as well would pay twice.
+    /// owes a seed, the grid_scroll hand-over does not.
+    ///
+    /// It deliberately does NOT ask whether a gesture owns the grid. That is
+    /// the tick's decision, on the main thread, where the gesture state lives:
+    /// these seeds join the main surface's in the same `tickSmoothScroll`,
+    /// which tells a gesture-owned grid from a decayed one below. Answering it
+    /// here, on the core thread, dropped the seed outright — and a single-row
+    /// step arriving while `pendingSentScroll` is non-zero is exactly the held
+    /// key that needs one, so the picture snapped a whole cell. The main
+    /// renderer's `captureLayerScrollStep` documents the same rule.
     private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int, seedsEase: Bool) {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         guard ws.rowState.usingRowBuffers else { return }
@@ -1967,7 +1975,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 rowStart: rowStart,
                 rowEnd: rowEnd,
                 rowsDelta: rowsDelta,
-                seedsEase: !(mainTerminalView?.gestureOwnsScroll(gridId: gridId) ?? false)
+                seedsEase: true
             )
         }
         flushHasStructuralRowChange = true

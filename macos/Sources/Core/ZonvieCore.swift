@@ -4404,9 +4404,8 @@ final class ZonvieCore {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             guard let mainView = self.terminalView else { return }
-            let scale = mainView.window?.backingScaleFactor ?? 1.0
-
-            ZonvieCore.appLog("[resizeExternalWindows] cellW=\(cellWidthPx) cellH=\(cellHeightPx) scale=\(scale)")
+            // No shared scale here: each window converts with its own, below.
+            ZonvieCore.appLog("[resizeExternalWindows] cellW=\(cellWidthPx) cellH=\(cellHeightPx)")
 
             for (gridId, window) in self.externalWindows {
                 // Skip special windows (cmdline, popupmenu, msg_show, msg_history)
@@ -4424,6 +4423,13 @@ final class ZonvieCore {
 
                 guard rows > 0 && cols > 0 else { continue }
 
+                // The window's OWN scale converts its pixel cell metrics to the
+                // points its frame is set in. Using the main window's put an
+                // external window on a different-DPI screen at a size whose
+                // drawable no longer matches `rows * cellHeightPx`, which is the
+                // viewport the surface renders into. The view already resolves
+                // every other scale from its own window.
+                let scale = window.backingScaleFactor
                 let newWidth = CGFloat(cols) * cellWidthPx / scale
                 let newHeight = CGFloat(rows) * cellHeightPx / scale
 
@@ -5000,7 +5006,8 @@ final class ZonvieCore {
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
         let cellW = CGFloat(renderer.cellWidthPx)
         let cellH = CGFloat(renderer.cellHeightPx)
-        let scale = mainView.window?.backingScaleFactor ?? 1.0
+        // This window's own scale, for the reason resizeExternalWindows states.
+        let scale = window.backingScaleFactor
 
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
         // Resize the OS window to match the grid size.

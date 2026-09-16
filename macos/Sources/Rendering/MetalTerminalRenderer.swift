@@ -3036,13 +3036,24 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // translated back to the edge it left through; the shader then
             // applies its grid's scroll offset like any other row, and the
             // existing content clip discards the part outside the window.
+            // Gated on this frame's raw offset, not on smoothScrolling. Both
+            // the offset shift and the content clip come from the grid's
+            // ScrollOffset entry, matched by grid_id in the vertex shader. On
+            // the settle's final frame the offset is gone while smoothScrolling
+            // stays true for one more frame (the extension the back-buffer blit
+            // needs), so a retained row drawn then matches no entry and lands
+            // unshifted and UNCLIPPED at its targetRow, in the margin rows above
+            // the edge it left through. `pruneUndisplaced` is not a defence:
+            // it deliberately keeps a band whose grid still has an unspent seed.
+            // The external surface has always used this predicate.
+            let retainedRows = hadActiveScrollOffsetThisFrame ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
-            let smoothRowRange = 0..<(safeRowCount + (smoothScrolling ? retainedSnapshot.count : 0))
+            let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow >= retainedRowBase else { return resolvedRowState(logicalRow) }
                 let i = logicalRow - retainedRowBase
-                guard i < retainedSnapshot.count else { return nil }
-                let r = retainedSnapshot[i]
+                guard i < retainedRows.count else { return nil }
+                let r = retainedRows[i]
                 // A layer's retained rows are drawn in that layer's own pass,
                 // where its transform places them.
                 guard r.gridId == 1 else { return nil }
@@ -5847,9 +5858,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // `depthRows` — the offset is clamped to the same reach — so keep the
         // rows adjacent to the edge the block left through.
         let depth = retention.depthRows
+        // Clamp to the rows the grid actually has, as the external surface
+        // does. The bounds are armed per gesture and never disarmed, so a grid
+        // that has shrunk since plans rows past its end: every one of them
+        // fails `captureOneRetainedRow`'s vertex-count test, the band opens
+        // empty, and `beginStep` has already pruned the previous step's good
+        // rows against a pivot derived from the stale span.
+        let capturableRowEnd = min(bounds.bottomEx, cs.rowState.counts.count)
         guard let plan = ScrollRetention.plan(
             rowStart: bounds.top,
-            rowEnd: bounds.bottomEx,
+            rowEnd: capturableRowEnd,
             rowsDelta: rowsDelta,
             depth: depth
         ) else {
