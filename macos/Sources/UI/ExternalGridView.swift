@@ -168,6 +168,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var pendingLayoutDamage = false
     private var layerGridIdScratch: [Int64] = []
     private var layerDrawSnapshot: [(SurfaceLayer, SurfaceBufferSet)] = []
+    /// Rows each hosted layer's committed placement has travelled upwards
+    /// since this surface began, in the same units and direction as
+    /// on_grid_scroll's rowsDelta. The float ledger's other half; the main
+    /// renderer keeps the identical map for the layers IT places, and the debt
+    /// it computes was simply absent for a float an external window hosts.
+    /// Written only under `tripleBufferLock` at commit; read by
+    /// copyPlacementRowsUp.
+    private var layerPlacementRowsUp: [Int64: Int] = [:]
+
+    /// Hand the float ledger this surface's half, merging into storage the
+    /// caller owns so the per-frame read costs one lock and no allocation.
+    func copyPlacementRowsUp(into out: inout [Int64: Int]) {
+        tripleBufferLock.lock()
+        defer { tripleBufferLock.unlock() }
+        for (gridId, rows) in layerPlacementRowsUp { out[gridId] = rows }
+    }
+
     /// This surface's fixed-float mask, the same one the main renderer keeps.
     /// Built in draw() from the committed layer snapshot, so it needs no lock
     /// of its own; rebuilt only when the rectangles change.
@@ -1553,8 +1570,31 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             committedCursorGridId = pendingCursorGridId
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
+                // How far each hosted layer's committed placement has travelled,
+                // counted upwards to match on_grid_scroll's rowsDelta. The float
+                // ledger pairs this with the anchor's compensation so a float is
+                // not handed the offset for a step its own placement already
+                // performed. Accumulated here for the same reason the main
+                // renderer accumulates it at its own promotion: this is the only
+                // point a placement change is a discrete, known event.
+                let ledgerCellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
+                if ledgerCellHeightPx > 0 {
+                    for layer in staged where layer.gridId != gridId {
+                        guard let previous = committedSurfaceLayers.first(where: { $0.gridId == layer.gridId })
+                        else { continue }
+                        let rowsUp = Int(((previous.originPx.y - layer.originPx.y) / ledgerCellHeightPx).rounded())
+                        if rowsUp != 0 { layerPlacementRowsUp[layer.gridId, default: 0] += rowsUp }
+                    }
+                }
                 committedSurfaceLayers = staged
                 pendingSurfaceLayers = nil
+                // A destroyed grid's travel describes a layer that no longer
+                // exists, and its id is reused by the next float a scroll makes.
+                if layerPlacementRowsUp.count > staged.count {
+                    layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
+                        staged.contains { $0.gridId == entry.key }
+                    }
+                }
                 // Removing the last child must erase its old pixels too.
                 pendingLayoutDamage = true
             }
@@ -2841,6 +2881,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let cursorOwnerSnapshot: Int64
             let cursorLayerOriginSnapshot: simd_float2
             let cursorLayerFollowsScrollSnapshot: Bool
+            let cursorLayerAnchorGridSnapshot: Int64
             let layoutDamageSnapshot: Bool
 
             // Settle this frame's scroll state BEFORE the latch below, which is
@@ -3032,6 +3073,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             cursorLayerFollowsScrollSnapshot = committedSurfaceLayers.first {
                 $0.gridId == cursorOwnerSnapshot && $0.gridId != gridId
             }?.followsScroll ?? false
+            // Taken from the same committed entry as the flag above: the float
+            // ledger is keyed by the pair (float, its anchor).
+            cursorLayerAnchorGridSnapshot = committedSurfaceLayers.first {
+                $0.gridId == cursorOwnerSnapshot && $0.gridId != gridId
+            }?.anchorGrid ?? gridId
             layerDrawSnapshot.removeAll(keepingCapacity: true)
             for layer in committedSurfaceLayers where layer.gridId != gridId {
                 if let sets = gridBuffers.existingSets(for: layer.gridId) {
@@ -3625,6 +3671,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     offset: offset,
                     viewportHeightPx: viewportMetrics.fragmentHeight
                 )
+                // The same debt the body gives back, or the cursor and the rows
+                // it sits on are drawn rows apart.
+                cursorDrawOrigin.y += mainTerminalView?.floatDebtPx(
+                    gridId: cursorOwnerSnapshot,
+                    anchorGridId: cursorLayerAnchorGridSnapshot,
+                    cellHeightPx: Float(ch)
+                ) ?? 0
             }
 
             func drawHostedLayers(_ encoder: MTLRenderCommandEncoder, glow: Bool = false) {
@@ -3650,6 +3703,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             offset: offset,
                             viewportHeightPx: extent.y
                         )
+                        // Give back the rows this float's own placement has
+                        // already travelled. Without it the float is handed the
+                        // anchor's whole compensation on top of a placement that
+                        // has moved with it, and drifts from its anchor for the
+                        // length of the scroll — the correction the main
+                        // renderer applies when it builds a float's offset, and
+                        // which a float an external window hosts never got.
+                        origin.y += mainTerminalView?.floatDebtPx(
+                            gridId: layer.gridId,
+                            anchorGridId: layer.anchorGrid,
+                            cellHeightPx: Float(ch)
+                        ) ?? 0
                     }
                     let ratio: Float = glow ? 0.5 : 1
                     // A displaced origin is fractional mid-ease; floor it and

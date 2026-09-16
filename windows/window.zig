@@ -2224,6 +2224,16 @@ pub export fn WndProc(
 
                 // Read vertex-related state from TBS committed set (refcount-protected, lock-free).
                 const row_mode = committed.row_mode;
+                // The generation this committed set's vertices were generated
+                // against. `row_layout_gen` and `shared_metrics_gen` are bumped
+                // together, but the only gate below compares `row_layout_gen`
+                // to THIS paint's snapshot — i.e. the already-new value — so a
+                // paint landing after a guifont/linespace/DPI change and before
+                // the core's re-flush passed it and drew the old set against the
+                // new row height. Rows and columns need not have changed, so the
+                // rows_mismatch test does not catch it either. The external
+                // driver has always refused such a set.
+                const committed_metrics_gen = committed.metrics_gen;
                 const rows_snapshot: u32 = committed.rows;
                 const row_verts_len: u32 = @intCast(committed.row_map.items.len);
                 const main_verts_len_snapshot: u32 = @intCast(committed.flat_verts.items.len);
@@ -3638,8 +3648,10 @@ pub export fn WndProc(
 
                         var layout_ok: bool = true;
                         var rows_current: u32 = 0;
+                        var metrics_ok: bool = true;
                         app.mu.lockUncancelable(core.clock.io());
                         layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
+                        metrics_ok = row_mode and committed_metrics_gen == app.shared_metrics_gen;
                         rows_current = committed.rows;
                         app.mu.unlock(core.clock.io());
 
@@ -3651,6 +3663,9 @@ pub export fn WndProc(
                             // render-failure path requeues a full paint at the
                             // new generation.
                             if (!layout_ok) break :blk false;
+                            // Same rule from the set's own side: these vertices
+                            // were generated against the metrics named above.
+                            if (row_mode and !metrics_ok) break :blk false;
                             if (rows_current != rows_snapshot) break :blk false;
                             // A failed VB create/upload/draw means one or more
                             // rows from this paint snapshot never reached
