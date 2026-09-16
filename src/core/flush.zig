@@ -5455,6 +5455,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                 // lifecycle callback is committed; nothing exists to shift yet.
                 if (self.grid.external_grids.contains(grid_id) and
                     !self.known_external_grids.contains(grid_id)) break :blk false;
+                // The same clause dispatchGridRowScroll applies to the HOST.
+                // These two gates decide one thing — "did the frontend get a
+                // shift, so may I send only the vacated rows?" — and must agree.
+                // A layer placed on an external root whose open is still
+                // withheld gets no shift dispatched, so assuming one here sent
+                // a partial row set the frontend cannot place.
+                const placed_surface = placedSurfaceForGrid(&self.grid, grid_id) orelse break :blk false;
+                if (placed_surface != 1 and
+                    !self.known_external_grids.contains(placed_surface)) break :blk false;
                 const op = sg.last_scroll_op orelse break :blk false;
                 if (sg.scroll_fast_path_blocked) break :blk false;
                 _ = gridScrollFastPathRegion(

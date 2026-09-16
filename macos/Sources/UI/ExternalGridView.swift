@@ -544,7 +544,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// What `markScrollOffsetStatePresented` last froze, for the end-of-ease
     /// comparison the root's own `lastPresentedScrollOffsetData` makes.
     private var lastPresentedHostedScrollOffsetData: [MetalTerminalRenderer.ScrollOffset] = []
-    private var hostedLayerOriginScratch: [(gridId: Int64, originYPx: Float)] = []
+    private var hostedLayerOriginScratch: [(gridId: Int64, originYPx: Float, z: Int32)] = []
     private var lastPresentedScrollOffsetData: MetalTerminalRenderer.ScrollOffset?
     private var lastPresentedScrollOffsetActive: Bool = false
     /// Rows scrolled off this window's edge, kept alive so the band the
@@ -4435,7 +4435,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         tripleBufferLock.lock()
         hostedLayerOriginScratch.removeAll(keepingCapacity: true)
         for layer in committedSurfaceLayers where layer.gridId != gridId {
-            hostedLayerOriginScratch.append((gridId: layer.gridId, originYPx: layer.originPx.y))
+            hostedLayerOriginScratch.append((gridId: layer.gridId, originYPx: layer.originPx.y, z: Int32(clamping: layer.z)))
         }
         tripleBufferLock.unlock()
 
@@ -4447,6 +4447,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 cellHeightPx: cellHeightPx
             ) else { continue }
             info.gridTopYNDC = 1.0 - (vpOriginYPxForGridTop + hosted.originYPx) * (2.0 / viewportHeight)
+            // The z this surface's fixed-float mask is built from, so the two
+            // are on one scale. getScrollOffsetInfo leaves zindex at 0 because
+            // the main window fills it in itself from the Neovim zindex; here
+            // the mask carries `layer.z`, which the core emits as a PAINT-ORDER
+            // rank (>= 1 for every hosted layer). Left at 0 the shader's
+            // `interval.z > scroll_z` was true for a float tested against its
+            // OWN rect, so a fixed float scrolled on its own discarded its
+            // scrolled glyphs for the whole ease.
+            info.zindex = hosted.z
             hostedScrollOffsetScratch.append(MetalTerminalRenderer.computeScrollOffset(
                 info: info,
                 viewportHeight: viewportHeight,
