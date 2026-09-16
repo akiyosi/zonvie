@@ -141,6 +141,16 @@ fn beginVertexBudgetTransaction(core: *Core) !void {
     if (core.vertex_budget_transaction_active) return vertexBudgetExceeded(core);
     try syncVertexBudgetAggregate(core, true);
     core.grid.main_buf.vertex_budget_touched = false;
+    // The intrusive touched list is rebuilt from the head, so a sub-grid whose
+    // flag survived a torn-down transaction would never be re-linked and would
+    // escape the per-surface limit. Clearing main's flag defensively and not
+    // theirs was the asymmetry; `GridBuf.resize` nulling `vertex_budget_touched_next`
+    // mid-transaction is the path that can leave one set.
+    var sg_it = core.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| {
+        sg.vertex_budget_touched = false;
+        sg.vertex_budget_touched_next = null;
+    }
     core.vertex_budget_touched_grid_head = null;
     core.vertex_budget_transaction_active = true;
 }
@@ -201,7 +211,7 @@ fn clearTouchedVertexBudgetSurfaces(core: *Core) void {
 /// back exactly as the still-committed frame left it. Returns false when the
 /// snapshot could not be taken, in which case the caller must fall back to the
 /// invalidate-everything recovery.
-fn snapshotMainVertexRowLedger(core: *Core) bool {
+fn snapshotVertexRowLedgers(core: *Core) bool {
     core.flush_row_ledger_snapshot_valid = false;
     if (!core.grid.main_buf.vertex_row_ledger_valid) return false;
     const counts = core.grid.main_buf.vertex_row_counts;
@@ -209,17 +219,58 @@ fn snapshotMainVertexRowLedger(core: *Core) bool {
     core.flush_row_counts_snapshot.items.len = counts.len;
     @memcpy(core.flush_row_counts_snapshot.items, counts);
     core.flush_main_vertex_count_snapshot = core.grid.main_buf.surface_vertex_count;
+
+    // Retire last attempt's entries before recording this one's.
+    var stale = core.flush_subgrid_ledgers.valueIterator();
+    while (stale.next()) |entry| entry.live = false;
+
+    var sg_it = core.grid.sub_grids.iterator();
+    while (sg_it.next()) |e| {
+        const buf = e.value_ptr;
+        // One unaccounted surface makes the whole restore unsound, so fall back
+        // to the invalidate-everything recovery exactly as main does.
+        if (!buf.vertex_row_ledger_valid) return false;
+        const gop = core.flush_subgrid_ledgers.getOrPut(core.alloc, e.key_ptr.*) catch return false;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const saved = gop.value_ptr;
+        saved.counts.ensureTotalCapacity(core.alloc, buf.vertex_row_counts.len) catch return false;
+        saved.counts.items.len = buf.vertex_row_counts.len;
+        @memcpy(saved.counts.items, buf.vertex_row_counts);
+        saved.surface_vertex_count = buf.surface_vertex_count;
+        saved.live = true;
+    }
+    core.flush_subgrid_aggregate_snapshot = core.grid.subgrid_surface_vertex_count;
     core.flush_row_ledger_snapshot_valid = true;
     return true;
 }
 
-fn restoreMainVertexRowLedger(core: *Core) bool {
+fn restoreVertexRowLedgers(core: *Core) bool {
     if (!core.flush_row_ledger_snapshot_valid) return false;
     const saved = core.flush_row_counts_snapshot.items;
     if (saved.len != core.grid.main_buf.vertex_row_counts.len) return false;
+    // Check every surface before mutating any: a half-applied restore would
+    // leave some grids accounted against the committed frame and others not,
+    // which is worse than the conservative full invalidation.
+    var check = core.flush_subgrid_ledgers.iterator();
+    while (check.next()) |e| {
+        if (!e.value_ptr.live) continue;
+        const buf = core.grid.sub_grids.getPtr(e.key_ptr.*) orelse return false;
+        if (buf.vertex_row_counts.len != e.value_ptr.counts.items.len) return false;
+    }
+
     @memcpy(core.grid.main_buf.vertex_row_counts, saved);
     core.grid.main_buf.surface_vertex_count = core.flush_main_vertex_count_snapshot;
     core.grid.main_buf.vertex_row_ledger_valid = true;
+
+    var it = core.flush_subgrid_ledgers.iterator();
+    while (it.next()) |e| {
+        if (!e.value_ptr.live) continue;
+        const buf = core.grid.sub_grids.getPtr(e.key_ptr.*).?;
+        @memcpy(buf.vertex_row_counts, e.value_ptr.counts.items);
+        buf.surface_vertex_count = e.value_ptr.surface_vertex_count;
+        buf.vertex_row_ledger_valid = true;
+    }
+    core.grid.subgrid_surface_vertex_count = core.flush_subgrid_aggregate_snapshot;
     return true;
 }
 
@@ -237,19 +288,16 @@ fn finishVertexBudgetTransactionRestoring(core: *Core, commit: bool, restore_mai
     // the screen, and atlas reclamation reads them.
     if (commit) core.display_mirror_stale = false;
     clearTouchedVertexBudgetSurfaces(core);
-    if (!commit and restore_main_ledger and restoreMainVertexRowLedger(core)) {
+    if (!commit and restore_main_ledger and restoreVertexRowLedgers(core)) {
         core.display_mirror_stale = true;
-        // Sub-grid surfaces keep the conservative recovery: this core holds no
-        // vertex mirror of what their frontend surfaces retained.
-        var sg_it = core.grid.sub_grids.valueIterator();
-        while (sg_it.next()) |sg| {
-            sg.surface_vertex_count = 0;
-            sg.vertex_row_ledger_valid = false;
-            sg.markAllDirty();
-        }
-        core.grid.subgrid_surface_vertex_count = 0;
+        // Every surface keeps its exact accounting now, sub-grids included.
+        // They used to be zeroed and re-marked whole here because the ledger
+        // was only ever mirrored for the main grid — and under ext_multigrid
+        // that is the container, not the content, so one routine backpressure
+        // refusal reshaped every split and float.
         core.force_ext_cursor_recheck = true;
-        core.flush_vertex_count_aggregate = core.grid.main_buf.surface_vertex_count;
+        core.flush_vertex_count_aggregate =
+            core.grid.main_buf.surface_vertex_count + core.grid.subgrid_surface_vertex_count;
         core.vertex_budget_transaction_active = false;
         return;
     }
@@ -944,14 +992,22 @@ pub const FlushCache = struct {
     }
 
     /// Reset cache for a new flush (clear valid flags and counters).
-    pub fn reset(self: *FlushCache) void {
-        @memset(self.hl_valid_buf, false);
+    /// Zero the per-grid counters only. `hl_id` is a Neovim-global id and the
+    /// resolved attribute does not depend on which grid asked, so the validity
+    /// bits survive: they are reset once per flush, as the main pass resets
+    /// them once for itself.
+    pub fn resetCounters(self: *FlushCache) void {
         self.perf_hl_cache_hits = 0;
         self.perf_hl_cache_misses = 0;
         self.perf_glyph_ascii_hits = 0;
         self.perf_glyph_ascii_misses = 0;
         self.perf_glyph_nonascii_hits = 0;
         self.perf_glyph_nonascii_misses = 0;
+    }
+
+    pub fn reset(self: *FlushCache) void {
+        @memset(self.hl_valid_buf, false);
+        self.resetCounters();
     }
 };
 
@@ -2654,11 +2710,17 @@ fn dispatchGridRowScroll(
     grid_id: i64,
 ) bool {
     if (grid_id < 2) return false;
-    if (placedSurfaceForGrid(&core.grid, grid_id) == null) return false;
+    const surface_id = placedSurfaceForGrid(&core.grid, grid_id) orelse return false;
     // An external grid has no frontend surface to remap into until its open
     // callback has seeded one; a layer of the main surface always has one.
     if (core.grid.external_grids.contains(grid_id) and
         !core.known_external_grids.contains(grid_id)) return false;
+    // Nor has a layer drawn ON such a grid. notifyExternalWindowChanges
+    // withholds the open for a pending grid still under 2 rows or columns, and
+    // publishSurfaceLayouts withholds its layout to match; a shift sent for
+    // something placed on that surface reaches a frontend with no storage for
+    // it, and both answer by failing the whole flush until the resize lands.
+    if (surface_id != 1 and !core.known_external_grids.contains(surface_id)) return false;
     const sg = core.grid.sub_grids.getPtr(grid_id) orelse return false;
     if (sg.scroll_fast_path_blocked) return false;
 
@@ -2688,7 +2750,7 @@ pub const FlushCtx = struct {
         ctx.core.grid.snapshotDirty(ctx.core.alloc, &ctx.core.flush_dirty_snapshot) catch {
             dirty_snapshot_valid = false;
         };
-        if (!snapshotMainVertexRowLedger(ctx.core)) dirty_snapshot_valid = false;
+        if (!snapshotVertexRowLedgers(ctx.core)) dirty_snapshot_valid = false;
 
         // === PERF LOG: flush開始 ===
         const perf_enabled = ctx.core.log.cb != null;
@@ -2872,13 +2934,16 @@ pub const FlushCtx = struct {
                     // Successfully invoked on_grid_scroll IDs are consumed at
                     // the call site; any unvisited IDs remain in the compact
                     // prefix/per-grid bits for retry.
+                    // The snapshot covers the sub-grids too, so each of them
+                    // owes exactly the rows this attempt consumed. Only a
+                    // failed snapshot falls back to the full resend.
                     if (dirty_snapshot_valid) {
                         ctx.core.grid.restoreDirty(&ctx.core.flush_dirty_snapshot);
                     } else {
                         ctx.core.grid.markAllDirty();
+                        var sg_it = ctx.core.grid.sub_grids.valueIterator();
+                        while (sg_it.next()) |sg| sg.markAllDirty();
                     }
-                    var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                    while (sg_it.next()) |sg| sg.markAllDirty();
                     ctx.core.last_sent_content_rev = last_sent_content_rev_before;
                     ctx.core.last_sent_cursor_rev = last_sent_cursor_rev_before;
                     ctx.core.force_ext_cursor_recheck = true;
@@ -4154,7 +4219,7 @@ pub const FlushCtx = struct {
                                             uv3,
                                             fg,
                                             cursor_grid_id, // cursor belongs to its actual grid
-                                            c_api.DECO_SCROLLABLE | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0), // cursor is always in content area
+                                            cursorGlyphDecoFlags(ge.bytes_per_pixel), // cursor is always in content area
                                         );
                                     }
                                 }
@@ -4446,18 +4511,29 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
 /// Whether the main surface draws any window grid as its own layer. Mirrors the
 /// acceptance test in `collectSurfaceLayerEntries`, so the root grid's cells
 /// beneath such a layer are never what the user sees.
-fn mainSurfaceHasLayers(self: *Core) bool {
+/// Whether `surface_id` places any grid as a layer on top of its own root.
+///
+/// The surface is an argument because an external grid is a surface root too,
+/// and can host floats exactly as the main window does. Asking this only about
+/// surface 1 meant an external root kept painting the default background under
+/// its layers, which is the compounded-alpha defect the main-side flag exists
+/// to prevent.
+fn surfaceHasLayers(self: *Core, surface_id: i64) bool {
     var it = self.grid.win_pos.iterator();
     while (it.next()) |e| {
         const grid_id = e.key_ptr.*;
         if (grid_id == 1) continue;
         if (self.grid.external_grids.contains(grid_id)) continue;
-        if (placedSurfaceForGrid(&self.grid, grid_id) != 1) continue;
+        if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) continue;
         const sg = self.grid.sub_grids.get(grid_id) orelse continue;
         if (sg.rows == 0 or sg.cols == 0) continue;
         return true;
     }
     return false;
+}
+
+fn mainSurfaceHasLayers(self: *Core) bool {
+    return surfaceHasLayers(self, 1);
 }
 
 /// Fill `core.emit_grid_ids` with every grid that emits its own rows: the
@@ -4711,9 +4787,12 @@ fn rowTopPadPx(linespace_px: i32) i32 {
     return @divTrunc(linespace_px, 2);
 }
 
-fn externalCursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
+/// Deco flags for a cursor glyph. The same set on every surface: the emoji test
+/// is `>= 4` as it is at every other row-path site (`== 4` here was the only
+/// exception, and `bytes_per_pixel` is documented as 1, 3 or 4).
+fn cursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
     return c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE |
-        (if (bytes_per_pixel == 4) c_api.DECO_COLOR_EMOJI else 0);
+        (if (bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
 }
 
 const ExternalFloatRowRange = struct {
@@ -5116,10 +5195,18 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         }
     }
 
-    // Cursor on a closed external grid (e.g. cmdline): force-redraw whichever
-    // grid previously held it.
-    const cursor_on_closed_grid = !self.known_external_grids.contains(cursor_grid) and
-        cursor_grid != 1; // cursor_grid != global grid
+    // Cursor on a CLOSED grid (e.g. the cmdline going away): force-redraw
+    // whichever grid previously held it.
+    //
+    // "Closed" has to mean no surface places the grid any more. The test used
+    // to be `not an external root`, which is also true of every split the main
+    // window places and of every float this very window hosts — so an ordinary
+    // cursor move out of an external window regenerated that window's every
+    // row. The grid the cursor left is already told to clear by the empty
+    // cursor set the loop below sends it, so nothing but a genuinely departed
+    // grid needs more than that.
+    const cursor_on_closed_grid = cursor_grid != 1 and
+        placedSurfaceForGrid(&self.grid, cursor_grid) == null;
     const need_force_redraw_last = cursor_on_closed_grid and
         self.known_external_grids.contains(self.last_ext_cursor_grid);
 
@@ -5236,6 +5323,13 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         .hl_cache_buf = self.hl_cache_buf orelse &.{},
         .hl_valid_buf = self.hl_valid_buf orelse &.{},
     };
+    // Once for this pass, not once per grid. The validity bits are indexed by
+    // Neovim's global hl_id, so a resolution one grid paid for is good for
+    // every other grid in the same flush; clearing them per grid both memset
+    // the whole table (up to the configured hl_cache_size) N times and threw
+    // away every cross-grid hit. The main pass already clears them once for
+    // itself, on the same reasoning.
+    cache.reset();
     // Glyph cache is persistent across flushes (same as row_mode path).
 
     // If any grid triggers an atlas reset, already-sent grids have stale UVs.
@@ -5280,7 +5374,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         if (!force_render and !force_redraw_this and !sg.dirty and !cursor_affected and !cursor_moved_within) continue;
 
-        cache.reset();
+        // Counters only: the hl validity table is this whole pass's, cleared above.
+        cache.resetCounters();
 
         // Full redraw only for forced operations, not cursor-only changes.
         // Cursor rows are handled via regen_rows (fast path) or dirty_rows marking below.
@@ -5311,6 +5406,14 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             const ext_margins = self.grid.getViewportMargins(grid_id);
 
             const is_cmdline = grid_id == grid_mod.CMDLINE_GRID_ID;
+            // An external grid is a surface root and can host floats, so it owes
+            // the same rule the main root does: once a layer paints the default
+            // background over it, painting it here too compounds the alpha under
+            // blur. Only asked under blur, and only of a root, so the win_pos
+            // scan costs nothing in the common case.
+            const surface_skips_default_bg = self.blur_enabled and
+                self.grid.external_grids.contains(grid_id) and
+                surfaceHasLayers(self, grid_id);
 
             var ext_retried: bool = false;
 
@@ -5380,7 +5483,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             ext_retry: while (true) {
                 if (ext_retried) {
                     // Reset per-pass state for clean retry
-                    cache.reset(); // Resets perf counters + hl_valid (hl_valid reset is harmless)
+                    // An atlas reset invalidates glyph UVs, not hl resolution.
+                    cache.resetCounters();
                     ext_had_row_error = false;
                     ext_had_glyph_miss = false;
                 }
@@ -5478,6 +5582,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             .background_opacity = self.background_opacity,
                             .is_cmdline = is_cmdline,
                             .glow_enabled = ext_glow_enabled,
+                            .skip_default_bg = surface_skips_default_bg,
                         }, ext_verts) catch |err| {
                             ext_verts.clearRetainingCapacity();
                             ext_had_row_error = true;
@@ -5697,7 +5802,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                                             self.hl.default_bg;
                                         const text_col = Helpers.rgb(cursor_fg);
 
-                                        const cursor_glyph_flags = externalCursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
+                                        const cursor_glyph_flags = cursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
                                         VH.pushGlyphQuadAssumeCapacity(
                                             ext_verts,
                                             gx0,
@@ -8959,11 +9064,11 @@ test "negative linespace splits above and below the text" {
 }
 
 test "external cursor color glyph retains emoji decoration" {
-    const rgba_flags = externalCursorGlyphDecoFlags(4);
+    const rgba_flags = cursorGlyphDecoFlags(4);
     try std.testing.expect((rgba_flags & c_api.DECO_CURSOR) != 0);
     try std.testing.expect((rgba_flags & c_api.DECO_SCROLLABLE) != 0);
     try std.testing.expect((rgba_flags & c_api.DECO_COLOR_EMOJI) != 0);
-    try std.testing.expect((externalCursorGlyphDecoFlags(1) & c_api.DECO_COLOR_EMOJI) == 0);
+    try std.testing.expect((cursorGlyphDecoFlags(1) & c_api.DECO_COLOR_EMOJI) == 0);
 }
 
 test "flush begin abort preserves undispatched scroll state" {
@@ -14924,6 +15029,75 @@ test "the scroll fast path applies to a vertical split, a float, and both at onc
     try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3));
 }
 
+test "a row shift waits for the external window that hosts the scrolling float" {
+    const State = struct {
+        calls: u32 = 0,
+        last_grid: i64 = 0,
+
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls += 1;
+            self.last_grid = grid_id;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(10, 40);
+    var state = State{};
+    core.ctx = &state;
+
+    // An external window Neovim proposed too small: the open is withheld until
+    // the resize the core asked for lands, so the frontend has no surface yet.
+    try core.grid.resizeGrid(2, 10, 20);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.grid.pending_ext_window_grids.put(core.alloc, 2, .{ .grid_id = 2, .width = 20, .height = 10 });
+
+    // A float that surface hosts.
+    try core.grid.resizeGrid(3, 6, 10);
+    try core.grid.setWinFloatPos(3, 43, 1, 1, 50, 0, 2, true);
+
+    // Neither the withheld host nor anything it places may shift: the frontend
+    // has no storage for that surface and answers a shift by failing the flush.
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 2));
+    core.grid.scrollGrid(3, 0, 6, 0, 10, 1, 0);
+    try std.testing.expect(!dispatchGridRowScroll(&core, State.onRowScroll, 3));
+    try std.testing.expectEqual(@as(u32, 0), state.calls);
+
+    // The open lands, and the float becomes eligible with its host.
+    _ = core.grid.pending_ext_window_grids.remove(2);
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 10,
+        .cols = 20,
+    });
+    core.grid.sub_grids.getPtr(3).?.clearScrollState();
+    core.grid.scrollGrid(3, 0, 6, 0, 10, 1, 0);
+    try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 3));
+    try std.testing.expectEqual(@as(u32, 1), state.calls);
+    try std.testing.expectEqual(@as(i64, 3), state.last_grid);
+}
+
 test "a vertical split's scroll publishes a shift instead of regenerating the band" {
     const State = struct {
         scroll_calls: u32 = 0,
@@ -15703,4 +15877,301 @@ test "a layer's combining tail is read at the cell that owns it, not at the wind
         &.{ ' ', 'e', 0x0301, ' ', ' ', ' ', ' ', ' ', ' ' },
         state.seen[0..state.seen_len],
     );
+}
+
+test "a rejected flush owes each sub-grid only the rows it consumed" {
+    const ROWS: u32 = 8;
+    const COLS: u32 = 4;
+    const State = struct {
+        core: *Core,
+        reject: bool = false,
+        rows_seen: u32 = 0,
+
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, verts: ?[*]const c_api.Vertex, vert_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.rows_seen += 1;
+            if (self.reject) self.core.flush_aborted = true;
+        }
+        fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+            return 1;
+        }
+        fn upload(ctx: ?*anyopaque, dx: u32, dy: u32, w: u32, h: u32, b: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = ctx;
+            _ = dx;
+            _ = dy;
+            _ = w;
+            _ = h;
+            _ = b;
+        }
+        fn create(ctx: ?*anyopaque, aw: u32, ah: u32) callconv(.c) void {
+            _ = ctx;
+            _ = aw;
+            _ = ah;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    // Two splits, as ext_multigrid draws them: the sub-grids hold the content
+    // and grid 1 is only their container.
+    try core.grid.resizeGrid(1, ROWS, COLS * 2);
+    try core.grid.resizeGrid(2, ROWS, COLS);
+    try core.grid.setWinPos(2, 102, 0, 0);
+    try core.grid.resizeGrid(3, ROWS, COLS);
+    try core.grid.setWinPos(3, 103, 0, COLS);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = COLS * 2;
+    core.drawable_h_px = ROWS;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    for (2..4) |gid| {
+        for (0..ROWS) |r| for (0..COLS) |cc| core.grid.putCellGrid(@intCast(gid), @intCast(r), @intCast(cc), 'A', 0);
+    }
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    // Settle, so the next attempt owes single rows rather than the viewport.
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(ROWS, COLS * 2);
+    try flush_ctx.onFlush(ROWS, COLS * 2);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(2).?.dirty_all);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(3).?.dirty_all);
+
+    // One window changes one row; the frontend then declines to publish.
+    core.grid.putCellGrid(2, 5, 0, 'B', 0);
+    state.reject = true;
+    state.rows_seen = 0;
+    flush_ctx.onFlush(ROWS, COLS * 2) catch {};
+    // Vacuity gate: the rejection must have landed on a real emission.
+    try std.testing.expect(state.rows_seen != 0);
+
+    const sg2 = core.grid.sub_grids.getPtr(2).?;
+    const sg3 = core.grid.sub_grids.getPtr(3).?;
+    try std.testing.expect(!sg2.dirty_all);
+    try std.testing.expect(!sg3.dirty_all);
+    try std.testing.expect(sg2.dirty_rows.isSet(5));
+    // The untouched split owes nothing: a refusal leaves its committed frame on
+    // screen, so resending it was pure waste.
+    var owed3: u32 = 0;
+    var it3 = sg3.dirty_rows.iterator(.{});
+    while (it3.next()) |_| owed3 += 1;
+    try std.testing.expectEqual(@as(u32, 0), owed3);
+}
+
+test "an external root stops painting the default background once it hosts a float" {
+    // The external twin of the main-root rule above. An external grid is a
+    // surface root and can host floats, so under blur the same compounded
+    // alpha (0.5 -> 0.75) appears if it keeps painting the background beneath
+    // them. This was main-only, because the flag asked about surface 1.
+    const State = struct {
+        ext_root_bg_quads: u32 = 0,
+        float_bg_quads: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            const vp = verts orelse return;
+            var i: usize = 0;
+            while (i < vert_count) : (i += 6) {
+                if (vp[i].texCoord[0] >= 0) continue;
+                if (grid_id == 2) self.ext_root_bg_quads += 1 else if (grid_id == 3) {
+                    self.float_bg_quads += 1;
+                }
+            }
+        }
+    };
+
+    var state = State{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 20;
+    core.drawable_h_px = 4;
+    core.blur_enabled = true;
+    try core.grid.resize(4, 20);
+    core.grid.cursor_visible = false;
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+
+    // An external window with nothing on it: it is the only thing on its own
+    // surface and must paint its own background.
+    try core.grid.resizeGrid(2, 4, 20);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = 4,
+        .cols = 20,
+    });
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.ext_root_bg_quads > 0);
+
+    // A float anchored onto that external window draws as its own layer and
+    // paints the same background, so the external root must stop.
+    state = .{};
+    try core.grid.resizeGrid(3, 2, 10);
+    try core.grid.setWinFloatPos(3, 43, 1, 1, 50, 0, 2, true);
+    core.grid.markAllDirty();
+    core.grid.sub_grids.getPtr(2).?.markAllDirty();
+    core.grid.sub_grids.getPtr(3).?.markAllDirty();
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.float_bg_quads > 0);
+    try std.testing.expectEqual(@as(u32, 0), state.ext_root_bg_quads);
+
+    // Without blur nothing compounds, so the root paints again.
+    state = .{};
+    core.blur_enabled = false;
+    core.background_opacity = 0.8;
+    core.grid.markAllDirty();
+    core.grid.sub_grids.getPtr(2).?.markAllDirty();
+    core.grid.sub_grids.getPtr(3).?.markAllDirty();
+    try flush_ctx.onFlush(4, 20);
+    try std.testing.expect(state.ext_root_bg_quads > 0);
+}
+
+test "a cursor leaving an external window for a live grid does not regenerate it" {
+    const ROWS: u32 = 6;
+    const COLS: u32 = 8;
+    const State = struct {
+        ext_content_rows: u32 = 0,
+        ext_cursor_clears: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id != 2) return;
+            if (flags & c_api.VERT_UPDATE_CURSOR != 0) {
+                if (vert_count == 0) self.ext_cursor_clears += 1;
+                return;
+            }
+            self.ext_content_rows += 1;
+        }
+        fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 0, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+            return 1;
+        }
+        fn upload(ctx: ?*anyopaque, dx: u32, dy: u32, w: u32, h: u32, b: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = ctx;
+            _ = dx;
+            _ = dy;
+            _ = w;
+            _ = h;
+            _ = b;
+        }
+        fn create(ctx: ?*anyopaque, aw: u32, ah: u32) callconv(.c) void {
+            _ = ctx;
+            _ = aw;
+            _ = ah;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, ROWS, COLS);
+    // grid 2: an external window. grid 3: a split the MAIN window places, which
+    // is a perfectly live grid and simply not an external root.
+    try core.grid.resizeGrid(2, ROWS, COLS);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{
+        .win = 42,
+        .start_row = 0,
+        .start_col = 0,
+        .rows = ROWS,
+        .cols = COLS,
+    });
+    try core.grid.resizeGrid(3, ROWS, COLS);
+    try core.grid.setWinPos(3, 103, 0, 0);
+    core.drawable_w_px = COLS;
+    core.drawable_h_px = ROWS;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+    for (0..ROWS) |r| for (0..COLS) |cc| core.grid.putCellGrid(2, @intCast(r), @intCast(cc), 'A', 0);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    // Settle with the cursor in the external window.
+    core.grid.cursor_visible = true;
+    core.grid.cursor_grid = 2;
+    core.grid.cursor_row = 1;
+    core.grid.cursor_col = 1;
+    core.grid.cursor_valid = true;
+    core.grid.cursor_rev +%= 1;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(ROWS, COLS);
+    try flush_ctx.onFlush(ROWS, COLS);
+
+    // Move the cursor to the main-surface split. The external window owes its
+    // cursor clear and nothing else — regenerating its rows was the defect.
+    state = .{};
+    core.grid.cursor_grid = 3;
+    core.grid.cursor_row = 2;
+    core.grid.cursor_col = 2;
+    core.grid.cursor_rev +%= 1;
+    try flush_ctx.onFlush(ROWS, COLS);
+    try std.testing.expectEqual(@as(u32, 1), state.ext_cursor_clears);
+    try std.testing.expectEqual(@as(u32, 0), state.ext_content_rows);
 }
