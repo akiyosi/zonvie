@@ -2261,6 +2261,7 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             const old_rows = sg.rows;
+            const old_cols = sg.cols;
             const shape_changed = sg.rows != rows or sg.cols != cols;
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
@@ -2282,7 +2283,15 @@ pub const Grid = struct {
                     while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
                 } else {
                     self.content_rev +%= 1;
-                    self.markAllDirty();
+                    // A resize to or from a zero dimension changes whether this
+                    // grid counts as a layer at all, and with it every main
+                    // row's `skip_default_bg`; anything else only repaints the
+                    // band the layer covered, at its larger extent.
+                    if (rows == 0 or cols == 0 or old_rows == 0 or old_cols == 0) {
+                        self.markAllDirty();
+                    } else {
+                        self.markDirtyRect(p.row, p.row +| @max(old_rows, rows));
+                    }
                 }
             }
             return;
@@ -2310,7 +2319,13 @@ pub const Grid = struct {
                 while (r < rows) : (r += 1) self.dirtyCompositedRow(p, r);
             } else {
                 self.content_rev +%= 1;
-                self.markAllDirty();
+                // A grid appearing as this surface's FIRST layer flips
+                // `skip_default_bg` for every main row.
+                if (rows == 0 or cols == 0 or !self.mainSurfaceHasAnyLayer()) {
+                    self.markAllDirty();
+                } else {
+                    self.markDirtyRect(p.row, p.row +| rows);
+                }
             }
         }
     }
@@ -2347,6 +2362,27 @@ pub const Grid = struct {
 
     /// Resolve the owning surface through the complete anchor chain without
     /// allocating or guessing a main surface for missing/cyclic placement.
+    /// Whether any grid still places itself as a layer on the MAIN surface.
+    ///
+    /// The flush's `skip_default_bg` for EVERY main row turns on this answer,
+    /// so a mutation that flips it owes the whole grid a repaint and not just
+    /// the rows the layer covered. Mirrors `surfaceHasLayers(1)` in flush.zig:
+    /// grid 1 itself and the external grids are not layers of this surface, and
+    /// a zero-sized grid is not drawn.
+    pub fn mainSurfaceHasAnyLayer(self: *const Grid) bool {
+        var it = self.win_pos.iterator();
+        while (it.next()) |e| {
+            const gid = e.key_ptr.*;
+            if (gid == 1) continue;
+            if (self.external_grids.contains(gid)) continue;
+            if (self.surfaceForGrid(gid) != @as(?i64, 1)) continue;
+            const sg = self.sub_grids.get(gid) orelse continue;
+            if (sg.rows == 0 or sg.cols == 0) continue;
+            return true;
+        }
+        return false;
+    }
+
     pub fn surfaceForGrid(self: *const Grid, grid_id: i64) ?i64 {
         var id = grid_id;
         var remaining = self.win_pos.count() + 1;
@@ -2905,7 +2941,15 @@ pub const Grid = struct {
                 while (r < old_rows) : (r += 1) {
                     self.dirtyCompositedRow(p, r);
                 }
+            } else if (self.mainSurfaceHasAnyLayer()) {
+                // Repaint only what this layer covered. The rows underneath are
+                // grid 1's own and were never overwritten by it.
+                self.markDirtyRect(p.row, p.row +| old_rows);
+                self.content_rev +%= 1;
             } else {
+                // The last layer just went away, so every main row's
+                // `skip_default_bg` flips with it and the whole grid owes a
+                // regeneration, not only this layer's band.
                 self.markAllDirty();
             }
         } else if (!was_external) {
@@ -2977,6 +3021,12 @@ pub const Grid = struct {
             if (old_pos.row == row and old_pos.col == col and !was_float) return;
         }
 
+        // Whether this surface had any layer before this placement. Becoming
+        // the FIRST one flips `skip_default_bg` for every main row, the mirror
+        // of the case destroyGrid guards when the LAST one goes away, so the
+        // band-precise marking below is not enough on its own.
+        const had_any_layer_before = self.mainSurfaceHasAnyLayer();
+
         // First dirty the old range (position changed, so exposed area needs recomposition)
         if (old_pos_opt) |old_pos| {
             const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
@@ -2992,6 +3042,9 @@ pub const Grid = struct {
         // Dirty the new range
         const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
         self.markDirtyRect(row, row +| h_new);
+        if (!had_any_layer_before and self.mainSurfaceHasAnyLayer()) {
+            self.markAllDirty();
+        }
 
         // Bump content_rev so the next flush's need_main is true and actually
         // recomposes the window at its new position. markDirtyRect alone is
@@ -5193,4 +5246,60 @@ test "destroying an external grid owes the main viewport no repaint" {
     grid.main_buf.dirty_all = false;
     try grid.destroyGrid(3);
     try std.testing.expect(!grid.main_buf.dirty_all);
+}
+
+test "closing or resizing a main-surface layer repaints its band, not the viewport" {
+    const ROWS: u32 = 20;
+    const COLS: u32 = 40;
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(ROWS, COLS);
+
+    const owed = struct {
+        fn count(g: *Grid) u32 {
+            if (g.main_buf.dirty_all) return ROWS;
+            var n: u32 = 0;
+            var it = g.main_buf.dirty_rows.iterator(.{});
+            while (it.next()) |_| n += 1;
+            return n;
+        }
+        fn settle(g: *Grid) void {
+            g.main_buf.dirty_all = false;
+            if (g.main_buf.dirty_rows.bit_length != 0) g.main_buf.dirty_rows.unsetAll();
+        }
+    };
+
+    // Two splits, so removing one still leaves the surface with a layer.
+    try grid.resizeGrid(2, 5, COLS);
+    try grid.setWinPos(2, 102, 3, 0);
+    try grid.resizeGrid(3, 5, COLS);
+    try grid.setWinPos(3, 103, 10, 0);
+
+    // Resizing one repaints the band it covers at its larger extent, not the
+    // whole viewport.
+    owed.settle(&grid);
+    try grid.resizeGrid(2, 7, COLS);
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expectEqual(@as(u32, 7), owed.count(&grid));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(3));
+    try std.testing.expect(grid.main_buf.dirty_rows.isSet(9));
+    try std.testing.expect(!grid.main_buf.dirty_rows.isSet(10));
+
+    // Closing one, with the other still there, repaints only its band.
+    owed.settle(&grid);
+    try grid.destroyGrid(2);
+    try std.testing.expect(!grid.main_buf.dirty_all);
+    try std.testing.expectEqual(@as(u32, 7), owed.count(&grid));
+
+    // Closing the LAST layer flips every main row's skip_default_bg, so the
+    // whole grid is owed — this is the half that must NOT be narrowed.
+    owed.settle(&grid);
+    try grid.destroyGrid(3);
+    try std.testing.expect(grid.main_buf.dirty_all);
+
+    // And the first layer to appear flips it back.
+    owed.settle(&grid);
+    try grid.resizeGrid(4, 5, COLS);
+    try grid.setWinPos(4, 104, 2, 0);
+    try std.testing.expect(grid.main_buf.dirty_all);
 }
