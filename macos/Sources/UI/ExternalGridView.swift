@@ -302,9 +302,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // contract -- a different lock, a different source for the flush bracket,
     // and here an extra lockHeld parameter for the re-entrant caller. Merging
     // them would put both surfaces under a single lock discipline that neither
-    // has, in the path that produced the scroll freeze fixed by de6c402 and
-    // the ext-grid capacity gate stall. Reviewed under the 2026-08-25 audit,
-    // finding 037; left duplicated on purpose.
+    // has, in the path that produced the scroll freeze fixed by b83ff29 and the
+    // ext-grid capacity gate stall fixed by 4b1ad75. Reviewed under the
+    // 2026-08-25 audit, finding 037; left duplicated on purpose. Both of those
+    // were async deferral in this path, not locking: the caution is about the
+    // neighbourhood, not the mechanism.
     // Fixed-size capacity ledger. The core callback only raises entries;
     // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
     // bracket closes, before retrying the core flush.
