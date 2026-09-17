@@ -556,10 +556,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private(set) var flushFailed: Bool = false // Core thread only
     // ExternalGridView carries a deliberately parallel ledger and provisioning
     // pass. The pure parts are already shared free functions in
-    // MetalTypes.swift; what is left is each class's own concurrency contract,
-    // and merging it would put both surfaces under a single lock discipline
-    // neither has — in the path that produced the scroll freeze fixed by
-    // b83ff29. Reviewed under the 2026-08-25 audit, finding 037.
+    // MetalTypes.swift, which take the lock and a `lockHeld` flag so two
+    // surfaces can share code without sharing a lock; what is left is each
+    // class's adapter. This class keeps ONE lock where ExternalGridView keeps
+    // three: splitting it would make commitFlush hold two at once, because the
+    // retention publish there has to be atomic with the vertex publish.
+    // Audit 2026-08-25, finding 037.
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.

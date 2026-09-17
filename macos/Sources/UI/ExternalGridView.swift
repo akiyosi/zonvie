@@ -298,15 +298,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var flushHasStructuralRowChange = false
     // MetalTerminalRenderer carries a deliberately parallel ledger and
     // provisioning pass. The pure parts already live as shared free functions
-    // in MetalTypes.swift; what is left is each class's own concurrency
-    // contract -- a different lock, a different source for the flush bracket,
-    // and here an extra lockHeld parameter for the re-entrant caller. Merging
-    // them would put both surfaces under a single lock discipline that neither
-    // has, in the path that produced the scroll freeze fixed by b83ff29 and the
-    // ext-grid capacity gate stall fixed by 4b1ad75. Reviewed under the
-    // 2026-08-25 audit, finding 037; left duplicated on purpose. Both of those
-    // were async deferral in this path, not locking: the caution is about the
-    // neighbourhood, not the mechanism.
+    // in MetalTypes.swift, which take the lock and a `lockHeld` flag so two
+    // surfaces can share code without sharing a lock; what is left is each
+    // class's adapter. The lock COUNT differs for one reason: this class arms
+    // scroll state from the main thread mid-gesture (`pendingGridScrollLock`)
+    // and publishes eased offsets outside the bracket (`lock`), and a
+    // core-thread bracket may block neither. Everything else — retention
+    // included — is under the same lock as the vertex publish on both
+    // surfaces. Touching the provisioning path itself: b83ff29 and 4b1ad75 are
+    // the same mistake twice, a capacity gate that deferred allocation and
+    // raced the per-flush row remap. Audit 2026-08-25, finding 037.
     // Fixed-size capacity ledger. The core callback only raises entries;
     // ZonvieCore's retry worker provisions metadata and MTLBuffers after the
     // bracket closes, before retrying the core flush.
