@@ -997,11 +997,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// side is acquired by `prepareRowWriteState()` on the first row mutation,
     /// mirroring MetalTerminalRenderer.prepareMainWriteState().
     ///
-    /// Always returns true now; the return stays so ZonvieCore's abort path
-    /// keeps its shape, and so a future gate here can still refuse a bracket.
+    /// Refuses the bracket while the capacity ledger is armed, which is the
+    /// gate `MetalTerminalRenderer.beginFlush` has carried all along. Only that
+    /// one: the row SET is still acquired lazily by `prepareRowWriteState`, so
+    /// a cursor-only flush is never dropped for a set it does not want (56f3b4a
+    /// moved it there for exactly that reason, and this must not undo it).
+    ///
+    /// Refusing here rather than at the first row submit does not change the
+    /// blast radius — both end in `zonvie_core_abort_flush` plus a retry — but
+    /// it spends no vertex generation first. The ledger only arms on a real
+    /// allocation failure (b83ff29, 4b1ad75), so this is a rare, transient
+    /// state, not a per-flush cost.
     @discardableResult
     func beginFlush() -> Bool {
         tripleBufferLock.lock()
+        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+            tripleBufferLock.unlock()
+            ZonvieCore.appLog("[ExternalGridView] beginFlush: waiting for row capacity provisioning gridId=\(gridId)")
+            return false
+        }
         flushDirtyRows.removeAll()
         // What the pending set held before this bracket added anything. Only
         // these marks describe pre-shift rows, and a row number this bracket
@@ -1038,9 +1052,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     }
 
     /// Acquire and synchronize the row write set, once, on the first row
-    /// mutation of a bracket. Returns false when no set is free or a capacity
-    /// worker owns the row state, and latches `flushFailed` itself on those
-    /// two — the same contract MetalTerminalRenderer.prepareMainWriteState()
+    /// mutation of a bracket. Returns false when no set is free, and latches
+    /// `flushFailed` itself — the same contract MetalTerminalRenderer.prepareMainWriteState()
     /// has, which ZonvieCore escalates into an abort at flush end. The comment
     /// here used to claim that contract while leaving the latch to the caller;
     /// every caller did it, but forgetting it is the worst failure this file
@@ -1056,12 +1069,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard isInFlush else { return false }
 
         tripleBufferLock.lock()
-        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
-            tripleBufferLock.unlock()
-            flushFailed = true
-            ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row capacity provisioning gridId=\(gridId)")
-            return false
-        }
         let srcIdx = flushSourceSetIndex
         let picked = pickFreeBufferSetIndex(
             count: 3,

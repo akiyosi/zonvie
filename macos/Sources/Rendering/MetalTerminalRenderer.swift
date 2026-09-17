@@ -3674,6 +3674,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 cmd.commit()
                 gpuSubmitted = true
+                // Submitted, but the drawable was never populated and backTex
+                // may hold a half-drawn frame. Refuse to `.load` it next time,
+                // as ExternalGridView does at each of its matching bails.
+                // `markAllRowsDirty` below bands every cell-aligned row, which
+                // is not the same statement: this one also stops the idle gates
+                // skipping past the repair. Deliberately NOT set on the
+                // "no drawable" bail below — there backTex is complete and only
+                // the present is missing, which is why the external surface
+                // leaves its own copy of that one alone too.
+                hasPresentedOnce = false
                 bailWithoutSubmit("render encoder creation failed")
                 return
             }
@@ -4356,6 +4366,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 cmd.commit()
                 gpuSubmitted = true
+                // Submitted but never presented — see "render encoder creation
+                // failed" above for why this is set here and not on "no drawable".
+                hasPresentedOnce = false
                 bailWithoutSubmit("glow resource/encoder creation failed")
                 return
             }
@@ -4468,6 +4481,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 cmd.commit()
                 gpuSubmitted = true
+                // Submitted but never presented — see "render encoder creation
+                // failed" above for why this is set here and not on "no drawable".
+                hasPresentedOnce = false
                 bailWithoutSubmit("final copy encoder creation failed")
                 return
             }
@@ -4562,6 +4578,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     }
                     cmd.commit()
                     gpuSubmitted = true
+                    // Submitted but never presented — see "render encoder creation
+                    // failed" above for why this is set here and not on "no drawable".
+                    hasPresentedOnce = false
                     bailWithoutSubmit("cursor encoder creation failed")
                     return
                 }
