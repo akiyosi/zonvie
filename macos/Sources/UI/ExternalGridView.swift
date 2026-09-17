@@ -1400,9 +1400,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 pendingGridScrollLock.unlock()
             }
             mainTerminalView?.renderer.publishCursorShaderState()
-            if !cursorOnlyCommit {
-                commitRevision &+= 1
-            }
+            // Every commit bumps, as MetalTerminalRenderer's does. The revision
+            // answers one question — "is the committed state a generation this
+            // draw has not seen?" — and nothing else. Whether the back buffer may
+            // be reused is asked of the CONTENT predicates below, which is what
+            // the suppression used to stand in for.
+            commitRevision &+= 1
             if publishedRows {
                 serviceSurfaceRowStorageRetirement(
                     bufferSets: bufferSets,
@@ -2705,8 +2708,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let drawableSizeChanged = backBufferSize != view.drawableSize && backBuffer != nil
             let hasNewCommit = currentCommitRevision != lastDrawnRevision
             lastDrawnRevision = currentCommitRevision
-            let hasDirtyContent = hasNewCommit && !submittedDirtyRows.isEmpty
-            let hasPendingScroll = hasNewCommit && pendingScroll != nil
+            // Content questions, asked of content. They used to be gated on
+            // `hasNewCommit` because a cursor-only commit did not bump; now that
+            // every commit does, the gate would make them true for frames that
+            // changed nothing.
+            let hasDirtyContent = !submittedDirtyRows.isEmpty
+            let hasPendingScroll = pendingScroll != nil
 
             // `hasScrollOffset` was settled with the rest of this frame's scroll
             // state ahead of the latch, so the offset the shader applies belongs
@@ -3070,12 +3077,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // uses a dedicated cursor buffer instead, so dirtyRows may be empty. In that
             // case, preserve the back buffer to avoid clearing valid content.
             let hasAnyDirtyInRowMode = rowMode && !dirtyRows.isEmpty
-            let cursorOnlyFrame = (hasCursorUpdate || isBlinkOnlyFrame) && dirtyRows.isEmpty && !hasNewCommit
+            let cursorOnlyFrame = (hasCursorUpdate || isBlinkOnlyFrame) && dirtyRows.isEmpty
+                && !hasDirtyContent && !hasPendingScroll && !layoutDamageSnapshot
             // The cursor is composited after the retained texture. A pure
             // blink needs no root or hosted-row draw, including under blur.
             let reuseHostedContents = rowMode && !layerDrawSnapshot.isEmpty
                 && committedFontIsCurrent && hasPresentedOnce
-                && !layoutDamageSnapshot && !hasNewCommit && !hasDirtyContent
+                && !layoutDamageSnapshot && !hasDirtyContent
                 && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged
                 && !smoothScrolling && !shaderAnimates && !glowEnabled
                 && !isDecoratedSurface
