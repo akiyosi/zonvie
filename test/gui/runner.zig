@@ -244,6 +244,15 @@ test "gui:visual_float" {
     }
 }
 
+test "gui:visual_main_float_cursor_moves" {
+    if (comptime driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/main_float_cursor_moves.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_emoji_cursor_width" {
     if (comptime driver.capture.supported) {
         try requirePrereqs();
