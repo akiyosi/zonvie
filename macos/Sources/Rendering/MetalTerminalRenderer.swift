@@ -5193,8 +5193,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // changes, so this stays off the per-frame cost.
         if ZonvieCore.appLogEnabled, cursorCur != lastLoggedShaderCursor {
             lastLoggedShaderCursor = cursorCur
+            // `scale` is this window's, because the rect is in ITS drawable
+            // pixels whatever grid published it — an external surface converts
+            // into this space before forwarding. It rides on the rect rather
+            // than on a resize line: resizeExternalWindows stopped carrying a
+            // shared one when each window started converting with its own, and
+            // the cmdline's window is skipped by that loop entirely.
             ZonvieCore.appLog(
-                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3) grid=\(cursorGrid)"
+                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3) grid=\(cursorGrid) scale=\(backingScale)"
             )
         }
         uniforms.iCurrentCursor = cursorCur

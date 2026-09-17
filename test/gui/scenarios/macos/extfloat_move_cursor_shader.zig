@@ -147,10 +147,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const moved = try waitCursorRect(alloc, t1, 10_000);
     std.debug.print("[gui] cursor shader rect after move:  ({d:.0},{d:.0})\n", .{ moved.x, moved.y });
 
-    // Backing scale from the app's own log rather than assuming Retina:
-    // the rect is in drawable pixels, the move was in points.
+    // Backing scale from the app's own log rather than assuming Retina: the
+    // rect is in drawable pixels, the move was in points. It rides on the rect's
+    // own line because that is the space it describes; `resizeExternalWindows`
+    // stopped carrying a shared scale when each window began converting with
+    // its own.
     const scale = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+        const line = (try app_log.lastLineSince(alloc, log_path, marker, 0)) orelse
             return error.BackingScaleUnknown;
         defer alloc.free(line);
         break :blk app_log.field(line, "scale") orelse return error.BackingScaleUnknown;
