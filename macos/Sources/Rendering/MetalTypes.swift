@@ -2210,7 +2210,7 @@ func ensureSurfaceRowBuffer(
         // Reuse deliberately accepts storage larger than this row needs. The
         // oversize rejection belonged to 91bb4ad's async provisioning, which
         // reached here with allowAllocation: false so the provisioner refilled
-        // the slot off the redraw callback; de6c402 restored synchronous
+        // the slot off the redraw callback; b83ff29 restored synchronous
         // allocation at the hot sites, so the same rejection would now land as
         // device.makeBuffer() inside the callback (the provisioner survives as
         // the allocation-failure fallback). Whether it fires depends on how the
