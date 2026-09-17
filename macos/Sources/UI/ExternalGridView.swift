@@ -53,7 +53,6 @@ fileprivate func screenSpaceParameters(
 final class ExternalGridView: MTKView, MTKViewDelegate {
     private let mtlDevice: MTLDevice
     private let queue: MTLCommandQueue
-    private weak var sharedAtlas: GlyphAtlas?
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
@@ -722,7 +721,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         self.mtlDevice = device
         self.retention = ScrollRetention(device: device)
         self.queue = commandQueue
-        self.sharedAtlas = atlas
         self.blurEnabled = blurEnabled
         self.isDecoratedSurface = isDecoratedSurface
 
@@ -3041,7 +3039,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 ) ?? 0
             }
 
-            func drawHostedLayers(_ encoder: MTLRenderCommandEncoder, glow: Bool = false) {
+            /// `glowPipeline` non-nil IS the glow pass. The caller binds it
+            /// from the main renderer's `if let` chain, so passing it in keeps
+            /// that proof instead of reaching back through `mainTerminalView`
+            /// for a pipeline the enclosing scope already holds.
+            func drawHostedLayers(_ encoder: MTLRenderCommandEncoder, glowPipeline: MTLRenderPipelineState? = nil) {
+                let glow = glowPipeline != nil
                 guard committedFontIsCurrent else { return }
                 let extent = simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
                 for (layer, set) in layerDrawSnapshot {
@@ -3151,7 +3154,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     _ = encodeSurfaceRowDraws(
                         encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
                         resolve: resolveLayerRow,
-                        pipeline: glow ? mainTerminalView!.renderer.glowExtractPipeline! : pipeline,
+                        pipeline: glowPipeline ?? pipeline,
                         backgroundPipeline: backgroundPipeline, glyphPipeline: glyphPipeline,
                         useTwoPass: !glow && use2Pass,
                         unifiedBlurPipeline: unifiedBlurPipeline
@@ -3536,7 +3539,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         }
                     }
 
-                    drawHostedLayers(enc, glow: true)
+                    drawHostedLayers(enc, glowPipeline: extractPipe)
 
                     // Cursor vertices for cursor glow
                     if committedFontIsCurrent,
