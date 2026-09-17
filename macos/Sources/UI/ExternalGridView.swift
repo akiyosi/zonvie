@@ -1966,45 +1966,42 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// A failure — every slot being read by a frame in flight, or a buffer that
     /// cannot be grown — fails the flush, exactly as the row side does.
     private func writeBracketCursorVertices(ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
+        // The lock covers the PICK only, as MetalTerminalRenderer's does. What
+        // makes the write safe without it is slot exclusivity, not the lock:
+        // `pickCursorSlotLocked` refuses the committed slot and any slot with a
+        // frame in flight, `draw(in:)` only ever latches `committedCursorSetIndex`,
+        // and only this thread moves it — so the picked slot is memory no other
+        // thread can name. Holding the lock across the write put a
+        // `device.makeBuffer` on the core thread inside the lock that draw()
+        // blocks on, for no reader it excluded.
         tripleBufferLock.lock()
-        defer { tripleBufferLock.unlock() }
         if cursorWriteSetIndex == -1 {
             cursorWriteSetIndex = pickCursorSlotLocked()
         }
         let target = cursorWriteSetIndex
+        let inf = cursorGpuInFlightCount
+        let committed = committedCursorSetIndex
+        tripleBufferLock.unlock()
+
         if target != -1, writeCursorVertices(into: cursorSlots[target], ptr: ptr, count: count) {
             return
         }
+        tripleBufferLock.lock()
         cursorWriteSetIndex = -1
-        let inf = cursorGpuInFlightCount
-        ZonvieCore.appLog("[ExternalGridView] cursor write failed gridId=\(gridId) committed=\(committedCursorSetIndex) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
+        tripleBufferLock.unlock()
+        ZonvieCore.appLog("[ExternalGridView] cursor write failed gridId=\(gridId) committed=\(committed) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
         flushFailed = true
     }
 
-    /// A cursor slot that is neither published, nor being read by the GPU, nor
-    /// `reserved` — the slot an open bracket is going to rotate in. Handing
-    /// that one to an out-of-bracket publish would put a live cursor in a slot
-    /// the core thread still writes into. -1 when nothing is free.
-    /// Caller holds `tripleBufferLock`.
-    private func pickCursorSlotLocked(excluding reserved: Int = -1) -> Int {
+    /// A cursor slot that is neither published nor being read by the GPU.
+    /// -1 when nothing is free. Caller holds `tripleBufferLock`.
+    private func pickCursorSlotLocked() -> Int {
         for index in 0..<cursorSlots.count
         where index != committedCursorSetIndex
-            && index != reserved
             && cursorGpuInFlightCount[index] == 0 {
             return index
         }
         return -1
-    }
-
-    /// Publish `count` cursor vertices into a free slot and make it committed.
-    /// Returns false when no slot was free or the write failed — the caller
-    /// then stages CPU-side. Caller holds `tripleBufferLock`.
-    private func publishCursorVerticesLocked(ptr: UnsafePointer<zonvie_vertex>?, count: Int) -> Bool {
-        let picked = pickCursorSlotLocked(excluding: cursorWriteSetIndex)
-        guard picked != -1 else { return false }
-        guard writeCursorVertices(into: cursorSlots[picked], ptr: ptr, count: count) else { return false }
-        committedCursorSetIndex = picked
-        return true
     }
 
     /// Release one protected GPU read of a cursor slot. Caller holds
