@@ -3,6 +3,14 @@ import Metal
 import MetalKit
 import simd
 
+/// See MetalTerminalRenderer's cap for the rationale: a safety cap against a
+/// corrupt row index, not a practical content limit — external windows
+/// (ext_multigrid) have no smaller row bound than the main grid, so this must
+/// not be materially tighter than that cap. File scope because the row-history
+/// sets are prepared to it at construction, and a stored property cannot name
+/// another one in its initializer.
+private let externalGridMaxRowBuffers = 20_000
+
 /// Compute the screen-space parameters (custom shader uniforms) for an
 /// external MTKView relative to the main terminal view. `screenResolution`
 /// is the main MTKView's drawable size in pixels; `windowOffset` is the
@@ -154,10 +162,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     func submitLayerRow(gridId id: Int64, rowStart: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, totalRows: Int, totalCols: Int) {
         guard isInFlush, id != gridId else { return }
-        guard prepareRowWriteState() else {
-            flushFailed = true
-            return
-        }
+        guard prepareRowWriteState() else { return }
         let sets = gridBuffers.sets(for: id)
         // Match root rows: reuse buffers, then grow synchronously if needed.
         // Deferring ordinary growth aborts the whole flush into retry backoff.
@@ -267,24 +272,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // carries rows changed since it last committed; scroll/resize/abort use a
     // full-copy barrier. This mirrors MetalTerminalRenderer and keeps a one-row
     // external flush O(changed rows) instead of O(total rows).
-    private var staleRowsBySet: [SparseRowSet] = [
-        SparseRowSet(rowLimit: 20_000),
-        SparseRowSet(rowLimit: 20_000),
-        SparseRowSet(rowLimit: 20_000),
+    //
+    // Prepared to the cap at construction, as MetalTerminalRenderer's are. The
+    // alternative was growing them on demand, which needed a main-queue worker,
+    // a bracket-fairness gate, and a refusal path that `ZonvieCore`'s per-view
+    // sweep escalated into an app-wide abort_flush — so one external float's
+    // unprepared history stalled the main grid. The row-BUFFER ledger was moved
+    // off that same design for the same reason (see submitVerticesRowRaw
+    // below); this is the gate that was left behind.
+    private let staleRowsBySet: [SparseRowSet] = [
+        SparseRowSet(rowLimit: externalGridMaxRowBuffers, preparedRows: externalGridMaxRowBuffers),
+        SparseRowSet(rowLimit: externalGridMaxRowBuffers, preparedRows: externalGridMaxRowBuffers),
+        SparseRowSet(rowLimit: externalGridMaxRowBuffers, preparedRows: externalGridMaxRowBuffers),
     ]
-    private var flushChangedRows = SparseRowSet(rowLimit: 20_000)
+    private let flushChangedRows = SparseRowSet(rowLimit: externalGridMaxRowBuffers, preparedRows: externalGridMaxRowBuffers)
     // Rows regenerated after the most recent font-generation transition in
     // this bracket. A commit may advance its set's font generation only when
     // every logical row was regenerated; cursor-only and partial commits keep
     // the older generation and are suppressed by the draw-generation gate.
-    private var flushGeneratedRows = SparseRowSet(rowLimit: 20_000)
-    // Capacity is prepared before publication. A later structural growth is
-    // staged onto the main thread; the current core flush aborts instead of
-    // allocating while a row callback or flush bracket holds rendering state.
-    private var rowHistoryPreparedRowCount = 0
-    private var rowHistoryRequestedRowCount = 0
-    private var rowHistoryGrowthScheduled = false
-    private var rowHistoryGrowthWaitingForBracket = false
+    private let flushGeneratedRows = SparseRowSet(rowLimit: externalGridMaxRowBuffers, preparedRows: externalGridMaxRowBuffers)
     private var flushFontGeneration: UInt64 = 0
     private var flushGeneratedTotalRows: Int = 0
     private var flushGeneratedTotalCols: Int = 0
@@ -403,11 +409,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // to process draw requests while GPU processes the previous frame.
     // Uses non-blocking tryWait since draw() runs on main thread.
     private let inflightSemaphore = DispatchSemaphore(value: 2)
-    // See MetalTerminalRenderer.maxRowBuffers for the rationale: a safety
-    // cap against a corrupt row index, not a practical content limit —
-    // external windows (ext_multigrid) have no smaller row bound than the
-    // main grid, so this must not be materially tighter than that cap.
-    private let maxRowBuffers = 20000
+    private let maxRowBuffers = externalGridMaxRowBuffers
 
     /// Occlusion and window-move observers; see viewDidMoveToWindow.
     private var occlusionObserver: NSObjectProtocol?
@@ -736,8 +738,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         for bufferSet in bufferSets {
             bufferSet.fontGeneration = initialFontGeneration
         }
-        prepareRowHistoryCapacityNow(rowCount: initialRows)
-
         ZonvieCore.appLog("[ExternalGridView] init: gridId=\(gridId) blurEnabled=\(blurEnabled) (using shared pipelines)")
 
         self.delegate = self
@@ -955,135 +955,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // (scroll offset / drawable size buffers removed: now passed via setVertexBytes/setFragmentBytes)
     }
 
-    private func prepareRowHistoryCapacityNow(rowCount: Int) {
-        let target = min(maxRowBuffers, max(0, rowCount))
-        guard target > rowHistoryPreparedRowCount else { return }
-        for staleRows in staleRowsBySet {
-            staleRows.prepare(rowCount: target)
-        }
-        flushChangedRows.prepare(rowCount: target)
-        flushGeneratedRows.prepare(rowCount: target)
-        rowHistoryPreparedRowCount = target
-    }
-
-    private func requestRowHistoryCapacity(rowCount: Int) -> Bool {
-        let target = min(maxRowBuffers, max(0, rowCount))
-        tripleBufferLock.lock()
-        if target <= rowHistoryPreparedRowCount {
-            tripleBufferLock.unlock()
-            return true
-        }
-        rowHistoryRequestedRowCount = max(rowHistoryRequestedRowCount, target)
-        let shouldSchedule = !rowHistoryGrowthScheduled && !rowHistoryGrowthWaitingForBracket
-        if shouldSchedule {
-            rowHistoryGrowthScheduled = true
-        }
-        tripleBufferLock.unlock()
-
-        if shouldSchedule {
-            enqueueRowHistoryGrowth()
-        }
-        return false
-    }
-
-    private func enqueueRowHistoryGrowth() {
-        DispatchQueue.main.async { [weak self] in
-            self?.growRowHistoryCapacityOutsideFlush()
-        }
-    }
-
-    /// Caller holds tripleBufferLock after closing bracketOpen.
-    private func scheduleWaitingRowHistoryGrowthLocked() -> Bool {
-        guard rowHistoryGrowthWaitingForBracket else { return false }
-        if rowHistoryRequestedRowCount <= rowHistoryPreparedRowCount {
-            rowHistoryGrowthWaitingForBracket = false
-            return false
-        }
-        guard !rowHistoryGrowthScheduled else { return false }
-        // Keep the fairness gate set until the prepared capacity publishes.
-        // A new core bracket arriving before the main-queue worker then aborts
-        // instead of repeatedly racing and discarding another allocation.
-        rowHistoryGrowthScheduled = true
-        return true
-    }
-
-    private func growRowHistoryCapacityOutsideFlush() {
-        tripleBufferLock.lock()
-        if bracketOpen {
-            rowHistoryGrowthScheduled = false
-            rowHistoryGrowthWaitingForBracket = true
-            tripleBufferLock.unlock()
-            return
-        }
-        let requested = rowHistoryRequestedRowCount
-        let doubled = rowHistoryPreparedRowCount > maxRowBuffers / 2
-            ? maxRowBuffers
-            : max(64, rowHistoryPreparedRowCount * 2)
-        let target = min(maxRowBuffers, max(requested, doubled))
-        tripleBufferLock.unlock()
-
-        // Allocate every replacement outside the render-state lock. Do not
-        // retain COW snapshots of the live trackers: a concurrent append or
-        // removeAll would otherwise detach their Array backing storage on the
-        // core hot path. Sparse history can be discarded safely by publishing
-        // a full-sync barrier for all three sets at the atomic swap below.
-        let replacementStaleRows = [
-            SparseRowSet(rowLimit: maxRowBuffers),
-            SparseRowSet(rowLimit: maxRowBuffers),
-            SparseRowSet(rowLimit: maxRowBuffers),
-        ]
-        let replacementChangedRows = SparseRowSet(rowLimit: maxRowBuffers)
-        let replacementGeneratedRows = SparseRowSet(rowLimit: maxRowBuffers)
-        for rows in replacementStaleRows {
-            rows.prepare(rowCount: target)
-        }
-        replacementChangedRows.prepare(rowCount: target)
-        replacementGeneratedRows.prepare(rowCount: target)
-
-        tripleBufferLock.lock()
-        if target <= rowHistoryPreparedRowCount {
-            rowHistoryGrowthWaitingForBracket = false
-            let needsAnotherGrowth = rowHistoryRequestedRowCount > rowHistoryPreparedRowCount
-            rowHistoryGrowthScheduled = needsAnotherGrowth
-            tripleBufferLock.unlock()
-            if needsAnotherGrowth {
-                enqueueRowHistoryGrowth()
-            }
-            return
-        }
-        if bracketOpen {
-            rowHistoryGrowthScheduled = false
-            rowHistoryGrowthWaitingForBracket = true
-            tripleBufferLock.unlock()
-            return
-        }
-        // Keep the retired trackers alive until after unlock so their Array
-        // backing storage cannot be freed while draw/flush waits on this lock.
-        let retiredStaleRows = staleRowsBySet
-        let retiredChangedRows = flushChangedRows
-        let retiredGeneratedRows = flushGeneratedRows
-        staleRowsBySet = replacementStaleRows
-        flushChangedRows = replacementChangedRows
-        flushGeneratedRows = replacementGeneratedRows
-        for i in rowStateNeedsFullSync.indices {
-            rowStateNeedsFullSync[i] = true
-        }
-        rowHistoryPreparedRowCount = target
-        rowHistoryGrowthWaitingForBracket = false
-        let needsAnotherGrowth = rowHistoryRequestedRowCount > target
-        rowHistoryGrowthScheduled = needsAnotherGrowth
-        tripleBufferLock.unlock()
-
-        withExtendedLifetime(retiredStaleRows) {}
-        withExtendedLifetime(retiredChangedRows) {}
-        withExtendedLifetime(retiredGeneratedRows) {}
-
-        ZonvieCore.appLog("[ExternalGridView] row history capacity grown outside flush gridId=\(gridId) rows=\(target)")
-        if needsAnotherGrowth {
-            enqueueRowHistoryGrowth()
-        }
-    }
-
     required init(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
@@ -1167,9 +1038,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     /// Acquire and synchronize the row write set, once, on the first row
     /// mutation of a bracket. Returns false when no set is free or a capacity
-    /// worker owns the row state; the caller latches `flushFailed`, which
-    /// ZonvieCore escalates into an abort at flush end — the same contract
-    /// MetalTerminalRenderer.prepareMainWriteState() has.
+    /// worker owns the row state, and latches `flushFailed` itself on those
+    /// two — the same contract MetalTerminalRenderer.prepareMainWriteState()
+    /// has, which ZonvieCore escalates into an abort at flush end. The comment
+    /// here used to claim that contract while leaving the latch to the caller;
+    /// every caller did it, but forgetting it is the worst failure this file
+    /// has (the core clears its dirty state, the flush commits, and those rows
+    /// are never resent).
+    ///
+    /// Returning false because no bracket is open is NOT latched: `flushFailed`
+    /// is only read at flush end, so latching outside a bracket would poison
+    /// the next flush instead of this one.
     @discardableResult
     private func prepareRowWriteState() -> Bool {
         if rowWritePrepared { return true }
@@ -1178,16 +1057,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         tripleBufferLock.lock()
         if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
             tripleBufferLock.unlock()
+            flushFailed = true
             ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row capacity provisioning gridId=\(gridId)")
-            return false
-        }
-        if rowHistoryGrowthWaitingForBracket {
-            // A capacity worker collided with the previous bracket. Give its
-            // already-scheduled main-queue retry an allocation-free publish
-            // window; otherwise a high-frequency core stream can starve it by
-            // opening a new bracket before every attempt.
-            tripleBufferLock.unlock()
-            ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: waiting for row-history growth gridId=\(gridId)")
             return false
         }
         let srcIdx = flushSourceSetIndex
@@ -1199,6 +1070,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if picked == -1 {
             let inf = gpuInFlightCount
             tripleBufferLock.unlock()
+            flushFailed = true
             ZonvieCore.appLog("[ExternalGridView] prepareRowWriteState: no free buffer set, dropping flush gridId=\(gridId) committed=\(srcIdx) gpuInFlight=[\(inf[0]),\(inf[1]),\(inf[2])]")
             return false
         }
@@ -1297,11 +1169,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         flushGeneratedRows.removeAll()
         flushHasStructuralRowChange = false
         bracketOpen = false
-        let shouldScheduleGrowth = scheduleWaitingRowHistoryGrowthLocked()
         tripleBufferLock.unlock()
-        if shouldScheduleGrowth {
-            enqueueRowHistoryGrowth()
-        }
     }
 
     /// Commit flush — publish write set as the new committed state for draw().
@@ -1313,7 +1181,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Captured before the bracket's state is reset below; -1 names a commit
         // that published no rows.
         let tracedWriteSet = rowWritePrepared ? writeSetIndex : -1
-        var shouldScheduleGrowth = false
         if hadContent {
             // What this bracket actually published. A flush that only moved the
             // cursor took no row set and rotates none: it must not bump the
@@ -1516,7 +1383,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rowWritePrepared = false
             writeSetIndex = -1
             bracketOpen = false
-            shouldScheduleGrowth = scheduleWaitingRowHistoryGrowthLocked()
             tripleBufferLock.unlock()
         } else {
             // Contentless bracket: nothing rotates. Close the bracket flag
@@ -1528,13 +1394,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             rowWritePrepared = false
             writeSetIndex = -1
             bracketOpen = false
-            shouldScheduleGrowth = scheduleWaitingRowHistoryGrowthLocked()
             tripleBufferLock.unlock()
         }
         isInFlush = false
-        if shouldScheduleGrowth {
-            enqueueRowHistoryGrowth()
-        }
         if hadContent {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_commit surface=\(gridId) write_set=\(tracedWriteSet)")
             activateDrawLoop()
@@ -1852,10 +1714,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // per-view sweep) aborted the whole app's flush including the main
         // grid.
 
-        guard prepareRowWriteState() else {
-            flushFailed = true
-            return
-        }
+        guard prepareRowWriteState() else { return }
         let ws = bufferSets[writeSetIndex]
         // Capture the outgoing rows when the grid_scroll callback handed over
         // no distance of its own. That hand-over is gated to gesture-owned
@@ -2108,16 +1967,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return
         }
 
-        guard requestRowHistoryCapacity(rowCount: totalRows) else {
-            flushFailed = true
-            return
-        }
-
         // In-bracket (core thread): write set is never GPU-in-flight.
-        guard prepareRowWriteState() else {
-            flushFailed = true
-            return
-        }
+        guard prepareRowWriteState() else { return }
         let sourceSet = bufferSets[flushSourceSetIndex]
         let structural = !sourceSet.rowState.usingRowBuffers
             || totalRows != sourceSet.knownTotalRows
