@@ -1,31 +1,21 @@
 // visual/main_float_cursor_moves — a cursor moving inside a float the MAIN
 // window hosts must produce a frame.
 //
-// The main surface's row-mode skip gate is
-//   rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling
-//     && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnce
-//     && !anyCustomShaderNeedsAnimation
-// and it carries no `hasNewCommit` term. A dirty row is therefore the only
-// thing that keeps a cursor-only frame alive — but `submitLayerCursor`, the
-// route a float's cursor takes (ZonvieCore's `.mainLayer` case), marks no row
-// damage and never sets `flushHadLayerWork`, so `anyLayerWork` stays false.
-//
-// What rescues it today is indirect: there is one global cursor revision, so a
-// cursor moving inside the float also fires grid 1's cursor callback with an
-// EMPTY slice. The renderer discards that (`cursor_ignore ...
-// reason=empty_nonowner`) — but the view marks its row dirty before the
-// renderer ever sees it.
+// `submitLayerCursor`, the route a float's cursor takes (ZonvieCore's
+// `.mainLayer` case), marks no row damage and never sets `flushHadLayerWork`,
+// so neither `dirtyRows` nor `anyLayerWork` says anything about it. The commit
+// revision is what keeps the frame alive: the main surface's row-mode skip gate
+// carries `!hasNewCommit`, so a commit this draw has not seen is not skipped
+// (it did not always; see ad3d17a).
 //
 // WHAT THIS SCENARIO DOES AND DOES NOT COVER. It asserts the OUTCOME: the
 // cursor visibly moves inside a float the main window hosts. It does NOT
-// isolate the gate above, and that is measured, not assumed. Instrumenting a
-// run showed the `.mainLayer` route taken 10 times and the view marking damage
-// 157 times, while the gate fired ZERO times — there is enough other redraw
-// traffic here (capture itself provokes some) that the gate is never the
-// deciding factor. Deleting the view's `markDirtyRows` and re-running leaves
-// this scenario passing unchanged. So do not read a green run here as licence
-// to remove that damage mark; the tripwire for that change does not exist yet,
-// and building one needs a quieter harness than screen capture provides.
+// isolate that gate, and that is measured, not assumed. Instrumenting a run
+// showed the `.mainLayer` route taken 10 times while the gate fired ZERO times
+// — there is enough other redraw traffic here (capture itself provokes some)
+// that the gate is never the deciding factor. So read a green run here as "the
+// cursor reached the screen", nothing narrower; isolating the gate needs a
+// quieter harness than screen capture provides.
 //
 // Measured as pixels, not as bookkeeping: a frame that is never produced and
 // a frame that is produced and identical are the same trace but not the same
