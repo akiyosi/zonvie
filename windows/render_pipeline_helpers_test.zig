@@ -593,6 +593,56 @@ test "slot backing is retained until the layout has produced a row" {
     try std.testing.expect(!helpers.shouldRetireSlotBacking(std.math.maxInt(usize), 0));
 }
 
+test "paint policy keeps the previous frame only when nothing forces a redraw" {
+    const quiet = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = true,
+    };
+    const p = helpers.paintPolicy(quiet);
+    try std.testing.expect(!p.force_full_rows);
+    try std.testing.expect(p.preserve_back);
+}
+
+test "paint policy forces a full redraw on each of its four terms" {
+    const base = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = true,
+    };
+    var a = base;
+    a.force_full = true;
+    var b = base;
+    b.cursor_grid_changed = true;
+    var c2 = base;
+    c2.glow_enabled = true;
+    var d = base;
+    d.opacity = 0.9;
+    for ([_]helpers.PaintPolicyInputs{ a, b, c2, d }) |in| {
+        const p = helpers.paintPolicy(in);
+        try std.testing.expect(p.force_full_rows);
+        // A forced full redraw never preserves the back buffer.
+        try std.testing.expect(!p.preserve_back);
+    }
+}
+
+test "paint policy refuses to preserve a back buffer that is not valid" {
+    const in = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = false,
+    };
+    const p = helpers.paintPolicy(in);
+    try std.testing.expect(!p.force_full_rows);
+    try std.testing.expect(!p.preserve_back);
+}
+
 test "present rect clamping drops rects that clamp away and keeps the rest" {
     var rects = [_]Rect{
         .{ .left = -5, .top = -5, .right = 40, .bottom = 40 },

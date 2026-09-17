@@ -2638,14 +2638,21 @@ pub export fn WndProc(
                         // and the same fix, as drawNormalExternalSurfaceRowMode.
                         const cursor_grid_changed =
                             tbs_snapshot.cursor_layer_grid_id != app.last_painted_cursor_grid;
-                        const force_full_rows =
-                            did_need_seed or
-                            paint_full_snapshot or
-                            seed_clear_pending_snapshot or
-                            (seed_pending_snapshot and !back_tex_valid_snapshot) or
-                            cursor_grid_changed or
-                            glow_enabled or
-                            (g.opacity < 1.0);
+                        // Everything seed-shaped is this driver's own
+                        // "repaint everything" request; the terms both drivers
+                        // share live in render_helpers.paintPolicy.
+                        const paint_policy = render_helpers.paintPolicy(.{
+                            .force_full =
+                                did_need_seed or
+                                paint_full_snapshot or
+                                seed_clear_pending_snapshot or
+                                (seed_pending_snapshot and !back_tex_valid_snapshot),
+                            .cursor_grid_changed = cursor_grid_changed,
+                            .glow_enabled = glow_enabled,
+                            .opacity = g.opacity,
+                            .back_tex_valid = back_tex_valid_snapshot,
+                        });
+                        const force_full_rows = paint_policy.force_full_rows;
 
                         if (log_enabled) {
                             applog.appLog(
@@ -3203,10 +3210,13 @@ pub export fn WndProc(
                         // alpha blending accumulates on retained back_tex, producing faint ghost
                         // text on rows that are drawn over without an intervening clear (matches
                         // external window logic in drawNormalExtRowMode).
-                        const preserve_back = !seed_clear and
-                            back_tex_valid_snapshot and
-                            !glow_enabled and
-                            g.opacity >= 1.0;
+                        // From the shared policy above. It is stricter than the
+                        // terms spelled out here used to be — it also refuses on
+                        // paint_full and on a cursor that changed grid — but every
+                        // case it newly refuses is one where force_full_rows is
+                        // true and every row redraws anyway, and the chrome is
+                        // regenerated each paint regardless.
+                        const preserve_back = paint_policy.preserve_back;
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{

@@ -730,10 +730,17 @@ fn drawNormalExternalSurfaceRowMode(
     // narrower fix; it needs the surface coordinates of a grid that may no
     // longer be placed, which is more machinery than the case is worth.
     const cursor_grid_changed = tbs_snap.cursor_layer_grid_id != ext_win.last_painted_cursor_grid;
-    const force_full_rows = force_full or
-        cursor_grid_changed or
-        glow_enabled or
-        (g.opacity < 1.0);
+    const paint_policy = render_pipeline_helpers.paintPolicy(.{
+        .force_full = force_full,
+        .cursor_grid_changed = cursor_grid_changed,
+        .glow_enabled = glow_enabled,
+        .opacity = g.opacity,
+        // An external window keeps no back-buffer validity flag of its own, so
+        // it asserts one; that is exactly what its previous bare
+        // `!force_full_rows` preserve_back meant.
+        .back_tex_valid = true,
+    });
+    const force_full_rows = paint_policy.force_full_rows;
 
     // Build sorted, deduplicated rows_to_draw list in per-window scratch.
     const rows_to_draw = &ext_win.paint_rows_to_draw;
@@ -774,7 +781,13 @@ fn drawNormalExternalSurfaceRowMode(
             break;
         }
     }
-    if (cursor_on_root and has_layers and !force_full_rows) {
+    // Unconditionally, as the main driver does for `cursor_grid == 1`. Claiming
+    // both rows from their own grid's vertices is what removes the previous
+    // cursor, including an in-place shape change that leaves the row otherwise
+    // unchanged. This used to be claimed only when layers were present, and the
+    // no-layer case was covered by the overlay's erase branch instead — a
+    // full-content-width clear that the layer case already had to forbid.
+    if (cursor_on_root) {
         for (cursor_erase_rows) |maybe_row| {
             const r = maybe_row orelse continue;
             if (r >= ext_rows) continue;
@@ -817,7 +830,7 @@ fn drawNormalExternalSurfaceRowMode(
         .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
         .row_h_px = row_h_px,
         .content_right = content_right,
-        .preserve_back = !force_full_rows,
+        .preserve_back = paint_policy.preserve_back,
         .root_rows_may_be_empty = has_layers,
         // The root layer drives the pixel space core vertices arrive in.
         .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
@@ -943,7 +956,7 @@ fn drawNormalExternalSurfaceRowMode(
             .content_height = @intCast(draw_params.content_height),
             .row_h_px = row_h_px,
             .cell_w_px = @intCast(@max(1, app.cell_w_px)),
-            .preserve_back = !force_full_rows,
+            .preserve_back = paint_policy.preserve_back,
             .paint_full = force_full_rows,
             .cursor_grid = tbs_snap.cursor_layer_grid_id,
             .last_cursor_row = ext_win.last_painted_cursor_row,
@@ -1091,18 +1104,6 @@ fn drawNormalExternalSurfaceRowMode(
             .ctx_ptr = result.ctx_ptr,
             .rs_set_sc_fn = result.rs_set_sc_fn,
             .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-            // External windows preserve back_tex and may not redraw the cursor row on
-            // an in-place shape change, so erase the stale overlay before redrawing.
-            // A full-row frame already cleared the back texture and redrew every row;
-            // clearing again would accumulate alpha on the cursor row when transparent.
-            //
-            // With layers the erase is forbidden whatever it would fix: it
-            // clears a band the full content width and can refill it from one
-            // grid only, so it would wipe the layers just drawn over that row.
-            // The claim above repaints the row from its own grid instead, which
-            // is what removes the previous cursor. The main window works the
-            // same way and never erases.
-            .erase_cursor_row = !force_full_rows and !has_layers,
             .row_already_redrawn = cursor_row_redrawn,
             .cursor_layer_origin_x_px = cursor_origin_x,
             .cursor_layer_origin_y_px = cursor_origin_y,

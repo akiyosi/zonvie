@@ -4176,7 +4176,6 @@ pub const CursorOverlayParams = struct {
     /// their back_tex per paint, so an in-place cursor shape/position change
     /// would stack the new overlay on top of the stale one (block + bar). The
     /// clear+redraw erases the old overlay even over empty (no-bg-quad) cells.
-    erase_cursor_row: bool = false,
     /// The caller already redrew every row, including the cursor row, in this
     /// frame. In that case blink-on only needs the cursor quad and blink-off
     /// needs no work; clearing/redrawing again would double-blend transparent
@@ -4283,13 +4282,10 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     }
 
     // 4. Erase the previous cursor overlay, then draw the new one.
-    // erase_cursor_row (external windows): clear the cursor row to bg and redraw
-    // its content first, so a stale overlay left in the preserved back_tex is
-    // erased even over empty cells. Without it, an in-place shape change stacks
-    // the new overlay on top of the old (block + bar). Then draw the cursor when
-    // blink is visible.
-    // Default path (main window): blink on draws the cursor; blink off redraws
-    // the row content to erase the cursor.
+    // Both drivers now claim the cursor's rows into the redraw set, so the
+    // stale overlay is gone before this runs and the two branches left are the
+    // whole policy: the row was already redrawn, or it was not and blink-off
+    // has to redraw its content to erase the cursor.
     if (p.row_already_redrawn) {
         if (p.blink_visible) {
             if (log_enabled) applog.appLog("[cursor-overlay] row already redrawn, draw cursor row={d}\n", .{cursor_row});
@@ -4297,14 +4293,6 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
             try g.drawVB(vb, p.cursor_verts.len);
         } else if (log_enabled) {
             applog.appLog("[cursor-overlay] row already redrawn, blink off row={d}\n", .{cursor_row});
-        }
-    } else if (p.erase_cursor_row) {
-        if (log_enabled) applog.appLog("[cursor-overlay] erase+draw row={d} verts={d} blink={}\n", .{ cursor_row, p.cursor_verts.len, p.blink_visible });
-        try g.drawClearRow();
-        try redrawCursorRowContent(g, p, cursor_row, cursor_ox, cursor_oy, layer_w, layer_h);
-        if (p.blink_visible) {
-            g.setLayerTransform(cursor_ox, cursor_oy, layer_w, layer_h);
-            try g.drawVB(vb, p.cursor_verts.len);
         }
     } else if (p.blink_visible) {
         if (log_enabled) applog.appLog("[cursor-overlay] draw cursor row={d} verts={d}\n", .{ cursor_row, p.cursor_verts.len });
