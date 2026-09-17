@@ -559,7 +559,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // MetalTypes.swift; what is left is each class's own concurrency contract,
     // and merging it would put both surfaces under a single lock discipline
     // neither has — in the path that produced the scroll freeze fixed by
-    // de6c402. Reviewed under the 2026-08-25 audit, finding 037.
+    // b83ff29. Reviewed under the 2026-08-25 audit, finding 037.
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
