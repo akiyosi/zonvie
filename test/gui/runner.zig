@@ -486,6 +486,17 @@ test "gui:extwin_cursor_move_reuses_rows" {
     }
 }
 
+test "gui:visual_extwin_hosted_layer_glow" {
+    // macOS only: it enumerates the app's OS windows and captures a
+    // non-main one, and the bloom path under test is macOS frontend code.
+    if (comptime builtin.os.tag == .macos and driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extwin_hosted_layer_glow.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:main_cursor_move_reuses_rows" {
     // macOS only: MetalTerminalRenderer is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {
