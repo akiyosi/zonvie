@@ -1066,6 +1066,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // --- Dirty region tracking (drawable pixel coordinates) ---
     private var pendingDirtyRectPx: NSRect? = nil
     private var pendingDirtyRows: IndexSet = IndexSet()
+    /// The last commit carried a cursor and nothing else, and left no earlier
+    /// damage undrawn. `ExternalGridView` calls the same thing `cursorOnlyCommit`
+    /// and uses it to reuse the surface instead of clearing it; this is that
+    /// state on the main surface, so neither surface has to spend a dirty row to
+    /// say "the cursor moved". Cleared by any commit that writes content, and by
+    /// a cursor commit that finds rows a draw has not consumed yet — those rows
+    /// are the frame's real work and must not be reused over.
+    private var pendingCursorOnlyCommit = false
     // Render-thread scratch. Ownership is swapped into draw() for the frame
     // and returned by defer, so appending/scroll expansion reuses capacity
     // without a live property alias that would trigger Array COW detaches.
@@ -2100,6 +2108,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         flushDirtyRows.removeAll()
         flushDirtyRectPx = nil
+        // Read the pending sets AFTER this bracket folded into them: a cursor
+        // commit that arrives while a content commit still waits for a draw is
+        // not a cursor-only frame, and treating it as one loses those rows.
+        pendingCursorOnlyCommit = didCursorWrite
+            && !didMainWrite
+            && !flushHadLayerWork
+            && pendingDirtyRows.isEmpty
+            && pendingDirtyRectPx == nil
         // Only update lastCommitTime when there are pending visual changes
         // (dirty rows, dirty rect, or a layer's rows/shift). Empty flushes
         // should not prevent the draw loop from deactivating.
@@ -2735,6 +2751,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // the core thread replaces both while this frame is being encoded.
             let cursorLayerOriginSnapshot: simd_float2
             let cursorOwnerGridSnapshot: Int64
+            /// The committed state carries a cursor move and nothing else.
+            let cursorOnlyCommitSnapshot: Bool
 
             let snappedBgRGB: UInt32
             let snappedCommittedDrawableW: UInt32
@@ -2765,8 +2783,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             swap(&dirtyRows, &dirtyRowsScratch)
             dirtyRows.removeAll(keepingCapacity: true)
             dirtyRows.append(contentsOf: pendingDirtyRows)
+            cursorOnlyCommitSnapshot = pendingCursorOnlyCommit
             pendingDirtyRectPx = nil
             pendingDirtyRows.removeAll()
+            pendingCursorOnlyCommit = false
             // Extend smoothScrolling one frame past the offset reaching zero:
             // the back buffer still holds pixels rendered with a non-zero shader
             // offset, and blitting those again is a 1-row jitter.
@@ -3157,7 +3177,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // pixel. Avoids the ~5.7ms .clear cost (alpha=0.8 backgrounds
             // disable Apple's fast-clear path). Glow is excluded: bloom samples
             // backTex through its own intermediate pass.
-            let noMainWorkFrame = !hasNewCommit
+            // `cursorOnlyCommitSnapshot` joins `!hasNewCommit` rather than
+            // replacing it: a commit that moved only the cursor changes no
+            // backTex pixel either, which is why `ExternalGridView` reuses its
+            // surface for one. Without it the main surface needs a dirty row to
+            // keep the frame alive, and that row drags a background band and
+            // every layer under it into the redraw.
+            let noMainWorkFrame = (!hasNewCommit || cursorOnlyCommitSnapshot)
                 && dirtyRows.isEmpty
                 && !anyLayerWork
                 && dirtyRectPxOpt == nil

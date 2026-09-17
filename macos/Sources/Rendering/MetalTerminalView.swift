@@ -1703,7 +1703,16 @@ final class MetalTerminalView: MTKView {
 
 
     
-        renderer.markDirtyRows(rowStart: rowStart, rowCount: rowCount)
+        // A cursor-only callback marks no row damage: the renderer records the
+        // commit as cursor-only and reuses the surface, exactly as
+        // ExternalGridView does. A row marked here would instead band that row,
+        // redraw it, and pull every layer crossing it into the frame. The
+        // redraw request below still schedules the frame.
+        let cursorOnly = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
+            && (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) == 0
+        if !cursorOnly {
+            renderer.markDirtyRows(rowStart: rowStart, rowCount: rowCount)
+        }
     
 
     

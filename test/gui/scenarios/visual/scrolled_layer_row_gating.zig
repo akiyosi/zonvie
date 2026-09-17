@@ -18,6 +18,16 @@
 // the part that was broken and that no predicate test can see.
 //
 // Both frontends emit [layer_draw] from their per-layer draw loop.
+//
+// The cursor moves below run with `cursorline` on, so each one genuinely
+// dirties two of the layer's rows. That is deliberate and load-bearing: a bare
+// cursor move changes no cell, and neither surface draws a layer for one — the
+// cursor is an overlay on the drawable. The main surface used to draw a layer
+// anyway, because its view marked the cursor's root row dirty and the band over
+// that row pulled every layer crossing it into the frame; that asymmetry is
+// gone. With `cursorline` the layer has real rows to redraw, so the measurement
+// is the same one it always was (owed rows vs every row) on a vehicle that does
+// not depend on phantom damage.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");
@@ -30,13 +40,14 @@ const draw_marker = "[layer_draw] gridId=";
 const blit_marker = "[layer_blit] gridId=";
 const refused_marker = "[layer_blit_refused] gridId=";
 
-/// Cursor moves in the measured phase. Each one dirties two rows at most.
+/// Cursor moves in the measured phase. With `cursorline` each one dirties the
+/// row being left and the row being entered — two rows.
 const cursor_moves = 16;
 const max_grids = 16;
 
 /// A frame that re-encodes at least this share of a layer's rows redrew the
 /// whole thing rather than the rows it owed. Deliberately far from both
-/// measured populations (1 of 52 when the gating works, 54 of 52 when it does
+/// measured populations (2 of 52 when the gating works, 54 of 52 when it does
 /// not) so this is a live/dead check, not a performance threshold.
 const full_redraw_share = 0.5;
 
@@ -132,7 +143,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // A vertical split always fails the core's full-width row-scroll fast
     // path, so its window grid is drawn as a layer and its outgoing rows can
     // only be kept by the retention this scenario measures.
-    try g.exec("execute('set laststatus=0 noruler noshowcmd scrolloff=0 nowrap noswapfile')");
+    try g.exec("execute('set laststatus=0 noruler noshowcmd scrolloff=0 nowrap noswapfile cursorline')");
     try g.exec(
         \\setline(1, map(range(1, 400), {_, i -> printf('%3d %s', i, repeat(nr2char(65 + i % 26), 60))}))
     );
