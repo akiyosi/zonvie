@@ -2949,11 +2949,27 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             // In rowMode with no vertex updates and no dirty rows, skip rendering.
-            // Also skip when a new commit arrived but carried no visual changes
-            // (e.g. empty non-scroll flush).  Without this, the .clear loadAction
-            // destroys the backbuffer between GPU-blit scroll frames.
+            //
+            // This used to skip a new commit too, on the grounds that an empty
+            // non-scroll flush would otherwise reach a `.clear` loadAction and
+            // destroy the backbuffer a GPU-blit scroll depends on. That conflated
+            // "nothing to draw" with "do not clear": it also swallowed commits
+            // that DID carry something no other term expresses — a cursor moving
+            // inside a float the main surface hosts reaches `submitLayerCursor`,
+            // which marks no row and sets no layer work, so this gate was the
+            // only thing between it and a frame. And because the gate returns
+            // before `lastDrawnRevision` is assigned, a swallowed commit stayed
+            // unacknowledged, pinning `hasNewCommit` true and disabling the blink
+            // fast path and `skipMainPass` until something else rendered.
+            //
+            // It now respects the revision, as the idle gate above it already
+            // did, so `commitRevision` means the same thing on this surface as it
+            // does on ExternalGridView: a generation this draw has not seen.
+            // Whether the backbuffer may be reused stays where it belongs, in
+            // `shouldReusePreviousContents`. `dirtyRectPxOpt` joins it for the
+            // same reason — rect-only damage was consumed and then discarded here.
             // Same animation exception as above.
-            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation {
+            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil {
                 FrameTracer.trace(.drawSkipNoChange, a: 3)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
