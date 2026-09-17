@@ -691,6 +691,46 @@ pub fn shouldRetireSlotBacking(capacity: usize, layout_peak_verts: usize) bool {
 /// Sort rectangles in place, then merge overlapping or edge-adjacent entries.
 /// The merge may enlarge damage to a bounding rectangle, but never drops
 /// damaged pixels. This keeps the paint path allocation-free and O(n log n).
+/// What a paint driver has to decide before it draws: whether every row must
+/// be redrawn, and whether the previous frame in `back_tex` may be kept.
+///
+/// Both drivers derived these separately and reached different answers. The
+/// terms they already shared — a cursor that changed grid, glow, and a
+/// translucent window — are the whole of `force_full_rows` here; everything
+/// surface-specific is folded into `force_full` by the caller, which is where
+/// the main driver's seed state and an external window's `paint_full` live.
+pub const PaintPolicyInputs = struct {
+    /// The surface's own "repaint everything" request.
+    force_full: bool,
+    cursor_grid_changed: bool,
+    glow_enabled: bool,
+    opacity: f32,
+    /// Whether `back_tex` still holds a usable previous frame. The main driver
+    /// tracks this per app; an external window has no equivalent yet and
+    /// passes true, which is what its previous `!force_full_rows` meant.
+    back_tex_valid: bool,
+};
+
+pub const PaintPolicy = struct {
+    force_full_rows: bool,
+    preserve_back: bool,
+};
+
+pub fn paintPolicy(in: PaintPolicyInputs) PaintPolicy {
+    const force_full_rows =
+        in.force_full or
+        in.cursor_grid_changed or
+        in.glow_enabled or
+        (in.opacity < 1.0);
+    return .{
+        .force_full_rows = force_full_rows,
+        // Keeping the previous frame is only safe when nothing forces a full
+        // redraw AND that frame is still there. A frame this returns false for
+        // redraws every row anyway, so clearing costs nothing it needs.
+        .preserve_back = !force_full_rows and in.back_tex_valid,
+    };
+}
+
 /// Clamp present rectangles to the render target and drop the ones that clamp
 /// away to nothing, returning the surviving length.
 ///
