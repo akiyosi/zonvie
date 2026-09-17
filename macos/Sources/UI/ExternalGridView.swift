@@ -565,8 +565,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// root's and every hosted grid's row state into it, and rotate, or be
     /// dropped when all three were GPU-in-flight. Cursor callbacks replace the
     /// cursor outright, so a slot needs no copy-forward; three of them are
-    /// enough for the committed one plus the frames in flight, and
-    /// `cursorStaging` still covers the case where they are all busy.
+    /// enough for the committed one plus the frames in flight.
     /// Mirrors MetalTerminalRenderer's cursor triple.
     private final class SurfaceCursorSlot {
         var vertexBuffer: MTLBuffer? = nil
@@ -582,33 +581,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// The slot this bracket wrote, or -1 when it has written no cursor. Only a
     /// bracket that wrote one rotates `committedCursorSetIndex` at commit.
     private var cursorWriteSetIndex: Int = -1
-
-    // Staged out-of-bracket cursor update awaiting a safe apply point.
-    // Written by submitVerticesRowRaw's out-of-bracket cursor path when every
-    // cursor slot is GPU-in-flight (writing one in place would race the
-    // in-flight read); applied by draw() once a slot frees up.
-    // cursorStagingCount: -1 = none pending, 0 = clear cursor, >0 = vertex
-    // count in cursorStaging. Protected by tripleBufferLock.
-    private var cursorStaging: [zonvie_vertex] = []
-    private var cursorStagingCount: Int = -1
-
-    // Staged out-of-bracket ROW updates awaiting a safe apply point (mirrors
-    // cursorStaging). Row buffers are COW-shared across buffer sets, so an
-    // in-place write into the committed set can alias a buffer an OLDER
-    // GPU-in-flight set still reads — writes are only safe when ALL sets are
-    // idle. Applied by draw() at the idle check, or folded into the write set
-    // by beginFlush() (a flush's own row content is newer and overwrites).
-    // Protected by tripleBufferLock.
-    private var rowStaging: [Int: [zonvie_vertex]] = [:]
-    private var rowStagingTotalRows: Int = 0
-    private var rowStagingTotalCols: Int = 0
-
-    // Staged rows folded into the CURRENT bracket's write set by beginFlush.
-    // Held here (not dropped) until the bracket resolves: commitFlush clears
-    // them (published), cancelFlush / a contentless commit merges them back
-    // into rowStaging (newer staged entries win) so a cancelled flush cannot
-    // permanently lose replayed rows. Protected by tripleBufferLock.
-    private var rowStagingFolded: [Int: [zonvie_vertex]] = [:]
 
     /// Complete one protected GPU read and immediately service any contraction
     /// that had to skip this set while it was in flight. Caller holds
@@ -685,16 +657,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 }
             }
         }
-    }
-
-    /// Merge folded (bracket-pending) staged rows back into rowStaging.
-    /// Caller must hold tripleBufferLock. Newer staged entries win.
-    private func restoreFoldedRowStagingLocked() {
-        guard !rowStagingFolded.isEmpty else { return }
-        for (row, verts) in rowStagingFolded where rowStaging[row] == nil {
-            rowStaging[row] = verts
-        }
-        rowStagingFolded.removeAll(keepingCapacity: true)
     }
 
     // --- Scrollbar ---
@@ -1291,73 +1253,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // cursor is left alone too — draw() publishes it into a free slot
         // without needing this bracket to reach a commit.
         tripleBufferLock.lock()
-        // Fold staged out-of-bracket ROW updates into the write set (never
-        // GPU-in-flight, so this is always safe). Moved into rowStagingFolded
-        // (not dropped): commitFlush clears them once published, while
-        // cancelFlush merges them back into rowStaging so a cancelled flush
-        // cannot permanently lose replayed rows. Any newer row content
-        // submitted during this bracket simply overwrites the folded rows in
-        // the write set, preserving submission order.
-        // Folding staged rows IS flush content — without flushHadContent the
-        // bracket may end without a commit and the folded rows would stay
-        // orphaned in the write set (same failure shape as the cursor-only
-        // flush bug in submitVerticesRowRaw).
-        if !rowStaging.isEmpty {
-            flushHadContent = true
-            gridRows = UInt32(rowStagingTotalRows)
-            gridCols = UInt32(rowStagingTotalCols)
-            for (row, verts) in rowStaging {
-                verts.withUnsafeBufferPointer { stagedBuf in
-                    // Locked variant: this section holds tripleBufferLock.
-                    let structural = !src.rowState.usingRowBuffers
-                        || rowStagingTotalRows != src.knownTotalRows
-                        || rowStagingTotalCols != src.knownTotalCols
-                    // Allocate synchronously, finishing the revert b83ff29 began
-                    // and 4b1ad75 applied to submitVerticesRowRaw above: the
-                    // pre-provisioning gate does not converge, and a per-view
-                    // failure here escalates through ZonvieCore's flushFailed
-                    // sweep into an app-wide abort_flush. requirePreparedRowCapacity
-                    // now only records a real allocation failure for recovery.
-                    if !submitSurfaceRowVertices(
-                        target: dst,
-                        sourceSet: src,
-                        device: mtlDevice,
-                        rowStart: row,
-                        ptr: stagedBuf.baseAddress.map(UnsafeRawPointer.init),
-                        count: verts.count,
-                        maxRowBuffers: maxRowBuffers,
-                        totalRows: rowStagingTotalRows,
-                        totalCols: rowStagingTotalCols,
-                        inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
-                    ) {
-                        _ = requirePreparedRowCapacity(
-                            row: row,
-                            vertexCount: verts.count,
-                            totalRows: rowStagingTotalRows,
-                            lockHeld: true,
-                            useWriteMapping: true
-                        )
-                        flushFailed = true
-                    } else {
-                        recordGeneratedRowsLocked(
-                            rowStart: row,
-                            rowCount: 1,
-                            totalRows: rowStagingTotalRows,
-                            totalCols: rowStagingTotalCols
-                        )
-                        if structural {
-                            flushHasStructuralRowChange = true
-                        } else {
-                            flushChangedRows.insert(row)
-                        }
-                    }
-                }
-                pendingDirtyRows.insert(row)
-                flushDirtyRows.insert(row)
-                rowStagingFolded[row] = verts
-            }
-            rowStaging.removeAll(keepingCapacity: true)
-        }
         tripleBufferLock.unlock()
         return true
     }
@@ -1381,10 +1276,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// view's beginFlush() failed and the whole flush is aborted (mirrors
     /// windows/callbacks.zig onFlushBegin's cancelFlush loop). The write set
     /// holds only scratch state until commitFlush publishes it, so dropping
-    /// the bracket flag is sufficient — EXCEPT for staged rows this bracket's
-    /// beginFlush folded into the (now discarded) write set: merge them back
-    /// into rowStaging or the replayed rows are lost forever (the core never
-    /// resends them). Safe no-op when no bracket is open.
+    /// the bracket flag is sufficient. Safe no-op when no bracket is open.
     func cancelFlush() {
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_abort surface=\(gridId) was_open=\(isInFlush)")
         isInFlush = false
@@ -1401,7 +1293,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // An abandoned bracket publishes no cursor. The slot it wrote is simply
         // released; the committed one is still whatever was last published.
         cursorWriteSetIndex = -1
-        restoreFoldedRowStagingLocked()
         flushChangedRows.removeAll()
         flushGeneratedRows.removeAll()
         flushHasStructuralRowChange = false
@@ -1596,8 +1487,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             pendingDirtyRows.formUnion(flushDirtyRows)
             flushDirtyRows.removeAll()
             if publishedRows {
-                // Folded staged rows are published with this commit — drop them.
-                rowStagingFolded.removeAll(keepingCapacity: true)
                 let committed = bufferSets[writeSetIndex]
                 let generatedRowCount = flushGeneratedTotalRows == committed.knownTotalRows
                     && flushGeneratedTotalCols == committed.knownTotalCols
@@ -1628,11 +1517,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             tripleBufferLock.unlock()
         } else {
             // Contentless bracket: nothing rotates. Close the bracket flag
-            // and put any folded staged rows back (unreachable in practice —
-            // folding sets flushHadContent — kept for robustness).
             tripleBufferLock.lock()
             cursorWriteSetIndex = -1
-            restoreFoldedRowStagingLocked()
             flushChangedRows.removeAll()
             flushGeneratedRows.removeAll()
             flushHasStructuralRowChange = false
@@ -1740,8 +1626,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // published rows a step behind the content they are drawn against —
         // stale lines over live text, with the edge stretch suppressed because
         // rows are still published. commitFlush clears it once the vertices
-        // this capture belongs to are actually on screen. Same reasoning as
-        // cancelFlush's rowStaging merge-back.
+        // this capture belongs to are actually on screen.
         pendingGridScrollLock.lock()
         let rowsDelta = pendingGridScrollRows
         let bounds = scrollCaptureBounds
@@ -2079,11 +1964,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// keeps a bracket that writes the cursor twice from consuming two.
     ///
     /// A failure — every slot being read by a frame in flight, or a buffer that
-    /// cannot be grown — fails the flush, exactly as the row side does. It must
-    /// NOT fall back to `cursorStaging`: that channel is published by draw() the
-    /// moment a slot frees, with no regard for whether this bracket ever
-    /// committed, so a cursor from an uncommitted or aborted flush would be
-    /// drawn against the previous content and layout.
+    /// cannot be grown — fails the flush, exactly as the row side does.
     private func writeBracketCursorVertices(ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
         tripleBufferLock.lock()
         defer { tripleBufferLock.unlock() }
@@ -2092,7 +1973,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
         let target = cursorWriteSetIndex
         if target != -1, writeCursorVertices(into: cursorSlots[target], ptr: ptr, count: count) {
-            cursorStagingCount = -1  // this write supersedes any staged update
             return
         }
         cursorWriteSetIndex = -1
@@ -2150,83 +2030,42 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// With ZONVIE_VERT_UPDATE_CURSOR (2) they go to the dedicated cursor
     /// buffer instead, outside the row buffers and so immune to the GPU scroll
     /// copy (no cursor ghosts).
-    /// `outOfBracket: true` marks MAIN-thread recovery callers outside any
-    /// bracket. They must never consult `isInFlush` — it is core-thread state,
-    /// and observing an open bracket would route the write into the SAME buffer
-    /// set the core thread is mutating (unsynchronized Swift Array appends in
-    /// ensureSurfaceRowStorage → memory corruption).
-    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32 = 1, totalRows: Int, totalCols: Int, outOfBracket: Bool = false) {
+    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32 = 1, totalRows: Int, totalCols: Int) {
         // A view registered after on_flush_begin did not join this flush's
         // bracket. Do not reinterpret its later core callbacks as an
         // out-of-bracket publication: those vertices sample this flush's back
         // atlas, while the view can only snapshot an older committed texture.
         // External-window creation has already scheduled a bracketed resend.
-        if !outOfBracket && !isInFlush {
+        if !isInFlush {
             return
         }
 
-        // gridRows/gridCols are core-thread bracket state (commitFlush
-        // publishes them into committedGridRows/Cols). Main-thread
-        // out-of-bracket callers must not write them here — the direct-write
-        // branch below updates them under tripleBufferLock when no bracket
-        // is open (and the cursor replay passes totalRows=0, which would
-        // clobber the real dims).
-        if !outOfBracket {
-            gridRows = UInt32(totalRows)
-            gridCols = UInt32(totalCols)
-        }
+        // gridRows/gridCols are core-thread bracket state; commitFlush
+        // publishes them into committedGridRows/Cols.
+        gridRows = UInt32(totalRows)
+        gridCols = UInt32(totalCols)
 
         let isCursorUpdate = (flags & 2) != 0  // ZONVIE_VERT_UPDATE_CURSOR
         if isCursorUpdate {
-            if !outOfBracket && count == 0 && pendingCursorGridId != gridId {
+            if count == 0 && pendingCursorGridId != gridId {
                 ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(gridId) owner=\(pendingCursorGridId ?? 0) reason=empty_nonowner")
                 return
             }
-            if !outOfBracket { pendingCursorGridId = gridId }
+            pendingCursorGridId = gridId
             tripleBufferLock.lock()
             lastKnownCursorRow = rowStart
             cursorDirty = true
             tripleBufferLock.unlock()
-            if !outOfBracket && isInFlush {
-                // A slot of this bracket's own, rotated in at commit. Reusing
-                // the one already picked keeps a bracket that writes the cursor
-                // twice from consuming two slots.
-                writeBracketCursorVertices(ptr: ptr, count: count)
-                // A cursor update IS flush content: without this, a
-                // cursor-only flush (plain cursor movement — no row changed)
-                // never rotates committedSetIndex, the cursor written above
-                // stays orphaned in the write set, and draw() keeps showing
-                // the stale committed cursor (invisible cursor trail during
-                // j-repeat on external windows).
-                flushHadContent = true
-            } else {
-                // Out-of-bracket: publish into a slot no frame is reading. An
-                // open bracket is no longer a reason to hold back — the cursor
-                // no longer rides the row set a commit rotates, so nothing this
-                // write lands in can be discarded by one. When every slot is
-                // busy, stage CPU-side for draw() to publish.
-                tripleBufferLock.lock()
-                if publishCursorVerticesLocked(ptr: ptr, count: count) {
-                    cursorStagingCount = -1
-                    // Out-of-bracket publication has no commitFlush() to freeze
-                    // the atlas alongside the rows this cursor is drawn over.
-                    // Only while the committed set is idle, as before: draw()
-                    // reads this reference outside the lock, so an in-flight
-                    // frame must not have it changed under it.
-                    let csi = committedSetIndex
-                    if !bracketOpen && gpuInFlightCount[csi] == 0 {
-                        bufferSets[csi].atlasTextureSnapshot =
-                            mainTerminalView?.renderer.committedAtlasSnapshot()
-                    }
-                } else {
-                    cursorStaging.removeAll(keepingCapacity: true)
-                    if count > 0, let validPtr = ptr {
-                        cursorStaging.append(contentsOf: UnsafeBufferPointer(start: validPtr, count: count))
-                    }
-                    cursorStagingCount = count
-                }
-                tripleBufferLock.unlock()
-            }
+            // A slot of this bracket's own, rotated in at commit. Reusing
+            // the one already picked keeps a bracket that writes the cursor
+            // twice from consuming two slots.
+            writeBracketCursorVertices(ptr: ptr, count: count)
+            // A cursor update IS flush content: without this, a cursor-only
+            // flush (plain cursor movement — no row changed) never rotates
+            // committedSetIndex, the cursor written above stays orphaned in the
+            // write set, and draw() keeps showing the stale committed cursor
+            // (invisible cursor trail during j-repeat on external windows).
+            flushHadContent = true
             if count > 0, let validPtr = ptr {
                 // Forward the cursor rect into the main renderer's
                 // shader cursor state so cursor shaders running through
@@ -2249,8 +2088,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         if rowCount == 0 {
             // A zero-cell layout rewrites the write set's row state, so it owes
             // the same acquisition an ordinary row does.
-            guard !outOfBracket,
-                  count == 0,
+            guard count == 0,
                   prepareRowWriteState(),
                   applySurfaceZeroCellLayout(
                     bufferSet: bufferSets[writeSetIndex],
@@ -2275,167 +2113,72 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             return
         }
 
-        if !outOfBracket && isInFlush {
-            // In-bracket (core thread): write set is never GPU-in-flight.
-            guard prepareRowWriteState() else {
-                flushFailed = true
-                return
-            }
-            let sourceSet = bufferSets[flushSourceSetIndex]
-            let structural = !sourceSet.rowState.usingRowBuffers
-                || totalRows != sourceSet.knownTotalRows
-                || totalCols != sourceSet.knownTotalCols
-            // Allocate synchronously (was gated behind requirePreparedRowCapacity
-            // + allowAllocation: false), mirroring submitVerticesRowRaw in
-            // MetalTerminalRenderer: the async pre-provisioning detour does not
-            // converge under sustained scroll. The gate mattered more here than
-            // on the main grid, because ZonvieCore's per-view flushFailed sweep
-            // escalates any external failure into an app-wide abort_flush, so a
-            // float's unprepared capacity stalled the main grid too.
-            // requirePreparedRowCapacity is still used below, but only to record
-            // a real allocation failure for the async recovery path.
-            if !submitSurfaceRowVertices(
-                target: bufferSets[writeSetIndex],
-                sourceSet: sourceSet,
-                device: mtlDevice,
-                rowStart: rowStart,
-                ptr: UnsafeRawPointer(ptr),
-                count: count,
-                maxRowBuffers: maxRowBuffers,
-                totalRows: totalRows,
-                totalCols: totalCols,
-                inflightRowBuffers: { self.inflightRowBuffers(atSlot: $0) }
-            ) {
-                _ = requirePreparedRowCapacity(
-                    row: rowStart,
-                    vertexCount: count,
-                    totalRows: totalRows,
-                    useWriteMapping: true
-                )
-                flushFailed = true
-            } else {
-                tripleBufferLock.lock()
-                recordGeneratedRowsLocked(
-                    rowStart: rowStart,
-                    rowCount: rowCount,
-                    totalRows: totalRows,
-                    totalCols: totalCols
-                )
-                tripleBufferLock.unlock()
-                if structural {
-                    flushHasStructuralRowChange = true
-                } else {
-                    for row in rowStart..<max(rowStart, rowStart + rowCount) {
-                        flushChangedRows.insert(row)
-                    }
-                }
-            }
-            // Track dirty rows for GPU scroll copy path, and stage into
-            // flushDirtyRows so commitFlush can re-publish these marks if a
-            // draw() steals them mid-flush (see flushDirtyRows doc comment;
-            // mirrors MetalTerminalRenderer.markDirtyRows).
-            tripleBufferLock.lock()
-            for r in rowStart..<max(rowStart, rowStart + rowCount) {
-                pendingDirtyRows.insert(r)
-                flushDirtyRows.insert(r)
-            }
-            tripleBufferLock.unlock()
-            flushHadContent = true
+        // In-bracket (core thread): write set is never GPU-in-flight.
+        guard prepareRowWriteState() else {
+            flushFailed = true
             return
         }
-
-        // Out-of-bracket / non-flush path. Two hazards force staging:
-        // (a) Row buffers are COW-shared across buffer sets, so an in-place
-        //     write into the committed set can alias a buffer an older
-        //     GPU-in-flight set still reads (submitSurfaceRowVertices only
-        //     consults the alias guard when allocating a NEW buffer).
-        // (b) An OPEN flush bracket already COW-copied the committed set;
-        //     its commit rotates onto that pre-write copy, silently
-        //     discarding a direct committed write (and the unlocked copy in
-        //     beginFlush would race it).
-        // Write directly only when no bracket is open AND all sets are idle,
-        // while holding tripleBufferLock; otherwise stage for draw() /
-        // beginFlush() to apply at the next safe point.
-        tripleBufferLock.lock()
-        let csi = committedSetIndex
-        let allIdle = gpuInFlightCount[0] == 0 && gpuInFlightCount[1] == 0 && gpuInFlightCount[2] == 0
-        var stagedForRetry = false
-        if !bracketOpen && !rowCapacity.provisioning && allIdle {
-            // Locked variant: tripleBufferLock is held (NSLock is
-            // non-recursive) — and with all sets idle there are no in-flight
-            // aliases anyway.
-            let target = bufferSets[csi]
-            let structural = !target.rowState.usingRowBuffers
-                || totalRows != target.knownTotalRows
-                || totalCols != target.knownTotalCols
-            let submitted = submitSurfaceRowVertices(
-                target: target,
-                sourceSet: nil,
-                device: mtlDevice,
-                rowStart: rowStart,
-                ptr: UnsafeRawPointer(ptr),
-                count: count,
-                maxRowBuffers: maxRowBuffers,
+        let sourceSet = bufferSets[flushSourceSetIndex]
+        let structural = !sourceSet.rowState.usingRowBuffers
+            || totalRows != sourceSet.knownTotalRows
+            || totalCols != sourceSet.knownTotalCols
+        // Allocate synchronously (was gated behind requirePreparedRowCapacity
+        // + allowAllocation: false), mirroring submitVerticesRowRaw in
+        // MetalTerminalRenderer: the async pre-provisioning detour does not
+        // converge under sustained scroll. The gate mattered more here than
+        // on the main grid, because ZonvieCore's per-view flushFailed sweep
+        // escalates any external failure into an app-wide abort_flush, so a
+        // float's unprepared capacity stalled the main grid too.
+        // requirePreparedRowCapacity is still used below, but only to record
+        // a real allocation failure for the async recovery path.
+        if !submitSurfaceRowVertices(
+            target: bufferSets[writeSetIndex],
+            sourceSet: sourceSet,
+            device: mtlDevice,
+            rowStart: rowStart,
+            ptr: UnsafeRawPointer(ptr),
+            count: count,
+            maxRowBuffers: maxRowBuffers,
+            totalRows: totalRows,
+            totalCols: totalCols,
+            inflightRowBuffers: { self.inflightRowBuffers(atSlot: $0) }
+        ) {
+            _ = requirePreparedRowCapacity(
+                row: rowStart,
+                vertexCount: count,
                 totalRows: totalRows,
-                totalCols: totalCols,
-                allowAllocation: false,
-                inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
+                useWriteMapping: true
             )
-            if submitted {
-                for r in rowStart..<max(rowStart, rowStart + rowCount) {
-                    pendingDirtyRows.insert(r)
-                }
-                // Track grid dims here (no bracket open, so no core-thread
-                // writer can race this) instead of the unconditional top-of-
-                // function write, which raced core-thread bracket state.
-                gridRows = UInt32(totalRows)
-                gridCols = UInt32(totalCols)
-                committedGridRows = UInt32(totalRows)
-                committedGridCols = UInt32(totalCols)
-                // Match commitFlush's vertex/atlas publication contract for
-                // deferred window creation, which replays rows outside a core
-                // flush and may receive no later redraw batch.
-                bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
-                // Publish: without a revision bump the next draw computes
-                // hasNewCommit=false and its early-exit path would consume and
-                // discard the dirty marks above. Callers that bump the
-                // revision again are harmless (monotonic counter).
-                commitRevision &+= 1
-                recordCommittedRowMutationLocked(
-                    committedIndex: csi,
-                    rows: rowStart..<max(rowStart, rowStart + rowCount),
-                    structural: structural
-                )
-            } else {
-                var staged: [zonvie_vertex] = []
-                if count > 0, let validPtr = ptr {
-                    staged.append(contentsOf: UnsafeBufferPointer(start: validPtr, count: count))
-                }
-                rowStaging[rowStart] = staged
-                rowStagingTotalRows = totalRows
-                rowStagingTotalCols = totalCols
-                stagedForRetry = true
-            }
-            tripleBufferLock.unlock()
+            flushFailed = true
         } else {
-            var staged: [zonvie_vertex] = []
-            if count > 0, let validPtr = ptr {
-                staged.append(contentsOf: UnsafeBufferPointer(start: validPtr, count: count))
-            }
-            rowStaging[rowStart] = staged
-            rowStagingTotalRows = totalRows
-            rowStagingTotalCols = totalCols
-            stagedForRetry = true
+            tripleBufferLock.lock()
+            recordGeneratedRowsLocked(
+                rowStart: rowStart,
+                rowCount: rowCount,
+                totalRows: totalRows,
+                totalCols: totalCols
+            )
             tripleBufferLock.unlock()
-        }
-        if stagedForRetry {
-            // Schedule a draw so the staging is applied once the sets go idle.
-            DispatchQueue.main.async { [weak self] in
-                self?.requestRedraw()
+            if structural {
+                flushHasStructuralRowChange = true
+            } else {
+                for row in rowStart..<max(rowStart, rowStart + rowCount) {
+                    flushChangedRows.insert(row)
+                }
             }
         }
-        // NOTE: no flushHadContent write here — that is core-thread bracket
-        // state; out-of-bracket paths publish via commitRevision instead.
+        // Track dirty rows for GPU scroll copy path, and stage into
+        // flushDirtyRows so commitFlush can re-publish these marks if a
+        // draw() steals them mid-flush (see flushDirtyRows doc comment;
+        // mirrors MetalTerminalRenderer.markDirtyRows).
+        tripleBufferLock.lock()
+        for r in rowStart..<max(rowStart, rowStart + rowCount) {
+            pendingDirtyRows.insert(r)
+            flushDirtyRows.insert(r)
+        }
+        tripleBufferLock.unlock()
+        flushHadContent = true
+        return
     }
 
     /// Request a redraw after vertices are submitted.
@@ -2807,127 +2550,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             csi = committedSetIndex
             retainedSnapshot = retention.snapshotPublished()
-            // Set when the staged replay below raises rowCapacity.requiredRows, so
-            // provisioning can be driven after tripleBufferLock is released.
-            var recordedRowCapacityShortfall = false
-            // Apply staged out-of-bracket ROW updates once ALL sets are idle
-            // (row buffers are COW-shared across sets, so csi-idle alone is
-            // not sufficient — see rowStaging doc comment) AND no bracket is
-            // open (an open bracket's commit would rotate onto a write set
-            // copied before this apply, discarding it). Must happen BEFORE
-            // the commitRevision snapshot below AND bump the revision:
-            // otherwise this draw computes hasNewCommit=false, the
-            // early-exit path consumes-and-discards the dirty marks inserted
-            // here, and the staged rows never reach the screen.
-            if !rowStaging.isEmpty, !bracketOpen,
-               gpuInFlightCount[0] == 0, gpuInFlightCount[1] == 0, gpuInFlightCount[2] == 0 {
-                var appliedRows: [Int] = []
-                appliedRows.reserveCapacity(rowStaging.count)
-                let committed = bufferSets[csi]
-                let structural = !committed.rowState.usingRowBuffers
-                    || rowStagingTotalRows != committed.knownTotalRows
-                    || rowStagingTotalCols != committed.knownTotalCols
-                for (row, verts) in rowStaging {
-                    var submitted = false
-                    verts.withUnsafeBufferPointer { stagedBuf in
-                        // Locked variant: this section holds tripleBufferLock.
-                        submitted = submitSurfaceRowVertices(
-                            target: bufferSets[csi],
-                            sourceSet: nil,
-                            device: mtlDevice,
-                            rowStart: row,
-                            ptr: stagedBuf.baseAddress.map(UnsafeRawPointer.init),
-                            count: verts.count,
-                            maxRowBuffers: maxRowBuffers,
-                            totalRows: rowStagingTotalRows,
-                            totalCols: rowStagingTotalCols,
-                            allowAllocation: false,
-                            inflightRowBuffers: { self.inflightRowBuffersLocked(atSlot: $0) }
-                        )
-                    }
-                    if submitted {
-                        pendingDirtyRows.insert(row)
-                        appliedRows.append(row)
-                    } else {
-                        // Record the requirement, or the ledger stays at zero,
-                        // provisionPendingRowCapacity short-circuits without
-                        // allocating, and this replay fails identically on every
-                        // subsequent draw while stagingPending keeps re-arming
-                        // requestRedraw.
-                        //
-                        // Recorded inline rather than through
-                        // requirePreparedRowCapacity for two reasons: the replay
-                        // targets bufferSets[csi], which is neither the write set
-                        // nor the flush source set that helper maps through, so it
-                        // would name a different physical slot; and it latches
-                        // flushFailed, which on_flush_end escalates into an
-                        // app-wide abort_flush — wrong for a draw-time shortfall
-                        // on one view, outside any bracket.
-                        let capacityRow = surfacePhysicalCapacityRow(
-                            logicalRow: row,
-                            logicalToSlot: bufferSets[csi].rowLogicalToSlot
-                        )
-                        if capacityRow >= 0, capacityRow < maxRowBuffers,
-                           rowStagingTotalRows >= 0, rowStagingTotalRows <= maxRowBuffers,
-                           surfaceSafeNeededBytes(vertexCount: max(0, verts.count)) != nil {
-                            rowCapacity.requiredRows = max(
-                                max(rowCapacity.requiredRows, rowStagingTotalRows),
-                                capacityRow + 1
-                            )
-                            rowCapacity.requiredVertexCounts[capacityRow] = max(
-                                rowCapacity.requiredVertexCounts[capacityRow],
-                                max(0, verts.count)
-                            )
-                            // A raised ledger gates the top of draw(), so it needs
-                            // a driver: provisionPendingRowCapacity runs only from
-                            // the flush-retry queue, and nothing on this path
-                            // schedules one. Without it the view would stop
-                            // presenting and spin the display link instead.
-                            recordedRowCapacityShortfall = true
-                        }
-                    }
-                }
-                for row in appliedRows {
-                    rowStaging.removeValue(forKey: row)
-                }
-                if !appliedRows.isEmpty {
-                    gridRows = UInt32(rowStagingTotalRows)
-                    gridCols = UInt32(rowStagingTotalCols)
-                    committedGridRows = UInt32(rowStagingTotalRows)
-                    committedGridCols = UInt32(rowStagingTotalCols)
-                    bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
-                    commitRevision &+= 1
-                    recordCommittedRowMutationLocked(
-                        committedIndex: csi,
-                        rows: appliedRows,
-                        structural: structural
-                    )
-                }
-            }
             currentCommitRevision = commitRevision
             snappedGridRows = committedGridRows
             snappedGridCols = committedGridCols
-            // Publish a staged cursor update (see submitVerticesRowRaw) now
-            // that a slot may have freed — must happen BEFORE the in-flight
-            // increments below mark slots busy. Re-arm cursorDirty: an EARLIER
-            // draw may already have consumed it while every slot was still
-            // busy, and without it the retry draw that finally publishes the
-            // staging would take the idle early-exit and never present the
-            // freshly written cursor.
-            if cursorStagingCount >= 0 {
-                let stagedCount = cursorStagingCount
-                var submitted = false
-                cursorStaging.withUnsafeBufferPointer { stagedBuf in
-                    submitted = publishCursorVerticesLocked(ptr: stagedBuf.baseAddress, count: stagedCount)
-                }
-                if submitted {
-                    cursorStagingCount = -1
-                    cursorDirty = true
-                    if !bracketOpen && gpuInFlightCount[csi] == 0 {
-                        bufferSets[csi].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
-                    }
-                }
-            }
             committedFontIsCurrent = fontResetState.isCurrent(
                 committedGeneration: bufferSets[csi].fontGeneration
             )
@@ -2943,7 +2568,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             submittedDirtyRows.removeAll(keepingCapacity: true)
             submittedDirtyRows.append(contentsOf: pendingDirtyRows)
             pendingDirtyRows.removeAll()
-            let stagingPending = cursorStagingCount >= 0 || !rowStaging.isEmpty
             cursorDirtySnapshot = cursorDirty
             cursorDirty = false
             lastKnownCursorRowSnapshot = lastKnownCursorRow
@@ -2978,24 +2602,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             defer {
                 submittedDirtyRows.removeAll(keepingCapacity: true)
                 swap(&submittedDirtyRows, &submittedDirtyRowsScratch)
-            }
-
-            // Staged cursor update couldn't be applied above (set still GPU
-            // in-flight): schedule another draw so an idle view doesn't keep
-            // showing the stale cursor (same retry idiom as the semaphore
-            // skip at the top of this method).
-            if stagingPending {
-                DispatchQueue.main.async { [weak self] in
-                    self?.requestRedraw()
-                }
-            }
-
-            // Drive the provisioner for the shortfall recorded above. Done after
-            // the lock is released: scheduleFlushRetry runs the worker on its own
-            // queue, which re-enters this view through provisionPendingRowCapacity
-            // and takes tripleBufferLock itself.
-            if recordedRowCapacityShortfall {
-                mainTerminalView?.core?.scheduleFlushRetry()
             }
 
             // Snapshot the previous-frame gate state BEFORE draw() overwrites
