@@ -337,7 +337,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     /// Publish the cursor layer for a grid the surface draws as a layer. The
     /// vertices are in that grid's own pixel space.
-    func submitLayerCursor(gridId: Int64, ptr: UnsafeRawPointer?, count: Int) {
+    func submitLayerCursor(gridId: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
         // Cursor clears are grid-local even though the surface has one overlay.
         guard count != 0 || pendingCursorLayerGridId == gridId else {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(pendingCursorLayerGridId) reason=empty_nonowner")
@@ -348,7 +348,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         submitVerticesPartialRaw(
             mainPtr: nil,
             mainCount: 0,
-            cursorPtr: ptr,
+            cursorPtr: ptr.map { UnsafeRawPointer($0) },
             cursorCount: count,
             updateMain: false,
             updateCursor: true
@@ -485,7 +485,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     func submitLayerRow(
         gridId: Int64,
         rowStart: Int,
-        ptr: UnsafeRawPointer?,
+        ptr: UnsafePointer<zonvie_vertex>?,
         count: Int,
         totalRows: Int,
         totalCols: Int

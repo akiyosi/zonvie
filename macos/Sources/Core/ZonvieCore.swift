@@ -684,25 +684,19 @@ final class ZonvieCore {
 
                 case .mainLayer:
                     // A grid the main surface places as a layer: a float or
-                    // split that lives in the main window, not its own.
+                    // split that lives in the main window, not its own. Same
+                    // shape as `.externalLayer` below — the surface is the
+                    // renderer here and the view there, but the two arms ask it
+                    // the same two questions with the same argument types.
+                    ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=1 grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
                     guard let renderer = core.terminalView?.renderer else { return }
                     if isCursorUpdate {
                         // The surface draws one cursor; remember which layer it
                         // belongs to so it is placed with that layer's transform.
-                        renderer.submitLayerCursor(
-                            gridId: gridId,
-                            ptr: verts.map { UnsafeRawPointer($0) },
-                            count: Int(vertCount)
-                        )
+                        renderer.submitLayerCursor(gridId: gridId, ptr: verts, count: Int(vertCount))
                     } else {
-                        renderer.submitLayerRow(
-                            gridId: gridId,
-                            rowStart: rs,
-                            ptr: verts.map { UnsafeRawPointer($0) },
-                            count: Int(vertCount),
-                            totalRows: tr,
-                            totalCols: tc
-                        )
+                        renderer.submitLayerRow(gridId: gridId, rowStart: rs, ptr: verts,
+                            count: Int(vertCount), totalRows: tr, totalCols: tc)
                     }
                     delivered = true
 
