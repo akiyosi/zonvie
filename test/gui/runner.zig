@@ -486,6 +486,16 @@ test "gui:extwin_cursor_move_reuses_rows" {
     }
 }
 
+test "gui:main_cursor_move_reuses_rows" {
+    // macOS only: MetalTerminalRenderer is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_cursor_move_reuses_rows.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_float_follows_externalized_anchor" {
     // macOS only: external windows and their surface plumbing are frontend code.
     if (comptime builtin.os.tag == .macos) {
