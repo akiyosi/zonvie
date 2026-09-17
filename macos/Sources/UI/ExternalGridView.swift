@@ -232,6 +232,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             flushFailed = true
             return
         }
+        // Before the remap, while the source set still holds the on-screen rows
+        // — the same ordering MetalTerminalRenderer.applyLayerRowScroll keeps.
+        captureLayerScrollStep(
+            gridId: id,
+            sets: sets,
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta
+        )
         remapSurfaceRowSlots(bufferSet: sets[writeSetIndex], rowStart: rowStart, rowEnd: rowEnd,
                             rowsDelta: rowsDelta, totalRows: totalRows, totalCols: totalCols,
                             maxRowBuffers: maxRowBuffers)
@@ -309,34 +318,22 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         lockHeld: Bool = false,
         useWriteMapping: Bool = false
     ) -> Bool {
-        switch surfaceRowCapacityVerdict(
+        let ok = requireSurfaceRowCapacity(
             bufferSets: bufferSets,
+            ledger: rowCapacity,
+            lock: tripleBufferLock,
+            lockHeld: lockHeld,
             row: row,
             vertexCount: vertexCount,
             totalRows: totalRows,
             maxRowBuffers: maxRowBuffers,
             mappingSetIndex: useWriteMapping ? writeSetIndex : flushSourceSetIndex,
             // An external surface is never asked about an already-physical row.
-            rowIsPhysical: false
-        ) {
-        case .ready:
-            return true
-
-        case .invalid:
-            flushFailed = true
-            return false
-
-        case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
-            if !lockHeld { tripleBufferLock.lock() }
-            rowCapacity.requiredRows = max(rowCapacity.requiredRows, requiredRows)
-            rowCapacity.requiredVertexCounts[capacityRow] = max(
-                rowCapacity.requiredVertexCounts[capacityRow],
-                neededVertexCount
-            )
-            if !lockHeld { tripleBufferLock.unlock() }
-            flushFailed = true
-            return false
-        }
+            rowIsPhysical: false,
+            logLabel: "ExternalGridView:\(gridId)"
+        )
+        if !ok { flushFailed = true }
+        return ok
     }
 
     /// True while this surface still owes a provisioning pass, or is in the
@@ -466,6 +463,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// that displaced grids that were square (it misplaced the cursor shader
     /// uniform in a split).
     private var stagedSmoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
+    /// Grids this bracket has already opened a retention step for. Two hints
+    /// can name the same grid inside one bracket; without this the second
+    /// would shift the rows the first already staged. Guarded by
+    /// `tripleBufferLock`, like MetalTerminalRenderer's set of the same name.
+    private var bracketStagedGrids: Set<Int64> = []
+    /// Indices into the frame's retained snapshot belonging to the layer being
+    /// drawn. Persistent so the layer pass allocates nothing per frame.
+    private var retainedIndexScratch: [Int] = []
     private var smoothScrollSeeds: [(gridId: Int64, rowsDelta: Int)] = []
     /// The scrollable row span of this window: the grid minus its viewport
     /// margins (a winbar makes marginTop 1, and its row does not scroll).
@@ -1182,6 +1187,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         flushGeneratedRows.removeAll()
         flushChangedRows.removeAll()
         flushHasStructuralRowChange = false
+        bracketStagedGrids.removeAll(keepingCapacity: true)
         // Publish "bracket open" BEFORE any unlocked committed-set copy:
         // main-thread out-of-bracket writers check this under the same lock and
         // stage instead of mutating the committed set, which makes
@@ -1787,6 +1793,86 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// step arriving while `pendingSentScroll` is non-zero is exactly the held
     /// key that needs one, so the picture snapped a whole cell. The main
     /// renderer's `captureLayerScrollStep` documents the same rule.
+    /// Retain the rows a hosted layer's scroll is about to displace, so its own
+    /// pass can ease them the way the root's are eased. The main surface does
+    /// this for every layer it places; an external surface used to stage
+    /// nothing for the layers it hosts, which is why a float inside one jumped
+    /// a whole row while the window behind it glided.
+    private func captureLayerScrollStep(
+        gridId id: Int64,
+        sets: [SurfaceBufferSet],
+        rowStart: Int,
+        rowEnd: Int,
+        rowsDelta: Int
+    ) {
+        guard MetalTerminalRenderer.smoothScrollEnabled else { return }
+        tripleBufferLock.lock()
+        var stepped = bracketStagedGrids.contains(id)
+        tripleBufferLock.unlock()
+
+        let cs = sets[flushSourceSetIndex]
+        if !stepped, cs.rowState.usingRowBuffers,
+           let plan = ScrollRetention.plan(
+               rowStart: rowStart,
+               rowEnd: rowEnd,
+               rowsDelta: rowsDelta,
+               depth: retention.depthRows
+           ) {
+            retention.beginStep(gridId: id, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+            tripleBufferLock.lock()
+            bracketStagedGrids.insert(id)
+            tripleBufferLock.unlock()
+            let capturedCellHeightPx = Float(mainTerminalView?.renderer.cellHeightPx ?? 0)
+            for i in 0..<plan.count {
+                let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+                captureOneLayerRetainedRow(
+                    cs: cs,
+                    gridId: id,
+                    readRow: row,
+                    targetRow: row - rowsDelta,
+                    cellHeightPx: capturedCellHeightPx
+                )
+            }
+            stepped = true
+        }
+        // commitFlush publishes the seeds only when a step was staged.
+        guard stepped, abs(rowsDelta) == 1 else { return }
+        tripleBufferLock.lock()
+        stagedSmoothScrollSeeds.append((gridId: id, rowsDelta: rowsDelta))
+        tripleBufferLock.unlock()
+    }
+
+    /// One row of `captureLayerScrollStep`, read out of the layer's own set.
+    private func captureOneLayerRetainedRow(
+        cs: SurfaceBufferSet,
+        gridId id: Int64,
+        readRow: Int,
+        targetRow: Int,
+        cellHeightPx: Float
+    ) {
+        guard readRow >= 0, readRow < cs.rowLogicalToSlot.count else { return }
+        let slot = cs.rowLogicalToSlot[readRow]
+        guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return }
+        let vc = cs.rowState.counts[slot]
+        guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
+        let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : readRow
+        guard let copied = copyRetainedScrollableRow(
+            retention: retention,
+            srcBuf: srcBuf,
+            vertexCount: vc,
+            gridId: id,
+            scrollableMask: ZONVIE_DECO_SCROLLABLE
+        ) else { return }
+        retention.stage(RetainedScrollRow(
+            buffer: copied.buffer,
+            count: copied.count,
+            gridId: id,
+            sourceRow: sourceRow,
+            targetRow: targetRow,
+            cellHeightPx: cellHeightPx
+        ))
+    }
+
     private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int, seedsEase: Bool) {
         guard MetalTerminalRenderer.smoothScrollEnabled else { return }
         guard ws.rowState.usingRowBuffers else { return }
@@ -1857,8 +1943,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         guard rowsDelta != 0 else { return }
         guard rowStart >= 0, rowEnd > rowStart else { return }
 
-        // Consumer-side eligibility: only remap full-width scrolls.
-        guard colStart == 0, colEnd == totalCols else { return }
+        // Consumer-side eligibility: only remap full-width scrolls. The core
+        // only shifts on full grid-local width (gridScrollFastPathRegion in
+        // src/core/flush.zig), so a narrower one has to be redrawn rather than
+        // staged as a shift the blit would apply too wide — returning here
+        // left the region carrying the pre-scroll pixels with nothing owed.
+        // `applyLayerRowScroll` in MetalTerminalRenderer takes the same else.
+        guard colStart == 0, colEnd == totalCols else {
+            tripleBufferLock.lock()
+            flushDirtyRows.insert(integersIn: rowStart..<rowEnd)
+            tripleBufferLock.unlock()
+            return
+        }
         // No capacity pre-check here, matching applyLayerRowScroll in
         // MetalTerminalRenderer: this path only grows the logical row-state
         // arrays, which remapSurfaceRowSlots does synchronously via
@@ -2368,8 +2464,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         desc.storageMode = .private
         backBuffer = mtlDevice.makeTexture(descriptor: desc)
         backBufferSize = drawableSize
-        // Drop ping-pong too — it must match the drawable.
-        customShaderPong.invalidate()
+        // The ping-pong is not dropped here: `SurfacePingPongTextures.ensure`
+        // is keyed on the size it is asked for and reallocates when the
+        // drawable changes, which is the only thing the main surface relies on.
         hasPresentedOnce = false
     }
 
@@ -3217,6 +3314,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let i = logicalRow - retainedRowBase
                 guard i < retainedRows.count else { return nil }
                 let r = retainedRows[i]
+                // A layer's retained rows belong to that layer's own pass,
+                // where its transform places them; drawing one here would put
+                // it at the root's origin. `MetalTerminalRenderer` filters on
+                // grid 1 for the same reason — this surface's root is its own
+                // grid id.
+                guard r.gridId == gridId else { return nil }
                 guard r.cellHeightPx == Float(cellHi) else { return nil }
                 // Same relation resolvedRowState uses: the vertices live at
                 // sourceRow and have to appear at targetRow.
@@ -3526,6 +3629,27 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     encoder.setScissorRect(scissor)
                     bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
                     bindSingleSurfaceScrollOffset(encoder: encoder, offset: layerOffset)
+                    // This layer's rows, then the rows its own smooth scroll
+                    // retained, both in its grid-local space. The index list is
+                    // reused so a layer costs no allocation per frame. Same
+                    // shape as the main renderer's layer pass.
+                    retainedIndexScratch.removeAll(keepingCapacity: true)
+                    for (i, r) in retainedSnapshot.enumerated()
+                    where r.gridId == layer.gridId && r.cellHeightPx == Float(cellHi) {
+                        retainedIndexScratch.append(i)
+                    }
+                    let retainedForLayerCount = retainedIndexScratch.count
+                    let retainedBase = rows
+                    let scratch = retainedIndexScratch
+                    func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+                        if row >= retainedBase {
+                            let i = row - retainedBase
+                            guard i < scratch.count else { return nil }
+                            let r = retainedSnapshot[scratch[i]]
+                            return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
+                        }
+                        return resolveSurfaceGridRow(set, row: row, cellHeightPx: Float(cellHi))
+                    }
                     if partialHostedContents && !glow {
                         // Recompose each dirty surface band back-to-front.
                         // Every layer is clipped to the band the root erased,
@@ -3560,8 +3684,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         )
                     }
                     _ = encodeSurfaceRowDraws(
-                        encoder: encoder, rows: 0..<rows,
-                        resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
+                        encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
+                        resolve: resolveLayerRow,
                         pipeline: glow ? mainTerminalView!.renderer.glowExtractPipeline! : pipeline,
                         backgroundPipeline: backgroundPipeline, glyphPipeline: glyphPipeline,
                         useTwoPass: !glow && use2Pass,

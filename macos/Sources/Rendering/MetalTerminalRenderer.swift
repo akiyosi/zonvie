@@ -12,6 +12,59 @@ private let metalTerminalMaxRowBuffers = 20_000
 // and the shader C ABI, and MetalTypes.swift is compiled standalone by the
 // `zig build test` Swift targets, which have neither.
 
+/// Record what a row callback found missing, so the provisioner can supply it
+/// after the bracket closes. Returns false when the row cannot be written this
+/// flush; the caller owns `flushFailed`, which is the only part of this
+/// decision that is not shared.
+///
+/// `lockHeld` is for the call sites that already hold the surface's lock. The
+/// main surface has none and passes false; an external surface has several.
+func requireSurfaceRowCapacity(
+    bufferSets: [SurfaceBufferSet],
+    ledger: SurfaceRowCapacityLedger,
+    lock: NSLock,
+    lockHeld: Bool,
+    row: Int,
+    vertexCount: Int,
+    totalRows: Int,
+    maxRowBuffers: Int,
+    mappingSetIndex: Int,
+    rowIsPhysical: Bool,
+    logLabel: String
+) -> Bool {
+    switch surfaceRowCapacityVerdict(
+        bufferSets: bufferSets,
+        row: row,
+        vertexCount: vertexCount,
+        totalRows: totalRows,
+        maxRowBuffers: maxRowBuffers,
+        mappingSetIndex: mappingSetIndex,
+        rowIsPhysical: rowIsPhysical
+    ) {
+    case .ready:
+        return true
+
+    case .invalid:
+        return false
+
+    case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
+        if !lockHeld { lock.lock() }
+        ledger.requiredRows = max(ledger.requiredRows, requiredRows)
+        ledger.requiredVertexCounts[capacityRow] = max(
+            ledger.requiredVertexCounts[capacityRow],
+            neededVertexCount
+        )
+        let newRequiredRows = ledger.requiredRows
+        if !lockHeld { lock.unlock() }
+        ZonvieCore.appLogScrollMode(
+            "[scroll_debug] row_capacity_required surface=\(logLabel) row=\(row) " +
+            "capacityRow=\(capacityRow) vertexCount=\(vertexCount) " +
+            "totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
+        )
+        return false
+    }
+}
+
 /// Provision the row capacity `ledger` owes, outside any flush bracket.
 ///
 /// `isBusyLocked` is evaluated while the lock is held and reports whatever else
@@ -511,7 +564,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
     private let rowCapacity = SurfaceRowCapacityLedger(maxRowBuffers: metalTerminalMaxRowBuffers)
-    private var rowCapacityBracketOpen = false // Protected by lock
+    // True while a core-thread flush bracket is open on this surface. Unlike
+    // `isInFlush` (core-thread-owned, unsafe to read from main), this is
+    // written and read ONLY under `lock`, so the provisioning worker can
+    // consult it. ExternalGridView keeps the same pair under the same names.
+    private var bracketOpen = false
 
     /// Read and clear flushFailed. Called once per flush from on_flush_end.
     func consumeFlushFailed() -> Bool {
@@ -520,9 +577,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return v
     }
 
-    private func closeRowCapacityBracket() {
+    private func closeBracketFlag() {
         lock.lock()
-        rowCapacityBracketOpen = false
+        bracketOpen = false
         lock.unlock()
     }
 
@@ -533,38 +590,21 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         rowIsPhysical: Bool = false,
         useWriteMapping: Bool = false
     ) -> Bool {
-        switch surfaceRowCapacityVerdict(
+        let ok = requireSurfaceRowCapacity(
             bufferSets: bufferSets,
+            ledger: rowCapacity,
+            lock: lock,
+            lockHeld: false,
             row: row,
             vertexCount: vertexCount,
             totalRows: totalRows,
             maxRowBuffers: maxRowBuffers,
             mappingSetIndex: useWriteMapping ? writeSetIndex : flushSourceSetIndex,
-            rowIsPhysical: rowIsPhysical
-        ) {
-        case .ready:
-            return true
-
-        case .invalid:
-            flushFailed = true
-            return false
-
-        case .needsProvisioning(let capacityRow, let requiredRows, let neededVertexCount):
-            lock.lock()
-            rowCapacity.requiredRows = max(rowCapacity.requiredRows, requiredRows)
-            rowCapacity.requiredVertexCounts[capacityRow] = max(
-                rowCapacity.requiredVertexCounts[capacityRow],
-                neededVertexCount
-            )
-            let newRequiredRows = rowCapacity.requiredRows
-            lock.unlock()
-            ZonvieCore.appLogScrollMode(
-                "[scroll_debug] row_capacity_required row=\(row) capacityRow=\(capacityRow) " +
-                "vertexCount=\(vertexCount) totalRows=\(totalRows) requiredRowsNow=\(newRequiredRows)"
-            )
-            flushFailed = true
-            return false
-        }
+            rowIsPhysical: rowIsPhysical,
+            logLabel: "Renderer"
+        )
+        if !ok { flushFailed = true }
+        return ok
     }
 
     /// True while this surface still owes a provisioning pass, or is in the
@@ -592,8 +632,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             device: device,
             maxRowBuffers: maxRowBuffers,
             logLabel: "Renderer",
-            isBusyLocked: { rowCapacityBracketOpen || gpuInFlightCount.contains(where: { $0 != 0 }) },
-            busyLogDetailLocked: { "bracketOpen=\(rowCapacityBracketOpen) gpuInFlight=\(gpuInFlightCount)" }
+            isBusyLocked: { bracketOpen || gpuInFlightCount.contains(where: { $0 != 0 }) },
+            busyLogDetailLocked: { "bracketOpen=\(bracketOpen) gpuInFlight=\(gpuInFlightCount)" }
         )
     }
     // Per-flush row submit accumulators. Reset in beginFlush, summed in
@@ -1556,7 +1596,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[Renderer] beginFlush: waiting for row capacity provisioning")
             return .dropped
         }
-        rowCapacityBracketOpen = true
+        bracketOpen = true
         lock.unlock()
         isInFlush = true
         mainWritePrepared = false
@@ -1632,7 +1672,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         atlasSyncedWasRecreate = prepResult.syncedWasRecreate
         if prepResult.shouldAbort {
             isInFlush = false
-            closeRowCapacityBracket()
+            closeBracketFlag()
             ZonvieCore.appLog("[WARNING] beginFlush: atlas prepare failed, dropping flush")
             return .dropped
         }
@@ -1656,7 +1696,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // state is untouched, so the next flush attempt retries it.
                 atlas.endAtlasWrite()
                 isInFlush = false
-                closeRowCapacityBracket()
+                closeBracketFlag()
                 ZonvieCore.appLog("[WARNING] beginFlush: atlas write blocked by in-flight external reads, dropping flush")
                 return .dropped
             }
@@ -1673,7 +1713,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     cmd.commit()
                     atlas.endAtlasWrite()
                     isInFlush = false
-                    closeRowCapacityBracket()
+                    closeBracketFlag()
                     ZonvieCore.appLog("[WARNING] beginFlush: atlas blit encode failed, dropping flush")
                     return .dropped
                 }
@@ -1707,7 +1747,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 atlas.endAtlasWrite()
                 atlas.cancelPendingBackTextureBlit()
                 isInFlush = false
-                closeRowCapacityBracket()
+                closeBracketFlag()
                 ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
                 return .dropped
             }
@@ -1843,7 +1883,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         mainWritePrepared = false
         cursorWritePrepared = false
         isInFlush = false
-        closeRowCapacityBracket()
+        closeBracketFlag()
     }
 
     /// Called from on_flush_end callback (core thread, grid_mu held).
@@ -1869,7 +1909,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             mainWritePrepared = false
             cursorWritePrepared = false
             isInFlush = false
-            closeRowCapacityBracket()
+            closeBracketFlag()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas upload writer unavailable")
             return false
         }
@@ -1887,7 +1927,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             mainWritePrepared = false
             cursorWritePrepared = false
             isInFlush = false
-            closeRowCapacityBracket()
+            closeBracketFlag()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas back-sync still pending or failed")
             return false
         }
@@ -2087,7 +2127,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         mainWritePrepared = false
         cursorWritePrepared = false
         isInFlush = false
-        closeRowCapacityBracket()
+        closeBracketFlag()
         if ZonvieCore.appLogEnabled, didMainWrite {
             let bs = bufferSets[ws]
             let rowCount = bs.rowState.buffers.count
