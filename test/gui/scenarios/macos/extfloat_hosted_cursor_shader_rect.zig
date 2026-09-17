@@ -222,8 +222,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // x only: the two windows' client areas start at the same x as their
     // frames, while their title bars make the y offset a frontend detail this
     // has no independent source for. The y axis is covered by the delta above.
+    // Off the rect's own line: it describes the space the rect is in, and
+    // `resizeExternalWindows` no longer carries a shared scale.
     const scale = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+        const line = (try app_log.lastLineSince(alloc, log_path, marker, 0)) orelse
             return error.BackingScaleUnknown;
         defer alloc.free(line);
         break :blk app_log.field(line, "scale") orelse return error.BackingScaleUnknown;

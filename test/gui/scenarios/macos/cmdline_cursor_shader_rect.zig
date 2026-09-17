@@ -93,12 +93,22 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const cmdline_win = newWindow(g.app_pid, main_wins) orelse return error.CmdlineWindowNotFound;
     const rect = try waitCursorRect(alloc, t0, 10_000);
 
-    const metrics = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+    // Scale comes off the rect's own line: it is the scale of the space the
+    // rect is in. `resizeExternalWindows` stopped carrying a shared one when
+    // each window began converting with its own, and it skips the cmdline's
+    // window anyway, so it can only answer for cell metrics now.
+    const scale = blk: {
+        const line = (try app_log.lastLineSince(alloc, log_path, marker, 0)) orelse
             return error.BackingScaleUnknown;
         defer alloc.free(line);
+        break :blk app_log.field(line, "scale") orelse return error.BackingScaleUnknown;
+    };
+    const metrics = blk: {
+        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+            return error.CellMetricsUnknown;
+        defer alloc.free(line);
         break :blk .{
-            .scale = app_log.field(line, "scale") orelse return error.BackingScaleUnknown,
+            .scale = scale,
             .cell_w = app_log.field(line, "cellW") orelse return error.CellMetricsUnknown,
             .cell_h = app_log.field(line, "cellH") orelse return error.CellMetricsUnknown,
         };
