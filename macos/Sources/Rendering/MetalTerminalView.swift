@@ -25,7 +25,6 @@ final class MetalTerminalView: MTKView {
 
     // Coalesce setNeedsDisplay to at most once per runloop tick, and union dirty rects.
     private let redrawScheduler = SurfaceRedrawScheduler()
-    private var lastCursorDirtyRectPx: NSRect? = nil
 
     private static var dirtyLogEnabled: Bool { ZonvieCore.appLogEnabled }
 
@@ -1648,120 +1647,6 @@ final class MetalTerminalView: MTKView {
         // grid_mu acquisition (see its computation before that call).
     }
 
-    func submitVerticesPartialRaw(
-        mainPtr: UnsafeRawPointer?, mainCount: Int,
-        cursorPtr: UnsafeRawPointer?, cursorCount: Int,
-        updateMain: Bool,
-        updateCursor: Bool
-    ) {
-        // Before the new vertices: the offsets must clear together with the
-        // vertex update, or content grid_scroll moved shifts twice.
-        processPendingScrollClears()
-
-        renderer.submitVerticesPartialRaw(
-            mainPtr: mainPtr, mainCount: mainCount,
-            cursorPtr: cursorPtr, cursorCount: cursorCount,
-            updateMain: updateMain,
-            updateCursor: updateCursor
-        )
-
-        if !updateMain && !updateCursor {
-            return
-        }
-
-        if updateCursor {
-            // cursorPtr absent / cursorCount==0 can be 'cursor erase' etc.
-            // In this case, redraw only 'previous cursor region' instead of full redraw to erase it.
-            if cursorCount <= 0 || cursorPtr == nil {
-                if let prev = lastCursorDirtyRectPx {
-                    let cellHpx = max(1.0, CGFloat(renderer.cellHeightPx))
-                    let rowStart = max(0, Int(floor(prev.minY / cellHpx)))
-                    let rowEndExclusive = max(rowStart + 1, Int(ceil(prev.maxY / cellHpx)))
-                    let rowCount = max(1, rowEndExclusive - rowStart)
-
-                    renderer.markDirtyRect(rowStart: rowStart, rowCount: rowCount, rectPx: prev)
-
-
-
-                    let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-                    let rectPt = NSRect(
-                        x: prev.origin.x / scale,
-                        y: prev.origin.y / scale,
-                        width: prev.size.width / scale,
-                        height: prev.size.height / scale
-                    )
-                    requestRedraw(rectPt)
-                }
-                lastCursorDirtyRectPx = nil
-                return
-            }
-
-            if let cursorPtr {
-                guard cursorCount > 0 && cursorCount <= 1000 else {
-                    renderer.submitVerticesPartialRaw(
-                        mainPtr: nil, mainCount: 0,
-                        cursorPtr: nil, cursorCount: 0,
-                        updateMain: false,
-                        updateCursor: updateCursor
-                    )
-                    return
-                }
-
-                let cursor = cursorPtr.assumingMemoryBound(to: zonvie_vertex.self)
-
-                // Compute cursor bounds in NDC, then map to drawable pixel rect (TOP-ORIGIN).
-                var minX: Float =  1e9
-                var maxX: Float = -1e9
-                var minY: Float =  1e9
-                var maxY: Float = -1e9
-
-                for i in 0..<cursorCount {
-                    let x = cursor[i].position.0
-                    let y = cursor[i].position.1
-                    minX = Swift.min(minX, x)
-                    maxX = Swift.max(maxX, x)
-                    minY = Swift.min(minY, y)
-                    maxY = Swift.max(maxY, y)
-                }
-
-                let dw = CGFloat(self.drawableSize.width)
-                let dh = CGFloat(self.drawableSize.height)
-
-                // NDC (-1..1) -> drawable pixel (top-origin)
-                let x0 = CGFloat((minX + 1.0) * 0.5) * dw
-                let x1 = CGFloat((maxX + 1.0) * 0.5) * dw
-                let y0 = CGFloat((1.0 - maxY) * 0.5) * dh
-                let y1 = CGFloat((1.0 - minY) * 0.5) * dh
-
-                let rectPx = NSRect(
-                    x: floor(Swift.min(x0, x1)),
-                    y: floor(Swift.min(y0, y1)),
-                    width: ceil(abs(x1 - x0)),
-                    height: ceil(abs(y1 - y0))
-                )
-
-                let unionRectPx: NSRect
-                if let prev = lastCursorDirtyRectPx {
-                    unionRectPx = prev.union(rectPx)
-                } else {
-                    unionRectPx = rectPx
-                }
-                lastCursorDirtyRectPx = rectPx
-
-                let cellHpx = max(1.0, CGFloat(renderer.cellHeightPx))
-                let rowStart = max(0, Int(floor(unionRectPx.minY / cellHpx)))
-                let rowEndExclusive = max(rowStart + 1, Int(ceil(unionRectPx.maxY / cellHpx)))
-                let rowCount = max(1, rowEndExclusive - rowStart)
-
-                renderer.markDirtyRows(rowStart: rowStart, rowCount: rowCount)
-                requestRedrawDrawablePx(unionRectPx)
-                return
-            }
-        }
-
-        // main-only update: the both-false case returned above.
-        requestRedraw()
-    }
 
 
 

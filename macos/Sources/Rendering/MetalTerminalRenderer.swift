@@ -1618,6 +1618,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         layerGridsPreparedThisFlush = false
+        // Begin owns this, not the terminators. A bracket has three exits —
+        // abortFlush and commitFlush's two deferred returns — and only the
+        // first cleared it, so a deferred commit leaked a stale `true` into the
+        // next bracket and gave it a `lastCommitTime` it had not earned.
+        // ExternalGridView clears its `flushHadContent` at begin for the same
+        // reason.
+        flushHadLayerWork = false
         let perfEnabled = ZonvieCore.appLogEnabled
         if perfEnabled {
             perfRowSubmitNs = 0
@@ -1639,6 +1646,14 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         flushDirtyRows.removeAll()
         flushDirtyRectPx = nil
         flushSourceSetIndex = committedSetIndex
+        // Re-seed the pending cursor owner from the committed one, as
+        // ExternalGridView.beginFlush does. abortFlush restores it too, but the
+        // two deferred returns in commitFlush do not, and the caller does not
+        // call abortFlush for them — so a deferred commit carried a stale owner
+        // into the retry, where the `count != 0 || pending == id` guards would
+        // drop the true owner's cursor clear and leave a cursor drawn where it
+        // no longer is.
+        pendingCursorLayerGridId = committedCursorLayerGridId
         bracketSourceShift.removeAll(keepingCapacity: true)
         bracketStagedGrids.removeAll(keepingCapacity: true)
         let retentionReplay = Self.smoothScrollEnabled ? pendingRetentionReplay : []
@@ -1860,6 +1875,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// from being published under the new layout dimensions.
     func abortFlush() {
         _ = atlas.endFlushUploadTransaction()
+        endBracketWithoutPublishing()
+    }
+
+    /// Put the surface back as an unpublished bracket found it.
+    ///
+    /// Three exits need this, not one: `abortFlush`, and commitFlush's two
+    /// deferred returns for an atlas transaction that could not close. Those
+    /// two used to reset a subset — leaving `pendingSurfaceLayers`, the layers'
+    /// staged dirty marks, and (before begin took them) the pending cursor
+    /// owner and `flushHadLayerWork` — and the caller does not call
+    /// `abortFlush` for them either (`ZonvieCore`'s `!mainCommitted` branch
+    /// cancels the external views and retries the core, nothing more).
+    private func endBracketWithoutPublishing() {
         if mainWritePrepared {
             // The scratch set may contain any prefix of this flush. It cannot
             // participate in sparse carry-forward until fully overwritten.
@@ -1900,16 +1928,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // the actual texture replace. If readers or a prior blit are active,
         // preserve staging and retry the frame without publishing its UVs.
         guard atlas.endFlushUploadTransaction() else {
-            if mainWritePrepared {
-                mainRowStateNeedsFullSync[writeSetIndex] = true
-                staleMainRowsBySet[writeSetIndex].removeAll()
-            }
-            flushChangedMainRows.removeAll()
-            flushHasStructuralMainChange = false
-            mainWritePrepared = false
-            cursorWritePrepared = false
-            isInFlush = false
-            closeBracketFlag()
+            endBracketWithoutPublishing()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas upload writer unavailable")
             return false
         }
@@ -1918,16 +1937,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // An in-flight back-sync is polled, never waited on under grid_mu.
         let atlasCommit = atlas.commitAndSnapshotFrontTexture()
         guard atlasCommit.committed else {
-            if mainWritePrepared {
-                mainRowStateNeedsFullSync[writeSetIndex] = true
-                staleMainRowsBySet[writeSetIndex].removeAll()
-            }
-            flushChangedMainRows.removeAll()
-            flushHasStructuralMainChange = false
-            mainWritePrepared = false
-            cursorWritePrepared = false
-            isInFlush = false
-            closeBracketFlag()
+            endBracketWithoutPublishing()
             ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas back-sync still pending or failed")
             return false
         }
