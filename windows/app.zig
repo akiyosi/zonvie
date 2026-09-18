@@ -3591,7 +3591,7 @@ fn refuseLayerBlit(
         "[layer_blit_refused] gridId={d} reason={s}\n",
         .{ grid_id, reason },
     );
-    const rows = render_pipeline_helpers.dirtyRowsWithoutBlit(
+    const rows = core.row_scroll.dirtyRowsWithoutBlit(
         scroll.row_start,
         scroll.row_end,
         origin_y_px,
@@ -3730,7 +3730,7 @@ pub fn planLayerFrame(
             if (layer.rows == 0 or layer.cols == 0) break :ladder "layout";
             if (scroll.total_rows != layer.rows or scroll.total_cols != layer.cols)
                 break :ladder "size";
-            const made = render_pipeline_helpers.RowScrollBlitPlan.make(
+            const made = core.row_scroll.make(
                 scroll.row_start,
                 scroll.row_end,
                 scroll.rows_delta,
@@ -3787,7 +3787,7 @@ pub fn planLayerFrame(
 
         const pl = plan.?;
         markDrawRows(state, pl.dirty_row_start, pl.dirty_row_end);
-        const band = pl.localClearBand();
+        const band = core.row_scroll.localClearBand(pl);
         state.blit_clear_band = .{ .top_px = band.top_px, .bottom_px = band.bottom_px };
 
         // The copy rewrote every pixel of its rectangle, so a layer drawn over
@@ -3828,7 +3828,7 @@ pub fn planLayerFrame(
             }
         }
 
-        state.draw_blit_rect = pl.blitRectPx();
+        state.draw_blit_rect = render_pipeline_helpers.blitRectPx(pl);
     }
 
     // 4. Rows every layer repaints over the layers above it. A layer owns the

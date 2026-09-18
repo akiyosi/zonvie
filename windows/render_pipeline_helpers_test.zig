@@ -1,4 +1,5 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 const helpers = @import("render_pipeline_helpers.zig");
 
 test "retry delay doubles and saturates" {
@@ -773,286 +774,19 @@ test "cluster inversion: a variation-selector emoji mid-run" {
 }
 
 // --- Row-scroll blit plan -------------------------------------------------
-// Ported from macos/Tests/RowScrollBlitPlanTests.swift: one row height, one
-// texture, so each case reads as rows.
+// The arithmetic itself is the core's now, and so are its tests
+// (src/core/row_scroll.zig). What stays here is the Windows-only damage this
+// frontend derives from a plan.
 
 const row_h_px: i32 = 20;
 const tex_rows: i32 = 44;
 const tex_w_px: i32 = 800;
 
-fn plan(row_start: u32, row_end: u32, rows_delta: i32, rows_in_tex: i32) ?helpers.RowScrollBlitPlan {
-    return helpers.RowScrollBlitPlan.make(
-        row_start,
-        row_end,
-        rows_delta,
-        0,
-        0,
-        tex_w_px,
-        tex_w_px,
-        rows_in_tex * row_h_px,
-        row_h_px,
-    );
-}
-
-test "row scroll down reads from below and vacates the bottom" {
-    const p = plan(0, 44, 3, tex_rows).?;
-    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.src_y_px);
-    try std.testing.expectEqual(@as(i32, 0), p.dst_y_px);
-    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.copy_h_px);
-    try std.testing.expectEqual(tex_w_px, p.copy_w_px);
-    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.clear_top_px);
-    try std.testing.expectEqual(@as(i32, 44 * row_h_px), p.clear_bottom_px);
-    try std.testing.expectEqual(@as(u32, 44), p.clamped_row_end);
-    try std.testing.expectEqual(@as(u32, 38), p.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 44), p.dirty_row_end);
-}
-
-test "row scroll up is the mirror image" {
-    const p = plan(0, 44, -3, tex_rows).?;
-    try std.testing.expectEqual(@as(i32, 0), p.src_y_px);
-    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.dst_y_px);
-    try std.testing.expectEqual(@as(i32, 41 * row_h_px), p.copy_h_px);
-    try std.testing.expectEqual(@as(i32, 0), p.clear_top_px);
-    try std.testing.expectEqual(@as(i32, 3 * row_h_px), p.clear_bottom_px);
-    try std.testing.expectEqual(@as(u32, 0), p.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 6), p.dirty_row_end);
-}
-
-test "a region that does not start at row 0 keeps its dirty rows inside" {
-    const p = plan(10, 30, 2, tex_rows).?;
-    try std.testing.expectEqual(@as(i32, 12 * row_h_px), p.src_y_px);
-    try std.testing.expectEqual(@as(i32, 10 * row_h_px), p.dst_y_px);
-    try std.testing.expectEqual(@as(i32, 18 * row_h_px), p.copy_h_px);
-    try std.testing.expectEqual(@as(u32, 26), p.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 30), p.dirty_row_end);
-
-    // The expansion never reaches above the region start.
-    const small = plan(10, 13, 2, tex_rows).?;
-    try std.testing.expectEqual(@as(u32, 10), small.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 13), small.dirty_row_end);
-}
-
-test "the texture clamp stops the copy, the band and the dirty rows together" {
-    const p = plan(0, 45, 1, tex_rows).?;
-    try std.testing.expectEqual(@as(u32, 44), p.clamped_row_end);
-    try std.testing.expectEqual(@as(i32, 43 * row_h_px), p.copy_h_px);
-    try std.testing.expectEqual(@as(i32, 44 * row_h_px), p.clear_bottom_px);
-    try std.testing.expectEqual(@as(u32, 42), p.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 44), p.dirty_row_end);
-
-    const far = plan(0, 50, 2, tex_rows).?;
-    try std.testing.expectEqual(@as(u32, 40), far.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 44), far.dirty_row_end);
-    try std.testing.expectEqual(@as(i32, 42 * row_h_px), far.clear_top_px);
-}
-
-test "geometries that produce no blit plan" {
-    try std.testing.expect(plan(0, 44, 0, tex_rows) == null);
-    try std.testing.expect(plan(0, 10, 10, tex_rows) == null);
-    try std.testing.expect(plan(0, 10, 12, tex_rows) == null);
-    try std.testing.expect(plan(44, 50, 1, tex_rows) == null);
-    try std.testing.expect(plan(0, 44, 1, 0) == null);
-    try std.testing.expect(helpers.RowScrollBlitPlan.make(
-        0,
-        44,
-        1,
-        0,
-        0,
-        0,
-        tex_w_px,
-        44 * row_h_px,
-        row_h_px,
-    ) == null);
-    try std.testing.expect(helpers.RowScrollBlitPlan.make(
-        0,
-        44,
-        1,
-        0,
-        0,
-        tex_w_px,
-        tex_w_px,
-        44 * row_h_px,
-        0,
-    ) == null);
-}
-
-test "the copy width is bounded by the texture" {
-    const narrow = helpers.RowScrollBlitPlan.make(
-        0,
-        44,
-        1,
-        0,
-        0,
-        800,
-        500,
-        44 * row_h_px,
-        row_h_px,
-    ).?;
-    try std.testing.expectEqual(@as(i32, 500), narrow.copy_w_px);
-}
-
-test "blit plan invariants hold over every small geometry" {
-    var planned: usize = 0;
-    var rows_in_tex: i32 = 0;
-    while (rows_in_tex <= 12) : (rows_in_tex += 1) {
-        var row_start: u32 = 0;
-        while (row_start <= 12) : (row_start += 1) {
-            var row_end: u32 = 0;
-            while (row_end <= 16) : (row_end += 1) {
-                var rows_delta: i32 = -8;
-                while (rows_delta <= 8) : (rows_delta += 1) {
-                    const p = plan(row_start, row_end, rows_delta, rows_in_tex) orelse continue;
-                    planned += 1;
-                    const tex_h_px = rows_in_tex * row_h_px;
-                    try std.testing.expect(p.src_y_px >= 0 and p.dst_y_px >= 0);
-                    try std.testing.expect(p.copy_h_px > 0);
-                    try std.testing.expect(p.src_y_px + p.copy_h_px <= tex_h_px);
-                    try std.testing.expect(p.dst_y_px + p.copy_h_px <= tex_h_px);
-                    try std.testing.expect(p.clear_bottom_px <= tex_h_px);
-                    try std.testing.expect(p.clear_top_px < p.clear_bottom_px);
-                    try std.testing.expect(p.clamped_row_end <= @as(u32, @intCast(rows_in_tex)));
-                    try std.testing.expect(p.clamped_row_end <= row_end);
-                    const vacated_first: u32 = @intCast(@divTrunc(p.clear_top_px, row_h_px));
-                    const vacated_end: u32 = @intCast(@divTrunc(p.clear_bottom_px, row_h_px));
-                    try std.testing.expect(p.dirty_row_start <= vacated_first);
-                    try std.testing.expect(vacated_end <= p.dirty_row_end);
-                    try std.testing.expect(p.dirty_row_start >= row_start);
-                    try std.testing.expect(p.dirty_row_end <= p.clamped_row_end);
-                }
-            }
-        }
-    }
-    try std.testing.expect(planned > 100);
-}
-
-test "without a blit the whole region is stale, still clamped to the texture" {
-    try std.testing.expectEqual(
-        [2]u32{ 0, 44 },
-        helpers.dirtyRowsWithoutBlit(0, 45, 0, 44 * row_h_px, row_h_px).?,
-    );
-    try std.testing.expectEqual(
-        [2]u32{ 10, 30 },
-        helpers.dirtyRowsWithoutBlit(10, 30, 0, 44 * row_h_px, row_h_px).?,
-    );
-    try std.testing.expect(helpers.dirtyRowsWithoutBlit(44, 50, 0, 44 * row_h_px, row_h_px) == null);
-    try std.testing.expect(helpers.dirtyRowsWithoutBlit(0, 10, 0, 44 * row_h_px, 0) == null);
-}
-
-test "a layer origin moves the pixels but not the row numbering" {
-    const origin_y_px: i32 = 5 * row_h_px;
-    const origin_x_px: i32 = 400;
-    const base = plan(0, 20, 3, tex_rows).?;
-    const p = helpers.RowScrollBlitPlan.make(
-        0,
-        20,
-        3,
-        origin_x_px,
-        origin_y_px,
-        400,
-        tex_w_px,
-        tex_rows * row_h_px,
-        row_h_px,
-    ).?;
-    try std.testing.expectEqual(base.src_y_px + origin_y_px, p.src_y_px);
-    try std.testing.expectEqual(base.dst_y_px + origin_y_px, p.dst_y_px);
-    try std.testing.expectEqual(base.clear_top_px + origin_y_px, p.clear_top_px);
-    try std.testing.expectEqual(base.clear_bottom_px + origin_y_px, p.clear_bottom_px);
-    try std.testing.expectEqual(base.dirty_row_start, p.dirty_row_start);
-    try std.testing.expectEqual(base.dirty_row_end, p.dirty_row_end);
-    try std.testing.expectEqual(origin_x_px, p.origin_x_px);
-    try std.testing.expectEqual(@as(i32, 400), p.copy_w_px);
-
-    const band = p.localClearBand();
-    try std.testing.expectEqual(base.clear_top_px, band.top_px);
-    try std.testing.expectEqual(base.clear_bottom_px, band.bottom_px);
-
-    // The rewritten pixels stay inside the layer's own rectangle.
-    const r = p.blitRectPx();
-    try std.testing.expectEqual(origin_x_px, r.left);
-    try std.testing.expectEqual(origin_x_px + 400, r.right);
-    try std.testing.expectEqual(origin_y_px, r.top);
-    try std.testing.expectEqual(origin_y_px + 20 * row_h_px, r.bottom);
-}
-
-test "a narrow layer copies its own width, clamped by the texture's right edge" {
-    const inside = helpers.RowScrollBlitPlan.make(
-        0,
-        44,
-        1,
-        0,
-        0,
-        300,
-        800,
-        tex_rows * row_h_px,
-        row_h_px,
-    ).?;
-    try std.testing.expectEqual(@as(i32, 300), inside.copy_w_px);
-
-    const offset = helpers.RowScrollBlitPlan.make(
-        0,
-        44,
-        1,
-        600,
-        0,
-        300,
-        800,
-        tex_rows * row_h_px,
-        row_h_px,
-    ).?;
-    try std.testing.expectEqual(@as(i32, 200), offset.copy_w_px);
-}
-
-test "a layer below the texture has nothing to blit and nothing to redraw" {
-    try std.testing.expect(helpers.RowScrollBlitPlan.make(
-        0,
-        20,
-        2,
-        0,
-        50 * row_h_px,
-        tex_w_px,
-        tex_w_px,
-        tex_rows * row_h_px,
-        row_h_px,
-    ) == null);
-    try std.testing.expect(helpers.dirtyRowsWithoutBlit(
-        0,
-        20,
-        50 * row_h_px,
-        tex_rows * row_h_px,
-        row_h_px,
-    ) == null);
-}
-
-test "a layer whose rows run off the bottom clamps the blit and the fallback alike" {
-    const origin_y_px: i32 = 30 * row_h_px;
-    const tex_h_px: i32 = tex_rows * row_h_px;
-    const p = helpers.RowScrollBlitPlan.make(
-        0,
-        20,
-        2,
-        0,
-        origin_y_px,
-        tex_w_px,
-        tex_w_px,
-        tex_h_px,
-        row_h_px,
-    ).?;
-    try std.testing.expectEqual(@as(u32, 14), p.clamped_row_end);
-    try std.testing.expectEqual(@as(u32, 10), p.dirty_row_start);
-    try std.testing.expectEqual(@as(u32, 14), p.dirty_row_end);
-    try std.testing.expect(p.src_y_px + p.copy_h_px <= tex_h_px);
-    try std.testing.expect(p.dst_y_px + p.copy_h_px <= tex_h_px);
-    try std.testing.expectEqual(tex_h_px, p.clear_bottom_px);
-    try std.testing.expectEqual(
-        [2]u32{ 0, 14 },
-        helpers.dirtyRowsWithoutBlit(0, 20, origin_y_px, tex_h_px, row_h_px).?,
-    );
-}
 
 /// A layer at y=100 scrolled down by 3: the blit rewrites rows 0..20 of it,
 /// pixels 100..500.
 fn overBlitBase() helpers.RowScrollBlitPlan {
-    return helpers.RowScrollBlitPlan.make(
+    return core.row_scroll.make(
         0,
         20,
         3,
@@ -1067,7 +801,7 @@ fn overBlitBase() helpers.RowScrollBlitPlan {
 
 test "a float over the blit marks its own rows, the rows under it and their source" {
     const p = overBlitBase();
-    const r = p.blitRectPx();
+    const r = helpers.blitRectPx(p);
     try std.testing.expectEqual(@as(i32, 0), r.left);
     try std.testing.expectEqual(@as(i32, 100), r.top);
     try std.testing.expectEqual(@as(i32, 400), r.right);
@@ -1222,7 +956,7 @@ test "blit rectangle stays inside the layer it scrolls" {
         for (deltas) |d| {
             var row_start: u32 = 0;
             while (row_start < 6) : (row_start += 1) {
-                const p = helpers.RowScrollBlitPlan.make(
+                const p = core.row_scroll.make(
                     row_start,
                     rows,
                     d,
@@ -1233,7 +967,7 @@ test "blit rectangle stays inside the layer it scrolls" {
                     tex_h,
                     row_h_px,
                 ) orelse continue;
-                const r = p.blitRectPx();
+                const r = helpers.blitRectPx(p);
                 try std.testing.expect(r.left >= o[0]);
                 try std.testing.expect(r.right <= o[0] + @as(i32, @intCast(cols)) * cell_w_px);
                 try std.testing.expect(r.right <= tex_w);

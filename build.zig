@@ -504,10 +504,15 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(msg_split_lua_tests).step);
 
     // Platform-independent Windows damage compaction regression tests.
+    // `render_pipeline_helpers.zig` reaches the core for the row-scroll blit
+    // arithmetic, so this module needs the same import win_mod has.
     const windows_render_helpers_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("windows/render_pipeline_helpers_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+        },
     });
     const windows_render_helpers_tests = b.addTest(.{
         .root_module = windows_render_helpers_test_mod,

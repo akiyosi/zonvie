@@ -1,21 +1,15 @@
 import Foundation
 import Metal
 
-/// The arithmetic of a GPU row-scroll blit, kept apart from the encoder so it
-/// can be checked without a device. Pixel values carry `Px`; everything else
-/// is in rows.
+/// Where a GPU row-scroll blit reads and writes, in this surface's back
+/// texture. Pixel values carry `Px`; everything else is in rows.
 ///
-/// The scrolled rectangle is a sub-rectangle of the back texture at
-/// (`originXPx`, `originYPx`), `widthPx` wide: origins 0 and the drawable
-/// width for a whole surface, the layer's own origin and width for one layer.
-///
-/// The row count the scroll callback reports can outlive the current
-/// drawable -- a window shrink is only protected on the first post-shrink
-/// frame, because ensureBackBuffer clears hasPresentedOnce -- and a guifont
-/// or linespace change grows the cell height before try_resize round-trips.
-/// Either way the blit would read past the texture, so rowEnd is clamped to
-/// the rows that fit below the origin and the copy, the vacated band, and the
-/// caller's dirty expansion all stop at that same clamped row.
+/// The arithmetic behind it is the core's (`src/core/row_scroll.zig`), so both
+/// frontends answer the same geometry the same way; `make` in
+/// MetalTerminalRenderer.swift is the bridge. This file is what remains on the
+/// Swift side: the shape the draw code reads, and the encoder that spends it.
+/// It stays free of ZonvieCore because build.zig hands it to swiftc on its own
+/// for RowScrollBlitPlanTests.
 struct RowScrollBlitPlan: Equatable {
     var srcYPx: Int
     var dstYPx: Int
@@ -41,94 +35,10 @@ struct RowScrollBlitPlan: Equatable {
     /// above; kept so `localClearBand()` can take it back out.
     var originYPx: Int
 
-    static func make(
-        rowStart: Int,
-        rowEnd: Int,
-        rowsDelta: Int,
-        originXPx: Int = 0,
-        originYPx: Int = 0,
-        widthPx: Int,
-        textureWidthPx: Int,
-        textureHeightPx: Int,
-        rowHeightPx: Int
-    ) -> RowScrollBlitPlan? {
-        let shift = abs(rowsDelta)
-        // Only the rows below the origin are available to this rectangle.
-        let texMaxRows = rowHeightPx > 0 ? max(0, (textureHeightPx - originYPx) / rowHeightPx) : 0
-        let clampedRowEnd = min(rowEnd, texMaxRows)
-        let regionHeightRows = clampedRowEnd - rowStart
-        guard shift > 0, shift < regionHeightRows else { return nil }
-        guard widthPx > 0, rowHeightPx > 0, originXPx >= 0, originYPx >= 0 else { return nil }
-
-        let copyWidthPx = min(widthPx, textureWidthPx - originXPx)
-        guard copyWidthPx > 0 else { return nil }
-
-        let copyHeightPx = (regionHeightRows - shift) * rowHeightPx
-        guard copyHeightPx > 0 else { return nil }
-
-        let srcYPx = originYPx + (rowsDelta > 0 ? rowStart + shift : rowStart) * rowHeightPx
-        let dstYPx = originYPx + (rowsDelta > 0 ? rowStart : rowStart + shift) * rowHeightPx
-
-        // Second clamp: the region can start low enough that even a
-        // within-bounds row count runs off the end from srcY or dstY. The
-        // rectangle's own bottom edge binds as well as the texture's.
-        let regionBottomPx = originYPx + clampedRowEnd * rowHeightPx
-        let maxCopyHeightPx = min(textureHeightPx, regionBottomPx) - max(srcYPx, dstYPx)
-        let safeCopyHeightPx = min(copyHeightPx, maxCopyHeightPx)
-        guard safeCopyHeightPx > 0 else { return nil }
-
-        let clearTopPx: Int
-        let clearBottomPx: Int
-        let dirtyRows: Range<Int>
-        if rowsDelta > 0 {
-            // Scroll down: vacated at bottom, intermediate rows above.
-            clearTopPx = originYPx + (clampedRowEnd - shift) * rowHeightPx
-            clearBottomPx = originYPx + clampedRowEnd * rowHeightPx
-            dirtyRows = max(rowStart, clampedRowEnd - 2 * shift)..<clampedRowEnd
-        } else {
-            // Scroll up: vacated at top, intermediate rows below.
-            clearTopPx = originYPx + rowStart * rowHeightPx
-            clearBottomPx = originYPx + (rowStart + shift) * rowHeightPx
-            dirtyRows = rowStart..<min(clampedRowEnd, rowStart + 2 * shift)
-        }
-
-        return RowScrollBlitPlan(
-            srcYPx: srcYPx,
-            dstYPx: dstYPx,
-            copyWidthPx: copyWidthPx,
-            copyHeightPx: safeCopyHeightPx,
-            clearTopPx: clearTopPx,
-            clearBottomPx: clearBottomPx,
-            clampedRowEnd: clampedRowEnd,
-            dirtyRows: dirtyRows,
-            originXPx: originXPx,
-            originYPx: originYPx
-        )
-    }
-
     /// The vacated band relative to `originYPx`, for callers drawing under a
     /// layer transform, whose pixel space starts at the layer origin.
     func localClearBand() -> (clearTopPx: Int, clearBottomPx: Int) {
         (clearTopPx: clearTopPx - originYPx, clearBottomPx: clearBottomPx - originYPx)
-    }
-
-    /// The rows to redraw when the blit never ran: the back texture's pixels
-    /// were never shifted, so every row in the scroll region is stale and the
-    /// core will not re-send them (it only marks the vacated band dirty on the
-    /// assumption the frontend shifts the rest). The region still stops at the
-    /// rows that fit below `originYPx`. nil when nothing of it is inside the
-    /// texture. Grid-local rows, like `dirtyRows`.
-    static func dirtyRowsWithoutBlit(
-        rowStart: Int,
-        rowEnd: Int,
-        originYPx: Int = 0,
-        textureHeightPx: Int,
-        rowHeightPx: Int
-    ) -> Range<Int>? {
-        let texMaxRows = rowHeightPx > 0 ? max(0, (textureHeightPx - originYPx) / rowHeightPx) : 0
-        let clampedRowEnd = min(rowEnd, texMaxRows)
-        guard clampedRowEnd > rowStart else { return nil }
-        return rowStart..<clampedRowEnd
     }
 }
 

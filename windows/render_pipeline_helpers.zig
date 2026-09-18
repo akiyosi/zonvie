@@ -1,4 +1,5 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 
 pub fn nextBackoffDelayMs(current_ms: u32, max_ms: u32) u32 {
     return @min(current_ms *| 2, max_ms);
@@ -866,124 +867,22 @@ pub fn invertClusterMap(
     }
 }
 
-/// The arithmetic of a GPU row-scroll blit, kept apart from the encoder so it
-/// can be checked without a device. Ported from
-/// `macos/Sources/Rendering/RowScrollBlitPlan.swift`.
-///
-/// The scrolled rectangle is a sub-rectangle of the back texture at
-/// (`origin_x_px`, `origin_y_px`), `width_px` wide: origin zero and the full
-/// width for a whole surface, the layer's own origin and width for one layer.
-///
-/// The row count the scroll callback reports can outlive the texture -- a
-/// window shrink, or a guifont/linespace change growing the cell height before
-/// try_resize round-trips -- so `row_end` is clamped to the rows that fit below
-/// the origin, and the copy, the vacated band and the dirty expansion all stop
-/// at that same clamped row.
-pub const RowScrollBlitPlan = struct {
-    origin_x_px: i32,
-    /// Already folded into every Y below; `localClearBand` takes it back out.
-    origin_y_px: i32,
-    src_y_px: i32,
-    dst_y_px: i32,
-    copy_w_px: i32,
-    copy_h_px: i32,
-    clear_top_px: i32,
-    clear_bottom_px: i32,
-    clamped_row_end: u32,
-    /// Half-open and grid-local: rows are numbered within the scroll region,
-    /// which `origin_y_px` moves the pixels of but does not renumber.
-    dirty_row_start: u32,
-    dirty_row_end: u32,
+/// The row-scroll blit arithmetic lives in the core now
+/// (`src/core/row_scroll.zig`), so both frontends get the same answer to the
+/// same geometry. Aliased under the name the paint code already uses.
+pub const RowScrollBlitPlan = core.row_scroll.Plan;
 
-    pub fn make(
-        row_start: u32,
-        row_end: u32,
-        rows_delta: i32,
-        origin_x_px: i32,
-        origin_y_px: i32,
-        width_px: i32,
-        tex_w: i32,
-        tex_h: i32,
-        row_h: i32,
-    ) ?RowScrollBlitPlan {
-        if (row_h <= 0 or width_px <= 0 or origin_x_px < 0 or origin_y_px < 0) return null;
-        const h: i64 = row_h;
-        const oy: i64 = origin_y_px;
-        const start: i64 = row_start;
-        const shift: i64 = @intCast(@abs(@as(i64, rows_delta)));
-        // Only the rows below the origin belong to this rectangle.
-        const tex_max_rows = @max(0, @divTrunc(@as(i64, tex_h) - oy, h));
-        const clamped_row_end = @min(@as(i64, row_end), tex_max_rows);
-        const region_rows = clamped_row_end - start;
-        if (shift == 0 or shift >= region_rows) return null;
-
-        const copy_w = @min(@as(i64, width_px), @as(i64, tex_w) - @as(i64, origin_x_px));
-        if (copy_w <= 0) return null;
-        const copy_h = (region_rows - shift) * h;
-        if (copy_h <= 0) return null;
-
-        const src_y = oy + (if (rows_delta > 0) start + shift else start) * h;
-        const dst_y = oy + (if (rows_delta > 0) start else start + shift) * h;
-
-        // Second clamp: a region low in the texture runs off the end from src
-        // or dst even with a within-bounds row count, and the rectangle's own
-        // bottom edge binds as well as the texture's.
-        const region_bottom = oy + clamped_row_end * h;
-        const safe_copy_h = @min(copy_h, @min(@as(i64, tex_h), region_bottom) - @max(src_y, dst_y));
-        if (safe_copy_h <= 0) return null;
-
-        var clear_top: i64 = undefined;
-        var clear_bottom: i64 = undefined;
-        var dirty_start: i64 = undefined;
-        var dirty_end: i64 = undefined;
-        if (rows_delta > 0) {
-            // Scroll down: vacated at the bottom, intermediate rows above.
-            clear_top = oy + (clamped_row_end - shift) * h;
-            clear_bottom = region_bottom;
-            dirty_start = @max(start, clamped_row_end - 2 * shift);
-            dirty_end = clamped_row_end;
-        } else {
-            // Scroll up: vacated at the top, intermediate rows below.
-            clear_top = oy + start * h;
-            clear_bottom = oy + (start + shift) * h;
-            dirty_start = start;
-            dirty_end = @min(clamped_row_end, start + 2 * shift);
-        }
-
-        return .{
-            .origin_x_px = origin_x_px,
-            .origin_y_px = origin_y_px,
-            .src_y_px = @intCast(src_y),
-            .dst_y_px = @intCast(dst_y),
-            .copy_w_px = @intCast(copy_w),
-            .copy_h_px = @intCast(safe_copy_h),
-            .clear_top_px = @intCast(clear_top),
-            .clear_bottom_px = @intCast(clear_bottom),
-            .clamped_row_end = @intCast(clamped_row_end),
-            .dirty_row_start = @intCast(dirty_start),
-            .dirty_row_end = @intCast(dirty_end),
-        };
-    }
-
-    /// The vacated band relative to `origin_y_px`, for callers drawing under a
-    /// layer transform, whose pixel space starts at the layer origin.
-    pub fn localClearBand(self: RowScrollBlitPlan) struct { top_px: i32, bottom_px: i32 } {
-        return .{
-            .top_px = self.clear_top_px - self.origin_y_px,
-            .bottom_px = self.clear_bottom_px - self.origin_y_px,
-        };
-    }
-
-    /// Every pixel the blit rewrites: the copy plus the band it vacated.
-    pub fn blitRectPx(self: RowScrollBlitPlan) BlitRectPx {
-        return .{
-            .left = self.origin_x_px,
-            .top = @min(@min(self.src_y_px, self.dst_y_px), self.clear_top_px),
-            .right = self.origin_x_px + self.copy_w_px,
-            .bottom = @max(@max(self.src_y_px, self.dst_y_px) + self.copy_h_px, self.clear_bottom_px),
-        };
-    }
-};
+/// Every pixel the blit rewrites: the copy plus the band it vacated. Windows
+/// only -- the z-aware float scroll mask needs the rectangle, the macOS
+/// frontend does not.
+pub fn blitRectPx(p: RowScrollBlitPlan) BlitRectPx {
+    return .{
+        .left = p.origin_x_px,
+        .top = @min(@min(p.src_y_px, p.dst_y_px), p.clear_top_px),
+        .right = p.origin_x_px + p.copy_w_px,
+        .bottom = @max(@max(p.src_y_px, p.dst_y_px) + p.copy_h_px, p.clear_bottom_px),
+    };
+}
 
 pub const BlitRectPx = struct { left: i32, top: i32, right: i32, bottom: i32 };
 
@@ -993,24 +892,6 @@ pub fn blitRectsIntersect(a: BlitRectPx, b: BlitRectPx) bool {
     return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom;
 }
 
-/// The rows to redraw when the blit never ran: nothing was shifted, so every
-/// row of the scroll region is stale and the core will not re-send them (it
-/// vacates only the band, assuming the frontend shifts the rest). Half-open
-/// and grid-local like `dirty_row_start`/`dirty_row_end`, still stopping at
-/// the rows that fit below `origin_y_px`.
-pub fn dirtyRowsWithoutBlit(
-    row_start: u32,
-    row_end: u32,
-    origin_y_px: i32,
-    tex_h: i32,
-    row_h: i32,
-) ?[2]u32 {
-    if (row_h <= 0) return null;
-    const tex_max_rows = @max(0, @divTrunc(@as(i64, tex_h) - @as(i64, origin_y_px), @as(i64, row_h)));
-    const clamped_row_end = @min(@as(i64, row_end), tex_max_rows);
-    if (clamped_row_end <= @as(i64, row_start)) return null;
-    return .{ row_start, @intCast(clamped_row_end) };
-}
 
 /// Inclusive row ranges, each absent when its own intersection is empty.
 pub const OverBlitRows = struct {
@@ -1041,7 +922,7 @@ pub fn rowsOverBlit(
     if (row_h_px <= 0 or above_rows == 0 or above_cols == 0) return null;
     const h: i64 = row_h_px;
     const oy: i64 = p.origin_y_px;
-    const r = p.blitRectPx();
+    const r = blitRectPx(p);
     // r.top is exactly origin_y_px + row_start * row_h.
     const region_first = @divTrunc(@as(i64, r.top) - oy, h);
     const region_last = @as(i64, p.clamped_row_end) - 1;
