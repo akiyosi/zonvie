@@ -1275,17 +1275,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let oldSize = backBufferSize
         let wasPresented = hasPresentedOnce
 
-        let w = max(1, Int(drawableSize.width))
-        let h = max(1, Int(drawableSize.height))
-
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
+        let desc = makeSurfaceTextureDescriptor(
+            size: drawableSize,
             pixelFormat: pixelFormat,
-            width: w,
-            height: h,
-            mipmapped: false
+            usage: [.renderTarget, .shaderRead]
         )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
 
         backBuffer = device.makeTexture(descriptor: desc)
         // backBufferSize is read from updateCursorShaderStateFromVerts() on
@@ -1840,25 +1834,13 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         let started = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
         let src = bufferSets[flushSourceSetIndex]
         let dst = bufferSets[picked]
-        let staleRows = staleMainRowsBySet[picked].rows
-        var syncMode = "sparse"
-        var syncedRows = staleRows.count
-        if mainRowStateNeedsFullSync[picked] {
-            copySurfaceBufferSetRowState(from: src, to: dst)
-            syncMode = "full_barrier"
-            syncedRows = src.rowState.buffers.count
-        } else if !copySurfaceBufferSetRows(
+        let sync = syncSurfaceWriteSetRowState(
             from: src,
             to: dst,
-            logicalRows: staleRows,
+            staleRows: staleMainRowsBySet[picked].rows,
+            needsFullSync: mainRowStateNeedsFullSync[picked],
             maxRowBuffers: maxRowBuffers
-        ) {
-            // A missed structural transition must never be approximated by
-            // row patches: mappings are frame state, not per-row content.
-            copySurfaceBufferSetRowState(from: src, to: dst)
-            syncMode = "full_mapping_fallback"
-            syncedRows = src.rowState.buffers.count
-        }
+        )
 
         copySurfaceMainVertexState(from: src, to: dst)
         dst.pendingScroll = nil
@@ -1870,7 +1852,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
         if ZonvieCore.appLogEnabled {
             let elapsedUs = (CFAbsoluteTimeGetCurrent() - started) * 1_000_000
-            ZonvieCore.appLogPerf("[perf] lazy_main_prepare src=\(flushSourceSetIndex) dst=\(picked) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(String(format: "%.1f", elapsedUs))")
+            ZonvieCore.appLogPerf("[perf] lazy_main_prepare src=\(flushSourceSetIndex) dst=\(picked) mode=\(sync.mode) syncedRows=\(sync.syncedRows) totalRows=\(src.rowState.buffers.count) us=\(String(format: "%.1f", elapsedUs))")
         }
         return true
     }
@@ -2197,21 +2179,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Returns true if a flush was committed within the given time window.
     /// Used by the draw loop idle detector to avoid premature deactivation
     /// when flushes complete between vsync intervals.
-    private static let machTimebaseInfo: mach_timebase_info_data_t = {
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
-        return info
-    }()
-
     func hadRecentCommit(withinNs: UInt64) -> Bool {
         lock.lock()
         let t = lastCommitTime
         lock.unlock()
-        if t == 0 { return false }
-        let now = mach_absolute_time()
-        let info = Self.machTimebaseInfo
-        let elapsedNs = (now - t) * UInt64(info.numer) / UInt64(info.denom)
-        return elapsedNs < withinNs
+        return surfaceHadRecentCommit(lastCommitTime: t, withinNs: withinNs)
     }
 
     /// Returns the committed atlas texture for external grid views.
@@ -3752,48 +3724,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
 
-            // Under .load a dirty row must overwrite its old pixels rather than
-            // draw on top of them: the core drops the root's default-background
-            // runs while the surface has layers (flush.zig `skip_default_bg`),
-            // so a row that lost or kept a glyph covers neither. The non-blur
-            // pipeline suffices — backgroundAlpha is 1.0, so the solid quad
-            // overwrites.
-            func clearDirtyRowsNonBlur(_ rows: [Int]) {
-                encodeSurfaceDirtyRowBands(
-                    encoder: enc,
-                    rows: rows,
-                    pipeline: pipeline!,
-                    cellHeightPx: cellH,
-                    widthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
-                    heightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
-                    bgRGB: snappedBgRGB,
-                    gridId: 1
-                )
-            }
-
-            // The scissored single-pass dirty-row draw that both the
-            // GPU-scroll-copy arm and the plain partial-redraw arm below
-            // perform, verbatim: overwrite the dirty rows, then draw them one
-            // scissor rect each.
             func drawScissoredDirtyRows() {
-                clearDirtyRowsNonBlur(dirtyRows)
-                _ = encodeSurfaceRowDraws(
+                encodeSurfaceScissoredDirtyRows(
                     encoder: enc,
                     rows: dirtyRows,
-                    resolve: resolvedRowState,
-                    scissor: { row in
-                        makeRowScissorRect(
-                            row: row,
-                            cellHeight_px: cellH,
-                            drawableWidth_px: drawableW,
-                            renderTargetWidth_px: backTex.width,
-                            renderTargetHeight_px: backTex.height
-                        )
-                    },
                     pipeline: pipeline!,
-                    backgroundPipeline: nil,
-                    glyphPipeline: nil,
-                    useTwoPass: false
+                    resolve: resolvedRowState,
+                    cellHeightPx: cellH,
+                    bandWidthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                    bandHeightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                    bgRGB: snappedBgRGB,
+                    gridId: 1,
+                    drawableWidthPx: drawableW,
+                    renderTargetWidthPx: backTex.width,
+                    renderTargetHeightPx: backTex.height
                 )
             }
 
@@ -3862,19 +3806,16 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         let drawableHeightF = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
                         let cellHiI = Int(cellHi)
                         if let bgPipe = backgroundPipeline {
-                            enc.setRenderPipelineState(bgPipe)
-                            for row in dirtyRows {
-                                let topPx = row * cellHiI
-                                let bottomPx = topPx + cellHiI
-                                drawSurfaceBackgroundClearBand(
-                                    enc,
-                                    clearBand: (clearTopPx: topPx, clearBottomPx: bottomPx),
-                                    xRangePx: (leftPx: 0, rightPx: drawableWidthF),
-                                    drawableHeight: drawableHeightF,
-                                    bgRGB: snappedBgRGB,
-                                    gridId: 1
-                                )
-                            }
+                            encodeSurfaceDirtyRowBands(
+                                encoder: enc,
+                                rows: dirtyRows,
+                                pipeline: bgPipe,
+                                cellHeightPx: cellHiI,
+                                widthPx: drawableWidthF,
+                                heightPx: drawableHeightF,
+                                bgRGB: snappedBgRGB,
+                                gridId: 1
+                            )
                         }
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
