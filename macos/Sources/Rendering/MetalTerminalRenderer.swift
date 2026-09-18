@@ -3683,7 +3683,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 // "no drawable" bail below — there backTex is complete and only
                 // the present is missing, which is why the external surface
                 // leaves its own copy of that one alone too.
+                //
+                // Under the lock, unlike ExternalGridView's copies of this: the
+                // GPU completion handler writes this flag from its own thread
+                // (:4805, :4814) and an earlier frame's can still be in flight
+                // behind the semaphore, so an unlocked `false` here races it and
+                // can be lost. The external surface's flag is main-thread
+                // confined — its completion handler hops to the main queue
+                // first — which is why its writes need no lock and this one does.
+                lock.lock()
                 hasPresentedOnce = false
+                lock.unlock()
                 bailWithoutSubmit("render encoder creation failed")
                 return
             }
@@ -4367,8 +4377,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cmd.commit()
                 gpuSubmitted = true
                 // Submitted but never presented — see "render encoder creation
-                // failed" above for why this is set here and not on "no drawable".
+                // failed" above for why this is set here, why not on "no
+                // drawable", and why it takes the lock.
+                lock.lock()
                 hasPresentedOnce = false
+                lock.unlock()
                 bailWithoutSubmit("glow resource/encoder creation failed")
                 return
             }
@@ -4482,8 +4495,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 cmd.commit()
                 gpuSubmitted = true
                 // Submitted but never presented — see "render encoder creation
-                // failed" above for why this is set here and not on "no drawable".
+                // failed" above for why this is set here, why not on "no
+                // drawable", and why it takes the lock.
+                lock.lock()
                 hasPresentedOnce = false
+                lock.unlock()
                 bailWithoutSubmit("final copy encoder creation failed")
                 return
             }
@@ -4579,8 +4595,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     cmd.commit()
                     gpuSubmitted = true
                     // Submitted but never presented — see "render encoder creation
-                    // failed" above for why this is set here and not on "no drawable".
+                    // failed" above for why this is set here, why not on "no
+                    // drawable", and why it takes the lock.
+                    lock.lock()
                     hasPresentedOnce = false
+                    lock.unlock()
                     bailWithoutSubmit("cursor encoder creation failed")
                     return
                 }
