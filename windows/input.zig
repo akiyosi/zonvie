@@ -5,6 +5,7 @@ const c = app_mod.c;
 const applog = app_mod.applog;
 const core = @import("zonvie_core");
 const dwrite_d2d = app_mod.dwrite_d2d;
+const render_helpers = @import("render_pipeline_helpers.zig");
 
 // =========================================================================
 // Keyboard constants and input helpers
@@ -237,16 +238,57 @@ pub fn clientPxToCell(
     // Zig rejects. An external window silently taking the main window's
     // chrome offsets is otherwise invisible until someone clicks.
     if (!is_main_window) return cellAt(x, y, cell_w, row_h, allow_negative);
+    const origin = surfaceOriginPx(app, true);
+    return cellAt(x - origin.x, y - origin.y, cell_w, row_h, allow_negative);
+}
 
-    const content_x: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-        x - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-    else
-        x;
-    const content_y: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        y - @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-    else
-        y;
-    return cellAt(content_x, content_y, cell_w, row_h, allow_negative);
+/// Offset from a window's client origin to its SURFACE origin -- grid 1's cell
+/// (0,0). Only the main window draws chrome inside its own client area, so it
+/// is zero everywhere else, which is why an external window can pass client
+/// pixels to a layer test unchanged and the main window cannot.
+///
+/// Split out of clientPxToCell because a hit test has to reach surface space
+/// BEFORE comparing against `zonvie_layer.x_px`, which is surface-local
+/// (include/zonvie_core.h), and must not then pay the offset a second time on
+/// the way to the core.
+pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOrigin {
+    return render_helpers.surfaceOriginPx(.{
+        .is_main_window = is_main_window,
+        .ext_tabline_enabled = app.ext_tabline_enabled,
+        .style_is_sidebar = app.tabline_style == .sidebar,
+        .style_is_titlebar = app.tabline_style == .titlebar,
+        .sidebar_on_right = app.sidebar_position_right,
+        .has_content_hwnd = app.content_hwnd != null,
+        .sidebar_width_px = @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))),
+        .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
+    });
+}
+
+/// Resolve a MAIN-window client point to the grid the pointer is actually over,
+/// the way ExternalWndProc has resolved its own since 5e7e9cb. Takes app.mu,
+/// which is what the committed layer list is protected by.
+pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const origin = surfaceOriginPx(app, true);
+    return resolveMouseTarget(
+        app.tbs.committed_layers.slice(),
+        1,
+        x - origin.x,
+        y - origin.y,
+        app.cell_w_px,
+        app.rowHeightPx(),
+    );
+}
+
+/// The drag/release counterpart: pin to the grid the press chose rather than
+/// hit-testing again, so a selection dragged out of a float does not retarget
+/// the moment the pointer leaves it.
+pub fn rebaseMainWindowTarget(app: *App, grid_id: i64, x: i32, y: i32) MouseTarget {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    const origin = surfaceOriginPx(app, true);
+    return rebaseToGrid(app.tbs.committed_layers.slice(), 1, grid_id, x - origin.x, y - origin.y);
 }
 
 fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32, allow_negative: bool) CellPos {
@@ -574,8 +616,11 @@ pub const MouseAction = enum {
     }
 };
 
+/// `x`/`y` are SURFACE-local pixels -- layer-local when a hit test chose a
+/// float, otherwise the surface origin already subtracted. The window handle is
+/// no longer a parameter: it existed only to re-derive the chrome offset here,
+/// which now happens once in the caller, before the layer rects are tested.
 pub fn sendMouseButton(
-    hwnd: c.HWND,
     app: *App,
     grid_id: i64,
     button: [*:0]const u8,
@@ -589,9 +634,8 @@ pub fn sendMouseButton(
     const row_h = app.rowHeightPx();
     app.mu.unlock(core.clock.io());
 
-    const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
     const drag = action == .drag;
-    const cell = clientPxToCell(app, is_main_window, x, y, cell_w, row_h, drag);
+    const cell = clientPxToCell(app, false, x, y, cell_w, row_h, drag);
     const mod_buf = buildMouseModifiers(wParam);
 
     // Where the mini window anchors itself next.

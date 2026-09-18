@@ -2954,7 +2954,7 @@ pub export fn ExternalWndProc(
                             break :blk "left";
                         },
                     };
-                    input.sendMouseButton(hwnd, app, target.grid_id, button, .press, target.x, target.y, wParam);
+                    input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
                     return 0;
                 }
             }
@@ -3042,7 +3042,7 @@ pub export fn ExternalWndProc(
                     if (msg != c.WM_LBUTTONUP) {
                         if (editor_target) {
                             const button: [*:0]const u8 = if (msg == c.WM_RBUTTONUP) "right" else "middle";
-                            input.sendMouseButton(hwnd, app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
+                            input.sendMouseButton(app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
                         }
                         return 0;
                     }
@@ -3069,7 +3069,7 @@ pub export fn ExternalWndProc(
                     // so its release must not either -- Neovim would see a
                     // release with no press and move the cursor there.
                     if (editor_target and !was_dragging_scrollbar and held == 1) {
-                        input.sendMouseButton(hwnd, app, up_target.grid_id, "left", .release, up_target.x, up_target.y, wParam);
+                        input.sendMouseButton(app, up_target.grid_id, "left", .release, up_target.x, up_target.y, wParam);
                     }
                     return 0;
                 }
@@ -3156,7 +3156,7 @@ pub export fn ExternalWndProc(
                                     y,
                                 );
                             };
-                            input.sendMouseButton(hwnd, app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
+                            input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
                         }
                     }
                 }

@@ -6500,7 +6500,16 @@ pub export fn WndProc(
                     else => "left",
                 };
 
-                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
+                // A float composited into this window is one of its layers,
+                // not a window of its own, so the press has to say which grid
+                // it landed on: Neovim trusts the id it is given and resolves
+                // grid 1 through the frame tree, which holds splits only. This
+                // is the follow-up 5e7e9cb deferred when it fixed the external
+                // path -- and it measured the cost on 0.12.2, a middle press
+                // over a float pasting destructively into the buffer behind it.
+                const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
+                app.mouse_press_grid_id = target.grid_id;
+                input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
 
                 return 0;
             }
@@ -6508,6 +6517,16 @@ pub export fn WndProc(
 
         c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
             if (getApp(hwnd)) |app| {
+                // Read and clear the press state before anything can return
+                // early, as ExternalWndProc does. The tabline, sidebar and
+                // scrollbar branches below all `return 0` without reaching the
+                // editor path, so clearing there left a button held: every
+                // later WM_MOUSEMOVE then passed the drag gate and Neovim saw a
+                // selection following a pointer with no button down.
+                const press_grid = app.mouse_press_grid_id;
+                app.mouse_button_held = 0;
+                app.mouse_press_grid_id = 0;
+
                 // Extract position from lParam (needed for tabline check)
                 const pos_x_up = input.mousePosFromLParam(lParam);
                 const x_up = pos_x_up.x;
@@ -6562,14 +6581,17 @@ pub export fn WndProc(
                     else => "left",
                 };
 
-                app.mouse_button_held = 0;
-
                 // Extract position from lParam
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
                 const y = pos.y;
 
-                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
+                // Pinned to the grid the press chose, at that layer's CURRENT
+                // origin: re-resolving here would move the release into another
+                // window the moment the pointer left the float, and Neovim
+                // would place the selection's end there.
+                const up_target = input.rebaseMainWindowTarget(app, press_grid, @as(i32, x), @as(i32, y));
+                input.sendMouseButton(app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
 
                 return 0;
             }
@@ -6593,7 +6615,9 @@ pub export fn WndProc(
                     break :blk "x2";
                 };
 
-                input.sendMouseButton(hwnd, app, 1, button, .press, @as(i32, x), @as(i32, y), wParam);
+                const x_target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
+                app.mouse_press_grid_id = x_target.grid_id;
+                input.sendMouseButton(app, x_target.grid_id, button, .press, x_target.x, x_target.y, wParam);
 
                 // WM_XBUTTONDOWN requires returning TRUE
                 return 1;
@@ -6613,7 +6637,9 @@ pub export fn WndProc(
 
                 app.mouse_button_held = 0;
 
-                input.sendMouseButton(hwnd, app, 1, button, .release, @as(i32, x), @as(i32, y), wParam);
+                const x_up = input.rebaseMainWindowTarget(app, app.mouse_press_grid_id, @as(i32, x), @as(i32, y));
+                app.mouse_press_grid_id = 0;
+                input.sendMouseButton(app, x_up.grid_id, button, .release, x_up.x, x_up.y, wParam);
 
                 // WM_XBUTTONUP requires returning TRUE
                 return 1;
@@ -6807,7 +6833,8 @@ pub export fn WndProc(
                 const button = input.heldMouseButtonName(app.mouse_button_held) orelse
                     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 
-                input.sendMouseButton(hwnd, app, 1, button, .drag, @as(i32, x), @as(i32, y), wParam);
+                const drag_target = input.rebaseMainWindowTarget(app, app.mouse_press_grid_id, @as(i32, x), @as(i32, y));
+                input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
 
                 return 0;
             }
@@ -7088,6 +7115,12 @@ pub export fn WndProc(
         c.WM_CAPTURECHANGED => {
             // Mouse capture lost - cancel any tabline/sidebar drag or button press
             if (getApp(hwnd)) |app| {
+                // WM_LBUTTONUP never arrives once capture is stolen, and it is
+                // the only place the editor drag ends: a held button left set
+                // here turns every later hover into a drag. ExternalWndProc has
+                // cleared both for the same reason since 5e7e9cb.
+                app.mouse_button_held = 0;
+                app.mouse_press_grid_id = 0;
                 // Scrollbar drag and track-repeat are both armed on button-down
                 // and cleared only in scrollbarMouseUp. With capture stolen,
                 // WM_LBUTTONUP never arrives here: the repeat timer would keep

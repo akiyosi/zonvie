@@ -1346,3 +1346,95 @@ test "two shifts in one flush compose" {
     // 4 -> 2, 8 -> 6, 9 -> 7, vacated [8,10) again.
     try expectBits(&bits, &.{ 2, 6, 7, 8, 9 });
 }
+
+// A hit test has to reach surface space before it can compare a point against
+// `zonvie_layer.x_px`, which is surface-local, and must not pay the offset a
+// second time on the way to the core. Getting either wrong moves every click by
+// a fixed number of cells and fails silently, so the offset itself is pinned
+// here rather than left to a hand test on Windows hardware.
+
+test "a non-main window's surface starts at its client origin" {
+    // An external window draws no chrome inside its own client rect, which is
+    // why it can hand client pixels to a layer test unchanged.
+    const o = helpers.surfaceOriginPx(.{
+        .is_main_window = false,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+        .style_is_titlebar = true,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), o.x);
+    try std.testing.expectEqual(@as(i32, 0), o.y);
+}
+
+test "no tabline means no offset at all" {
+    const o = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = false,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 0), o.x);
+    try std.testing.expectEqual(@as(i32, 0), o.y);
+}
+
+test "a left sidebar shifts the surface right; a right one does not" {
+    const left = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_on_right = false,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 120), left.x);
+    try std.testing.expectEqual(@as(i32, 0), left.y);
+
+    // A sidebar on the right takes no leading columns.
+    const right = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_on_right = true,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 0), right.x);
+    try std.testing.expectEqual(@as(i32, 0), right.y);
+}
+
+test "a titlebar tabline shifts the surface down, unless a child hwnd hosts it" {
+    const inline_bar = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_titlebar = true,
+        .has_content_hwnd = false,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), inline_bar.x);
+    try std.testing.expectEqual(@as(i32, 30), inline_bar.y);
+
+    // With a separate content HWND the tab bar is outside this client area.
+    const child_hosted = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_titlebar = true,
+        .has_content_hwnd = true,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), child_hosted.y);
+}
+
+test "the two styles are exclusive, so only one axis ever shifts" {
+    // tabline_style is one enum: sidebar and titlebar cannot both hold. The
+    // predicate is written per-axis, so this pins that a future third style
+    // cannot silently start shifting both.
+    const sidebar = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 120), sidebar.x);
+    try std.testing.expectEqual(@as(i32, 0), sidebar.y);
+}

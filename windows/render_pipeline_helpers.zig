@@ -699,6 +699,48 @@ pub fn shouldRetireSlotBacking(capacity: usize, layout_peak_verts: usize) bool {
 /// translucent window — are the whole of `force_full_rows` here; everything
 /// surface-specific is folded into `force_full` by the caller, which is where
 /// the main driver's seed state and an external window's `paint_full` live.
+/// Where a window's SURFACE begins inside its client area -- grid 1's cell
+/// (0,0). Only the main window draws chrome inside its own client rect, so the
+/// offset is zero for every other window, which is why an external window can
+/// hand client pixels to a layer test unchanged and the main window cannot.
+///
+/// Pure and host-testable because getting it wrong is silent: a hit test that
+/// applies it twice, or not at all, moves every click by a fixed number of
+/// cells and nothing fails until someone notices the cursor landing in the
+/// wrong place. Both callers in `input.zig` fill this from `App`.
+pub const SurfaceOriginInputs = struct {
+    is_main_window: bool,
+    ext_tabline_enabled: bool = false,
+    style_is_sidebar: bool = false,
+    style_is_titlebar: bool = false,
+    sidebar_on_right: bool = false,
+    /// A separate child HWND hosts the content, so the tab bar is not inside
+    /// the surface's own client area.
+    has_content_hwnd: bool = false,
+    /// Already DPI-scaled.
+    sidebar_width_px: i32 = 0,
+    /// Already DPI-scaled.
+    tab_bar_height_px: i32 = 0,
+};
+
+pub const SurfaceOrigin = struct { x: i32 = 0, y: i32 = 0 };
+
+pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
+    if (!in.is_main_window) return .{};
+    return .{
+        // A sidebar on the RIGHT takes no leading columns, so it shifts
+        // nothing: the surface still starts at the client origin.
+        .x = if (in.ext_tabline_enabled and in.style_is_sidebar and !in.sidebar_on_right)
+            in.sidebar_width_px
+        else
+            0,
+        .y = if (in.ext_tabline_enabled and in.style_is_titlebar and !in.has_content_hwnd)
+            in.tab_bar_height_px
+        else
+            0,
+    };
+}
+
 pub const PaintPolicyInputs = struct {
     /// The surface's own "repaint everything" request.
     force_full: bool,
