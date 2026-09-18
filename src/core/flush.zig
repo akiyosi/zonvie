@@ -4501,7 +4501,12 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         .rows = root.rows,
         .cols = root.cols,
         .z = 0,
-        .flags = 0,
+        // The header promises MOUSE_ENABLED is always set for the root, and
+        // every hit test is about to start relying on that: a main-window one
+        // written as a uniform loop over all layers would otherwise skip
+        // layers[0] and leave the root grid unclickable. Today's consumers all
+        // iterate layers[1..], so this changes nothing for them.
+        .flags = c_api.LAYER_MOUSE_ENABLED,
     }) catch |err| {
         failSurfaceLayout(self, err);
         return &.{};

@@ -3223,6 +3223,10 @@ final class MetalTerminalView: MTKView {
     }
 
     /// Hit-test to find which grid is at the given point (highest zindex wins)
+    /// Reused by both hit tests below; see the renderer's
+    /// `collectMouseDisabledLayerGridIds`.
+    private var mouseDisabledGridsScratch: [Int64] = []
+
     private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
 
@@ -3267,10 +3271,20 @@ final class MetalTerminalView: MTKView {
         var localRow: Int32 = globalRow
         var localCol: Int32 = globalCol
 
+        // A float that refuses the mouse is not a target and does not shadow
+        // one: Neovim looks the window up by handle, rejects it, and returns
+        // without re-resolving (mouse.c's mouse_find_grid_win, then
+        // mouse_find_win_inner's `else if (*gridp > 1) return NULL`), so naming
+        // it swallows the click instead of letting it reach what is drawn
+        // underneath. `zonvie_grid_info` carries no mouse field, so the answer
+        // comes from the layer list instead.
+        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
+
         for grid in grids {
             // External grids are separate top-level windows reported at (0,0);
             // they must not be hit by the main window's coordinate-space test.
             if grid.isExternal { continue }
+            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
             let inRowRange = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
             let inColRange = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
 
@@ -3356,10 +3370,17 @@ final class MetalTerminalView: MTKView {
         // window — shows through (req #1).
         var target: ZonvieCore.GridInfo?
         var bestZ = Int64.min
+        // Same rule as the click path, and a separate question from
+        // scrollability below: ExternalGridView applies both independently.
+        // A float that refuses the mouse but IS logically scrollable would
+        // otherwise take the gesture, ease its own pixels, get no grid_scroll
+        // back, and snap — while the window under it never moved.
+        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
         for grid in grids {
             // External grids are separate top-level windows reported at (0,0);
             // exclude them from the main window's scroll-target resolution.
             if grid.isExternal { continue }
+            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
             let inRow = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
             let inCol = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
             guard inRow && inCol else { continue }

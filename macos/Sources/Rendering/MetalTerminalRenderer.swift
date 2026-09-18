@@ -462,6 +462,29 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return created
     }
 
+    /// Grid ids of committed layers that refuse mouse input, appended to `out`.
+    ///
+    /// `include/zonvie_core.h` requires a hit test to skip such a layer: Neovim
+    /// rejects an event addressed to it and does not re-resolve against what is
+    /// behind it, so naming it swallows the event rather than passing it
+    /// through. `ExternalGridView` has obeyed that since 5e7e9cb; the main
+    /// window's two hit tests could not, because they resolve against
+    /// `zonvie_grid_info`, which carries no mouse field. This is the same
+    /// information, from the layer list the main surface already holds.
+    ///
+    /// Filled into a caller-owned scratch rather than returned, so a pointer
+    /// move allocates nothing — the list is empty in every ordinary
+    /// configuration. The root is never included: it always takes the mouse,
+    /// and a hit test that dropped grid 1 would make the window unclickable.
+    func collectMouseDisabledLayerGridIds(into out: inout [Int64]) {
+        out.removeAll(keepingCapacity: true)
+        lock.lock()
+        defer { lock.unlock() }
+        for layer in committedSurfaceLayers where layer.gridId != 1 && !layer.mouseEnabled {
+            out.append(layer.gridId)
+        }
+    }
+
     /// Drop a destroyed grid's draw state, alongside its buffer sets.
     func releaseLayerDrawState(gridId: Int64) {
         lock.lock()
