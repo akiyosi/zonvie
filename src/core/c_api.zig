@@ -16,6 +16,7 @@ pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
+pub const row_scroll = @import("row_scroll.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -1070,6 +1071,60 @@ pub export fn zonvie_core_send_input(p: ?*zonvie_core, keys: [*]const u8, len: u
 
 pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
     return @intCast(clock.nowNs());
+}
+
+/// Row-scroll blit arithmetic. Stateless, so no core handle: the answer
+/// depends only on the geometry passed in. The Windows frontend calls
+/// `row_scroll` directly as Zig; these exist for the macOS side.
+pub export fn zonvie_core_row_scroll_plan_make(
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    origin_x_px: i32,
+    origin_y_px: i32,
+    width_px: i32,
+    texture_width_px: i32,
+    texture_height_px: i32,
+    row_height_px: i32,
+    out: ?*row_scroll.Plan,
+) callconv(.c) bool {
+    const dst = out orelse return false;
+    const plan = row_scroll.make(
+        row_start,
+        row_end,
+        rows_delta,
+        origin_x_px,
+        origin_y_px,
+        width_px,
+        texture_width_px,
+        texture_height_px,
+        row_height_px,
+    ) orelse return false;
+    dst.* = plan;
+    return true;
+}
+
+pub export fn zonvie_core_row_scroll_dirty_rows_without_blit(
+    row_start: u32,
+    row_end: u32,
+    origin_y_px: i32,
+    texture_height_px: i32,
+    row_height_px: i32,
+    out_row_start: ?*u32,
+    out_row_end: ?*u32,
+) callconv(.c) bool {
+    const s = out_row_start orelse return false;
+    const e = out_row_end orelse return false;
+    const rows = row_scroll.dirtyRowsWithoutBlit(
+        row_start,
+        row_end,
+        origin_y_px,
+        texture_height_px,
+        row_height_px,
+    ) orelse return false;
+    s.* = rows[0];
+    e.* = rows[1];
+    return true;
 }
 
 // Build-time version string from `git describe`, null-terminated for C.

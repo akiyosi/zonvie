@@ -12,6 +12,76 @@ private let metalTerminalMaxRowBuffers = 20_000
 // and the shader C ABI, and MetalTypes.swift is compiled standalone by the
 // `zig build test` Swift targets, which have neither.
 
+extension RowScrollBlitPlan {
+    /// Ask the core where this scroll's blit reads and writes. Nil means no
+    /// blit is worth encoding and the caller redraws the region instead.
+    ///
+    /// The arithmetic is `src/core/row_scroll.zig`, which the Windows frontend
+    /// calls as Zig; this is the same answer through the C ABI. The Swift
+    /// struct stays a separate shape so the draw code keeps reading
+    /// `dirtyRows` as a Range.
+    static func make(
+        rowStart: Int,
+        rowEnd: Int,
+        rowsDelta: Int,
+        originXPx: Int = 0,
+        originYPx: Int = 0,
+        widthPx: Int,
+        textureWidthPx: Int,
+        textureHeightPx: Int,
+        rowHeightPx: Int
+    ) -> RowScrollBlitPlan? {
+        var c = zonvie_row_scroll_plan()
+        guard zonvie_core_row_scroll_plan_make(
+            UInt32(max(0, rowStart)),
+            UInt32(max(0, rowEnd)),
+            Int32(clamping: rowsDelta),
+            Int32(clamping: originXPx),
+            Int32(clamping: originYPx),
+            Int32(clamping: widthPx),
+            Int32(clamping: textureWidthPx),
+            Int32(clamping: textureHeightPx),
+            Int32(clamping: rowHeightPx),
+            &c
+        ) else { return nil }
+        return RowScrollBlitPlan(
+            srcYPx: Int(c.src_y_px),
+            dstYPx: Int(c.dst_y_px),
+            copyWidthPx: Int(c.copy_w_px),
+            copyHeightPx: Int(c.copy_h_px),
+            clearTopPx: Int(c.clear_top_px),
+            clearBottomPx: Int(c.clear_bottom_px),
+            clampedRowEnd: Int(c.clamped_row_end),
+            dirtyRows: Int(c.dirty_row_start)..<Int(c.dirty_row_end),
+            originXPx: Int(c.origin_x_px),
+            originYPx: Int(c.origin_y_px)
+        )
+    }
+
+    /// The rows to redraw when the blit never ran. Nil when nothing of the
+    /// region is inside the texture.
+    static func dirtyRowsWithoutBlit(
+        rowStart: Int,
+        rowEnd: Int,
+        originYPx: Int = 0,
+        textureHeightPx: Int,
+        rowHeightPx: Int
+    ) -> Range<Int>? {
+        var start: UInt32 = 0
+        var end: UInt32 = 0
+        guard zonvie_core_row_scroll_dirty_rows_without_blit(
+            UInt32(max(0, rowStart)),
+            UInt32(max(0, rowEnd)),
+            Int32(clamping: originYPx),
+            Int32(clamping: textureHeightPx),
+            Int32(clamping: rowHeightPx),
+            &start,
+            &end
+        ) else { return nil }
+        return Int(start)..<Int(end)
+    }
+}
+
 /// Record what a row callback found missing, so the provisioner can supply it
 /// after the bracket closes. Returns false when the row cannot be written this
 /// flush; the caller owns `flushFailed`, which is the only part of this
