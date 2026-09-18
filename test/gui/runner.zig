@@ -497,6 +497,17 @@ test "gui:visual_extwin_hosted_layer_glow" {
     }
 }
 
+test "gui:main_float_mouse_disabled_scroll" {
+    // macOS only: it drives a real trackpad gesture and tests the macOS
+    // frontend's own hit test.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_float_mouse_disabled_scroll.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:main_cursor_move_reuses_rows" {
     // macOS only: MetalTerminalRenderer is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {
