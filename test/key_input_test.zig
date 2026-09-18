@@ -320,3 +320,88 @@ test "macSpecialName returns correct names" {
     try std.testing.expectEqualStrings("Esc", nvim_core.Core.macSpecialName(53).?);
     try std.testing.expect(nvim_core.Core.macSpecialName(0) == null); // 0 is not special
 }
+
+// ---------------------------------------------------------------------------
+// Function keys, Insert, and the two ways they used to be lost.
+//
+// Both frontends classify F-keys as special and route them here, so a missing
+// table row was not a no-op: the Windows path reached `chars.len == 0` and sent
+// NOTHING, while the macOS path fell through to the text branch and sent the
+// raw private-use codepoint AppKit reports for the key -- U+F704 for F1, which
+// lands in the buffer as a character, and inside the Nerd Fonts PUA at that.
+//
+// Keycodes are not guesses. The macOS ones were confirmed against the character
+// AppKit reports for each key on real hardware (NSF1FunctionKey..NSF12, and the
+// order is NOT contiguous); the Win32 ones came from the mingw winuser.h this
+// target compiles against.
+// ---------------------------------------------------------------------------
+
+const mac_fkeys = [_]struct { code: u32, name: []const u8, chars: []const u8 }{
+    .{ .code = 122, .name = "<F1>", .chars = "\u{F704}" },
+    .{ .code = 120, .name = "<F2>", .chars = "\u{F705}" },
+    .{ .code = 99, .name = "<F3>", .chars = "\u{F706}" },
+    .{ .code = 118, .name = "<F4>", .chars = "\u{F707}" },
+    .{ .code = 96, .name = "<F5>", .chars = "\u{F708}" },
+    .{ .code = 97, .name = "<F6>", .chars = "\u{F709}" },
+    .{ .code = 98, .name = "<F7>", .chars = "\u{F70A}" },
+    .{ .code = 100, .name = "<F8>", .chars = "\u{F70B}" },
+    .{ .code = 101, .name = "<F9>", .chars = "\u{F70C}" },
+    .{ .code = 109, .name = "<F10>", .chars = "\u{F70D}" },
+    .{ .code = 103, .name = "<F11>", .chars = "\u{F70E}" },
+    .{ .code = 111, .name = "<F12>", .chars = "\u{F70F}" },
+};
+
+test "macOS function keys format as <Fn>, not as the private-use character" {
+    for (mac_fkeys) |k| {
+        try expectKeyFormat(k.name, k.code, 0, k.chars, k.chars);
+    }
+}
+
+test "Windows function keys format as <Fn> instead of sending nothing" {
+    const names = [_][]const u8{ "<F1>", "<F2>", "<F3>", "<F4>", "<F5>", "<F6>", "<F7>", "<F8>", "<F9>", "<F10>", "<F11>", "<F12>" };
+    for (names, 0..) |name, i| {
+        // VK_F1 = 0x70, contiguous through VK_F12 = 0x7B. The Windows frontend
+        // passes no characters for a special key, which is what used to make
+        // the missing row silent rather than wrong.
+        try expectKeyFormat(name, WIN_VK_FLAG | (0x70 + @as(u32, @intCast(i))), 0, "", "");
+    }
+}
+
+test "modifiers compose with function keys on both platforms" {
+    // Shift alone is not `has_mod`, so <S-F1> proves the table row is what
+    // carries the key rather than the modifier branch.
+    try expectKeyFormat("<S-F1>", 122, MOD_SHIFT, "\u{F704}", "\u{F704}");
+    try expectKeyFormat("<C-F5>", 96, MOD_CTRL, "\u{F708}", "\u{F708}");
+    try expectKeyFormat("<S-F1>", WIN_VK_FLAG | 0x70, MOD_SHIFT, "", "");
+    try expectKeyFormat("<C-F5>", WIN_VK_FLAG | 0x74, MOD_CTRL, "", "");
+    // Alt+F4 reaches Neovim as a key rather than being swallowed. Whether the
+    // OS should close the window instead is a separate product question.
+    try expectKeyFormat("<M-F4>", WIN_VK_FLAG | 0x73, MOD_ALT, "", "");
+}
+
+test "Insert is named on Windows and deliberately absent on macOS" {
+    // VK_INSERT = 0x2D, already classified special by the Windows frontend.
+    try expectKeyFormat("<Insert>", WIN_VK_FLAG | 0x2D, 0, "", "");
+    // macOS keycode 114 is Help on Apple's own layout and AppKit reports it as
+    // NSHelpFunctionKey. Calling it <Insert> is a product decision, not a
+    // missing row, so the table leaves it out and this pins that.
+    try std.testing.expect(nvim_core.Core.macSpecialName(114) == null);
+}
+
+test "the function-key rows do not collide with the existing ones" {
+    // 99, 96, 97, 98, 100, 101, 103 sit between the arrow and navigation
+    // keycodes; a typo would silently shadow one of those instead of failing.
+    try std.testing.expectEqualStrings("Left", nvim_core.Core.macSpecialName(123).?);
+    try std.testing.expectEqualStrings("Right", nvim_core.Core.macSpecialName(124).?);
+    try std.testing.expectEqualStrings("Down", nvim_core.Core.macSpecialName(125).?);
+    try std.testing.expectEqualStrings("Up", nvim_core.Core.macSpecialName(126).?);
+    try std.testing.expectEqualStrings("Home", nvim_core.Core.macSpecialName(115).?);
+    try std.testing.expectEqualStrings("End", nvim_core.Core.macSpecialName(119).?);
+    try std.testing.expectEqualStrings("PageUp", nvim_core.Core.macSpecialName(116).?);
+    try std.testing.expectEqualStrings("PageDown", nvim_core.Core.macSpecialName(121).?);
+    try std.testing.expectEqualStrings("BS", nvim_core.Core.macSpecialName(51).?);
+    try std.testing.expectEqualStrings("Del", nvim_core.Core.macSpecialName(117).?);
+    try std.testing.expectEqualStrings("CR", nvim_core.Core.macSpecialName(36).?);
+    try std.testing.expectEqualStrings("Tab", nvim_core.Core.macSpecialName(48).?);
+    try std.testing.expectEqualStrings("Esc", nvim_core.Core.macSpecialName(53).?);
+}
