@@ -918,21 +918,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         enableSetNeedsDisplay = true
     }
 
-    private static let machTimebaseInfo: mach_timebase_info_data_t = {
-        var info = mach_timebase_info_data_t()
-        mach_timebase_info(&info)
-        return info
-    }()
-
     private func hadRecentCommit(withinNs: UInt64) -> Bool {
         tripleBufferLock.lock()
         let t = lastCommitTime
         tripleBufferLock.unlock()
-        if t == 0 { return false }
-        let now = mach_absolute_time()
-        let info = Self.machTimebaseInfo
-        let elapsedNs = (now - t) * UInt64(info.numer) / UInt64(info.denom)
-        return elapsedNs < withinNs
+        return surfaceHadRecentCommit(lastCommitTime: t, withinNs: withinNs)
     }
 
     private func setupScrollbar() {
@@ -1105,28 +1095,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         bufferSets[picked].pendingScroll = nil
         let src = bufferSets[srcIdx]
         let dst = bufferSets[picked]
-        let staleRows = staleRowsBySet[picked].rows
         let perfStarted = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        var syncMode = "sparse"
-        var syncedRows = staleRows.count
-        if rowStateNeedsFullSync[picked] {
-            copySurfaceBufferSetRowState(from: src, to: dst)
-            syncMode = "full_barrier"
-            syncedRows = src.rowState.buffers.count
-        } else if !copySurfaceBufferSetRows(
+        let sync = syncSurfaceWriteSetRowState(
             from: src,
             to: dst,
-            logicalRows: staleRows,
+            staleRows: staleRowsBySet[picked].rows,
+            needsFullSync: rowStateNeedsFullSync[picked],
             maxRowBuffers: maxRowBuffers
-        ) {
-            copySurfaceBufferSetRowState(from: src, to: dst)
-            syncMode = "full_mapping_fallback"
-            syncedRows = src.rowState.buffers.count
-        }
+        )
         if ZonvieCore.appLogEnabled {
             let elapsedUs = (CFAbsoluteTimeGetCurrent() - perfStarted) * 1_000_000
             let elapsedUsString = String(format: "%.1f", elapsedUs)
-            ZonvieCore.appLogPerf("[perf] external_begin_prepare gridId=\(gridId) mode=\(syncMode) syncedRows=\(syncedRows) totalRows=\(src.rowState.buffers.count) us=\(elapsedUsString)")
+            ZonvieCore.appLogPerf("[perf] external_begin_prepare gridId=\(gridId) mode=\(sync.mode) syncedRows=\(sync.syncedRows) totalRows=\(src.rowState.buffers.count) us=\(elapsedUsString)")
         }
         // No cursor carry-forward: the cursor lives on its own triple now, and
         // a row-set rotation neither publishes nor invalidates it. A staged
@@ -2056,14 +2036,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
+        let desc = makeSurfaceTextureDescriptor(
+            size: drawableSize,
             pixelFormat: pixelFormat,
-            width: max(1, Int(drawableSize.width)),
-            height: max(1, Int(drawableSize.height)),
-            mipmapped: false
+            usage: [.renderTarget, .shaderRead]
         )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
         backBuffer = mtlDevice.makeTexture(descriptor: desc)
         backBufferSize = drawableSize
         // The ping-pong is not dropped here: `SurfacePingPongTextures.ensure`
@@ -3254,48 +3231,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
                     let cellH = max(1, Int(ch.rounded(.up)))
 
-                    // Match the main surface: partial non-blur passes load the
-                    // previous back texture, so a zero-vertex dirty row needs an
-                    // explicit background overwrite or stale glyphs remain. The
-                    // fragment backgroundAlpha is 1.0 without blur, including
-                    // decorated grids' viewport (their padding remains governed
-                    // by the transparent render-pass clear outside the viewport).
-                    func clearDirtyRowsNonBlur(_ rows: [Int]) {
-                        encodeSurfaceDirtyRowBands(
-                            encoder: enc,
-                            rows: rows,
-                            pipeline: pipeline,
-                            cellHeightPx: cellH,
-                            widthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
-                            heightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
-                            bgRGB: extractRGBFromClearColor(gridClearColor),
-                            gridId: gridId
-                        )
-                    }
-
-                    // The scissored single-pass dirty-row draw that both the
-                    // GPU-scroll-copy arm and the plain partial-redraw arm below
-                    // perform, verbatim: overwrite the dirty rows that carry no
-                    // vertices, then draw the dirty rows one scissor rect each.
+                    // A decorated grid's padding stays governed by the
+                    // transparent render-pass clear outside the viewport; the
+                    // bands only cover the viewport itself.
                     func drawScissoredDirtyRows() {
-                        clearDirtyRowsNonBlur(dirtyRows)
-                        _ = encodeSurfaceRowDraws(
+                        encodeSurfaceScissoredDirtyRows(
                             encoder: enc,
                             rows: dirtyRows,
-                            resolve: resolvedRowState,
-                            scissor: { row in
-                                makeRowScissorRect(
-                                    row: row,
-                                    cellHeight_px: cellH,
-                                    drawableWidth_px: drawableW,
-                                    renderTargetWidth_px: backTex.width,
-                                    renderTargetHeight_px: backTex.height
-                                )
-                            },
                             pipeline: pipeline,
-                            backgroundPipeline: nil,
-                            glyphPipeline: nil,
-                            useTwoPass: false
+                            resolve: resolvedRowState,
+                            cellHeightPx: cellH,
+                            bandWidthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
+                            bandHeightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                            bgRGB: extractRGBFromClearColor(gridClearColor),
+                            gridId: gridId,
+                            drawableWidthPx: drawableW,
+                            renderTargetWidthPx: backTex.width,
+                            renderTargetHeightPx: backTex.height
                         )
                     }
 
@@ -3311,19 +3263,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     func drawScissoredDirtyRowsTwoPass() {
                         let bandWidth = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
                         let bandHeight = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
-                        let bgRGB = extractRGBFromClearColor(gridClearColor)
-                        enc.setRenderPipelineState(backgroundPipeline!)
-                        for row in dirtyRows {
-                            let topPx = row * cellH
-                            drawSurfaceBackgroundClearBand(
-                                enc,
-                                clearBand: (clearTopPx: topPx, clearBottomPx: topPx + cellH),
-                                xRangePx: (leftPx: 0, rightPx: bandWidth),
-                                drawableHeight: bandHeight,
-                                bgRGB: bgRGB,
-                                gridId: gridId
-                            )
-                        }
+                        encodeSurfaceDirtyRowBands(
+                            encoder: enc,
+                            rows: dirtyRows,
+                            pipeline: backgroundPipeline!,
+                            cellHeightPx: cellH,
+                            widthPx: bandWidth,
+                            heightPx: bandHeight,
+                            bgRGB: extractRGBFromClearColor(gridClearColor),
+                            gridId: gridId
+                        )
                         _ = encodeSurfaceRowDraws(
                             encoder: enc,
                             rows: dirtyRows,
