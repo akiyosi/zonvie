@@ -1090,6 +1090,81 @@ void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int le
 /* Timestamp helper for perf-log correlation across frontend/core stages. */
 ZONVIE_API int64_t zonvie_core_perf_now_ns(void);
 
+/* ---------------------------------------------------------------------------
+   Row-scroll blit arithmetic.
+
+   Where a GPU row-scroll copy reads and writes, how far it may go inside the
+   frontend's back texture, which band it vacates, and which rows the caller
+   must redraw. Stateless: the answer depends only on the geometry passed in,
+   so these take no core handle.
+
+   The scrolled rectangle is a sub-rectangle of the back texture at
+   (origin_x_px, origin_y_px), width_px wide: origin zero and the full drawable
+   width for a whole surface, the layer's own origin and width for one layer.
+
+   The row count a scroll callback reports can outlive the texture -- a window
+   shrink, or a guifont/linespace change growing the cell height before
+   try_resize round-trips -- so row_end is clamped to the rows that fit below
+   the origin, and the copy, the vacated band and the dirty expansion all stop
+   at that same clamped row. Getting that wrong leaves part of the band the
+   blit cleared blank until the next full redraw. */
+typedef struct zonvie_row_scroll_plan {
+    /* The scrolled rectangle's left edge, which the encoder copies at. */
+    int32_t origin_x_px;
+    /* The top edge, already folded into every Y below. Subtract it to draw
+       under a layer transform, whose pixel space starts at the origin. */
+    int32_t origin_y_px;
+    int32_t src_y_px;
+    int32_t dst_y_px;
+    int32_t copy_w_px;
+    int32_t copy_h_px;
+    /* The band the copy vacated, which the caller clears to the background. */
+    int32_t clear_top_px;
+    int32_t clear_bottom_px;
+    /* row_end clamped to the texture: where the blit stopped. */
+    uint32_t clamped_row_end;
+    /* Rows the caller must redraw: the band vacated by an accumulated delta D,
+       plus another D for rows an intermediate scroll step copied and a later
+       one overwrote, which are stale in the back buffer. Half-open and
+       grid-local -- rows are numbered within the scroll region, which
+       origin_y_px moves the pixels of but does not renumber. */
+    uint32_t dirty_row_start;
+    uint32_t dirty_row_end;
+} zonvie_row_scroll_plan;
+
+/* Fills *out and returns true when a blit is worth encoding. False means the
+   caller redraws the region from scratch instead: no shift, a shift that fills
+   or exceeds the region, a degenerate geometry, or a rectangle with nothing
+   left inside the texture. *out is untouched when false. */
+ZONVIE_API bool zonvie_core_row_scroll_plan_make(
+    uint32_t row_start,
+    uint32_t row_end,
+    int32_t rows_delta,
+    int32_t origin_x_px,
+    int32_t origin_y_px,
+    int32_t width_px,
+    int32_t texture_width_px,
+    int32_t texture_height_px,
+    int32_t row_height_px,
+    zonvie_row_scroll_plan *out
+);
+
+/* The rows to redraw when the blit never ran: nothing was shifted, so every
+   row of the scroll region is stale and the core will not re-send them (it
+   vacates only the band, assuming the frontend shifts the rest). Half-open and
+   grid-local like dirty_row_start/dirty_row_end, still stopping at the rows
+   that fit below origin_y_px. False when nothing of the region is inside the
+   texture; the out params are untouched then. */
+ZONVIE_API bool zonvie_core_row_scroll_dirty_rows_without_blit(
+    uint32_t row_start,
+    uint32_t row_end,
+    int32_t origin_y_px,
+    int32_t texture_height_px,
+    int32_t row_height_px,
+    uint32_t *out_row_start,
+    uint32_t *out_row_end
+);
+
 /* Build-time version string (from `git describe`), e.g. "v0.3.21" or
    "v0.3.21-9-g4eb0177". The returned pointer is static and null-terminated;
    never null. Not tied to a core instance. */
