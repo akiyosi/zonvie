@@ -2556,6 +2556,41 @@ func copySurfaceBufferSetRows(
     return true
 }
 
+/// Bring a freshly picked write set's row state up to date from the set it
+/// rotates off, patching only the rows that went stale where that is sound.
+///
+/// `needsFullSync` is the caller's barrier flag: a structural transition it
+/// already knows crossed this set. The second full copy is NOT an
+/// optimisation being skipped — a missed structural transition must never be
+/// approximated by row patches, because mappings are frame state, not per-row
+/// content, so a sparse patch that reports a mapping mismatch falls all the way
+/// back to a full copy.
+///
+/// Returns what it did and how many rows that touched, which both surfaces
+/// report under their own perf-log key.
+func syncSurfaceWriteSetRowState(
+    from src: SurfaceBufferSet,
+    to dst: SurfaceBufferSet,
+    staleRows: [UInt32],
+    needsFullSync: Bool,
+    maxRowBuffers: Int
+) -> (mode: String, syncedRows: Int) {
+    if needsFullSync {
+        copySurfaceBufferSetRowState(from: src, to: dst)
+        return ("full_barrier", src.rowState.buffers.count)
+    }
+    if copySurfaceBufferSetRows(
+        from: src,
+        to: dst,
+        logicalRows: staleRows,
+        maxRowBuffers: maxRowBuffers
+    ) {
+        return ("sparse", staleRows.count)
+    }
+    copySurfaceBufferSetRowState(from: src, to: dst)
+    return ("full_mapping_fallback", src.rowState.buffers.count)
+}
+
 /// Submit vertices for a single row into a SurfaceBufferSet.
 /// Shared between MetalTerminalRenderer and ExternalGridView.
 ///
@@ -3433,7 +3468,108 @@ func encodeSurfaceDirtyRowBands(
     }
 }
 
+/// The scissored single-pass dirty-row draw both surfaces perform: band every
+/// dirty row, then draw the rows one scissor rect each. Reached from the
+/// GPU-scroll-copy arm and from the plain partial-redraw arm.
+///
+/// Under `.load` a dirty row must overwrite its old pixels rather than draw on
+/// top of them: the core drops the root's default-background runs while the
+/// surface has layers (flush.zig `skip_default_bg`), so a row that lost or kept
+/// a glyph covers neither. Single-pass means no blur, where `backgroundAlpha`
+/// is 1.0 and the solid quad overwrites, so one pipeline serves both the bands
+/// and the rows.
+func encodeSurfaceScissoredDirtyRows(
+    encoder: MTLRenderCommandEncoder,
+    rows: [Int],
+    pipeline: MTLRenderPipelineState,
+    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?,
+    cellHeightPx: Int,
+    bandWidthPx: Float,
+    bandHeightPx: Float,
+    bgRGB: UInt32,
+    gridId: Int64,
+    drawableWidthPx: Int,
+    renderTargetWidthPx: Int,
+    renderTargetHeightPx: Int
+) {
+    encodeSurfaceDirtyRowBands(
+        encoder: encoder,
+        rows: rows,
+        pipeline: pipeline,
+        cellHeightPx: cellHeightPx,
+        widthPx: bandWidthPx,
+        heightPx: bandHeightPx,
+        bgRGB: bgRGB,
+        gridId: gridId
+    )
+    _ = encodeSurfaceRowDraws(
+        encoder: encoder,
+        rows: rows,
+        resolve: resolve,
+        scissor: { row in
+            makeRowScissorRect(
+                row: row,
+                cellHeight_px: cellHeightPx,
+                drawableWidth_px: drawableWidthPx,
+                renderTargetWidth_px: renderTargetWidthPx,
+                renderTargetHeight_px: renderTargetHeightPx
+            )
+        },
+        pipeline: pipeline,
+        backgroundPipeline: nil,
+        glyphPipeline: nil,
+        useTwoPass: false
+    )
+}
+
+// MARK: - Shared Surface Timing
+
+/// Resolved once for the process. Both surfaces carried a private copy of this
+/// same lazy static to convert their own commit stamps.
+private let surfaceMachTimebaseInfo: mach_timebase_info_data_t = {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    return info
+}()
+
+/// True when a commit landed within `withinNs` of now. `lastCommitTime` is a
+/// `mach_absolute_time()` stamp, or 0 for "never committed".
+///
+/// The draw loop's idle detector uses this so a flush completing between vsync
+/// intervals does not read as an idle surface. The caller reads the stamp under
+/// its own lock and passes the value, because the two surfaces guard it with
+/// differently named locks.
+func surfaceHadRecentCommit(lastCommitTime: UInt64, withinNs: UInt64) -> Bool {
+    if lastCommitTime == 0 { return false }
+    let now = mach_absolute_time()
+    let info = surfaceMachTimebaseInfo
+    let elapsedNs = (now - lastCommitTime) * UInt64(info.numer) / UInt64(info.denom)
+    return elapsedNs < withinNs
+}
+
 // MARK: - Shared Off-Screen Surface Textures
+
+/// Descriptor for an off-screen texture sized from a drawable.
+///
+/// The `max(1, …)` floor is the load-bearing part: a window mid-resize or
+/// freshly ordered out reports a zero-sized drawable, and a zero extent is an
+/// invalid descriptor. `.private` is the storage mode every texture here wants —
+/// nothing reads them back on the CPU.
+func makeSurfaceTextureDescriptor(
+    size: CGSize,
+    pixelFormat: MTLPixelFormat,
+    usage: MTLTextureUsage
+) -> MTLTextureDescriptor {
+    let desc = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: pixelFormat,
+        width: max(1, Int(size.width)),
+        height: max(1, Int(size.height)),
+        mipmapped: false
+    )
+    desc.usage = usage
+    desc.storageMode = .private
+    return desc
+}
 
 /// The off-screen texture pair a multi-pass custom shader chain ping-pongs
 /// between. Both surfaces size it from their own drawable, so the pair lives
@@ -3457,14 +3593,11 @@ final class SurfacePingPongTextures {
     /// texture creation out of the per-frame path.
     func ensure(device: MTLDevice, size newSize: CGSize, pixelFormat: MTLPixelFormat) {
         if ready, size == newSize { return }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
+        let desc = makeSurfaceTextureDescriptor(
+            size: newSize,
             pixelFormat: pixelFormat,
-            width: max(1, Int(newSize.width)),
-            height: max(1, Int(newSize.height)),
-            mipmapped: false
+            usage: [.renderTarget, .shaderRead]
         )
-        desc.usage = [.renderTarget, .shaderRead]
-        desc.storageMode = .private
         textures[0] = device.makeTexture(descriptor: desc)
         textures[1] = device.makeTexture(descriptor: desc)
         size = newSize
@@ -3484,13 +3617,14 @@ final class SurfaceScrollScratchTexture {
 
     func ensure(device: MTLDevice, drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if texture != nil, size == drawableSize { return }
-        let desc = MTLTextureDescriptor.texture2DDescriptor(
+        // `.shaderRead` alone, matching the descriptor default this used to
+        // take: the scratch is a blit destination and a sampling source, never
+        // a render target.
+        let desc = makeSurfaceTextureDescriptor(
+            size: drawableSize,
             pixelFormat: pixelFormat,
-            width: max(1, Int(drawableSize.width)),
-            height: max(1, Int(drawableSize.height)),
-            mipmapped: false
+            usage: .shaderRead
         )
-        desc.storageMode = .private
         texture = device.makeTexture(descriptor: desc)
         size = drawableSize
     }
