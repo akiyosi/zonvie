@@ -8008,22 +8008,41 @@ final class ZonvieCore {
                 targetGrid = grids.first { $0.gridId == 1 }
             }
 
-            let mainFrame = mainWindow.frame
-            let mainContentRect = mainWindow.contentLayoutRect
+            // An external grid is a window of its own. The core reports it at
+            // (0,0) with no placement inside the main window
+            // (include/zonvie_core.h), so measuring its size against the MAIN
+            // window's origin put the mini at an arbitrary interior point of a
+            // window the user is not typing in — or past its edge when the
+            // external grid is the larger of the two. `.window` mode resolves
+            // this a few lines above; `.grid` never did, and `.grid` is the
+            // default for minis, so this is what an ext_windows user sees.
+            //
+            // Resolved from `targetGrid`, not from the cursor grid: the float
+            // walk above can land on a grid hosted by an external window.
+            let anchorWindow: NSWindow = {
+                guard let g = targetGrid, g.isExternal,
+                      let external = externalWindows[g.gridId] else { return mainWindow }
+                return external
+            }()
+            let anchorFrame = anchorWindow.frame
+            let anchorContentRect = anchorWindow.contentLayoutRect
 
             let gridRightPt: CGFloat
             let gridBottomPt: CGFloat
             if let grid = targetGrid {
+                // startCol/startRow are 0 for an external grid, so this
+                // degenerates to its own content size — which is right: an
+                // external grid IS its whole window.
                 gridRightPt = CGFloat(grid.startCol + grid.cols) * (cellWidthPx / scale)
                 gridBottomPt = CGFloat(grid.startRow + grid.rows) * (cellHeightPx / scale)
             } else {
-                gridRightPt = mainContentRect.width
-                gridBottomPt = mainContentRect.height
+                gridRightPt = anchorContentRect.width
+                gridBottomPt = anchorContentRect.height
             }
 
-            anchorX = mainFrame.origin.x + gridRightPt
-            let contentOriginY = mainFrame.origin.y + (mainFrame.height - mainContentRect.height - mainContentRect.origin.y)
-            anchorY = contentOriginY + (mainContentRect.height - gridBottomPt)
+            anchorX = anchorFrame.origin.x + gridRightPt
+            let contentOriginY = anchorFrame.origin.y + (anchorFrame.height - anchorContentRect.height - anchorContentRect.origin.y)
+            anchorY = contentOriginY + (anchorContentRect.height - gridBottomPt)
         }
 
         let visibleMinis = MiniWindowId.allCases.filter { miniWindows[$0]?.isVisible == true }
@@ -8188,8 +8207,17 @@ final class ZonvieCore {
                 targetGrid = grids.first { $0.gridId == 1 }
             }
 
-            let mainFrame = mainWindow.frame
-            let mainContentRect = mainWindow.contentLayoutRect
+            // Same resolution updateMiniPositions' `.grid` branch makes, for
+            // the same reason: an external grid is reported at (0,0) and is a
+            // window of its own, so measuring it against the MAIN window's
+            // origin puts the panel over the wrong window entirely.
+            let anchorWindow: NSWindow = {
+                guard let g = targetGrid, g.isExternal,
+                      let external = externalWindows[g.gridId] else { return mainWindow }
+                return external
+            }()
+            let anchorFrame = anchorWindow.frame
+            let anchorContentRect = anchorWindow.contentLayoutRect
 
             if let grid = targetGrid {
                 let gridLeftPt = CGFloat(grid.startCol) * (cellWidthPx / scale)
@@ -8197,10 +8225,10 @@ final class ZonvieCore {
                 let gridWidthPt = CGFloat(grid.cols) * (cellWidthPx / scale)
                 let gridHeightPt = CGFloat(grid.rows) * (cellHeightPx / scale)
 
-                let contentOriginY = mainFrame.origin.y + (mainFrame.height - mainContentRect.height - mainContentRect.origin.y)
+                let contentOriginY = anchorFrame.origin.y + (anchorFrame.height - anchorContentRect.height - anchorContentRect.origin.y)
                 return NSRect(
-                    x: mainFrame.origin.x + gridLeftPt,
-                    y: contentOriginY + (mainContentRect.height - gridTopPt - gridHeightPt),
+                    x: anchorFrame.origin.x + gridLeftPt,
+                    y: contentOriginY + (anchorContentRect.height - gridTopPt - gridHeightPt),
                     width: gridWidthPt,
                     height: gridHeightPt
                 )
@@ -8352,7 +8380,20 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
+            // `false` here is what the cmdline window takes deliberately, and
+            // it pays for it by following activation with its level (see
+            // setCmdlineWindowActive) — its own comment says a `.floating`
+            // window that never hides "would sit above every other app's
+            // windows". These two panels took the first half and not the
+            // second, and setCmdlineWindowActive is guarded to the cmdline
+            // grid, so nothing ever lowered them. A config.toml parse error
+            // reaches this path ungated by ext_messages, with timeout 0, no
+            // close button and no on_msg_clear to retire it: one malformed
+            // line and a red panel sits over every application for the rest of
+            // the session. Nothing here needs to outlive deactivation — unlike
+            // the cmdline, this is not a drag target and its text is not
+            // selectable — so it takes the same `true` as every sibling.
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
             let containerView = Self.makeRoundedPanelContainer(
                 width: windowWidth, height: windowHeight,
@@ -8437,7 +8478,20 @@ final class ZonvieCore {
                 backing: .buffered,
                 defer: false
             )
-            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: false)
+            // `false` here is what the cmdline window takes deliberately, and
+            // it pays for it by following activation with its level (see
+            // setCmdlineWindowActive) — its own comment says a `.floating`
+            // window that never hides "would sit above every other app's
+            // windows". These two panels took the first half and not the
+            // second, and setCmdlineWindowActive is guarded to the cmdline
+            // grid, so nothing ever lowered them. A config.toml parse error
+            // reaches this path ungated by ext_messages, with timeout 0, no
+            // close button and no on_msg_clear to retire it: one malformed
+            // line and a red panel sits over every application for the rest of
+            // the session. Nothing here needs to outlive deactivation — unlike
+            // the cmdline, this is not a drag target and its text is not
+            // selectable — so it takes the same `true` as every sibling.
+            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
 
             let containerView = Self.makeRoundedPanelContainer(
                 width: windowWidth, height: windowHeight,
