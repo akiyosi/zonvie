@@ -3841,6 +3841,26 @@ pub const Core = struct {
             0x0D => "CR", // VK_RETURN
             0x09 => "Tab", // VK_TAB
             0x1B => "Esc", // VK_ESCAPE
+            0x2D => "Insert", // VK_INSERT
+            // VK_F1..VK_F12, verified against the mingw winuser.h this target
+            // compiles with. Both frontends already classify these as special
+            // and route them here; without a name the Windows path reached
+            // `chars.len == 0` and sent nothing at all, and the macOS path fell
+            // through to the text branch and inserted the raw private-use
+            // codepoint AppKit reports. The caller wraps the name and applies
+            // modifiers, so <S-F1>, <C-F5> and <M-F4> follow from the row.
+            0x70 => "F1",
+            0x71 => "F2",
+            0x72 => "F3",
+            0x73 => "F4",
+            0x74 => "F5",
+            0x75 => "F6",
+            0x76 => "F7",
+            0x77 => "F8",
+            0x78 => "F9",
+            0x79 => "F10",
+            0x7A => "F11",
+            0x7B => "F12",
             else => null,
         };
     }
@@ -3861,6 +3881,24 @@ pub const Core = struct {
             36 => "CR",
             48 => "Tab",
             53 => "Esc",
+            // NSF1FunctionKey..NSF12FunctionKey (U+F704..U+F70F). Each keycode
+            // was confirmed against the character AppKit actually reports for
+            // it on this hardware; the order is NOT contiguous. Insert is
+            // deliberately absent: keycode 114 is Help on Apple's own layout
+            // and AppKit reports it as NSHelpFunctionKey, so calling it
+            // <Insert> is a product decision rather than a missing row.
+            122 => "F1",
+            120 => "F2",
+            99 => "F3",
+            118 => "F4",
+            96 => "F5",
+            97 => "F6",
+            98 => "F7",
+            100 => "F8",
+            101 => "F9",
+            109 => "F10",
+            103 => "F11",
+            111 => "F12",
             else => null,
         };
     }
