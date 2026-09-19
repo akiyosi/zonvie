@@ -11,7 +11,7 @@
 // cursor into a hosted float left iCurrentCursor wherever it was before —
 // the effect stayed behind while the real cursor moved. The main window has
 // never had this hole: its submitLayerCursor adds the layer's origin and
-// publishes (MetalTerminalRenderer.updateCursorShaderStateFromVerts).
+// publishes (GridSurfaceRenderer.updateCursorShaderStateFromVerts).
 //
 // Measured as the DELTA between two float placements rather than an absolute
 // rect. The absolute value needs the external view's client origin inside the

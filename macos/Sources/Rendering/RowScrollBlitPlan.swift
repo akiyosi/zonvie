@@ -6,7 +6,7 @@ import Metal
 ///
 /// The arithmetic behind it is the core's (`src/core/row_scroll.zig`), so both
 /// frontends answer the same geometry the same way; `make` in
-/// MetalTerminalRenderer.swift is the bridge. This file is what remains on the
+/// GridSurfaceRenderer.swift is the bridge. This file is what remains on the
 /// Swift side: the shape the draw code reads, and the encoder that spends it.
 /// It stays free of ZonvieCore because build.zig hands it to swiftc on its own
 /// for RowScrollBlitPlanTests.

@@ -260,7 +260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Apply blur using private API if blur is enabled
         if config.blurEnabled {
             applyWindowBlur(window: win, radius: config.window.blurRadius)
-            // Shadow invalidation is now handled in MetalTerminalRenderer after first present
+            // Shadow invalidation is now handled in GridSurfaceRenderer after first present
         }
 
         return win
@@ -394,7 +394,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         // Repaint on the way back, for the same reason windowDidDeminiaturize
-        // does: MetalTerminalRenderer.draw skips every frame while the window
+        // does: GridSurfaceRenderer.draw skips every frame while the window
         // is invisible (currentDrawable blocks the main thread there), and it
         // still clears redrawPending on the way out. A redraw that arrived
         // while covered is therefore dropped, and with an idle Neovim behind

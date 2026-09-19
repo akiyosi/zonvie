@@ -16,7 +16,7 @@ final class CustomShaderPipeline {
     let pipelineState: MTLRenderPipelineState
     /// True when the user GLSL references any time-varying Shadertoy
     /// uniform. Set by `load()` from a token scan of the source before
-    /// cross-compilation. Aggregated by `MetalTerminalRenderer` to decide
+    /// cross-compilation. Aggregated by `GridSurfaceRenderer` to decide
     /// whether to run the continuous vsync-driven draw loop; without this
     /// flag the shader would execute only when Neovim flushes, producing
     /// a static image for shaders whose output depends on `iTime`.

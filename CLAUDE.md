@@ -57,7 +57,7 @@ Applies especially to:
 - `src/core/vertexgen.zig`
 - `src/core/redraw_handler.zig`
 - text shaping / rasterization / atlas code
-- `macos/Sources/Rendering/MetalTerminalRenderer.swift` (triple-buffered vertex sets, COW detach)
+- `macos/Sources/Rendering/GridSurfaceRenderer.swift` (triple-buffered vertex sets, COW detach)
 - `macos/Sources/Font/GlyphAtlas.swift` (double-buffered atlas, two-phase prepare)
 
 Requirements:
