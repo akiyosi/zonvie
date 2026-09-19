@@ -105,6 +105,46 @@ extension RowScrollBlitPlan {
         ) else { return nil }
         return Int(start)..<Int(end)
     }
+
+    /// The plan in the core's own shape, for the calls that take one back.
+    var cValue: zonvie_row_scroll_plan {
+        zonvie_row_scroll_plan(
+            origin_x_px: Int32(clamping: originXPx),
+            origin_y_px: Int32(clamping: originYPx),
+            src_y_px: Int32(clamping: srcYPx),
+            dst_y_px: Int32(clamping: dstYPx),
+            copy_w_px: Int32(clamping: copyWidthPx),
+            copy_h_px: Int32(clamping: copyHeightPx),
+            clear_top_px: Int32(clamping: clearTopPx),
+            clear_bottom_px: Int32(clamping: clearBottomPx),
+            clamped_row_end: UInt32(clamping: clampedRowEnd),
+            dirty_row_start: UInt32(clamping: dirtyRows.lowerBound),
+            dirty_row_end: UInt32(clamping: dirtyRows.upperBound)
+        )
+    }
+}
+
+/// Which of a layer's own rows a full-width damage band overpaints, inclusive.
+/// The arithmetic is `src/core/row_scroll.zig`, which the Windows driver calls
+/// as Zig; this is the same answer through the C ABI.
+func layerRowsUnderBand(
+    bandTopPx: Int,
+    bandBottomPx: Int,
+    layer: SurfaceLayer,
+    rowHeightPx: Int
+) -> ClosedRange<Int>? {
+    var firstRow: UInt32 = 0
+    var lastRow: UInt32 = 0
+    guard zonvie_core_band_layer_rows(
+        Int32(clamping: bandTopPx),
+        Int32(clamping: bandBottomPx),
+        Int32(clamping: Int(layer.originPx.y.rounded(.down))),
+        UInt32(clamping: layer.rows),
+        Int32(clamping: rowHeightPx),
+        &firstRow,
+        &lastRow
+    ) else { return nil }
+    return Int(firstRow)...Int(lastRow)
 }
 
 /// Record what a row callback found missing, so the provisioner can supply it
@@ -3382,17 +3422,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             }
 
             // Repaint both sides of the damage an accepted per-layer blit does
-            // to the layers drawn on top of it. The blit rewrites every pixel of
-            // the scrolled rectangle R (copy plus vacated band). For a layer M
-            // above it: M's own pixels inside R moved, so every row of M meeting
-            // R is redrawn; and what they covered moved with them, so the rows
-            // of this layer they were dragged into — the same rows shifted by
-            // -rowsDelta, plus the unshifted ones to kill boundary off-by-ones —
-            // are redrawn from this layer's vertices. Both ranges come from a
-            // pixel intersection, so a layer off the cell grid gets both rows a
-            // boundary straddles. Only layers ABOVE need marking: R lies inside
-            // this layer's own rect, and `layerSnapshot` is back-to-front, so a
-            // marked layer repaints after this one, which is the screen order.
+            // to the layers drawn on top of it. The rule and its arithmetic are
+            // the core's (`src/core/row_scroll.zig`), which the Windows driver
+            // calls as Zig; this is the same answer through the C ABI.
             func markLayersOverBlit(
                 _ li: Int,
                 _ layer: SurfaceLayer,
@@ -3400,52 +3432,42 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 _ p: RowScrollBlitPlan,
                 _ rowsDelta: Int
             ) {
-                let rowHeightPx = Int(cellHi)
-                guard rowHeightPx > 0 else { return }
-                let blitLeftPx = p.originXPx
-                let blitRightPx = p.originXPx + p.copyWidthPx
-                let blitTopPx = min(min(p.srcYPx, p.dstYPx), p.clearTopPx)
-                let blitBottomPx = max(max(p.srcYPx, p.dstYPx) + p.copyHeightPx, p.clearBottomPx)
-                // The region in this layer's own rows; blitTopPx is exactly
-                // originYPx + rowStart * rowHeightPx.
-                let regionFirstRow = (blitTopPx - p.originYPx) / rowHeightPx
-                let regionLastRow = p.clampedRowEnd - 1
-                guard regionLastRow >= regionFirstRow else { return }
+                guard cellHi > 0 else { return }
+                var plan = p.cValue
 
                 for mi in (li + 1)..<layerSnapshot.count {
                     let above = layerSnapshot[mi]
                     guard above.rows > 0, above.cols > 0 else { continue }
-                    let aLeftPx = Int(above.originPx.x.rounded(.down))
-                    let aTopPx = Int(above.originPx.y.rounded(.down))
-                    let aRightPx = aLeftPx + above.cols * Int(cellWi)
-                    let aBottomPx = aTopPx + above.rows * rowHeightPx
-                    guard aLeftPx < blitRightPx, aRightPx > blitLeftPx,
-                          aTopPx < blitBottomPx, aBottomPx > blitTopPx
-                    else { continue }
-                    let overlapTopPx = max(aTopPx, blitTopPx)
-                    let overlapBottomPx = min(aBottomPx, blitBottomPx)
+                    var over = zonvie_over_blit_rows()
+                    guard zonvie_core_row_scroll_over_blit_rows(
+                        &plan,
+                        Int32(clamping: rowsDelta),
+                        Int32(clamping: Int(above.originPx.x.rounded(.down))),
+                        Int32(clamping: Int(above.originPx.y.rounded(.down))),
+                        UInt32(clamping: above.rows),
+                        UInt32(clamping: above.cols),
+                        Int32(clamping: cellWi),
+                        Int32(clamping: cellHi),
+                        &over
+                    ) else { continue }
 
                     // The covering layer puts itself back. A layer with no draw
                     // state redraws every row anyway, so there is nothing to
                     // mark for it.
-                    if let aboveState = layerStateSnapshot[mi] {
-                        let aFirstRow = max(0, (overlapTopPx - aTopPx) / rowHeightPx)
-                        let aLastRow = min(above.rows - 1, (overlapBottomPx - 1 - aTopPx) / rowHeightPx)
-                        if aLastRow >= aFirstRow {
-                            aboveState.drawRows.append(contentsOf: aFirstRow...aLastRow)
-                        }
+                    if over.has_above != 0, let aboveState = layerStateSnapshot[mi] {
+                        aboveState.drawRows.append(
+                            contentsOf: Int(over.above_first)...Int(over.above_last))
                     }
 
                     // This layer puts back the rows the covering layer's pixels
                     // were dragged into, plus the rows they came from.
-                    let underFirstRow = max(regionFirstRow, (overlapTopPx - p.originYPx) / rowHeightPx)
-                    let underLastRow = min(regionLastRow, (overlapBottomPx - 1 - p.originYPx) / rowHeightPx)
-                    guard underLastRow >= underFirstRow else { continue }
-                    state.drawRows.append(contentsOf: underFirstRow...underLastRow)
-                    let shiftedFirstRow = max(regionFirstRow, underFirstRow - rowsDelta)
-                    let shiftedLastRow = min(regionLastRow, underLastRow - rowsDelta)
-                    if shiftedLastRow >= shiftedFirstRow {
-                        state.drawRows.append(contentsOf: shiftedFirstRow...shiftedLastRow)
+                    if over.has_under != 0 {
+                        state.drawRows.append(
+                            contentsOf: Int(over.under_first)...Int(over.under_last))
+                    }
+                    if over.has_shifted != 0 {
+                        state.drawRows.append(
+                            contentsOf: Int(over.shifted_first)...Int(over.shifted_last))
                     }
                 }
             }
@@ -3609,17 +3631,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             if layerSnapshot.count > 1 && bandRowHeightPx > 0 {
                 for row in dirtyRows {
                     let bandTopPx = row * bandRowHeightPx
-                    let bandBottomPx = bandTopPx + bandRowHeightPx
                     for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                        guard let state = layerStateSnapshot[li], layer.rows > 0 else { continue }
-                        let originY = Int(layer.originPx.y.rounded(.down))
-                        guard bandBottomPx > originY else { continue }
-                        // A layer need not be cell-aligned, so one root row can
-                        // straddle two of its rows.
-                        let firstRow = max(0, (bandTopPx - originY) / bandRowHeightPx)
-                        let lastRow = min(layer.rows - 1, (bandBottomPx - 1 - originY) / bandRowHeightPx)
-                        guard lastRow >= firstRow else { continue }
-                        state.drawRows.append(contentsOf: firstRow...lastRow)
+                        guard let state = layerStateSnapshot[li] else { continue }
+                        guard let rows = layerRowsUnderBand(
+                            bandTopPx: bandTopPx,
+                            bandBottomPx: bandTopPx + bandRowHeightPx,
+                            layer: layer,
+                            rowHeightPx: bandRowHeightPx
+                        ) else { continue }
+                        state.drawRows.append(contentsOf: rows)
                     }
                 }
             }
@@ -3642,19 +3662,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 guard rowHeightPx > 0 else { return }
                 for mi in (li + 1)..<layerSnapshot.count {
                     let above = layerSnapshot[mi]
-                    guard let aboveState = layerStateSnapshot[mi],
-                          above.rows > 0, above.cols > 0 else { continue }
+                    guard let aboveState = layerStateSnapshot[mi], above.cols > 0 else { continue }
                     let aLeftPx = Int(above.originPx.x.rounded(.down))
                     let aRightPx = aLeftPx + above.cols * Int(cellWi)
                     guard aLeftPx < rightPx, aRightPx > leftPx else { continue }
-                    let aTopPx = Int(above.originPx.y.rounded(.down))
-                    let aBottomPx = aTopPx + above.rows * rowHeightPx
-                    guard aTopPx < bandBottomPx, aBottomPx > bandTopPx else { continue }
-                    let aFirstRow = max(0, (max(aTopPx, bandTopPx) - aTopPx) / rowHeightPx)
-                    let aLastRow = min(above.rows - 1, (min(aBottomPx, bandBottomPx) - 1 - aTopPx) / rowHeightPx)
-                    if aLastRow >= aFirstRow {
-                        aboveState.drawRows.append(contentsOf: aFirstRow...aLastRow)
-                    }
+                    guard let rows = layerRowsUnderBand(
+                        bandTopPx: bandTopPx,
+                        bandBottomPx: bandBottomPx,
+                        layer: above,
+                        rowHeightPx: rowHeightPx
+                    ) else { continue }
+                    aboveState.drawRows.append(contentsOf: rows)
                 }
             }
             // Back to front, and each layer is normalized before it becomes a

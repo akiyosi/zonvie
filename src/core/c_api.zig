@@ -1128,6 +1128,85 @@ pub export fn zonvie_core_row_scroll_dirty_rows_without_blit(
     return true;
 }
 
+pub export fn zonvie_core_band_layer_rows(
+    band_top_px: i32,
+    band_bottom_px: i32,
+    origin_y_px: i32,
+    layer_rows: u32,
+    row_height_px: i32,
+    out_first_row: ?*u32,
+    out_last_row: ?*u32,
+) callconv(.c) bool {
+    const f = out_first_row orelse return false;
+    const l = out_last_row orelse return false;
+    const rows = row_scroll.bandLayerRows(
+        band_top_px,
+        band_bottom_px,
+        origin_y_px,
+        layer_rows,
+        row_height_px,
+    ) orelse return false;
+    f.* = rows[0];
+    l.* = rows[1];
+    return true;
+}
+
+/// Layout must match `zonvie_over_blit_rows` in include/zonvie_core.h. The
+/// core answers in Zig optionals; C gets a flag beside each range.
+pub const OverBlitRowsC = extern struct {
+    above_first: u32,
+    above_last: u32,
+    under_first: u32,
+    under_last: u32,
+    shifted_first: u32,
+    shifted_last: u32,
+    has_above: u32,
+    has_under: u32,
+    has_shifted: u32,
+};
+
+comptime {
+    if (@sizeOf(OverBlitRowsC) != 9 * 4) @compileError("zonvie_over_blit_rows layout drifted from the header");
+    if (@offsetOf(OverBlitRowsC, "has_above") != 6 * 4) @compileError("field order drifted from the header");
+}
+
+pub export fn zonvie_core_row_scroll_over_blit_rows(
+    plan: ?*const row_scroll.Plan,
+    rows_delta: i32,
+    above_left_px: i32,
+    above_top_px: i32,
+    above_rows: u32,
+    above_cols: u32,
+    cell_width_px: i32,
+    row_height_px: i32,
+    out: ?*OverBlitRowsC,
+) callconv(.c) bool {
+    const p = plan orelse return false;
+    const dst = out orelse return false;
+    const over = row_scroll.overBlitRows(
+        p.*,
+        rows_delta,
+        above_left_px,
+        above_top_px,
+        above_rows,
+        above_cols,
+        cell_width_px,
+        row_height_px,
+    ) orelse return false;
+    dst.* = .{
+        .above_first = if (over.above) |a| a[0] else 0,
+        .above_last = if (over.above) |a| a[1] else 0,
+        .under_first = if (over.under) |u| u[0] else 0,
+        .under_last = if (over.under) |u| u[1] else 0,
+        .shifted_first = if (over.shifted) |s| s[0] else 0,
+        .shifted_last = if (over.shifted) |s| s[1] else 0,
+        .has_above = @intFromBool(over.above != null),
+        .has_under = @intFromBool(over.under != null),
+        .has_shifted = @intFromBool(over.shifted != null),
+    };
+    return true;
+}
+
 // Build-time version string from `git describe`, null-terminated for C.
 const version_cstr: [*:0]const u8 = std.fmt.comptimePrint("{s}", .{build_options.version});
 

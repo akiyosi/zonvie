@@ -1165,6 +1165,62 @@ ZONVIE_API bool zonvie_core_row_scroll_dirty_rows_without_blit(
     uint32_t *out_row_end
 );
 
+/* Which of a layer's own rows a full-width damage band overpaints, inclusive.
+   The band spans the whole surface width, so there is no X test; a layer need
+   not be cell-aligned, so one root row can straddle two of its rows. False
+   when the band misses the layer entirely; the out params are untouched then. */
+ZONVIE_API bool zonvie_core_band_layer_rows(
+    int32_t band_top_px,
+    int32_t band_bottom_px,
+    int32_t origin_y_px,
+    uint32_t layer_rows,
+    int32_t row_height_px,
+    uint32_t *out_first_row,
+    uint32_t *out_last_row
+);
+
+/* Inclusive row ranges naming the damage an accepted per-layer row-scroll blit
+   does to a layer drawn on top of it. Each range is valid only when its
+   has_* flag is non-zero.
+
+   The blit rewrites every pixel of its rectangle R. For a layer M above it:
+   M's own pixels inside R moved, so every row of M meeting R is redrawn
+   (above_*); and what they covered moved with them, so the rows of the
+   scrolled layer they were dragged into (under_*) plus the rows those pixels
+   came from (shifted_*, the same rows shifted back by rows_delta) are redrawn
+   from the scrolled layer's vertices. Both ranges come from a pixel
+   intersection, so a layer off the cell grid gets both rows a boundary
+   straddles. Only layers ABOVE need this: R lies inside the scrolled layer's
+   own rectangle, and a marked layer repaints after it, which is screen order. */
+typedef struct zonvie_over_blit_rows {
+    uint32_t above_first;
+    uint32_t above_last;
+    uint32_t under_first;
+    uint32_t under_last;
+    uint32_t shifted_first;
+    uint32_t shifted_last;
+    uint32_t has_above;
+    uint32_t has_under;
+    uint32_t has_shifted;
+} zonvie_over_blit_rows;
+
+/* Fills *out and returns true when the covering layer's rectangle meets the
+   blit's. False means it does not and there is nothing to mark; *out is
+   untouched then. `plan` is a plan zonvie_core_row_scroll_plan_make filled,
+   and the covering layer's origin is in the same pixel space as its
+   origin_x_px/origin_y_px. */
+ZONVIE_API bool zonvie_core_row_scroll_over_blit_rows(
+    const zonvie_row_scroll_plan *plan,
+    int32_t rows_delta,
+    int32_t above_left_px,
+    int32_t above_top_px,
+    uint32_t above_rows,
+    uint32_t above_cols,
+    int32_t cell_width_px,
+    int32_t row_height_px,
+    zonvie_over_blit_rows *out
+);
+
 /* Build-time version string (from `git describe`), e.g. "v0.3.21" or
    "v0.3.21-9-g4eb0177". The returned pointer is static and null-terminated;
    never null. Not tied to a core instance. */

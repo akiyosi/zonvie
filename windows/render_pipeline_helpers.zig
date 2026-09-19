@@ -872,105 +872,15 @@ pub fn invertClusterMap(
 /// same geometry. Aliased under the name the paint code already uses.
 pub const RowScrollBlitPlan = core.row_scroll.Plan;
 
-/// Every pixel the blit rewrites: the copy plus the band it vacated. Windows
-/// only -- the z-aware float scroll mask needs the rectangle, the macOS
-/// frontend does not.
-pub fn blitRectPx(p: RowScrollBlitPlan) BlitRectPx {
-    return .{
-        .left = p.origin_x_px,
-        .top = @min(@min(p.src_y_px, p.dst_y_px), p.clear_top_px),
-        .right = p.origin_x_px + p.copy_w_px,
-        .bottom = @max(@max(p.src_y_px, p.dst_y_px) + p.copy_h_px, p.clear_bottom_px),
-    };
-}
-
-pub const BlitRectPx = struct { left: i32, top: i32, right: i32, bottom: i32 };
+/// Every pixel the blit rewrites: the copy plus the band it vacated. The
+/// z-aware float scroll mask compares against it; the core computes it inside
+/// `overBlitRows` for the same reason.
+pub const BlitRectPx = core.row_scroll.Rect;
 
 /// Half-open on all four edges, so rectangles that only touch do not
 /// intersect: a layer abutting an accepted blit shares none of its pixels.
 pub fn blitRectsIntersect(a: BlitRectPx, b: BlitRectPx) bool {
     return a.left < b.right and b.left < a.right and a.top < b.bottom and b.top < a.bottom;
-}
-
-
-/// Inclusive row ranges, each absent when its own intersection is empty.
-pub const OverBlitRows = struct {
-    /// The covering layer's own rows that meet the blit rectangle.
-    above: ?[2]u32 = null,
-    /// The scrolled layer's rows under them.
-    under: ?[2]u32 = null,
-    /// Those rows shifted back by the delta: where the covering pixels came
-    /// from before the copy dragged them.
-    shifted: ?[2]u32 = null,
-};
-
-/// The damage an accepted blit does to a layer drawn on top of it. The blit
-/// rewrites every pixel of its rectangle, so the covering layer's rows inside
-/// it moved, and what they covered moved with them. Ported from
-/// `markLayersOverBlit` in MetalTerminalRenderer.swift. Null when the covering
-/// layer's rectangle does not meet the blit's.
-pub fn rowsOverBlit(
-    p: RowScrollBlitPlan,
-    rows_delta: i32,
-    above_left_px: i32,
-    above_top_px: i32,
-    above_rows: u32,
-    above_cols: u32,
-    cell_w_px: i32,
-    row_h_px: i32,
-) ?OverBlitRows {
-    if (row_h_px <= 0 or above_rows == 0 or above_cols == 0) return null;
-    const h: i64 = row_h_px;
-    const oy: i64 = p.origin_y_px;
-    const r = blitRectPx(p);
-    // r.top is exactly origin_y_px + row_start * row_h.
-    const region_first = @divTrunc(@as(i64, r.top) - oy, h);
-    const region_last = @as(i64, p.clamped_row_end) - 1;
-    if (region_last < region_first) return null;
-
-    const a_top: i64 = above_top_px;
-    const a_left: i64 = above_left_px;
-    const a_right = a_left + @as(i64, above_cols) * @as(i64, cell_w_px);
-    const a_bottom = a_top + @as(i64, above_rows) * h;
-    if (a_left >= @as(i64, r.right) or a_right <= @as(i64, r.left)) return null;
-    if (a_top >= @as(i64, r.bottom) or a_bottom <= @as(i64, r.top)) return null;
-
-    const overlap_top = @max(a_top, @as(i64, r.top));
-    const overlap_bottom = @min(a_bottom, @as(i64, r.bottom));
-
-    var out: OverBlitRows = .{};
-    const a_first = @max(0, @divTrunc(overlap_top - a_top, h));
-    const a_last = @min(@as(i64, above_rows) - 1, @divTrunc(overlap_bottom - 1 - a_top, h));
-    if (a_last >= a_first) out.above = .{ @intCast(a_first), @intCast(a_last) };
-
-    const under_first = @max(region_first, @divTrunc(overlap_top - oy, h));
-    const under_last = @min(region_last, @divTrunc(overlap_bottom - 1 - oy, h));
-    if (under_last < under_first) return out;
-    out.under = .{ @intCast(under_first), @intCast(under_last) };
-    const shifted_first = @max(region_first, under_first - @as(i64, rows_delta));
-    const shifted_last = @min(region_last, under_last - @as(i64, rows_delta));
-    if (shifted_last >= shifted_first) out.shifted = .{ @intCast(shifted_first), @intCast(shifted_last) };
-    return out;
-}
-
-/// Which of a layer's own rows a root dirty band overpaints. The band spans
-/// the full width, so there is no X test; a layer need not be cell-aligned, so
-/// one root row can straddle two of its rows. Inclusive.
-pub fn bandLayerRows(
-    band_top_px: i32,
-    band_bottom_px: i32,
-    origin_y_px: i32,
-    layer_rows: u32,
-    row_h_px: i32,
-) ?[2]u32 {
-    if (row_h_px <= 0 or layer_rows == 0) return null;
-    const h: i64 = row_h_px;
-    const oy: i64 = origin_y_px;
-    if (@as(i64, band_bottom_px) <= oy) return null;
-    const first = @max(0, @divTrunc(@as(i64, band_top_px) - oy, h));
-    const last = @min(@as(i64, layer_rows) - 1, @divTrunc(@as(i64, band_bottom_px) - 1 - oy, h));
-    if (last < first) return null;
-    return .{ @intCast(first), @intCast(last) };
 }
 
 /// The ROOT rows a layer's pixels can occupy after the root's own scroll copy
