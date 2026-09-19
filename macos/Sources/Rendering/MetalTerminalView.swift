@@ -7,6 +7,20 @@ import MetalKit
 /// and its IME state.
 typealias KeyRepeatOwner = NSView & NSTextInputClient
 
+/// Neovim's name for an AppKit "other" mouse button, or nil for one it has no
+/// name for.
+///
+/// Both surfaces carried the same switch. It answers a question about the
+/// Neovim protocol, not about either view, so it belongs to neither.
+func surfaceOtherMouseButtonName(_ buttonNumber: Int) -> String? {
+    switch buttonNumber {
+    case 2: return "middle"
+    case 3: return "x1"
+    case 4: return "x2"
+    default: return nil
+    }
+}
+
 final class MetalTerminalView: MTKView {
     var renderer: GridSurfaceRenderer!
 
@@ -728,17 +742,16 @@ final class MetalTerminalView: MTKView {
     }
 
     override func keyUp(with event: NSEvent) {
-        if event.keyCode == heldKeyCode {
-            disarmKeyRepeatSynthesis("keyUp")
-        }
+        // The same call an external grid view makes; this surface open-coded
+        // the held-key test the API already performs.
+        disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
         super.keyUp(with: event)
     }
 
     override func flagsChanged(with event: NSEvent) {
-        // Any modifier change invalidates the recorded input (e.g. j -> C-j).
-        if heldKeyCode != nil {
-            disarmKeyRepeatSynthesis("flagsChanged")
-        }
+        // Any modifier change invalidates the recorded input (e.g. j -> C-j),
+        // which is what a nil `ifHeld` means.
+        disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
         super.flagsChanged(with: event)
     }
 
@@ -954,13 +967,7 @@ final class MetalTerminalView: MTKView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        // Cycle the input context so the system IME candidate window
-        // picks up the current Light/Dark appearance.
-        // Skip if the user is mid-composition to avoid breaking the IME session.
-        if let ctx = _inputContext, !hasMarkedText() {
-            ctx.deactivate()
-            ctx.activate()
-        }
+        surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
     }
 
     override func viewDidMoveToWindow() {
@@ -1089,7 +1096,7 @@ final class MetalTerminalView: MTKView {
 
     override func otherMouseDown(with event: NSEvent) {
         super.otherMouseDown(with: event)
-        let btn = otherButtonName(event.buttonNumber)
+        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
         if let btn {
             heldMouseButton = btn
             sendMouseEvent(button: btn, action: "press", event: event)
@@ -1098,7 +1105,7 @@ final class MetalTerminalView: MTKView {
 
     override func otherMouseUp(with event: NSEvent) {
         super.otherMouseUp(with: event)
-        let btn = otherButtonName(event.buttonNumber)
+        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
         if btn != nil {
             heldMouseButton = nil
             sendMouseEvent(button: btn!, action: "release", event: event)
@@ -1107,21 +1114,13 @@ final class MetalTerminalView: MTKView {
 
     override func otherMouseDragged(with event: NSEvent) {
         super.otherMouseDragged(with: event)
-        let btn = otherButtonName(event.buttonNumber)
+        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
         if let btn {
             sendMouseEvent(button: btn, action: "drag", event: event)
         }
     }
 
     /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
-    private func otherButtonName(_ buttonNumber: Int) -> String? {
-        switch buttonNumber {
-        case 2: return "middle"
-        case 3: return "x1"
-        case 4: return "x2"
-        default: return nil
-        }
-    }
 
     func buildModifierString(from flags: NSEvent.ModifierFlags) -> String {
         var mods = ""
@@ -1766,11 +1765,13 @@ final class MetalTerminalView: MTKView {
             // Cmd shortcuts must not synthesize repeats; everything else
             // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
             if !event.isARepeat && !m.contains(.command) {
-                armHeldKey(owner: self, code: event.keyCode, action: .keyEvent(
+                armHeldKeyEvent(
+                    owner: self,
+                    code: event.keyCode,
                     mods: mods,
                     characters: chars,
                     charactersIgnoringModifiers: event.charactersIgnoringModifiers
-                ))
+                )
             }
             return
         }
@@ -1784,35 +1785,22 @@ final class MetalTerminalView: MTKView {
         if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
            let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
         {
-            keyRepeatCaptureActive = !event.isARepeat
-            keyRepeatCapturedText = nil
-            keyRepeatCapturedCount = 0
+            // The same three calls an external grid view makes.
+            // `endHeldKeyCapture` also refuses to arm while text is marked,
+            // which cannot happen here: the guard above already required none.
+            beginHeldKeyCapture(isRepeat: event.isARepeat)
             sendInputNow(swapped)
-            if keyRepeatCaptureActive {
-                keyRepeatCaptureActive = false
-                if keyRepeatCapturedCount == 1 {
-                    armHeldKey(owner: self, code: event.keyCode, action: .text(swapped))
-                }
-            }
+            endHeldKeyCapture(owner: self, code: event.keyCode)
             return
         }
 
         // Plain key: capture what this keyDown sends (via IME insertText ->
         // sendInputNow) so repeats can replay it. Only a clean single-send
         // keyDown is a synthesis candidate.
-        keyRepeatCaptureActive = !event.isARepeat
-        keyRepeatCapturedText = nil
-        keyRepeatCapturedCount = 0
-        defer {
-            if keyRepeatCaptureActive {
-                keyRepeatCaptureActive = false
-                if keyRepeatCapturedCount == 1, let t = keyRepeatCapturedText,
-                   !hasMarkedText()
-                {
-                    armHeldKey(owner: self, code: event.keyCode, action: .text(t))
-                }
-            }
-        }
+        // Shared with ExternalGridView, which has called these two since it
+        // was written; this surface open-coded the same window.
+        beginHeldKeyCapture(isRepeat: event.isARepeat)
+        defer { endHeldKeyCapture(owner: self, code: event.keyCode) }
 
         // Let the system handle IME input.
         if let ctx = inputContext, ctx.handleEvent(event) {
