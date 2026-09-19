@@ -3445,9 +3445,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
                 let intensity = mainTerminalView?.core?.getGlowIntensity() ?? 0.8
 
+                // One read, for both the chain's depth and the taps' reach.
+                let glowRadiusScale = mainTerminalView?.core?.getGlowRadiusScale() ?? 1.0
                 let glowChain = surfaceGlowChain(
                     surfaceWidthPx: Int(view.drawableSize.width),
-                    surfaceHeightPx: Int(view.drawableSize.height)
+                    surfaceHeightPx: Int(view.drawableSize.height),
+                    radiusScale: glowRadiusScale
                 )
                 if glowTextures.ensure(device: mtlDevice, chain: glowChain, pixelFormat: view.colorPixelFormat),
                    glowTextures.ensureIntensityBuffer(device: mtlDevice) {
@@ -3467,7 +3470,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     bilinearSampler: bilinSamp,
                     intensity: intensity,
                     chain: glowChain,
-                    radiusScale: mainTerminalView?.core?.getGlowRadiusScale() ?? 1.0
+                    radiusScale: glowRadiusScale
                     ) { enc in
                     // Set up atlas and scroll offsets for extract pass.
                     // ps_glow_extract takes only texture(0) + sampler(0), but the

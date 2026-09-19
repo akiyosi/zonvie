@@ -3133,6 +3133,9 @@ struct SurfaceGlowChain {
     var halfHeightPx: Int
     var mipWidthPx: [Int]
     var mipHeightPx: [Int]
+    /// Only the passes to run. How many there are follows the radius: a tight
+    /// one stops a level short of the smallest mip. The extents above do not,
+    /// so the textures need no resize when the radius changes.
     var down: [Pass]
     var up: [Pass]
 }
@@ -3217,8 +3220,8 @@ func encodeSurfaceBloomPasses(
     intensity: Float,
     chain: SurfaceGlowChain,
     /// `vim.g.zonvie_glow.radius` as a tap-offset multiplier; 1.0 is the
-    /// default radius. The chain's depth is fixed, so reach per tap is the
-    /// only thing a radius can change.
+    /// default radius. It sets how far each Kawase tap reaches; how deep the
+    /// chain goes is already decided, in `chain`.
     radiusScale: Float,
     encodeExtractVertices: (MTLRenderCommandEncoder) -> Void
 ) -> Bool {
