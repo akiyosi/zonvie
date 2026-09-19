@@ -335,7 +335,7 @@ fn swapAndShiftRows(
 }
 
 /// Remap slot indices in row_map for a scroll region. Physical data does not move.
-/// macOS equivalent: remapMainRowSlots (MetalTerminalRenderer.swift).
+/// macOS equivalent: remapMainRowSlots (GridSurfaceRenderer.swift).
 /// Vacated rows retain their old slot references (shared pool data is NOT modified
 /// to preserve COW safety with the committed set). The caller must ensure that
 /// vacated rows are regenerated via on_vertices_row → cowDetachRow before commit.

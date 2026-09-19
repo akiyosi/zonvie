@@ -8,7 +8,7 @@ final class ZonvieConfig {
     var backgroundAlpha: Float = 1.0
 }
 
-final class MetalTerminalRenderer {
+final class GridSurfaceRenderer {
     struct ScrollOffset {
         var grid_id: Int32
         var offset_y: Float
@@ -414,8 +414,8 @@ private enum SurfaceRowProvisionTests {
     // fine here): true when (x, y) lies inside a mask segment whose z is
     // strictly greater than scrollZ.
     private static func maskCoversAbove(
-        bands: [MetalTerminalRenderer.FixedFloatBand],
-        intervals: [MetalTerminalRenderer.FixedFloatInterval],
+        bands: [GridSurfaceRenderer.FixedFloatBand],
+        intervals: [GridSurfaceRenderer.FixedFloatInterval],
         x: Float,
         y: Float,
         scrollZ: Float
@@ -432,13 +432,13 @@ private enum SurfaceRowProvisionTests {
     }
 
     private static func buildMask(
-        _ rects: [MetalTerminalRenderer.FixedFloatRect]
-    ) -> (bands: [MetalTerminalRenderer.FixedFloatBand], intervals: [MetalTerminalRenderer.FixedFloatInterval]) {
-        var bands: [MetalTerminalRenderer.FixedFloatBand] = []
-        var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+        _ rects: [GridSurfaceRenderer.FixedFloatRect]
+    ) -> (bands: [GridSurfaceRenderer.FixedFloatBand], intervals: [GridSurfaceRenderer.FixedFloatInterval]) {
+        var bands: [GridSurfaceRenderer.FixedFloatBand] = []
+        var intervals: [GridSurfaceRenderer.FixedFloatInterval] = []
         var yEdges: [Float] = []
         var xEdges: [Float] = []
-        var covering: [MetalTerminalRenderer.FixedFloatRect] = []
+        var covering: [GridSurfaceRenderer.FixedFloatRect] = []
         buildSurfaceFixedFloatMask(
             rects: rects,
             bands: &bands,
@@ -452,8 +452,8 @@ private enum SurfaceRowProvisionTests {
 
     private static func verifyFixedFloatMaskZOrder() {
         // Lazy layout: full-screen backdrop (z49) under an inner float (z50).
-        let backdrop = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
-        let lazy = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
+        let backdrop = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
+        let lazy = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
         let (bands, intervals) = buildMask([backdrop, lazy])
 
         require(bands.count == 3, "lazy mask should split into 3 bands, got \(bands.count)")
@@ -479,7 +479,7 @@ private enum SurfaceRowProvisionTests {
                 "the scrolled float must not be masked over the backdrop alone")
 
         // A higher-z fixed float stacked over the scrolled one must win.
-        let popup = MetalTerminalRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
+        let popup = GridSurfaceRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
         let stacked = buildMask([backdrop, lazy, popup])
         require(maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 400, y: 300, scrollZ: 50),
                 "a z50 scrolled float must be masked under a z60 fixed float")
@@ -489,29 +489,29 @@ private enum SurfaceRowProvisionTests {
                 "the z60 popup must not mask the scrolled float outside its own rect")
 
         // Contiguous equal-z rects merge into one interval; differing z stays split.
-        let leftSame = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let rightSame = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
+        let leftSame = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let rightSame = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
         let mergedMask = buildMask([leftSame, rightSame])
         require(mergedMask.bands.count == 1 && mergedMask.intervals.count == 1,
                 "touching equal-z rects must merge into one interval")
         require(mergedMask.intervals[0].x0 == 0 && mergedMask.intervals[0].x1 == 200,
                 "merged interval must span both rects")
-        let rightHigher = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
+        let rightHigher = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
         let splitMask = buildMask([leftSame, rightHigher])
         require(splitMask.intervals.count == 2, "touching rects with differing z must stay split")
         require(splitMask.intervals[0].z == 50 && splitMask.intervals[1].z == 60,
                 "split segments must keep their own z")
 
         // Vertically disjoint rects: no band is emitted for the gap between them.
-        let upper = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let lower = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
+        let upper = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let lower = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
         let disjoint = buildMask([upper, lower])
         require(disjoint.bands.count == 2, "vertically disjoint rects must produce exactly 2 bands")
         require(!maskCoversAbove(bands: disjoint.bands, intervals: disjoint.intervals, x: 50, y: 200, scrollZ: 0),
                 "the vertical gap between rects must not be masked")
 
         // Degenerate rects are ignored; an empty input clears the outputs.
-        let degenerate = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let degenerate = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
         let degenerateMask = buildMask([degenerate])
         require(degenerateMask.bands.isEmpty && degenerateMask.intervals.isEmpty,
                 "a zero-width rect must produce an empty mask")

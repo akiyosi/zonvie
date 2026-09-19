@@ -10,7 +10,7 @@
 // the row they moved TO is never repainted and keeps what the copy dragged in.
 //
 // The main surface shifts both of its mark sets with the rows
-// (MetalTerminalRenderer's applyLayerRowScroll and commitFlush). The external
+// (GridSurfaceRenderer's applyLayerRowScroll and commitFlush). The external
 // surface's root path called the same remap and shifted neither: the commit
 // that introduced the main-side shift says in its own message that the
 // external caller "is not audited".

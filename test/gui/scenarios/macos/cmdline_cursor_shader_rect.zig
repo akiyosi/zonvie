@@ -132,7 +132,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // whenever the cmdline window starts at or left of the main window.
     // Require the publisher to BE the cmdline grid rather than merely not be
     // the main one: shaderCursorGridId starts at 0
-    // (macos/Sources/Rendering/MetalTerminalRenderer.swift:1080), so a
+    // (macos/Sources/Rendering/GridSurfaceRenderer.swift:1080), so a
     // regression that never staged a grid id, or one that staged a window
     // grid (2, 3, ...), passes any "not 1" form of this check.
     if (rect.grid != cmdline_grid_id) {

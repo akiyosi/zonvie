@@ -9,7 +9,7 @@
 // `MetalTerminalView.submitVerticesRowRaw` and let that row keep the frame
 // alive — which also banded that row, redrew it, and pulled every layer
 // crossing it into the redraw. Both arrived at "the cursor moved"; only one
-// said so. `MetalTerminalRenderer` now records the commit as cursor-only, and
+// said so. `GridSurfaceRenderer` now records the commit as cursor-only, and
 // `noMainWorkFrame`/`skipMainPass` encode no main pass at all.
 //
 // Observed through the app log rather than through pixels: a reused frame and
@@ -22,7 +22,7 @@
 // the row the cursor leaves and the row it enters, which is real content change
 // and correctly redraws.
 //
-// macOS-only: MetalTerminalRenderer is macOS frontend code.
+// macOS-only: GridSurfaceRenderer is macOS frontend code.
 
 const std = @import("std");
 const driver = @import("../../driver.zig");

@@ -5,7 +5,7 @@
 // margin row: a main-grid window's winbar makes only a top margin, but a
 // float with border="single" carries border rows on both edges
 // (marginTop = 2 with a winbar, marginBottom = 1). Scrolling inside the
-// float exercises MetalTerminalRenderer's grid_scroll retention capture
+// float exercises GridSurfaceRenderer's grid_scroll retention capture
 // (captureOneRetainedRow) — the composited-float path, distinct from both
 // the external-window path and the main fast path.
 //

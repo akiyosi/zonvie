@@ -310,7 +310,7 @@ final class ScrollRetention {
     ///
     /// No allocation: both lookups scan arrays the caller already owns.
     func pruneUndisplaced(
-        offsets: [MetalTerminalRenderer.ScrollOffset],
+        offsets: [GridSurfaceRenderer.ScrollOffset],
         seedGrids: [(gridId: Int64, rowsDelta: Int)]
     ) {
         prunePublished { retained in
@@ -554,7 +554,7 @@ final class ScrollRetention {
 /// flag, so the shader neither shifts them by the scroll offset nor marks them
 /// for the fragment content clip; retained and translated to a targetRow they
 /// would land statically on a margin row and persist in the back buffer.
-/// Shared by MetalTerminalRenderer's grid_scroll capture and ExternalGridView's
+/// Shared by GridSurfaceRenderer's grid_scroll capture and ExternalGridView's
 /// pending-scroll capture, so both retain under one invariant: scrollable cells
 /// of one grid, nothing else. nil when the row has nothing retainable (the band
 /// then falls back to the edge stretch) or the ring has no buffer.
@@ -913,13 +913,13 @@ final class SurfaceBufferSet {
     // grids advance it only after a flush regenerated every logical row.
     var fontGeneration: UInt64 = 0
 
-    // Main vertex buffer (used by MetalTerminalRenderer, not by ExternalGridView)
+    // Main vertex buffer (used by GridSurfaceRenderer, not by ExternalGridView)
     var mainVertexBuffer: MTLBuffer? = nil
     var mainVertexBufferCap: Int = 0
     var mainVertexCount: Int = 0
 
     // Atlas texture frozen at commit time alongside this set's vertex data
-    // (ExternalGridView only; MetalTerminalRenderer reads committedAtlasTexture
+    // (ExternalGridView only; GridSurfaceRenderer reads committedAtlasTexture
     // under its own `lock` in the same scope as its committed-index snapshot).
     // Without it, ExternalGridView.draw(in:) fetching the atlas from the main
     // renderer at a LATER, independent point in the same draw call could pair
@@ -927,7 +927,7 @@ final class SurfaceBufferSet {
     // commit installed in between. Published in ExternalGridView.commitFlush()
     // with committedSetIndex, under the same tripleBufferLock.
     var atlasTextureSnapshot: MTLTexture? = nil
-    // Cursor vertex buffer (used by both MetalTerminalRenderer and ExternalGridView,
+    // Cursor vertex buffer (used by both GridSurfaceRenderer and ExternalGridView,
     // each keeping its own per-set copy so a GPU-in-flight read never races a CPU write)
     var cursorVertexBuffer: MTLBuffer? = nil
     var cursorVertexBufferCap: Int = 0
@@ -2592,7 +2592,7 @@ func syncSurfaceWriteSetRowState(
 }
 
 /// Submit vertices for a single row into a SurfaceBufferSet.
-/// Shared between MetalTerminalRenderer and ExternalGridView.
+/// Shared between GridSurfaceRenderer and ExternalGridView.
 ///
 /// - Parameters:
 ///   - target: The buffer set to write into (write set during flush, or committed set)
@@ -2686,8 +2686,8 @@ func submitSurfaceRowVertices(
 /// and the shader's own per-vertex lookup already relies on.
 func surfaceScrollOffset(
     gridId: Int64,
-    offsets: [MetalTerminalRenderer.ScrollOffset]
-) -> MetalTerminalRenderer.ScrollOffset? {
+    offsets: [GridSurfaceRenderer.ScrollOffset]
+) -> GridSurfaceRenderer.ScrollOffset? {
     let key = Int32(truncatingIfNeeded: gridId)
     var lo = 0
     var hi = offsets.count
@@ -2713,7 +2713,7 @@ func surfaceScrollOffset(
 /// space the core emits, hence the negation.
 func displacedLayerOriginPx(
     originPx: simd_float2,
-    offset: MetalTerminalRenderer.ScrollOffset,
+    offset: GridSurfaceRenderer.ScrollOffset,
     viewportHeightPx: Float
 ) -> simd_float2 {
     guard viewportHeightPx > 0, offset.offset_y.isFinite else { return originPx }
@@ -2795,12 +2795,12 @@ func makeRowScissorRect(
 /// z comparison needs a single lookup. Outputs and scratch buffers retain
 /// capacity; the steady path allocates nothing.
 func buildSurfaceFixedFloatMask(
-    rects: [MetalTerminalRenderer.FixedFloatRect],
-    bands: inout [MetalTerminalRenderer.FixedFloatBand],
-    intervals: inout [MetalTerminalRenderer.FixedFloatInterval],
+    rects: [GridSurfaceRenderer.FixedFloatRect],
+    bands: inout [GridSurfaceRenderer.FixedFloatBand],
+    intervals: inout [GridSurfaceRenderer.FixedFloatInterval],
     yEdgesScratch: inout [Float],
     xEdgesScratch: inout [Float],
-    coveringScratch: inout [MetalTerminalRenderer.FixedFloatRect]
+    coveringScratch: inout [GridSurfaceRenderer.FixedFloatRect]
 ) {
     bands.removeAll(keepingCapacity: true)
     intervals.removeAll(keepingCapacity: true)
@@ -2839,7 +2839,7 @@ func buildSurfaceFixedFloatMask(
         // contiguous segments with equal z so the common non-overlapping
         // case emits exactly one interval per rect, as before.
         let start = intervals.count
-        var pending: MetalTerminalRenderer.FixedFloatInterval?
+        var pending: GridSurfaceRenderer.FixedFloatInterval?
         for xIndex in 0..<(xEdgesScratch.count - 1) {
             let x0 = xEdgesScratch[xIndex]
             let x1 = xEdgesScratch[xIndex + 1]
@@ -2861,12 +2861,12 @@ func buildSurfaceFixedFloatMask(
                 pending = merged
             } else {
                 if let flushed = pending { intervals.append(flushed) }
-                pending = MetalTerminalRenderer.FixedFloatInterval(x0: x0, x1: x1, z: zf)
+                pending = GridSurfaceRenderer.FixedFloatInterval(x0: x0, x1: x1, z: zf)
             }
         }
         if let flushed = pending { intervals.append(flushed) }
         guard intervals.count > start else { continue }
-        bands.append(MetalTerminalRenderer.FixedFloatBand(
+        bands.append(GridSurfaceRenderer.FixedFloatBand(
             top: top,
             bottom: bottom,
             intervalStart: UInt32(start),
@@ -2895,7 +2895,7 @@ private func dedupSortedSurfaceEdges(_ values: inout [Float]) {
 /// for an empty array.
 func bindSurfaceScrollOffsets(
     encoder: MTLRenderCommandEncoder,
-    offsets: [MetalTerminalRenderer.ScrollOffset],
+    offsets: [GridSurfaceRenderer.ScrollOffset],
     device: MTLDevice,
     scratchBuffer: inout MTLBuffer?,
     scratchCapacity: inout Int
@@ -2920,15 +2920,15 @@ func bindSurfaceScrollOffsets(
                     memcpy(buf.contents(), ptr.baseAddress!, ptr.count)
                     encoder.setVertexBuffer(buf, offset: 0, index: 1)
                 } else {
-                    var dummy = MetalTerminalRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
-                    encoder.setVertexBytes(&dummy, length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride, index: 1)
+                    var dummy = GridSurfaceRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+                    encoder.setVertexBytes(&dummy, length: MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride, index: 1)
                     effectiveCount = 0
                 }
             }
         }
     } else {
-        var dummy = MetalTerminalRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
-        encoder.setVertexBytes(&dummy, length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride, index: 1)
+        var dummy = GridSurfaceRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
+        encoder.setVertexBytes(&dummy, length: MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride, index: 1)
     }
     encoder.setVertexBytes(&effectiveCount, length: MemoryLayout<UInt32>.size, index: 2)
 }
@@ -2937,18 +2937,18 @@ func bindSurfaceScrollOffsets(
 /// constructing a temporary Swift Array in the per-frame draw path.
 func bindSingleSurfaceScrollOffset(
     encoder: MTLRenderCommandEncoder,
-    offset: MetalTerminalRenderer.ScrollOffset?
+    offset: GridSurfaceRenderer.ScrollOffset?
 ) {
     var effectiveCount: UInt32 = 0
     if var value = offset {
         encoder.setVertexBytes(
             &value,
-            length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride,
+            length: MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride,
             index: 1
         )
         effectiveCount = 1
     } else {
-        var dummy = MetalTerminalRenderer.ScrollOffset(
+        var dummy = GridSurfaceRenderer.ScrollOffset(
             grid_id: 0,
             offset_y: 0,
             content_top_y: 0,
@@ -2956,7 +2956,7 @@ func bindSingleSurfaceScrollOffset(
         )
         encoder.setVertexBytes(
             &dummy,
-            length: MemoryLayout<MetalTerminalRenderer.ScrollOffset>.stride,
+            length: MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride,
             index: 1
         )
     }
@@ -2979,19 +2979,19 @@ final class SurfaceFixedFloatMask {
     /// float.
     static let maxRects = 16
 
-    private(set) var bands: [MetalTerminalRenderer.FixedFloatBand] = []
-    private(set) var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
-    private var input: [MetalTerminalRenderer.FixedFloatRect] = []
+    private(set) var bands: [GridSurfaceRenderer.FixedFloatBand] = []
+    private(set) var intervals: [GridSurfaceRenderer.FixedFloatInterval] = []
+    private var input: [GridSurfaceRenderer.FixedFloatRect] = []
     private var overflowed = false
     private var yEdgesScratch: [Float] = []
     private var xEdgesScratch: [Float] = []
-    private var coveringScratch: [MetalTerminalRenderer.FixedFloatRect] = []
+    private var coveringScratch: [GridSurfaceRenderer.FixedFloatRect] = []
 
     /// False when the union cannot be represented. A partial transform is
     /// visibly wrong, so the caller must drop the whole scroll transform rather
     /// than mask part of it.
     @discardableResult
-    func update(_ rects: [MetalTerminalRenderer.FixedFloatRect]) -> Bool {
+    func update(_ rects: [GridSurfaceRenderer.FixedFloatRect]) -> Bool {
         if rects.count > Self.maxRects {
             if !overflowed {
                 input.removeAll(keepingCapacity: true)
@@ -3024,8 +3024,8 @@ func bindSurfaceFragmentState(
     backgroundAlphaBuffer: MTLBuffer?,
     cursorBlinkBuffer: MTLBuffer?,
     cursorBlinkVisible: Bool,
-    fixedFloatBands: [MetalTerminalRenderer.FixedFloatBand] = [],
-    fixedFloatIntervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+    fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand] = [],
+    fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval] = []
 ) {
     var size = DrawableSize(width: viewportMetrics.fragmentWidth, height: viewportMetrics.fragmentHeight)
     encoder.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
@@ -3043,11 +3043,11 @@ func bindSurfaceFragmentState(
     // Exact fixed-float union (fragment buffers 3/4/5). Bands and their
     // interval slices are both sorted and disjoint, so each fragment needs
     // two binary searches instead of a linear scan over every float.
-    let bandStride = MemoryLayout<MetalTerminalRenderer.FixedFloatBand>.stride
-    let intervalStride = MemoryLayout<MetalTerminalRenderer.FixedFloatInterval>.stride
+    let bandStride = MemoryLayout<GridSurfaceRenderer.FixedFloatBand>.stride
+    let intervalStride = MemoryLayout<GridSurfaceRenderer.FixedFloatInterval>.stride
     var fixedBandCount = UInt32(fixedFloatBands.count)
     if fixedFloatBands.isEmpty {
-        var dummyBand = MetalTerminalRenderer.FixedFloatBand(top: 0, bottom: 0, intervalStart: 0, intervalCount: 0)
+        var dummyBand = GridSurfaceRenderer.FixedFloatBand(top: 0, bottom: 0, intervalStart: 0, intervalCount: 0)
         encoder.setFragmentBytes(&dummyBand, length: bandStride, index: 3)
     } else {
         fixedFloatBands.withUnsafeBytes { ptr in
@@ -3056,7 +3056,7 @@ func bindSurfaceFragmentState(
     }
     encoder.setFragmentBytes(&fixedBandCount, length: MemoryLayout<UInt32>.size, index: 4)
     if fixedFloatIntervals.isEmpty {
-        var dummyInterval = MetalTerminalRenderer.FixedFloatInterval(x0: 0, x1: 0)
+        var dummyInterval = GridSurfaceRenderer.FixedFloatInterval(x0: 0, x1: 0)
         encoder.setFragmentBytes(&dummyInterval, length: intervalStride, index: 5)
     } else {
         fixedFloatIntervals.withUnsafeBytes { ptr in
@@ -3424,6 +3424,144 @@ func stageSurfaceRowScroll(
 ///
 /// `prepare` runs on the descriptor before the encoder is made; the main
 /// surface attaches its GPU counter samples there.
+/// backTex -> drawable: the custom post-process chain when one is configured
+/// for `.afterBloom`, otherwise the plain copy pass.
+///
+/// Both surfaces wrote this ladder out — the same four conditions in the same
+/// order, the same fall-through, the same "encoded nothing" answer — and
+/// differed only in two places, which are the two closures. The uniforms differ
+/// because an external window's screen-space origin is not the main window's;
+/// `prepareCopy` differs because only the main surface attaches GPU performance
+/// samples to the copy pass.
+///
+/// `makeUniforms` is a closure rather than a value: building them costs a
+/// cursor-shader evaluation on the external side, and the chain only runs when
+/// all four conditions hold.
+///
+/// `.notEncoded` means nothing could be encoded. Both callers read that as
+/// "submit what is already encoded, present nothing, and do not consume this
+/// frame's state" — the drawable would otherwise be presented untouched.
+/// The blink fast path: one row, scissored, redrawn in place so the old cursor
+/// is erased and the new one drawn without touching any other pixel.
+///
+/// Single pass through the unified blur pipeline when one exists; the two-pass
+/// background-then-glyph fallback otherwise, which is the rule every other
+/// `use2Pass` branch follows — the background pass overwrites, which is what
+/// erases the old cursor, and the glyph pass blends the text back over it.
+///
+/// Both surfaces had this written out, identical apart from where each keeps
+/// the cursor's row. A row whose scissor cannot be formed encodes nothing: the
+/// row is outside the render target, and drawing it unscissored would repaint
+/// the wrong band.
+func encodeSurfaceBlinkFastPathRow(
+    encoder: MTLRenderCommandEncoder,
+    row: Int,
+    resolved: (vc: Int, vb: MTLBuffer, translationY: Float),
+    cellHeightPx: Int,
+    drawableWidthPx: Int,
+    renderTargetWidthPx: Int,
+    renderTargetHeightPx: Int,
+    backgroundPipeline: MTLRenderPipelineState?,
+    glyphPipeline: MTLRenderPipelineState?,
+    unifiedBlurPipeline: MTLRenderPipelineState?
+) {
+    guard let scissor = makeRowScissorRect(
+        row: row,
+        cellHeight_px: cellHeightPx,
+        drawableWidth_px: drawableWidthPx,
+        renderTargetWidth_px: renderTargetWidthPx,
+        renderTargetHeight_px: renderTargetHeightPx
+    ) else { return }
+    encoder.setScissorRect(scissor)
+    var rowTranslation = resolved.translationY
+    func draw(_ pipeline: MTLRenderPipelineState) {
+        encoder.setRenderPipelineState(pipeline)
+        encoder.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+        encoder.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+    }
+    if let unified = unifiedBlurPipeline {
+        draw(unified)
+        return
+    }
+    if let bg = backgroundPipeline { draw(bg) }
+    if let glyph = glyphPipeline { draw(glyph) }
+}
+
+/// The cursor, composited onto the drawable after the copy.
+///
+/// It goes on the drawable and never into the back buffer, so a GPU scroll copy
+/// cannot drag stale cursor pixels, and so nothing repaints over it — which is
+/// also why the fixed-float mask has to be bound here: without it a cursor
+/// easing with a scroll slides across a hosted fixed float instead of being
+/// discarded under it.
+///
+/// Both surfaces wrote this pass out in full. The two that could not be plain
+/// parameters are closures: `prepare` because only the main surface attaches GPU
+/// performance samples, and `bindScrollOffsets` because the main surface binds
+/// an array of per-grid offsets where an external one binds the single offset of
+/// the grid that owns the cursor.
+///
+/// Returns false when the encoder could not be created. Both callers treat that
+/// as "submit what is encoded, present nothing": presenting the copy without the
+/// cursor it was asked for would consume the cursor revision and leave a
+/// visibly incomplete transaction.
+func encodeSurfaceCursorOverlay(
+    cmd: MTLCommandBuffer,
+    drawableTexture: MTLTexture,
+    pipeline: MTLRenderPipelineState,
+    atlasTexture: MTLTexture?,
+    sampler: MTLSamplerState,
+    viewportMetrics: SurfaceViewportMetrics,
+    cursorVertexBuffer: MTLBuffer,
+    cursorVertexCount: Int,
+    layerOriginPx: simd_float2,
+    backgroundAlphaBuffer: MTLBuffer?,
+    cursorBlinkBuffer: MTLBuffer?,
+    fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand],
+    fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval],
+    prepare: (MTLRenderPassDescriptor) -> Void = { _ in },
+    bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
+) -> Bool {
+    let rpd = MTLRenderPassDescriptor()
+    rpd.colorAttachments[0].texture = drawableTexture
+    rpd.colorAttachments[0].loadAction = .load
+    rpd.colorAttachments[0].storeAction = .store
+    prepare(rpd)
+    guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
+    viewportMetrics.applyViewport(to: enc)
+    enc.setRenderPipelineState(pipeline)
+    if let atlasTexture {
+        enc.setFragmentTexture(atlasTexture, index: 0)
+    }
+    enc.setFragmentSamplerState(sampler, index: 0)
+    bindScrollOffsets(enc)
+    bindSurfaceFragmentState(
+        encoder: enc,
+        viewportMetrics: viewportMetrics,
+        backgroundAlphaBuffer: backgroundAlphaBuffer,
+        cursorBlinkBuffer: cursorBlinkBuffer,
+        cursorBlinkVisible: true,
+        fixedFloatBands: fixedFloatBands,
+        fixedFloatIntervals: fixedFloatIntervals
+    )
+    var zeroTranslation: Float = 0
+    enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+    // The cursor is in its own layer's pixel space; applyViewport above set the
+    // viewport to the root layer's.
+    bindLayerTransform(
+        encoder: enc,
+        LayerTransform(
+            originPx: layerOriginPx,
+            extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
+        )
+    )
+    enc.setVertexBuffer(cursorVertexBuffer, offset: 0, index: 0)
+    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: cursorVertexCount)
+    enc.endEncoding()
+    return true
+}
+
 func encodeSurfaceDrawableCopy(
     cmd: MTLCommandBuffer,
     input: MTLTexture,

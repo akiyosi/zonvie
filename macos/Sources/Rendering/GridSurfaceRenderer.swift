@@ -316,6 +316,65 @@ func provisionSurfaceRowCapacity(
 /// `pongSize` is the caller's drawable size rather than `output`'s dimensions:
 /// the two surfaces each derive it from their own view, and reading it off the
 /// texture would change which value the pair is keyed on.
+/// Which route put the back buffer on the drawable, or that none did.
+enum SurfaceDrawablePresentation {
+    case customShaderChain
+    case plainCopy
+    case notEncoded
+
+    var encoded: Bool { self != .notEncoded }
+    var tookCustomShaderChain: Bool { self == .customShaderChain }
+}
+
+@discardableResult
+func encodeSurfaceBackBufferToDrawable(
+    cmd: MTLCommandBuffer,
+    backTex: MTLTexture,
+    drawableTexture: MTLTexture,
+    customShaderPipelines: [CustomShaderPipeline],
+    runsCustomShaderChain: Bool,
+    customShaderPong: SurfacePingPongTextures,
+    pongSize: CGSize,
+    copyPipeline: MTLRenderPipelineState?,
+    copyVertexBuffer: MTLBuffer?,
+    sampler: MTLSamplerState?,
+    bilinearSampler: MTLSamplerState?,
+    makeUniforms: () -> zonvie_shader_uniforms,
+    prepareCopy: (MTLRenderPassDescriptor) -> Void = { _ in }
+) -> SurfaceDrawablePresentation {
+    if runsCustomShaderChain,
+       !customShaderPipelines.isEmpty,
+       let copyVB = copyVertexBuffer,
+       let bilinSamp = bilinearSampler,
+       encodeSurfaceCustomShaderChain(
+           cmd: cmd,
+           pipelines: customShaderPipelines,
+           input: backTex,
+           output: drawableTexture,
+           pong: customShaderPong,
+           pongSize: pongSize,
+           copyVertexBuffer: copyVB,
+           sampler: bilinSamp,
+           uniforms: makeUniforms()
+       )
+    {
+        return .customShaderChain
+    }
+    guard let copyPipe = copyPipeline,
+          let copyVB = copyVertexBuffer,
+          let samp = sampler else { return .notEncoded }
+    let copied = encodeSurfaceDrawableCopy(
+        cmd: cmd,
+        input: backTex,
+        output: drawableTexture,
+        pipeline: copyPipe,
+        copyVertexBuffer: copyVB,
+        sampler: samp,
+        prepare: prepareCopy
+    )
+    return copied ? .plainCopy : .notEncoded
+}
+
 func encodeSurfaceCustomShaderChain(
     cmd: MTLCommandBuffer,
     pipelines: [CustomShaderPipeline],
@@ -354,20 +413,41 @@ func encodeSurfaceCustomShaderChain(
 // MUST be committed before being dropped. Uncommitted command buffers leak
 // IOAccelerator GPU memory regions that the kernel never reclaims (observable
 // as growing phys_footprint under flush bursts).
-final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
-    private let device: MTLDevice
+final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
+    /// The GPU objects this surface shares with every other one. Created here
+    /// because the main window's renderer is the first surface to exist; every
+    /// other surface is handed this same instance.
+    let shared: SharedRenderResources
+    private var device: MTLDevice { shared.device }
     private let queue: MTLCommandQueue
-    private var atlas: GlyphAtlas
+    private var atlas: GlyphAtlas { shared.atlas }
 
     /// Expose device for external grid views (shared Metal device).
     var metalDevice: MTLDevice { device }
 
+    /// The queue this surface draws on. The atlas blit rides the MAIN
+    /// surface's queue so that surface needs no reader admission — see
+    /// SharedRenderResources.beginFlushTransaction.
+    var commandQueue: MTLCommandQueue { queue }
+
+    /// Whether this surface allocates GPU counter sample buffers and reports
+    /// `[perf] gpu_passes`. A property rather than "this is the main renderer",
+    /// so the surface kind stops being implied by the type. Defaults on
+    /// because the only surface built from this type today is the main one;
+    /// a surface that comes and goes with a float must pass false, since
+    /// setupGpuPerfSampling allocates an MTLCounterSampleBuffer per instance.
+    private let collectsGpuPerfSamples: Bool
+
     /// Expose atlas for external grid views (shared glyph cache).
     var glyphAtlas: GlyphAtlas { atlas }
 
-    private var pipeline: MTLRenderPipelineState?
+    // Forwarders onto `shared`, so the ~170 uses below read as they always did
+    // while the objects themselves belong to no surface. Read-only on purpose:
+    // the build sites write `shared.x` directly, which keeps "who writes these"
+    // answerable by searching for `shared.`.
+    private var pipeline: MTLRenderPipelineState? { shared.pipeline }
     /// Also read by ExternalGridView for the shared back-buffer copy.
-    private(set) var sampler: MTLSamplerState?
+    var sampler: MTLSamplerState? { shared.sampler }
     private var initializationError: String?
     private var pipelineNeedsBuilding = true
     private var pipelineRetryDelaySeconds: TimeInterval = 0.1
@@ -377,19 +457,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // 2-pass rendering pipelines for blur support
     // Background pipeline uses overwrite blending (one, zero) to avoid ghosting
     // Glyph pipeline uses standard alpha blending for correct antialiasing
-    private var backgroundPipeline: MTLRenderPipelineState?
-    private var glyphPipeline: MTLRenderPipelineState?
+    private var backgroundPipeline: MTLRenderPipelineState? { shared.backgroundPipeline }
+    private var glyphPipeline: MTLRenderPipelineState? { shared.glyphPipeline }
     // Single-pass replacement for the (backgroundPipeline + glyphPipeline) 2-pass.
     // Uses ps_unified_blur which reads tile memory via raster_order_group and
     // composites bg + glyph + decorations in a single fragment shader. Halves
     // fragment-shader invocations vs the 2-pass discard pattern when enabled.
     // nil → fall back to 2-pass for safety.
-    private var unifiedBlurPipeline: MTLRenderPipelineState?
+    private var unifiedBlurPipeline: MTLRenderPipelineState? { shared.unifiedBlurPipeline }
 
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
-    private(set) var copyPipeline: MTLRenderPipelineState?
-    private(set) var copyVertexBuffer: MTLBuffer?
+    var copyPipeline: MTLRenderPipelineState? { shared.copyPipeline }
+    var copyVertexBuffer: MTLBuffer? { shared.copyVertexBuffer }
 
     // Binary archive for caching compiled pipeline states
     // This avoids XPC compiler service calls after first successful compilation
@@ -938,7 +1018,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     private var mainRowStateDrawableH: UInt32 = 0 // Core thread only
 
     private var committedAtlasTexture: MTLTexture?  // Protected by lock
-    private var linespacePx: Int32 = 0
 
     private var backingScale: CGFloat = 1.0
 
@@ -994,59 +1073,19 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         backingScale = s
         lock.unlock()
-        // Eagerly update atlas so that cellWidthPx/cellHeightPx reflect the
-        // new scale immediately (before the next draw() call). This ensures
-        // maybeResizeCoreGrid() sends correct cell metrics to the core and
-        // prevents the initial grid being sized with @1x metrics while the
-        // drawable uses @2x pixel dimensions.
-        atlas.setBackingScale(s)
+        shared.setBackingScale(s)
     }
 
     /// Cell width in drawable pixel coordinates.
-    var cellWidthPx: Float { atlas.fontMetricsSnapshot().width }
+    var cellWidthPx: Float { shared.cellWidthPx }
 
-    /// Cell height in drawable pixel coordinates.
-    // var cellHeightPx: Float { atlas.cellHeightPx }
-    // atlas.fontMetricsSnapshot() reads all four font metrics together
-    // under the atlas's own lock (setFont()/setBackingScale() write them
-    // there from the core/RPC thread); linespacePx is a separate field
-    // written under `lock` by setLineSpace(), read under that same lock
-    // here. Combining the two snapshots still can't mix a fresh atlas
-    // height with a stale linespace value within either field.
-    var cellHeightPx: Float {
-        lock.lock()
-        let ls = linespacePx
-        lock.unlock()
-        // 'linespace' may be negative (Neovim allows it to tighten rows under
-        // a font that reserves too much room between lines), so the sum has to
-        // stay positive: the grid divides the drawable by this to get its row
-        // count, and rows also cannot be measured in zero pixels.
-        return max(1, atlas.fontMetricsSnapshot().height + Float(ls))
-    }
+    /// Cell height in drawable pixel coordinates, `linespace` included.
+    var cellHeightPx: Float { shared.cellHeightPx }
 
 
     var currentFontName: String { atlas.currentFontName }
 
     var currentPointSize: CGFloat { atlas.currentPointSize }
-
-    // MARK: - Shared Resources for External Grid Views
-
-    /// Expose main pipeline for external grid views (shared shader compilation).
-    var sharedPipeline: MTLRenderPipelineState? { pipeline }
-
-    /// Expose 2-pass background pipeline for blur support.
-    var sharedBackgroundPipeline: MTLRenderPipelineState? { backgroundPipeline }
-
-    /// Expose 2-pass glyph pipeline for blur support.
-    var sharedGlyphPipeline: MTLRenderPipelineState? { glyphPipeline }
-
-    /// Expose the single-pass blur pipeline that supersedes the 2-pass pair.
-    /// nil when the shader or the pipeline build failed; the surface then
-    /// falls back to the two passes, exactly as this renderer does.
-    var sharedUnifiedBlurPipeline: MTLRenderPipelineState? { unifiedBlurPipeline }
-
-    /// Expose sampler for external grid views.
-    var sharedSampler: MTLSamplerState? { sampler }
 
     // Phase 2: Core-managed atlas pass-through
 
@@ -1282,6 +1321,26 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     // new content. Without an interleave the re-publish is an idempotent union.
     private var flushDirtyRows: IndexSet = IndexSet()
     private var flushDirtyRectPx: NSRect? = nil
+    /// Two questions wear this one name, and the merged draw has to keep them
+    /// apart.
+    ///
+    /// **"The back texture holds a frame worth loading"** — what the load-action
+    /// and idle gates ask. That becomes true at *submit*, because command
+    /// buffers on one queue are ordered and the next frame's `.load` sees this
+    /// frame's output. ExternalGridView answers exactly that, and sets its own
+    /// flag at submit.
+    ///
+    /// **"The window is on screen"** — what the deferred guifont flush and the
+    /// blur shadow recalculation below ask. That is the GPU completion handler,
+    /// which is where this one is set.
+    ///
+    /// Measured cost of answering the first question with the second: one extra
+    /// `.clear` per app launch (one `presented=0` decision in a 50 s capture),
+    /// so the conservative answer stays. Noted because the two are not the same
+    /// question, and because `hasPresentedOnce` is also cleared on every back
+    /// buffer resize — which re-arms the "first present" side effects below
+    /// after a window resize. `markFirstPresentDone` has its own latch and is
+    /// unaffected; the shadow recalculation does not.
     private var hasPresentedOnce: Bool = false
 
     /// Previous on-glass presentation time (MTLDrawable.presentedTime, seconds).
@@ -1303,20 +1362,20 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
     // --- Post-process bloom (neon glow, Dual Kawase) ---
     // Pipelines and sampler are internal so ExternalGridView can share them.
-    private(set) var glowExtractPipeline: MTLRenderPipelineState?
+    var glowExtractPipeline: MTLRenderPipelineState? { shared.glowExtractPipeline }
     /// Attenuates extracted glow by a layer's background coverage, so a glyph
     /// behind an opaque layer does not bloom through it.
-    private(set) var glowOccludePipeline: MTLRenderPipelineState?
-    private(set) var kawaseDownPipeline: MTLRenderPipelineState?
-    private(set) var kawaseUpPipeline: MTLRenderPipelineState?
-    private(set) var glowCompositePipeline: MTLRenderPipelineState?
+    var glowOccludePipeline: MTLRenderPipelineState? { shared.glowOccludePipeline }
+    var kawaseDownPipeline: MTLRenderPipelineState? { shared.kawaseDownPipeline }
+    var kawaseUpPipeline: MTLRenderPipelineState? { shared.kawaseUpPipeline }
+    var glowCompositePipeline: MTLRenderPipelineState? { shared.glowCompositePipeline }
     let glowTextures = SurfaceGlowTextures()
-    private(set) var bilinearSampler: MTLSamplerState?
+    var bilinearSampler: MTLSamplerState? { shared.bilinearSampler }
 
     // --- User-supplied custom post-process shaders ---
     // Loaded once from config paths during bloom-pipeline construction.
     // Empty array when `[shaders].enabled = false` or no paths are listed.
-    private(set) var customShaderPipelines: [CustomShaderPipeline] = []
+    var customShaderPipelines: [CustomShaderPipeline] { shared.customShaderPipelines }
     /// Opaque variant of the custom shader chain for DECORATED surfaces
     /// (ext-cmdline / popupmenu / messages). Their backTex has alpha=0 regions —
     /// padding, empty parts of the input line — where `preserve_alpha` would
@@ -1324,15 +1383,15 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// documented), so these always compile with it OFF while the main window
     /// keeps `config.preserveAlpha`. When that is false the two sets are
     /// identical and this just aliases `customShaderPipelines`.
-    private(set) var customShaderPipelinesDecorated: [CustomShaderPipeline] = []
+    var customShaderPipelinesDecorated: [CustomShaderPipeline] { shared.customShaderPipelinesDecorated }
     /// Where the custom shader chain inserts relative to bloom. Mirrored from
     /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
     /// path does not need to re-read config each frame.
-    private(set) var customShaderPostProcess: ZonvieConfig.ShaderPostProcess = .afterBloom
+    var customShaderPostProcess: ZonvieConfig.ShaderPostProcess { shared.customShaderPostProcess }
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. Used by `MetalTerminalView` to keep the vsync
     /// draw loop active instead of falling back to flush-driven rendering.
-    private(set) var anyCustomShaderNeedsAnimation: Bool = false
+    var anyCustomShaderNeedsAnimation: Bool { shared.anyCustomShaderNeedsAnimation }
 
     // Shadertoy-style uniforms block (160 bytes, std140). Populated per
     // draw into a local `zonvie_shader_uniforms` value and handed to the
@@ -1435,12 +1494,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// Allocate the two ping-pong textures used by multi-pass custom
     /// shader chains. Size/format must match the drawable so the final
     /// pass can write the same pixel format the drawable expects.
-    init?(view: MTKView) {
+    init?(view: MTKView, collectsGpuPerfSamples: Bool = true) {
+        self.collectsGpuPerfSamples = collectsGpuPerfSamples
         guard let dev = view.device else {
             ZonvieCore.appLog("[Renderer] init failed: MTKView.device is nil")
             return nil
         }
-        self.device = dev
         self.retention = ScrollRetention(device: dev)
         guard let q = dev.makeCommandQueue() else {
             ZonvieCore.appLog("[Renderer] init failed: Failed to create command queue")
@@ -1487,7 +1546,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[Renderer] init failed: GlyphAtlas init failed")
             return nil
         }
-        self.atlas = builtAtlas
+        self.shared = SharedRenderResources(device: dev, atlas: builtAtlas)
         self.blurEnabled = ZonvieConfig.shared.blurEnabled
 
         super.init()
@@ -1518,7 +1577,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
         }
 
-        setupGpuPerfSampling()
+        if collectsGpuPerfSamples { setupGpuPerfSampling() }
     }
 
     // Probe device support for stage-boundary timestamp counters and allocate
@@ -1832,102 +1891,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             )
         }
 
-        // Prepare atlas back texture.
-        // Phase 1: handle non-GPU cases (rebuild, CPU sync, no-op).
-        // Phase 2: only create a Metal command buffer if GPU blit is needed.
-        // This avoids leaking IOAccelerator GPU memory regions from uncommitted
-        // command buffers (observed: ~70 leaked regions/sec without this fix).
+        // The atlas transaction belongs to the flush, not to this surface;
+        // SharedRenderResources owns it. What stays here is mapping a refusal
+        // onto this bracket's own teardown.
+        //
+        // OPENED here and CLOSED by ZonvieCore.on_flush_end, which is
+        // deliberate rather than an oversight. It opens late, after the guards
+        // above have accepted the flush: prepareBackTexture can encode a blit,
+        // and a flush this surface was going to drop for row capacity must not
+        // pay for one. It closes centrally because EVERY surface's publication
+        // depends on the swap, so no single surface may own that decision.
+        //
+        // The queue handed over is this surface's, and the main window's
+        // surface is the one whose bracket the core opens — see the doc comment
+        // on beginFlushTransaction for why the blit must ride the queue the
+        // main surface draws on.
         var needsCoreInvalidation = false
-        let tAtlasPrepareStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        let prepResult = atlas.prepareBackTexture()
-        if perfEnabled {
-            atlasPrepareUs = (CFAbsoluteTimeGetCurrent() - tAtlasPrepareStart) * 1_000_000
-        }
-        needsCoreInvalidation = prepResult.needsCoreInvalidation
-        atlasNeedsCoreInvalidation = prepResult.needsCoreInvalidation
-        atlasDidCpuSync = prepResult.didCpuSync
-        atlasSyncedWasRecreate = prepResult.syncedWasRecreate
-        if prepResult.shouldAbort {
+        switch shared.beginFlushTransaction(queue: queue, perfEnabled: perfEnabled) {
+        case .drop(let reason):
             isInFlush = false
             closeBracketFlag()
-            ZonvieCore.appLog("[WARNING] beginFlush: atlas prepare failed, dropping flush")
+            ZonvieCore.appLog("[WARNING] beginFlush: \(reason)")
             return .dropped
-        }
-        if prepResult.needsGpuBlit {
-            // Commit the blit without waiting on the renderer's own in-flight
-            // work: waiting blocked the core thread (grid_mu held) on a
-            // full-texture round-trip per flush under atlas-full churn. A later
-            // back-texture consumer polls the command and retries if it is still
-            // in flight; no redraw callback may wait for it while grid_mu is
-            // held.
-            //
-            // beginAtlasWrite()/endAtlasWrite() is a separate, much cheaper gate
-            // against ExternalGridView's queue reading the texture this blit
-            // overwrites, and returns immediately when no external read is
-            // outstanding. Held across cmd.commit() (as on every exit path
-            // below) so no new external read is admitted before submission.
-            guard atlas.beginAtlasWrite() else {
-                // Fail-closed (see beginAtlasWrite's doc comment): drop
-                // this flush's atlas blit rather than mutate a texture an
-                // external read hasn't finished with. atlas_reset/back-sync
-                // state is untouched, so the next flush attempt retries it.
-                atlas.endAtlasWrite()
-                isInFlush = false
-                closeBracketFlag()
-                ZonvieCore.appLog("[WARNING] beginFlush: atlas write blocked by in-flight external reads, dropping flush")
-                return .dropped
-            }
-            if let cmd = queue.makeCommandBuffer() {
-                let blitEncoded = atlas.encodeBackTextureBlit(commandBuffer: cmd)
-                guard blitEncoded else {
-                    // cmd was already created (driver-side resources reserved
-                    // at creation, per the IOAccelerator leak note in
-                    // CLAUDE.md); nothing was encoded into it, but it must
-                    // still be committed — an uncommitted MTLCommandBuffer
-                    // left to ARC deallocation does not reliably release
-                    // those resources, and this path can repeat on every
-                    // flush attempt while the driver stays under pressure.
-                    cmd.commit()
-                    atlas.endAtlasWrite()
-                    isInFlush = false
-                    closeBracketFlag()
-                    ZonvieCore.appLog("[WARNING] beginFlush: atlas blit encode failed, dropping flush")
-                    return .dropped
-                }
-                // Signal on this SAME command buffer, before commit, so the
-                // event only reaches this generation once the GPU has
-                // actually finished the blit — endAtlasWrite() below reopens
-                // the CPU-side admission gate immediately (no waiting), but
-                // readers' beginAtlasExternalRead() wait-encode still orders
-                // their GPU work strictly after this blit via the event, independent of
-                // when endAtlasWrite() runs.
-                let blitGen = atlas.encodeBlitCompletionSignal(into: cmd)
-                // If the GPU stops executing this buffer before reaching the
-                // signal command above (device loss, driver error), the event
-                // never reaches blitGen and any reader already waiting on it
-                // would hang forever — see recoverFailedBlit's doc comment.
-                let atlasForBlitCompletion = atlas
-                cmd.addCompletedHandler { completedCmd in
-                    if completedCmd.status != .completed {
-                        atlasForBlitCompletion.recoverFailedBlit(generation: blitGen)
-                    }
-                }
-                let tAtlasCommitStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-                cmd.commit()
-                atlas.endAtlasWrite()
-                if perfEnabled {
-                    atlasCommitUs = (CFAbsoluteTimeGetCurrent() - tAtlasCommitStart) * 1_000_000
-                }
-                atlas.setPendingBackBlit(cmd)
-                atlasDidBlit = true
-            } else {
-                atlas.endAtlasWrite()
-                atlas.cancelPendingBackTextureBlit()
-                isInFlush = false
-                closeBracketFlag()
-                ZonvieCore.appLog("[WARNING] beginFlush: commandBuffer creation failed for atlas blit, dropping flush")
-                return .dropped
-            }
+        case .opened(let opened):
+            needsCoreInvalidation = opened.needsCoreInvalidation
+            atlasNeedsCoreInvalidation = opened.needsCoreInvalidation
+            atlasDidCpuSync = opened.didCpuSync
+            atlasSyncedWasRecreate = opened.syncedWasRecreate
+            atlasDidBlit = opened.didBlit
+            atlasPrepareUs = opened.prepareUs
+            atlasCommitUs = opened.commitUs
         }
 
         if perfEnabled {
@@ -2023,8 +2016,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// the core later called zonvie_core_abort_flush (e.g. recreateTexture failure).
     /// Clears isInFlush so commitFlush becomes a no-op, preventing stale vertices
     /// from being published under the new layout dimensions.
+    /// Put this surface's bracket back without publishing. The atlas
+    /// transaction is NOT closed here: it belongs to the flush, not to a
+    /// surface, and `ZonvieCore` closes it once for every surface.
     func abortFlush() {
-        _ = atlas.endFlushUploadTransaction()
         endBracketWithoutPublishing()
     }
 
@@ -2070,28 +2065,17 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     /// zonvie_core_get_layout while grid_mu is still held — this guarantees
     /// the values match the NDC coordinates in the committed vertices.
     @discardableResult
-    func commitFlush(drawableW: UInt32, drawableH: UInt32) -> Bool {
+    /// Publish this bracket. `publishedAtlasTexture` is the front texture the
+    /// flush's transaction swapped in — the caller closed the transaction
+    /// before calling this, for every surface at once, because a surface that
+    /// published UVs against an unswapped texture would sample the wrong
+    /// glyphs.
+    func commitFlush(drawableW: UInt32, drawableH: UInt32, publishedAtlasTexture: MTLTexture?) -> Bool {
         guard isInFlush else { return false }  // Flush was dropped or aborted
         FrameTracer.trace(.commitFlush)
 
-        // Commit staged CPU pixels while holding reader admission only across
-        // the actual texture replace. If readers or a prior blit are active,
-        // preserve staging and retry the frame without publishing its UVs.
-        guard atlas.endFlushUploadTransaction() else {
-            endBracketWithoutPublishing()
-            ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas upload writer unavailable")
-            return false
-        }
-
         // Atomically commit atlas (swap if modified) and snapshot front texture.
         // An in-flight back-sync is polled, never waited on under grid_mu.
-        let atlasCommit = atlas.commitAndSnapshotFrontTexture()
-        guard atlasCommit.committed else {
-            endBracketWithoutPublishing()
-            ZonvieCore.appLog("[MetalTerminalRenderer] commitFlush deferred: atlas back-sync still pending or failed")
-            return false
-        }
-
         let didMainWrite = mainWritePrepared
         let didCursorWrite = cursorWritePrepared
         let ws = writeSetIndex
@@ -2104,8 +2088,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // registry has its own lock and the established order is
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
-        // Also taken before `lock`: the accessor locks to read linespacePx, so
-        // reading it inside the region below would deadlock on this thread.
+        // Read here rather than inside the region below for symmetry with the
+        // line above, not out of necessity: since `linespace` moved to
+        // SharedRenderResources this accessor takes a leaf lock, so reading it
+        // under `lock` would be safe. It used to take `lock` itself, and doing
+        // this on the same thread deadlocked.
         let ledgerCellHeightPx = cellHeightPx
         lock.lock()
         let mainLayoutChanged = didMainWrite
@@ -2160,7 +2147,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
         committedDrawableW = drawableW
         committedDrawableH = drawableH
-        committedAtlasTexture = atlasCommit.texture  // same lock as vertex state
+        committedAtlasTexture = publishedAtlasTexture  // same lock as vertex state
         // Publish this bracket's smooth-scroll retention together with the
         // vertices it belongs to: a retained row shown against pre-scroll
         // content would draw the same line twice.
@@ -2330,25 +2317,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         return tex
     }
 
-    /// Forwards to GlyphAtlas.beginExternalRead(commandBuffer:snapshot:) —
-    /// see that method's doc comment. Called by an ExternalGridView right
-    /// after creating its command buffer and BEFORE creating any render
-    /// encoder that samples the atlas, passing a closure that returns the
-    /// texture reference (e.g. `{ committed.atlasTextureSnapshot }`). This
-    /// single call performs reader admission, the texture snapshot, and the
-    /// GPU-side wait-for-latest-blit encode as one atomic step under the
-    /// atlas's gate lock — splitting these into separate calls would leave a
-    /// gap where a writer's blit (and generation bump) lands between them.
-    func beginAtlasExternalRead<T>(commandBuffer cmd: MTLCommandBuffer, snapshot: () -> T?) -> T? {
-        atlas.beginExternalRead(commandBuffer: cmd, snapshot: snapshot)
-    }
-
-    /// Forwards to GlyphAtlas.endExternalRead(). Called from the
-    /// completion handler of the command buffer whose render pass was
-    /// covered by the matching beginAtlasExternalRead().
-    func endAtlasExternalRead() {
-        atlas.endExternalRead()
-    }
 
     /// Update the default Neovim background color (for clear color in viewport edges).
     /// Called from core thread during flush.
@@ -2468,11 +2436,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     func setLineSpace(px: Int32) {
-        lock.lock()
-        defer { lock.unlock() }
         // Kept signed: cellHeightPx floors the row height that results.
-        linespacePx = px
+        shared.setLineSpace(px: px)
     }
+
 
     /// Update scroll offsets for smooth scrolling.
     /// Scroll offset info for a grid (includes margin info)
@@ -3084,15 +3051,31 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // shader pass sees an advancing clock. Otherwise the shader only
             // runs on Neovim flushes and the animation appears frozen
             // between keystrokes.
-            if hasPresentedOnceSnapshot,
-               !hasNewCommit,
-               dirtyRectPxOpt == nil,
-               dirtyRows.isEmpty,
-               !anyLayerWork,
-               !smoothScrolling,
-               !blinkStateChanged,
-               !drawableSizeChanged,
-               !anyCustomShaderNeedsAnimation {
+            // Shared with ExternalGridView: SurfaceIdleTerms holds every term
+            // either surface has, and the ones this surface does not have
+            // (a staged scroll, a scroll-offset latch, an unpublished cursor
+            // flag) stay at defaults that cannot block a skip. `rowMode` is
+            // settled by the whole-grid gate above, so it passes true.
+            let idleGateSkips = SurfaceIdleTerms(
+                hasPresentedOnce: hasPresentedOnceSnapshot,
+                hasNewCommit: hasNewCommit,
+                hasDirtyRows: !dirtyRows.isEmpty,
+                hasDirtyRect: dirtyRectPxOpt != nil,
+                hasLayerWork: anyLayerWork,
+                isSmoothScrolling: smoothScrolling,
+                blinkStateChanged: blinkStateChanged,
+                drawableSizeChanged: drawableSizeChanged,
+                shaderAnimates: anyCustomShaderNeedsAnimation
+            ).skipsFrame
+            ZonvieCore.drawTrace(
+                "surface=1 gate=idle presented=\(hasPresentedOnceSnapshot ? 1 : 0)"
+                    + " newCommit=\(hasNewCommit ? 1 : 0) rect=\(dirtyRectPxOpt != nil ? 1 : 0)"
+                    + " dirty=\(dirtyRows.isEmpty ? 0 : 1) layerWork=\(anyLayerWork ? 1 : 0)"
+                    + " smooth=\(smoothScrolling ? 1 : 0) blink=\(blinkStateChanged ? 1 : 0)"
+                    + " sizeChg=\(drawableSizeChanged ? 1 : 0) anim=\(anyCustomShaderNeedsAnimation ? 1 : 0)"
+                    + " -> \(idleGateSkips ? "skip" : "draw")"
+            )
+            if idleGateSkips {
                 // Still reset redrawPending so future redraws are not blocked.
                 FrameTracer.trace(.drawSkipNoChange, a: 2)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
@@ -3726,13 +3709,36 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // avoids a full clear between scroll flushes (e.g. statusline).
             let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
                 && hasPresentedOnceSnapshot && !smoothScrolling && !drawableSizeChanged && !glowEnabled
-            let shouldReusePreviousContents = !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
+            // Shared with ExternalGridView: SurfaceLoadActionTerms holds every
+            // guard and arm either surface has. This surface has no font gate,
+            // no separate layout-damage flag and is never decorated, so those
+            // stay at defaults. `layersOutsideDirtySet` stays false on purpose
+            // — the layers this surface hosts are already inside
+            // `hasAnyDirtyInRowMode`, via `anyLayerWork`.
+            let loadTerms = SurfaceLoadActionTerms(
+                glowEnabled: glowEnabled,
+                canBlinkFastPath: canBlinkFastPath,
+                useGpuScrollCopy: useGpuScrollCopy,
+                canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
+                hasDirtyRect: dirtyRectPxOpt != nil,
+                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
+                isSmoothScrolling: smoothScrolling
+            )
+            let shouldReusePreviousContents = loadTerms.reusesPreviousContents
+            ZonvieCore.drawTrace(
+                "surface=1 gate=load glow=\(glowEnabled ? 1 : 0)"
+                    + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
+                    + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0) smooth=\(smoothScrolling ? 1 : 0)"
+                    + " rect=\(dirtyRectPxOpt != nil ? 1 : 0) rowDirty=\(hasAnyDirtyInRowMode ? 1 : 0)"
+                    + " presented=\(hasPresentedOnceSnapshot ? 1 : 0) sizeChg=\(drawableSizeChanged ? 1 : 0)"
+                    + " -> reuse=\(shouldReusePreviousContents ? 1 : 0)"
+            )
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnceSnapshot,
                 drawableSizeChanged: drawableSizeChanged,
                 shouldReusePreviousContents: shouldReusePreviousContents,
-                forceReusePreviousContents: !glowEnabled && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
+                forceReusePreviousContents: loadTerms.forcesReusePreviousContents
             )
 
             if rpd.colorAttachments[0].loadAction == .load {
@@ -3860,110 +3866,117 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
 
             // use2Pass and safeRowCount are pre-computed in Step 2 above.
 
+            // Shared with ExternalGridView: WHICH rows this pass draws is
+            // one decision now; `use2Pass` still says HOW, which is why three
+            // cases below still split on it.
+            //
+            // `rootScrollBlitVacatedBand` is false here on purpose — this
+            // surface blits for its LAYERS, whose own pass repaints them, and
+            // its root is the ext_multigrid container, which never scrolls.
+            // `hasDirtyRows` carries `anyLayerWork` because those layers are
+            // drawn from this same pass.
+            let rowPassPlan = SurfaceRowPassTerms(
+                useTwoPass: use2Pass,
+                canBlinkFastPath: canBlinkFastPath,
+                isSmoothScrolling: smoothScrolling,
+                canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
+                loadedPreviousContents: rpd.colorAttachments[0].loadAction == .load,
+                hasDirtyRows: !dirtyRows.isEmpty || anyLayerWork,
+                glowEnabled: glowEnabled,
+                drawableSizeChanged: drawableSizeChanged
+            ).plan
+
             if rowMode {
-                if use2Pass {
-                    if canBlinkFastPath {
-                        // FAST PATH: blink-only — redraw only cursor row.
-                        // Single-pass via unified blur pipeline when available;
-                        // 2-pass fallback otherwise (matches the global rule
-                        // for use2Pass branches).
-                        let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
-                        let vc = resolved.vc
-                        let vb = resolved.vb
-
-                        if let scissor = makeRowScissorRect(
-                            row: cursorGridRow,
-                            cellHeight_px: Int(cellHi),
-                            drawableWidth_px: drawableW,
-                            renderTargetWidth_px: backTex.width,
-                            renderTargetHeight_px: backTex.height
-                        ) {
-                            enc.setScissorRect(scissor)
-                            var rowTranslation = resolved.translationY
-                            if let unified = unifiedBlurPipeline {
-                                enc.setRenderPipelineState(unified)
-                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                                enc.setVertexBuffer(vb, offset: 0, index: 0)
-                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-                            } else {
-                                // Pass 1: Background (overwrite blending — erases old cursor)
-                                enc.setRenderPipelineState(backgroundPipeline!)
-                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                                enc.setVertexBuffer(vb, offset: 0, index: 0)
-                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-
-                                // Pass 2: Glyph (alpha blending — redraws text/decorations)
-                                enc.setRenderPipelineState(glyphPipeline!)
-                                enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-                                enc.setVertexBuffer(vb, offset: 0, index: 0)
-                                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vc)
-                            }
-                        }
-
-                        ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(vc) unified=\(unifiedBlurPipeline != nil)")
-                    } else if canDirtyOnlyWithBlur {
-                        // Partial redraw with .load for blur: only dirty rows are
-                        // redrawn 2-pass (overwrite bg + alpha glyph) with
-                        // scissor rects, so alpha cannot accumulate.
-                        //
-                        // Under .load a dirty row that does not repaint every
-                        // pixel it owns keeps the previous frame's, and the core
-                        // drops the root's default-background runs while the
-                        // surface has layers (flush.zig `skip_default_bg`): an
-                        // empty row is skipped entirely, and a row that still
-                        // carries a glyph emits no background quad under it and
-                        // creeps toward opaque. So band every dirty row with
-                        // backgroundPipeline first; the row's own background
-                        // quads then overwrite the band where it has any.
-                        let drawableWidthF = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
-                        let drawableHeightF = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
-                        let cellHiI = Int(cellHi)
-                        if let bgPipe = backgroundPipeline {
-                            encodeSurfaceDirtyRowBands(
-                                encoder: enc,
-                                rows: dirtyRows,
-                                pipeline: bgPipe,
-                                cellHeightPx: cellHiI,
-                                widthPx: drawableWidthF,
-                                heightPx: drawableHeightF,
-                                bgRGB: snappedBgRGB,
-                                gridId: 1
-                            )
-                        }
-                        _ = encodeSurfaceRowDraws(
+                switch rowPassPlan {
+                case .blinkFastPathRow:
+                    // FAST PATH: blink-only — redraw only cursor row.
+                    // Single-pass via unified blur pipeline when available;
+                    // 2-pass fallback otherwise (matches the global rule
+                    // for use2Pass branches).
+                    let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
+                    // Shared with ExternalGridView; only the row differs.
+                    encodeSurfaceBlinkFastPathRow(
+                        encoder: enc,
+                        row: cursorGridRow,
+                        resolved: resolved,
+                        cellHeightPx: Int(cellHi),
+                        drawableWidthPx: drawableW,
+                        renderTargetWidthPx: backTex.width,
+                        renderTargetHeightPx: backTex.height,
+                        backgroundPipeline: backgroundPipeline,
+                        glyphPipeline: glyphPipeline,
+                        unifiedBlurPipeline: unifiedBlurPipeline
+                    )
+                    ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(resolved.vc) unified=\(unifiedBlurPipeline != nil)")
+                case .dirtyRowsOnly where use2Pass:
+                    // Partial redraw with .load for blur: only dirty rows are
+                    // redrawn 2-pass (overwrite bg + alpha glyph) with
+                    // scissor rects, so alpha cannot accumulate.
+                    //
+                    // Under .load a dirty row that does not repaint every
+                    // pixel it owns keeps the previous frame's, and the core
+                    // drops the root's default-background runs while the
+                    // surface has layers (flush.zig `skip_default_bg`): an
+                    // empty row is skipped entirely, and a row that still
+                    // carries a glyph emits no background quad under it and
+                    // creeps toward opaque. So band every dirty row with
+                    // backgroundPipeline first; the row's own background
+                    // quads then overwrite the band where it has any.
+                    let drawableWidthF = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
+                    let drawableHeightF = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
+                    let cellHiI = Int(cellHi)
+                    if let bgPipe = backgroundPipeline {
+                        encodeSurfaceDirtyRowBands(
                             encoder: enc,
                             rows: dirtyRows,
-                            resolve: resolvedRowState,
-                            scissor: { row in
-                                makeRowScissorRect(
-                                    row: row,
-                                    cellHeight_px: cellHiI,
-                                    drawableWidth_px: drawableW,
-                                    renderTargetWidth_px: backTex.width,
-                                    renderTargetHeight_px: backTex.height
-                                )
-                            },
-                            pipeline: pipeline!,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
-                            useTwoPass: true,
-                            unifiedBlurPipeline: unifiedBlurPipeline
-                        )
-                    } else {
-                        // 2-Pass rendering for blur: draw backgrounds first, then glyphs
-                        // This prevents ghosting with semi-transparent backgrounds
-                        _ = encodeSurfaceRowDraws(
-                            encoder: enc,
-                            rows: smoothRowRange,
-                            resolve: resolvedSmoothRowState,
-                            pipeline: pipeline!,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
-                            useTwoPass: true,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            pipeline: bgPipe,
+                            cellHeightPx: cellHiI,
+                            widthPx: drawableWidthF,
+                            heightPx: drawableHeightF,
+                            bgRGB: snappedBgRGB,
+                            gridId: 1
                         )
                     }
-                } else if smoothScrolling {
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: dirtyRows,
+                        resolve: resolvedRowState,
+                        scissor: { row in
+                            makeRowScissorRect(
+                                row: row,
+                                cellHeight_px: cellHiI,
+                                drawableWidth_px: drawableW,
+                                renderTargetWidth_px: backTex.width,
+                                renderTargetHeight_px: backTex.height
+                            )
+                        },
+                        pipeline: pipeline!,
+                        backgroundPipeline: backgroundPipeline,
+                        glyphPipeline: glyphPipeline,
+                        useTwoPass: true,
+                        unifiedBlurPipeline: unifiedBlurPipeline
+                    )
+                case .dirtyRowsOnly:
+                    // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
+                    // Skipped when glow is enabled — full redraw needed for correct bloom composite.
+                    // Use this only when the render pass preserved clean rows.
+                    // Resize and fail-closed blur-pipeline frames use .clear;
+                    // drawing only dirty rows there would blank every other row.
+                    drawScissoredDirtyRows()
+                case .allRowsWithRetained where use2Pass:
+                    // 2-Pass rendering for blur: draw backgrounds first, then glyphs
+                    // This prevents ghosting with semi-transparent backgrounds
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: smoothRowRange,
+                        resolve: resolvedSmoothRowState,
+                        pipeline: pipeline!,
+                        backgroundPipeline: backgroundPipeline,
+                        glyphPipeline: glyphPipeline,
+                        useTwoPass: true,
+                        unifiedBlurPipeline: unifiedBlurPipeline
+                    )
+                case .allRowsWithRetained:
                     // Smooth scroll without blur: draw all rows without scissor
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
@@ -3974,16 +3987,24 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                         glyphPipeline: nil,
                         useTwoPass: false
                     )
-                } else if !glowEnabled && (!dirtyRows.isEmpty || anyLayerWork) && !drawableSizeChanged
-                            && rpd.colorAttachments[0].loadAction == .load {
-                    // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
-                    // Skipped when glow is enabled — full redraw needed for correct bloom composite.
-                    // Use this only when the render pass preserved clean rows.
-                    // Resize and fail-closed blur-pipeline frames use .clear;
-                    // drawing only dirty rows there would blank every other row.
-                    drawScissoredDirtyRows()
-                } else {
+                case .allRows:
                     // Safety: if no dirtyRows (first frame), draw all rows without scissor.
+                    _ = encodeSurfaceRowDraws(
+                        encoder: enc,
+                        rows: 0..<safeRowCount,
+                        resolve: resolvedRowState,
+                        pipeline: pipeline!,
+                        backgroundPipeline: nil,
+                        glyphPipeline: nil,
+                        useTwoPass: false
+                    )
+                case .dirtyRowsAfterScrollBlit:
+                    // Unreachable: this surface passes
+                    // `rootScrollBlitVacatedBand: false`, its root being the
+                    // container grid. Named rather than folded into a default,
+                    // so giving the root a scroll blit later lands here instead
+                    // of silently taking someone else's arm.
+                    assertionFailure("main surface has no root scroll blit")
                     _ = encodeSurfaceRowDraws(
                         encoder: enc,
                         rows: 0..<safeRowCount,
@@ -4522,50 +4543,38 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // backTex -> drawable step when configured in `.afterBloom`
             // mode. See ExternalGridView.draw for the external-grid path,
             // which drives the same chain through the same helper.
-            var customShaderHandled = false
-            if !customShaderPipelines.isEmpty,
-               customShaderPostProcess == .afterBloom,
-               let copyVB = copyVertexBuffer,
-               let bilinSamp = bilinearSampler
-            {
-                let uniforms = makeCustomShaderUniforms(
-                    screenResolution: view.drawableSize,
-                    windowOffset: .zero,
-                    windowSize: view.drawableSize
-                )
-                customShaderHandled = encodeSurfaceCustomShaderChain(
-                    cmd: cmd,
-                    pipelines: customShaderPipelines,
-                    input: backTex,
-                    output: drawable.texture,
-                    pong: customShaderPong,
-                    pongSize: view.drawableSize,
-                    copyVertexBuffer: copyVB,
-                    sampler: bilinSamp,
-                    uniforms: uniforms
-                )
-            }
+            // Shared with ExternalGridView: the chain-or-copy ladder is one
+            // function now, and the two closures are the only places the
+            // surfaces differ.
+            let presentation = encodeSurfaceBackBufferToDrawable(
+                cmd: cmd,
+                backTex: backTex,
+                drawableTexture: drawable.texture,
+                customShaderPipelines: customShaderPipelines,
+                runsCustomShaderChain: customShaderPostProcess == .afterBloom,
+                customShaderPong: customShaderPong,
+                pongSize: view.drawableSize,
+                copyPipeline: copyPipeline,
+                copyVertexBuffer: copyVertexBuffer,
+                sampler: sampler,
+                bilinearSampler: bilinearSampler,
+                makeUniforms: {
+                    makeCustomShaderUniforms(
+                        screenResolution: view.drawableSize,
+                        windowOffset: .zero,
+                        windowSize: view.drawableSize
+                    )
+                },
+                prepareCopy: { copyRPD in
+                    // Full 4-stage sampling (vertex + fragment) on the copy
+                    // pass to investigate why it measures ~2.9ms vs ~0.7ms
+                    // theoretical.
+                    attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
+                    attachGpuStatsSamples(to: copyRPD, label: "copy")
+                }
+            )
 
-            var finalCopyEncoded = customShaderHandled
-            if !customShaderHandled, let copyPipe = copyPipeline, let copyVB = copyVertexBuffer {
-                finalCopyEncoded = encodeSurfaceDrawableCopy(
-                    cmd: cmd,
-                    input: backTex,
-                    output: drawable.texture,
-                    pipeline: copyPipe,
-                    copyVertexBuffer: copyVB,
-                    sampler: sampler!,
-                    prepare: { copyRPD in
-                        // Full 4-stage sampling (vertex + fragment) on the copy
-                        // pass to investigate why it measures ~2.9ms vs ~0.7ms
-                        // theoretical.
-                        attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
-                        attachGpuStatsSamples(to: copyRPD, label: "copy")
-                    }
-                )
-            }
-
-            guard finalCopyEncoded else {
+            guard presentation.encoded else {
                 // Submit the already-encoded back-buffer work so Metal can
                 // reclaim this command buffer, but do not present an
                 // untouched drawable or consume the frame's dirty state.
@@ -4626,7 +4635,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 }
                 let dirtyPct = Double(dirtyHpx) * 100.0 / Double(drawableHpx)
                 let category: String
-                if customShaderHandled {
+                if presentation.tookCustomShaderChain {
                     category = "shader"
                 } else if smoothScrolling || useGpuScrollCopy {
                     category = "scroll"
@@ -4647,7 +4656,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     && !drawableSizeChanged
                     && !blinkStateChanged
                     && hasPresentedOnceSnapshot
-                    && !customShaderHandled
+                    && !presentation.tookCustomShaderChain
                 ZonvieCore.appLogPerf("[perf] copy_opportunity dirty_rows=\(dirtyRows.count) dirty_h_px=\(dirtyHpx) drawable_h_px=\(drawableHpx) dirty_pct=\(String(format: "%.1f", dirtyPct)) category=\(category) noop_eligible=\(noopEligible)")
             }
 
@@ -4656,14 +4665,39 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             // cursor pixels from being moved by GPU scroll-region copies.
             ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkStateSnapshot) cursorCount=\(currentCursorCount)")
             if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
-                let cursorRPD = MTLRenderPassDescriptor()
-                cursorRPD.colorAttachments[0].texture = drawable.texture
-                cursorRPD.colorAttachments[0].loadAction = .load
-                cursorRPD.colorAttachments[0].storeAction = .store
-
-                attachGpuPerfSamples(to: cursorRPD, label: "cursor")
-                attachGpuStatsSamples(to: cursorRPD, label: "cursor")
-                guard let cursorEnc = cmd.makeRenderCommandEncoder(descriptor: cursorRPD) else {
+                // Shared with ExternalGridView. The two closures below are the
+                // only places the surfaces differ: perf samples, and an array
+                // of per-grid offsets where an external surface binds one.
+                let cursorEncoded = encodeSurfaceCursorOverlay(
+                    cmd: cmd,
+                    drawableTexture: drawable.texture,
+                    pipeline: pipeline!,
+                    atlasTexture: atlasTex,
+                    sampler: sampler!,
+                    viewportMetrics: viewportMetrics,
+                    cursorVertexBuffer: cvb,
+                    cursorVertexCount: currentCursorCount,
+                    layerOriginPx: cursorLayerOriginSnapshot,
+                    backgroundAlphaBuffer: backgroundAlphaBuffer,
+                    cursorBlinkBuffer: cursorBlinkBuffer,
+                    fixedFloatBands: fixedFloatBandsSnapshot,
+                    // mask a scrolling cursor under a fixed float
+                    fixedFloatIntervals: fixedFloatIntervalsSnapshot,
+                    prepare: { cursorRPD in
+                        attachGpuPerfSamples(to: cursorRPD, label: "cursor")
+                        attachGpuStatsSamples(to: cursorRPD, label: "cursor")
+                    },
+                    bindScrollOffsets: { cursorEnc in
+                        bindSurfaceScrollOffsets(
+                            encoder: cursorEnc,
+                            offsets: scrollSnapshot,
+                            device: device,
+                            scratchBuffer: &committedCursor.cursorScrollOffsetBuffer,
+                            scratchCapacity: &committedCursor.cursorScrollOffsetBufferCap
+                        )
+                    }
+                )
+                if !cursorEncoded {
                     // The drawable copy was encoded, but presenting it without
                     // the requested cursor would consume cursor_rev and leave a
                     // visibly incomplete transaction. Submit the already-
@@ -4689,38 +4723,6 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     bailWithoutSubmit("cursor encoder creation failed")
                     return
                 }
-                viewportMetrics.applyViewport(to: cursorEnc)
-                cursorEnc.setRenderPipelineState(pipeline!)
-                if let tex = atlasTex {
-                    cursorEnc.setFragmentTexture(tex, index: 0)
-                }
-                cursorEnc.setFragmentSamplerState(sampler!, index: 0)
-
-                bindSurfaceScrollOffsets(encoder: cursorEnc, offsets: scrollSnapshot, device: device, scratchBuffer: &committedCursor.cursorScrollOffsetBuffer, scratchCapacity: &committedCursor.cursorScrollOffsetBufferCap)
-                bindSurfaceFragmentState(
-                    encoder: cursorEnc,
-                    viewportMetrics: viewportMetrics,
-                    backgroundAlphaBuffer: backgroundAlphaBuffer,
-                    cursorBlinkBuffer: cursorBlinkBuffer,
-                    cursorBlinkVisible: true,
-                    fixedFloatBands: fixedFloatBandsSnapshot,
-                    fixedFloatIntervals: fixedFloatIntervalsSnapshot  // mask a scrolling cursor under a fixed float
-                )
-                var zeroTranslation: Float = 0
-                cursorEnc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
-                // The cursor is in its own layer's pixel space, which
-                // applyViewport above set to the root layer's.
-                bindLayerTransform(
-                    encoder: cursorEnc,
-                    LayerTransform(
-                        originPx: cursorLayerOriginSnapshot,
-                        extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
-                    )
-                )
-
-                cursorEnc.setVertexBuffer(cvb, offset: 0, index: 0)
-                cursorEnc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
-                cursorEnc.endEncoding()
             }
 
             if FrameTracer.enabled {
@@ -5057,7 +5059,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         // Create main pipeline state (this requires XPC compiler service)
         do {
             ZonvieCore.appLog("[Renderer] Creating pipeline state via XPC compiler...")
-            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            shared.pipeline = try device.makeRenderPipelineState(descriptor: desc)
             ZonvieCore.appLog("[Renderer] Pipeline created successfully!")
         } catch {
             initializationError = "Failed to make pipeline state: \(error)"
@@ -5077,7 +5079,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
+            shared.copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
             ZonvieCore.appLog("[Renderer] Copy pipeline created successfully!")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make copy pipeline: \(error)")
@@ -5142,8 +5144,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            backgroundPipeline = try device.makeRenderPipelineState(descriptor: bgDesc)
-            glyphPipeline = try device.makeRenderPipelineState(descriptor: glyphDesc)
+            shared.backgroundPipeline = try device.makeRenderPipelineState(descriptor: bgDesc)
+            shared.glyphPipeline = try device.makeRenderPipelineState(descriptor: glyphDesc)
             ZonvieCore.appLog("[Renderer] 2-pass pipelines created for blur support")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
@@ -5163,11 +5165,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 a.isBlendingEnabled = false  // shader does manual alpha blend via tile read
             }
             do {
-                unifiedBlurPipeline = try device.makeRenderPipelineState(descriptor: uDesc)
+                shared.unifiedBlurPipeline = try device.makeRenderPipelineState(descriptor: uDesc)
                 ZonvieCore.appLog("[Renderer] unified blur pipeline created (1-pass programmable blending)")
             } catch {
                 ZonvieCore.appLog("[Renderer] WARNING: unified blur pipeline build failed; 2-pass fallback in use: \(error)")
-                unifiedBlurPipeline = nil
+                shared.unifiedBlurPipeline = nil
             }
         } else {
             ZonvieCore.appLog("[Renderer] WARNING: ps_unified_blur shader not found; 2-pass fallback in use")
@@ -5273,11 +5275,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            glowExtractPipeline = try device.makeRenderPipelineState(descriptor: extractDesc)
-            glowOccludePipeline = try device.makeRenderPipelineState(descriptor: occludeDesc)
-            kawaseDownPipeline = try device.makeRenderPipelineState(descriptor: kawaseDownDesc)
-            kawaseUpPipeline = try device.makeRenderPipelineState(descriptor: kawaseUpDesc)
-            glowCompositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)
+            shared.glowExtractPipeline = try device.makeRenderPipelineState(descriptor: extractDesc)
+            shared.glowOccludePipeline = try device.makeRenderPipelineState(descriptor: occludeDesc)
+            shared.kawaseDownPipeline = try device.makeRenderPipelineState(descriptor: kawaseDownDesc)
+            shared.kawaseUpPipeline = try device.makeRenderPipelineState(descriptor: kawaseUpDesc)
+            shared.glowCompositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)
             ZonvieCore.appLog("[Renderer] Bloom pipelines created successfully")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to create bloom pipelines: \(error)")
@@ -5291,7 +5293,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             samplerDesc.mipFilter = .notMipmapped
             samplerDesc.sAddressMode = .clampToEdge
             samplerDesc.tAddressMode = .clampToEdge
-            bilinearSampler = device.makeSamplerState(descriptor: samplerDesc)
+            shared.bilinearSampler = device.makeSamplerState(descriptor: samplerDesc)
         }
 
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
@@ -5578,10 +5580,10 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         pixelFormat: MTLPixelFormat
     ) {
         let config = ZonvieConfig.shared.shaders
-        customShaderPostProcess = config.postProcess
-        customShaderPipelines.removeAll()
-        customShaderPipelinesDecorated.removeAll()
-        anyCustomShaderNeedsAnimation = false
+        shared.customShaderPostProcess = config.postProcess
+        shared.customShaderPipelines.removeAll()
+        shared.customShaderPipelinesDecorated.removeAll()
+        shared.anyCustomShaderNeedsAnimation = false
         if !config.enabled || config.paths.isEmpty {
             return
         }
@@ -5600,9 +5602,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 pixelFormat: pixelFormat,
                 preserveAlpha: config.preserveAlpha
             ) {
-                customShaderPipelines.append(pipeline)
+                shared.customShaderPipelines.append(pipeline)
                 if pipeline.needsAnimation {
-                    anyCustomShaderNeedsAnimation = true
+                    shared.anyCustomShaderNeedsAnimation = true
                 }
             }
         }
@@ -5621,11 +5623,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     pixelFormat: pixelFormat,
                     preserveAlpha: false
                 ) {
-                    customShaderPipelinesDecorated.append(pipeline)
+                    shared.customShaderPipelinesDecorated.append(pipeline)
                 }
             }
         } else {
-            customShaderPipelinesDecorated = customShaderPipelines
+            shared.customShaderPipelinesDecorated = customShaderPipelines
         }
         ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
     }
@@ -5686,8 +5688,8 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         copyDesc.binaryArchives = [archive]
 
         do {
-            pipeline = try device.makeRenderPipelineState(descriptor: desc)
-            copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
+            shared.pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            shared.copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
             ZonvieCore.appLog("[Renderer] All pipelines loaded from archive successfully")
             return true
         } catch {
@@ -5817,7 +5819,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
         s.mipFilter = .notMipmapped
         s.sAddressMode = .clampToEdge
         s.tAddressMode = .clampToEdge
-        sampler = device.makeSamplerState(descriptor: s)
+        shared.sampler = device.makeSamplerState(descriptor: s)
     }
 
     /// Build vertex buffer for fullscreen quad copy (replaces Blit)
@@ -5837,7 +5839,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
             -1.0,  1.0,  0.0, 0.0,  // top-left
         ]
         let size = vertices.count * MemoryLayout<Float>.stride
-        copyVertexBuffer = device.makeBuffer(bytes: &vertices, length: size, options: .storageModeShared)
+        shared.copyVertexBuffer = device.makeBuffer(bytes: &vertices, length: size, options: .storageModeShared)
     }
 
     // safeNeededBytes / growCapacity are provided by MetalTypes.swift as

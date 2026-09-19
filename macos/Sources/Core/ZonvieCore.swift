@@ -54,11 +54,24 @@ final class ZonvieCore {
     // Wire this from ViewController.
     weak var terminalView: MetalTerminalView? {
         didSet {
+            if let renderer = terminalView?.renderer {
+                // Held directly, not reached through the view: the atlas
+                // transaction is the flush's, and on_flush_end must be able to
+                // close it even if the main window has gone. Strong, because
+                // nothing else owns it once the view is torn down and a
+                // half-open transaction would wedge the atlas's writer gate.
+                sharedResources = renderer.shared
+            }
             if terminalView != nil {
                 processPendingExternalWindows()
             }
         }
     }
+
+    /// The GPU objects every surface borrows, including the glyph atlas and its
+    /// per-flush upload transaction. Set when the first surface's renderer is
+    /// registered; see `terminalView`'s observer.
+    private var sharedResources: SharedRenderResources?
 
     static var appLogEnabled = false
     /// When true, only [perf...] tagged lines reach the on_log callback at the
@@ -85,6 +98,34 @@ final class ZonvieCore {
     static func renderTrace(_ message: @autoclosure () -> String) {
         guard appLogEnabled && appLogVerbose && !appLogPerfOnly && !appLogScrollOnly else { return }
         appLog("[render_trace] side=macos \(message())")
+    }
+
+    /// Whether `drawTrace` emits. Its own gate, deliberately NOT `verbose`:
+    /// verbose costs 1-2 ms per flush and perturbs the very timing a draw
+    /// trace records, and only two of the suite's fixtures set it. An
+    /// environment variable rather than a config key, because a config key is
+    /// a field in the core's config view — an ABI change this work does not
+    /// make, for an instrument no user sets.
+    static let drawTraceEnabled: Bool =
+        ProcessInfo.processInfo.environment["ZONVIE_DRAW_TRACE"] == "1"
+
+    /// One decision a draw took, as the terms it read and the outcome it
+    /// reached — NOT what the frame ended up containing.
+    ///
+    /// The distinction is the whole point. A frame's composition depends on
+    /// which commits landed before it, and that depends on a 2 ms main-thread
+    /// guard-band spin, on `hadRecentCommit`'s wall clock, and on when an
+    /// animated shader asked for the next frame. Two runs of one scenario
+    /// coalesce different flush sets into a frame, so `rows=` and `bands=`
+    /// differ run to run on identical source and cannot be compared.
+    ///
+    /// A gate's inputs and its outcome are a property of the decision
+    /// function instead. Comparing "for every (gate, input tuple) seen, the
+    /// outcome matched" is falsifiable across a refactor; comparing frames is
+    /// not.
+    static func drawTrace(_ message: @autoclosure () -> String) {
+        guard drawTraceEnabled else { return }
+        appLog("[dtrace] \(message())")
     }
     static var appLogFilePath: String? = nil
     private static var logFileHandle: FileHandle? = nil
@@ -137,6 +178,11 @@ final class ZonvieCore {
     /// generation they were never told about leaves them drawing stale rows
     /// against a rebuilt atlas. guifont was the only caller, which left the
     /// backing-scale rebuild — same field, same clearCaches — unannounced.
+    ///
+    /// The MAIN surface is deliberately not here; see the design spec's §4.3.
+    /// Its root grid is the ext_multigrid container, so "every row regenerated"
+    /// — the condition `commitGeneration` requires to publish a new generation
+    /// — never holds for it, and the gate would latch stale forever.
     @discardableResult
     func stageFontGenerationOnExternalSurfaces(_ generation: UInt64) -> [ExternalGridView] {
         externalGridViewsLock.lock()
@@ -422,7 +468,7 @@ final class ZonvieCore {
     // and stashes any guifont payload that arrives before that point.
     //
     // The RPC thread reads firstPresentDone (and writes pendingGuiFontPayload)
-    // from onGuiFont; MetalTerminalRenderer flips firstPresentDone to true from
+    // from onGuiFont; GridSurfaceRenderer flips firstPresentDone to true from
     // its first present-completed handler (dispatched to main). Both fields
     // are guarded by pendingGuiFontLock so the test/store sequences are
     // atomic with respect to each other.
@@ -1100,6 +1146,7 @@ final class ZonvieCore {
                     if let renderer = me.terminalView?.renderer,
                        renderer.glyphAtlas.needsAtlasRebuildPending {
                         renderer.abortFlush()
+                        me.sharedResources?.abortFlushTransaction()
                         zonvie_core_abort_flush(corePtr)
                         me.externalFlushAborted = true
                         me.scheduleFlushRetry()
@@ -1185,6 +1232,7 @@ final class ZonvieCore {
                         zonvie_core_abort_flush(corePtr)
                     }
                     me.terminalView?.renderer.abortFlush()
+                    me.sharedResources?.abortFlushTransaction()
                     for gridView in me.extViewsScratch {
                         gridView.cancelFlush()
                     }
@@ -1203,12 +1251,40 @@ final class ZonvieCore {
                 if let corePtr = me.core {
                     zonvie_core_get_layout(corePtr, &dw, &dh, nil, nil)
                 }
-                let mainCommitted = me.terminalView?.renderer.commitFlush(drawableW: dw, drawableH: dh) ?? false
+                // Close the atlas transaction BEFORE any surface publishes.
+                // The gate is the transaction, not a surface: a deferred close
+                // means nobody may publish UVs that address the texture it did
+                // not swap. This used to be the main renderer's commitFlush
+                // returning false, which read as "the main window is special"
+                // and made `terminalView == nil` abort every flush forever.
+                let publishedAtlasTexture: MTLTexture?
+                switch me.sharedResources?.endFlushTransaction() ?? .deferred("no shared resources") {
+                case .deferred(let reason):
+                    // The back-sync is still in flight (or failed). Retry after
+                    // grid_mu is released rather than waiting for the GPU here.
+                    ZonvieCore.appLog("[flush] deferred: \(reason)")
+                    me.terminalView?.renderer.abortFlush()
+                    for gridView in me.extViewsScratch {
+                        gridView.cancelFlush()
+                    }
+                    me.extViewsScratch.removeAll(keepingCapacity: true)
+                    if let corePtr = me.core {
+                        zonvie_core_abort_flush(corePtr)
+                    }
+                    me.scheduleFlushRetry()
+                    return
+                case .published(let texture):
+                    publishedAtlasTexture = texture
+                }
+
+                let mainCommitted = me.terminalView?.renderer.commitFlush(
+                    drawableW: dw, drawableH: dh,
+                    publishedAtlasTexture: publishedAtlasTexture
+                ) ?? false
                 if !mainCommitted {
-                    // The atlas back-sync command is still in flight (or failed).
-                    // Do not publish external sets whose UVs belong to this
-                    // uncommitted atlas transaction. Retry after grid_mu is
-                    // released instead of waiting for the GPU here.
+                    // The main surface's own bracket was not open (dropped or
+                    // already aborted). Its layers' sets would be published
+                    // against vertices that never landed.
                     for gridView in me.extViewsScratch {
                         gridView.cancelFlush()
                     }
@@ -3809,7 +3885,7 @@ final class ZonvieCore {
         window.setFrame(newFrame, display: true)
     }
 
-    /// Called from MetalTerminalRenderer's first present-completed handler
+    /// Called from GridSurfaceRenderer's first present-completed handler
     /// (dispatched to main). Marks the firstPresentDone flag and applies any
     /// guifont payload that was deferred from onGuiFont.
     func markFirstPresentDone() {
@@ -4029,6 +4105,7 @@ final class ZonvieCore {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=\(gridView.gridId)")
             externalFlushAborted = true
             terminalView?.renderer.abortFlush()
+            sharedResources?.abortFlushTransaction()
             if let core {
                 zonvie_core_abort_flush(core)
             }
@@ -4733,8 +4810,8 @@ final class ZonvieCore {
             // Metal build is retried by the renderer with bounded backoff, so
             // a permanent failure cannot create/close NSWindows at 10 Hz.
             guard renderer.ensurePipelineReady(view: mainView),
-                  let sharedPipeline = renderer.sharedPipeline,
-                  let sharedSampler = renderer.sharedSampler else {
+                  renderer.shared.pipeline != nil,
+                  renderer.shared.sampler != nil else {
                 ZonvieCore.appLog("[external_window] renderer pipelines not ready, queuing request for gridId=\(gridId)")
                 self.queuePendingExternalWindowRequest(
                     PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration),
@@ -4794,11 +4871,7 @@ final class ZonvieCore {
                 cursorBlinkBuffer: cursorBlinkBuffer,
                 initialRows: Int(rows),
                 atlas: renderer.glyphAtlas,
-                sharedPipeline: sharedPipeline,
-                sharedBackgroundPipeline: renderer.sharedBackgroundPipeline,
-                sharedGlyphPipeline: renderer.sharedGlyphPipeline,
-                sharedUnifiedBlurPipeline: renderer.sharedUnifiedBlurPipeline,
-                sharedSampler: sharedSampler,
+                shared: renderer.shared,
                 blurEnabled: blurEnabledForGrid,
                 isDecoratedSurface: isSpecialWindow
             )
@@ -5725,7 +5798,7 @@ final class ZonvieCore {
     private struct DecoratedGridContext {
         let window: NSWindow
         let containerView: NSView
-        let renderer: MetalTerminalRenderer
+        let renderer: GridSurfaceRenderer
         let scale: CGFloat
     }
 
@@ -8899,7 +8972,7 @@ final class ZonvieCore {
     nonisolated private func onGridScroll(gridId: Int64, rowsDelta: Int) {
         // Queue the distance the content moved for this grid (thread-safe).
         // The offset is reconciled against it in processPendingScrollClears(),
-        // called from MetalTerminalRenderer.onPreDraw before each frame is
+        // called from GridSurfaceRenderer.onPreDraw before each frame is
         // rendered, so the reduction and the vertices that moved the rows reach
         // the glass together instead of a frame apart.
         ZonvieCore.appLog("[on_grid_scroll] gridId=\(gridId) rowsDelta=\(rowsDelta)")

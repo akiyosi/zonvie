@@ -354,6 +354,22 @@ pub fn build(b: *std.Build) !void {
         // back texture, and the vacated band always inside the rows the
         // caller redraws. The blit itself is checked against a real texture
         // when a Metal device exists.
+        // The one gate that decides whether a surface draws at all. Both
+        // surfaces' original chains are transcribed in the test and every
+        // assignment of their terms is enumerated against the shared one.
+        const compile_draw_gate_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_draw_gate_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_draw_gate_test.addFileArg(b.path("macos/Sources/Rendering/SurfaceDrawGate.swift"));
+        compile_draw_gate_test.addFileArg(b.path("macos/Tests/SurfaceDrawGateTests.swift"));
+        compile_draw_gate_test.addArg("-o");
+        const draw_gate_test_exe = compile_draw_gate_test.addOutputFileArg("surface-draw-gate-tests");
+        const run_draw_gate_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_draw_gate_test.addFileArg(draw_gate_test_exe);
+        test_step.dependOn(&run_draw_gate_test.step);
+
         const compile_row_scroll_blit_plan_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
         compile_row_scroll_blit_plan_test.addArgs(&.{
             "-module-cache-path",

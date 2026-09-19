@@ -486,6 +486,26 @@ test "gui:extwin_cursor_move_reuses_rows" {
     }
 }
 
+test "gui:extwin_hosted_layer_row_gating" {
+    // macOS only: ExternalGridView is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_hosted_layer_row_gating.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_blink_without_cursor_skips" {
+    // macOS only: ExternalGridView is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_blink_without_cursor_skips.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_extwin_hosted_layer_glow" {
     // macOS only: it enumerates the app's OS windows and captures a
     // non-main one, and the bloom path under test is macOS frontend code.
@@ -509,7 +529,7 @@ test "gui:main_float_mouse_disabled_scroll" {
 }
 
 test "gui:main_cursor_move_reuses_rows" {
-    // macOS only: MetalTerminalRenderer is macOS frontend code.
+    // macOS only: GridSurfaceRenderer is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {
         try requirePrereqs();
         try @import("scenarios/macos/main_cursor_move_reuses_rows.zig").run(testing.allocator);

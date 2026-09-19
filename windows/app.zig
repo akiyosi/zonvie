@@ -2771,7 +2771,7 @@ pub const ScrollShiftResult = struct {
 /// Apply scroll pixel shift to back_tex, shift row_vbs, and add cursor ghost
 /// rows to rows_to_draw.  Shared between main window and external windows.
 /// macOS equivalent: encodePendingMainRowScrollCopy + dirty row expansion
-/// in MetalTerminalRenderer.draw().
+/// in GridSurfaceRenderer.draw().
 /// When fast path is blocked (no scroll_rect), both platforms skip this
 /// entirely and redraw all dirty rows from scratch.
 ///
@@ -4910,7 +4910,7 @@ pub const App = struct {
     // Reset by paths that invalidate back_tex content: swapchain resize (real
     // dimension change), font/linespace/DPI changes that shift cell metrics
     // without necessarily resizing the swapchain. macOS analogue:
-    // hasPresentedOnce on MetalTerminalRenderer.
+    // hasPresentedOnce on GridSurfaceRenderer.
     back_tex_valid: bool = false,
 
     linespace_px: i32 = 0,

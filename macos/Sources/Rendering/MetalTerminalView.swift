@@ -8,7 +8,7 @@ import MetalKit
 typealias KeyRepeatOwner = NSView & NSTextInputClient
 
 final class MetalTerminalView: MTKView {
-    var renderer: MetalTerminalRenderer!
+    var renderer: GridSurfaceRenderer!
 
     /// Expose drawable size without requiring MetalKit import at call site.
     var currentDrawableSize: CGSize { drawableSize }
@@ -56,14 +56,14 @@ final class MetalTerminalView: MTKView {
     // removeAll(keepingCapacity: true) instead of building fresh arrays
     // (compactMap/etc.) every call — this runs in the pre-draw path on
     // every scrolled frame.
-    private var scrollOffsetInfoScratch: [MetalTerminalRenderer.ScrollOffsetInfo] = []
+    private var scrollOffsetInfoScratch: [GridSurfaceRenderer.ScrollOffsetInfo] = []
     private var scrollOffsetStaleKeysScratch: [Int64] = []
     private var gridInfoMapScratch: [Int64: ZonvieCore.GridInfo] = [:]
     private var visibleGridIdsScratch: Set<Int64> = []
     // Reused by the fixedRects collection below; updateFixedFloatRects()
     // copies elements into the renderer's own storage rather than aliasing
     // this buffer, so reusing it here doesn't force a COW detach there.
-    private var fixedFloatRectsScratch: [MetalTerminalRenderer.FixedFloatRect] = []
+    private var fixedFloatRectsScratch: [GridSurfaceRenderer.FixedFloatRect] = []
     // Lock protecting scrollOffsetPx from concurrent access between
     // the RPC thread (processPendingScrollClears via submitVerticesRowRaw)
     // and the main thread (handleScrollInput, updateScrollShaderOffset).
@@ -302,8 +302,9 @@ final class MetalTerminalView: MTKView {
     // During rapid updates (scrolling, typing), switch MTKView to continuous
     // vsync-driven rendering to eliminate the requestRedraw → setNeedsDisplay
     // async dispatch latency.  Revert to on-demand mode after idle frames.
-    private var activeDrawIdleFrames: Int = 0
-    private let activeDrawIdleThreshold = 15
+    /// Shared with ExternalGridView (SurfaceDrawGate.swift). The threshold is
+    /// this surface's own: see DrawLoopIdleCounter on why the two differ.
+    private var idleCounter = DrawLoopIdleCounter(threshold: 15)
 
     // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
     // only while the core reports a pending deadline. Replaces the former
@@ -370,7 +371,7 @@ final class MetalTerminalView: MTKView {
     private func sendInputNow(_ text: String) {
         sendInputForHeldKey(text)
         // Keep the active draw loop alive so the response is drawn promptly.
-        activeDrawIdleFrames = 0
+        idleCounter.noteActive()
     }
 
     /// Send committed text and record it for repeat synthesis. An external
@@ -771,7 +772,7 @@ final class MetalTerminalView: MTKView {
     func activateDrawLoop() {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.window != nil else { return }
-            self.activeDrawIdleFrames = 0
+            self.idleCounter.noteActive()
             if self.isPaused {
                 ZonvieCore.appLogScrollMode("[drawloop] activate: switching to continuous rendering")
                 self.isPaused = false
@@ -789,38 +790,27 @@ final class MetalTerminalView: MTKView {
     /// Switch back to on-demand rendering (setNeedsDisplay-driven).
     private func deactivateDrawLoop() {
         guard !isPaused else { return }
-        ZonvieCore.appLogScrollMode("[drawloop] deactivate: switching to on-demand rendering (idle=\(activeDrawIdleFrames))")
+        ZonvieCore.appLogScrollMode("[drawloop] deactivate: switching to on-demand rendering (idle=\(idleCounter.idleFrames))")
         isPaused = true
         enableSetNeedsDisplay = true
     }
 
     /// Called from draw() early-return paths when no rendering was needed.
     func notifyDrawIdle() {
-        // While a synthesized key repeat is armed, the draw loop is its clock:
-        // never deactivate, even if individual frames had nothing to render
-        // (e.g. holding j at the end of the buffer).
-        if synthRepeatActive {
-            activeDrawIdleFrames = 0
-            return
-        }
-        // If a flush committed data recently (within ~50ms = ~3 vsync periods),
-        // the "idle" frame is likely a timing race: the flush completed between
-        // the draw's lock snapshot and the next vsync.  Don't count it toward
-        // deactivation, so rapid scrolling doesn't trigger premature on-demand
-        // switching that causes periodic stuttering.
-        if renderer?.hadRecentCommit(withinNs: 50_000_000) == true {
-            activeDrawIdleFrames = 0
-            return
-        }
-        activeDrawIdleFrames += 1
-        if activeDrawIdleFrames > activeDrawIdleThreshold {
+        // `heldActive`: while a synthesized key repeat is armed, the draw loop
+        // is its clock and must never stop, even on frames with nothing to
+        // render (holding j at the end of the buffer).
+        if idleCounter.noteIdle(
+            hadRecentCommit: renderer?.hadRecentCommit(withinNs: 50_000_000) == true,
+            heldActive: synthRepeatActive
+        ) {
             deactivateDrawLoop()
         }
     }
 
     /// Called from draw() when actual rendering proceeds.
     func notifyDrawActive() {
-        activeDrawIdleFrames = 0
+        idleCounter.noteActive()
     }
 
     private func drawablePxRectToViewRect(_ rectPxTopOrigin: NSRect) -> NSRect {
@@ -886,8 +876,8 @@ final class MetalTerminalView: MTKView {
         // Safe initial drawable size.
         drawableSize = CGSize(width: 1, height: 1)
 
-        guard let newRenderer = MetalTerminalRenderer(view: self) else {
-            ZonvieCore.appLog("[View] Failed to create MetalTerminalRenderer")
+        guard let newRenderer = GridSurfaceRenderer(view: self) else {
+            ZonvieCore.appLog("[View] Failed to create GridSurfaceRenderer")
             return
         }
         renderer = newRenderer
@@ -2055,7 +2045,7 @@ final class MetalTerminalView: MTKView {
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
-            scrollOffsetInfoScratch.append(MetalTerminalRenderer.ScrollOffsetInfo(
+            scrollOffsetInfoScratch.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 gridId: gridId,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
@@ -2102,7 +2092,7 @@ final class MetalTerminalView: MTKView {
                 // guard compares its own zindex against the mask segment's, so
                 // it cannot self-discard, while lower-z content scrolled in
                 // the same frame is still masked under it.
-                fixedFloatRectsScratch.append(MetalTerminalRenderer.FixedFloatRect(
+                fixedFloatRectsScratch.append(GridSurfaceRenderer.FixedFloatRect(
                     x0: Float(g.startCol) * cellW,
                     x1: Float(g.startCol + g.cols) * cellW,
                     top: Float(g.startRow) * cellHeightPx,
@@ -2112,7 +2102,7 @@ final class MetalTerminalView: MTKView {
                 // One entry beyond the representable maximum is enough to
                 // select the cell-aligned fallback; do not grow this hot-path
                 // scratch buffer with every remaining float.
-                if fixedFloatRectsScratch.count > MetalTerminalRenderer.maxFixedFloatRects { break }
+                if fixedFloatRectsScratch.count > GridSurfaceRenderer.maxFixedFloatRects { break }
             }
         }
         let fixedFloatMaskRepresentable = renderer.updateFixedFloatRects(fixedFloatRectsScratch)
@@ -2151,7 +2141,7 @@ final class MetalTerminalView: MTKView {
     ///
     /// UNREACHABLE: nothing calls this, and it is the only caller of the
     /// renderer's clearScrollOffsets — so none of that reset happens on any
-    /// surface (an external grid view has no MetalTerminalRenderer of its own).
+    /// surface (an external grid view has no GridSurfaceRenderer of its own).
     ///
     /// What it would reset is handled elsewhere: pendingRetentionReplay by
     /// commitFlush, bracketSourceShift by beginFlush, published rows by
@@ -2189,7 +2179,7 @@ final class MetalTerminalView: MTKView {
     /// Note the spans are never disarmed in practice (see
     /// clearAllScrollOffsets), so one gesture arms every grid for the session.
     private func armScrollRetention(gridId: Int64) {
-        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        guard GridSurfaceRenderer.smoothScrollEnabled, let core else { return }
         // The band a wheel event opens is as wide as the rows it moves, so the
         // retention has to keep that many to cover it.
         renderer.setRetentionDepthRows(core.getMouseScrollVer())
@@ -2611,7 +2601,7 @@ final class MetalTerminalView: MTKView {
         // row that left instead of the edge-row background stretch (the
         // neighbouring row's highlight) on grids the row-scroll fast path
         // cannot cover.
-        if MetalTerminalRenderer.smoothScrollEnabled {
+        if GridSurfaceRenderer.smoothScrollEnabled {
             scrollOffsetLock.lock()
             let offset = scrollOffsetPx[gridId] ?? 0
             let lookahead = gestureLookaheadGrids.contains(gridId)
@@ -2762,7 +2752,7 @@ final class MetalTerminalView: MTKView {
     /// driving. Idempotent on the Neovim side, but only sent once per gesture;
     /// a request that could not be issued is retried by the tick below.
     private func requestGestureSmoothScroll(gridId: Int64) {
-        guard MetalTerminalRenderer.smoothScrollEnabled, let core else { return }
+        guard GridSurfaceRenderer.smoothScrollEnabled, let core else { return }
         if smoothScrollBorrowedGrid == gridId, !smoothScrollBorrowPending { return }
         // A gesture that moved to another grid hands the old one back first.
         // Queued rather than issued once: the core refuses while the grid lock
@@ -2956,7 +2946,7 @@ final class MetalTerminalView: MTKView {
                     // which already blocks the seed. Recorded under exactly the
                     // conditions tickSmoothScroll needs to reach its clear, so
                     // a mark can never outlive the only thing that erases it.
-                    if MetalTerminalRenderer.smoothScrollEnabled, rowHeightPx > 0 {
+                    if GridSurfaceRenderer.smoothScrollEnabled, rowHeightPx > 0 {
                         reconciledThisTick.insert(gridId)
                     }
                 } else {
@@ -3001,7 +2991,7 @@ final class MetalTerminalView: MTKView {
     /// decaying second settles at one row of lag; decaying first would settle
     /// at two, which is past what the retention ring can cover.
     private func tickSmoothScroll() {
-        guard MetalTerminalRenderer.smoothScrollEnabled else { return }
+        guard GridSurfaceRenderer.smoothScrollEnabled else { return }
         let rowHeightPx = CGFloat(renderer.cellHeightPx)
         guard rowHeightPx > 0 else { return }
 
@@ -3196,7 +3186,7 @@ final class MetalTerminalView: MTKView {
 
     /// Scroll offset info for one grid, for an external window's shader update.
     /// nil when the grid is gone or its offset has settled.
-    func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> MetalTerminalRenderer.ScrollOffsetInfo? {
+    func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> GridSurfaceRenderer.ScrollOffsetInfo? {
         guard let core else { return nil }
 
         scrollOffsetLock.lock()
@@ -3212,7 +3202,7 @@ final class MetalTerminalView: MTKView {
         let gridTopPx = Float(info.startRow) * cellHeightPx
         let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
-        return MetalTerminalRenderer.ScrollOffsetInfo(
+        return GridSurfaceRenderer.ScrollOffsetInfo(
             gridId: gridId,
             offsetYPx: Float(offsetPx),
             gridTopYNDC: gridTopYNDC,
@@ -3402,7 +3392,7 @@ final class MetalTerminalView: MTKView {
     /// (viewport-margin) rows — translates via move_all, so a scroll-offset entry
     /// is all that is needed; the float's vertices are not regenerated.
     private func appendFloatScrollOffsets(
-        into offsets: inout [MetalTerminalRenderer.ScrollOffsetInfo],
+        into offsets: inout [GridSurfaceRenderer.ScrollOffsetInfo],
         grids: [ZonvieCore.GridInfo],
         gridInfoMap: [Int64: ZonvieCore.GridInfo],
         cellHeightPx: Float,
@@ -3480,7 +3470,7 @@ final class MetalTerminalView: MTKView {
 
             let gridTopPx = Float(floatGrid.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
-            offsets.append(MetalTerminalRenderer.ScrollOffsetInfo(
+            offsets.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 gridId: floatGrid.gridId,
                 offsetYPx: effectiveOffsetYPx,
                 gridTopYNDC: gridTopYNDC,

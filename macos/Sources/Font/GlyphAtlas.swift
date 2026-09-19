@@ -521,7 +521,7 @@ final class GlyphAtlas {
     // the sole writer increments it while beginAtlasWrite() holds that gate.
     private var blitGeneration: UInt64 = 0
 
-    /// Called by the writer (MetalTerminalRenderer.beginFlush's blit path)
+    /// Called by the writer (GridSurfaceRenderer.beginFlush's blit path)
     /// on the SAME command buffer as encodeBackTextureBlit, right before
     /// cmd.commit(). Must be called while still holding the write critical
     /// section (i.e. before endAtlasWrite()). Returns the generation encoded,
@@ -2260,7 +2260,7 @@ final class GlyphAtlas {
         // blocks the core thread. That automatic
         // ordering is scoped to the main renderer's OWN MTLCommandQueue --
         // it does not cover ExternalGridView's reads, each of which runs on
-        // its own separate MTLCommandQueue. The caller (MetalTerminalRenderer's
+        // its own separate MTLCommandQueue. The caller (GridSurfaceRenderer's
         // beginFlush, right before committing this blit's command buffer)
         // calls beginAtlasWrite()/endAtlasWrite() to close that gap explicitly instead
         // of relying solely on the append-only/byte-identical/fresh-texture

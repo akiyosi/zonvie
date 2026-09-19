@@ -5,7 +5,7 @@
 // `preserve_alpha`; the DECORATED set is always compiled with it OFF, because
 // an ext-cmdline / popupmenu / message surface has alpha-0 padding and
 // empty-input regions where preserving alpha makes the shader vanish
-// (MetalTerminalRenderer's customShaderPipelinesDecorated).
+// (GridSurfaceRenderer's customShaderPipelinesDecorated).
 //
 // ExternalGridView chose the decorated set for every surface it drew,
 // including ordinary editor windows given a window of their own. Those have no
