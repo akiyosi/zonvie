@@ -69,6 +69,26 @@ struct SurfaceIdleTerms {
     /// be re-encoded even with nothing else to say.
     var shaderAnimates = false
 
+    /// The decision and every term behind it, for `ZONVIE_DRAW_TRACE=1`.
+    ///
+    /// Built here rather than at the two call sites, which is where the field
+    /// sets drifted apart: each surface printed only the terms it happened to
+    /// have, so a line from one could not be read against a line from the
+    /// other. Every term is printed by every surface now, including the ones it
+    /// leaves at their defaults — a term that is structurally always 0 is
+    /// itself a fact worth seeing in the trace.
+    func traceLine(surface: Int64) -> String {
+        "surface=\(surface) gate=idle"
+            + " presented=\(hasPresentedOnce ? 1 : 0) rowMode=\(rowModeSatisfied ? 1 : 0)"
+            + " newCommit=\(hasNewCommit ? 1 : 0) cursor=\(hasCursorUpdate ? 1 : 0)"
+            + " dirty=\(hasDirtyRows ? 1 : 0) rect=\(hasDirtyRect ? 1 : 0)"
+            + " layerWork=\(hasLayerWork ? 1 : 0) scroll=\(hasStagedScroll ? 1 : 0)"
+            + " scrollOff=\(scrollOffsetChanged ? 1 : 0) smooth=\(isSmoothScrolling ? 1 : 0)"
+            + " blink=\(blinkStateChanged ? 1 : 0) sizeChg=\(drawableSizeChanged ? 1 : 0)"
+            + " anim=\(shaderAnimates ? 1 : 0)"
+            + " -> \(skipsFrame ? "skip" : "draw")"
+    }
+
     /// True when nothing this surface tracks has changed, so no frame is
     /// encoded or presented.
     var skipsFrame: Bool {
@@ -176,6 +196,22 @@ struct SurfaceLoadActionTerms {
     /// Every guard passes.
     private var guardsAllow: Bool {
         !glowEnabled && fontIsCurrent && !hasLayoutDamage && !isDecoratedSurface
+    }
+
+    /// The decision and every term behind it, for `ZONVIE_DRAW_TRACE=1`.
+    /// One field set for both surfaces — see `SurfaceIdleTerms.traceLine`.
+    func traceLine(surface: Int64) -> String {
+        "surface=\(surface) gate=load"
+            + " glow=\(glowEnabled ? 1 : 0) fontCurrent=\(fontIsCurrent ? 1 : 0)"
+            + " layout=\(hasLayoutDamage ? 1 : 0) decorated=\(isDecoratedSurface ? 1 : 0)"
+            + " layersOutside=\(layersOutsideDirtySet ? 1 : 0)"
+            + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
+            + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0) cursorOnly=\(isCursorOnlyFrame ? 1 : 0)"
+            + " reuseHosted=\(reuseHostedContents ? 1 : 0) reuseRoot=\(reuseRootContents ? 1 : 0)"
+            + " partialHosted=\(partialHostedContents ? 1 : 0)"
+            + " rect=\(hasDirtyRect ? 1 : 0) rowDirty=\(hasDirtyRowsInRowMode ? 1 : 0)"
+            + " smooth=\(isSmoothScrolling ? 1 : 0)"
+            + " -> reuse=\(reusesPreviousContents ? 1 : 0) force=\(forcesReusePreviousContents ? 1 : 0)"
     }
 
     /// `shouldReusePreviousContents`: reuse is permitted if blur does not
