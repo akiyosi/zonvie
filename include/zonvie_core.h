@@ -1641,9 +1641,15 @@ ZONVIE_API float zonvie_core_get_glow_radius_scale(zonvie_core *core);
 
    How large each of the bloom's scratch textures is, and which one every pass
    reads and writes. The chain runs at half the surface's resolution and halves
-   again at each of ZONVIE_GLOW_MIP_COUNT levels, down and then back up to the
-   extract texture the composite samples. Stateless: it depends only on the
-   surface size, so it takes no core handle.
+   again at each level, down and then back up to the extract texture the
+   composite samples. Stateless: it depends only on the surface size and the
+   radius scale, so it takes no core handle.
+
+   How deep it goes is the radius's call: a tight radius stops one level short,
+   because reaching a sixteenth of the surface makes the light redistribute on
+   every pixel of content motion. Run exactly `level_count` of `down` and then
+   `level_count` of `up`; the entries past that are padding. The extents never
+   move with the radius, so the textures need no resize when it changes.
 
    `src` and `dst` name a texture: ZONVIE_GLOW_TARGET_EXTRACT for the
    half-resolution extract texture, otherwise a mip index in
@@ -1667,12 +1673,16 @@ typedef struct zonvie_glow_chain {
     uint32_t mip_h_px[ZONVIE_GLOW_MIP_COUNT];
     zonvie_glow_pass down[ZONVIE_GLOW_MIP_COUNT];
     zonvie_glow_pass up[ZONVIE_GLOW_MIP_COUNT];
+    /* How many of down/up to run, in [1, ZONVIE_GLOW_MIP_COUNT]. */
+    uint32_t level_count;
 } zonvie_glow_chain;
 
-/* Fills *out. Does nothing when out is null. */
+/* Fills *out. Does nothing when out is null.
+   radius_scale is zonvie_core_get_glow_radius_scale()'s value. */
 ZONVIE_API void zonvie_core_glow_chain_plan(
     uint32_t surface_w_px,
     uint32_t surface_h_px,
+    float radius_scale,
     zonvie_glow_chain *out
 );
 
