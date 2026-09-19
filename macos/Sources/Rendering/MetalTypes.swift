@@ -751,6 +751,61 @@ func resolveSurfaceColorLoadAction(
 /// the array, so capacity is retained and the hot path performs no heap work.
 /// This replaces contains-per-row expansion, which was O(R²) when a scroll
 /// blit failed and the whole region had to be redrawn.
+/// Resolve one row of the range a smooth scroll draws: the grid's own rows
+/// first, then the rows retained past the edge it scrolled through.
+///
+/// Both surfaces had this written out, identical apart from the id each calls
+/// its root: a retained row belonging to a LAYER is drawn in that layer's own
+/// pass, where its transform places it, so drawing it here would put it at the
+/// root's origin. The main surface's root is grid 1; an external surface's root
+/// is its own grid id. Hence `rootGridId` rather than a literal.
+///
+/// A row whose cell height no longer matches is dropped rather than drawn: a
+/// font or linespace change invalidates the geometry the copy was built with.
+func resolveSurfaceSmoothRow(
+    logicalRow: Int,
+    retainedRowBase: Int,
+    retainedRows: [RetainedScrollRow],
+    rootGridId: Int64,
+    cellHeightPx: Int,
+    resolveRow: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?
+) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+    guard logicalRow >= retainedRowBase else { return resolveRow(logicalRow) }
+    let i = logicalRow - retainedRowBase
+    guard i < retainedRows.count else { return nil }
+    let r = retainedRows[i]
+    guard r.gridId == rootGridId else { return nil }
+    guard r.cellHeightPx == Float(cellHeightPx) else { return nil }
+    // Same relation resolveRow uses: the vertices live at sourceRow and have to
+    // appear at targetRow.
+    let translationY = Float(r.targetRow - r.sourceRow) * Float(cellHeightPx)
+    return (r.count, r.buffer, translationY)
+}
+
+/// Submit a command buffer whose encoded work is real but whose frame will not
+/// be presented, and release the frame's GPU bookkeeping once the GPU is done
+/// with it.
+///
+/// Every abandoned frame on both surfaces ends this way. The buffer has to be
+/// committed or the IOAccelerator region attached to it is never reclaimed; the
+/// in-flight semaphore has to be signalled or the next draw waits forever; and
+/// the buffer set this frame read has to be released or `beginFlush` treats it
+/// as in flight for the rest of the session. Written out at each site that was
+/// nine copies of the same steps, and the cost of getting one wrong is a
+/// permanently wedged surface.
+///
+/// `release` is supplied already built with the caller's own `[weak self]`. A
+/// strong capture here would keep the view alive until the GPU finished, while
+/// the lock and semaphore inside it are captured strongly on purpose so the
+/// signal still fires when the view is already gone.
+func submitSurfaceFrameWithoutPresenting(
+    cmd: MTLCommandBuffer,
+    release: @escaping () -> Void
+) {
+    cmd.addCompletedHandler { _ in release() }
+    cmd.commit()
+}
+
 func surfaceSortAndDeduplicateRows(_ rows: inout [Int]) {
     guard rows.count > 1 else { return }
     rows.sort()
@@ -2767,6 +2822,44 @@ func clampScissor(
     return MTLScissorRect(x: left, y: top, width: right - left, height: bottom - top)
 }
 
+/// The geometry every row this frame draws is placed with: a cell's height,
+/// how wide and tall a full-width band is, and the render target rows are
+/// clipped to.
+///
+/// All six are settled once the frame's metrics and back texture are known, and
+/// both surfaces then recomputed them at each row-drawing call site — the same
+/// `Int(cellHi)`, the same `backTex.width`/`.height`, the same
+/// `vpWidth > 0 ? vpWidth : drawableSize.width` fallback, six times each. They
+/// are decided once a frame, so they are stated once a frame.
+struct SurfaceRowGeometry {
+    let cellHeightPx: Int
+    let drawableWidthPx: Int
+    let renderTargetWidthPx: Int
+    let renderTargetHeightPx: Int
+    let bandWidthPx: Float
+    let bandHeightPx: Float
+
+    init(
+        cellHeightPx: Int,
+        renderTarget: MTLTexture,
+        viewportMetrics: SurfaceViewportMetrics,
+        drawableSize: CGSize
+    ) {
+        self.cellHeightPx = cellHeightPx
+        // Both surfaces derived this the same way from the drawable; there is
+        // no reason for either to hand it in.
+        self.drawableWidthPx = max(0, Int(drawableSize.width.rounded(.down)))
+        self.renderTargetWidthPx = renderTarget.width
+        self.renderTargetHeightPx = renderTarget.height
+        // A viewport of zero means "not resolved yet"; the drawable is the only
+        // size known to be real then.
+        let vw = viewportMetrics.viewportWidth
+        let vh = viewportMetrics.viewportHeight
+        self.bandWidthPx = Float(vw > 0 ? vw : Double(drawableSize.width))
+        self.bandHeightPx = Float(vh > 0 ? vh : Double(drawableSize.height))
+    }
+}
+
 func makeRowScissorRect(
     row: Int,
     cellHeight_px: Int,
@@ -3457,20 +3550,17 @@ func encodeSurfaceBlinkFastPathRow(
     encoder: MTLRenderCommandEncoder,
     row: Int,
     resolved: (vc: Int, vb: MTLBuffer, translationY: Float),
-    cellHeightPx: Int,
-    drawableWidthPx: Int,
-    renderTargetWidthPx: Int,
-    renderTargetHeightPx: Int,
+    geometry: SurfaceRowGeometry,
     backgroundPipeline: MTLRenderPipelineState?,
     glyphPipeline: MTLRenderPipelineState?,
     unifiedBlurPipeline: MTLRenderPipelineState?
 ) {
     guard let scissor = makeRowScissorRect(
         row: row,
-        cellHeight_px: cellHeightPx,
-        drawableWidth_px: drawableWidthPx,
-        renderTargetWidth_px: renderTargetWidthPx,
-        renderTargetHeight_px: renderTargetHeightPx
+        cellHeight_px: geometry.cellHeightPx,
+        drawableWidth_px: geometry.drawableWidthPx,
+        renderTargetWidth_px: geometry.renderTargetWidthPx,
+        renderTargetHeight_px: geometry.renderTargetHeightPx
     ) else { return }
     encoder.setScissorRect(scissor)
     var rowTranslation = resolved.translationY
@@ -3633,15 +3723,16 @@ func encodeSurfaceScissoredDirtyRows(
     rows: [Int],
     pipeline: MTLRenderPipelineState,
     resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?,
-    cellHeightPx: Int,
-    bandWidthPx: Float,
-    bandHeightPx: Float,
+    geometry: SurfaceRowGeometry,
     bgRGB: UInt32,
-    gridId: Int64,
-    drawableWidthPx: Int,
-    renderTargetWidthPx: Int,
-    renderTargetHeightPx: Int
+    gridId: Int64
 ) {
+    let cellHeightPx = geometry.cellHeightPx
+    let bandWidthPx = geometry.bandWidthPx
+    let bandHeightPx = geometry.bandHeightPx
+    let drawableWidthPx = geometry.drawableWidthPx
+    let renderTargetWidthPx = geometry.renderTargetWidthPx
+    let renderTargetHeightPx = geometry.renderTargetHeightPx
     encodeSurfaceDirtyRowBands(
         encoder: encoder,
         rows: rows,

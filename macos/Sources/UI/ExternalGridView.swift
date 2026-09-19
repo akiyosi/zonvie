@@ -2548,13 +2548,26 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // Safety defer: decrement gpuInFlight and signal semaphore on early return.
             // On normal GPU submission, the completion handler handles cleanup.
             var gpuSubmitted = false
+
+            // What this frame owes back whether it reaches the screen or not:
+            // the row set and cursor slot it read, and the in-flight slot it
+            // took. Stated once, the way GridSurfaceRenderer states it, and
+            // used by the defer below and by every path that commits encoded
+            // work it will not present. It used to be written out at six sites.
+            //
+            // `self` weakly so an abandoned frame does not keep the view alive;
+            // the lock and semaphore strongly so the release still runs when it
+            // is already gone.
+            let sem = inflightSemaphore
+            let tbLock = tripleBufferLock
+            let releaseFrameState: () -> Void = { [weak self] in
+                tbLock.lock()
+                self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
+                tbLock.unlock()
+                sem.signal()
+            }
             defer {
-                if !gpuSubmitted {
-                    inflightSemaphore.signal()
-                    tripleBufferLock.lock()
-                    completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                    tripleBufferLock.unlock()
-                }
+                if !gpuSubmitted { releaseFrameState() }
             }
 
             let committed = bufferSets[csi]
@@ -2644,8 +2657,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // term either surface has, and this surface's missing ones (a
             // dirty rect, per-layer work) stay at defaults that cannot block a
             // skip. `hasCursorUpdate` is passed as its two sources rather than
-            // the OR the trace below prints: !(a || b) == !a && !b.
-            let idleGateSkips = SurfaceIdleTerms(
+            // as the OR: !(a || b) == !a && !b.
+            let idleTerms = SurfaceIdleTerms(
                 hasPresentedOnce: hasPresentedOnce,
                 rowModeSatisfied: rowMode,
                 hasNewCommit: hasNewCommit,
@@ -2657,16 +2670,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 blinkStateChanged: blinkStateChanged,
                 drawableSizeChanged: drawableSizeChanged,
                 shaderAnimates: shaderAnimates
-            ).skipsFrame
-            ZonvieCore.drawTrace(
-                "surface=\(gridId) gate=idle rowMode=\(rowMode ? 1 : 0)"
-                    + " presented=\(hasPresentedOnce ? 1 : 0) blink=\(blinkStateChanged ? 1 : 0)"
-                    + " dirty=\(hasDirtyContent ? 1 : 0) scroll=\(hasPendingScroll ? 1 : 0)"
-                    + " sizeChg=\(drawableSizeChanged ? 1 : 0) scrollOff=\(scrollOffsetChanged ? 1 : 0)"
-                    + " cursor=\(hasCursorUpdate ? 1 : 0) smooth=\(smoothScrolling ? 1 : 0)"
-                    + " anim=\(shaderAnimates ? 1 : 0)"
-                    + " -> \(idleGateSkips ? "skip" : "draw")"
             )
+            let idleGateSkips = idleTerms.skipsFrame
+            ZonvieCore.drawTrace(idleTerms.traceLine(surface: gridId))
             if idleGateSkips {
                 FrameTracer.trace(.drawSkipNoChange, a: 2, seq: UInt32(truncatingIfNeeded: gridId))
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
@@ -2855,22 +2861,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let retainedRows = hasScrollOffset ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
             let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
+            // Shared with GridSurfaceRenderer; this surface's root is its own grid.
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                guard logicalRow >= retainedRowBase else { return resolvedRowState(logicalRow) }
-                let i = logicalRow - retainedRowBase
-                guard i < retainedRows.count else { return nil }
-                let r = retainedRows[i]
-                // A layer's retained rows belong to that layer's own pass,
-                // where its transform places them; drawing one here would put
-                // it at the root's origin. `GridSurfaceRenderer` filters on
-                // grid 1 for the same reason — this surface's root is its own
-                // grid id.
-                guard r.gridId == gridId else { return nil }
-                guard r.cellHeightPx == Float(cellHi) else { return nil }
-                // Same relation resolvedRowState uses: the vertices live at
-                // sourceRow and have to appear at targetRow.
-                let translationY = Float(r.targetRow - r.sourceRow) * Float(cellHi)
-                return (r.count, r.buffer, translationY)
+                resolveSurfaceSmoothRow(
+                    logicalRow: logicalRow,
+                    retainedRowBase: retainedRowBase,
+                    retainedRows: retainedRows,
+                    rootGridId: gridId,
+                    cellHeightPx: Int(cellHi),
+                    resolveRow: resolvedRowState
+                )
             }
 
             let canBlinkFastPath: Bool = {
@@ -2927,6 +2927,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 cmd.commit()
                 bailWithoutSubmit("atlas reader admission deferred")
                 return
+            }
+
+            // The same release, plus the atlas read this frame registered.
+            // Every bail past this point owes both; before it, only the defer's
+            // copy applies, because no read exists yet to end.
+            let releaseAbandonedFrame: () -> Void = {
+                releaseFrameState()
+                atlasReader.endExternalRead()
             }
 
             // --- GPU scroll blit (shift pixels in back buffer) ---
@@ -3084,18 +3092,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 isSmoothScrolling: smoothScrolling
             )
             let shouldReusePreviousContents = loadTerms.reusesPreviousContents
-            ZonvieCore.drawTrace(
-                "surface=\(gridId) gate=load glow=\(glowEnabled ? 1 : 0)"
-                    + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
-                    + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0) smooth=\(smoothScrolling ? 1 : 0)"
-                    + " rowDirty=\(hasAnyDirtyInRowMode ? 1 : 0)"
-                    + " presented=\(hasPresentedOnce ? 1 : 0) sizeChg=\(drawableSizeChanged ? 1 : 0)"
-                    + " fontCurrent=\(committedFontIsCurrent ? 1 : 0)"
-                    + " cursorOnly=\(cursorOnlyFrame ? 1 : 0) reuseHosted=\(reuseHostedContents ? 1 : 0)"
-                    + " reuseRoot=\(reuseRootContents ? 1 : 0) partialHosted=\(partialHostedContents ? 1 : 0)"
-                    + " decorated=\(isDecoratedSurface ? 1 : 0) layout=\(layoutDamageSnapshot ? 1 : 0)"
-                    + " -> reuse=\(shouldReusePreviousContents ? 1 : 0)"
-            )
+            ZonvieCore.drawTrace(loadTerms.traceLine(surface: gridId))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnce,
@@ -3318,15 +3315,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // than waiting for this now-empty command buffer's completion.
                     atlasReader.endExternalRead()
                     hasPresentedOnce = false
-                    let sem = inflightSemaphore
-                    let tbLock = tripleBufferLock
-                    cmd.addCompletedHandler { [weak self] _ in
-                        tbLock.lock()
-                        self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                        tbLock.unlock()
-                        sem.signal()
-                    }
-                    cmd.commit()
+                    submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                     gpuSubmitted = true
                     bailWithoutSubmit("render encoder creation failed")
                     return
@@ -3378,6 +3367,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
                     let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
                     let cellH = max(1, Int(ch.rounded(.up)))
+                    // Shared with GridSurfaceRenderer: the geometry every row
+                    // below is placed with, resolved once instead of at each
+                    // call site.
+                    let rowGeometry = SurfaceRowGeometry(
+                        cellHeightPx: cellH,
+                        renderTarget: backTex,
+                        viewportMetrics: viewportMetrics,
+                        drawableSize: view.drawableSize
+                    )
 
                     // A decorated grid's padding stays governed by the
                     // transparent render-pass clear outside the viewport; the
@@ -3388,14 +3386,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             rows: dirtyRows,
                             pipeline: pipeline,
                             resolve: resolvedRowState,
-                            cellHeightPx: cellH,
-                            bandWidthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
-                            bandHeightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                            geometry: rowGeometry,
                             bgRGB: extractRGBFromClearColor(gridClearColor),
-                            gridId: gridId,
-                            drawableWidthPx: drawableW,
-                            renderTargetWidthPx: backTex.width,
-                            renderTargetHeightPx: backTex.height
+                            gridId: gridId
                         )
                     }
 
@@ -3467,10 +3460,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             encoder: enc,
                             row: cursorRow,
                             resolved: resolved,
-                            cellHeightPx: Int(cellHi),
-                            drawableWidthPx: drawableW,
-                            renderTargetWidthPx: backTex.width,
-                            renderTargetHeightPx: backTex.height,
+                            geometry: rowGeometry,
                             backgroundPipeline: backgroundPipeline,
                             glyphPipeline: glyphPipeline,
                             unifiedBlurPipeline: unifiedBlurPipeline
@@ -3578,45 +3568,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
 
             // --- Post-process bloom (neon glow) ---
-            var glowPassSucceeded = !glowEnabled
-            if glowEnabled,
-               let extractPipe = shared.glowExtractPipeline,
-               let downPipe = shared.kawaseDownPipeline,
-               let upPipe = shared.kawaseUpPipeline,
-               let compositePipe = shared.glowCompositePipeline,
-               let copyVB = shared.copyVertexBuffer,
-               let bilinSamp = shared.bilinearSampler
-            {
-                let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
-                let intensity = mainTerminalView?.core?.getGlowIntensity() ?? 0.8
-
+            // Shared with GridSurfaceRenderer; only where the intensity and
+            // the radius are read from differs, and this surface's viewport
+            // does not start at the drawable's origin.
+            let glowPassSucceeded = encodeSurfaceBloom(
+                enabled: glowEnabled,
+                shared: shared,
+                cmd: cmd,
+                backTex: backTex,
+                pixelFormat: view.colorPixelFormat,
+                viewportMetrics: viewportMetrics,
+                drawableSize: view.drawableSize,
+                viewportOrigin: CGPoint(x: vpOriginX, y: vpOriginY),
+                glowTextures: glowTextures,
+                intensity: mainTerminalView?.core?.getGlowIntensity() ?? 0.8,
                 // One read, for both the chain's depth and the taps' reach.
-                let glowRadiusScale = mainTerminalView?.core?.getGlowRadiusScale() ?? 1.0
-                let glowChain = surfaceGlowChain(
-                    surfaceWidthPx: Int(view.drawableSize.width),
-                    surfaceHeightPx: Int(view.drawableSize.height),
-                    radiusScale: glowRadiusScale
-                )
-                if glowTextures.ensure(device: mtlDevice, chain: glowChain, pixelFormat: view.colorPixelFormat),
-                   glowTextures.ensureIntensityBuffer(device: mtlDevice) {
-                    glowPassSucceeded = encodeSurfaceBloomPasses(
-                    cmd: cmd,
-                    backTex: backTex,
-                    viewportSize: vpSize,
-                    drawableSize: view.drawableSize,
-                    viewportOrigin: CGPoint(x: vpOriginX, y: vpOriginY),
-                    layerTransform: viewportMetrics.layerTransform,
-                    glowTextures: glowTextures,
-                    extractPipeline: extractPipe,
-                    kawaseDownPipeline: downPipe,
-                    kawaseUpPipeline: upPipe,
-                    compositePipeline: compositePipe,
-                    copyVertexBuffer: copyVB,
-                    bilinearSampler: bilinSamp,
-                    intensity: intensity,
-                    chain: glowChain,
-                    radiusScale: glowRadiusScale
-                    ) { enc in
+                radiusScale: mainTerminalView?.core?.getGlowRadiusScale() ?? 1.0
+            ) { enc, extractPipe in
                     // Set up atlas and scroll offsets for extract pass.
                     // ps_glow_extract takes only texture(0) + sampler(0), but the
                     // occlusion pass drawHostedLayers runs reads the background
@@ -3666,20 +3634,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: committedCursor.vertexCount)
                     }
                     }
-                }
-            }
 
             guard glowPassSucceeded else {
-                let sem = inflightSemaphore
-                let tbLock = tripleBufferLock
-                cmd.addCompletedHandler { [weak self] _ in
-                    tbLock.lock()
-                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                    tbLock.unlock()
-                    sem.signal()
-                    atlasReader.endExternalRead()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
                 gpuSubmitted = true
                 hasPresentedOnce = false
                 bailWithoutSubmit("glow resource/encoder creation failed", restoreScroll: false)
@@ -3703,19 +3660,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 FrameTracer.trace(.drawSkipNoDrawable, seq: UInt32(truncatingIfNeeded: gridId))
                 // Capture semaphore and lock directly so the signal fires even
                 // if the view is deallocated before the GPU finishes.
-                let sem = inflightSemaphore
-                let tbLock = tripleBufferLock
-                cmd.addCompletedHandler { [weak self] _ in
-                    tbLock.lock()
-                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                    tbLock.unlock()
-                    sem.signal()
-                    // Paired with beginExternalRead() above. Uses the
-                    // strongly-captured atlasReadRenderer, not [weak self] —
-                    // see its declaration comment for why.
-                    atlasReader.endExternalRead()
-                }
-                cmd.commit()
+                // `releaseAbandonedFrame` ends the read through the strongly
+                // captured `atlasReader`, not through `self` — see
+                // beginExternalRead's declaration comment for why.
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
                 gpuSubmitted = true
                 // Rows + revision restored, scroll NOT restored: the scroll
                 // blit is already committed into backTex above; restoring it
@@ -3791,16 +3739,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // Back-buffer work is valid and must be submitted to release
                 // its Metal resources, but the drawable was not populated.
                 // Keep the consumed rows/revision pending for another draw.
-                let sem = inflightSemaphore
-                let tbLock = tripleBufferLock
-                cmd.addCompletedHandler { [weak self] _ in
-                    tbLock.lock()
-                    self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                    tbLock.unlock()
-                    sem.signal()
-                    atlasReader.endExternalRead()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
                 gpuSubmitted = true
                 hasPresentedOnce = false
                 bailWithoutSubmit("final blit encoder creation failed", restoreScroll: false)
@@ -3836,16 +3775,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     }
                 )
                 if !cursorEncoded {
-                    let sem = inflightSemaphore
-                    let tbLock = tripleBufferLock
-                    cmd.addCompletedHandler { [weak self] _ in
-                        tbLock.lock()
-                        self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
-                        tbLock.unlock()
-                        sem.signal()
-                        atlasReader.endExternalRead()
-                    }
-                    cmd.commit()
+                    submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseAbandonedFrame)
                     gpuSubmitted = true
                     hasPresentedOnce = false
                     // Main/back-buffer and scroll work is now submitted, so
@@ -3867,10 +3797,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             FrameTracer.trace(.presentCall, seq: UInt32(truncatingIfNeeded: gridId))
             cmd.present(drawable)
-            // Capture semaphore and lock directly so the signal fires even
-            // if the view is deallocated before the GPU finishes.
-            let sem = inflightSemaphore
-            let tbLock = tripleBufferLock
+            // `sem` and `tbLock` are the ones captured for `releaseFrameState`
+            // above, for the same reason: the signal has to fire even if the
+            // view is deallocated before the GPU finishes.
             cmd.addCompletedHandler { [weak self] completed in
                 tbLock.lock()
                 self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
