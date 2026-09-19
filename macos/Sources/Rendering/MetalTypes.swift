@@ -2139,6 +2139,48 @@ struct SurfaceRowStorageRetirementState {
 /// index, rather than copying row counts into the pending state, makes a
 /// repeated contraction automatically supersede an older demand without a
 /// per-frame allocation.
+/// Release one buffer set's GPU read and let any storage that was waiting on it
+/// retire.
+///
+/// Both surfaces wrote this out: the same guard against a stale or already-zero
+/// index, the same decrement, and the same retirement service call, differing
+/// only in whether the main vertex buffers retire too — an external surface has
+/// none. Getting the guard wrong strands a set as permanently in-flight, which
+/// `beginFlush` then refuses forever, so it is worth having in one place.
+func completeSurfaceGpuRead(
+    setIndex: Int,
+    gpuInFlightCount: inout [Int],
+    bufferSets: [SurfaceBufferSet],
+    committedSetIndex: Int,
+    retirement: inout SurfaceRowStorageRetirementState,
+    retireMainBuffers: Bool
+) {
+    guard setIndex >= 0,
+          setIndex < gpuInFlightCount.count,
+          gpuInFlightCount[setIndex] > 0
+    else { return }
+    gpuInFlightCount[setIndex] -= 1
+    serviceSurfaceRowStorageRetirement(
+        bufferSets: bufferSets,
+        gpuInFlightCount: gpuInFlightCount,
+        committedSetIndex: committedSetIndex,
+        layoutContracted: false,
+        state: &retirement,
+        retireMainBuffers: retireMainBuffers
+    )
+}
+
+/// Cycle the input context so the system IME candidate window picks up the
+/// current Light/Dark appearance — unless the user is mid-composition, where
+/// cycling would break the session.
+///
+/// A rule, not plumbing, and it was written out on both surfaces.
+func surfaceCycleInputContextForAppearance(_ context: NSTextInputContext?, hasMarkedText: Bool) {
+    guard let context, !hasMarkedText else { return }
+    context.deactivate()
+    context.activate()
+}
+
 func serviceSurfaceRowStorageRetirement(
     bufferSets: [SurfaceBufferSet],
     gpuInFlightCount: [Int],
