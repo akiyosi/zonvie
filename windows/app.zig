@@ -1945,6 +1945,14 @@ pub const LayerGridState = struct {
     /// moves arrays between rows without rewriting their pixels, so the draw
     /// has to offset them by the difference.
     origin_rows: std.ArrayListUnmanaged(u32) = .empty,
+    /// The origins the layer draw actually placed this frame's pixels at.
+    ///
+    /// The bloom extract runs in a third `App.mu` hold, after the draw's and
+    /// the cursor overlay's, and `content_gen` exists because a flush can
+    /// commit in between -- rewriting `origin_rows` under a frame already
+    /// drawn. Re-reading them there put the light at rows the glyphs are not
+    /// on. The draw records what it used; the extract spends that.
+    drawn_origin_rows: std.ArrayListUnmanaged(u32) = .empty,
     /// Set when rows changed since the last paint; the paint presents this
     /// layer's rect and clears it.
     dirty: bool = false,
@@ -2016,6 +2024,8 @@ pub const LayerGridState = struct {
         self.rows_buf = .empty;
         self.origin_rows.deinit(alloc);
         self.origin_rows = .empty;
+        self.drawn_origin_rows.deinit(alloc);
+        self.drawn_origin_rows = .empty;
         self.dirty_rows.deinit(alloc);
         self.dirty_rows = .{};
         self.draw_rows.deinit(alloc);
@@ -2136,6 +2146,11 @@ pub const LayerGridState = struct {
             const old_len = self.origin_rows.items.len;
             self.origin_rows.resize(alloc, need) catch return false;
             for (self.origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
+        }
+        if (self.drawn_origin_rows.items.len < need) {
+            const old_len = self.drawn_origin_rows.items.len;
+            self.drawn_origin_rows.resize(alloc, need) catch return false;
+            for (self.drawn_origin_rows.items[old_len..], old_len..) |*o, i| o.* = @intCast(i);
         }
         if (self.dirty_rows.bit_length < need) {
             self.dirty_rows.resize(alloc, need, false) catch return false;
@@ -3499,9 +3514,9 @@ pub fn rowModeViewportWidth(g: *d3d11.Renderer, params: RowModeDrawParams) u32 {
 
 /// How far a row-shift hint moved this layer row's vertices from where they
 /// were built. The layer draw and the bloom extract apply the same offset.
-fn layerRowShiftPx(state: *const LayerGridState, row_index: usize, row_h_px: i32) f32 {
-    const origin_row: u32 = if (row_index < state.origin_rows.items.len)
-        state.origin_rows.items[row_index]
+fn layerRowShiftPx(origins: []const u32, row_index: usize, row_h_px: i32) f32 {
+    const origin_row: u32 = if (row_index < origins.len)
+        origins[row_index]
     else
         @intCast(row_index);
     return @floatFromInt(
@@ -4018,8 +4033,16 @@ fn drawLayerRow(
         rv.uploaded_gen = rv.gen;
     }
     // A row-shift hint moves an array between rows without rewriting its
-    // pixels, so offset it by the distance it moved.
-    const row_dy: f32 = layerRowShiftPx(state, ri, d.row_h_px);
+    // pixels, so offset it by the distance it moved. Record the origin this
+    // used: the bloom extract reads it in a later lock hold, by which time the
+    // core may have shifted the rows again.
+    const row_dy: f32 = layerRowShiftPx(state.origin_rows.items, ri, d.row_h_px);
+    if (ri < state.drawn_origin_rows.items.len) {
+        state.drawn_origin_rows.items[ri] = if (ri < state.origin_rows.items.len)
+            state.origin_rows.items[ri]
+        else
+            @intCast(ri);
+    }
     g.setLayerTransform(d.origin_x, d.origin_y + row_dy, d.base_vp.w, d.base_vp.h);
     g.drawVB(vb, rv.verts.items.len) catch
         return .{ .encoded = encoded, .failed = true };
@@ -4442,7 +4465,9 @@ fn drawBloomRowBuffers(
                         // failed and leaves uploaded_gen behind.
                         if (rv.uploaded_gen != rv.gen) continue;
                         const vb = rv.vb orelse continue;
-                        const row_dy = layerRowShiftPx(state, ri, ctx.row_h_px);
+                        // The origins the draw placed these pixels at, not the
+                        // ones the core may have published since.
+                        const row_dy = layerRowShiftPx(state.drawn_origin_rows.items, ri, ctx.row_h_px);
                         g.setLayerTransform(origin_x, origin_y + row_dy, extent_w_px, extent_h_px);
                         g.drawVB(vb, rv.verts.items.len) catch {};
                     }

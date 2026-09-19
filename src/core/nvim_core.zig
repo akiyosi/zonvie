@@ -1098,6 +1098,9 @@ pub const Core = struct {
     glow_radius_px: f32 = 6.0,
     glow_intensity_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
     glow_hl_ids: ?std.AutoHashMap(u32, void) = null,
+    /// Attribute ids already reported by `noteGlowMiss`, so a refusal is said
+    /// once rather than per cell per frame.
+    glow_miss_seen: std.AutoHashMap(u32, void) = undefined,
     // Owned strings — each element is alloc.dupe'd from RPC response
     glow_group_names: std.ArrayListUnmanaged([]const u8) = .empty,
     // Atomic msgid for tracking pending glow config RPC request (0 = no pending)
@@ -1187,6 +1190,7 @@ pub const Core = struct {
             .log = .{ .cb = cb.on_log, .ctx = ctx },
             .grid = grid,
             .hl = Highlights.init(alloc),
+            .glow_miss_seen = std.AutoHashMap(u32, void).init(alloc),
         };
     }
 
@@ -1199,6 +1203,7 @@ pub const Core = struct {
             .log = .{ .cb = null, .ctx = null },
             .grid = Grid.init(alloc),
             .hl = Highlights.init(alloc),
+            .glow_miss_seen = std.AutoHashMap(u32, void).init(alloc),
         };
     }
 
@@ -1271,6 +1276,7 @@ pub const Core = struct {
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
         self.glow_hl_ids = null;
+        self.glow_miss_seen.deinit();
 
         // Session state.
         self.known_external_grids.deinit(self.alloc);
@@ -4929,6 +4935,34 @@ pub const Core = struct {
         // their bloom pass on. Naming groups that resolve to nothing used to
         // report enabled and then light nothing.
         self.glow_enabled.store(map.count() > 0, .release);
+
+        self.log.write("glow resolve: {d} attr ids for {d} groups\n", .{
+            map.count(),
+            self.glow_group_names.items.len,
+        });
+    }
+
+    /// Say, once per attribute id, that a cell asked to glow and was refused.
+    /// The id is what `cellGlow` actually matches on, and it is not what
+    /// `:Inspect` shows -- a group can reach the screen under several composed
+    /// ids, and only the ones the attribute table named are in the set.
+    pub fn noteGlowMiss(self: *Core, attr_id: u32) void {
+        const gop = self.glow_miss_seen.getOrPut(attr_id) catch return;
+        if (gop.found_existing) return;
+        var names_buf: [192]u8 = undefined;
+        var used: usize = 0;
+        if (self.hl.attr_names.get(attr_id)) |names| {
+            for (names) |n| {
+                if (names_buf.len - used < n.len + 1) break;
+                if (used != 0) {
+                    names_buf[used] = ',';
+                    used += 1;
+                }
+                @memcpy(names_buf[used..][0..n.len], n);
+                used += n.len;
+            }
+        }
+        self.log.write("glow miss: attr={d} names=[{s}]\n", .{ attr_id, names_buf[0..used] });
     }
 
     /// Request vim.g.zonvie_glow from Neovim via RPC.
