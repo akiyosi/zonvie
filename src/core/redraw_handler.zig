@@ -2038,6 +2038,18 @@ pub fn handleRedraw(
                     } else {
                         try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
                     }
+
+                    // ext_hlstate's fourth element: the groups this attribute
+                    // id was composed from, innermost last. `hi_name` is the
+                    // syntax group, `ui_name` the builtin the UI knows it by;
+                    // record both, because a user names either one.
+                    if (t.len >= 4 and t[3] == .arr) {
+                        for (t[3].arr) |iv| {
+                            if (iv != .map) continue;
+                            if (mapGetStr(iv.map, "hi_name")) |n| try hl.addAttrName(id_u32, n);
+                            if (mapGetStr(iv.map, "ui_name")) |n| try hl.addAttrName(id_u32, n);
+                        }
+                    }
                 }
             },
             .hl_group_set => {

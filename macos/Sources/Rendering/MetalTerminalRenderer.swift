@@ -12,6 +12,28 @@ private let metalTerminalMaxRowBuffers = 20_000
 // and the shader C ABI, and MetalTypes.swift is compiled standalone by the
 // `zig build test` Swift targets, which have neither.
 
+/// Ask the core for the bloom chain's geometry and carry it into the shape
+/// MetalTypes.swift can hold. That file is compiled on its own by `zig build
+/// test`, so the translation has to happen somewhere that can see the C ABI.
+func surfaceGlowChain(surfaceWidthPx: Int, surfaceHeightPx: Int) -> SurfaceGlowChain {
+    var c = zonvie_glow_chain()
+    zonvie_core_glow_chain_plan(UInt32(max(0, surfaceWidthPx)), UInt32(max(0, surfaceHeightPx)), &c)
+    func passes(_ tuple: (zonvie_glow_pass, zonvie_glow_pass, zonvie_glow_pass)) -> [SurfaceGlowChain.Pass] {
+        [tuple.0, tuple.1, tuple.2].map {
+            .init(src: Int($0.src), dst: Int($0.dst),
+                  dstWidthPx: Int($0.dst_w_px), dstHeightPx: Int($0.dst_h_px))
+        }
+    }
+    return .init(
+        halfWidthPx: Int(c.half_w_px),
+        halfHeightPx: Int(c.half_h_px),
+        mipWidthPx: [Int(c.mip_w_px.0), Int(c.mip_w_px.1), Int(c.mip_w_px.2)],
+        mipHeightPx: [Int(c.mip_h_px.0), Int(c.mip_h_px.1), Int(c.mip_h_px.2)],
+        down: passes(c.down),
+        up: passes(c.up)
+    )
+}
+
 extension RowScrollBlitPlan {
     /// Ask the core where this scroll's blit reads and writes. Nil means no
     /// blit is worth encoding and the caller redraws the region instead.
@@ -4261,7 +4283,11 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
                 let intensity = (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8
 
-                if glowTextures.ensure(device: device, drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat),
+                let glowChain = surfaceGlowChain(
+                    surfaceWidthPx: Int(view.drawableSize.width),
+                    surfaceHeightPx: Int(view.drawableSize.height)
+                )
+                if glowTextures.ensure(device: device, chain: glowChain, pixelFormat: view.colorPixelFormat),
                    glowTextures.ensureIntensityBuffer(device: device) {
                     glowPassSucceeded = encodeSurfaceBloomPasses(
                     cmd: cmd,
@@ -4276,7 +4302,9 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     compositePipeline: compositePipe,
                     copyVertexBuffer: copyVB,
                     bilinearSampler: bilinSamp,
-                    intensity: intensity
+                    intensity: intensity,
+                    chain: glowChain,
+                    radiusScale: (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
                     ) { enc in
                     // Extract vertices: atlas + scroll offsets + row/main + cursor
                     if let tex = atlasTex {

@@ -778,8 +778,9 @@ fragment float4 ps_glow_occlude(VSOut in [[stage_in]],
 /// Each pass halves resolution, progressively eliminating grid patterns.
 fragment float4 ps_kawase_down(CopyVSOut in [[stage_in]],
                                 texture2d<float> src [[texture(0)]],
-                                sampler samp [[sampler(0)]]) {
-    float2 halfpixel = 0.5 / float2(src.get_width(), src.get_height());
+                                sampler samp [[sampler(0)]],
+                                constant float& radiusScale [[buffer(0)]]) {
+    float2 halfpixel = (0.5 * radiusScale) / float2(src.get_width(), src.get_height());
 
     float4 sum = src.sample(samp, in.uv) * 4.0;
     sum += src.sample(samp, in.uv + float2(-halfpixel.x, -halfpixel.y));
@@ -793,8 +794,9 @@ fragment float4 ps_kawase_down(CopyVSOut in [[stage_in]],
 /// Each pass doubles resolution, accumulating smooth blur.
 fragment float4 ps_kawase_up(CopyVSOut in [[stage_in]],
                               texture2d<float> src [[texture(0)]],
-                              sampler samp [[sampler(0)]]) {
-    float2 halfpixel = 0.5 / float2(src.get_width(), src.get_height());
+                              sampler samp [[sampler(0)]],
+                              constant float& radiusScale [[buffer(0)]]) {
+    float2 halfpixel = (0.5 * radiusScale) / float2(src.get_width(), src.get_height());
 
     float4 sum = 0;
     sum += src.sample(samp, in.uv + float2(-halfpixel.x * 2.0, 0.0));

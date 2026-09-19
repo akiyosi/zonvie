@@ -1110,6 +1110,20 @@ pub const Core = struct {
         return @bitCast(self.glow_intensity_bits.load(.acquire));
     }
 
+    /// `radius` as a multiplier on the blur's tap offsets, which is the only
+    /// form a Dual Kawase chain can take it in: the chain's depth is fixed, so
+    /// what a radius buys is how far each tap reaches.
+    ///
+    /// The default radius maps to 1.0, so a config that never sets one keeps
+    /// exactly the spread the chain had before this was wired up. A smaller
+    /// radius concentrates the same light into fewer pixels, which is what
+    /// makes it brighter; the clamp keeps the taps close enough together that
+    /// the chain still reads as a blur rather than as rings.
+    pub fn getGlowRadiusScale(self: *const Core) f32 {
+        const default_radius_px: f32 = 6.0;
+        return std.math.clamp(self.glow_radius_px / default_radius_px, 0.33, 2.0);
+    }
+
     pub fn isHardRenderFailure(reason: anyerror) bool {
         return switch (reason) {
             error.GridTooLarge,
@@ -4558,8 +4572,8 @@ pub const Core = struct {
         try rpc.packInt(buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, rgb (always) + optional ext_*
-        var opt_count: u32 = 2;
+        // Option count: ext_multigrid, ext_hlstate, rgb (always) + optional ext_*
+        var opt_count: u32 = 3;
         if (self.ext_windows_enabled) opt_count += 1;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
@@ -4567,6 +4581,12 @@ pub const Core = struct {
         if (self.ext_tabline_enabled) opt_count += 1;
         try rpc.packMap(buf, self.alloc, opt_count);
         try rpc.packStr(buf, self.alloc, "ext_multigrid");
+        try rpc.packBool(buf, self.alloc, true);
+        // Without this, `hl_attr_define` carries no `info`, and a cell's
+        // attribute id cannot be traced back to the highlight groups it was
+        // composed from -- which is the only way to answer "does this cell
+        // belong to Keyword?" for `vim.g.zonvie_glow`.
+        try rpc.packStr(buf, self.alloc, "ext_hlstate");
         try rpc.packBool(buf, self.alloc, true);
         try rpc.packStr(buf, self.alloc, "rgb");
         try rpc.packBool(buf, self.alloc, true);
@@ -4878,12 +4898,37 @@ pub const Core = struct {
             return;
         }
         var map = &(self.glow_hl_ids.?);
-        for (self.glow_group_names.items) |name| {
-            if (self.hl.groups.get(name)) |hl_id| {
-                map.put(hl_id, {}) catch {};
+
+        // A cell carries an *attribute* id, so that is what has to go in the
+        // set. Walk the attribute table and take every id composed from a
+        // named group: one name spans many ids once Neovim composes a group
+        // with search, extmarks or the cursorline, and every one of those
+        // composites is still that group on screen.
+        var it = self.hl.attr_names.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.*) |attr_name| {
+                for (self.glow_group_names.items) |want| {
+                    if (std.mem.eql(u8, attr_name, want)) {
+                        map.put(entry.key_ptr.*, {}) catch {};
+                        break;
+                    }
+                }
             }
         }
-        self.glow_enabled.store(self.glow_group_names.items.len > 0, .release);
+
+        // `hl_group_set` also reports attribute ids, for the builtins the UI
+        // styles its own chrome with. Keep honouring it: it arrives before the
+        // attribute table on a fresh attach.
+        for (self.glow_group_names.items) |name| {
+            if (self.hl.groups.get(name)) |attr_id| {
+                map.put(attr_id, {}) catch {};
+            }
+        }
+
+        // Enabled means "some cell can glow", which is what the frontends gate
+        // their bloom pass on. Naming groups that resolve to nothing used to
+        // report enabled and then light nothing.
+        self.glow_enabled.store(map.count() > 0, .release);
     }
 
     /// Request vim.g.zonvie_glow from Neovim via RPC.

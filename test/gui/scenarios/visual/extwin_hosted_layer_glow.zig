@@ -192,7 +192,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // keep redraws coming until the core reports it accepted the config.
     const t_glow = try app_log.nowMs(alloc, log_path);
     try g.exec(
-        \\luaeval('(function() vim.g.zonvie_glow = { groups = "all", radius = 6, intensity = 1.0 } return 1 end)()')
+        \\luaeval('(function() vim.g.zonvie_glow = { groups = { "Search" }, radius = 6, intensity = 1.0 } return 1 end)()')
     );
     var armed = false;
     var tries: u32 = 0;

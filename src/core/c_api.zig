@@ -17,6 +17,7 @@ pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
+pub const glow_chain = @import("glow_chain.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -2079,6 +2080,24 @@ pub export fn zonvie_core_get_glow_intensity(p: ?*zonvie_core) callconv(.c) f32 
     if (p == null) return 0.0;
     const box = asBox(p.?);
     return box.core.getGlowIntensity();
+}
+
+pub export fn zonvie_core_get_glow_radius_scale(p: ?*zonvie_core) callconv(.c) f32 {
+    if (p == null) return 1.0;
+    const box = asBox(p.?);
+    return box.core.getGlowRadiusScale();
+}
+
+/// Bloom chain geometry. Stateless, like the row-scroll plan: it depends only
+/// on the surface size. The Windows frontend calls `glow_chain` directly as
+/// Zig; this exists for the macOS side.
+pub export fn zonvie_core_glow_chain_plan(
+    surface_w_px: u32,
+    surface_h_px: u32,
+    out: ?*glow_chain.Chain,
+) callconv(.c) void {
+    const dst = out orelse return;
+    dst.* = glow_chain.plan(surface_w_px, surface_h_px);
 }
 
 /// Read the current drawable/cell layout stored in core.

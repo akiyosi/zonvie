@@ -474,6 +474,11 @@ final class ZonvieCore {
         return zonvie_core_get_glow_intensity(c)
     }
 
+    func getGlowRadiusScale() -> Float {
+        guard let c = core else { return 1.0 }
+        return zonvie_core_get_glow_radius_scale(c)
+    }
+
     /// Which log tiers a line belongs to. The core Logger (src/core/log.zig)
     /// and the Windows sink (windows/app_log.zig) classify by the format
     /// string's prefix at comptime, before any formatting happens. Swift
