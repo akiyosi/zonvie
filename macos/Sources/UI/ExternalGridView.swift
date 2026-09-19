@@ -1583,6 +1583,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// this for every layer it places; an external surface used to stage
     /// nothing for the layers it hosts, which is why a float inside one jumped
     /// a whole row while the window behind it glided.
+    /// Shared with GridSurfaceRenderer (`captureSurfaceLayerScrollStep`); this
+    /// surface resolves a retained row through `captureOneLayerRetainedRow`,
+    /// which needs the cell height the capture was taken at, and guards its
+    /// state with the triple-buffer lock.
     private func captureLayerScrollStep(
         gridId id: Int64,
         sets: [SurfaceBufferSet],
@@ -1591,40 +1595,27 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         rowsDelta: Int
     ) {
         guard GridSurfaceRenderer.smoothScrollEnabled else { return }
-        tripleBufferLock.lock()
-        var stepped = bracketStagedGrids.contains(id)
-        tripleBufferLock.unlock()
-
-        let cs = sets[flushSourceSetIndex]
-        if !stepped, cs.rowState.usingRowBuffers,
-           let plan = ScrollRetention.plan(
-               rowStart: rowStart,
-               rowEnd: rowEnd,
-               rowsDelta: rowsDelta,
-               depth: retention.depthRows
-           ) {
-            retention.beginStep(gridId: id, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
-            tripleBufferLock.lock()
-            bracketStagedGrids.insert(id)
-            tripleBufferLock.unlock()
-            let capturedCellHeightPx = Float(shared.cellHeightPx ?? 0)
-            for i in 0..<plan.count {
-                let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-                captureOneLayerRetainedRow(
-                    cs: cs,
-                    gridId: id,
-                    readRow: row,
-                    targetRow: row - rowsDelta,
-                    cellHeightPx: capturedCellHeightPx
-                )
-            }
-            stepped = true
+        let capturedCellHeightPx = Float(shared.cellHeightPx ?? 0)
+        captureSurfaceLayerScrollStep(
+            gridId: id,
+            sets: sets,
+            flushSourceSetIndex: flushSourceSetIndex,
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta,
+            retention: retention,
+            lock: tripleBufferLock,
+            bracketStagedGrids: &bracketStagedGrids,
+            stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds
+        ) { cs, readRow, targetRow in
+            captureOneLayerRetainedRow(
+                cs: cs,
+                gridId: id,
+                readRow: readRow,
+                targetRow: targetRow,
+                cellHeightPx: capturedCellHeightPx
+            )
         }
-        // commitFlush publishes the seeds only when a step was staged.
-        guard stepped, abs(rowsDelta) == 1 else { return }
-        tripleBufferLock.lock()
-        stagedSmoothScrollSeeds.append((gridId: id, rowsDelta: rowsDelta))
-        tripleBufferLock.unlock()
     }
 
     /// One row of `captureLayerScrollStep`, read out of the layer's own set.
