@@ -1151,6 +1151,43 @@ pub export fn zonvie_core_band_layer_rows(
     return true;
 }
 
+/// Layout must match `zonvie_row_scroll_merge` in include/zonvie_core.h.
+pub const RowScrollMergeC = extern struct {
+    staged: row_scroll.Staged,
+    superseded: row_scroll.Staged,
+    has_superseded: u32,
+    _pad: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(row_scroll.Staged) != 7 * 4) @compileError("zonvie_row_scroll layout drifted from the header");
+    if (@offsetOf(RowScrollMergeC, "has_superseded") != 14 * 4) @compileError("field order drifted from the header");
+}
+
+/// Fold a row scroll into whatever is staged for the same grid. `existing` is
+/// null when nothing is staged.
+pub export fn zonvie_core_row_scroll_merge(
+    existing: ?*const row_scroll.Staged,
+    incoming: ?*const row_scroll.Staged,
+    out: ?*RowScrollMergeC,
+) callconv(.c) bool {
+    const inc = incoming orelse return false;
+    const dst = out orelse return false;
+    const merged = row_scroll.mergeStaged(
+        if (existing) |e| e.* else null,
+        inc.*,
+    );
+    dst.staged = merged.staged;
+    if (merged.superseded) |sup| {
+        dst.superseded = sup;
+        dst.has_superseded = 1;
+    } else {
+        dst.superseded = std.mem.zeroes(row_scroll.Staged);
+        dst.has_superseded = 0;
+    }
+    return true;
+}
+
 /// Layout must match `zonvie_over_blit_rows` in include/zonvie_core.h. The
 /// core answers in Zig optionals; C gets a flag beside each range.
 pub const OverBlitRowsC = extern struct {
