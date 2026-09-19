@@ -1201,6 +1201,12 @@ fn drawNormalExternalSurfaceRowMode(
         const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
         // drawBloomRowsOverlay takes app.mu itself for the layer storage it
         // reads; app.mu must be free here.
+        // The blur reads this from the renderer rather than the call, so it
+        // has to be current before the passes run.
+        g.glow_radius_scale = if (app.corep) |cp|
+            core.zonvie_core_get_glow_radius_scale(cp)
+        else
+            1.0;
         app_mod.drawBloomRowsOverlay(
             g,
             tbs_committed.row_map.items,

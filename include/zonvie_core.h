@@ -1629,6 +1629,53 @@ ZONVIE_API bool zonvie_core_get_glow_enabled(zonvie_core *core);
 // Safe to call from any thread.
 ZONVIE_API float zonvie_core_get_glow_intensity(zonvie_core *core);
 
+// Query `vim.g.zonvie_glow.radius` as a multiplier (0.33–2.0) on the blur's
+// tap offsets. A Dual Kawase chain has a fixed depth, so a radius can only
+// change how far each tap reaches; multiply the half-pixel offset of every
+// downsample and upsample tap by this. The default radius returns exactly 1.0.
+// Safe to call from any thread.
+ZONVIE_API float zonvie_core_get_glow_radius_scale(zonvie_core *core);
+
+/* ---------------------------------------------------------------------------
+   Bloom chain geometry.
+
+   How large each of the bloom's scratch textures is, and which one every pass
+   reads and writes. The chain runs at half the surface's resolution and halves
+   again at each of ZONVIE_GLOW_MIP_COUNT levels, down and then back up to the
+   extract texture the composite samples. Stateless: it depends only on the
+   surface size, so it takes no core handle.
+
+   `src` and `dst` name a texture: ZONVIE_GLOW_TARGET_EXTRACT for the
+   half-resolution extract texture, otherwise a mip index in
+   [0, ZONVIE_GLOW_MIP_COUNT). Every extent is floored at one pixel, because a
+   surface narrow enough for a level to round to zero still has to produce a
+   texture the passes can bind. */
+#define ZONVIE_GLOW_MIP_COUNT 3
+#define ZONVIE_GLOW_TARGET_EXTRACT (-1)
+
+typedef struct zonvie_glow_pass {
+    int32_t src;
+    int32_t dst;
+    uint32_t dst_w_px;
+    uint32_t dst_h_px;
+} zonvie_glow_pass;
+
+typedef struct zonvie_glow_chain {
+    uint32_t half_w_px;
+    uint32_t half_h_px;
+    uint32_t mip_w_px[ZONVIE_GLOW_MIP_COUNT];
+    uint32_t mip_h_px[ZONVIE_GLOW_MIP_COUNT];
+    zonvie_glow_pass down[ZONVIE_GLOW_MIP_COUNT];
+    zonvie_glow_pass up[ZONVIE_GLOW_MIP_COUNT];
+} zonvie_glow_chain;
+
+/* Fills *out. Does nothing when out is null. */
+ZONVIE_API void zonvie_core_glow_chain_plan(
+    uint32_t surface_w_px,
+    uint32_t surface_h_px,
+    zonvie_glow_chain *out
+);
+
 // Read the current drawable/cell layout stored in core.
 // Intended for use from on_flush_end callback (grid_mu is held, so the
 // returned values match exactly what was used for the flush's NDC computation).

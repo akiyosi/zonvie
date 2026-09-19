@@ -2184,6 +2184,7 @@ pub export fn WndProc(
                 // not acquire grid_mu from the UI paint path.
                 const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
                 const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
+                const glow_radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else @as(f32, 1.0);
 
                 // The atlas transaction must cover the TBS and atlas snapshots,
                 // not only the eventual draw. Otherwise a reset can commit
@@ -3591,6 +3592,9 @@ pub export fn WndProc(
                                 &[_]core.Vertex{};
                             // drawBloomRowsOverlay takes app.mu itself for the
                             // layer storage it reads; app.mu must be free here.
+                            // The blur reads this from the renderer rather than the call, so it
+                            // has to be current before the passes run.
+                            g.glow_radius_scale = glow_radius_scale;
                             app_mod.drawBloomRowsOverlay(
                                 g,
                                 committed.row_map.items,

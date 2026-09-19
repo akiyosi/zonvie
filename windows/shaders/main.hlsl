@@ -387,11 +387,20 @@ float4 PSGlowExtract(VSOut i) : SV_Target {
 Texture2D glowTex : register(t1);
 SamplerState glowSamp : register(s1);
 
+// Bound for every bloom pass after extract. `glowRadiusScale` stretches the
+// Kawase tap offsets: the chain's depth is fixed, so reach per tap is the only
+// thing a radius can change. 1.0 is the default radius.
+cbuffer GlowParams : register(b0) {
+    float glowIntensity;
+    float glowRadiusScale;
+    float2 _pad;
+};
+
 // Dual Kawase downsample (5 taps)
 float4 PSKawaseDown(FSQuadVSOut i) : SV_Target {
     uint w, h;
     glowTex.GetDimensions(w, h);
-    float2 halfpixel = 0.5 / float2(w, h);
+    float2 halfpixel = (0.5 * glowRadiusScale) / float2(w, h);
 
     float4 sum = glowTex.Sample(glowSamp, i.uv) * 4.0;
     sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x, -halfpixel.y));
@@ -405,7 +414,7 @@ float4 PSKawaseDown(FSQuadVSOut i) : SV_Target {
 float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
     uint w, h;
     glowTex.GetDimensions(w, h);
-    float2 halfpixel = 0.5 / float2(w, h);
+    float2 halfpixel = (0.5 * glowRadiusScale) / float2(w, h);
 
     float4 sum = 0;
     sum += glowTex.Sample(glowSamp, i.uv + float2(-halfpixel.x * 2.0, 0.0));
@@ -419,12 +428,6 @@ float4 PSKawaseUp(FSQuadVSOut i) : SV_Target {
     return sum / 12.0;
 }
 
-// Glow composite: blend blurred glow onto back buffer with additive blending.
-// Pipeline uses additive blend state (ONE, ONE), so we just scale by intensity.
-cbuffer GlowParams : register(b0) {
-    float glowIntensity;
-    float3 _pad;
-};
 
 float4 PSGlowComposite(FSQuadVSOut i) : SV_Target {
     return glowTex.Sample(glowSamp, i.uv) * glowIntensity;
