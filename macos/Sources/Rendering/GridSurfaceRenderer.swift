@@ -443,6 +443,79 @@ func encodeSurfaceBloom(
     )
 }
 
+/// Stage a row scroll on the WRITE set, merging it into one already staged for
+/// the same region.
+///
+/// Staging on the write set rather than straight onto a per-grid accumulator is
+/// what stops a draw() interleaving before commitFlush from consuming a delta
+/// whose vertices are not committed yet — and, if the bracket is then
+/// cancelled, from keeping that mis-shifted frame permanently.
+///
+/// When the region changes inside one bracket the older shift can no longer be
+/// represented, but its row slots were already remapped, so the rows it covered
+/// are handed to `dirtySupersededRows` to redraw post-remap. Each caller keeps
+/// its own guard on when staging is allowed at all.
+///
+/// The merge itself is the core's (`src/core/row_scroll.zig` `mergeStaged`),
+/// beside the blit plan it feeds. Three implementations of this rule were
+/// found and they did not agree — see that function's comment. Nothing is left
+/// here to drift: this reads the answer and writes it down.
+///
+/// Lives here rather than in MetalTypes.swift because that file is compiled
+/// standalone by the Swift test steps and cannot see the core's header.
+func stageSurfaceRowScroll(
+    on set: SurfaceBufferSet,
+    rowStart: Int,
+    rowEnd: Int,
+    colStart: Int,
+    colEnd: Int,
+    rowsDelta: Int,
+    totalRows: Int,
+    totalCols: Int,
+    dirtySupersededRows: (_ rowStart: Int, _ rowEnd: Int) -> Void
+) {
+    var incoming = zonvie_row_scroll(
+        row_start: Int32(clamping: rowStart),
+        row_end: Int32(clamping: rowEnd),
+        col_start: Int32(clamping: colStart),
+        col_end: Int32(clamping: colEnd),
+        rows_delta: Int32(clamping: rowsDelta),
+        total_rows: Int32(clamping: totalRows),
+        total_cols: Int32(clamping: totalCols)
+    )
+    var out = zonvie_row_scroll_merge()
+    let answered: Bool
+    if let staged = set.pendingScroll {
+        var existing = zonvie_row_scroll(
+            row_start: Int32(clamping: staged.rowStart),
+            row_end: Int32(clamping: staged.rowEnd),
+            col_start: Int32(clamping: staged.colStart),
+            col_end: Int32(clamping: staged.colEnd),
+            rows_delta: Int32(clamping: staged.rowsDelta),
+            total_rows: Int32(clamping: staged.totalRows),
+            total_cols: Int32(clamping: staged.totalCols)
+        )
+        answered = zonvie_core_row_scroll_merge(&existing, &incoming, &out)
+    } else {
+        answered = zonvie_core_row_scroll_merge(nil, &incoming, &out)
+    }
+    // The core refuses only a null argument, which cannot happen here.
+    guard answered else { return }
+
+    if out.has_superseded != 0 {
+        dirtySupersededRows(Int(out.superseded.row_start), Int(out.superseded.row_end))
+    }
+    set.pendingScroll = SurfaceRowScroll(
+        rowStart: Int(out.staged.row_start),
+        rowEnd: Int(out.staged.row_end),
+        colStart: Int(out.staged.col_start),
+        colEnd: Int(out.staged.col_end),
+        rowsDelta: Int(out.staged.rows_delta),
+        totalRows: Int(out.staged.total_rows),
+        totalCols: Int(out.staged.total_cols)
+    )
+}
+
 func encodeSurfaceCustomShaderChain(
     cmd: MTLCommandBuffer,
     pipelines: [CustomShaderPipeline],
