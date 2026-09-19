@@ -779,79 +779,6 @@ test "cluster inversion: a variation-selector emoji mid-run" {
 // frontend derives from a plan.
 
 const row_h_px: i32 = 20;
-const tex_rows: i32 = 44;
-const tex_w_px: i32 = 800;
-
-
-/// A layer at y=100 scrolled down by 3: the blit rewrites rows 0..20 of it,
-/// pixels 100..500.
-fn overBlitBase() helpers.RowScrollBlitPlan {
-    return core.row_scroll.make(
-        0,
-        20,
-        3,
-        0,
-        100,
-        400,
-        tex_w_px,
-        tex_rows * row_h_px,
-        row_h_px,
-    ).?;
-}
-
-test "a float over the blit marks its own rows, the rows under it and their source" {
-    const p = overBlitBase();
-    const r = helpers.blitRectPx(p);
-    try std.testing.expectEqual(@as(i32, 0), r.left);
-    try std.testing.expectEqual(@as(i32, 100), r.top);
-    try std.testing.expectEqual(@as(i32, 400), r.right);
-    try std.testing.expectEqual(@as(i32, 500), r.bottom);
-
-    // A float at y=210, 4 rows tall, x=100..200: straddles the band.
-    const got = helpers.rowsOverBlit(p, 3, 100, 210, 4, 10, 10, row_h_px).?;
-    try std.testing.expectEqual([2]u32{ 0, 3 }, got.above.?);
-    try std.testing.expectEqual([2]u32{ 5, 9 }, got.under.?);
-    // Shifted back by the delta, never forward.
-    try std.testing.expectEqual([2]u32{ 2, 6 }, got.shifted.?);
-}
-
-test "rows over a blit clamp to the covering layer and to the scroll region" {
-    const p = overBlitBase();
-
-    // Starts above the blit rectangle: the covering layer's first marked row
-    // is the one the rectangle's top edge lands in, not its own row 0.
-    const high = helpers.rowsOverBlit(p, 3, 0, 60, 4, 40, 10, row_h_px).?;
-    try std.testing.expectEqual([2]u32{ 2, 3 }, high.above.?);
-
-    // Taller than the rectangle: both ranges stop at the region's last row.
-    const tall = helpers.rowsOverBlit(p, 3, 0, 100, 30, 40, 10, row_h_px).?;
-    try std.testing.expectEqual([2]u32{ 0, 19 }, tall.above.?);
-    try std.testing.expectEqual([2]u32{ 0, 19 }, tall.under.?);
-    try std.testing.expectEqual([2]u32{ 0, 16 }, tall.shifted.?);
-}
-
-test "a float that misses the blit rectangle marks nothing" {
-    const p = overBlitBase();
-    // Entirely to the right of the copy.
-    try std.testing.expect(helpers.rowsOverBlit(p, 3, 400, 210, 4, 10, 10, row_h_px) == null);
-    // Entirely below it.
-    try std.testing.expect(helpers.rowsOverBlit(p, 3, 100, 500, 4, 10, 10, row_h_px) == null);
-    // Empty covering layer.
-    try std.testing.expect(helpers.rowsOverBlit(p, 3, 100, 210, 0, 10, 10, row_h_px) == null);
-}
-
-test "a root dirty band marks the layer rows it overpaints" {
-    // Cell-aligned: one root row lands on exactly one layer row.
-    try std.testing.expectEqual([2]u32{ 5, 5 }, helpers.bandLayerRows(200, 220, 100, 10, row_h_px).?);
-    // Off the cell grid: the same band straddles two.
-    try std.testing.expectEqual([2]u32{ 4, 5 }, helpers.bandLayerRows(200, 220, 110, 10, row_h_px).?);
-    // Overlapping the layer's top edge from above.
-    try std.testing.expectEqual([2]u32{ 0, 0 }, helpers.bandLayerRows(90, 110, 100, 10, row_h_px).?);
-    // Entirely above the layer.
-    try std.testing.expect(helpers.bandLayerRows(0, 20, 100, 10, row_h_px) == null);
-    // Entirely below it.
-    try std.testing.expect(helpers.bandLayerRows(400, 420, 100, 2, row_h_px) == null);
-}
 
 test "the root repaints the rows its scroll copy dragged a layer onto" {
     // row_h_px is 20 here, so a float at y=200 covers rows 10..14.
@@ -967,7 +894,7 @@ test "blit rectangle stays inside the layer it scrolls" {
                     tex_h,
                     row_h_px,
                 ) orelse continue;
-                const r = helpers.blitRectPx(p);
+                const r = core.row_scroll.blitRect(p);
                 try std.testing.expect(r.left >= o[0]);
                 try std.testing.expect(r.right <= o[0] + @as(i32, @intCast(cols)) * cell_w_px);
                 try std.testing.expect(r.right <= tex_w);

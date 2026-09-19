@@ -3636,7 +3636,7 @@ fn markLayersOverBand(
         const a_left = above.x_px;
         const a_right = a_left + @as(i32, @intCast(above.cols)) * cell_w_px;
         if (a_right <= left or a_left >= right) continue;
-        const rows = render_pipeline_helpers.bandLayerRows(
+        const rows = core.row_scroll.bandLayerRows(
             band_top_px,
             band_bottom_px,
             above.y_px,
@@ -3696,7 +3696,7 @@ pub fn planLayerFrame(
         if (state.draw_all) continue;
         for (p.rows_to_draw) |row| {
             const band_top: i32 = @as(i32, @intCast(row)) * p.row_h_px;
-            const rows = render_pipeline_helpers.bandLayerRows(
+            const rows = core.row_scroll.bandLayerRows(
                 band_top,
                 band_top + p.row_h_px,
                 layer.y_px,
@@ -3715,7 +3715,7 @@ pub fn planLayerFrame(
         for (layers[1..n]) |layer| {
             const state = app.layer_grids.get(layer.grid_id) orelse continue;
             if (state.draw_all) continue;
-            const rows = render_pipeline_helpers.bandLayerRows(
+            const rows = core.row_scroll.bandLayerRows(
                 sr.top - p.y_offset,
                 sr.bottom - p.y_offset,
                 layer.y_px,
@@ -3808,7 +3808,7 @@ pub fn planLayerFrame(
         // The copy rewrote every pixel of its rectangle, so a layer drawn over
         // it moved with it, and so did what it covered.
         for (layers[li + 1 .. n]) |above| {
-            const over = render_pipeline_helpers.rowsOverBlit(
+            const over = core.row_scroll.overBlitRows(
                 pl,
                 scroll.rows_delta,
                 p.x_offset + above.x_px,
@@ -3843,7 +3843,7 @@ pub fn planLayerFrame(
             }
         }
 
-        state.draw_blit_rect = render_pipeline_helpers.blitRectPx(pl);
+        state.draw_blit_rect = core.row_scroll.blitRect(pl);
     }
 
     // 4. Rows every layer repaints over the layers above it. A layer owns the
