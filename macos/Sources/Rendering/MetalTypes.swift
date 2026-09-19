@@ -3463,50 +3463,6 @@ func drawSurfaceBackgroundClearBand(
     }
 }
 
-/// Stage a row scroll on the WRITE set, merging it into one already staged for
-/// the same region.
-///
-/// Staging on the write set rather than straight onto a per-grid accumulator is
-/// what stops a draw() interleaving before commitFlush from consuming a delta
-/// whose vertices are not committed yet — and, if the bracket is then
-/// cancelled, from keeping that mis-shifted frame permanently.
-///
-/// When the region changes inside one bracket the older shift can no longer be
-/// represented, but its row slots were already remapped, so the rows it covered
-/// are handed to `dirtySupersededRows` to redraw post-remap. Each caller keeps
-/// its own guard on when staging is allowed at all.
-func stageSurfaceRowScroll(
-    on set: SurfaceBufferSet,
-    rowStart: Int,
-    rowEnd: Int,
-    colStart: Int,
-    colEnd: Int,
-    rowsDelta: Int,
-    totalRows: Int,
-    totalCols: Int,
-    dirtySupersededRows: (_ rowStart: Int, _ rowEnd: Int) -> Void
-) {
-    if let staged = set.pendingScroll,
-       staged.rowStart == rowStart,
-       staged.rowEnd == rowEnd {
-        set.pendingScroll = SurfaceRowScroll(
-            rowStart: rowStart, rowEnd: rowEnd,
-            colStart: colStart, colEnd: colEnd,
-            rowsDelta: clampRowsDelta(staged.rowsDelta &+ rowsDelta),
-            totalRows: totalRows, totalCols: totalCols
-        )
-        return
-    }
-    if let staged = set.pendingScroll, staged.rowEnd > staged.rowStart {
-        dirtySupersededRows(staged.rowStart, staged.rowEnd)
-    }
-    set.pendingScroll = SurfaceRowScroll(
-        rowStart: rowStart, rowEnd: rowEnd,
-        colStart: colStart, colEnd: colEnd,
-        rowsDelta: rowsDelta,
-        totalRows: totalRows, totalCols: totalCols
-    )
-}
 
 /// Copy `input` into `output` through a fullscreen render pass.
 ///

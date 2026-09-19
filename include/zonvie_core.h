@@ -1221,6 +1221,45 @@ ZONVIE_API bool zonvie_core_row_scroll_over_blit_rows(
     zonvie_over_blit_rows *out
 );
 
+/* A row scroll staged for one grid, waiting for the flush that will spend it.
+   col_start/col_end are the columns the shift covers: the macOS main surface
+   stages a shift only when it spans the full width and redraws otherwise, and
+   a caller that does not track columns passes the whole grid. */
+typedef struct zonvie_row_scroll {
+    int32_t row_start;
+    int32_t row_end;
+    int32_t col_start;
+    int32_t col_end;
+    int32_t rows_delta;
+    int32_t total_rows;
+    int32_t total_cols;
+} zonvie_row_scroll;
+
+typedef struct zonvie_row_scroll_merge {
+    /* What the caller stages in place of whatever it held. */
+    zonvie_row_scroll staged;
+    /* A region the staged one displaced, whose rows the caller must mark dirty
+       because nothing will move their pixels now. Meaningful only when
+       has_superseded is non-zero: that is false when the incoming shift
+       continued the staged one, and when the displaced region was empty. */
+    zonvie_row_scroll superseded;
+    uint32_t has_superseded;
+    uint32_t reserved;
+} zonvie_row_scroll_merge;
+
+/* Fold a new row scroll into whatever is already staged for the same grid.
+   Two shifts of the SAME region in one flush are one shift and their deltas
+   add; two shifts of DIFFERENT regions are not, and the displaced one's rows
+   come back in `superseded` for the caller to repaint.
+
+   `existing` is null when nothing is staged. Returns false, leaving *out
+   untouched, only when `incoming` or `out` is null. */
+ZONVIE_API bool zonvie_core_row_scroll_merge(
+    const zonvie_row_scroll *existing,
+    const zonvie_row_scroll *incoming,
+    zonvie_row_scroll_merge *out
+);
+
 /* Build-time version string (from `git describe`), e.g. "v0.3.21" or
    "v0.3.21-9-g4eb0177". The returned pointer is static and null-terminated;
    never null. Not tied to a core instance. */

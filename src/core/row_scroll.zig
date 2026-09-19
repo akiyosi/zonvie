@@ -257,6 +257,73 @@ pub fn bandLayerRows(
     return .{ @intCast(first), @intCast(last) };
 }
 
+/// A row scroll staged for one grid, waiting for the flush that will spend it.
+pub const Staged = extern struct {
+    row_start: i32,
+    row_end: i32,
+    /// The columns the shift covers. The macOS main surface stages a shift only
+    /// when it spans the full width and redraws otherwise; the callers that do
+    /// not track columns pass the whole grid.
+    col_start: i32,
+    col_end: i32,
+    rows_delta: i32,
+    total_rows: i32,
+    total_cols: i32,
+};
+
+/// Bound a scroll-delta accumulator well below the integer extremes, which a
+/// later abs() would trap on.
+pub fn clampRowsDelta(value: i64) i32 {
+    return @intCast(@max(-1_000_000, @min(1_000_000, value)));
+}
+
+pub const Merge = struct {
+    /// What the caller stages in place of whatever it held.
+    staged: Staged,
+    /// A region the staged one displaced, whose rows the caller must mark dirty
+    /// because nothing will move their pixels now. Null when the incoming shift
+    /// continued the staged one, or when the displaced region was empty.
+    superseded: ?Staged,
+};
+
+/// Fold a new row scroll into whatever is already staged for the same grid.
+///
+/// Two shifts of the SAME region in one flush are one shift: their deltas add,
+/// and the blit that eventually runs moves the pixels once. Two shifts of
+/// DIFFERENT regions are not: blitting the newer would smear pixels the older
+/// already moved outside its rectangle, so the older region's rows are handed
+/// back to be repainted instead.
+///
+/// Three implementations were found asking this, and they did NOT agree on the
+/// second case. Recorded here because the divergence outlived every reading of
+/// the individual copies:
+///
+///   macOS `stageSurfaceRowScroll`  dirty the displaced region, stage the new
+///                                  one, and let it blit — what this returns
+///   Windows layer `mergeLayerScroll` dirty BOTH regions, stage neither
+///   Windows root (app.zig, inline)   escalate to a full paint of the surface
+///
+/// The cost rises across those three, and the reasoning for the cheapest one is
+/// that a staged shift has moved no pixels yet: the slot is spent at paint time,
+/// so a displaced region only owes its rows a repaint, while the incoming shift
+/// is still a valid blit. Whether the two Windows drivers are merely
+/// conservative or are guarding something their row storage does differently
+/// cannot be settled without hardware, so only the macOS caller is wired to
+/// this; the Windows copies are left alone and named above.
+pub fn mergeStaged(existing: ?Staged, incoming: Staged) Merge {
+    const old = existing orelse return .{ .staged = incoming, .superseded = null };
+    if (old.row_start == incoming.row_start and old.row_end == incoming.row_end) {
+        var merged = incoming;
+        merged.rows_delta = clampRowsDelta(
+            @as(i64, old.rows_delta) + @as(i64, incoming.rows_delta),
+        );
+        return .{ .staged = merged, .superseded = null };
+    }
+    // An empty region moved nothing, so it has no rows to repaint.
+    const displaced: ?Staged = if (old.row_end > old.row_start) old else null;
+    return .{ .staged = incoming, .superseded = displaced };
+}
+
 // ---------------------------------------------------------------------------
 // Tests. Merged from the two implementations this replaced:
 // macos/Tests/RowScrollBlitPlanTests.swift and the RowScrollBlitPlan cases in
@@ -542,4 +609,161 @@ test "a band never names a row outside the layer it covers" {
             }
         }
     }
+}
+
+// --- mergeStaged. Transcribed from the two implementations it replaces:
+// MetalTypes.swift stageSurfaceRowScroll and windows mergeLayerScroll.
+
+fn staged(row_start: i32, row_end: i32, rows_delta: i32) Staged {
+    return .{
+        .row_start = row_start,
+        .row_end = row_end,
+        .col_start = 0,
+        .col_end = 80,
+        .rows_delta = rows_delta,
+        .total_rows = 40,
+        .total_cols = 80,
+    };
+}
+
+test "nothing staged yet takes the incoming shift whole" {
+    const m = mergeStaged(null, staged(2, 10, 3));
+    try testing.expectEqual(@as(i32, 3), m.staged.rows_delta);
+    try testing.expect(m.superseded == null);
+}
+
+test "the same region in one flush is one shift, and the deltas add" {
+    const m = mergeStaged(staged(2, 10, 3), staged(2, 10, 4));
+    try testing.expectEqual(@as(i32, 7), m.staged.rows_delta);
+    try testing.expectEqual(@as(i32, 2), m.staged.row_start);
+    try testing.expect(m.superseded == null);
+}
+
+test "opposite deltas cancel rather than conflict" {
+    const m = mergeStaged(staged(2, 10, 5), staged(2, 10, -5));
+    try testing.expectEqual(@as(i32, 0), m.staged.rows_delta);
+    try testing.expect(m.superseded == null);
+}
+
+test "an accumulating delta cannot run off to where abs would trap" {
+    const m = mergeStaged(staged(0, 40, 1_000_000), staged(0, 40, 1_000_000));
+    try testing.expectEqual(@as(i32, 1_000_000), m.staged.rows_delta);
+    const n = mergeStaged(staged(0, 40, -1_000_000), staged(0, 40, -1_000_000));
+    try testing.expectEqual(@as(i32, -1_000_000), n.staged.rows_delta);
+}
+
+test "a different region displaces the staged one, which must be repainted" {
+    const m = mergeStaged(staged(2, 10, 3), staged(12, 20, 1));
+    try testing.expectEqual(@as(i32, 12), m.staged.row_start);
+    try testing.expectEqual(@as(i32, 1), m.staged.rows_delta);
+    try testing.expect(m.superseded != null);
+    try testing.expectEqual(@as(i32, 2), m.superseded.?.row_start);
+    try testing.expectEqual(@as(i32, 10), m.superseded.?.row_end);
+}
+
+test "a region that differs only at its end still displaces" {
+    const m = mergeStaged(staged(2, 10, 3), staged(2, 11, 1));
+    try testing.expect(m.superseded != null);
+    try testing.expectEqual(@as(i32, 10), m.superseded.?.row_end);
+}
+
+test "an empty staged region has no rows to repaint" {
+    const m = mergeStaged(staged(5, 5, 3), staged(12, 20, 1));
+    try testing.expect(m.superseded == null);
+    try testing.expectEqual(@as(i32, 12), m.staged.row_start);
+}
+
+test "the incoming shift is always what ends up staged" {
+    // Every pairing of a few regions and deltas: whatever else happens, the
+    // caller stages the region it was just handed, and only its delta can
+    // differ from what came in.
+    const regions = [_][2]i32{ .{ 0, 40 }, .{ 2, 10 }, .{ 2, 11 }, .{ 5, 5 }, .{ 30, 40 } };
+    const deltas = [_]i32{ -7, -1, 0, 1, 7 };
+    for (regions) |ra| for (deltas) |da| for (regions) |rb| for (deltas) |db| {
+        const m = mergeStaged(staged(ra[0], ra[1], da), staged(rb[0], rb[1], db));
+        try testing.expectEqual(rb[0], m.staged.row_start);
+        try testing.expectEqual(rb[1], m.staged.row_end);
+        const same = ra[0] == rb[0] and ra[1] == rb[1];
+        if (same) {
+            try testing.expectEqual(clampRowsDelta(@as(i64, da) + @as(i64, db)), m.staged.rows_delta);
+            try testing.expect(m.superseded == null);
+        } else {
+            try testing.expectEqual(db, m.staged.rows_delta);
+            try testing.expectEqual(ra[1] > ra[0], m.superseded != null);
+        }
+    };
+}
+
+/// MetalTypes.swift `stageSurfaceRowScroll`, transcribed, so the sweep below
+/// compares `mergeStaged` against the rule it replaced rather than against
+/// itself. It is a copy on purpose: an intended change to `mergeStaged` has to
+/// be made here too, and that second edit is where someone notices.
+///
+///     if let staged = set.pendingScroll,
+///        staged.rowStart == rowStart, staged.rowEnd == rowEnd {
+///         set.pendingScroll = <incoming, delta = clamp(staged + incoming)>
+///         return
+///     }
+///     if let staged = set.pendingScroll, staged.rowEnd > staged.rowStart {
+///         dirtySupersededRows(staged.rowStart, staged.rowEnd)
+///     }
+///     set.pendingScroll = <incoming>
+fn swiftStageSurfaceRowScroll(existing: ?Staged, incoming: Staged) Merge {
+    if (existing) |st| {
+        if (st.row_start == incoming.row_start and st.row_end == incoming.row_end) {
+            var merged = incoming;
+            merged.rows_delta = clampRowsDelta(
+                @as(i64, st.rows_delta) + @as(i64, incoming.rows_delta),
+            );
+            return .{ .staged = merged, .superseded = null };
+        }
+        if (st.row_end > st.row_start) {
+            return .{ .staged = incoming, .superseded = st };
+        }
+        return .{ .staged = incoming, .superseded = null };
+    }
+    return .{ .staged = incoming, .superseded = null };
+}
+
+test "mergeStaged decides what stageSurfaceRowScroll decided, over the whole space" {
+    // Empty regions, adjacent ones, ones that differ only at one end, and the
+    // whole grid — the shapes the displaced case turns on. Deltas include both
+    // clamp bounds and values whose sum crosses one from either side.
+    const regions = [_][2]i32{
+        .{ 0, 40 }, .{ 2, 10 }, .{ 2, 11 }, .{ 3, 10 }, .{ 5, 5 }, .{ 10, 20 }, .{ 30, 40 },
+    };
+    const deltas = [_]i32{
+        -1_000_000, -999_999, -7, -1, 0, 1, 7, 999_999, 1_000_000,
+    };
+
+    var checks: usize = 0;
+    var displaced: usize = 0;
+    var kept: usize = 0;
+
+    for (regions) |r| for (deltas) |d| {
+        const inc = staged(r[0], r[1], d);
+        const a = mergeStaged(null, inc);
+        const b = swiftStageSurfaceRowScroll(null, inc);
+        try testing.expectEqual(b.staged, a.staged);
+        try testing.expectEqual(b.superseded == null, a.superseded == null);
+        checks += 1;
+        kept += 1;
+    };
+
+    for (regions) |ra| for (deltas) |da| for (regions) |rb| for (deltas) |db| {
+        const ex = staged(ra[0], ra[1], da);
+        const inc = staged(rb[0], rb[1], db);
+        const a = mergeStaged(ex, inc);
+        const b = swiftStageSurfaceRowScroll(ex, inc);
+        try testing.expectEqual(b.staged, a.staged);
+        try testing.expectEqual(b.superseded == null, a.superseded == null);
+        if (b.superseded) |sup| try testing.expectEqual(sup, a.superseded.?);
+        checks += 1;
+        if (a.superseded != null) displaced += 1 else kept += 1;
+    };
+
+    try testing.expectEqual(@as(usize, 7 * 9 + 7 * 9 * 7 * 9), checks);
+    // Both outcomes must occur, or the sweep asserts nothing.
+    try testing.expect(displaced > 0);
+    try testing.expect(kept > 0);
 }
