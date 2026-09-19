@@ -516,6 +516,74 @@ func stageSurfaceRowScroll(
     )
 }
 
+/// Begin one smooth-scroll retention step for a layer, capture the rows it
+/// pushes past the edge, and seed the sub-row ease.
+///
+/// The rule, not the capture: `bracketStagedGrids` is what stops one grid being
+/// stepped twice inside a bracket, and `abs(rowsDelta) == 1` is what limits the
+/// seed to a step small enough to ease. Both surfaces carried both conditions,
+/// and scroll retention is where this project's scroll defects have repeatedly
+/// come from — so the two conditions live together, once.
+///
+/// `captureRow` is the caller's, because the two surfaces resolve a row's
+/// vertices differently. `lock` is the caller's for the same reason the two
+/// surfaces still have different numbers of locks.
+///
+/// Returns true when a step was staged or was already staged for this grid in
+/// this bracket, which is what the seed below is gated on.
+@discardableResult
+func captureSurfaceLayerScrollStep(
+    gridId: Int64,
+    sets: [SurfaceBufferSet],
+    flushSourceSetIndex: Int,
+    rowStart: Int,
+    rowEnd: Int,
+    rowsDelta: Int,
+    retention: ScrollRetention,
+    lock: NSLock,
+    bracketStagedGrids: inout Set<Int64>,
+    stagedSmoothScrollSeeds: inout [(gridId: Int64, rowsDelta: Int)],
+    captureRow: (SurfaceBufferSet, Int, Int) -> Void
+) -> Bool {
+    lock.lock()
+    var stepped = bracketStagedGrids.contains(gridId)
+    lock.unlock()
+
+    let cs = sets[flushSourceSetIndex]
+    if !stepped, cs.rowState.usingRowBuffers,
+       let plan = ScrollRetention.plan(
+           rowStart: rowStart,
+           rowEnd: rowEnd,
+           rowsDelta: rowsDelta,
+           depth: retention.depthRows
+       )
+    {
+        retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+        lock.lock()
+        bracketStagedGrids.insert(gridId)
+        lock.unlock()
+        for i in 0..<plan.count {
+            let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+            captureRow(cs, row, row - rowsDelta)
+        }
+        stepped = true
+    }
+
+    // Only a single-row step can be eased; anything larger lands whole.
+    guard stepped, abs(rowsDelta) == 1 else { return stepped }
+    lock.lock()
+    stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
+    lock.unlock()
+    // `continuous_j_scroll_matches_jump` counts these to tell an eased scroll
+    // from one that jumped, so the marker is part of the contract. It used to
+    // be emitted by the main surface only; an external one seeds the same way
+    // and now says so too.
+    if ZonvieCore.appLogEnabled {
+        ZonvieCore.appLog("[smooth_scroll_seed] gridId=\(gridId) rowsDelta=\(rowsDelta)")
+    }
+    return stepped
+}
+
 func encodeSurfaceCustomShaderChain(
     cmd: MTLCommandBuffer,
     pipelines: [CustomShaderPipeline],
@@ -6178,6 +6246,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// A larger jump — page motion, a resize — is not seeded: it would displace
     /// the picture by the whole jump and ease back only the rows the retention
     /// can cover. The rows are still retained, and the draw path prunes them.
+    /// Shared with ExternalGridView (`captureSurfaceLayerScrollStep`); this
+    /// surface resolves a retained row through `captureOneRetainedRow` and
+    /// guards its state with its single lock.
     private func captureLayerScrollStep(
         gridId: Int64,
         sets: [SurfaceBufferSet],
@@ -6186,42 +6257,19 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         rowsDelta: Int
     ) {
         guard Self.smoothScrollEnabled else { return }
-        lock.lock()
-        // The grid_scroll notification is dispatched earlier in this bracket and
-        // may already have opened a step for this grid; a second one would shift
-        // its rows twice. Standing down must not mean leaving the function: the
-        // seed below is this path's alone.
-        var stepped = bracketStagedGrids.contains(gridId)
-        lock.unlock()
-
-        let cs = sets[flushSourceSetIndex]
-        if !stepped, cs.rowState.usingRowBuffers,
-           let plan = ScrollRetention.plan(
-               rowStart: rowStart,
-               rowEnd: rowEnd,
-               rowsDelta: rowsDelta,
-               depth: retention.depthRows
-           ) {
-            retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
-            lock.lock()
-            bracketStagedGrids.insert(gridId)
-            lock.unlock()
-            for i in 0..<plan.count {
-                let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-                captureOneRetainedRow(cs: cs, gridId: gridId, readRow: row, targetRow: row - rowsDelta)
-            }
-            stepped = true
-        }
-        // commitFlush publishes the seeds only when a step was staged, so a
-        // step that could not be opened would have its seed dropped there.
-        guard stepped, abs(rowsDelta) == 1 else { return }
-        lock.lock()
-        stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
-        lock.unlock()
-        if ZonvieCore.appLogEnabled {
-            ZonvieCore.appLog(
-                "[smooth_scroll_seed] gridId=\(gridId) rowsDelta=\(rowsDelta)"
-            )
+        captureSurfaceLayerScrollStep(
+            gridId: gridId,
+            sets: sets,
+            flushSourceSetIndex: flushSourceSetIndex,
+            rowStart: rowStart,
+            rowEnd: rowEnd,
+            rowsDelta: rowsDelta,
+            retention: retention,
+            lock: lock,
+            bracketStagedGrids: &bracketStagedGrids,
+            stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds
+        ) { cs, readRow, targetRow in
+            captureOneRetainedRow(cs: cs, gridId: gridId, readRow: readRow, targetRow: targetRow)
         }
     }
 
