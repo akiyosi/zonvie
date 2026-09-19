@@ -937,6 +937,7 @@ inline fn composeRowRuns(
         if (glow_enabled) {
             const has_glow: u8 = cellGlow(glow_all, glow_hl_ids, run_hl);
             @memset(dst.glow_arr.items[ds..de], has_glow);
+            if (has_glow == 0 and !glow_all and run_hl != 0) core.noteGlowMiss(run_hl);
         }
         // SIMD stride-2 extraction: Cell{cp,hl} -> cp only, for the part of the
         // run the grid actually has; the rest is the blank the per-cell path
