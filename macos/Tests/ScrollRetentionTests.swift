@@ -5,13 +5,13 @@ import simd
 // Minimal collaborators required when MetalTypes.swift is compiled as a
 // standalone test executable. Same shape as SurfaceRowProvisionTests', and for
 // the same reason: the file's fixed-float mask and scroll-offset builders name
-// types owned by MetalTerminalRenderer, which the retention does not touch.
+// types owned by GridSurfaceRenderer, which the retention does not touch.
 final class ZonvieConfig {
     static let shared = ZonvieConfig()
     var backgroundAlpha: Float = 1.0
 }
 
-final class MetalTerminalRenderer {
+final class GridSurfaceRenderer {
     struct ScrollOffset {
         var grid_id: Int32
         var offset_y: Float
@@ -461,7 +461,7 @@ private enum ScrollRetentionTests {
         retention.stage(makeRow(retention, gridId: 3, targetRow: 0))
         _ = retention.commit()
 
-        let displaced = MetalTerminalRenderer.ScrollOffset(
+        let displaced = GridSurfaceRenderer.ScrollOffset(
             grid_id: 3, offset_y: 0.04, content_top_y: 1, content_bottom_y: -1
         )
         retention.pruneUndisplaced(offsets: [displaced], seedGrids: [])
@@ -501,7 +501,7 @@ private enum ScrollRetentionTests {
         let height: Float = 1760
         // updateScrollOffsets: offset_y = -offsetYPx * 2 / viewportHeight.
         func ndc(_ px: Float) -> Float { -px * 2 / height }
-        let follower = MetalTerminalRenderer.ScrollOffset(
+        let follower = GridSurfaceRenderer.ScrollOffset(
             grid_id: 15, offset_y: ndc(88),
             content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
 
@@ -535,7 +535,7 @@ private enum ScrollRetentionTests {
 
         // A sub-pixel ease step: the origin is fractional, and the caller pads
         // one pixel so flooring cannot clip the layer's leading edge.
-        let easing = MetalTerminalRenderer.ScrollOffset(
+        let easing = GridSurfaceRenderer.ScrollOffset(
             grid_id: 15, offset_y: ndc(3.90125),
             content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
         let sub = displacedLayerOriginPx(
@@ -544,7 +544,7 @@ private enum ScrollRetentionTests {
         require(sub.y != sub.y.rounded(.down), "the ease leaves a fractional origin to pad for")
 
         // An undisplaced layer must not move at all.
-        let still = MetalTerminalRenderer.ScrollOffset(
+        let still = GridSurfaceRenderer.ScrollOffset(
             grid_id: 15, offset_y: 0, content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1)
         requireEqual(
             displacedLayerOriginPx(originPx: simd_float2(0, 160), offset: still,
@@ -557,10 +557,10 @@ private enum ScrollRetentionTests {
     /// its scrolled rows to its content band.
     private static func verifyScrollOffsetLookup() {
         let offsets = [
-            MetalTerminalRenderer.ScrollOffset(
+            GridSurfaceRenderer.ScrollOffset(
                 grid_id: 2, offset_y: -0.1,
                 content_top_y: 0.954, content_bottom_y: -0.954),
-            MetalTerminalRenderer.ScrollOffset(
+            GridSurfaceRenderer.ScrollOffset(
                 grid_id: 15, offset_y: -0.1,
                 content_top_y: 2.0, content_bottom_y: -2.0, move_all: 1),
         ]

@@ -4,7 +4,7 @@
 //
 // The cursor is composited onto the drawable, never into the back texture, so
 // a frame that carries only a cursor change can keep every pixel it already
-// has. The main surface states that outright: MetalTerminalRenderer computes
+// has. The main surface states that outright: GridSurfaceRenderer computes
 // `noMainWorkFrame`/`skipMainPass` and encodes no main pass at all.
 // ExternalGridView had the same intent — its `cursorOnlyFrame` sets the pass
 // to `.load` — but no branch of its row ladder said "draw nothing", so the

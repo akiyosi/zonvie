@@ -4,7 +4,7 @@
 // The sub-row ease is what makes a one-row scroll glide instead of jump: the
 // step seeds a pixel offset of about one cell and the frames after it decay
 // that offset to zero. Both ends of that used to belong to the main surface
-// alone — the seed was staged by MetalTerminalRenderer and spent by the main
+// alone — the seed was staged by GridSurfaceRenderer and spent by the main
 // view's onPreDraw — so a grid living in its own window produced no seed and
 // had no tick to spend one, and its content jumped a whole row. The seed now
 // rides ScrollRetention (which every surface steps through) and the tick runs
