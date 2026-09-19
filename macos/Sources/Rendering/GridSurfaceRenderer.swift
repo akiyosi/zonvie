@@ -375,6 +375,74 @@ func encodeSurfaceBackBufferToDrawable(
     return copied ? .plainCopy : .notEncoded
 }
 
+/// The bloom pass, taking its resources from where they live rather than from
+/// seven `let`s the caller unpacks by hand.
+///
+/// Five pipelines, the copy vertex buffer and the bilinear sampler are on
+/// SharedRenderResources; the textures, viewport and layer transform belong to
+/// the surface. Both surfaces wrote out the same seven-binding `if let` ladder
+/// and the same fifteen-argument call, differing only in where they read the
+/// intensity and radius from.
+///
+/// Returns false only when the pass was wanted and could not be encoded — a
+/// missing resource, or textures that would not allocate — which both callers
+/// treat as a frame to abandon. Glow being off is `true`: nothing to encode is
+/// not a failure.
+func encodeSurfaceBloom(
+    enabled: Bool,
+    shared: SharedRenderResources,
+    cmd: MTLCommandBuffer,
+    backTex: MTLTexture,
+    pixelFormat: MTLPixelFormat,
+    viewportMetrics: SurfaceViewportMetrics,
+    drawableSize: CGSize,
+    /// A decorated surface's viewport does not start at the drawable's origin.
+    viewportOrigin: CGPoint = .zero,
+    glowTextures: SurfaceGlowTextures,
+    intensity: Float,
+    radiusScale: Float,
+    /// The extract pass's own pipeline is handed back, because the vertices a
+    /// surface extracts are drawn with it and both callers need it inside.
+    encodeExtractVertices: (MTLRenderCommandEncoder, MTLRenderPipelineState) -> Void
+) -> Bool {
+    guard enabled else { return true }
+    guard let extractPipe = shared.glowExtractPipeline,
+          let downPipe = shared.kawaseDownPipeline,
+          let upPipe = shared.kawaseUpPipeline,
+          let compositePipe = shared.glowCompositePipeline,
+          let copyVB = shared.copyVertexBuffer,
+          let bilinSamp = shared.bilinearSampler else { return false }
+    let chain = surfaceGlowChain(
+        surfaceWidthPx: Int(drawableSize.width),
+        surfaceHeightPx: Int(drawableSize.height),
+        radiusScale: radiusScale
+    )
+    guard glowTextures.ensure(device: shared.device, chain: chain, pixelFormat: pixelFormat),
+          glowTextures.ensureIntensityBuffer(device: shared.device) else { return false }
+    return encodeSurfaceBloomPasses(
+        cmd: cmd,
+        backTex: backTex,
+        viewportSize: CGSize(
+            width: viewportMetrics.viewportWidth,
+            height: viewportMetrics.viewportHeight
+        ),
+        drawableSize: drawableSize,
+        viewportOrigin: viewportOrigin,
+        layerTransform: viewportMetrics.layerTransform,
+        glowTextures: glowTextures,
+        extractPipeline: extractPipe,
+        kawaseDownPipeline: downPipe,
+        kawaseUpPipeline: upPipe,
+        compositePipeline: compositePipe,
+        copyVertexBuffer: copyVB,
+        bilinearSampler: bilinSamp,
+        intensity: intensity,
+        chain: chain,
+        radiusScale: radiusScale,
+        encodeExtractVertices: { enc in encodeExtractVertices(enc, extractPipe) }
+    )
+}
+
 func encodeSurfaceCustomShaderChain(
     cmd: MTLCommandBuffer,
     pipelines: [CustomShaderPipeline],
@@ -2961,14 +3029,28 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Safety defer: decrement gpuInFlight + signal semaphore on early return.
             // On normal GPU submission, the completion handler handles cleanup instead.
             var gpuSubmitted = false
+
+            // What this frame owes back whether it reaches the screen or not:
+            // the buffer set it read, the cursor slot it read, and the in-flight
+            // slot it took. Stated once and used by every path that gives up —
+            // the defer below when nothing was submitted, and
+            // `submitSurfaceFrameWithoutPresenting` when encoded work has to be
+            // committed anyway. It used to be written out at each of six sites.
+            //
+            // `self` weakly so an abandoned frame does not keep the renderer
+            // alive; the lock and semaphore strongly so the release still runs
+            // when it is already gone.
+            let sem = inflightSemaphore
+            let lk = lock
+            let releaseFrameState: () -> Void = { [weak self] in
+                lk.lock()
+                self?.completeSurfaceGpuReadLocked(csi)
+                self?.cursorGpuInFlightCount[cci] -= 1
+                lk.unlock()
+                sem.signal()
+            }
             defer {
-                if !gpuSubmitted {
-                    inflightSemaphore.signal()
-                    lock.lock()
-                    completeSurfaceGpuReadLocked(csi)
-                    cursorGpuInFlightCount[cci] -= 1
-                    lock.unlock()
-                }
+                if !gpuSubmitted { releaseFrameState() }
             }
 
             // Now safe to read from committed set (protected by gpuInFlight)
@@ -3072,7 +3154,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // (a staged scroll, a scroll-offset latch, an unpublished cursor
             // flag) stay at defaults that cannot block a skip. `rowMode` is
             // settled by the whole-grid gate above, so it passes true.
-            let idleGateSkips = SurfaceIdleTerms(
+            let idleTerms = SurfaceIdleTerms(
                 hasPresentedOnce: hasPresentedOnceSnapshot,
                 hasNewCommit: hasNewCommit,
                 hasDirtyRows: !dirtyRows.isEmpty,
@@ -3082,15 +3164,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 blinkStateChanged: blinkStateChanged,
                 drawableSizeChanged: drawableSizeChanged,
                 shaderAnimates: anyCustomShaderNeedsAnimation
-            ).skipsFrame
-            ZonvieCore.drawTrace(
-                "surface=1 gate=idle presented=\(hasPresentedOnceSnapshot ? 1 : 0)"
-                    + " newCommit=\(hasNewCommit ? 1 : 0) rect=\(dirtyRectPxOpt != nil ? 1 : 0)"
-                    + " dirty=\(dirtyRows.isEmpty ? 0 : 1) layerWork=\(anyLayerWork ? 1 : 0)"
-                    + " smooth=\(smoothScrolling ? 1 : 0) blink=\(blinkStateChanged ? 1 : 0)"
-                    + " sizeChg=\(drawableSizeChanged ? 1 : 0) anim=\(anyCustomShaderNeedsAnimation ? 1 : 0)"
-                    + " -> \(idleGateSkips ? "skip" : "draw")"
             )
+            let idleGateSkips = idleTerms.skipsFrame
+            ZonvieCore.drawTrace(idleTerms.traceLine(surface: 1))
             if idleGateSkips {
                 // Still reset redrawPending so future redraws are not blocked.
                 FrameTracer.trace(.drawSkipNoChange, a: 2)
@@ -3253,19 +3329,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let retainedRows = hadActiveScrollOffsetThisFrame ? retainedSnapshot : []
             let retainedRowBase = safeRowCount
             let smoothRowRange = 0..<(safeRowCount + retainedRows.count)
+            // Shared with ExternalGridView; this surface's root is grid 1.
             func resolvedSmoothRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                guard logicalRow >= retainedRowBase else { return resolvedRowState(logicalRow) }
-                let i = logicalRow - retainedRowBase
-                guard i < retainedRows.count else { return nil }
-                let r = retainedRows[i]
-                // A layer's retained rows are drawn in that layer's own pass,
-                // where its transform places them.
-                guard r.gridId == 1 else { return nil }
-                guard r.cellHeightPx == Float(cellHi) else { return nil }
-                // Same relation resolvedRowState uses: the vertices live at
-                // sourceRow and have to appear at targetRow.
-                let translationY = Float(r.targetRow - r.sourceRow) * Float(cellHi)
-                return (r.count, r.buffer, translationY)
+                resolveSurfaceSmoothRow(
+                    logicalRow: logicalRow,
+                    retainedRowBase: retainedRowBase,
+                    retainedRows: retainedRows,
+                    rootGridId: 1,
+                    cellHeightPx: Int(cellHi),
+                    resolveRow: resolvedRowState
+                )
             }
 
             // --- Step 3: Compute cursor grid row from vertex positions ---
@@ -3741,14 +3814,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 isSmoothScrolling: smoothScrolling
             )
             let shouldReusePreviousContents = loadTerms.reusesPreviousContents
-            ZonvieCore.drawTrace(
-                "surface=1 gate=load glow=\(glowEnabled ? 1 : 0)"
-                    + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
-                    + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0) smooth=\(smoothScrolling ? 1 : 0)"
-                    + " rect=\(dirtyRectPxOpt != nil ? 1 : 0) rowDirty=\(hasAnyDirtyInRowMode ? 1 : 0)"
-                    + " presented=\(hasPresentedOnceSnapshot ? 1 : 0) sizeChg=\(drawableSizeChanged ? 1 : 0)"
-                    + " -> reuse=\(shouldReusePreviousContents ? 1 : 0)"
-            )
+            ZonvieCore.drawTrace(loadTerms.traceLine(surface: 1))
             rpd.colorAttachments[0].loadAction = resolveSurfaceColorLoadAction(
                 blurEnabled: blurEnabled,
                 hasPresentedOnce: hasPresentedOnceSnapshot,
@@ -3793,16 +3859,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
                 // an uncommitted MTLCommandBuffer leaks GPU memory permanently.
-                let sem = inflightSemaphore
-                let lk = lock
-                cmd.addCompletedHandler { [weak self] _ in
-                    lk.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
-                    self?.cursorGpuInFlightCount[cci] -= 1
-                    lk.unlock()
-                    sem.signal()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                 gpuSubmitted = true
                 // Submitted, but the drawable was never populated and backTex
                 // may hold a half-drawn frame. Refuse to `.load` it next time,
@@ -3858,6 +3915,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
             let cellH = max(1, Int(cellHeightPx.rounded(.up)))
+            // Shared with ExternalGridView: the geometry every row below is
+            // placed with, resolved once instead of at each call site.
+            let rowGeometry = SurfaceRowGeometry(
+                cellHeightPx: cellH,
+                renderTarget: backTex,
+                viewportMetrics: viewportMetrics,
+                drawableSize: view.drawableSize
+            )
 
             func drawScissoredDirtyRows() {
                 encodeSurfaceScissoredDirtyRows(
@@ -3865,14 +3930,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     rows: dirtyRows,
                     pipeline: pipeline!,
                     resolve: resolvedRowState,
-                    cellHeightPx: cellH,
-                    bandWidthPx: Float(vpWidth > 0 ? vpWidth : Double(view.drawableSize.width)),
-                    bandHeightPx: Float(vpHeight > 0 ? vpHeight : Double(view.drawableSize.height)),
+                    geometry: rowGeometry,
                     bgRGB: snappedBgRGB,
-                    gridId: 1,
-                    drawableWidthPx: drawableW,
-                    renderTargetWidthPx: backTex.width,
-                    renderTargetHeightPx: backTex.height
+                    gridId: 1
                 )
             }
 
@@ -3915,10 +3975,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         row: cursorGridRow,
                         resolved: resolved,
-                        cellHeightPx: Int(cellHi),
-                        drawableWidthPx: drawableW,
-                        renderTargetWidthPx: backTex.width,
-                        renderTargetHeightPx: backTex.height,
+                        geometry: rowGeometry,
                         backgroundPipeline: backgroundPipeline,
                         glyphPipeline: glyphPipeline,
                         unifiedBlurPipeline: unifiedBlurPipeline
@@ -4329,44 +4386,21 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }  // end of `if !skipMainPass`
 
             // --- Post-process bloom (neon glow) ---
-            var glowPassSucceeded = !glowEnabled
-            if glowEnabled,
-               let extractPipe = glowExtractPipeline,
-               let downPipe = kawaseDownPipeline,
-               let upPipe = kawaseUpPipeline,
-               let compositePipe = glowCompositePipeline,
-               let copyVB = copyVertexBuffer,
-               let bilinSamp = bilinearSampler
-            {
-                let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
-                let intensity = (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8
-
+            // Shared with ExternalGridView; only where the intensity and the
+            // radius are read from differs.
+            let glowPassSucceeded = encodeSurfaceBloom(
+                enabled: glowEnabled,
+                shared: shared,
+                cmd: cmd,
+                backTex: backTex,
+                pixelFormat: view.colorPixelFormat,
+                viewportMetrics: viewportMetrics,
+                drawableSize: view.drawableSize,
+                glowTextures: glowTextures,
+                intensity: (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8,
                 // One read, for both the chain's depth and the taps' reach.
-                let glowRadiusScale = (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
-                let glowChain = surfaceGlowChain(
-                    surfaceWidthPx: Int(view.drawableSize.width),
-                    surfaceHeightPx: Int(view.drawableSize.height),
-                    radiusScale: glowRadiusScale
-                )
-                if glowTextures.ensure(device: device, chain: glowChain, pixelFormat: view.colorPixelFormat),
-                   glowTextures.ensureIntensityBuffer(device: device) {
-                    glowPassSucceeded = encodeSurfaceBloomPasses(
-                    cmd: cmd,
-                    backTex: backTex,
-                    viewportSize: vpSize,
-                    drawableSize: view.drawableSize,
-                    layerTransform: viewportMetrics.layerTransform,
-                    glowTextures: glowTextures,
-                    extractPipeline: extractPipe,
-                    kawaseDownPipeline: downPipe,
-                    kawaseUpPipeline: upPipe,
-                    compositePipeline: compositePipe,
-                    copyVertexBuffer: copyVB,
-                    bilinearSampler: bilinSamp,
-                    intensity: intensity,
-                    chain: glowChain,
-                    radiusScale: glowRadiusScale
-                    ) { enc in
+                radiusScale: (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
+            ) { enc, extractPipe in
                     // Extract vertices: atlas + scroll offsets + row/main + cursor
                     if let tex = atlasTex {
                         enc.setFragmentTexture(tex, index: 0)
@@ -4484,20 +4518,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
                     }
                     }
-                }
-            }
 
             guard glowPassSucceeded else {
-                let sem = inflightSemaphore
-                let lk = lock
-                cmd.addCompletedHandler { [weak self] _ in
-                    lk.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
-                    self?.cursorGpuInFlightCount[cci] -= 1
-                    lk.unlock()
-                    sem.signal()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                 gpuSubmitted = true
                 // Submitted but never presented — see "render encoder creation
                 // failed" above for why this is set here, why not on "no
@@ -4522,16 +4545,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // Commit the already-encoded persistent-texture work so Metal
                 // can reclaim the command buffer. A full dirty retry heals the
                 // consumed scroll state before the next presentation.
-                let sem = inflightSemaphore
-                let lk = lock
-                cmd.addCompletedHandler { [weak self] _ in
-                    lk.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
-                    self?.cursorGpuInFlightCount[cci] -= 1
-                    lk.unlock()
-                    sem.signal()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                 gpuSubmitted = true
                 bailWithoutSubmit("no drawable after back-buffer encode")
                 return
@@ -4594,16 +4608,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // Submit the already-encoded back-buffer work so Metal can
                 // reclaim this command buffer, but do not present an
                 // untouched drawable or consume the frame's dirty state.
-                let sem = inflightSemaphore
-                let lk = lock
-                cmd.addCompletedHandler { [weak self] _ in
-                    lk.lock()
-                    self?.completeSurfaceGpuReadLocked(csi)
-                    self?.cursorGpuInFlightCount[cci] -= 1
-                    lk.unlock()
-                    sem.signal()
-                }
-                cmd.commit()
+                submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                 gpuSubmitted = true
                 // Submitted but never presented — see "render encoder creation
                 // failed" above for why this is set here, why not on "no
@@ -4719,16 +4724,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // visibly incomplete transaction. Submit the already-
                     // encoded back-buffer work only to release driver resources,
                     // then roll the frame state back for a complete retry.
-                    let sem = inflightSemaphore
-                    let lk = lock
-                    cmd.addCompletedHandler { [weak self] _ in
-                        lk.lock()
-                        self?.completeSurfaceGpuReadLocked(csi)
-                        self?.cursorGpuInFlightCount[cci] -= 1
-                        lk.unlock()
-                        sem.signal()
-                    }
-                    cmd.commit()
+                    submitSurfaceFrameWithoutPresenting(cmd: cmd, release: releaseFrameState)
                     gpuSubmitted = true
                     // Submitted but never presented — see "render encoder creation
                     // failed" above for why this is set here, why not on "no
@@ -4789,10 +4785,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             FrameTracer.trace(.presentCall)
             cmd.present(drawable)
             FrameTracer.trace(.gpuSubmit)
-            // Capture semaphore and lock directly so the signal fires even
-            // if the renderer is deallocated before the GPU finishes.
-            let sem = inflightSemaphore
-            let lk = lock
+            // `sem` and `lk` are the ones captured for `releaseFrameState`
+            // above, for the same reason: the signal has to fire even if the
+            // renderer is deallocated before the GPU finishes.
             // Wall-time clock at submission, used to compute gpu_wall_us
             // (queue + GPU + present scheduling latency) inside the completion
             // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
