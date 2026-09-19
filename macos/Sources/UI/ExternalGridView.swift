@@ -96,6 +96,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Single-pass replacement for the pair above; nil falls back to them.
     private var unifiedBlurPipeline: MTLRenderPipelineState? { shared.unifiedBlurPipeline }
 
+    /// Scroll-offset publication and the font generation: `scrollOffsetData`,
+    /// `lastPresentedScrollOffsetData`, `lastPresentedScrollOffsetActive`,
+    /// `retention`'s published set, and the committed font generation.
+    ///
+    /// One of **three** locks on this surface where the main surface has one.
+    /// Measured under a sustained 30 Hz scroll, the split costs nothing and
+    /// buys nothing: this lock was taken 1,556 times and found held **0**, the
+    /// triple-buffer lock 4,408 times and held 9, the scroll lock 2,272 times
+    /// and held 1 — against the main surface's single lock at 19,764 takes and
+    /// 49 held, 0.248%. So the number of locks is a legibility question, not a
+    /// performance one, which is why they are written down rather than merged.
+    ///
+    /// **The ordering invariant, in full:** `tripleBufferLock` may be held
+    /// while `pendingGridScrollLock` is taken — twice, both in `commitFlush` —
+    /// and nothing else nests. This lock is never held with either. A
+    /// call-graph scan (`tmp/lockscan.py`) confirms no function reached from
+    /// inside one lock's region acquires another, which is the nesting a
+    /// line-level read misses.
     private let lock = NSLock()
 
 
@@ -410,6 +428,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var lastDrawnRevision: UInt64 = 0     // Draw only
     private var committedGridRows: UInt32 = 0     // Protected by tripleBufferLock
     private var committedGridCols: UInt32 = 0     // Protected by tripleBufferLock
+    /// The committed/write/free row sets, the cursor slots, the commit
+    /// revision, the committed grid size, pending dirty rows, pending scroll
+    /// and layout damage — this surface's counterpart to the main surface's
+    /// single `lock`, and the one the core thread holds across a flush.
+    ///
+    /// Outermost of the three: see `lock`'s comment for the full ordering
+    /// invariant and the measurement behind keeping them apart.
     private let tripleBufferLock = NSLock()
     // GPU back-pressure: allow 2 in-flight command buffers.
     // With flush ops now running on core thread (not main), main thread is free
@@ -488,6 +513,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// Neovim's response can land before the next frame. Guarded by
     /// `pendingGridScrollLock`.
     private var scrollCaptureBounds: (top: Int, bottomEx: Int)?
+    /// The input side of scrolling: `scrollCaptureBounds`,
+    /// `pendingGridScrollRows` and `smoothScrollSeeds`, armed on the MAIN
+    /// thread as a gesture is sent and spent by a flush.
+    ///
+    /// Innermost of the three, and the only lock `tripleBufferLock` is ever
+    /// held across (twice, in `commitFlush`). Never taken in the other order.
     private let pendingGridScrollLock = NSLock()
 
     // Accumulated scroll delta (consumed by draw, survives across flushes)
