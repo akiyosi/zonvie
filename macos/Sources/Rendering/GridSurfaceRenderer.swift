@@ -1107,18 +1107,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Complete one protected GPU read and immediately service any contraction
     /// that had to skip this set while it was in flight. Caller holds `lock`.
+    /// Shared with ExternalGridView; this surface has main vertex buffers to
+    /// retire and an external one does not.
     private func completeSurfaceGpuReadLocked(_ setIndex: Int) {
-        guard setIndex >= 0,
-              setIndex < gpuInFlightCount.count,
-              gpuInFlightCount[setIndex] > 0
-        else { return }
-        gpuInFlightCount[setIndex] -= 1
-        serviceSurfaceRowStorageRetirement(
+        completeSurfaceGpuRead(
+            setIndex: setIndex,
+            gpuInFlightCount: &gpuInFlightCount,
             bufferSets: bufferSets,
-            gpuInFlightCount: gpuInFlightCount,
             committedSetIndex: committedSetIndex,
-            layoutContracted: false,
-            state: &rowStorageRetirement,
+            retirement: &rowStorageRetirement,
             retireMainBuffers: true
         )
     }

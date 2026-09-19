@@ -626,18 +626,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// Complete one protected GPU read and immediately service any contraction
     /// that had to skip this set while it was in flight. Caller holds
     /// `tripleBufferLock`.
+    /// Shared with GridSurfaceRenderer; this surface has no main vertex
+    /// buffers to retire.
     private func completeSurfaceGpuReadLocked(_ setIndex: Int) {
-        guard setIndex >= 0,
-              setIndex < gpuInFlightCount.count,
-              gpuInFlightCount[setIndex] > 0
-        else { return }
-        gpuInFlightCount[setIndex] -= 1
-        serviceSurfaceRowStorageRetirement(
+        completeSurfaceGpuRead(
+            setIndex: setIndex,
+            gpuInFlightCount: &gpuInFlightCount,
             bufferSets: bufferSets,
-            gpuInFlightCount: gpuInFlightCount,
             committedSetIndex: committedSetIndex,
-            layoutContracted: false,
-            state: &rowStorageRetirement
+            retirement: &rowStorageRetirement,
+            retireMainBuffers: false
         )
     }
 
@@ -941,10 +939,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     func activateDrawLoop() {
         DispatchQueue.main.async { [weak self] in
             guard let self, self.window != nil else { return }
+            // Outside the `isPaused` test, as MetalTerminalView does it.
+            // This surface calls activateDrawLoop every frame while a shader
+            // animates, an edge bounce settles or a scroll eases — none of
+            // which is a commit, so `noteIdle`'s hadRecentCommit clause does
+            // not reset the run. Counting those frames as idle deactivated the
+            // loop every eleventh one and the next call woke it again.
+            self.idleCounter.noteActive()
             if self.isPaused {
                 self.isPaused = false
                 self.enableSetNeedsDisplay = false
-                self.idleCounter.noteActive()
                 // Kick only the paused -> active transition. MTKView's
                 // display link may otherwise wait one or more vsyncs after
                 // unpausing; calling this for every already-active commit
@@ -4092,33 +4096,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     override func otherMouseDown(with event: NSEvent) {
         super.otherMouseDown(with: event)
         window?.makeFirstResponder(self)
-        if let btn = otherButtonName(event.buttonNumber) {
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
             sendMouseEvent(button: btn, action: "press", event: event)
         }
     }
 
     override func otherMouseUp(with event: NSEvent) {
         super.otherMouseUp(with: event)
-        if let btn = otherButtonName(event.buttonNumber) {
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
             sendMouseEvent(button: btn, action: "release", event: event)
         }
     }
 
     override func otherMouseDragged(with event: NSEvent) {
         super.otherMouseDragged(with: event)
-        if let btn = otherButtonName(event.buttonNumber) {
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
             sendMouseEvent(button: btn, action: "drag", event: event)
         }
     }
 
-    private func otherButtonName(_ buttonNumber: Int) -> String? {
-        switch buttonNumber {
-        case 2: return "middle"
-        case 3: return "x1"
-        case 4: return "x2"
-        default: return nil
-        }
-    }
 
     /// Which grid a pointer event at `pointPx` (surface content pixels,
     /// top-origin) targets, and the point in that grid's own cells. A float
@@ -4302,13 +4298,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
         }
 
-        // Build modifier string (same format as MetalTerminalView)
-        let mods = event.modifierFlags
-        var modStr = ""
-        if mods.contains(.shift)   { modStr += "S" }
-        if mods.contains(.control) { modStr += "C" }
-        if mods.contains(.option)  { modStr += "A" }
-        if mods.contains(.command) { modStr += "D" }
+        // The formatter itself, not a copy of it. `scrollWheel` in this file
+        // has always called it; this one carried its own transcription under a
+        // comment saying it matched.
+        let modStr = main.buildModifierString(from: event.modifierFlags)
 
         ZonvieCore.appLog("[ExternalGridView mouseEvent] button=\(button) action=\(action) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
 
@@ -4617,13 +4610,7 @@ extension ExternalGridView: NSTextInputClient {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        // Cycle the input context so the system IME candidate window
-        // picks up the current Light/Dark appearance.
-        // Skip if the user is mid-composition to avoid breaking the IME session.
-        if let ctx = _inputContext, !hasMarkedText() {
-            ctx.deactivate()
-            ctx.activate()
-        }
+        surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
     }
 
     override func viewDidMoveToWindow() {
