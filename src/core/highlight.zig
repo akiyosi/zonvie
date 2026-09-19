@@ -102,6 +102,17 @@ pub const Highlights = struct {
     // For "hl_group_set"
     groups: std.StringHashMap(u32),
 
+    /// Every source group name an attribute id was composed from, from
+    /// `hl_attr_define`'s `info` under ext_hlstate.
+    ///
+    /// `groups` cannot answer this. Neovim announces a name through
+    /// `hl_group_set` only for the handful of groups the UI styles its own
+    /// chrome with, and a cell's `hl_id` is an *attribute* id -- one entry of
+    /// the table `hl_attr_define` builds, composed from however many groups
+    /// applied to that cell. Matching a syntax group by name therefore needs
+    /// the other direction: attribute id -> the names it came from.
+    attr_names: std.AutoHashMap(u32, [][]u8),
+
     default_fg: u32 = 0x00FFFFFF,
     default_bg: u32 = 0x00000000,
     default_sp: u32 = 0x00000000,
@@ -115,6 +126,7 @@ pub const Highlights = struct {
             .alloc = alloc,
             .map = std.AutoHashMap(u32, Attr).init(alloc),
             .groups = std.StringHashMap(u32).init(alloc),
+            .attr_names = std.AutoHashMap(u32, [][]u8).init(alloc),
         };
     }
 
@@ -126,7 +138,18 @@ pub const Highlights = struct {
         }
         self.groups.deinit();
 
+        self.freeAttrNames();
+        self.attr_names.deinit();
+
         self.map.deinit();
+    }
+
+    fn freeAttrNames(self: *Highlights) void {
+        var it = self.attr_names.iterator();
+        while (it.next()) |e| {
+            for (e.value_ptr.*) |n| self.alloc.free(n);
+            self.alloc.free(e.value_ptr.*);
+        }
     }
 
     /// Drop all state owned by one Neovim UI attachment while retaining map
@@ -137,6 +160,8 @@ pub const Highlights = struct {
             self.alloc.free(@constCast(e.key_ptr.*));
         }
         self.groups.clearRetainingCapacity();
+        self.freeAttrNames();
+        self.attr_names.clearRetainingCapacity();
         self.map.clearRetainingCapacity();
         self.glyph_style_rev +%= 1;
         self.default_fg = 0x00FFFFFF;
@@ -162,6 +187,23 @@ pub const Highlights = struct {
         const k = try self.alloc.dupe(u8, name);
         errdefer self.alloc.free(k);
         try self.groups.put(k, hl_id);
+        self.groups_changed = true;
+    }
+
+    /// Record one source group name for an attribute id. Names repeat across
+    /// ids and ids repeat across redraws, so both are checked before growing.
+    /// Sets `groups_changed`, which is what makes the glow set re-resolve.
+    pub fn addAttrName(self: *Highlights, attr_id: u32, name: []const u8) !void {
+        const gop = try self.attr_names.getOrPut(attr_id);
+        if (!gop.found_existing) gop.value_ptr.* = &.{};
+        for (gop.value_ptr.*) |existing| {
+            if (std.mem.eql(u8, existing, name)) return;
+        }
+        const owned = try self.alloc.dupe(u8, name);
+        errdefer self.alloc.free(owned);
+        const grown = try self.alloc.realloc(gop.value_ptr.*, gop.value_ptr.len + 1);
+        grown[grown.len - 1] = owned;
+        gop.value_ptr.* = grown;
         self.groups_changed = true;
     }
 

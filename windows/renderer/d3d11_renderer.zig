@@ -139,6 +139,16 @@ fn blobSize(b: ?*ID3DBlob) usize {
     return @intCast(get_sz(p));
 }
 
+/// Say why glow is off. `prepareBloomShaders` is attempted once per renderer
+/// and every one of its exits disables bloom for the rest of the process, so a
+/// silent one leaves no way to tell a failed compile from a config that never
+/// asked for glow. This goes through applog rather than dbgLog because the
+/// builds users run are not Debug builds.
+fn bloomUnavailable(comptime fmt: []const u8, args: anytype) void {
+    if (!applog.isEnabled()) return;
+    applog.appLog("[d3d] bloom unavailable, glow disabled: " ++ fmt ++ "\n", args);
+}
+
 fn dumpBlobAsText(prefix: []const u8, b: ?*ID3DBlob) void {
     const p = b orelse return;
 
@@ -251,6 +261,13 @@ pub const Renderer = struct {
     /// that SPIRV-Cross generates for `layout(location=0) in vec2 vUV`.
     vs_custom_post: ?*c.ID3D11VertexShader = null,
     ps_glow_extract: ?*c.ID3D11PixelShader = null,
+    /// One-shot latch for the per-frame bloom gates, which would otherwise
+    /// repeat their reason every frame.
+    bloom_skip_logged: bool = false,
+    /// `vim.g.zonvie_glow.radius` as a tap-offset multiplier. Set from the
+    /// core each paint; 1.0 is the default radius, so a config that never sets
+    /// one keeps the spread the chain had before radius was wired up.
+    glow_radius_scale: f32 = 1.0,
     /// Attenuates extracted glow by a layer's background coverage, so a glyph
     /// behind an opaque layer does not bloom through it.
     ps_glow_occlude: ?*c.ID3D11PixelShader = null,
@@ -3047,8 +3064,9 @@ pub const Renderer = struct {
     }
 
     fn ensureGlowTextures(self: *Renderer) void {
-        const hw = @max(1, self.width / 2);
-        const hh = @max(1, self.height / 2);
+        const chain = core.glow_chain.plan(self.width, self.height);
+        const hw = chain.half_w_px;
+        const hh = chain.half_h_px;
         if (self.glow_extract_tex != null and self.glow_half_w == hw and self.glow_half_h == hh) return;
 
         // Release old textures
@@ -3089,12 +3107,10 @@ pub const Renderer = struct {
         if (c.FAILED(create_srv(dev, @ptrCast(tex1.?), null, &srv1)) or srv1 == null) return;
         self.glow_extract_srv = srv1;
 
-        // Mip textures: 1/4, 1/8, 1/16
-        var mw = @max(1, hw / 2);
-        var mh = @max(1, hh / 2);
-        for (0..3) |i| {
-            td.Width = mw;
-            td.Height = mh;
+        // Mip textures, sized by the same plan the passes are driven from.
+        for (0..core.glow_chain.mip_count) |i| {
+            td.Width = chain.mip_w_px[i];
+            td.Height = chain.mip_h_px[i];
 
             var tex_m: ?*c.ID3D11Texture2D = null;
             if (c.FAILED(create_tex(dev, &td, null, &tex_m)) or tex_m == null) return;
@@ -3107,9 +3123,6 @@ pub const Renderer = struct {
             var srv_m: ?*c.ID3D11ShaderResourceView = null;
             if (c.FAILED(create_srv(dev, @ptrCast(tex_m.?), null, &srv_m)) or srv_m == null) return;
             self.glow_mip_srv[i] = srv_m;
-
-            mw = @max(1, mw / 2);
-            mh = @max(1, mh / 2);
         }
 
         self.glow_half_w = hw;
@@ -3239,6 +3252,12 @@ pub const Renderer = struct {
             self.ps_glow_composite != null;
     }
 
+    fn noteBloomSkip(self: *Renderer, reason: []const u8) void {
+        if (self.bloom_skip_logged) return;
+        self.bloom_skip_logged = true;
+        bloomUnavailable("{s}", .{reason});
+    }
+
     /// Compile the bloom shaders before a glow-enabled paint is queued.
     /// No-op once built. Keeping this opt-in avoids the ~50 ms cost for
     /// configs that never enable glow without charging the first WM_PAINT.
@@ -3248,10 +3267,19 @@ pub const Renderer = struct {
         if (self.bloom_prepare_attempted) return false;
         self.bloom_prepare_attempted = true;
 
-        const dev = self.device orelse return false;
+        const dev = self.device orelse {
+            bloomUnavailable("no device", .{});
+            return false;
+        };
         const dev_vtbl = dev.*.lpVtbl;
-        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return false;
-        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return false;
+        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse {
+            bloomUnavailable("CreateVertexShader unavailable", .{});
+            return false;
+        };
+        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse {
+            bloomUnavailable("CreatePixelShader unavailable", .{});
+            return false;
+        };
         const hlsl = @embedFile("../shaders/main.hlsl");
 
         const BloomEntry = struct {
@@ -3277,30 +3305,51 @@ pub const Renderer = struct {
             const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
             if (hr_b != 0 or blob == null) {
                 dumpBlobAsText("[D3DCompile bloom] ", err_b);
-                dbgLog("[d3d] WARNING: bloom shader '{s}' compile failed, bloom disabled\n", .{be.entry});
+                bloomUnavailable("'{s}' compile failed hr=0x{x}", .{ be.entry, @as(u32, @bitCast(hr_b)) });
                 return false;
             }
             bloom_blobs[idx] = blob;
         }
 
         if (self.vs_fullscreen == null) {
-            const bp0 = blobPtr(bloom_blobs[0]) orelse return false;
+            const bp0 = blobPtr(bloom_blobs[0]) orelse {
+                bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[0].entry});
+                return false;
+            };
             const bs0 = blobSize(bloom_blobs[0]);
             var vs_fs: ?*c.ID3D11VertexShader = null;
-            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) return false;
+            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) {
+                bloomUnavailable("CreateVertexShader rejected '{s}'", .{bloom_entries[0].entry});
+                return false;
+            }
             self.vs_fullscreen = vs_fs;
         }
 
         inline for (.{ 1, 2, 3, 4, 5 }, .{ &self.ps_glow_extract, &self.ps_glow_occlude, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
             if (field.* == null) {
-                const bp = blobPtr(bloom_blobs[idx]) orelse return false;
+                const bp = blobPtr(bloom_blobs[idx]) orelse {
+                    bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[idx].entry});
+                    return false;
+                };
                 const bs = blobSize(bloom_blobs[idx]);
                 var ps_out: ?*c.ID3D11PixelShader = null;
-                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return false;
+                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) {
+                    bloomUnavailable("CreatePixelShader rejected '{s}'", .{bloom_entries[idx].entry});
+                    return false;
+                }
                 field.* = ps_out;
             }
         }
-        return self.bloomShadersReady();
+        const ready = self.bloomShadersReady();
+        if (!ready) {
+            bloomUnavailable("a shader slot stayed null after preparation", .{});
+        } else if (applog.isEnabled()) {
+            // Say so on success too: preparation runs once, and without this
+            // line a silent log cannot distinguish "bloom is fine" from "this
+            // build predates the failure reporting".
+            applog.appLog("[d3d] bloom shaders ready ({d} entries)\n", .{bloom_entries.len});
+        }
+        return ready;
     }
 
     /// Compile `VSCustomPost` from main.hlsl the first time it's needed.
@@ -3997,9 +4046,6 @@ pub const Renderer = struct {
         const draw_fn = ctx_vtbl.*.Draw orelse return;
         const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
 
-        const hw = self.glow_half_w;
-        const hh = self.glow_half_h;
-
         // --- Pass 1: Glow extract → glow_extract_tex (1/2 res) ---
         // Apply content viewport offset (sidebar/tabline) scaled to half resolution.
         {
@@ -4041,20 +4087,14 @@ pub const Renderer = struct {
             }
             self.drawVertices(cursor) catch return;
 
+
             ps_set_fn(ctx, self.ps.?, null, 0);
         }
 
         // Helper: compute mip dimensions
-        const mip_widths: [3]u32 = .{
-            @max(1, hw / 2),
-            @max(1, hw / 4),
-            @max(1, hw / 8),
-        };
-        const mip_heights: [3]u32 = .{
-            @max(1, hh / 2),
-            @max(1, hh / 4),
-            @max(1, hh / 8),
-        };
+        // The chain's geometry is the core's (src/core/glow_chain.zig): which
+        // texture each pass reads and writes, and at what size.
+        const chain = core.glow_chain.plan(self.width, self.height);
 
         // Setup common state for fullscreen passes
         vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
@@ -4066,84 +4106,69 @@ pub const Renderer = struct {
         var samps: [1]?*c.ID3D11SamplerState = .{self.bilinear_sampler.?};
         ps_set_samp(ctx, 1, 1, @ptrCast(&samps));
 
-        // --- Downsample chain: extract → mip[0] → mip[1] → mip[2] ---
-        for (0..3) |level| {
-            // Unbind SRV slot 1 to avoid RTV/SRV hazard
-            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
-
-            var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.glow_mip_rtv[level].?};
-            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
-
-            var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
-                .TopLeftY = 0,
-                .Width = @floatFromInt(mip_widths[level]),
-                .Height = @floatFromInt(mip_heights[level]),
-                .MinDepth = 0,
-                .MaxDepth = 1,
-            };
-            rs_set_vp(ctx, 1, &vp);
-
-            var sr: c.D3D11_RECT = .{
-                .left = 0,
-                .top = 0,
-                .right = @intCast(mip_widths[level]),
-                .bottom = @intCast(mip_heights[level]),
-            };
-            rs_set_sc(ctx, 1, &sr);
-
-            // Source: extract for level 0, mip[level-1] otherwise
-            const src_srv = if (level == 0) self.glow_extract_srv.? else self.glow_mip_srv[level - 1].?;
-            var srvs: [1]?*c.ID3D11ShaderResourceView = .{src_srv};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
-
-            ps_set_fn(ctx, self.ps_kawase_down.?, null, 0);
-            draw_fn(ctx, 3, 0);
+        // GlowParams carries the radius the Kawase taps stretch by as well as
+        // the composite's intensity, so it is bound for the whole chain rather
+        // than just the last pass.
+        const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
+        if (self.glow_cb) |gcb| {
+            const gcb_res: *c.ID3D11Resource = @ptrCast(gcb);
+            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+            if (!c.FAILED(mapDiscard(ctx, gcb_res, &mapped))) {
+                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
+                dst.* = .{ intensity, self.glow_radius_scale, 0, 0 };
+                unmap0(ctx, gcb_res);
+            }
+            var cbs: [1]?*c.ID3D11Buffer = .{gcb};
+            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
         }
 
-        // --- Upsample chain: mip[2] → mip[1] → mip[0] → extractTex ---
-        for (0..3) |i| {
-            const level = 2 - i;
+        // Down then up, both the same shape: unbind the source slot, bind the
+        // pass's target, size the viewport to it, bind the source, draw.
+        for ([2][core.glow_chain.mip_count]core.glow_chain.Pass{ chain.down, chain.up }, 0..) |passes, stage| {
+            const ps = if (stage == 0) self.ps_kawase_down.? else self.ps_kawase_up.?;
+            for (passes) |pass| {
+                // Unbind SRV slot 1 to avoid an RTV/SRV hazard on the texture
+                // this pass is about to write.
+                var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
+                ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
 
-            // Unbind SRV slot 1
-            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+                const dst_rtv = if (pass.dst == core.glow_chain.extract_target)
+                    self.glow_extract_rtv.?
+                else
+                    self.glow_mip_rtv[@intCast(pass.dst)].?;
+                var rtvs: [1]?*c.ID3D11RenderTargetView = .{dst_rtv};
+                om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
 
-            // Destination: mip[level-1] for level > 0, extract for level 0
-            const dst_rtv = if (level == 0) self.glow_extract_rtv.? else self.glow_mip_rtv[level - 1].?;
-            var rtvs: [1]?*c.ID3D11RenderTargetView = .{dst_rtv};
-            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+                var vp: c.D3D11_VIEWPORT = .{
+                    .TopLeftX = 0,
+                    .TopLeftY = 0,
+                    .Width = @floatFromInt(pass.dst_w_px),
+                    .Height = @floatFromInt(pass.dst_h_px),
+                    .MinDepth = 0,
+                    .MaxDepth = 1,
+                };
+                rs_set_vp(ctx, 1, &vp);
 
-            // Viewport = destination size
-            const dst_w: u32 = if (level == 0) hw else mip_widths[level - 1];
-            const dst_h: u32 = if (level == 0) hh else mip_heights[level - 1];
+                var sr: c.D3D11_RECT = .{
+                    .left = 0,
+                    .top = 0,
+                    .right = @intCast(pass.dst_w_px),
+                    .bottom = @intCast(pass.dst_h_px),
+                };
+                rs_set_sc(ctx, 1, &sr);
 
-            var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
-                .TopLeftY = 0,
-                .Width = @floatFromInt(dst_w),
-                .Height = @floatFromInt(dst_h),
-                .MinDepth = 0,
-                .MaxDepth = 1,
-            };
-            rs_set_vp(ctx, 1, &vp);
+                const src_srv = if (pass.src == core.glow_chain.extract_target)
+                    self.glow_extract_srv.?
+                else
+                    self.glow_mip_srv[@intCast(pass.src)].?;
+                var srvs: [1]?*c.ID3D11ShaderResourceView = .{src_srv};
+                ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
-            var sr: c.D3D11_RECT = .{
-                .left = 0,
-                .top = 0,
-                .right = @intCast(dst_w),
-                .bottom = @intCast(dst_h),
-            };
-            rs_set_sc(ctx, 1, &sr);
-
-            // Source: mip[level] (the smaller texture we're upsampling from)
-            var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.glow_mip_srv[level].?};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
-
-            ps_set_fn(ctx, self.ps_kawase_up.?, null, 0);
-            draw_fn(ctx, 3, 0);
+                ps_set_fn(ctx, ps, null, 0);
+                draw_fn(ctx, 3, 0);
+            }
         }
+
 
         // --- Composite → back buffer (additive blend) ---
         {
@@ -4174,24 +4199,13 @@ pub const Renderer = struct {
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.glow_extract_srv.?};
             ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
-            const gcb_res: *c.ID3D11Resource = @ptrCast(self.glow_cb.?);
-            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
-            const hr_map = mapDiscard(ctx, gcb_res, &mapped);
-            if (!c.FAILED(hr_map)) {
-                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
-                dst.* = .{ intensity, 0, 0, 0 };
-                unmap0(ctx, gcb_res);
-            }
-
-            const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
-            var cbs: [1]?*c.ID3D11Buffer = .{self.glow_cb.?};
-            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
-
             om_set_blend(ctx, self.additive_blend.?, &blend_factor, 0xFFFFFFFF);
 
             ps_set_fn(ctx, self.ps_glow_composite.?, null, 0);
 
+
             draw_fn(ctx, 3, 0);
+
 
             // --- Restore state ---
             ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
@@ -4258,10 +4272,23 @@ pub const Renderer = struct {
         vp_w: u32,
         vp_h: u32,
     ) void {
-        if (!self.bloomShadersReady()) return;
+        // Every gate below runs per frame and drops glow without a trace, so
+        // each one says so once. `prepareBloomShaders` logs its own failure;
+        // reaching the shaders-not-ready gate without that line means glow was
+        // asked for before preparation ran.
+        if (!self.bloomShadersReady()) {
+            self.noteBloomSkip("shaders not ready");
+            return;
+        }
         self.ensureGlowTextures();
-        if (!self.glowTexturesComplete()) return;
-        const ctx = self.ctx orelse return;
+        if (!self.glowTexturesComplete()) {
+            self.noteBloomSkip("glow render targets incomplete");
+            return;
+        }
+        const ctx = self.ctx orelse {
+            self.noteBloomSkip("no device context");
+            return;
+        };
         const ctx_vtbl = ctx.*.lpVtbl;
         self.drawBloomPasses(ctx, ctx_vtbl, &.{}, cursor, intensity, vp_x, vp_y, vp_w, vp_h, rows_ctx, draw_rows_fn);
     }

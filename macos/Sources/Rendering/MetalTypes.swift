@@ -3110,6 +3110,33 @@ func encodeSurfaceNonRowContent(
 
 // MARK: - Bloom (Neon Glow) Shared Helpers
 
+/// The bloom chain's geometry: how large each scratch texture is, and which
+/// one every pass reads and writes.
+///
+/// The arithmetic is the core's (`src/core/glow_chain.zig`,
+/// `zonvie_core_glow_chain_plan`), so both frontends step the same ladder.
+/// This is a plain value rather than the C struct because build.zig hands this
+/// file to swiftc on its own, with no ZonvieCore; the callers translate.
+struct SurfaceGlowChain {
+    static let mipCount = 3
+    /// A pass's source or destination: this, or a mip index.
+    static let extractTarget = -1
+
+    struct Pass {
+        var src: Int
+        var dst: Int
+        var dstWidthPx: Int
+        var dstHeightPx: Int
+    }
+
+    var halfWidthPx: Int
+    var halfHeightPx: Int
+    var mipWidthPx: [Int]
+    var mipHeightPx: [Int]
+    var down: [Pass]
+    var up: [Pass]
+}
+
 /// Shared glow texture state managed per-view (sizes differ per window).
 final class SurfaceGlowTextures {
     var extractTex: MTLTexture?
@@ -3117,12 +3144,12 @@ final class SurfaceGlowTextures {
     var texSize: CGSize = .zero
     var intensityBuffer: MTLBuffer?
 
-    /// Ensure glow textures exist at half `drawableSize` — sized from the
-    /// drawable, not the grid viewport, so blur can bleed into the margins.
+    /// Ensure the glow textures exist at the sizes `chain` gives. The chain is
+    /// sized from the drawable, not the grid viewport, so blur can bleed into
+    /// the margins.
     @discardableResult
-    func ensure(device: MTLDevice, drawableSize: CGSize, pixelFormat: MTLPixelFormat) -> Bool {
-        let halfSize = CGSize(width: max(1, drawableSize.width / 2.0),
-                              height: max(1, drawableSize.height / 2.0))
+    func ensure(device: MTLDevice, chain: SurfaceGlowChain, pixelFormat: MTLPixelFormat) -> Bool {
+        let halfSize = CGSize(width: chain.halfWidthPx, height: chain.halfHeightPx)
         if extractTex != nil, mipTextures.allSatisfy({ $0 != nil }), texSize == halfSize { return true }
 
         let desc = MTLTextureDescriptor()
@@ -3137,15 +3164,11 @@ final class SurfaceGlowTextures {
         guard let newExtract = device.makeTexture(descriptor: desc) else { return false }
 
         var newMips: [MTLTexture?] = [nil, nil, nil]
-        var mw = max(1, desc.width / 2)
-        var mh = max(1, desc.height / 2)
-        for i in 0..<3 {
-            desc.width = mw
-            desc.height = mh
+        for i in 0..<SurfaceGlowChain.mipCount {
+            desc.width = chain.mipWidthPx[i]
+            desc.height = chain.mipHeightPx[i]
             guard let mip = device.makeTexture(descriptor: desc) else { return false }
             newMips[i] = mip
-            mw = max(1, mw / 2)
-            mh = max(1, mh / 2)
         }
         extractTex = newExtract
         mipTextures = newMips
@@ -3192,6 +3215,11 @@ func encodeSurfaceBloomPasses(
     copyVertexBuffer: MTLBuffer,
     bilinearSampler: MTLSamplerState,
     intensity: Float,
+    chain: SurfaceGlowChain,
+    /// `vim.g.zonvie_glow.radius` as a tap-offset multiplier; 1.0 is the
+    /// default radius. The chain's depth is fixed, so reach per tap is the
+    /// only thing a radius can change.
+    radiusScale: Float,
     encodeExtractVertices: (MTLRenderCommandEncoder) -> Void
 ) -> Bool {
     guard let extractTex = glowTextures.extractTex,
@@ -3223,53 +3251,34 @@ func encodeSurfaceBloomPasses(
     encodeExtractVertices(extractEnc)
     extractEnc.endEncoding()
 
-    // Dual Kawase downsample chain: extract → mip[0] → mip[1] → mip[2]
-    for level in 0..<3 {
-        let srcTex = (level == 0) ? extractTex : glowTextures.mipTextures[level - 1]!
-        let dstTex = glowTextures.mipTextures[level]!
-
-        let rpd = MTLRenderPassDescriptor()
-        rpd.colorAttachments[0].texture = dstTex
-        rpd.colorAttachments[0].loadAction = .dontCare
-        rpd.colorAttachments[0].storeAction = .store
-
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
-        enc.setRenderPipelineState(kawaseDownPipeline)
-        enc.setViewport(MTLViewport(originX: 0, originY: 0,
-                                     width: Double(dstTex.width), height: Double(dstTex.height),
-                                     znear: 0, zfar: 1))
-        enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
-        enc.setFragmentTexture(srcTex, index: 0)
-        enc.setFragmentSamplerState(bilinearSampler, index: 0)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        enc.endEncoding()
+    // Down then up, both the same shape: bind the pass's target, size the
+    // viewport to it, bind its source, draw. Which texture each end is comes
+    // from the core's plan.
+    func glowTexture(_ target: Int) -> MTLTexture? {
+        target == SurfaceGlowChain.extractTarget ? extractTex : glowTextures.mipTextures[target]
     }
+    for (stage, passes) in [chain.down, chain.up].enumerated() {
+        for pass in passes {
+            guard let srcTex = glowTexture(pass.src), let dstTex = glowTexture(pass.dst) else { return false }
 
-    // Dual Kawase upsample chain: mip[2] → mip[1] → mip[0] → extractTex
-    for level in stride(from: 2, through: 0, by: -1) {
-        let srcTex = (level == 2) ? glowTextures.mipTextures[2]! : glowTextures.mipTextures[level]!
-        let dstTex: MTLTexture
-        if level == 0 {
-            dstTex = extractTex
-        } else {
-            dstTex = glowTextures.mipTextures[level - 1]!
+            let rpd = MTLRenderPassDescriptor()
+            rpd.colorAttachments[0].texture = dstTex
+            rpd.colorAttachments[0].loadAction = .dontCare
+            rpd.colorAttachments[0].storeAction = .store
+
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
+            enc.setRenderPipelineState(stage == 0 ? kawaseDownPipeline : kawaseUpPipeline)
+            var radius = radiusScale
+            enc.setFragmentBytes(&radius, length: MemoryLayout<Float>.size, index: 0)
+            enc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                         width: Double(pass.dstWidthPx), height: Double(pass.dstHeightPx),
+                                         znear: 0, zfar: 1))
+            enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
+            enc.setFragmentTexture(srcTex, index: 0)
+            enc.setFragmentSamplerState(bilinearSampler, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
+            enc.endEncoding()
         }
-
-        let rpd = MTLRenderPassDescriptor()
-        rpd.colorAttachments[0].texture = dstTex
-        rpd.colorAttachments[0].loadAction = .dontCare
-        rpd.colorAttachments[0].storeAction = .store
-
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
-        enc.setRenderPipelineState(kawaseUpPipeline)
-        enc.setViewport(MTLViewport(originX: 0, originY: 0,
-                                     width: Double(dstTex.width), height: Double(dstTex.height),
-                                     znear: 0, zfar: 1))
-        enc.setVertexBuffer(copyVertexBuffer, offset: 0, index: 0)
-        enc.setFragmentTexture(srcTex, index: 0)
-        enc.setFragmentSamplerState(bilinearSampler, index: 0)
-        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
-        enc.endEncoding()
     }
 
     // Composite → backBuffer (additive blend)
