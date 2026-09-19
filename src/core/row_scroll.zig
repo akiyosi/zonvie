@@ -11,6 +11,10 @@
 //! try_resize round-trips -- so `row_end` is clamped to the rows that fit
 //! below the origin, and the copy, the vacated band and the dirty expansion
 //! all stop at that same clamped row.
+//!
+//! The damage a blit leaves behind is answered here too: which rows of a layer
+//! drawn over it moved, and which of a layer's own rows a full-width band of
+//! root damage overpaints.
 
 const std = @import("std");
 
@@ -149,6 +153,108 @@ pub fn dirtyRowsWithoutBlit(
     const clamped_row_end = @min(@as(i64, row_end), tex_max_rows);
     if (clamped_row_end <= @as(i64, row_start)) return null;
     return .{ row_start, @intCast(clamped_row_end) };
+}
+
+/// Every pixel the blit rewrites: the copy plus the band it vacated. Half-open
+/// on all four edges, so rectangles that only touch do not intersect.
+pub const Rect = struct { left: i32, top: i32, right: i32, bottom: i32 };
+
+pub fn blitRect(p: Plan) Rect {
+    return .{
+        .left = p.origin_x_px,
+        .top = @min(@min(p.src_y_px, p.dst_y_px), p.clear_top_px),
+        .right = p.origin_x_px + p.copy_w_px,
+        .bottom = @max(@max(p.src_y_px, p.dst_y_px) + p.copy_h_px, p.clear_bottom_px),
+    };
+}
+
+/// Inclusive row ranges, each absent when its own intersection is empty.
+pub const OverBlitRows = struct {
+    /// The covering layer's own rows that meet the blit rectangle.
+    above: ?[2]u32 = null,
+    /// The scrolled layer's rows under them.
+    under: ?[2]u32 = null,
+    /// Those rows shifted back by the delta: where the covering pixels came
+    /// from before the copy dragged them.
+    shifted: ?[2]u32 = null,
+};
+
+/// The damage an accepted per-layer blit does to a layer drawn on top of it.
+///
+/// The blit rewrites every pixel of its rectangle R. For a layer M above it:
+/// M's own pixels inside R moved, so every row of M meeting R is redrawn; and
+/// what they covered moved with them, so the rows of the scrolled layer they
+/// were dragged into -- the same rows shifted by -`rows_delta`, plus the
+/// unshifted ones to kill boundary off-by-ones -- are redrawn from the
+/// scrolled layer's vertices. Both ranges come from a pixel intersection, so a
+/// layer off the cell grid gets both rows a boundary straddles.
+///
+/// Only layers ABOVE need this: R lies inside the scrolled layer's own rect,
+/// and a marked layer repaints after it, which is the screen order.
+///
+/// Null when the covering layer's rectangle does not meet the blit's.
+pub fn overBlitRows(
+    p: Plan,
+    rows_delta: i32,
+    above_left_px: i32,
+    above_top_px: i32,
+    above_rows: u32,
+    above_cols: u32,
+    cell_w_px: i32,
+    row_h_px: i32,
+) ?OverBlitRows {
+    if (row_h_px <= 0 or above_rows == 0 or above_cols == 0) return null;
+    const h: i64 = row_h_px;
+    const oy: i64 = p.origin_y_px;
+    const r = blitRect(p);
+    // r.top is exactly origin_y_px + row_start * row_h.
+    const region_first = @divTrunc(@as(i64, r.top) - oy, h);
+    const region_last = @as(i64, p.clamped_row_end) - 1;
+    if (region_last < region_first) return null;
+
+    const a_top: i64 = above_top_px;
+    const a_left: i64 = above_left_px;
+    const a_right = a_left + @as(i64, above_cols) * @as(i64, cell_w_px);
+    const a_bottom = a_top + @as(i64, above_rows) * h;
+    if (a_left >= @as(i64, r.right) or a_right <= @as(i64, r.left)) return null;
+    if (a_top >= @as(i64, r.bottom) or a_bottom <= @as(i64, r.top)) return null;
+
+    const overlap_top = @max(a_top, @as(i64, r.top));
+    const overlap_bottom = @min(a_bottom, @as(i64, r.bottom));
+
+    var out: OverBlitRows = .{};
+    const a_first = @max(0, @divTrunc(overlap_top - a_top, h));
+    const a_last = @min(@as(i64, above_rows) - 1, @divTrunc(overlap_bottom - 1 - a_top, h));
+    if (a_last >= a_first) out.above = .{ @intCast(a_first), @intCast(a_last) };
+
+    const under_first = @max(region_first, @divTrunc(overlap_top - oy, h));
+    const under_last = @min(region_last, @divTrunc(overlap_bottom - 1 - oy, h));
+    if (under_last < under_first) return out;
+    out.under = .{ @intCast(under_first), @intCast(under_last) };
+    const shifted_first = @max(region_first, under_first - @as(i64, rows_delta));
+    const shifted_last = @min(region_last, under_last - @as(i64, rows_delta));
+    if (shifted_last >= shifted_first) out.shifted = .{ @intCast(shifted_first), @intCast(shifted_last) };
+    return out;
+}
+
+/// Which of a layer's own rows a full-width damage band overpaints. The band
+/// spans the whole surface width, so there is no X test; a layer need not be
+/// cell-aligned, so one root row can straddle two of its rows. Inclusive.
+pub fn bandLayerRows(
+    band_top_px: i32,
+    band_bottom_px: i32,
+    origin_y_px: i32,
+    layer_rows: u32,
+    row_h_px: i32,
+) ?[2]u32 {
+    if (row_h_px <= 0 or layer_rows == 0) return null;
+    const h: i64 = row_h_px;
+    const oy: i64 = origin_y_px;
+    if (@as(i64, band_bottom_px) <= oy) return null;
+    const first = @max(0, @divTrunc(@as(i64, band_top_px) - oy, h));
+    const last = @min(@as(i64, layer_rows) - 1, @divTrunc(@as(i64, band_bottom_px) - 1 - oy, h));
+    if (last < first) return null;
+    return .{ @intCast(first), @intCast(last) };
 }
 
 // ---------------------------------------------------------------------------
@@ -324,4 +430,116 @@ test "a layer low in the texture clamps copy, dirty rows and fallback alike" {
     try testing.expectEqual(@as(u32, 5), p.dirty_row_end);
     const fallback = dirtyRowsWithoutBlit(0, 10, 250, 300, row_h).?;
     try testing.expectEqual([2]u32{ 0, 5 }, fallback);
+}
+
+// Over-blit damage. Merged from the Windows `rowsOverBlit` cases; the macOS
+// copy this replaced had none of its own.
+
+/// A layer at y=100, 20 rows of 20px, scrolled down by 3: the blit rewrites
+/// its rows 0..20, pixels 100..500 of a 400px-wide rectangle.
+fn overBlitBase() Plan {
+    return make(0, 20, 3, 0, 100, 400, 800, 44 * 20, 20).?;
+}
+
+test "the blit rectangle spans the copy and the band it vacated" {
+    const r = blitRect(overBlitBase());
+    try testing.expectEqual(@as(i32, 0), r.left);
+    try testing.expectEqual(@as(i32, 100), r.top);
+    try testing.expectEqual(@as(i32, 400), r.right);
+    try testing.expectEqual(@as(i32, 500), r.bottom);
+}
+
+test "a float over the blit marks its own rows, the rows under it and their source" {
+    const p = overBlitBase();
+    // A float at y=210, 4 rows tall, x=100..200: straddles the band.
+    const got = overBlitRows(p, 3, 100, 210, 4, 10, 10, 20).?;
+    try testing.expectEqual([2]u32{ 0, 3 }, got.above.?);
+    try testing.expectEqual([2]u32{ 5, 9 }, got.under.?);
+    // Shifted back by the delta, never forward.
+    try testing.expectEqual([2]u32{ 2, 6 }, got.shifted.?);
+}
+
+test "rows over a blit clamp to the covering layer and to the scroll region" {
+    const p = overBlitBase();
+
+    // Starts above the blit rectangle: the covering layer's first marked row
+    // is the one the rectangle's top edge lands in, not its own row 0.
+    const high = overBlitRows(p, 3, 0, 60, 4, 40, 10, 20).?;
+    try testing.expectEqual([2]u32{ 2, 3 }, high.above.?);
+
+    // Taller than the rectangle: both ranges stop at the region's last row.
+    const tall = overBlitRows(p, 3, 0, 100, 30, 40, 10, 20).?;
+    try testing.expectEqual([2]u32{ 0, 19 }, tall.above.?);
+    try testing.expectEqual([2]u32{ 0, 19 }, tall.under.?);
+    try testing.expectEqual([2]u32{ 0, 16 }, tall.shifted.?);
+}
+
+test "a float that misses the blit rectangle marks nothing" {
+    const p = overBlitBase();
+    // Entirely to the right of the copy.
+    try testing.expect(overBlitRows(p, 3, 400, 210, 4, 10, 10, 20) == null);
+    // Entirely below it.
+    try testing.expect(overBlitRows(p, 3, 100, 500, 4, 10, 10, 20) == null);
+    // Empty covering layer.
+    try testing.expect(overBlitRows(p, 3, 100, 210, 0, 10, 10, 20) == null);
+    try testing.expect(overBlitRows(p, 3, 100, 210, 4, 0, 10, 20) == null);
+    try testing.expect(overBlitRows(p, 3, 100, 210, 4, 10, 10, 0) == null);
+}
+
+test "every over-blit range stays inside the layer it names" {
+    const p = overBlitBase();
+    var top: i32 = 0;
+    while (top <= 600) : (top += 7) {
+        var rows: u32 = 1;
+        while (rows <= 8) : (rows += 1) {
+            const over = overBlitRows(p, 3, 0, top, rows, 40, 10, 20) orelse continue;
+            if (over.above) |a| {
+                try testing.expect(a[0] <= a[1]);
+                try testing.expect(a[1] < rows);
+            }
+            const region_last: u32 = p.clamped_row_end - 1;
+            if (over.under) |u| {
+                try testing.expect(u[0] <= u[1]);
+                try testing.expect(u[1] <= region_last);
+            }
+            if (over.shifted) |s| {
+                try testing.expect(s[0] <= s[1]);
+                try testing.expect(s[1] <= region_last);
+            }
+        }
+    }
+}
+
+test "a root dirty band marks the layer rows it overpaints" {
+    // Cell-aligned: one root row lands on exactly one layer row.
+    try testing.expectEqual([2]u32{ 5, 5 }, bandLayerRows(200, 220, 100, 10, 20).?);
+    // Off the cell grid: the same band straddles two.
+    try testing.expectEqual([2]u32{ 4, 5 }, bandLayerRows(200, 220, 110, 10, 20).?);
+    // Overlapping the layer's top edge from above.
+    try testing.expectEqual([2]u32{ 0, 0 }, bandLayerRows(90, 110, 100, 10, 20).?);
+    // Entirely above the layer.
+    try testing.expect(bandLayerRows(0, 20, 100, 10, 20) == null);
+    // Entirely below it.
+    try testing.expect(bandLayerRows(400, 420, 100, 2, 20) == null);
+    // Degenerate geometry.
+    try testing.expect(bandLayerRows(200, 220, 100, 0, 20) == null);
+    try testing.expect(bandLayerRows(200, 220, 100, 10, 0) == null);
+}
+
+test "a band never names a row outside the layer it covers" {
+    var top: i32 = -60;
+    while (top <= 400) : (top += 7) {
+        var height: i32 = 1;
+        while (height <= 90) : (height += 11) {
+            var rows: u32 = 1;
+            while (rows <= 8) : (rows += 1) {
+                const r = bandLayerRows(top, top + height, 100, rows, 20) orelse continue;
+                try testing.expect(r[0] <= r[1]);
+                try testing.expect(r[1] < rows);
+                // The band really does reach the first row it names.
+                const first_row_bottom = 100 + (@as(i32, @intCast(r[0])) + 1) * 20;
+                try testing.expect(top < first_row_bottom);
+            }
+        }
+    }
 }
