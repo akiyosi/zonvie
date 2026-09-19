@@ -15,11 +15,14 @@ private let metalTerminalMaxRowBuffers = 20_000
 /// Ask the core for the bloom chain's geometry and carry it into the shape
 /// MetalTypes.swift can hold. That file is compiled on its own by `zig build
 /// test`, so the translation has to happen somewhere that can see the C ABI.
-func surfaceGlowChain(surfaceWidthPx: Int, surfaceHeightPx: Int) -> SurfaceGlowChain {
+func surfaceGlowChain(surfaceWidthPx: Int, surfaceHeightPx: Int, radiusScale: Float) -> SurfaceGlowChain {
     var c = zonvie_glow_chain()
-    zonvie_core_glow_chain_plan(UInt32(max(0, surfaceWidthPx)), UInt32(max(0, surfaceHeightPx)), &c)
+    zonvie_core_glow_chain_plan(UInt32(max(0, surfaceWidthPx)), UInt32(max(0, surfaceHeightPx)), radiusScale, &c)
+    // The plan fills both arrays and says how many entries are the ladder; drop
+    // the padding here so the encoder just walks what it is given.
+    let levels = min(Int(c.level_count), SurfaceGlowChain.mipCount)
     func passes(_ tuple: (zonvie_glow_pass, zonvie_glow_pass, zonvie_glow_pass)) -> [SurfaceGlowChain.Pass] {
-        [tuple.0, tuple.1, tuple.2].map {
+        [tuple.0, tuple.1, tuple.2].prefix(levels).map {
             .init(src: Int($0.src), dst: Int($0.dst),
                   dstWidthPx: Int($0.dst_w_px), dstHeightPx: Int($0.dst_h_px))
         }
@@ -4283,9 +4286,12 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                 let vpSize = CGSize(width: viewportMetrics.viewportWidth, height: viewportMetrics.viewportHeight)
                 let intensity = (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8
 
+                // One read, for both the chain's depth and the taps' reach.
+                let glowRadiusScale = (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
                 let glowChain = surfaceGlowChain(
                     surfaceWidthPx: Int(view.drawableSize.width),
-                    surfaceHeightPx: Int(view.drawableSize.height)
+                    surfaceHeightPx: Int(view.drawableSize.height),
+                    radiusScale: glowRadiusScale
                 )
                 if glowTextures.ensure(device: device, chain: glowChain, pixelFormat: view.colorPixelFormat),
                    glowTextures.ensureIntensityBuffer(device: device) {
@@ -4304,7 +4310,7 @@ final class MetalTerminalRenderer: NSObject, MTKViewDelegate {
                     bilinearSampler: bilinSamp,
                     intensity: intensity,
                     chain: glowChain,
-                    radiusScale: (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
+                    radiusScale: glowRadiusScale
                     ) { enc in
                     // Extract vertices: atlas + scroll offsets + row/main + cursor
                     if let tex = atlasTex {

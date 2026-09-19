@@ -3064,7 +3064,7 @@ pub const Renderer = struct {
     }
 
     fn ensureGlowTextures(self: *Renderer) void {
-        const chain = core.glow_chain.plan(self.width, self.height);
+        const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
         const hw = chain.half_w_px;
         const hh = chain.half_h_px;
         if (self.glow_extract_tex != null and self.glow_half_w == hw and self.glow_half_h == hh) return;
@@ -4094,7 +4094,7 @@ pub const Renderer = struct {
         // Helper: compute mip dimensions
         // The chain's geometry is the core's (src/core/glow_chain.zig): which
         // texture each pass reads and writes, and at what size.
-        const chain = core.glow_chain.plan(self.width, self.height);
+        const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
 
         // Setup common state for fullscreen passes
         vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
@@ -4126,7 +4126,7 @@ pub const Renderer = struct {
         // pass's target, size the viewport to it, bind the source, draw.
         for ([2][core.glow_chain.mip_count]core.glow_chain.Pass{ chain.down, chain.up }, 0..) |passes, stage| {
             const ps = if (stage == 0) self.ps_kawase_down.? else self.ps_kawase_up.?;
-            for (passes) |pass| {
+            for (passes[0..chain.level_count]) |pass| {
                 // Unbind SRV slot 1 to avoid an RTV/SRV hazard on the texture
                 // this pass is about to write.
                 var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};

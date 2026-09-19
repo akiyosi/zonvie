@@ -23,7 +23,8 @@
 //     bleed can reach them — but their BACKGROUND is what the ordinary pipeline
 //     would hand to the bloom.
 //
-// Measured, and mutated to prove it is not vacuous:
+// Measured, and mutated to prove it is not vacuous (under `groups = "all"`,
+// which is what this asked for at the time; the named form below reads 0.4470):
 //
 //   correct                              glyph 0.4529   blank 0.0055
 //   extract pass uses `pipeline`         glyph 0.5573   blank 0.7648   FAIL
@@ -32,15 +33,13 @@
 // The blank band moves by two orders of magnitude, which is why the thresholds
 // only have to separate populations rather than measure anything.
 //
-// `groups = "all"` rather than a named group, and that is a finding worth
-// keeping: the core resolves a glow group through `hl.groups`, which is filled
-// from Neovim's `hl_group_set` — sent only for the UI groups Neovim announces.
-// A user-defined group name never arrives, so `resolveGlowGroups` leaves
-// `glow_hl_ids` empty while still logging "glow config: enabled", and the
-// screen does not change at all. This scenario measured exactly that (0.0000 in
-// both bands) before switching to "all". Whether a named group is reachable
-// from a GUI test at all is unresolved; "all" exercises the same pipeline
-// choice, which is what is under test here.
+// `groups = { "Search" }` -- a named group, the form README documents -- and
+// that is deliberate: it is the form that was broken. The core matched a cell's
+// attribute id against ids from `hl_group_set`, two different id spaces, so
+// `glow_hl_ids` stayed empty while the log still said "glow config: enabled"
+// and the screen did not change. This scenario measured exactly that, 0.0000 in
+// both bands, until 28492df taught the core to resolve names through
+// `ext_hlstate`.
 //
 // Relational — the same screen with glow off and glow on — so it needs no
 // golden and is immune to per-host font and DPI drift.
@@ -156,9 +155,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec("execute('set laststatus=0 noruler noshowcmd showtabline=0 scrolloff=0 nowrap noswapfile')");
     try g.exec("execute('set guicursor=a:block-blinkon0')");
     // A bright, saturated foreground on the float's text rows, so the light
-    // they contribute is unmistakable against the blank rows below. `Search`
-    // only because it is a group Neovim announces and therefore one the core
-    // can colour; which group it is does not matter under `groups = "all"`.
+    // they contribute is unmistakable against the blank rows below. It is the
+    // same group the glow configuration below names, so the rows that glow are
+    // the rows that are bright.
     try g.exec("execute('highlight Search guifg=#00ff66 guibg=NONE gui=NONE')");
 
     var before_buf: [max_windows]platform.MainWindow = undefined;

@@ -2094,10 +2094,11 @@ pub export fn zonvie_core_get_glow_radius_scale(p: ?*zonvie_core) callconv(.c) f
 pub export fn zonvie_core_glow_chain_plan(
     surface_w_px: u32,
     surface_h_px: u32,
+    radius_scale: f32,
     out: ?*glow_chain.Chain,
 ) callconv(.c) void {
     const dst = out orelse return;
-    dst.* = glow_chain.plan(surface_w_px, surface_h_px);
+    dst.* = glow_chain.plan(surface_w_px, surface_h_px, radius_scale);
 }
 
 /// Read the current drawable/cell layout stored in core.
