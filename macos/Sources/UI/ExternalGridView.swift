@@ -428,8 +428,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var commitRevision: UInt64 = 0        // Protected by tripleBufferLock
     private var lastCommitTime: UInt64 = 0        // Protected by tripleBufferLock — mach_absolute_time of last visual commit
     private var lastDrawnRevision: UInt64 = 0     // Draw only
-    private var committedGridRows: UInt32 = 0     // Protected by tripleBufferLock
-    private var committedGridCols: UInt32 = 0     // Protected by tripleBufferLock
+    /// Shared with GridSurfaceRenderer. This surface measures in GRID CELLS:
+    /// its window is sized to the grid, so the viewport comes from the row and
+    /// column counts. Width is columns, height is rows.
+    /// Protected by `tripleBufferLock`.
+    private var committedExtent = SurfaceCommittedExtent()
     /// The committed/write/free row sets, the cursor slots, the commit
     /// revision, the committed grid size, pending dirty rows, pending scroll
     /// and layout damage — this surface's counterpart to the main surface's
@@ -1015,7 +1018,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             flushFontGeneration = generation
             flushGeneratedRows.removeAll()
         }
-        let totalRows = Int(committedGridRows)
+        let totalRows = Int(committedExtent.height)
         if totalRows > 0 { pendingDirtyRows.insert(integersIn: 0..<totalRows) }
         if generationAdvanced {
             // Force one draw even before the delayed main-queue notification.
@@ -1253,8 +1256,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 // any more — a cursor-only commit deliberately leaves it alone.
                 cursorDirty = true
             }
-            committedGridRows = gridRows
-            committedGridCols = gridCols
+            committedExtent.commit(width: gridCols, height: gridRows)
             cursorOwner.commit()
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
@@ -1545,7 +1547,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // there is nothing to guess: without it, capture nothing and let the
         // edge stretch have the band rather than retain the wrong rows.
         guard let bounds else { return }
-        let rows = Int(committedGridRows > 0 ? committedGridRows : gridRows)
+        let rows = Int(committedExtent.resolved(liveWidth: gridCols, liveHeight: gridRows).height)
         // Seeding is decided by who compensates the scroll, not by which path
         // captured the rows: this same capture serves a trackpad gesture (which
         // compensates through the finger and owes no seed) and a keyboard
@@ -1932,7 +1934,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         }
 
         // gridRows/gridCols are core-thread bracket state; commitFlush
-        // publishes them into committedGridRows/Cols.
+        // publishes them into committedExtent.
         gridRows = UInt32(totalRows)
         gridCols = UInt32(totalCols)
 
@@ -2374,8 +2376,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let pendingScroll: SurfaceRowScroll?
             var submittedDirtyRows: [Int] = []
 
-            let snappedGridRows: UInt32
-            let snappedGridCols: UInt32
+            let snappedCommittedExtent: SurfaceCommittedExtent
             let cursorDirtySnapshot: Bool
             let lastKnownCursorRowSnapshot: Int
             let cursorBlinkStateSnapshot: Bool
@@ -2431,8 +2432,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             csi = committedSetIndex
             retainedSnapshot = retention.snapshotPublished()
             currentCommitRevision = commitRevision
-            snappedGridRows = committedGridRows
-            snappedGridCols = committedGridCols
+            snappedCommittedExtent = committedExtent
             committedFontIsCurrent = fontResetState.isCurrent(
                 committedGeneration: bufferSets[csi].fontGeneration
             )
@@ -2584,8 +2584,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // viewport_rows exceeds drawable rows (e.g. sg.rows=45 with winbar
             // but window fits 44), Metal clips to the render target bounds
             // automatically — the NDC mapping stays correct for visible rows.
-            let snapGridRows = snappedGridRows > 0 ? snappedGridRows : gridRows
-            let snapGridCols = snappedGridCols > 0 ? snappedGridCols : gridCols
+            let (snapGridCols, snapGridRows) = snappedCommittedExtent.resolved(
+                liveWidth: gridCols,
+                liveHeight: gridRows
+            )
             // External grids are row-mode only: the core reaches them through
             // on_vertices_row, and the ABI has no whole-surface callback.
             if !rowMode {
@@ -3863,15 +3865,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // Use the same grid-based snapped viewport height draw() computes
         // (vpHeight = snapGridRows * cellHi). snapGridRows is a LOCAL inside
         // draw(), not a property — recompute it here the same way:
-        // committedGridRows under tripleBufferLock, falling back to gridRows
-        // when no commit has published dimensions yet. The fragment shader's
-        // NDC reconstruction uses this grid-based height for external
+        // the committed extent under tripleBufferLock, falling back to the
+        // live grid when no commit has published dimensions yet. The fragment
+        // shader's NDC reconstruction uses this grid-based height for external
         // surfaces (via SurfaceViewportMetrics.fragmentHeight), not
         // drawableSize.height.
         tripleBufferLock.lock()
-        let snappedRows = committedGridRows
+        let snappedExtent = committedExtent
         tripleBufferLock.unlock()
-        let rowsForHeight = snappedRows > 0 ? snappedRows : gridRows
+        let rowsForHeight = snappedExtent.resolved(
+            liveWidth: gridCols,
+            liveHeight: gridRows
+        ).height
         let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
         let viewportHeight = Float(rowsForHeight) * Float(cellHi)
         guard viewportHeight > 0 else { return false }
