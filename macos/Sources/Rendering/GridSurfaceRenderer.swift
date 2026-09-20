@@ -3276,7 +3276,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // `shouldReusePreviousContents`. `dirtyRectPxOpt` joins it for the
             // same reason — rect-only damage was consumed and then discarded here.
             // Same animation exception as above.
-            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !shared.anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil {
+            // `shaderCursorMovedThisFrame` joins the list for the reason the
+            // paragraph above gives for `hasNewCommit`: this condition is a
+            // hand-written second copy of the idle gate's terms, so a term
+            // added to the shared `SurfaceIdleTerms` does not reach it. A
+            // cursor shader's rect moves on frames with no dirty row, no layer
+            // work and no blink, and this gate returned SILENTLY — sixteen
+            // frames in a row on a failing run, with nothing in the log and the
+            // effect left on the split the cursor came from.
+            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !shared.anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil && !shaderCursorMovedThisFrame {
                 FrameTracer.trace(.drawSkipNoChange, a: 3)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
