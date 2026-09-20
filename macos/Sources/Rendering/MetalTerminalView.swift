@@ -21,7 +21,7 @@ func surfaceOtherMouseButtonName(_ buttonNumber: Int) -> String? {
     }
 }
 
-final class MetalTerminalView: MTKView {
+final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     var renderer: GridSurfaceRenderer!
 
     /// Expose drawable size without requiring MetalKit import at call site.
@@ -56,7 +56,7 @@ final class MetalTerminalView: MTKView {
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
-        activateDrawLoop()
+        activateSurfaceDrawLoop()
         requestRedraw(nil)
     }
 
@@ -316,9 +316,12 @@ final class MetalTerminalView: MTKView {
     // During rapid updates (scrolling, typing), switch MTKView to continuous
     // vsync-driven rendering to eliminate the requestRedraw → setNeedsDisplay
     // async dispatch latency.  Revert to on-demand mode after idle frames.
-    /// Shared with ExternalGridView (SurfaceDrawGate.swift). The threshold is
-    /// this surface's own: see DrawLoopIdleCounter on why the two differ.
-    private var idleCounter = DrawLoopIdleCounter(threshold: 15)
+    /// Shared with ExternalGridView: the counter is DrawLoopIdleCounter
+    /// (SurfaceDrawGate.swift) and the mode switching is SurfaceDrawLoopHost
+    /// (SurfaceDrawLoop.swift). The threshold is this surface's own — see
+    /// DrawLoopIdleCounter on why the two differ.
+    var drawLoopIdleCounter = DrawLoopIdleCounter(threshold: 15)
+    let drawLoopTraceName = "main"
 
     // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
     // only while the core reports a pending deadline. Replaces the former
@@ -385,7 +388,7 @@ final class MetalTerminalView: MTKView {
     private func sendInputNow(_ text: String) {
         sendInputForHeldKey(text)
         // Keep the active draw loop alive so the response is drawn promptly.
-        idleCounter.noteActive()
+        drawLoopIdleCounter.noteActive()
     }
 
     /// Send committed text and record it for repeat synthesis. An external
@@ -518,7 +521,7 @@ final class MetalTerminalView: MTKView {
         // This OS repeat is replaced by an immediate synthesized one, then
         // the display link paces the rest.
         replayHeldKey()
-        activateDrawLoop()
+        activateSurfaceDrawLoop()
         startRepeatDisplayLink()
     }
 
@@ -780,50 +783,22 @@ final class MetalTerminalView: MTKView {
 
     // MARK: - Active Draw Loop
 
-    /// Activate continuous vsync-driven rendering.
-    /// Called from core thread (on_flush_end) — dispatches to main.
-    func activateDrawLoop() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.window != nil else { return }
-            self.idleCounter.noteActive()
-            if self.isPaused {
-                ZonvieCore.appLogScrollMode("[drawloop] activate: switching to continuous rendering")
-                self.isPaused = false
-                self.enableSetNeedsDisplay = false
-                // Kick a draw immediately. Without this, MTKView's internal
-                // CADisplayLink can take up to 1-2 vsyncs to start firing
-                // after isPaused flips, which lets several commits pile up
-                // and produces a multi-row "jump" on the first draw of a
-                // held-key scroll.
-                self.setNeedsDisplay(self.bounds)
-            }
-        }
-    }
-
-    /// Switch back to on-demand rendering (setNeedsDisplay-driven).
-    private func deactivateDrawLoop() {
-        guard !isPaused else { return }
-        ZonvieCore.appLogScrollMode("[drawloop] deactivate: switching to on-demand rendering (idle=\(idleCounter.idleFrames))")
-        isPaused = true
-        enableSetNeedsDisplay = true
-    }
-
     /// Called from draw() early-return paths when no rendering was needed.
     func notifyDrawIdle() {
         // `heldActive`: while a synthesized key repeat is armed, the draw loop
         // is its clock and must never stop, even on frames with nothing to
         // render (holding j at the end of the buffer).
-        if idleCounter.noteIdle(
+        if drawLoopIdleCounter.noteIdle(
             hadRecentCommit: renderer?.hadRecentCommit(withinNs: 50_000_000) == true,
             heldActive: synthRepeatActive
         ) {
-            deactivateDrawLoop()
+            deactivateSurfaceDrawLoop()
         }
     }
 
     /// Called from draw() when actual rendering proceeds.
     func notifyDrawActive() {
-        idleCounter.noteActive()
+        drawLoopIdleCounter.noteActive()
     }
 
     private func drawablePxRectToViewRect(_ rectPxTopOrigin: NSRect) -> NSRect {
@@ -929,7 +904,7 @@ final class MetalTerminalView: MTKView {
             // Keep the draw loop alive while an edge bounce is held/animating,
             // so the bounce-back keeps ticking after input events stop.
             if let self, self.isPaused, self.isScrollEdgeBounceActive() {
-                self.activateDrawLoop()
+                self.activateSurfaceDrawLoop()
             }
             // Update shader with current scroll offsets (safe to call here on main thread).
             self?.updateScrollShaderOffset()
@@ -2522,7 +2497,7 @@ final class MetalTerminalView: MTKView {
             // flushes, so flush-driven activation never fires (a paused loop
             // would freeze the rubber band, e.g. while the finger holds still).
             if isPaused && (abs(newOffset) >= Self.scrollOffsetEpsilon || alreadyPending + scrollCount > 0) {
-                activateDrawLoop()
+                activateSurfaceDrawLoop()
             }
 
             return newOffset
@@ -3097,7 +3072,7 @@ final class MetalTerminalView: MTKView {
         // The last key of a hold produces no further flushes, so the ease
         // needs the draw clock kept alive to settle.
         if easeActive && isPaused {
-            activateDrawLoop()
+            activateSurfaceDrawLoop()
         }
     }
 

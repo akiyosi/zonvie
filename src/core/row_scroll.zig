@@ -306,10 +306,17 @@ pub const Merge = struct {
 /// The cost rises across those three, and the reasoning for the cheapest one is
 /// that a staged shift has moved no pixels yet: the slot is spent at paint time,
 /// so a displaced region only owes its rows a repaint, while the incoming shift
-/// is still a valid blit. Whether the two Windows drivers are merely
-/// conservative or are guarding something their row storage does differently
-/// cannot be settled without hardware, so only the macOS caller is wired to
-/// this; the Windows copies are left alone and named above.
+/// is still a valid blit.
+///
+/// The Windows LAYER driver now calls this for the arithmetic — the clamp, the
+/// same-region test and the empty-displaced-region guard — and keeps its own
+/// answer to the conflict, which is the one line where the two differ. Whether
+/// it may take the cheaper answer cannot be settled without hardware.
+///
+/// The Windows ROOT is not wired and cannot be: it keys the merge on the pixel
+/// RECT rather than on rows, so "the same region" is a different question
+/// there, and it carries a second accumulator (`pending_vb_shift`) this type
+/// does not model.
 pub fn mergeStaged(existing: ?Staged, incoming: Staged) Merge {
     const old = existing orelse return .{ .staged = incoming, .superseded = null };
     if (old.row_start == incoming.row_start and old.row_end == incoming.row_end) {
