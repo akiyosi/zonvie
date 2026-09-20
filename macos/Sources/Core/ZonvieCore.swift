@@ -1324,7 +1324,7 @@ final class ZonvieCore {
                 }
                 // Activate continuous draw loop so the new commit gets rendered
                 // at display refresh rate without async dispatch latency.
-                me.terminalView?.activateDrawLoop()
+                me.terminalView?.activateSurfaceDrawLoop()
                 // requestRedraw as fallback: triggers setNeedsDisplay for the
                 // first frame when still in paused mode.  No-op in active mode
                 // (enableSetNeedsDisplay=false).

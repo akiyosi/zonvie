@@ -171,6 +171,12 @@ struct SurfaceLoadActionTerms {
     var canDirtyOnlyWithBlur = false
 
     /// The frame carries a cursor move and nothing else.
+    ///
+    /// Left false by a surface that says the same thing by refusing to encode
+    /// the surface pass at all — GridSurfaceRenderer's `skipMainPass`, whose
+    /// `noMainWorkFrame` is this condition plus the layer work only it has.
+    /// Both reach the same load action; they differ in whether the frame still
+    /// runs a pass that would overwrite what it loads.
     var isCursorOnlyFrame = false
 
     /// Hosted layers are unchanged and nothing else moved.
@@ -518,5 +524,38 @@ struct SurfaceCommittedExtent {
     func resolved(liveWidth: UInt32, liveHeight: UInt32) -> (width: UInt32, height: UInt32) {
         guard width > 0, height > 0 else { return (liveWidth, liveHeight) }
         return (width, height)
+    }
+}
+
+/// A surface's cursor blink phase, and what its last frame drew with.
+///
+/// Both surfaces kept the same two fields and the same lock-guarded accessor,
+/// twelve identical lines each. The lock is passed in rather than owned: the
+/// draw reads `visible` inside the same critical section as the rest of its
+/// snapshot, and giving this its own lock would split that atomicity.
+struct SurfaceBlinkState {
+    /// Visible now — false while the blink hides the cursor. Written by the
+    /// blink timer, read by the draw, both under the surface's lock.
+    private var visible = true
+
+    /// What the last frame this surface drew showed. Draw thread only.
+    var lastRendered = true
+
+    /// For a caller that already holds the lock.
+    var visibleLocked: Bool {
+        get { visible }
+        set { visible = newValue }
+    }
+
+    func isVisible(lock: NSLock) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return visible
+    }
+
+    mutating func setVisible(_ newValue: Bool, lock: NSLock) {
+        lock.lock()
+        visible = newValue
+        lock.unlock()
     }
 }

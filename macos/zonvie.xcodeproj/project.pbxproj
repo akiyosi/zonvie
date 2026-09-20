@@ -36,6 +36,7 @@
 		ACF001212F2000010072639A /* RowScrollBlitPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001202F2000010072639A /* RowScrollBlitPlan.swift */; };
 		ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001302F2000010072639A /* SharedRenderResources.swift */; };
 		ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001322F2000010072639A /* SurfaceDrawGate.swift */; };
+		ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001412F2000010072639A /* SurfaceDrawLoop.swift */; };
 		ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF002002F2000020072639A /* FlushRetryBackoff.swift */; };
 		ACF00A022F3000010072639A /* KeyCharacterSelection.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF00A012F3000010072639A /* KeyCharacterSelection.swift */; };
 		ACF003012F2000030072639A /* FrameTracer.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF003002F2000030072639A /* FrameTracer.swift */; };
@@ -74,6 +75,7 @@
 		ACF001202F2000010072639A /* RowScrollBlitPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RowScrollBlitPlan.swift; sourceTree = "<group>"; };
 		ACF001302F2000010072639A /* SharedRenderResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedRenderResources.swift; sourceTree = "<group>"; };
 		ACF001322F2000010072639A /* SurfaceDrawGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawGate.swift; sourceTree = "<group>"; };
+		ACF001412F2000010072639A /* SurfaceDrawLoop.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SurfaceDrawLoop.swift; sourceTree = "<group>"; };
 		ACF002002F2000020072639A /* FlushRetryBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlushRetryBackoff.swift; sourceTree = "<group>"; };
 		ACF00A012F3000010072639A /* KeyCharacterSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyCharacterSelection.swift; sourceTree = "<group>"; };
 		ACF003002F2000030072639A /* FrameTracer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameTracer.swift; sourceTree = "<group>"; };
@@ -170,6 +172,7 @@
 				ACF001202F2000010072639A /* RowScrollBlitPlan.swift */,
 				ACF001302F2000010072639A /* SharedRenderResources.swift */,
 				ACF001322F2000010072639A /* SurfaceDrawGate.swift */,
+				ACF001412F2000010072639A /* SurfaceDrawLoop.swift */,
 				ACF003002F2000030072639A /* FrameTracer.swift */,
 			);
 			path = Rendering;
@@ -298,6 +301,7 @@
 				ACF001212F2000010072639A /* RowScrollBlitPlan.swift in Sources */,
 				ACF001312F2000010072639A /* SharedRenderResources.swift in Sources */,
 				ACF001332F2000010072639A /* SurfaceDrawGate.swift in Sources */,
+				ACF001402F2000010072639A /* SurfaceDrawLoop.swift in Sources */,
 				ACF002012F2000020072639A /* FlushRetryBackoff.swift in Sources */,
 				ACF00A022F3000010072639A /* KeyCharacterSelection.swift in Sources */,
 				ACF003012F2000030072639A /* FrameTracer.swift in Sources */,
