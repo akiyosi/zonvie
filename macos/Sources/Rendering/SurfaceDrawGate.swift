@@ -489,3 +489,34 @@ struct SurfaceCursorOwner {
         staged = committed
     }
 }
+
+
+/// The dimensions the committed vertices were baked for.
+///
+/// A surface's viewport has to match what the core generated NDC against, or
+/// every row lands at the wrong height. Both surfaces published that pair at
+/// commit and read it back at draw with a fallback to the live value — one in
+/// drawable pixels, the other in grid rows and columns, which is why the fields
+/// here are named for their role rather than their unit and each surface says
+/// which it means at its own declaration.
+///
+/// The pair is published together, so it is all-or-nothing: a surface has
+/// either committed both or neither. One surface tested both and the other
+/// tested each separately, which is the same answer under that invariant —
+/// stated once here, and the safer of the two if it were ever broken, because
+/// a committed width beside a live height describes no frame that existed.
+struct SurfaceCommittedExtent {
+    private(set) var width: UInt32 = 0
+    private(set) var height: UInt32 = 0
+
+    mutating func commit(width: UInt32, height: UInt32) {
+        self.width = width
+        self.height = height
+    }
+
+    /// The committed pair, or the live one when nothing has been committed.
+    func resolved(liveWidth: UInt32, liveHeight: UInt32) -> (width: UInt32, height: UInt32) {
+        guard width > 0, height > 0 else { return (liveWidth, liveHeight) }
+        return (width, height)
+    }
+}

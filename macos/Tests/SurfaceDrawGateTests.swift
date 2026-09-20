@@ -553,8 +553,62 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// The committed extent both surfaces now share, against the two fallback
+    /// rules it replaced.
+    ///
+    ///     main      if committedW > 0 && committedH > 0 { use both }
+    ///               else { use the live drawable for both }
+    ///     external  rows = committedRows > 0 ? committedRows : liveRows
+    ///               cols = committedCols > 0 ? committedCols : liveCols
+    ///
+    /// The two agree on every pair a surface can actually hold, because the
+    /// pair is published together and is therefore all-or-nothing. This
+    /// enumerates the mixed pairs too — the ones the invariant forbids — and
+    /// asserts the shared rule takes the all-or-nothing answer there, which is
+    /// the safe one: a committed width beside a live height describes no frame
+    /// that ever existed.
+    private static func verifyCommittedExtent() {
+        let values: [UInt32] = [0, 1, 40, 80]
+        let liveW: UInt32 = 7
+        let liveH: UInt32 = 9
+        var mixedSeen = 0
+        for w in values {
+            for h in values {
+                var extent = SurfaceCommittedExtent()
+                extent.commit(width: w, height: h)
+                let got = extent.resolved(liveWidth: liveW, liveHeight: liveH)
+
+                let mainRule: (UInt32, UInt32) = (w > 0 && h > 0) ? (w, h) : (liveW, liveH)
+                let externalRule: (UInt32, UInt32) =
+                    (w > 0 ? w : liveW, h > 0 ? h : liveH)
+
+                check(got.width == mainRule.0 && got.height == mainRule.1, true,
+                      "extent vs main rule w=\(w) h=\(h)")
+
+                if (w == 0) == (h == 0) {
+                    // The pairs a surface can hold: the two rules agree.
+                    check(got.width == externalRule.0 && got.height == externalRule.1, true,
+                          "extent vs external rule w=\(w) h=\(h)")
+                } else {
+                    mixedSeen += 1
+                    // The invariant forbids these, and the two rules disagree
+                    // on them: the shared one takes all-or-nothing.
+                    if got.width != liveW || got.height != liveH {
+                        failures += 1
+                        print("FAIL: a mixed extent w=\(w) h=\(h) did not fall back whole")
+                    }
+                }
+            }
+        }
+        if mixedSeen == 0 {
+            failures += 1
+            print("FAIL: the enumeration produced no mixed pair, so it proved nothing")
+        }
+    }
+
     static func main() {
         verifyMainSurface()
+        verifyCommittedExtent()
         verifyCursorOwner()
         verifyScrollOffsetLatch()
         verifyExternalSurface()
