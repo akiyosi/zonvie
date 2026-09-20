@@ -695,22 +695,27 @@ func resolveSurfaceClearAlpha(
     return Double(resolveSurfaceBackgroundAlpha(blurEnabled: blurEnabled, decoratedSurface: false))
 }
 
-func extractRGBFromClearColor(_ color: MTLClearColor) -> UInt32 {
-    let r = UInt32(color.red * 255.0) & 0xFF
-    let g = UInt32(color.green * 255.0) & 0xFF
-    let b = UInt32(color.blue * 255.0) & 0xFF
+/// Pack three 0...1 components into the 8-bit RGB both surfaces keep their
+/// background as. The colour arrives from the core as 8-bit already; this is
+/// for the paths that reach it through AppKit's CGFloat components.
+func packSurfaceBgRGB(red: Double, green: Double, blue: Double) -> UInt32 {
+    let r = UInt32(red * 255.0) & 0xFF
+    let g = UInt32(green * 255.0) & 0xFF
+    let b = UInt32(blue * 255.0) & 0xFF
     return (r << 16) | (g << 8) | b
 }
 
-func makeSurfaceClearColor(
-    red: Double,
-    green: Double,
-    blue: Double,
-    blurEnabled: Bool,
-    decoratedSurface: Bool
-) -> MTLClearColor {
-    let alpha = resolveSurfaceClearAlpha(blurEnabled: blurEnabled, decoratedSurface: decoratedSurface)
-    return MTLClearColor(red: red, green: green, blue: blue, alpha: alpha)
+/// The clear colour a surface's load action uses: its 8-bit background plus
+/// the alpha its kind resolves to. GridSurfaceRenderer resolves that alpha
+/// from `blurEnabled` on every draw; ExternalGridView is handed it by the app,
+/// which picks a different one for a decorated surface's margin.
+func makeSurfaceClearColor(bgRGB: UInt32, clearAlpha: Double) -> MTLClearColor {
+    return MTLClearColor(
+        red: Double((bgRGB >> 16) & 0xFF) / 255.0,
+        green: Double((bgRGB >> 8) & 0xFF) / 255.0,
+        blue: Double(bgRGB & 0xFF) / 255.0,
+        alpha: clearAlpha
+    )
 }
 
 func makeSurfaceClearColor(
@@ -718,15 +723,12 @@ func makeSurfaceClearColor(
     blurEnabled: Bool,
     decoratedSurface: Bool = false
 ) -> MTLClearColor {
-    let red = Double((bgRGB >> 16) & 0xFF) / 255.0
-    let green = Double((bgRGB >> 8) & 0xFF) / 255.0
-    let blue = Double(bgRGB & 0xFF) / 255.0
     return makeSurfaceClearColor(
-        red: red,
-        green: green,
-        blue: blue,
-        blurEnabled: blurEnabled,
-        decoratedSurface: decoratedSurface
+        bgRGB: bgRGB,
+        clearAlpha: resolveSurfaceClearAlpha(
+            blurEnabled: blurEnabled,
+            decoratedSurface: decoratedSurface
+        )
     )
 }
 
@@ -1053,6 +1055,55 @@ struct SurfaceRowScroll {
     var rowsDelta: Int
     var totalRows: Int
     var totalCols: Int
+}
+
+/// What one grid a surface places as a layer owes the next frame.
+///
+/// A reference type, so mutating one grid's entry never detaches the
+/// dictionary's storage while the draw thread holds a reference into it.
+///
+/// `flushDirtyRows` belongs to the core thread inside the flush bracket;
+/// `pendingDirtyRows`, `pendingScrollAccum` and `needsFullRedraw` cross to
+/// the draw thread under the surface's lock; the `draw*` fields belong to the
+/// draw thread for one frame. Every row number here is grid-local.
+///
+/// Only the main renderer keeps these today; ExternalGridView carries nil in
+/// every layer frame. It is declared here so both surfaces can name the same
+/// frame entry.
+final class SurfaceLayerDrawState {
+    var flushDirtyRows = IndexSet()
+    var pendingDirtyRows = IndexSet()
+    var pendingScrollAccum: SurfaceRowScroll? = nil
+    var needsFullRedraw = false
+    /// Consumed under the surface's lock at the top of a frame; capacity is reused.
+    var drawRows: [Int] = []
+    var drawScroll: SurfaceRowScroll? = nil
+    var drawAllRows = false
+    /// The band this frame's accepted GPU scroll copy vacated, in the layer's
+    /// own pixel space, or nil when no blit ran for this layer.
+    var drawBlitClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
+    var lastDrawnRowCount = 0
+}
+
+/// One layer a frame draws, with the buffer set it reads and what it owes.
+///
+/// Both surfaces take this snapshot under their own lock and then draw from it
+/// without the lock. GridSurfaceRenderer held three arrays read at the same
+/// index, then one array of its own struct; ExternalGridView held an array of
+/// `(layer, set)` pairs. One type, and both resolve the triple-buffer index
+/// where the snapshot is taken rather than at each later use.
+///
+/// Which layers are admitted is still each surface's own: the main renderer's
+/// entry 0 is its root grid, and ExternalGridView leaves its own grid out and
+/// admits only layers whose grid has submitted.
+struct SurfaceLayerFrame {
+    let layer: SurfaceLayer
+    /// The committed set of the layer's grid, nil for one that has never
+    /// submitted.
+    let set: SurfaceBufferSet?
+    /// What the layer owes this frame; nil on a surface that keeps no
+    /// per-layer draw state, and treated as owing everything.
+    let state: SurfaceLayerDrawState?
 }
 
 /// Clamp a scroll-delta accumulator (produced via wrapping &+ to avoid a
