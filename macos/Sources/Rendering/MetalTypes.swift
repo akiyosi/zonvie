@@ -946,6 +946,66 @@ struct SurfaceLayer {
     var mouseEnabled: Bool = true
 }
 
+/// One published cursor, and the buffers the frames reading it need.
+///
+/// The cursor used to live on `SurfaceBufferSet`, which tied publishing a
+/// cursor to rotating a ROW set: plain cursor motion — the commonest flush a
+/// surface sees — had to find a free row set, resynchronize every grid's row
+/// state into it and rotate, or be dropped when all three were GPU-in-flight.
+/// Cursor callbacks replace the cursor outright, so a slot needs no
+/// copy-forward; three are enough for the committed one plus the frames in
+/// flight.
+///
+/// ExternalGridView split it out first. The main renderer kept its cursor in
+/// the row-set objects and indexed that array with the CURSOR index, which is
+/// only correct because nothing else in a set is read at that index.
+final class SurfaceCursorSlot {
+    var vertexBuffer: MTLBuffer? = nil
+    var vertexBufferCap: Int = 0
+    var vertexCount: Int = 0
+    /// Fallback scratch for the cursor pass's scroll offsets, used only when
+    /// they exceed setVertexBytes' 4096-byte limit. Stays nil on a surface that
+    /// binds one offset rather than an array.
+    var scrollOffsetBuffer: MTLBuffer? = nil
+    var scrollOffsetBufferCap: Int = 0
+}
+
+/// Where the grid that owns the cursor sits on a surface, and how it moves.
+///
+/// Both surfaces answer this from their committed layer list, and both treat
+/// their OWN root grid specially: the cursor there sits at the surface origin,
+/// follows nothing and anchors to nothing. GridSurfaceRenderer said that by
+/// returning zero for grid 1; ExternalGridView said it with a `!= gridId`
+/// clause on two of its three lookups and not on the third, which therefore
+/// took the root layer's own origin. One resolve, and one scan where the
+/// external surface made three.
+struct SurfaceCursorPlacement {
+    var originPx: simd_float2
+    var followsScroll: Bool
+    var anchorGrid: Int64
+}
+
+func resolveSurfaceCursorPlacement(
+    ownerGridId: Int64,
+    rootGridId: Int64,
+    layers: [SurfaceLayer]
+) -> SurfaceCursorPlacement {
+    guard ownerGridId != rootGridId,
+          let layer = layers.first(where: { $0.gridId == ownerGridId })
+    else {
+        return SurfaceCursorPlacement(
+            originPx: simd_float2(0, 0),
+            followsScroll: false,
+            anchorGrid: rootGridId
+        )
+    }
+    return SurfaceCursorPlacement(
+        originPx: layer.originPx,
+        followsScroll: layer.followsScroll,
+        anchorGrid: layer.anchorGrid
+    )
+}
+
 /// Resolve a retained row in grid-local pixels, including a prior slot shift.
 func resolveSurfaceGridRow(_ set: SurfaceBufferSet, row: Int, cellHeightPx: Float)
     -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
@@ -984,22 +1044,14 @@ final class SurfaceBufferSet {
     // commit installed in between. Published in ExternalGridView.commitFlush()
     // with committedSetIndex, under the same tripleBufferLock.
     var atlasTextureSnapshot: MTLTexture? = nil
-    // Cursor vertex buffer (used by both GridSurfaceRenderer and ExternalGridView,
-    // each keeping its own per-set copy so a GPU-in-flight read never races a CPU write)
-    var cursorVertexBuffer: MTLBuffer? = nil
-    var cursorVertexBufferCap: Int = 0
-    var cursorVertexCount: Int = 0
-
     // Scroll-offset scratch for bindSurfaceScrollOffsets' fallback path (only
     // when offsets exceed the 4096-byte setVertexBytes limit — rare). Per-set
-    // for the same reason as cursorVertexBuffer above: gpuInFlightCount
-    // guarantees the previous frame's read of this slot completed before it is
-    // reused. Two buffers because the main and cursor passes can bind different
-    // offsets within the same frame.
+    // because gpuInFlightCount guarantees the previous frame's read of this
+    // slot completed before it is reused. The cursor pass has its own, on the
+    // cursor slot, because the two passes can bind different offsets within
+    // one frame.
     var scrollOffsetBuffer: MTLBuffer? = nil
     var scrollOffsetBufferCap: Int = 0
-    var cursorScrollOffsetBuffer: MTLBuffer? = nil
-    var cursorScrollOffsetBufferCap: Int = 0
 
     // Detach pool: buffers saved from this set before beginFlush overwrites them.
     // On COW detach, reuse a pool buffer instead of calling device.makeBuffer().

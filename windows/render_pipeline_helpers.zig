@@ -921,31 +921,63 @@ pub const LayerScroll = struct {
     rows_delta: i32,
     total_rows: u32,
     total_cols: u32,
+
+    /// This driver does not track the columns a shift covers, so the whole
+    /// grid width is what the core is told. `mergeStaged` compares rows only,
+    /// which is what every caller of it decides on.
+    fn toStaged(self: LayerScroll) core.row_scroll.Staged {
+        return .{
+            .row_start = @intCast(self.row_start),
+            .row_end = @intCast(self.row_end),
+            .col_start = 0,
+            .col_end = @intCast(self.total_cols),
+            .rows_delta = self.rows_delta,
+            .total_rows = @intCast(self.total_rows),
+            .total_cols = @intCast(self.total_cols),
+        };
+    }
+
+    fn fromStaged(s: core.row_scroll.Staged) LayerScroll {
+        return .{
+            .row_start = @intCast(@max(0, s.row_start)),
+            .row_end = @intCast(@max(0, s.row_end)),
+            .rows_delta = s.rows_delta,
+            .total_rows = @intCast(@max(0, s.total_rows)),
+            .total_cols = @intCast(@max(0, s.total_cols)),
+        };
+    }
 };
 
 pub const LayerScrollMerge = union(enum) {
     accumulate: LayerScroll,
-    /// Two different regions in one flush. Neither can be blitted, so both are
-    /// handed back for the caller to dirty; blitting the newer one would smear
-    /// the pixels the older one already moved outside its rectangle.
+    /// Two different regions in one flush. This driver blits neither and hands
+    /// both back for the caller to dirty.
+    ///
+    /// The core's rule keeps the incoming one as a valid blit and returns only
+    /// the displaced region — see `row_scroll.mergeStaged`, which names all
+    /// three answers that were found asking this. The arithmetic below is the
+    /// core's; only this policy is the driver's, and it stays until hardware
+    /// can say whether the cheaper answer holds here.
     conflict: struct { old: LayerScroll, new: LayerScroll },
 };
 
 pub fn mergeLayerScroll(existing: ?LayerScroll, incoming: LayerScroll) LayerScrollMerge {
-    const old = existing orelse return .{ .accumulate = incoming };
-    if (old.row_start != incoming.row_start or old.row_end != incoming.row_end) {
-        return .{ .conflict = .{ .old = old, .new = incoming } };
+    const staged_existing: ?core.row_scroll.Staged =
+        if (existing) |e| e.toStaged() else null;
+    const merged = core.row_scroll.mergeStaged(staged_existing, incoming.toStaged());
+    if (merged.superseded) |old| {
+        return .{ .conflict = .{ .old = LayerScroll.fromStaged(old), .new = incoming } };
     }
-    var merged = incoming;
-    merged.rows_delta = clampRowsDelta(@as(i64, old.rows_delta) + @as(i64, incoming.rows_delta));
-    return .{ .accumulate = merged };
+    // `superseded` is also null for a displaced region that was empty, which
+    // moved nothing and so owes no repaint — the core drops it and this driver
+    // has nothing to dirty either.
+    return .{ .accumulate = LayerScroll.fromStaged(merged.staged) };
 }
 
 /// Bound a scroll-delta accumulator well below the integer extremes, which
-/// later abs() calls would trap on. Mirrors MetalTypes.swift clampRowsDelta.
-pub fn clampRowsDelta(value: i64) i32 {
-    return @intCast(@max(-1_000_000, @min(1_000_000, value)));
-}
+/// later abs() calls would trap on. The core's, so the two frontends clamp
+/// identically.
+pub const clampRowsDelta = core.row_scroll.clampRowsDelta;
 
 fn swapRowBits(bits: *std.DynamicBitSetUnmanaged, a: usize, b: usize) void {
     const av = bits.isSet(a);

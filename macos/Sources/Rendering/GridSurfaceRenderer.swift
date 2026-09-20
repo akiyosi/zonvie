@@ -992,12 +992,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var cursorOwner = SurfaceCursorOwner(initial: 1)
     var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
 
-    /// The committed cursor's layer origin within the surface.
-    private var committedCursorLayerOriginPx: simd_float2 {
-        let owner = cursorOwner.committed ?? 1
-        guard owner != 1 else { return simd_float2(0, 0) }
-        return committedSurfaceLayers.first { $0.gridId == owner }?.originPx
-            ?? simd_float2(0, 0)
+    /// Where the committed cursor's own grid sits on this surface.
+    private var committedCursorPlacement: SurfaceCursorPlacement {
+        resolveSurfaceCursorPlacement(
+            ownerGridId: cursorOwner.committed ?? 1,
+            rootGridId: 1,
+            layers: committedSurfaceLayers
+        )
     }
 
     /// Publish the cursor layer for a grid the surface draws as a layer. The
@@ -1010,6 +1011,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=1 grid=\(gridId) vertices=\(count)")
         cursorOwner.stage(gridId)
+        // A layer's cursor is in that grid's rows, not the root's, so the root
+        // row this records is no longer valid. The blink fast path refuses a
+        // non-root owner anyway; -1 says so without relying on that.
+        lock.lock()
+        lastKnownCursorRow = -1
+        lock.unlock()
         submitVerticesPartialRaw(
             mainPtr: nil,
             mainCount: 0,
@@ -1223,6 +1230,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var committedSetIndex: Int = 0   // Protected by lock
     private var cursorWriteSetIndex: Int = 0 // Core thread only
     private var cursorWritePrepared = false  // Core thread only
+    /// The cursor triple, shared with ExternalGridView; see `SurfaceCursorSlot`
+    /// for why it is not on the row sets. Guarded by `lock`.
+    private var cursorSlots: [SurfaceCursorSlot] = [
+        SurfaceCursorSlot(), SurfaceCursorSlot(), SurfaceCursorSlot()
+    ]
+    /// The root row the core last named for the cursor, or -1 when the cursor
+    /// is on a layer. Recorded at submit the way ExternalGridView does it, in
+    /// place of rediscovering it from the committed vertices on every frame.
+    /// Protected by `lock`.
+    private var lastKnownCursorRow: Int = -1
     private var committedCursorSetIndex: Int = 0 // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
     // Complete row metadata is retained independently in all three sets. A
@@ -1366,7 +1383,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by lock
     private var cursorGpuInFlightCount: [Int] = [0, 0, 0] // Protected by lock
-    private var defaultBgRGB: UInt32 = 0               // Protected by lock
+    /// This surface's background: the 8-bit colour the row bands paint with.
+    /// The clear colour is built from it where it is used, as on
+    /// ExternalGridView, which additionally stores the alpha the app hands it —
+    /// this surface derives that from `blurEnabled` instead. Protected by `lock`.
+    private var surfaceBgRGB: UInt32 = 0
 
     /// Complete one protected GPU read and immediately service any contraction
     /// that had to skip this set while it was in flight. Caller holds `lock`.
@@ -1533,23 +1554,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return created
     }
 
-    // (vertexBuffer/cursorVertexBuffer moved into BufferSet for triple buffering)
-
-    /// Cursor blink state (true = visible, false = hidden during blink)
-    private var cursorBlinkStateStorage: Bool = true
+    /// Cursor blink phase and what the last frame drew with. Shared with
+    /// ExternalGridView; see `SurfaceBlinkState`.
+    private var blink = SurfaceBlinkState()
     var cursorBlinkState: Bool {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return cursorBlinkStateStorage
-        }
-        set {
-            lock.lock()
-            cursorBlinkStateStorage = newValue
-            lock.unlock()
-        }
+        get { blink.isVisible(lock: lock) }
+        set { blink.setVisible(newValue, lock: lock) }
     }
-    private var lastRenderedBlinkState: Bool = true
 
     // --- Scroll offset for smooth scrolling ---
     // Stored as value-type array under lock; passed to GPU via setVertexBytes
@@ -1832,6 +1843,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// The rect as the core measured it, and the grid it belongs to. Turned
     /// into the screen-space state above by `evaluateCursorShaderChange`, once
     /// the frame's displacement for that grid is known. Written under `lock`.
+    ///
+    /// This whole cluster is SHARED state living on one surface: there is one
+    /// cursor across the main window and every external one, and the shader
+    /// trails it wherever it goes. ExternalGridView therefore asks this
+    /// renderer for permission (`shaderCursorBelongs(toGrid:)`) and publishes
+    /// through it, which is the last place an external surface still reaches
+    /// into the main one for something that is not the main window's own.
+    /// It belongs in `SharedRenderResources` alongside the atlas and the
+    /// pipelines; the move is ten stored members and ~156 lines whose
+    /// `*Locked` halves assume THIS surface's `lock`, so it is a round of its
+    /// own rather than a step inside one.
     private var shaderCursorRawRect: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorRawColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     private var shaderCursorGridId: Int64 = 0
@@ -2540,7 +2562,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Called from core thread during flush.
     func updateDefaultBgColor(_ rgb: UInt32) {
         lock.lock()
-        defaultBgRGB = rgb
+        surfaceBgRGB = rgb
         lock.unlock()
     }
 
@@ -2581,15 +2603,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         if updateCursor {
             if cursorCount > 0, let cursorPtr {
                 ensureCursorBufferInSet(cursorSet, vertexCount: cursorCount)
-                if let cvb = bufferSets[cursorSet].cursorVertexBuffer {
+                if let cvb = cursorSlots[cursorSet].vertexBuffer {
                     memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                    bufferSets[cursorSet].cursorVertexCount = cursorCount
+                    cursorSlots[cursorSet].vertexCount = cursorCount
                 } else {
-                    bufferSets[cursorSet].cursorVertexCount = 0
+                    cursorSlots[cursorSet].vertexCount = 0
                 }
                 updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
             } else {
-                bufferSets[cursorSet].cursorVertexCount = 0
+                cursorSlots[cursorSet].vertexCount = 0
             }
         }
     }
@@ -2713,26 +2735,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // (move_all) translates every vertex it owns.
         var cursorScrollOffsetPx: Float = 0
         for info in offsets {
-            let ndc = -info.offsetYPx * scale
             if info.gridId == shaderCursorGridId {
                 cursorScrollOffsetPx = info.offsetYPx
             }
-
-            // Content bounds in NDC, used only for fragment-level clipping of
-            // scrolled content that lands in a margin; the scroll decision
-            // itself is flag-based (DECO_SCROLLABLE in the vertex data). A float
-            // (clipToContent == false) translates bodily, so widen the bounds
-            // past the screen and clip nothing.
-            let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
-            let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
-
-            scrollOffsetData.append(ScrollOffset(
-                grid_id: Int32(truncatingIfNeeded: info.gridId),
-                offset_y: ndc,
-                content_top_y: contentTopY,
-                content_bottom_y: contentBottomY,
-                move_all: info.clipToContent ? 0 : 1,
-                zindex: info.zindex
+            scrollOffsetData.append(Self.computeScrollOffset(
+                info: info,
+                viewportHeight: drawableHeight,
+                cellHeightPx: cellHeightPx
             ))
         }
         // Shaders.metal uses binary search for the per-vertex grid lookup.
@@ -2831,9 +2840,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let cellHeightNDC: Float = cellHeightPx * scale
         let ndc = -info.offsetYPx * scale
 
-        // Content bounds for fragment shader clipping. Float windows
-        // (clipToContent == false) translate as a whole; widen the bounds past the
-        // screen so nothing is clipped, matching updateScrollOffsets.
+        // Content bounds in NDC, used only for fragment-level clipping of
+        // scrolled content that lands in a margin; the scroll decision itself
+        // is flag-based (DECO_SCROLLABLE in the vertex data). A float
+        // (clipToContent == false) translates bodily, so widen the bounds past
+        // the screen and clip nothing.
         let contentTopY = info.clipToContent ? (info.gridTopYNDC - Float(info.marginTop) * cellHeightNDC) : 2.0
         let contentBottomY = info.clipToContent ? (info.gridTopYNDC - Float(info.gridRows - info.marginBottom) * cellHeightNDC) : -2.0
 
@@ -2924,7 +2935,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // animation-driving uniforms (iTime etc.). A missing pipeline must
             // not reset the idle counter every frame.
             if shared.anyCustomShaderNeedsAnimation {
-                (view as? MetalTerminalView)?.activateDrawLoop()
+                (view as? MetalTerminalView)?.activateSurfaceDrawLoop()
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
@@ -3044,6 +3055,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // the core thread replaces both while this frame is being encoded.
             let cursorLayerOriginSnapshot: simd_float2
             let cursorOwnerGridSnapshot: Int64
+            let lastKnownCursorRowSnapshot: Int
             /// The committed state carries a cursor move and nothing else.
             let cursorOnlyCommitSnapshot: Bool
 
@@ -3124,9 +3136,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     state: state
                 ))
             }
-            cursorLayerOriginSnapshot = committedCursorLayerOriginPx
+            cursorLayerOriginSnapshot = committedCursorPlacement.originPx
             cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
-            snappedBgRGB = defaultBgRGB
+            lastKnownCursorRowSnapshot = lastKnownCursorRow
+            snappedBgRGB = surfaceBgRGB
             snappedCommittedExtent = committedExtent
             lock.unlock()
 
@@ -3164,12 +3177,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             // Now safe to read from committed set (protected by gpuInFlight)
             let committed = bufferSets[csi]
-            let committedCursor = bufferSets[cci]
+            let committedCursor = cursorSlots[cci]
             let rowBuffersSnapshot = committed.rowState.buffers
             let rowCountsSnapshot = committed.rowState.counts
             let rowMode = committed.rowState.usingRowBuffers
             let committedMainCount = committed.mainVertexCount
-            let committedCursorCount = committedCursor.cursorVertexCount
+            let committedCursorCount = committedCursor.vertexCount
 
             if FrameTracer.enabled {
                 FrameTracer.trace(
@@ -3205,7 +3218,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let renderStateSnapshot: (hasPresented: Bool, cursorBlink: Bool) = {
                 lock.lock()
                 defer { lock.unlock() }
-                return (hasPresentedOnce, cursorBlinkStateStorage)
+                return (hasPresentedOnce, blink.visibleLocked)
             }()
             let hasPresentedOnceSnapshot = renderStateSnapshot.hasPresented
             let cursorBlinkStateSnapshot = renderStateSnapshot.cursorBlink
@@ -3225,7 +3238,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            let blinkStateChanged = cursorBlinkStateSnapshot != lastRenderedBlinkState
+            let blinkStateChanged = cursorBlinkStateSnapshot != blink.lastRendered
 
             // Check if committed data changed since last draw
             let hasNewCommit = currentCommitRevision != lastDrawnRevision
@@ -3327,7 +3340,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 && isBlinkOnlyFrame
                 && currentCursorCount == 0
                 && !shared.anyCustomShaderNeedsAnimation {
-                lastRenderedBlinkState = cursorBlinkStateSnapshot
+                blink.lastRendered = cursorBlinkStateSnapshot
                 FrameTracer.trace(.drawSkipNoChange, a: 4)
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
                 (view as? MetalTerminalView)?.notifyDrawIdle()
@@ -3352,7 +3365,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let prevDrawnRevision = lastDrawnRevision
             let prevDrawnDrawableSize = lastDrawnDrawableSize
             var prevDrawnHadActiveScrollOffset = false
-            let prevRenderedBlinkState = lastRenderedBlinkState
+            let prevRenderedBlinkState = blink.lastRendered
 
             // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision
@@ -3362,7 +3375,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             prevDrawnHadActiveScrollOffset = scrollOffsetLatch.latch(hadActiveScrollOffsetThisFrame)
 
             // Update last rendered blink state since we're proceeding with render
-            lastRenderedBlinkState = cursorBlinkStateSnapshot
+            blink.lastRendered = cursorBlinkStateSnapshot
 
 
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
@@ -3445,19 +3458,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 )
             }
 
-            // --- Step 3: Compute cursor grid row from vertex positions ---
-            var cursorGridRow: Int = -1
-            if currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
-                let ptr = cvb.contents().bindMemory(to: Vertex.self, capacity: currentCursorCount)
-                // Grid-local pixels with y down: the smallest y is the top edge.
-                var topYPx: Float = ptr[0].position.y
-                for i in 1..<currentCursorCount {
-                    let y = ptr[i].position.y
-                    if y < topYPx { topYPx = y }
-                }
-                cursorGridRow = Int(floor(topYPx / Float(cellHi)))
-                // No clamping: out-of-range → canBlinkFastPath = false → full redraw
-            }
+            // --- Step 3: the row the core named for the cursor ---
+            // This used to be rediscovered every frame by scanning the
+            // committed cursor vertices for their topmost y and dividing by the
+            // cell height — an inference from pixels back to the row the core
+            // had already named. ExternalGridView records the callback's row
+            // instead; a full suite with the two compared under a precondition
+            // never disagreed.
+            let cursorGridRow = lastKnownCursorRowSnapshot
 
             // --- Step 4: Gate for blink fast path ---
             let canBlinkFastPath: Bool = {
@@ -3519,7 +3527,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 lastDrawnRevision = prevDrawnRevision
                 lastDrawnDrawableSize = prevDrawnDrawableSize
                 scrollOffsetLatch.restore(previousFrameWasActive: prevDrawnHadActiveScrollOffset)
-                lastRenderedBlinkState = prevRenderedBlinkState
+                blink.lastRendered = prevRenderedBlinkState
                 (view as? MetalTerminalView)?.didDrawFrame()
                 (view as? MetalTerminalView)?.requestRedraw()
             }
@@ -4603,7 +4611,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     }
 
                     // Cursor glow
-                    if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
+                    if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.vertexBuffer {
                         var ct: Float = 0
                         // The cursor is in its own layer's pixel space.
                         bindLayerTransform(
@@ -4786,7 +4794,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // This keeps the persistent back buffer cursor-free and prevents stale
             // cursor pixels from being moved by GPU scroll-region copies.
             ZonvieCore.appLog("[cursor-draw] cursorBlinkState=\(cursorBlinkStateSnapshot) cursorCount=\(currentCursorCount)")
-            if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.cursorVertexBuffer {
+            if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.vertexBuffer {
                 // Shared with ExternalGridView. The two closures below are the
                 // only places the surfaces differ: perf samples, and an array
                 // of per-grid offsets where an external surface binds one.
@@ -4814,8 +4822,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             encoder: cursorEnc,
                             offsets: scrollSnapshot,
                             device: shared.device,
-                            scratchBuffer: &committedCursor.cursorScrollOffsetBuffer,
-                            scratchCapacity: &committedCursor.cursorScrollOffsetBufferCap
+                            scratchBuffer: &committedCursor.scrollOffsetBuffer,
+                            scratchCapacity: &committedCursor.scrollOffsetBufferCap
                         )
                     }
                 )
@@ -5998,32 +6006,28 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Ensure cursor vertex buffer in the specified buffer set has sufficient capacity.
-    /// If the buffer is shared with the committed set (COW), detach by reusing
-    /// the pool buffer saved in beginFlush, or allocate new if pool is insufficient.
+    /// Ensure one cursor slot's vertex buffer has room for `vertexCount`.
+    ///
+    /// No COW detach: a cursor callback replaces the cursor outright, so a slot
+    /// never shares a buffer with the committed one (see
+    /// `prepareCursorWriteState`). Allocate only when nil or too small.
     private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
         let vc = max(0, vertexCount)
         guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else {
             flushFailed = true
             return
         }
-
-        // Cursor buffer is NOT COW-shared (beginFlush copies data into dst's own buffer).
-        // Only allocate if nil or too small.
-        let bs = bufferSets[setIdx]
-        let needsNew = bs.cursorVertexBuffer == nil || needed > bs.cursorVertexBufferCap
-
-        if needsNew {
-            guard let nextCap = surfaceGrowCapacity(current: bs.cursorVertexBufferCap, needed: max(1, needed)) else {
-                flushFailed = true
-                return
-            }
-            bs.cursorVertexBufferCap = nextCap
-            bs.cursorVertexBuffer = shared.device.makeBuffer(length: nextCap, options: .storageModeShared)
-            if bs.cursorVertexBuffer == nil {
-                bs.cursorVertexBufferCap = 0
-                flushFailed = true
-            }
+        let slot = cursorSlots[setIdx]
+        guard slot.vertexBuffer == nil || needed > slot.vertexBufferCap else { return }
+        guard let nextCap = surfaceGrowCapacity(current: slot.vertexBufferCap, needed: max(1, needed)) else {
+            flushFailed = true
+            return
+        }
+        slot.vertexBufferCap = nextCap
+        slot.vertexBuffer = shared.device.makeBuffer(length: nextCap, options: .storageModeShared)
+        if slot.vertexBuffer == nil {
+            slot.vertexBufferCap = 0
+            flushFailed = true
         }
     }
 
@@ -6253,6 +6257,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
             cursorOwner.stage(1)
+            lock.lock()
+            lastKnownCursorRow = rowStart
+            lock.unlock()
             submitVerticesPartialRaw(
                 mainPtr: nil,
                 mainCount: 0,
