@@ -128,6 +128,14 @@ final class SharedRenderResources {
     /// the two are identical and the second just aliases the first.
     var customShaderPipelines: [CustomShaderPipeline] = []
     var customShaderPipelinesDecorated: [CustomShaderPipeline] = []
+
+    /// Which of the two a surface draws with. Asked of the object that owns
+    /// both, so the surfaces differ by the argument rather than by shape: the
+    /// main renderer used to name its chain directly and ExternalGridView had
+    /// its own selector.
+    func customShaderChain(decorated: Bool) -> [CustomShaderPipeline] {
+        decorated ? customShaderPipelinesDecorated : customShaderPipelines
+    }
     /// Where the user chain runs relative to bloom, and whether any shader in
     /// it animates (which keeps the draw loop alive). Both are properties of
     /// the loaded chain, so they belong with it.

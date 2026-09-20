@@ -1118,11 +1118,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// This grid's draw state, created on first use — grid creation time, not a
     /// per-frame path. Must not be called while holding `lock`.
-    private func layerDrawState(gridId: Int64) -> LayerDrawState {
+    private func layerDrawState(gridId: Int64) -> SurfaceLayerDrawState {
         lock.lock()
         defer { lock.unlock() }
         if let existing = layerDrawStates[gridId] { return existing }
-        let created = LayerDrawState()
+        let created = SurfaceLayerDrawState()
         layerDrawStates[gridId] = created
         return created
     }
@@ -1472,11 +1472,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// window at the old size while the core had already regenerated their rows
     /// at the new one.
     ///
-    /// `cellWidthPx` / `cellHeightPx` take the atlas lock and `lock`
-    /// respectively, so they are read before `lock` is taken here.
+    /// `shared.cellWidthPx` / `shared.cellHeightPx` take leaf locks inside
+    /// `shared`, so they are read before `lock` is taken here.
     func notifyCellMetricsIfChanged() {
-        let cw = cellWidthPx
-        let ch = cellHeightPx
+        let cw = shared.cellWidthPx
+        let ch = shared.cellHeightPx
         lock.lock()
         let changed = cw != lastCellWidthPx || ch != lastCellHeightPx
         if changed {
@@ -1566,8 +1566,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// This surface's fixed-float mask. Shared with the external surfaces,
     /// which own one each; see SurfaceFixedFloatMask.
     private let fixedFloatMask = SurfaceFixedFloatMask()
-    private var fixedFloatBandData: [FixedFloatBand] { fixedFloatMask.bands }
-    private var fixedFloatIntervalData: [FixedFloatInterval] { fixedFloatMask.intervals }
     // setFragmentBytes is limited to 4096 bytes. Sixteen arbitrary rectangles
     // produce at most 31 bands and 496 intervals, fitting both buffers. When
     // this limit is exceeded the caller disables smooth scrolling for the
@@ -1700,30 +1698,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // and returned by defer, so appending/scroll expansion reuses capacity
     // without a live property alias that would trigger Array COW detaches.
     private var dirtyRowsScratch: [Int] = []
-    /// One layer this frame draws, and everything the draw needs about it.
-    ///
-    /// These were three arrays read at the same index, which the declarations
-    /// had to keep saying were "index-aligned" — a pairing the type system did
-    /// not hold, so any append that missed one array silently paired a layer
-    /// with another layer's buffers. ExternalGridView never had that shape; it
-    /// carries one array of pairs. One array of one struct is the same idea
-    /// with the draw state this surface additionally keeps.
-    private struct LayerFrameEntry {
-        let layer: SurfaceLayer
-        /// Every buffer set this layer's grid owns, or empty for one that has
-        /// never submitted.
-        let sets: [SurfaceBufferSet]
-        /// The draw state of the grid the layer places: nil for the root and
-        /// for a grid that has not submitted anything yet.
-        let state: LayerDrawState?
-    }
-
-    /// Per-frame snapshot taken under `lock`, reused across frames.
-    private var layerSnapshot: [LayerFrameEntry] = []
+    /// Per-frame snapshot taken under `lock`, reused across frames. Entry 0 is
+    /// this surface's root grid, which every draw loop below skips.
+    private var layerSnapshot: [SurfaceLayerFrame] = []
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
     /// Protected by `lock`; an entry is created when a grid first submits a row
     /// or a scroll and released when the grid is destroyed.
-    private var layerDrawStates: [Int64: LayerDrawState] = [:]
+    private var layerDrawStates: [Int64: SurfaceLayerDrawState] = [:]
     /// Rows each layer's committed placement has travelled upwards since the
     /// surface began, in the same units and direction as on_grid_scroll's
     /// rowsDelta. Only commitFlush writes it; copyPlacementRowsUp reads it.
@@ -1800,24 +1781,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Attenuates extracted glow by a layer's background coverage, so a glyph
     /// behind an opaque layer does not bloom through it.
     let glowTextures = SurfaceGlowTextures()
-
-    // --- User-supplied custom post-process shaders ---
-    // Loaded once from config paths during bloom-pipeline construction.
-    // Empty array when `[shaders].enabled = false` or no paths are listed.
-    var customShaderPipelines: [CustomShaderPipeline] { shared.customShaderPipelines }
-    /// Opaque variant of the custom shader chain for DECORATED surfaces
-    /// (ext-cmdline / popupmenu / messages). Their backTex has alpha=0 regions —
-    /// padding, empty parts of the input line — where `preserve_alpha` would
-    /// make the shader inherit alpha 0 and vanish (the hazard f0c81c07b95
-    /// documented), so these always compile with it OFF while the main window
-    /// keeps `config.preserveAlpha`. When that is false the two sets are
-    /// identical and this just aliases `customShaderPipelines`.
-    /// Where the custom shader chain inserts relative to bloom. Mirrored from
-    /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
-    /// path does not need to re-read config each frame.
-    /// True when any loaded custom shader references a time-varying
-    /// Shadertoy uniform. Used by `MetalTerminalView` to keep the vsync
-    /// draw loop active instead of falling back to flush-driven rendering.
 
     // Shadertoy-style uniforms block (160 bytes, std140). Populated per
     // draw into a local `zonvie_shader_uniforms` value and handed to the
@@ -2347,11 +2310,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // lock -> registryLock, so read the list outside that nesting.
         gridBuffers.copyGridIds(into: &commitGridIdScratch)
         // Read here rather than inside the region below for symmetry with the
-        // line above, not out of necessity: since `linespace` moved to
-        // SharedRenderResources this accessor takes a leaf lock, so reading it
-        // under `lock` would be safe. It used to take `lock` itself, and doing
-        // this on the same thread deadlocked.
-        let ledgerCellHeightPx = cellHeightPx
+        // line above, not out of necessity: the accessor takes a leaf lock
+        // inside `shared`, so reading it under `lock` would be safe.
+        let ledgerCellHeightPx = shared.cellHeightPx
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
@@ -2717,30 +2678,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // fixed floats with a STRICTLY higher zindex, so a float scrolling
         // above its own backdrop keeps drawing.
         var zindex: Int32 = 0
-    }
-
-    /// What one grid the surface places as a layer owes the next frame.
-    ///
-    /// A reference type, so mutating one grid's entry never detaches the
-    /// dictionary's storage while the draw thread holds a reference into it.
-    ///
-    /// `flushDirtyRows` belongs to the core thread inside the flush bracket;
-    /// `pendingDirtyRows`, `pendingScrollAccum` and `needsFullRedraw` cross to
-    /// the draw thread under `lock`; the `draw*` fields belong to the draw
-    /// thread for one frame. Every row number here is grid-local.
-    private final class LayerDrawState {
-        var flushDirtyRows = IndexSet()
-        var pendingDirtyRows = IndexSet()
-        var pendingScrollAccum: SurfaceRowScroll? = nil
-        var needsFullRedraw = false
-        /// Consumed under `lock` at the top of a frame; capacity is reused.
-        var drawRows: [Int] = []
-        var drawScroll: SurfaceRowScroll? = nil
-        var drawAllRows = false
-        /// The band this frame's accepted GPU scroll copy vacated, in the
-        /// layer's own pixel space, or nil when no blit ran for this layer.
-        var drawBlitClearBand: (clearTopPx: Int, clearBottomPx: Int)? = nil
-        var lastDrawnRowCount = 0
     }
 
     /// - Parameters:
@@ -3157,8 +3094,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // an ease that has committed but not been spent keeps its band.
             retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
             retainedSnapshot = retention.snapshotPublished()
-            fixedFloatBandsSnapshot = fixedFloatBandData  // Value-type copies (safe across frames)
-            fixedFloatIntervalsSnapshot = fixedFloatIntervalData
+            fixedFloatBandsSnapshot = fixedFloatMask.bands  // Value-type copies (safe across frames)
+            fixedFloatIntervalsSnapshot = fixedFloatMask.intervals
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             layerSnapshot.removeAll(keepingCapacity: true)
@@ -3180,9 +3117,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         anyLayerWork = true
                     }
                 }
-                layerSnapshot.append(LayerFrameEntry(
+                let layerSets = gridBuffers.existingSets(for: layer.gridId)
+                layerSnapshot.append(SurfaceLayerFrame(
                     layer: layer,
-                    sets: gridBuffers.existingSets(for: layer.gridId) ?? [],
+                    set: layerSets?.count == 3 ? layerSets?[csi] : nil,
                     state: state
                 ))
             }
@@ -3273,8 +3211,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let cursorBlinkStateSnapshot = renderStateSnapshot.cursorBlink
 
             notifyCellMetricsIfChanged()
-            let cw = cellWidthPx
-            let ch = cellHeightPx
+            let cw = shared.cellWidthPx
+            let ch = shared.cellHeightPx
 
             // With triple buffering, counts come directly from committed set
             let currentMainCount = committedMainCount
@@ -3618,9 +3556,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Asked for by both the blit decision below and the layer draw
             // loop, which have to agree on how tall the layer is.
             func layerResolvableRowCount(_ li: Int, _ layer: SurfaceLayer) -> Int {
-                let sets = layerSnapshot[li].sets
-                guard sets.count == 3 else { return 0 }
-                return min(sets[csi].rowLogicalToSlot.count, layer.rows)
+                guard let set = layerSnapshot[li].set else { return 0 }
+                return min(set.rowLogicalToSlot.count, layer.rows)
             }
 
             // Retained rows of this layer at the current cell height, collected
@@ -3642,7 +3579,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // (see the caller). A disagreement costs a wasted blit or a wider
             // redraw, never correctness.
             func layerNeedsAllRows(
-                state: LayerDrawState?,
+                state: SurfaceLayerDrawState?,
                 rowCount: Int,
                 retainedRowCount: Int,
                 loadActionIsClear: Bool
@@ -3663,7 +3600,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             func markLayersOverBlit(
                 _ li: Int,
                 _ layer: SurfaceLayer,
-                _ state: LayerDrawState,
+                _ state: SurfaceLayerDrawState,
                 _ p: RowScrollBlitPlan,
                 _ rowsDelta: Int
             ) {
@@ -4302,9 +4239,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 enc.setRenderPipelineState(shared.pipeline!)
                 for (li, entry) in layerSnapshot.enumerated().dropFirst() {
                     let layer = entry.layer
-                    let sets = entry.sets
-                    guard sets.count == 3 else { continue }
-                    let set = sets[csi]
+                    guard let set = entry.set else { continue }
                     let rowCount = layerResolvableRowCount(li, layer)
                     guard rowCount > 0 else { continue }
                     // What this layer owes the frame; nil for a grid with no
@@ -4612,9 +4547,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     if layerSnapshot.count > 1 {
                         for entry in layerSnapshot.dropFirst() {
                             let layer = entry.layer
-                            let sets = entry.sets
-                            guard sets.count == 3 else { continue }
-                            let set = sets[csi]
+                            guard let set = entry.set else { continue }
                             let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
                             guard rowCount > 0 else { continue }
                             bindLayerTransform(
@@ -4748,7 +4681,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 cmd: cmd,
                 backTex: backTex,
                 drawableTexture: drawable.texture,
-                customShaderPipelines: customShaderPipelines,
+                customShaderPipelines: shared.customShaderChain(decorated: false),
                 runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom,
                 customShaderPong: customShaderPong,
                 pongSize: view.drawableSize,
@@ -5799,9 +5732,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 }
             }
         } else {
-            shared.customShaderPipelinesDecorated = customShaderPipelines
+            shared.customShaderPipelinesDecorated = shared.customShaderPipelines
         }
-        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(shared.customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(shared.anyCustomShaderNeedsAnimation)")
+        ZonvieCore.appLog("[Renderer] Loaded \(shared.customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(shared.customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(shared.anyCustomShaderNeedsAnimation)")
     }
 
     private func loadPipelineFromArchive(lib: MTLLibrary, vs: MTLFunction, fs: MTLFunction, vsCopy: MTLFunction, fsCopy: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) -> Bool {
@@ -6230,10 +6163,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let vc = cs.rowState.counts[slot]
         guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
         let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : row
-
-        // Read before locking: the accessor takes `lock` itself, which is not
-        // recursive.
-        let capturedCellHeightPx = cellHeightPx
+        let capturedCellHeightPx = shared.cellHeightPx
         // Content cells only — see copyRetainedScrollableRow.
         guard let copied = copyRetainedScrollableRow(
             retention: retention,

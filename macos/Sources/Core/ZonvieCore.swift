@@ -5152,7 +5152,8 @@ final class ZonvieCore {
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).
         // Falls back to vertex-extracted bgColor if the group is not defined.
-        gridView.gridClearColor = resolveExternalWindowClearColor(kind: .normal, gridId: gridId, vertexBgColor: bgColor)
+        let background = resolveExternalWindowBackground(kind: .normal, gridId: gridId, vertexBgColor: bgColor)
+        gridView.setGridBackground(rgb: background.rgb, clearAlpha: background.clearAlpha)
     }
 
     /// Called when an external grid is closed.
@@ -5672,7 +5673,7 @@ final class ZonvieCore {
         let kind = classifyExternalGridKind(gridId)
         guard kind != .normal else { return (vertices, nil) }
 
-        let shaderActive = (terminalView?.renderer?.customShaderPipelines.isEmpty == false)
+        let shaderActive = (terminalView?.renderer?.shared.customShaderPipelines.isEmpty == false)
 
         // When a custom post-process shader is active, skip the decorated-surface
         // background rewrite below — the +0.05 "panel" lightening
@@ -6698,17 +6699,22 @@ final class ZonvieCore {
         return NSColor(red: r, green: g, blue: b, alpha: 1.0)
     }
 
-    /// Resolve the Metal clear color for an external window from its highlight group.
-    /// Falls back to the vertex-extracted bgColor if the highlight group is not defined.
-    private func resolveExternalWindowClearColor(kind: ExternalGridKind, gridId: Int64, vertexBgColor: NSColor?) -> MTLClearColor {
+    /// Resolve an external window's background — the 8-bit colour and the clear
+    /// alpha — from its highlight group. Falls back to the vertex-extracted
+    /// bgColor if the highlight group is not defined.
+    private func resolveExternalWindowBackground(
+        kind: ExternalGridKind,
+        gridId: Int64,
+        vertexBgColor: NSColor?
+    ) -> (rgb: UInt32, clearAlpha: Double) {
         let bgColor = resolveHlGroupBgColor(kind: kind, gridId: gridId) ?? vertexBgColor
         let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
         if let bgColor, let srgb = bgColor.usingColorSpace(.sRGB) {
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
-            return MTLClearColor(red: Double(r), green: Double(g), blue: Double(b), alpha: clearAlpha)
+            return (packSurfaceBgRGB(red: Double(r), green: Double(g), blue: Double(b)), clearAlpha)
         }
-        return MTLClearColor(red: 0, green: 0, blue: 0, alpha: clearAlpha)
+        return (0, clearAlpha)
     }
 
     private func updateDecoratedExternalGrid(
@@ -6766,18 +6772,20 @@ final class ZonvieCore {
         // Rounded corners stay clipped by the container's masksToBounds, and the
         // cmdline icon is re-stacked above the MTKView, so an opaque padding is
         // safe (see installDecoratedExternalWindowShell).
-        let shaderActive = (terminalView?.renderer?.customShaderPipelines.isEmpty == false)
+        let shaderActive = (terminalView?.renderer?.shared.customShaderPipelines.isEmpty == false)
         let marginBg = shaderActive ? resolvedBg : adjustedBg
         let marginAlpha = resolveSurfaceBackgroundAlpha(
             blurEnabled: ZonvieConfig.shared.blurEnabled,
             decoratedSurface: true
         )
         let clearRgb = marginBg.usingColorSpace(.deviceRGB)
-        gridView.gridClearColor = MTLClearColor(
-            red: Double(clearRgb?.redComponent ?? 0),
-            green: Double(clearRgb?.greenComponent ?? 0),
-            blue: Double(clearRgb?.blueComponent ?? 0),
-            alpha: Double(marginAlpha)
+        gridView.setGridBackground(
+            rgb: packSurfaceBgRGB(
+                red: Double(clearRgb?.redComponent ?? 0),
+                green: Double(clearRgb?.greenComponent ?? 0),
+                blue: Double(clearRgb?.blueComponent ?? 0)
+            ),
+            clearAlpha: Double(marginAlpha)
         )
     }
 
