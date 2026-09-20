@@ -618,6 +618,238 @@ func encodeSurfaceCustomShaderChain(
     return true
 }
 
+/// Per-pass GPU measurement for one surface: stage-boundary timestamps on
+/// attachment slot 0 and fragment-invocation counters on slot 1.
+///
+/// One sample buffer of each kind is reused across frames; safe because
+/// inflightSemaphore bounds in-flight frames to 1, so the previous frame's
+/// completion handler resolves the buffers before the next draw assigns slots.
+/// The two kinds gate independently: a device that exposes `timestamp` but not
+/// `statistic` still reports pass timings.
+struct GpuPassSampler {
+    struct Slot { let label: String; let startIdx: Int; let endIdx: Int }
+    /// Full 4-stage sampling for one pass (vertex start/end + fragment
+    /// start/end). Used to investigate why the copy pass measures ~2.9ms even
+    /// though it's a single 6-vert blit (~0.7ms theoretical bandwidth limit) —
+    /// the fragment-only number doesn't show vertex stage cost or the gap
+    /// waiting for the previous pass's tile store.
+    struct FullSlot {
+        let label: String
+        let startVIdx: Int
+        let endVIdx: Int
+        let startFIdx: Int
+        let endFIdx: Int
+    }
+
+    /// What one frame hands its completion handler. A value copy, so the
+    /// renderer is free to reset the live slot arrays on the next draw.
+    struct Frame {
+        var timestampBuffer: MTLCounterSampleBuffer?
+        var sampleCount: Int = 0
+        var tickPeriodNs: Double = 1.0
+        var slots: [Slot] = []
+        var fullSlots: [FullSlot] = []
+        var statsBuffer: MTLCounterSampleBuffer?
+        var statsSlots: [Slot] = []
+    }
+
+    private var timestampBuffer: MTLCounterSampleBuffer?
+    private var timestampsEnabled = false
+    private var tickPeriodNs: Double = 1.0
+    private var slots: [Slot] = []        // Render thread only; reset per draw
+    private var fullSlots: [FullSlot] = []  // ditto, full-stage sampling
+    private var nextIdx = 0               // shared sample-buffer cursor; reset per draw
+    private var statsBuffer: MTLCounterSampleBuffer?
+    private var statsEnabled = false
+    private var statsSlots: [Slot] = []   // Render thread only; reset per draw
+
+    /// Probe device support for stage-boundary counters and allocate the
+    /// reusable sample buffers. On unsupported devices the gates stay false and
+    /// the per-pass logs are silently skipped (gpu_execution still emits).
+    mutating func setUp(device: MTLDevice) {
+        // Diagnostic dump of what the device actually exposes. M-series Macs
+        // typically only show "timestamp" via runtime API; statistic and
+        // stageutilization are restricted to Xcode GPU Capture on macOS.
+        let exposedSets = (device.counterSets ?? []).map { $0.name }.joined(separator: ",")
+        let supportsStage = device.supportsCounterSampling(.atStageBoundary)
+        let supportsDraw = device.supportsCounterSampling(.atDrawBoundary)
+        let supportsBlit = device.supportsCounterSampling(.atBlitBoundary)
+        ZonvieCore.appLogPerf("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
+
+        guard supportsStage else {
+            ZonvieCore.appLogPerf("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
+            return
+        }
+        let timestampSet = device.counterSets?.first { cs in
+            // MTLCommonCounterSet is a RawRepresentable wrapper around String;
+            // MTLCounterSet.name returns a Swift String, so compare via rawValue.
+            cs.name == MTLCommonCounterSet.timestamp.rawValue
+        }
+        guard let cs = timestampSet else {
+            ZonvieCore.appLogPerf("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
+            return
+        }
+        let desc = MTLCounterSampleBufferDescriptor()
+        desc.counterSet = cs
+        desc.label = "ZonvieGpuPerfTimestamps"
+        desc.storageMode = .shared
+        // Capacity 16 = up to 8 passes per frame (start+end each). Today we attach
+        // 3 (main, copy, cursor); headroom for future custom-shader chain entries.
+        desc.sampleCount = 16
+        do {
+            timestampBuffer = try device.makeCounterSampleBuffer(descriptor: desc)
+        } catch {
+            ZonvieCore.appLogPerf("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
+            return
+        }
+        // Calibrate GPU tick → ns. On Apple Silicon timestamps already arrive in
+        // nanoseconds, but compute the ratio so other backends (Intel discrete
+        // GPUs, future hw) report correctly. Newer SDKs expose this as a
+        // tuple-returning method instead of inout pointers.
+        let (cpu0, gpu0) = device.sampleTimestamps()
+        Thread.sleep(forTimeInterval: 0.002)
+        let (cpu1, gpu1) = device.sampleTimestamps()
+        let cpuDelta = Double(cpu1 &- cpu0)
+        let gpuDelta = Double(gpu1 &- gpu0)
+        if cpuDelta > 0, gpuDelta > 0 {
+            // sampleTimestamps' cpuTimestamp is in nanoseconds (mach_absolute_time
+            // converted via timebase, per Apple docs); gpuTimestamp is in GPU ticks.
+            tickPeriodNs = cpuDelta / gpuDelta
+        }
+        timestampsEnabled = true
+        ZonvieCore.appLogPerf("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", tickPeriodNs)))")
+
+        // ── Statistic counter set: fragment invocations for overdraw measurement.
+        let statisticSet = device.counterSets?.first { cs in
+            cs.name == MTLCommonCounterSet.statistic.rawValue
+        }
+        guard let stCs = statisticSet else {
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: no statistic counter set; skipping")
+            return
+        }
+        let stDesc = MTLCounterSampleBufferDescriptor()
+        stDesc.counterSet = stCs
+        stDesc.label = "ZonvieGpuStatsBuffer"
+        stDesc.storageMode = .shared
+        stDesc.sampleCount = 16
+        do {
+            statsBuffer = try device.makeCounterSampleBuffer(descriptor: stDesc)
+            statsEnabled = true
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: enabled")
+        } catch {
+            ZonvieCore.appLogPerf("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
+        }
+    }
+
+    /// Drop the previous frame's slot assignments. The caller gates this on
+    /// perf logging so the hot path pays nothing when logging is off (the
+    /// attach calls bail out internally, but these removeAlls would not).
+    mutating func beginFrame() {
+        slots.removeAll(keepingCapacity: true)
+        fullSlots.removeAll(keepingCapacity: true)
+        nextIdx = 0
+        statsSlots.removeAll(keepingCapacity: true)
+    }
+
+    // Attach fragment-stage timestamp samples to a render pass descriptor so the
+    // GPU records start-of-fragment / end-of-fragment timestamps. The duration
+    // (end - start) is scaled by tickPeriodNs when the frame resolves.
+    //
+    // Why fragment-stage only (not start_v..end_f): on Apple Silicon TBDR, the
+    // vertex stage of pass N+1 runs in parallel with the fragment stage of pass
+    // N, so start_v..end_f intervals overlap heavily and don't yield meaningful
+    // per-pass cost (sum was ~1.6x exec_us when measured that way). Adjacent
+    // passes that share textures are serialized at the fragment boundary
+    // (read-after-write), so fragment-only sampling produces costs that roughly
+    // sum to gpu_exec_us. Vertex cost is small for text rendering and acceptable
+    // to elide.
+    //
+    // No-op when perf logging is off or the device lacks counter sampling.
+    // Must be called BEFORE makeRenderCommandEncoder(rpd).
+    mutating func attach(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard timestampsEnabled, ZonvieCore.appLogEnabled, let buf = timestampBuffer else { return }
+        let startIdx = nextIdx
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        nextIdx += 2
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
+        attach.endOfFragmentSampleIndex = endIdx
+        slots.append(Slot(label: label, startIdx: startIdx, endIdx: endIdx))
+    }
+
+    // Same as attach(to:label:) but also samples the vertex-stage boundary
+    // so we get start_v / end_v / start_f / end_f for one pass. Lets us split:
+    //   vertex_us  = end_v - start_v   (vertex shader + binning)
+    //   vfgap_us   = start_f - end_v   (idle waiting for tile binning to settle
+    //                                   or for previous pass's tile store)
+    //   fragment_us = end_f - start_f  (= existing copy_us field)
+    //   total_us   = end_f - start_v   (whole pass wall time)
+    //
+    // Used only for the copy pass today, where the 2.9ms p50 measurement is
+    // 4x the bandwidth-limited theoretical minimum and we need the breakdown
+    // to know whether the cost is in vertex/binning, in cross-pass scheduling,
+    // or actually in fragment shading.
+    mutating func attachFull(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard timestampsEnabled, ZonvieCore.appLogEnabled, let buf = timestampBuffer else { return }
+        let baseIdx = nextIdx
+        let endFIdx = baseIdx + 3
+        guard endFIdx < buf.sampleCount else { return }
+        nextIdx += 4
+        let attach = rpd.sampleBufferAttachments[0]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = baseIdx
+        attach.endOfVertexSampleIndex = baseIdx + 1
+        attach.startOfFragmentSampleIndex = baseIdx + 2
+        attach.endOfFragmentSampleIndex = baseIdx + 3
+        fullSlots.append(FullSlot(
+            label: label,
+            startVIdx: baseIdx,
+            endVIdx: baseIdx + 1,
+            startFIdx: baseIdx + 2,
+            endFIdx: baseIdx + 3
+        ))
+    }
+
+    // Attach fragment-invocation counter samples on attachment slot 1 (slot 0 is
+    // taken by timestamps). Uses the same fragment-stage boundaries so the
+    // invocation count covers the same work the timestamp duration does.
+    // Resolved as fragmentInvocations(end - start); overdraw ratio is computed
+    // against actual visible pixel area.
+    mutating func attachStats(to rpd: MTLRenderPassDescriptor, label: String) {
+        guard statsEnabled, ZonvieCore.appLogEnabled, let buf = statsBuffer else { return }
+        let startIdx = statsSlots.count * 2
+        let endIdx = startIdx + 1
+        guard endIdx < buf.sampleCount else { return }
+        let attach = rpd.sampleBufferAttachments[1]!
+        attach.sampleBuffer = buf
+        attach.startOfVertexSampleIndex = MTLCounterDontSample
+        attach.endOfVertexSampleIndex = MTLCounterDontSample
+        attach.startOfFragmentSampleIndex = startIdx
+        attach.endOfFragmentSampleIndex = endIdx
+        statsSlots.append(Slot(label: label, startIdx: startIdx, endIdx: endIdx))
+    }
+
+    /// Snapshot this frame's slots for the completion handler. `logging` is the
+    /// caller's one read of `appLogEnabled`: when it is false the copy is empty
+    /// constants rather than array copies / ref bumps.
+    func frameSnapshot(logging: Bool) -> Frame {
+        guard logging else { return Frame(tickPeriodNs: tickPeriodNs) }
+        return Frame(
+            timestampBuffer: timestampBuffer,
+            sampleCount: nextIdx,
+            tickPeriodNs: tickPeriodNs,
+            slots: slots,
+            fullSlots: fullSlots,
+            statsBuffer: statsBuffer,
+            statsSlots: statsSlots
+        )
+    }
+}
+
 // MTLCommandBuffer rule: any command buffer created via queue.makeCommandBuffer()
 // MUST be committed before being dropped. Uncommitted command buffers leak
 // IOAccelerator GPU memory regions that the kernel never reclaims (observable
@@ -627,12 +859,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// because the main window's renderer is the first surface to exist; every
     /// other surface is handed this same instance.
     let shared: SharedRenderResources
-    private var device: MTLDevice { shared.device }
     private let queue: MTLCommandQueue
-    private var atlas: GlyphAtlas { shared.atlas }
 
     /// Expose device for external grid views (shared Metal device).
-    var metalDevice: MTLDevice { device }
+    var metalDevice: MTLDevice { shared.device }
 
     /// The queue this surface draws on. The atlas blit rides the MAIN
     /// surface's queue so that surface needs no reader admission — see
@@ -644,19 +874,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// so the surface kind stops being implied by the type. Defaults on
     /// because the only surface built from this type today is the main one;
     /// a surface that comes and goes with a float must pass false, since
-    /// setupGpuPerfSampling allocates an MTLCounterSampleBuffer per instance.
+    /// GpuPassSampler.setUp allocates an MTLCounterSampleBuffer per instance.
     private let collectsGpuPerfSamples: Bool
 
     /// Expose atlas for external grid views (shared glyph cache).
-    var glyphAtlas: GlyphAtlas { atlas }
+    var glyphAtlas: GlyphAtlas { shared.atlas }
 
     // Forwarders onto `shared`, so the ~170 uses below read as they always did
     // while the objects themselves belong to no surface. Read-only on purpose:
     // the build sites write `shared.x` directly, which keeps "who writes these"
     // answerable by searching for `shared.`.
-    private var pipeline: MTLRenderPipelineState? { shared.pipeline }
     /// Also read by ExternalGridView for the shared back-buffer copy.
-    var sampler: MTLSamplerState? { shared.sampler }
     private var initializationError: String?
     private var pipelineNeedsBuilding = true
     private var pipelineRetryDelaySeconds: TimeInterval = 0.1
@@ -666,19 +894,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // 2-pass rendering pipelines for blur support
     // Background pipeline uses overwrite blending (one, zero) to avoid ghosting
     // Glyph pipeline uses standard alpha blending for correct antialiasing
-    private var backgroundPipeline: MTLRenderPipelineState? { shared.backgroundPipeline }
-    private var glyphPipeline: MTLRenderPipelineState? { shared.glyphPipeline }
     // Single-pass replacement for the (backgroundPipeline + glyphPipeline) 2-pass.
     // Uses ps_unified_blur which reads tile memory via raster_order_group and
     // composites bg + glyph + decorations in a single fragment shader. Halves
     // fragment-shader invocations vs the 2-pass discard pattern when enabled.
     // nil → fall back to 2-pass for safety.
-    private var unifiedBlurPipeline: MTLRenderPipelineState? { shared.unifiedBlurPipeline }
 
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
-    var copyPipeline: MTLRenderPipelineState? { shared.copyPipeline }
-    var copyVertexBuffer: MTLBuffer? { shared.copyVertexBuffer }
 
     // Binary archive for caching compiled pipeline states
     // This avoids XPC compiler service calls after first successful compilation
@@ -965,7 +1188,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let submitted = submitSurfaceRowVertices(
             target: sets[writeSetIndex],
             sourceSet: sets[flushSourceSetIndex],
-            device: device,
+            device: shared.device,
             rowStart: rowStart,
             ptr: ptr,
             count: count,
@@ -1096,7 +1319,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             ledger: rowCapacity,
             lock: lock,
             bufferSets: bufferSets,
-            device: device,
+            device: shared.device,
             maxRowBuffers: maxRowBuffers,
             logLabel: "Renderer",
             isBusyLocked: { bracketOpen || gpuInFlightCount.contains(where: { $0 != 0 }) },
@@ -1110,38 +1333,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var perfRowSubmitCalls: Int = 0   // Core thread only
     private var perfRowSubmitVerts: Int = 0   // Core thread only
 
-    // Per-pass GPU timing via MTLCounterSampleBuffer (stage-boundary timestamps).
-    // One sample buffer is reused across frames; safe because inflightSemaphore
-    // bounds in-flight frames to 1, so the previous frame's completion handler
-    // resolves the buffer before the next draw assigns slots.
-    private struct GpuPerfSlot { let label: String; let startIdx: Int; let endIdx: Int }
-    // Full 4-stage sampling for one pass (vertex start/end + fragment start/end).
-    // Used to investigate why the copy pass measures ~2.9ms even though it's a
-    // single 6-vert blit (~0.7ms theoretical bandwidth limit) — the fragment-
-    // only number doesn't show vertex stage cost or the gap waiting for the
-    // previous pass's tile store.
-    private struct GpuPerfSlotFull {
-        let label: String
-        let startVIdx: Int
-        let endVIdx: Int
-        let startFIdx: Int
-        let endFIdx: Int
-    }
-    private var gpuPerfSampleBuffer: MTLCounterSampleBuffer?
-    private var gpuPerfSamplingEnabled: Bool = false
-    private var gpuTimestampPeriodNs: Double = 1.0
-    private var gpuPerfSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
-    private var gpuPerfFullSlots: [GpuPerfSlotFull] = []  // ditto, full-stage sampling
-    private var gpuPerfNextIdx: Int = 0  // shared sample-buffer cursor; reset per draw
-
-    // Per-pass overdraw measurement via MTLCommonCounterSetStatistic.
-    // Captures fragmentInvocations at pass start/end; ratio against the actual
-    // visible pixel area (drawable_w × dirty_h_px) is true overdraw. Confirms
-    // whether the 2-pass blur path actually doubles fragment work, which our
-    // hypothesis says is the dominant ~5ms in main pass.
-    private var gpuStatsSampleBuffer: MTLCounterSampleBuffer?
-    private var gpuStatsSamplingEnabled: Bool = false
-    private var gpuStatsSlots: [GpuPerfSlot] = []  // Render thread only; reset per draw
+    // Per-pass GPU measurement (stage-boundary timestamps + fragment
+    // invocation counters). Render thread only; reset at the top of each draw.
+    private var gpuSampler = GpuPassSampler()
 
     private let inflightSemaphore = DispatchSemaphore(value: 1)  // Max 1 GPU in-flight
     /// How long a frame may wait for an in-flight commit before giving up and
@@ -1308,14 +1502,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     var cellHeightPx: Float { shared.cellHeightPx }
 
 
-    var currentFontName: String { atlas.currentFontName }
+    var currentFontName: String { shared.atlas.currentFontName }
 
-    var currentPointSize: CGFloat { atlas.currentPointSize }
+    var currentPointSize: CGFloat { shared.atlas.currentPointSize }
 
     // Phase 2: Core-managed atlas pass-through
 
     func rasterizeGlyphOnly(scalar: UInt32, styleFlags: UInt32, corePtr: OpaquePointer?, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>) -> Bool {
-        return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: corePtr, outBitmap: outBitmap)
+        return shared.atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: corePtr, outBitmap: outBitmap)
     }
 
     /// Classifies an upload that did not actually happen so the C callback can
@@ -1323,12 +1517,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// GlyphAtlas.uploadRegion's doc comment for the cache-publication contract.
     @discardableResult
     func uploadAtlasRegion(destX: UInt32, destY: UInt32, width: UInt32, height: UInt32, bitmap: UnsafePointer<zonvie_glyph_bitmap>) -> GlyphAtlas.UploadResult {
-        atlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
+        shared.atlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
     }
 
     @discardableResult
     func recreateAtlasTexture(width: UInt32, height: UInt32) -> Bool {
-        let created = atlas.recreateTexture(width: Int(width), height: Int(height))
+        let created = shared.atlas.recreateTexture(width: Int(width), height: Int(height))
         if !created && isInFlush {
             // on_atlas_create has a void C ABI. Latch the failure in the
             // frontend transaction as well as aborting from the callback so
@@ -1603,15 +1797,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // --- Post-process bloom (neon glow, Dual Kawase) ---
     // Pipelines and sampler are internal so ExternalGridView can share them.
-    var glowExtractPipeline: MTLRenderPipelineState? { shared.glowExtractPipeline }
     /// Attenuates extracted glow by a layer's background coverage, so a glyph
     /// behind an opaque layer does not bloom through it.
-    var glowOccludePipeline: MTLRenderPipelineState? { shared.glowOccludePipeline }
-    var kawaseDownPipeline: MTLRenderPipelineState? { shared.kawaseDownPipeline }
-    var kawaseUpPipeline: MTLRenderPipelineState? { shared.kawaseUpPipeline }
-    var glowCompositePipeline: MTLRenderPipelineState? { shared.glowCompositePipeline }
     let glowTextures = SurfaceGlowTextures()
-    var bilinearSampler: MTLSamplerState? { shared.bilinearSampler }
 
     // --- User-supplied custom post-process shaders ---
     // Loaded once from config paths during bloom-pipeline construction.
@@ -1624,15 +1812,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// documented), so these always compile with it OFF while the main window
     /// keeps `config.preserveAlpha`. When that is false the two sets are
     /// identical and this just aliases `customShaderPipelines`.
-    var customShaderPipelinesDecorated: [CustomShaderPipeline] { shared.customShaderPipelinesDecorated }
     /// Where the custom shader chain inserts relative to bloom. Mirrored from
     /// `ZonvieConfig.shared.shaders.postProcess` at build time so the draw
     /// path does not need to re-read config each frame.
-    var customShaderPostProcess: ZonvieConfig.ShaderPostProcess { shared.customShaderPostProcess }
     /// True when any loaded custom shader references a time-varying
     /// Shadertoy uniform. Used by `MetalTerminalView` to keep the vsync
     /// draw loop active instead of falling back to flush-driven rendering.
-    var anyCustomShaderNeedsAnimation: Bool { shared.anyCustomShaderNeedsAnimation }
 
     // Shadertoy-style uniforms block (160 bytes, std140). Populated per
     // draw into a local `zonvie_shader_uniforms` value and handed to the
@@ -1716,7 +1901,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             usage: [.renderTarget, .shaderRead]
         )
 
-        backBuffer = device.makeTexture(descriptor: desc)
+        backBuffer = shared.device.makeTexture(descriptor: desc)
         // backBufferSize is read from updateCursorShaderStateFromVerts() on
         // the core/RPC thread (to convert cursor NDC coords to pixels) —
         // guard the write with `lock` so that read never sees a stale size
@@ -1801,7 +1986,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         buildSampler()
 
         // Create background alpha buffer for shader
-        backgroundAlphaBuffer = device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
+        backgroundAlphaBuffer = shared.device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
         if let buf = backgroundAlphaBuffer {
             var alpha = resolveSurfaceBackgroundAlpha(
                 blurEnabled: blurEnabled,
@@ -1812,181 +1997,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         // Create cursor blink buffer for shader (always visible for main window cursor)
-        cursorBlinkBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared)
+        cursorBlinkBuffer = shared.device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared)
         if let buf = cursorBlinkBuffer {
             var visible: UInt32 = 1
             memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
         }
 
-        if collectsGpuPerfSamples { setupGpuPerfSampling() }
-    }
-
-    // Probe device support for stage-boundary timestamp counters and allocate
-    // a reusable sample buffer. On unsupported devices the gate stays false and
-    // the per-pass GPU log is silently skipped (gpu_execution still emits).
-    private func setupGpuPerfSampling() {
-        // Diagnostic dump of what the device actually exposes. M-series Macs
-        // typically only show "timestamp" via runtime API; statistic and
-        // stageutilization are restricted to Xcode GPU Capture on macOS.
-        let exposedSets = (device.counterSets ?? []).map { $0.name }.joined(separator: ",")
-        let supportsStage = device.supportsCounterSampling(.atStageBoundary)
-        let supportsDraw = device.supportsCounterSampling(.atDrawBoundary)
-        let supportsBlit = device.supportsCounterSampling(.atBlitBoundary)
-        ZonvieCore.appLogPerf("[perf] gpu_counters: sets=[\(exposedSets)] stage=\(supportsStage) draw=\(supportsDraw) blit=\(supportsBlit)")
-
-        guard supportsStage else {
-            ZonvieCore.appLogPerf("[perf] gpu_passes: device does not support .atStageBoundary; skipping per-pass GPU timing")
-            return
-        }
-        let timestampSet = device.counterSets?.first { cs in
-            // MTLCommonCounterSet is a RawRepresentable wrapper around String;
-            // MTLCounterSet.name returns a Swift String, so compare via rawValue.
-            cs.name == MTLCommonCounterSet.timestamp.rawValue
-        }
-        guard let cs = timestampSet else {
-            ZonvieCore.appLogPerf("[perf] gpu_passes: no timestamp counter set available; skipping per-pass GPU timing")
-            return
-        }
-        let desc = MTLCounterSampleBufferDescriptor()
-        desc.counterSet = cs
-        desc.label = "ZonvieGpuPerfTimestamps"
-        desc.storageMode = .shared
-        // Capacity 16 = up to 8 passes per frame (start+end each). Today we attach
-        // 3 (main, copy, cursor); headroom for future custom-shader chain entries.
-        desc.sampleCount = 16
-        do {
-            gpuPerfSampleBuffer = try device.makeCounterSampleBuffer(descriptor: desc)
-        } catch {
-            ZonvieCore.appLogPerf("[perf] gpu_passes: makeCounterSampleBuffer failed: \(error)")
-            return
-        }
-        // Calibrate GPU tick → ns. On Apple Silicon timestamps already arrive in
-        // nanoseconds, but compute the ratio so other backends (Intel discrete
-        // GPUs, future hw) report correctly. Newer SDKs expose this as a
-        // tuple-returning method instead of inout pointers.
-        let (cpu0, gpu0) = device.sampleTimestamps()
-        Thread.sleep(forTimeInterval: 0.002)
-        let (cpu1, gpu1) = device.sampleTimestamps()
-        let cpuDelta = Double(cpu1 &- cpu0)
-        let gpuDelta = Double(gpu1 &- gpu0)
-        if cpuDelta > 0, gpuDelta > 0 {
-            // sampleTimestamps' cpuTimestamp is in nanoseconds (mach_absolute_time
-            // converted via timebase, per Apple docs); gpuTimestamp is in GPU ticks.
-            gpuTimestampPeriodNs = cpuDelta / gpuDelta
-        }
-        gpuPerfSamplingEnabled = true
-        ZonvieCore.appLogPerf("[perf] gpu_passes: enabled (tick_period_ns=\(String(format: "%.4f", gpuTimestampPeriodNs)))")
-
-        // ── Statistic counter set: fragment invocations for overdraw measurement.
-        // Independent enable gate so a partial-support device can still benefit
-        // from gpu_passes timing even if statistic isn't available.
-        let statisticSet = device.counterSets?.first { cs in
-            cs.name == MTLCommonCounterSet.statistic.rawValue
-        }
-        guard let stCs = statisticSet else {
-            ZonvieCore.appLogPerf("[perf] gpu_overdraw: no statistic counter set; skipping")
-            return
-        }
-        let stDesc = MTLCounterSampleBufferDescriptor()
-        stDesc.counterSet = stCs
-        stDesc.label = "ZonvieGpuStatsBuffer"
-        stDesc.storageMode = .shared
-        stDesc.sampleCount = 16
-        do {
-            gpuStatsSampleBuffer = try device.makeCounterSampleBuffer(descriptor: stDesc)
-            gpuStatsSamplingEnabled = true
-            ZonvieCore.appLogPerf("[perf] gpu_overdraw: enabled")
-        } catch {
-            ZonvieCore.appLogPerf("[perf] gpu_overdraw: makeCounterSampleBuffer(statistic) failed: \(error)")
-        }
-    }
-
-    // Attach fragment-stage timestamp samples to a render pass descriptor so the
-    // GPU records start-of-fragment / end-of-fragment timestamps. The duration
-    // (end - start) is scaled by gpuTimestampPeriodNs in the completion handler.
-    //
-    // Why fragment-stage only (not start_v..end_f): on Apple Silicon TBDR, the
-    // vertex stage of pass N+1 runs in parallel with the fragment stage of pass
-    // N, so start_v..end_f intervals overlap heavily and don't yield meaningful
-    // per-pass cost (sum was ~1.6x exec_us when measured that way). Adjacent
-    // passes that share textures are serialized at the fragment boundary
-    // (read-after-write), so fragment-only sampling produces costs that roughly
-    // sum to gpu_exec_us. Vertex cost is small for text rendering and acceptable
-    // to elide.
-    //
-    // No-op when perf logging is off or the device lacks counter sampling.
-    // Must be called BEFORE makeRenderCommandEncoder(rpd).
-    private func attachGpuPerfSamples(to rpd: MTLRenderPassDescriptor, label: String) {
-        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
-              let buf = gpuPerfSampleBuffer
-        else { return }
-        let startIdx = gpuPerfNextIdx
-        let endIdx = startIdx + 1
-        guard endIdx < buf.sampleCount else { return }
-        gpuPerfNextIdx += 2
-        let attach = rpd.sampleBufferAttachments[0]!
-        attach.sampleBuffer = buf
-        attach.startOfVertexSampleIndex = MTLCounterDontSample
-        attach.endOfVertexSampleIndex = MTLCounterDontSample
-        attach.startOfFragmentSampleIndex = startIdx
-        attach.endOfFragmentSampleIndex = endIdx
-        gpuPerfSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
-    }
-
-    // Same as attachGpuPerfSamples but also samples the vertex-stage boundary
-    // so we get start_v / end_v / start_f / end_f for one pass. Lets us split:
-    //   vertex_us  = end_v - start_v   (vertex shader + binning)
-    //   vfgap_us   = start_f - end_v   (idle waiting for tile binning to settle
-    //                                   or for previous pass's tile store)
-    //   fragment_us = end_f - start_f  (= existing copy_us field)
-    //   total_us   = end_f - start_v   (whole pass wall time)
-    //
-    // Used only for the copy pass today, where the 2.9ms p50 measurement is
-    // 4x the bandwidth-limited theoretical minimum and we need the breakdown
-    // to know whether the cost is in vertex/binning, in cross-pass scheduling,
-    // or actually in fragment shading.
-    private func attachGpuPerfSamplesFull(to rpd: MTLRenderPassDescriptor, label: String) {
-        guard gpuPerfSamplingEnabled, ZonvieCore.appLogEnabled,
-              let buf = gpuPerfSampleBuffer
-        else { return }
-        let baseIdx = gpuPerfNextIdx
-        let endFIdx = baseIdx + 3
-        guard endFIdx < buf.sampleCount else { return }
-        gpuPerfNextIdx += 4
-        let attach = rpd.sampleBufferAttachments[0]!
-        attach.sampleBuffer = buf
-        attach.startOfVertexSampleIndex = baseIdx
-        attach.endOfVertexSampleIndex = baseIdx + 1
-        attach.startOfFragmentSampleIndex = baseIdx + 2
-        attach.endOfFragmentSampleIndex = baseIdx + 3
-        gpuPerfFullSlots.append(GpuPerfSlotFull(
-            label: label,
-            startVIdx: baseIdx,
-            endVIdx: baseIdx + 1,
-            startFIdx: baseIdx + 2,
-            endFIdx: baseIdx + 3
-        ))
-    }
-
-    // Attach fragment-invocation counter samples on attachment slot 1 (slot 0 is
-    // taken by timestamps). Uses the same fragment-stage boundaries so the
-    // invocation count covers the same work the timestamp duration does.
-    // Resolved in the completion handler as fragmentInvocations(end - start);
-    // overdraw ratio is computed against actual visible pixel area.
-    private func attachGpuStatsSamples(to rpd: MTLRenderPassDescriptor, label: String) {
-        guard gpuStatsSamplingEnabled, ZonvieCore.appLogEnabled,
-              let buf = gpuStatsSampleBuffer
-        else { return }
-        let startIdx = gpuStatsSlots.count * 2
-        let endIdx = startIdx + 1
-        guard endIdx < buf.sampleCount else { return }
-        let attach = rpd.sampleBufferAttachments[1]!
-        attach.sampleBuffer = buf
-        attach.startOfVertexSampleIndex = MTLCounterDontSample
-        attach.endOfVertexSampleIndex = MTLCounterDontSample
-        attach.startOfFragmentSampleIndex = startIdx
-        attach.endOfFragmentSampleIndex = endIdx
-        gpuStatsSlots.append(GpuPerfSlot(label: label, startIdx: startIdx, endIdx: endIdx))
+        if collectsGpuPerfSamples { gpuSampler.setUp(device: shared.device) }
     }
 
     // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
@@ -1996,7 +2013,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// This builds the pipeline synchronously if not already done.
     @discardableResult
     func ensurePipelineReady(view: MTKView) -> Bool {
-        if pipeline != nil && sampler != nil {
+        if shared.pipeline != nil && shared.sampler != nil {
             pipelineRetryDelaySeconds = 0.1
             pipelineRetryNotBefore = 0
             return true
@@ -2006,9 +2023,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         guard pipelineNeedsBuilding, now >= pipelineRetryNotBefore else { return false }
 
         pipelineNeedsBuilding = false
-        if sampler == nil { buildSampler() }
+        if shared.sampler == nil { buildSampler() }
         buildPipeline(view: view)
-        if pipeline != nil && sampler != nil {
+        if shared.pipeline != nil && shared.sampler != nil {
             initializationError = nil
             pipelineRetryDelaySeconds = 0.1
             pipelineRetryNotBefore = 0
@@ -2025,7 +2042,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         pipelineRetryDelaySeconds = min(pipelineRetryDelaySeconds * 2, 5.0)
         DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self, weak view] in
             guard let self, let view,
-                  self.pipeline == nil,
+                  self.shared.pipeline == nil,
                   CFAbsoluteTimeGetCurrent() >= self.pipelineRetryNotBefore else { return }
             if let terminalView = view as? MetalTerminalView {
                 terminalView.requestRedraw()
@@ -2048,7 +2065,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     enum BeginFlushResult {
         case proceed                   // Normal flush, no special action needed
         case proceedWithInvalidation   // Flush OK, but core glyph cache invalidation needed
-        case dropped                   // Flush aborted — core must skip vertex/atlas generation
+        case dropped                   // Flush aborted — core must skip vertex/shared.atlas generation
     }
 
     func beginFlush() -> BeginFlushResult {
@@ -2957,7 +2974,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             _ = ensurePipelineReady(view: view)
 
             // Graceful degradation: if GPU initialization failed, skip rendering
-            guard pipeline != nil, sampler != nil else {
+            guard shared.pipeline != nil, shared.sampler != nil else {
                 if let error = initializationError {
                     ZonvieCore.appLog("[draw] Skipping render due to initialization error: \(error)")
                 }
@@ -2969,7 +2986,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Keep the vsync draw loop alive while any custom shader references
             // animation-driving uniforms (iTime etc.). A missing pipeline must
             // not reset the idle counter every frame.
-            if anyCustomShaderNeedsAnimation {
+            if shared.anyCustomShaderNeedsAnimation {
                 (view as? MetalTerminalView)?.activateDrawLoop()
             }
 
@@ -3317,7 +3334,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 isSmoothScrolling: smoothScrolling,
                 blinkStateChanged: blinkStateChanged,
                 drawableSizeChanged: drawableSizeChanged,
-                shaderAnimates: anyCustomShaderNeedsAnimation
+                shaderAnimates: shared.anyCustomShaderNeedsAnimation
             )
             let idleGateSkips = idleTerms.skipsFrame
             ZonvieCore.drawTrace(idleTerms.traceLine(surface: 1))
@@ -3350,7 +3367,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // `shouldReusePreviousContents`. `dirtyRectPxOpt` joins it for the
             // same reason — rect-only damage was consumed and then discarded here.
             // Same animation exception as above.
-            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil {
+            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !shared.anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil {
                 FrameTracer.trace(.drawSkipNoChange, a: 3)
                 (view as? MetalTerminalView)?.notifyDrawIdle()
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -3371,7 +3388,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if rowMode
                 && isBlinkOnlyFrame
                 && currentCursorCount == 0
-                && !anyCustomShaderNeedsAnimation {
+                && !shared.anyCustomShaderNeedsAnimation {
                 lastRenderedBlinkState = cursorBlinkStateSnapshot
                 FrameTracer.trace(.drawSkipNoChange, a: 4)
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
@@ -3428,7 +3445,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 layerOriginPx: rootLayerOrigin
             )
 
-            let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
+            let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
             let safeRowCount: Int
             if rowMode {
@@ -3592,13 +3609,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // below append entries that the completion handler resolves into a
             // single [perf] gpu_passes line. Gated so the hot path pays zero
             // cost when perf logging is off (the attach helpers also bail out
-            // internally, but the removeAll calls themselves would otherwise
-            // run unconditionally).
+            // internally, but beginFrame's removeAlls would otherwise run
+            // unconditionally).
             if ZonvieCore.appLogEnabled {
-                gpuPerfSlots.removeAll(keepingCapacity: true)
-                gpuPerfFullSlots.removeAll(keepingCapacity: true)
-                gpuPerfNextIdx = 0
-                gpuStatsSlots.removeAll(keepingCapacity: true)
+                gpuSampler.beginFrame()
             }
             // The rows of a layer the current buffer set can actually resolve.
             // Asked for by both the blit decision below and the layer draw
@@ -3801,7 +3815,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
                 if refusalReason == nil, let p = plan {
                     if scrollBlitEncoder == nil {
-                        scrollScratch.ensure(device: device, drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
+                        scrollScratch.ensure(device: shared.device, drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
                         scrollBlitEncoder = cmd.makeBlitCommandEncoder()
                     }
                     if let blit = scrollBlitEncoder, let scratch = scrollScratch.texture {
@@ -4005,8 +4019,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 ZonvieCore.appLog("[draw] skipMainPass=true (\(reason); backTex preserved, copy+cursor only)")
             }
             if !skipMainPass {
-            attachGpuPerfSamples(to: rpd, label: "main")
-            attachGpuStatsSamples(to: rpd, label: "main")
+            gpuSampler.attach(to: rpd, label: "main")
+            gpuSampler.attachStats(to: rpd, label: "main")
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
                 // Encoder creation failed (rare). Commit the empty cmd anyway so
                 // the IOAccelerator region attached to it is reclaimed; otherwise
@@ -4043,16 +4057,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             viewportMetrics.applyViewport(to: enc)
 
             // Safe to force unwrap: guard at top of draw() ensures pipeline/sampler are non-nil
-            enc.setRenderPipelineState(pipeline!)
+            enc.setRenderPipelineState(shared.pipeline!)
 
             // atlas texture + sampler
             if let tex = atlasTex {
                 enc.setFragmentTexture(tex, index: 0)
             }
-            enc.setFragmentSamplerState(sampler!, index: 0)
+            enc.setFragmentSamplerState(shared.sampler!, index: 0)
 
             // Bind scroll offsets, fragment state (drawable size, alpha, blink) via shared helpers
-            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot, device: device, scratchBuffer: &committed.scrollOffsetBuffer, scratchCapacity: &committed.scrollOffsetBufferCap)
+            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot, device: shared.device, scratchBuffer: &committed.scrollOffsetBuffer, scratchCapacity: &committed.scrollOffsetBufferCap)
             bindSurfaceFragmentState(
                 encoder: enc,
                 viewportMetrics: viewportMetrics,
@@ -4080,7 +4094,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 encodeSurfaceScissoredDirtyRows(
                     encoder: enc,
                     rows: dirtyRows,
-                    pipeline: pipeline!,
+                    pipeline: shared.pipeline!,
                     resolve: resolvedRowState,
                     geometry: rowGeometry,
                     bgRGB: snappedBgRGB,
@@ -4128,11 +4142,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         row: cursorGridRow,
                         resolved: resolved,
                         geometry: rowGeometry,
-                        backgroundPipeline: backgroundPipeline,
-                        glyphPipeline: glyphPipeline,
-                        unifiedBlurPipeline: unifiedBlurPipeline
+                        backgroundPipeline: shared.backgroundPipeline,
+                        glyphPipeline: shared.glyphPipeline,
+                        unifiedBlurPipeline: shared.unifiedBlurPipeline
                     )
-                    ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(resolved.vc) unified=\(unifiedBlurPipeline != nil)")
+                    ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(resolved.vc) unified=\(shared.unifiedBlurPipeline != nil)")
                 case .dirtyRowsOnly where use2Pass:
                     // Partial redraw with .load for blur: only dirty rows are
                     // redrawn 2-pass (overwrite bg + alpha glyph) with
@@ -4150,7 +4164,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     let drawableWidthF = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
                     let drawableHeightF = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
                     let cellHiI = Int(cellHi)
-                    if let bgPipe = backgroundPipeline {
+                    if let bgPipe = shared.backgroundPipeline {
                         encodeSurfaceDirtyRowBands(
                             encoder: enc,
                             rows: dirtyRows,
@@ -4175,11 +4189,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 renderTargetHeight_px: backTex.height
                             )
                         },
-                        pipeline: pipeline!,
-                        backgroundPipeline: backgroundPipeline,
-                        glyphPipeline: glyphPipeline,
+                        pipeline: shared.pipeline!,
+                        backgroundPipeline: shared.backgroundPipeline,
+                        glyphPipeline: shared.glyphPipeline,
                         useTwoPass: true,
-                        unifiedBlurPipeline: unifiedBlurPipeline
+                        unifiedBlurPipeline: shared.unifiedBlurPipeline
                     )
                 case .dirtyRowsOnly:
                     // Normal mode: scissor per dirty row (prevents giant scissor from accumulated unions).
@@ -4195,11 +4209,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         rows: smoothRowRange,
                         resolve: resolvedSmoothRowState,
-                        pipeline: pipeline!,
-                        backgroundPipeline: backgroundPipeline,
-                        glyphPipeline: glyphPipeline,
+                        pipeline: shared.pipeline!,
+                        backgroundPipeline: shared.backgroundPipeline,
+                        glyphPipeline: shared.glyphPipeline,
                         useTwoPass: true,
-                        unifiedBlurPipeline: unifiedBlurPipeline
+                        unifiedBlurPipeline: shared.unifiedBlurPipeline
                     )
                 case .allRowsWithRetained:
                     // Smooth scroll without blur: draw all rows without scissor
@@ -4207,7 +4221,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         rows: smoothRowRange,
                         resolve: resolvedSmoothRowState,
-                        pipeline: pipeline!,
+                        pipeline: shared.pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
                         useTwoPass: false
@@ -4218,7 +4232,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         rows: 0..<safeRowCount,
                         resolve: resolvedRowState,
-                        pipeline: pipeline!,
+                        pipeline: shared.pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
                         useTwoPass: false
@@ -4234,7 +4248,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         rows: 0..<safeRowCount,
                         resolve: resolvedRowState,
-                        pipeline: pipeline!,
+                        pipeline: shared.pipeline!,
                         backgroundPipeline: nil,
                         glyphPipeline: nil,
                         useTwoPass: false
@@ -4271,12 +4285,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     encoder: enc,
                     vertexBuffer: committed.mainVertexBuffer,
                     vertexCount: currentMainCount,
-                    pipeline: pipeline!,
-                    backgroundPipeline: backgroundPipeline,
-                    glyphPipeline: glyphPipeline,
+                    pipeline: shared.pipeline!,
+                    backgroundPipeline: shared.backgroundPipeline,
+                    glyphPipeline: shared.glyphPipeline,
                     useTwoPass: use2Pass,
                     scissorRect: dirtyScissor,
-                    unifiedBlurPipeline: unifiedBlurPipeline
+                    unifiedBlurPipeline: shared.unifiedBlurPipeline
                 )
             }
 
@@ -4285,7 +4299,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // whose grid has no rows yet draws nothing, which is what the
             // core's layout contract requires.
             if layerSnapshot.count > 1 {
-                enc.setRenderPipelineState(pipeline!)
+                enc.setRenderPipelineState(shared.pipeline!)
                 for (li, entry) in layerSnapshot.enumerated().dropFirst() {
                     let layer = entry.layer
                     let sets = entry.sets
@@ -4406,7 +4420,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 )
                                 encodedRows += 1
                             }
-                            enc.setRenderPipelineState(pipeline!)
+                            enc.setRenderPipelineState(shared.pipeline!)
                         }
 
                         // Same pipeline choice as the root grid: under blur the
@@ -4417,11 +4431,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             encoder: enc,
                             rows: 0..<(rowCount + retainedForLayerCount),
                             resolve: resolveLayerRow,
-                            pipeline: pipeline!,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
+                            pipeline: shared.pipeline!,
+                            backgroundPipeline: shared.backgroundPipeline,
+                            glyphPipeline: shared.glyphPipeline,
                             useTwoPass: use2Pass,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     } else {
                         let dirtyLayerRows = st!.drawRows
@@ -4429,7 +4443,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         // layer's own pixel space. Drawn before the rows: the
                         // plan's dirty rows cover the band and must land on top.
                         if let band = st!.drawBlitClearBand {
-                            enc.setRenderPipelineState(use2Pass ? (backgroundPipeline ?? pipeline!) : pipeline!)
+                            enc.setRenderPipelineState(use2Pass ? (shared.backgroundPipeline ?? shared.pipeline!) : shared.pipeline!)
                             drawSurfaceBackgroundClearBand(
                                 enc,
                                 clearBand: band,
@@ -4445,7 +4459,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         // where the background pass never runs for a row with no
                         // vertices.
                         if !dirtyLayerRows.isEmpty {
-                            enc.setRenderPipelineState(use2Pass ? (backgroundPipeline ?? pipeline!) : pipeline!)
+                            enc.setRenderPipelineState(use2Pass ? (shared.backgroundPipeline ?? shared.pipeline!) : shared.pipeline!)
                             for row in dirtyLayerRows where resolveLayerRow(row) == nil {
                                 guard row >= 0, row < rowCount else { continue }
                                 let topPx = row * Int(cellHi)
@@ -4477,11 +4491,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                     targetHeight: backTex.height
                                 )
                             },
-                            pipeline: pipeline!,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
+                            pipeline: shared.pipeline!,
+                            backgroundPipeline: shared.backgroundPipeline,
+                            glyphPipeline: shared.glyphPipeline,
                             useTwoPass: use2Pass,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     }
                     st?.lastDrawnRowCount = rowCount
@@ -4505,7 +4519,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 bindSurfaceScrollOffsets(
                     encoder: enc,
                     offsets: scrollSnapshot,
-                    device: device,
+                    device: shared.device,
                     scratchBuffer: &committed.scrollOffsetBuffer,
                     scratchCapacity: &committed.scrollOffsetBufferCap
                 )
@@ -4558,7 +4572,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     if let tex = atlasTex {
                         enc.setFragmentTexture(tex, index: 0)
                     }
-                    enc.setFragmentSamplerState(sampler!, index: 0)
+                    enc.setFragmentSamplerState(shared.sampler!, index: 0)
                     // ps_glow_occlude reads the same background alpha the main
                     // pass paints with, so the two agree on what a layer hides.
                     if let alphaBuf = backgroundAlphaBuffer {
@@ -4624,7 +4638,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             let retainedForGlowCount = collectLayerRetainedRows(layer.gridId)
                             for pass in 0..<2 {
                                 if pass == 0 {
-                                    guard let occludePipe = glowOccludePipeline else { continue }
+                                    guard let occludePipe = shared.glowOccludePipeline else { continue }
                                     enc.setRenderPipelineState(occludePipe)
                                 } else {
                                     enc.setRenderPipelineState(extractPipe)
@@ -4735,13 +4749,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 backTex: backTex,
                 drawableTexture: drawable.texture,
                 customShaderPipelines: customShaderPipelines,
-                runsCustomShaderChain: customShaderPostProcess == .afterBloom,
+                runsCustomShaderChain: shared.customShaderPostProcess == .afterBloom,
                 customShaderPong: customShaderPong,
                 pongSize: view.drawableSize,
-                copyPipeline: copyPipeline,
-                copyVertexBuffer: copyVertexBuffer,
-                sampler: sampler,
-                bilinearSampler: bilinearSampler,
+                copyPipeline: shared.copyPipeline,
+                copyVertexBuffer: shared.copyVertexBuffer,
+                sampler: shared.sampler,
+                bilinearSampler: shared.bilinearSampler,
                 makeUniforms: {
                     makeCustomShaderUniforms(
                         screenResolution: view.drawableSize,
@@ -4753,8 +4767,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // Full 4-stage sampling (vertex + fragment) on the copy
                     // pass to investigate why it measures ~2.9ms vs ~0.7ms
                     // theoretical.
-                    attachGpuPerfSamplesFull(to: copyRPD, label: "copy")
-                    attachGpuStatsSamples(to: copyRPD, label: "copy")
+                    gpuSampler.attachFull(to: copyRPD, label: "copy")
+                    gpuSampler.attachStats(to: copyRPD, label: "copy")
                 }
             )
 
@@ -4846,9 +4860,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 let cursorEncoded = encodeSurfaceCursorOverlay(
                     cmd: cmd,
                     drawableTexture: drawable.texture,
-                    pipeline: pipeline!,
+                    pipeline: shared.pipeline!,
                     atlasTexture: atlasTex,
-                    sampler: sampler!,
+                    sampler: shared.sampler!,
                     viewportMetrics: viewportMetrics,
                     cursorVertexBuffer: cvb,
                     cursorVertexCount: currentCursorCount,
@@ -4859,14 +4873,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // mask a scrolling cursor under a fixed float
                     fixedFloatIntervals: fixedFloatIntervalsSnapshot,
                     prepare: { cursorRPD in
-                        attachGpuPerfSamples(to: cursorRPD, label: "cursor")
-                        attachGpuStatsSamples(to: cursorRPD, label: "cursor")
+                        gpuSampler.attach(to: cursorRPD, label: "cursor")
+                        gpuSampler.attachStats(to: cursorRPD, label: "cursor")
                     },
                     bindScrollOffsets: { cursorEnc in
                         bindSurfaceScrollOffsets(
                             encoder: cursorEnc,
                             offsets: scrollSnapshot,
-                            device: device,
+                            device: shared.device,
                             scratchBuffer: &committedCursor.cursorScrollOffsetBuffer,
                             scratchCapacity: &committedCursor.cursorScrollOffsetBufferCap
                         )
@@ -4946,19 +4960,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // (queue + GPU + present scheduling latency) inside the completion
             // handler. gpu_exec_us comes from Metal's own gpuStart/gpuEndTime.
             let t_gpu_submit: CFAbsoluteTime = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
-            // Snapshot per-pass slots + sample buffer + tick scale for the
-            // completion handler. The renderer reuses gpuPerfSlots next frame,
+            // Snapshot per-pass slots + sample buffers + tick scale for the
+            // completion handler. The sampler reuses its slot arrays next frame,
             // so a value-typed copy keeps this frame's data alive until resolve.
-            // Gated on appLogEnabled so when logging is off the captures are
-            // cheap constants instead of array struct copies / ref bumps.
-            let logEnabledForCompletion = ZonvieCore.appLogEnabled
-            let frameSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuPerfSlots : []
-            let frameFullSlots: [GpuPerfSlotFull] = logEnabledForCompletion ? gpuPerfFullSlots : []
-            let frameSampleCount: Int = logEnabledForCompletion ? gpuPerfNextIdx : 0
-            let frameSampleBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuPerfSampleBuffer : nil
-            let frameTickNs = gpuTimestampPeriodNs
-            let frameStatsSlots: [GpuPerfSlot] = logEnabledForCompletion ? gpuStatsSlots : []
-            let frameStatsBuf: MTLCounterSampleBuffer? = logEnabledForCompletion ? gpuStatsSampleBuffer : nil
+            // Gated on appLogEnabled so when logging is off the copy is empty
+            // constants instead of array copies / ref bumps.
+            let gpuFrame = gpuSampler.frameSnapshot(logging: ZonvieCore.appLogEnabled)
             cmd.addCompletedHandler { [weak self, weak view] completed in
                 if FrameTracer.enabled {
                     // a/b = Metal's own GPU start/end in ns, so GPU execution
@@ -4984,22 +4991,22 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // Per-pass GPU breakdown via stage-boundary timestamps.
                     // Pairs with gpu_execution: per-pass durations should sum to
                     // ≤ exec_us (the gap is tile-binning / submit overhead).
-                    // frameSampleCount covers both fragment-only slots and full
+                    // gpuFrame.sampleCount covers both fragment-only slots and full
                     // (vertex+fragment) slots, allocated contiguously in the
-                    // shared sample buffer via gpuPerfNextIdx.
-                    if let buf = frameSampleBuf, frameSampleCount > 0,
-                       (!frameSlots.isEmpty || !frameFullSlots.isEmpty)
+                    // shared sample buffer by the sampler.
+                    if let buf = gpuFrame.timestampBuffer, gpuFrame.sampleCount > 0,
+                       (!gpuFrame.slots.isEmpty || !gpuFrame.fullSlots.isEmpty)
                     {
-                        if let data = try? buf.resolveCounterRange(0..<frameSampleCount) {
+                        if let data = try? buf.resolveCounterRange(0..<gpuFrame.sampleCount) {
                             data.withUnsafeBytes { raw in
                                 let ts = raw.bindMemory(to: MTLCounterResultTimestamp.self)
-                                guard ts.count >= frameSampleCount else { return }
+                                guard ts.count >= gpuFrame.sampleCount else { return }
                                 var msg = "[perf] gpu_passes"
-                                for slot in frameSlots {
+                                for slot in gpuFrame.slots {
                                     let s = ts[slot.startIdx].timestamp
                                     let e = ts[slot.endIdx].timestamp
                                     let ticks = (e >= s) ? Double(e &- s) : 0
-                                    let us = ticks * frameTickNs / 1000.0
+                                    let us = ticks * gpuFrame.tickPeriodNs / 1000.0
                                     msg += " \(slot.label)_us=\(String(format: "%.1f", us))"
                                 }
                                 // Full-stage slots: report fragment_us under
@@ -5007,11 +5014,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 // analyzer keeps working, then emit a separate
                                 // [perf] gpu_pass_detail line with the full
                                 // vertex/gap/fragment/total breakdown.
-                                for slot in frameFullSlots {
+                                for slot in gpuFrame.fullSlots {
                                     let sF = ts[slot.startFIdx].timestamp
                                     let eF = ts[slot.endFIdx].timestamp
                                     let fragTicks = (eF >= sF) ? Double(eF &- sF) : 0
-                                    let fragUs = fragTicks * frameTickNs / 1000.0
+                                    let fragUs = fragTicks * gpuFrame.tickPeriodNs / 1000.0
                                     msg += " \(slot.label)_us=\(String(format: "%.1f", fragUs))"
                                 }
                                 ZonvieCore.appLogPerf(msg)
@@ -5020,14 +5027,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 // fragment / total. vfgap is start_f - end_v —
                                 // idle between stages, often dominated by
                                 // waiting for the previous pass's tile store.
-                                for slot in frameFullSlots {
+                                for slot in gpuFrame.fullSlots {
                                     let sV = ts[slot.startVIdx].timestamp
                                     let eV = ts[slot.endVIdx].timestamp
                                     let sF = ts[slot.startFIdx].timestamp
                                     let eF = ts[slot.endFIdx].timestamp
                                     func usOf(_ a: UInt64, _ b: UInt64) -> Double {
                                         let t = (b >= a) ? Double(b &- a) : 0
-                                        return t * frameTickNs / 1000.0
+                                        return t * gpuFrame.tickPeriodNs / 1000.0
                                     }
                                     let vUs = usOf(sV, eV)
                                     let gapUs = usOf(eV, sF)
@@ -5049,14 +5056,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // with copy_opportunity dirty_h_px / drawable info to
                     // compute true overdraw per pass. Validates whether the
                     // 2-pass-for-blur path actually doubles fragment work.
-                    if let buf = frameStatsBuf, !frameStatsSlots.isEmpty {
-                        let total = frameStatsSlots.count * 2
+                    if let buf = gpuFrame.statsBuffer, !gpuFrame.statsSlots.isEmpty {
+                        let total = gpuFrame.statsSlots.count * 2
                         if let data = try? buf.resolveCounterRange(0..<total) {
                             data.withUnsafeBytes { raw in
                                 let st = raw.bindMemory(to: MTLCounterResultStatistic.self)
                                 guard st.count >= total else { return }
                                 var msg = "[perf] gpu_overdraw"
-                                for slot in frameStatsSlots {
+                                for slot in gpuFrame.statsSlots {
                                     let s = st[slot.startIdx].fragmentInvocations
                                     let e = st[slot.endIdx].fragmentInvocations
                                     let inv = (e >= s) ? (e &- s) : 0
@@ -5143,7 +5150,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     }
 
     private func buildPipeline(view: MTKView) {
-        guard let lib = device.makeDefaultLibrary() else {
+        guard let lib = shared.device.makeDefaultLibrary() else {
             initializationError = "Failed to make default library"
             ZonvieCore.appLog("ERROR: \(initializationError!)")
             return
@@ -5224,7 +5231,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Create main pipeline state (this requires XPC compiler service)
         do {
             ZonvieCore.appLog("[Renderer] Creating pipeline state via XPC compiler...")
-            shared.pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            shared.pipeline = try shared.device.makeRenderPipelineState(descriptor: desc)
             ZonvieCore.appLog("[Renderer] Pipeline created successfully!")
         } catch {
             initializationError = "Failed to make pipeline state: \(error)"
@@ -5244,7 +5251,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            shared.copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
+            shared.copyPipeline = try shared.device.makeRenderPipelineState(descriptor: copyDesc)
             ZonvieCore.appLog("[Renderer] Copy pipeline created successfully!")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make copy pipeline: \(error)")
@@ -5309,8 +5316,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            shared.backgroundPipeline = try device.makeRenderPipelineState(descriptor: bgDesc)
-            shared.glyphPipeline = try device.makeRenderPipelineState(descriptor: glyphDesc)
+            shared.backgroundPipeline = try shared.device.makeRenderPipelineState(descriptor: bgDesc)
+            shared.glyphPipeline = try shared.device.makeRenderPipelineState(descriptor: glyphDesc)
             ZonvieCore.appLog("[Renderer] 2-pass pipelines created for blur support")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
@@ -5330,7 +5337,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 a.isBlendingEnabled = false  // shader does manual alpha blend via tile read
             }
             do {
-                shared.unifiedBlurPipeline = try device.makeRenderPipelineState(descriptor: uDesc)
+                shared.unifiedBlurPipeline = try shared.device.makeRenderPipelineState(descriptor: uDesc)
                 ZonvieCore.appLog("[Renderer] unified blur pipeline created (1-pass programmable blending)")
             } catch {
                 ZonvieCore.appLog("[Renderer] WARNING: unified blur pipeline build failed; 2-pass fallback in use: \(error)")
@@ -5440,25 +5447,25 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         do {
-            shared.glowExtractPipeline = try device.makeRenderPipelineState(descriptor: extractDesc)
-            shared.glowOccludePipeline = try device.makeRenderPipelineState(descriptor: occludeDesc)
-            shared.kawaseDownPipeline = try device.makeRenderPipelineState(descriptor: kawaseDownDesc)
-            shared.kawaseUpPipeline = try device.makeRenderPipelineState(descriptor: kawaseUpDesc)
-            shared.glowCompositePipeline = try device.makeRenderPipelineState(descriptor: compositeDesc)
+            shared.glowExtractPipeline = try shared.device.makeRenderPipelineState(descriptor: extractDesc)
+            shared.glowOccludePipeline = try shared.device.makeRenderPipelineState(descriptor: occludeDesc)
+            shared.kawaseDownPipeline = try shared.device.makeRenderPipelineState(descriptor: kawaseDownDesc)
+            shared.kawaseUpPipeline = try shared.device.makeRenderPipelineState(descriptor: kawaseUpDesc)
+            shared.glowCompositePipeline = try shared.device.makeRenderPipelineState(descriptor: compositeDesc)
             ZonvieCore.appLog("[Renderer] Bloom pipelines created successfully")
         } catch {
             ZonvieCore.appLog("[Renderer] ERROR: Failed to create bloom pipelines: \(error)")
         }
 
         // Bilinear sampler for blur passes
-        if bilinearSampler == nil {
+        if shared.bilinearSampler == nil {
             let samplerDesc = MTLSamplerDescriptor()
             samplerDesc.minFilter = .linear
             samplerDesc.magFilter = .linear
             samplerDesc.mipFilter = .notMipmapped
             samplerDesc.sAddressMode = .clampToEdge
             samplerDesc.tAddressMode = .clampToEdge
-            shared.bilinearSampler = device.makeSamplerState(descriptor: samplerDesc)
+            shared.bilinearSampler = shared.device.makeSamplerState(descriptor: samplerDesc)
         }
 
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
@@ -5758,8 +5765,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         for path in config.paths {
             let expanded = (path as NSString).expandingTildeInPath
-            if let pipeline = CustomShaderPipeline.load(
-                device: device,
+            if let loaded = CustomShaderPipeline.load(
+                device: shared.device,
                 library: lib,
                 vsCustomPost: vsCustomPost,
                 copyVertexDescriptor: copyVertexDesc,
@@ -5767,8 +5774,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 pixelFormat: pixelFormat,
                 preserveAlpha: config.preserveAlpha
             ) {
-                shared.customShaderPipelines.append(pipeline)
-                if pipeline.needsAnimation {
+                shared.customShaderPipelines.append(loaded)
+                if loaded.needsAnimation {
                     shared.anyCustomShaderNeedsAnimation = true
                 }
             }
@@ -5779,8 +5786,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         if config.preserveAlpha {
             for path in config.paths {
                 let expanded = (path as NSString).expandingTildeInPath
-                if let pipeline = CustomShaderPipeline.load(
-                    device: device,
+                if let loaded = CustomShaderPipeline.load(
+                    device: shared.device,
                     library: lib,
                     vsCustomPost: vsCustomPost,
                     copyVertexDescriptor: copyVertexDesc,
@@ -5788,13 +5795,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     pixelFormat: pixelFormat,
                     preserveAlpha: false
                 ) {
-                    shared.customShaderPipelinesDecorated.append(pipeline)
+                    shared.customShaderPipelinesDecorated.append(loaded)
                 }
             }
         } else {
             shared.customShaderPipelinesDecorated = customShaderPipelines
         }
-        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(anyCustomShaderNeedsAnimation)")
+        ZonvieCore.appLog("[Renderer] Loaded \(customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(shared.customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(shared.anyCustomShaderNeedsAnimation)")
     }
 
     private func loadPipelineFromArchive(lib: MTLLibrary, vs: MTLFunction, fs: MTLFunction, vsCopy: MTLFunction, fsCopy: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) -> Bool {
@@ -5811,7 +5818,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         archiveDesc.url = archivePath
 
         do {
-            binaryArchive = try device.makeBinaryArchive(descriptor: archiveDesc)
+            binaryArchive = try shared.device.makeBinaryArchive(descriptor: archiveDesc)
             ZonvieCore.appLog("[Renderer] Loaded binary archive from \(archivePath.path)")
         } catch {
             ZonvieCore.appLog("[Renderer] Failed to load binary archive: \(error)")
@@ -5853,8 +5860,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         copyDesc.binaryArchives = [archive]
 
         do {
-            shared.pipeline = try device.makeRenderPipelineState(descriptor: desc)
-            shared.copyPipeline = try device.makeRenderPipelineState(descriptor: copyDesc)
+            shared.pipeline = try shared.device.makeRenderPipelineState(descriptor: desc)
+            shared.copyPipeline = try shared.device.makeRenderPipelineState(descriptor: copyDesc)
             ZonvieCore.appLog("[Renderer] All pipelines loaded from archive successfully")
             return true
         } catch {
@@ -5875,7 +5882,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Create new empty archive
         let archiveDesc = MTLBinaryArchiveDescriptor()
         do {
-            let archive = try device.makeBinaryArchive(descriptor: archiveDesc)
+            let archive = try shared.device.makeBinaryArchive(descriptor: archiveDesc)
             ZonvieCore.appLog("[Renderer] cacheToArchive: created empty archive")
 
             // Add successfully compiled pipeline descriptors
@@ -5984,7 +5991,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         s.mipFilter = .notMipmapped
         s.sAddressMode = .clampToEdge
         s.tAddressMode = .clampToEdge
-        shared.sampler = device.makeSamplerState(descriptor: s)
+        shared.sampler = shared.device.makeSamplerState(descriptor: s)
     }
 
     /// Build vertex buffer for fullscreen quad copy (replaces Blit)
@@ -6004,7 +6011,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             -1.0,  1.0,  0.0, 0.0,  // top-left
         ]
         let size = vertices.count * MemoryLayout<Float>.stride
-        shared.copyVertexBuffer = device.makeBuffer(bytes: &vertices, length: size, options: .storageModeShared)
+        shared.copyVertexBuffer = shared.device.makeBuffer(bytes: &vertices, length: size, options: .storageModeShared)
     }
 
     // safeNeededBytes / growCapacity are provided by MetalTypes.swift as
@@ -6049,7 +6056,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 bs.detachPoolMainBuffer = nil
             } else {
                 bs.mainVertexBufferCap = nextCap
-                bs.mainVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+                bs.mainVertexBuffer = shared.device.makeBuffer(length: nextCap, options: .storageModeShared)
                 if bs.mainVertexBuffer == nil {
                     bs.mainVertexBufferCap = 0
                     flushFailed = true
@@ -6079,7 +6086,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
             bs.cursorVertexBufferCap = nextCap
-            bs.cursorVertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            bs.cursorVertexBuffer = shared.device.makeBuffer(length: nextCap, options: .storageModeShared)
             if bs.cursorVertexBuffer == nil {
                 bs.cursorVertexBufferCap = 0
                 flushFailed = true
@@ -6362,7 +6369,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let submitted = submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
             sourceSet: sourceSet,
-            device: device,
+            device: shared.device,
             rowStart: rowStart,
             ptr: UnsafeRawPointer(ptr),
             count: count,
