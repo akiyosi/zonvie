@@ -476,6 +476,28 @@ test "gui:extwin_float_trackpad_scroll" {
     }
 }
 
+test "gui:extwin_float_stack_scroll_continuity" {
+    // macOS only: ExternalGridView hosts the layer and the trackpad gesture
+    // is driven through macos_window.zig.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_float_stack_scroll_continuity.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:extwin_hosted_float_phantom_hit" {
+    // macOS only: the main window's hit test and ExternalGridView are macOS
+    // frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_hosted_float_phantom_hit.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_cursor_move_reuses_rows" {
     // macOS only: ExternalGridView is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {
