@@ -3741,27 +3741,14 @@ pub const Grid = struct {
     }
 
     /// Handle cmdline_block_show event.
+    /// Replace the block with `lines`. Each line goes through
+    /// `appendCmdlineBlock`, whose body this used to repeat: the same dup of
+    /// every chunk's text out of arena memory, under the same errdefer that
+    /// frees the line being built and leaves the lines already appended — a
+    /// partial block, which is what the caller saw on failure either way.
     pub fn setCmdlineBlockShow(self: *Grid, lines: []const []const CmdlineChunk) !void {
         self.cmdline_block.clear(self.alloc);
-        for (lines) |line| {
-            var line_chunks: std.ArrayListUnmanaged(CmdlineChunk) = .empty;
-            errdefer {
-                for (line_chunks.items) |chunk| {
-                    if (chunk.text.len > 0) self.alloc.free(chunk.text);
-                }
-                line_chunks.deinit(self.alloc);
-            }
-            // Dup each chunk's text (arena memory may be freed later)
-            for (line) |chunk| {
-                const duped_text = try self.alloc.dupe(u8, chunk.text);
-                errdefer self.alloc.free(duped_text);
-                try line_chunks.append(self.alloc, CmdlineChunk{
-                    .hl_id = chunk.hl_id,
-                    .text = duped_text,
-                });
-            }
-            try self.cmdline_block.lines.append(self.alloc, line_chunks);
-        }
+        for (lines) |line| try self.appendCmdlineBlock(line);
         self.cmdline_block.visible = true;
         self.cmdline_dirty = true;
     }
