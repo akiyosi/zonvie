@@ -1167,7 +1167,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // (as ExternalGridView's wasScrollOffsetActiveInLastPresentedFrame does).
     // Without it a frame that both clears the offset and carries a grid_scroll
     // blits pixels already rendered with a shader offset: a 1-row jitter.
-    private var lastDrawnHadActiveScrollOffset: Bool = false // Render thread only
     private var gpuInFlightCount: [Int] = [0, 0, 0]  // Protected by lock
     private var rowStorageRetirement = SurfaceRowStorageRetirementState() // Protected by lock
     private var cursorGpuInFlightCount: [Int] = [0, 0, 0] // Protected by lock
@@ -1358,7 +1357,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // Stored as value-type array under lock; passed to GPU via setVertexBytes
     // to avoid shared MTLBuffer GPU/CPU race during smooth scrolling.
     private var scrollOffsetData: [ScrollOffset] = []
-    private var hasActiveScrollOffset: Bool = false  // true when smooth scrolling is active
+    /// Shared with ExternalGridView. This surface latches the previous frame
+    /// when it commits to drawing one (and rolls the latch back if that frame
+    /// is then abandoned); an external surface latches when it presents.
+    /// Protected by `lock` for the live half, render thread only for the latch.
+    private var scrollOffsetLatch = SurfaceScrollOffsetLatch()
     // Exact union of fixed, non-following float rects, represented as disjoint
     // horizontal intervals inside disjoint vertical bands. The fragment shader
     // binary-searches both levels instead of scanning every float per pixel.
@@ -2793,7 +2796,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
         // This eliminates the GPU/CPU race on shared MTLBuffers.
-        hasActiveScrollOffset = count > 0
+        scrollOffsetLatch.setActive(count > 0)
         // This surface owns the cursor's grid whenever it appears in its own
         // offsets, and a grid with no entry is simply not displaced.
         shaderCursorScrollOffsetPx = cursorScrollOffsetPx
@@ -2837,7 +2840,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // has no callers of its own. See that function's note before relying on
         // any of this running.
         scrollOffsetData = []
-        hasActiveScrollOffset = false
+        scrollOffsetLatch.setActive(false)
         // The spans describe the layout this reset abandons.
         gridScrollCaptureBounds.removeAll(keepingCapacity: true)
         // A parked step describes the same abandoned layout, and would be
@@ -3054,8 +3057,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let dirtyRectPxOpt: CGRect?
             var dirtyRows: [Int] = []
             let smoothScrolling: Bool
-            // Raw value of hasActiveScrollOffset at snapshot time (NOT the
-            // combined smoothScrolling). Stored to lastDrawnHadActiveScrollOffset
+            // Raw `scrollOffsetLatch.isActive` at snapshot time (NOT the
+            // combined smoothScrolling). Latched as the previous frame
             // below so the one-frame extension does not self-latch.
             let hadActiveScrollOffsetThisFrame: Bool
             let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
@@ -3111,8 +3114,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Extend smoothScrolling one frame past the offset reaching zero:
             // the back buffer still holds pixels rendered with a non-zero shader
             // offset, and blitting those again is a 1-row jitter.
-            hadActiveScrollOffsetThisFrame = hasActiveScrollOffset
-            smoothScrolling = hadActiveScrollOffsetThisFrame || lastDrawnHadActiveScrollOffset
+            hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive
+            smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
             // Retire retained rows whose grid is no longer displaced. Also here,
             // not only in updateScrollOffsets: the view skips that function once
@@ -3380,15 +3383,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // below (bailWithoutSubmit) can un-consume it for retry.
             let prevDrawnRevision = lastDrawnRevision
             let prevDrawnDrawableSize = lastDrawnDrawableSize
-            let prevDrawnHadActiveScrollOffset = lastDrawnHadActiveScrollOffset
+            var prevDrawnHadActiveScrollOffset = false
             let prevRenderedBlinkState = lastRenderedBlinkState
 
             // Track that we've consumed this revision and drawable size
             lastDrawnRevision = currentCommitRevision
             lastDrawnDrawableSize = view.drawableSize
-            // Record the raw hasActiveScrollOffset, NOT the combined
+            // Latch the raw active flag, NOT the combined
             // smoothScrolling: the combined value would latch true forever.
-            lastDrawnHadActiveScrollOffset = hadActiveScrollOffsetThisFrame
+            prevDrawnHadActiveScrollOffset = scrollOffsetLatch.latch(hadActiveScrollOffsetThisFrame)
 
             // Update last rendered blink state since we're proceeding with render
             lastRenderedBlinkState = cursorBlinkStateSnapshot
@@ -3552,7 +3555,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 }
                 lastDrawnRevision = prevDrawnRevision
                 lastDrawnDrawableSize = prevDrawnDrawableSize
-                lastDrawnHadActiveScrollOffset = prevDrawnHadActiveScrollOffset
+                scrollOffsetLatch.restore(previousFrameWasActive: prevDrawnHadActiveScrollOffset)
                 lastRenderedBlinkState = prevRenderedBlinkState
                 (view as? MetalTerminalView)?.didDrawFrame()
                 (view as? MetalTerminalView)?.requestRedraw()

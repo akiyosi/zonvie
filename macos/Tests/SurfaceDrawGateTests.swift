@@ -436,8 +436,60 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// The scroll-offset latch both surfaces now share, against the two pairs
+    /// of Bools it replaced.
+    ///
+    ///     main     smoothScrolling = hasActiveScrollOffset
+    ///                                  || lastDrawnHadActiveScrollOffset
+    ///     external smoothScrolling = scrollOffsetActive
+    ///                                  || lastPresentedScrollOffsetActive
+    ///
+    /// The same expression under two sets of names, so one enumeration covers
+    /// both: every assignment of (active now, active on the previous frame),
+    /// and every latch-then-restore round trip — what a frame that is encoded
+    /// and then abandoned does.
+    private static func verifyScrollOffsetLatch() {
+        for activeNow in [false, true] {
+            for previous in [false, true] {
+                var latch = SurfaceScrollOffsetLatch()
+                latch.setActive(previous)
+                latch.latch(previous)
+                latch.setActive(activeNow)
+
+                check(latch.isSmoothScrolling, activeNow || previous,
+                      "latch smooth active=\(activeNow) previous=\(previous)")
+
+                // A latch hands back what it displaced, and restoring it puts
+                // the pair back exactly: an abandoned frame must leave no
+                // trace, or the next one reads the wrong previous frame.
+                var abandoned = latch
+                let displaced = abandoned.latch(activeNow)
+                if displaced != previous {
+                    failures += 1
+                    print("FAIL: latch returned \(displaced), expected \(previous)")
+                }
+                abandoned.restore(previousFrameWasActive: displaced)
+                if abandoned.previousFrameWasActive != latch.previousFrameWasActive
+                    || abandoned.isActive != latch.isActive
+                {
+                    failures += 1
+                    print("FAIL: restore did not undo the latch")
+                }
+
+                // A latch that is kept moves the pair forward instead.
+                var kept = latch
+                kept.latch(activeNow)
+                if kept.previousFrameWasActive != activeNow {
+                    failures += 1
+                    print("FAIL: a kept latch did not record this frame")
+                }
+            }
+        }
+    }
+
     static func main() {
         verifyMainSurface()
+        verifyScrollOffsetLatch()
         verifyExternalSurface()
         verifyMainLoadAction()
         verifyExternalLoadAction()

@@ -392,3 +392,52 @@ struct SurfaceRowPassTerms {
         return .allRows
     }
 }
+
+/// Whether a surface is showing a sub-row scroll offset, and whether it was
+/// showing one on the frame before.
+///
+/// Both surfaces tracked exactly this, as two Bools each under their own names
+/// — `hasActiveScrollOffset`/`lastDrawnHadActiveScrollOffset` on one,
+/// `scrollOffsetActive`/`lastPresentedScrollOffsetActive` on the other — and
+/// each derived "smooth scrolling" from its own pair. Holding the concept once
+/// is what makes the remaining difference legible: they latch at different
+/// moments, which is a real question and is now asked in one place.
+///
+/// A struct of two Bools, stored inline. No allocation, no reference counting,
+/// nothing added to a per-frame path.
+struct SurfaceScrollOffsetLatch {
+    /// An offset applies to the frame being built now.
+    private(set) var isActive = false
+
+    /// The frame this surface last committed to was drawn with one.
+    private(set) var previousFrameWasActive = false
+
+    mutating func setActive(_ active: Bool) {
+        isActive = active
+    }
+
+    /// True for one frame past the offset reaching zero: the back buffer still
+    /// holds pixels rendered at a non-zero offset, and blitting those again is
+    /// a one-row jitter.
+    var isSmoothScrolling: Bool {
+        isActive || previousFrameWasActive
+    }
+
+    /// Record `activeThisFrame` as what the previous frame carried, returning
+    /// what the latch held so a frame later abandoned can put it back.
+    ///
+    /// The caller passes the value rather than the latch reading `isActive`
+    /// itself, because the two surfaces latch at different moments: one when a
+    /// frame is committed to being drawn, the other when it is presented.
+    @discardableResult
+    mutating func latch(_ activeThisFrame: Bool) -> Bool {
+        let previous = previousFrameWasActive
+        previousFrameWasActive = activeThisFrame
+        return previous
+    }
+
+    /// Undo a latch whose frame never reached the screen.
+    mutating func restore(previousFrameWasActive previous: Bool) {
+        previousFrameWasActive = previous
+    }
+}
