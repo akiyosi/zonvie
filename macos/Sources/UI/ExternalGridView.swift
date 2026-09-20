@@ -87,14 +87,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// `mainTerminalView?.renderer`, which made this surface unable to draw
     /// without the main window's renderer alive.
     let shared: SharedRenderResources
-    private var pipeline: MTLRenderPipelineState? { shared.pipeline }
-    private var sampler: MTLSamplerState? { shared.sampler }
-
-    // 2-pass rendering pipelines for blur support
-    private var backgroundPipeline: MTLRenderPipelineState? { shared.backgroundPipeline }
-    private var glyphPipeline: MTLRenderPipelineState? { shared.glyphPipeline }
-    // Single-pass replacement for the pair above; nil falls back to them.
-    private var unifiedBlurPipeline: MTLRenderPipelineState? { shared.unifiedBlurPipeline }
 
     /// Scroll-offset publication and the font generation: `scrollOffsetData`,
     /// `lastPresentedScrollOffsetData`, `scrollOffsetLatch`,
@@ -2293,7 +2285,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 }
             }
 
-            guard let pipeline = pipeline, let sampler = sampler else {
+            guard let pipeline = shared.pipeline, let sampler = shared.sampler else {
                 ZonvieCore.appLog("[ExternalGridView] Pipeline not ready")
                 return
             }
@@ -2806,7 +2798,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                 fixedFloatMask.update([])
             }
 
-            let use2Pass = blurEnabled && backgroundPipeline != nil && glyphPipeline != nil
+            let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
             let useGpuScrollCopy = rowMode
                 && !layoutDamageSnapshot
@@ -3263,9 +3255,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             guard first < end else { continue }
                             encodedRows += encodeSurfaceRowDraws(encoder: encoder, rows: first..<end,
                                 resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
-                                pipeline: pipeline, backgroundPipeline: backgroundPipeline,
-                                glyphPipeline: glyphPipeline, useTwoPass: use2Pass,
-                                unifiedBlurPipeline: unifiedBlurPipeline)
+                                pipeline: pipeline, backgroundPipeline: shared.backgroundPipeline,
+                                glyphPipeline: shared.glyphPipeline, useTwoPass: use2Pass,
+                                unifiedBlurPipeline: shared.unifiedBlurPipeline)
                         }
                         logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows)
                         continue
@@ -3286,9 +3278,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
                         resolve: resolveLayerRow,
                         pipeline: glowPipeline ?? pipeline,
-                        backgroundPipeline: backgroundPipeline, glyphPipeline: glyphPipeline,
+                        backgroundPipeline: shared.backgroundPipeline, glyphPipeline: shared.glyphPipeline,
                         useTwoPass: !glow && use2Pass,
-                        unifiedBlurPipeline: unifiedBlurPipeline
+                        unifiedBlurPipeline: shared.unifiedBlurPipeline
                     )
                     if !glow { logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows) }
                 }
@@ -3410,7 +3402,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                         encodeSurfaceDirtyRowBands(
                             encoder: enc,
                             rows: dirtyRows,
-                            pipeline: backgroundPipeline!,
+                            pipeline: shared.backgroundPipeline!,
                             cellHeightPx: cellH,
                             widthPx: bandWidth,
                             heightPx: bandHeight,
@@ -3431,10 +3423,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                                 )
                             },
                             pipeline: pipeline,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
+                            backgroundPipeline: shared.backgroundPipeline,
+                            glyphPipeline: shared.glyphPipeline,
                             useTwoPass: true,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     }
 
@@ -3464,15 +3456,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             row: cursorRow,
                             resolved: resolved,
                             geometry: rowGeometry,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            backgroundPipeline: shared.backgroundPipeline,
+                            glyphPipeline: shared.glyphPipeline,
+                            unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     case .dirtyRowsAfterScrollBlit where use2Pass:
                         // The back texture is loaded after the pixel shift, so all
                         // clears must overwrite it. The regular blur pipeline uses
                         // alpha blending and would leave stale glyph pixels behind.
-                        enc.setRenderPipelineState(backgroundPipeline!)
+                        enc.setRenderPipelineState(shared.backgroundPipeline!)
                         let scrollDrawableW = Float(vpWidth > 0 ? vpWidth : view.drawableSize.width)
                         let scrollDrawableH = Float(vpHeight > 0 ? vpHeight : view.drawableSize.height)
                         let bgRGB = extractRGBFromClearColor(gridClearColor)
@@ -3524,10 +3516,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                             rows: smoothRowRange,
                             resolve: resolvedSmoothRowState,
                             pipeline: pipeline,
-                            backgroundPipeline: backgroundPipeline,
-                            glyphPipeline: glyphPipeline,
+                            backgroundPipeline: shared.backgroundPipeline,
+                            glyphPipeline: shared.glyphPipeline,
                             useTwoPass: true,
-                            unifiedBlurPipeline: unifiedBlurPipeline
+                            unifiedBlurPipeline: shared.unifiedBlurPipeline
                         )
                     case .allRowsWithRetained:
                         // Smooth scroll without blur: draw all rows without scissor
@@ -3595,7 +3587,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
                     // paints with, so the two agree on what a layer hides.
                     // The helper does bind the layer transform (vertex buffer 4).
                     enc.setFragmentTexture(atlasTex, index: 0)
-                    enc.setFragmentSamplerState(self.sampler!, index: 0)
+                    enc.setFragmentSamplerState(self.shared.sampler!, index: 0)
                     if let alphaBuf = self.backgroundAlphaBuffer {
                         enc.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
                     }
