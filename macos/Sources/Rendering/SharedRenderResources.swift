@@ -1,5 +1,6 @@
 import Metal
 import MetalKit
+import QuartzCore
 
 /// The GPU objects every surface in this app shares: one device, one set of
 /// render pipelines, one sampler. A surface borrows them; none of them belongs
@@ -126,6 +127,15 @@ final class SharedRenderResources {
     /// message panels, popupmenu) takes the opaque chain, every editor surface
     /// takes the main one. When the config names no separate decorated shader
     /// the two are identical and the second just aliases the first.
+    /// The Shadertoy clock every surface measures `iTime` from, so a shader's
+    /// phase matches across windows. This was the main window's own timing
+    /// state, which every other surface then inherited from.
+    let shaderTimeBase = SurfaceShaderTiming()
+
+    /// The cursor a shader draws against — one, because there is one cursor.
+    /// See `SurfaceShaderCursor` for why it stopped living on a surface.
+    lazy var shaderCursor = SurfaceShaderCursor(timeBase: shaderTimeBase)
+
     var customShaderPipelines: [CustomShaderPipeline] = []
     var customShaderPipelinesDecorated: [CustomShaderPipeline] = []
 
@@ -272,6 +282,137 @@ final class SharedRenderResources {
         case deferred(String)
     }
 
+    // Shadertoy iDate cache: Calendar(identifier:) construction plus
+    // dateComponents() ran every frame (up to 60Hz while an animated custom
+    // shader is active) purely to fill a uniform that effects use at
+    // wall-clock, not frame, granularity. Reuse the Calendar and recompute the
+    // components at most once per second. Shared because it is a wall clock:
+    // every surface would have computed the same value.
+    private let shaderDateCalendar = Calendar(identifier: .gregorian)
+    private var shaderDateCacheSecond: Int = -1
+    private var shaderDateCache: (year: Float, month: Float, day: Float, secsInDay: Float) = (0, 0, 0, 0)
+
+    /// line up seamlessly across ext-cmdline / ext-popupmenu / extra OS
+    /// windows. `windowOffset` is the current view's top-left corner in
+    /// the main window's drawable pixels (top-left origin); `windowSize`
+    /// is the current view's own drawable size.
+    ///
+    /// Each caller passes the result inline via `setFragmentBytes`, so
+    /// multiple MTKViews animating at 60fps never race on a shared
+    /// buffer.
+    func makeShaderUniforms(
+        screenResolution: CGSize,
+        windowOffset: CGPoint,
+        windowSize: CGSize,
+        backingScale: CGFloat,
+        timing: SurfaceShaderTiming? = nil,
+        lastLoggedCursor: inout (Float, Float, Float, Float)
+    ) -> zonvie_shader_uniforms {
+        let state = timing ?? shaderTimeBase
+        let now = CACurrentMediaTime()
+        if state.startTimeSec == 0 {
+            // External views (timing != shaderTimeBase) inherit the
+            // main view's iTime origin once main has started so iTime
+            // and iTimeCursorChange (which the main path computes
+            // against shaderTimeBase.startTimeSec) stay in the same
+            // time base across the whole app.
+            if state !== shaderTimeBase, shaderTimeBase.startTimeSec != 0 {
+                state.startTimeSec = shaderTimeBase.startTimeSec
+            } else {
+                state.startTimeSec = now
+            }
+            state.lastTimeSec = now
+        }
+        let iTime = Float(now - state.startTimeSec)
+        let dt = Float(max(0, now - state.lastTimeSec))
+        state.lastTimeSec = now
+        if dt > 0 {
+            let instant = 1.0 / dt
+            state.emaFrameRate = state.emaFrameRate * 0.9 + instant * 0.1
+        }
+
+        var uniforms = zonvie_shader_uniforms()
+        uniforms.iResolution.0 = Float(screenResolution.width)
+        uniforms.iResolution.1 = Float(screenResolution.height)
+        uniforms.iResolution.2 = 1.0
+        uniforms.iTime = iTime
+        uniforms.iTimeDelta = dt
+        uniforms.iFrame = state.frameIndex
+        uniforms.iSampleRate = 44100.0
+        uniforms.iFrameRate = state.emaFrameRate
+        uniforms.iWindowOffset.0 = Float(windowOffset.x)
+        uniforms.iWindowOffset.1 = Float(windowOffset.y)
+        uniforms.iWindowSize.0 = Float(windowSize.width)
+        uniforms.iWindowSize.1 = Float(windowSize.height)
+        // Ghostty 1.1+ cursor uniforms. Taken as one snapshot: the submit
+        // thread writes those fields as a unit, so reading them individually
+        // could mix a new rect with a stale colour or timestamp for one frame.
+        // Already in screen space — `evaluate` folded each endpoint's
+        // displacement in when it accepted that endpoint.
+        let cursor = shaderCursor.snapshot()
+        let cursorCur = cursor.current
+        // Log the value the shader actually receives, not the one some
+        // upstream stage computed — the two came apart once already, when a
+        // re-projected rect stayed in the staging slot. Emitted only when it
+        // changes, so this stays off the per-frame cost.
+        if ZonvieCore.appLogEnabled, cursorCur != lastLoggedCursor {
+            lastLoggedCursor = cursorCur
+            // `scale` is this window's, because the rect is in ITS drawable
+            // pixels whatever grid published it — an external surface converts
+            // into this space before forwarding. It rides on the rect rather
+            // than on a resize line: resizeExternalWindows stopped carrying a
+            // shared one when each window started converting with its own, and
+            // the cmdline's window is skipped by that loop entirely.
+            ZonvieCore.appLog(
+                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3) grid=\(cursor.gridId) scale=\(backingScale)"
+            )
+        }
+        uniforms.iCurrentCursor = cursorCur
+        uniforms.iPreviousCursor = cursor.previous
+        uniforms.iCurrentCursorColor = cursor.currentColor
+        uniforms.iPreviousCursorColor = cursor.previousColor
+        uniforms.iTimeCursorChange = cursor.changeTimeSec
+        // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
+        // Shadertoy's howto lists the fields as "Year, month, day,
+        // time in seconds" without specifying month indexing. Forward
+        // Calendar's .month component verbatim (already 1..12), which
+        // matches the most common interpretation.
+        // Recomputed at most once per wall-clock second (see
+        // shaderDateCache doc above) -- effects using iDate don't need
+        // finer than 1s granularity.
+        let wallDate = Date()
+        let wallSecond = Int(wallDate.timeIntervalSince1970)
+        if wallSecond != shaderDateCacheSecond {
+            shaderDateCacheSecond = wallSecond
+            let comp = shaderDateCalendar.dateComponents(
+                [.year, .month, .day, .hour, .minute, .second, .nanosecond],
+                from: wallDate
+            )
+            let secsInDay: Float =
+                Float(comp.hour ?? 0) * 3600.0 +
+                Float(comp.minute ?? 0) * 60.0 +
+                Float(comp.second ?? 0) +
+                Float(comp.nanosecond ?? 0) / 1_000_000_000.0
+            shaderDateCache = (Float(comp.year ?? 0), Float(comp.month ?? 1), Float(comp.day ?? 0), secsInDay)
+        }
+        uniforms.iDate.0 = shaderDateCache.year
+        uniforms.iDate.1 = shaderDateCache.month
+        uniforms.iDate.2 = shaderDateCache.day
+        uniforms.iDate.3 = shaderDateCache.secsInDay
+        // iMouse unimplemented on macOS — stays zero.
+
+        state.frameIndex &+= 1
+        return uniforms
+    }
+
+    /// The front texture this flush published, which every surface's committed
+    /// vertices address. Written here, where the swap happens, and read by the
+    /// surfaces as they commit — all on the core thread, inside the flush.
+    ///
+    /// ExternalGridView used to ask the MAIN renderer for its copy of this,
+    /// which worked only because external surfaces commit after it.
+    private(set) var committedAtlasTexture: MTLTexture?
+
     /// Close the transaction: publish this flush's staged CPU pixels, then swap
     /// the front texture the UVs address. Both halves, because a caller that
     /// did the first and skipped the second would publish UVs into a texture
@@ -284,6 +425,7 @@ final class SharedRenderResources {
         guard commit.committed else {
             return .deferred("atlas back-sync still pending or failed")
         }
+        committedAtlasTexture = commit.texture
         return .published(texture: commit.texture)
     }
 
@@ -307,5 +449,217 @@ final class SharedRenderResources {
     /// Close the transaction of a bracket that will not publish.
     func abortFlushTransaction() {
         _ = atlas.endFlushUploadTransaction()
+    }
+}
+
+/// One surface's Shadertoy clock. Each surface counts its own frames, but they
+/// all measure `iTime` from the same start so a shader's phase matches across
+/// windows; `SharedRenderResources.shaderTimeBase` holds that start.
+///
+/// This was nested inside GridSurfaceRenderer, so ExternalGridView had to name
+/// `GridSurfaceRenderer.ShaderViewTimingState` for a value that is not the main
+/// window's.
+final class SurfaceShaderTiming {
+    var frameIndex: Int32 = 0
+    var startTimeSec: CFTimeInterval = 0
+    var lastTimeSec: CFTimeInterval = 0
+    var emaFrameRate: Float = 60.0
+    init() {}
+}
+
+/// The cursor a shader draws against: one across the main window and every
+/// external one, because there is one cursor.
+///
+/// Held in SCREEN space — the smooth-scroll displacement already folded in —
+/// because that is what a cursor shader draws against and what "the cursor
+/// moved" has to mean. The rect the core measures is in vertex space, which
+/// shifts by a whole row on every scroll step while the displacement cancels it
+/// and the cursor stays put on the glass. Rotating on that would restart the
+/// trail every step, so it never plays out.
+///
+/// This lived on GridSurfaceRenderer under that surface's lock, so every other
+/// surface asked the main renderer for permission before touching it and
+/// published through it — the last place an external surface reached into the
+/// main one for something that is not the main window's own. It has its own
+/// lock now, taken as a leaf: a surface may hold its own lock across a call
+/// here, and nothing here calls back out.
+final class SurfaceShaderCursor {
+    typealias Rect = (Float, Float, Float, Float)
+    typealias Color = (Float, Float, Float, Float)
+
+    /// What the shader is handed, and where it came from.
+    struct Snapshot {
+        var current: Rect
+        var previous: Rect
+        var currentColor: Color
+        var previousColor: Color
+        var changeTimeSec: Float
+        var gridId: Int64
+    }
+
+    private let lock = NSLock()
+    /// Read inside this type's lock, but NOT protected by it: the time base is
+    /// written by whichever surface draws first, once, as it goes from 0 to a
+    /// fixed origin. A pre-existing unsynchronised transition, named here so
+    /// the lock below is not read as covering it.
+    private let timeBase: SurfaceShaderTiming
+
+    /// Sub-pixel movement is not a cursor move; it is the ease sliding the
+    /// cursor along. Rotating on it would restart the trail every frame.
+    private static let moveEpsilonPx: Float = 0.5
+
+    private var current: Rect = (0, 0, 0, 0)
+    private var previous: Rect = (0, 0, 0, 0)
+    private var currentColor: Color = (0, 0, 0, 0)
+    private var previousColor: Color = (0, 0, 0, 0)
+    private var changeTimeSec: Float = 0
+
+    /// The rect as the core measured it, and the grid it belongs to. Turned
+    /// into the screen-space state above by `evaluate`, once the frame's
+    /// displacement for that grid is known.
+    private var rawRect: Rect = (0, 0, 0, 0)
+    private var rawColor: Color = (0, 0, 0, 0)
+    private var gridId: Int64 = 0
+
+    /// Cursor state measured during a flush, held until that flush commits.
+    ///
+    /// The rect describes the cursor vertices of the flush that measured it,
+    /// and those only reach the screen at commit. Publishing at submit put the
+    /// NEXT flush's cursor position into the uniforms while the screen still
+    /// showed the previous one — a row apart mid-scroll, which is a cursor
+    /// shader firing off the cursor for that frame.
+    private var staged: (rect: Rect, color: Color, gridId: Int64)?
+
+    init(timeBase: SurfaceShaderTiming) {
+        self.timeBase = timeBase
+    }
+
+    /// What the uniforms need, read in one critical section so a frame never
+    /// sees a rect from one update beside a colour from another.
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(
+            current: current,
+            previous: previous,
+            currentColor: currentColor,
+            previousColor: previousColor,
+            changeTimeSec: changeTimeSec,
+            gridId: gridId
+        )
+    }
+
+    /// Whether the cursor a shader is drawing belongs to this grid. A surface
+    /// asks before applying its own scroll displacement to the rect, so it does
+    /// not displace a rect belonging to another grid.
+    func belongs(toGrid grid: Int64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return gridId == grid
+    }
+
+    /// Stage the cursor state a flush just measured. Published by `publish()`
+    /// when that flush commits — see `staged` for why it cannot go straight
+    /// out. Called from the vertex-submit path (core/RPC thread) while a draw
+    /// reads the published fields on the main thread.
+    func stage(rect: Rect, color: Color, gridId grid: Int64) {
+        lock.lock()
+        staged = (rect: rect, color: color, gridId: grid)
+        lock.unlock()
+    }
+
+    /// Drop a measurement whose flush never committed.
+    func dropStaged() {
+        lock.lock()
+        staged = nil
+        lock.unlock()
+    }
+
+    /// Hand the staged state to the shader uniforms, together with the vertices
+    /// it describes. Called from every surface's commit.
+    func publish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let s = staged else { return }
+        staged = nil
+        rawRect = s.rect
+        rawColor = s.color
+        gridId = s.gridId
+    }
+
+    /// Re-anchor after the WINDOW that owns the cursor moved.
+    ///
+    /// Writes through rather than staging: `stage` only reaches the uniforms at
+    /// a commit, and a window drag produces none, so the shader would keep
+    /// burning at the pre-move position.
+    ///
+    /// Translates rather than replaces: the cursor did not move relative to its
+    /// text, so rotating previous/current would fire the cursor-move animation
+    /// and drag a trail from where the window used to be. Both endpoints shift
+    /// by the same delta and the change time is left alone.
+    ///
+    /// Ignored unless `grid` still owns the cursor, so a window that no longer
+    /// has it cannot hijack it by being dragged.
+    func reanchor(rect: Rect, gridId grid: Int64) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard gridId == grid else { return }
+        let dx = rect.0 - rawRect.0
+        let dy = rect.1 - rawRect.1
+        guard dx != 0 || dy != 0 else { return }
+        rawRect = rect
+        current = (current.0 + dx, current.1 + dy, current.2, current.3)
+        previous = (previous.0 + dx, previous.1 + dy, previous.2, previous.3)
+        // A cursor update that arrived during the drag is still waiting for a
+        // commit; move it too, or the commit would undo this re-anchor.
+        if let s = staged, s.gridId == grid {
+            staged = (rect: rect, color: s.color, gridId: s.gridId)
+        }
+    }
+
+    /// Fold this frame's displacement of the cursor's grid into the endpoints,
+    /// rotating them only when the cursor actually moved ON SCREEN.
+    ///
+    /// Called from each surface's pre-draw, where the displacement it is about
+    /// to render with is known. The measured rect alone cannot answer "did the
+    /// cursor move": a scroll step shifts it a whole row while the compensating
+    /// offset holds it still on the glass, and rotating there restarts the trail
+    /// every step so it never plays out.
+    ///
+    /// - Parameter scrollOffsetPx: displacement of the cursor's grid for this
+    ///   frame, or nil when the caller does not own that grid's cursor.
+    func evaluate(scrollOffsetPx: Float?) {
+        guard let scrollOffsetPx else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        let rect = (rawRect.0, rawRect.1 + scrollOffsetPx, rawRect.2, rawRect.3)
+        let color = rawColor
+        let eps = Self.moveEpsilonPx
+        let sameRect =
+            abs(rect.0 - current.0) < eps &&
+            abs(rect.1 - current.1) < eps &&
+            abs(rect.2 - current.2) < eps &&
+            abs(rect.3 - current.3) < eps
+        let sameColor =
+            color.0 == currentColor.0 &&
+            color.1 == currentColor.1 &&
+            color.2 == currentColor.2 &&
+            color.3 == currentColor.3
+        if sameRect && sameColor {
+            // Keep the endpoint exact even when the move was below the
+            // threshold, so a slow ease does not accumulate drift.
+            current = rect
+            return
+        }
+
+        previous = current
+        previousColor = currentColor
+        current = rect
+        currentColor = color
+        // Reported in the same time base as every surface's iTime, which is why
+        // that base is shared rather than the main window's.
+        changeTimeSec = timeBase.startTimeSec != 0
+            ? Float(CACurrentMediaTime() - timeBase.startTimeSec)
+            : 0
     }
 }

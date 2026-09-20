@@ -569,7 +569,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Per-view shader timing state. Owning this here (instead of the
     /// shared GridSurfaceRenderer) keeps iFrame / iTimeDelta /
     /// iFrameRate independent of draw order across views.
-    private let shaderTiming = GridSurfaceRenderer.ShaderViewTimingState()
+    private let shaderTiming = SurfaceShaderTiming()
+    /// Last cursor rect this surface handed its shader, so the log fires on
+    /// change only. Per-surface: each logs the rect IT hands its own shader.
+    private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
     /// Ping-pong render targets for multi-pass custom shader chains.
     /// Allocated lazily inside draw() when pipelines.count > 1.
     private let customShaderPong = SurfacePingPongTextures()
@@ -1258,7 +1261,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 // leaves it for the next (see captureRetainedRowsForPendingScroll).
                 pendingGridScrollRows = 0
             }
-            mainTerminalView?.renderer.publishCursorShaderState()
+            shared.shaderCursor.publish()
             // Every commit bumps, as GridSurfaceRenderer's does. The revision
             // answers one question — "is the committed state a generation this
             // draw has not seen?" — and nothing else. Whether the back buffer may
@@ -1288,10 +1291,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // refresh still draws: within one atlas generation the texture
             // object does not change, and a generation change is caught by
             // committedFontIsCurrent instead.
+            // The texture this flush published, taken from the transaction
+            // that published it. This asked the MAIN renderer for its copy,
+            // which is the same object only because external surfaces commit
+            // after it; a full suite with the two compared under a
+            // precondition never saw them differ.
+            let committedAtlas = shared.committedAtlasTexture
             if publishedRows {
-                bufferSets[writeSetIndex].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+                bufferSets[writeSetIndex].atlasTextureSnapshot = committedAtlas
             } else if gpuInFlightCount[committedSetIndex] == 0 {
-                bufferSets[committedSetIndex].atlasTextureSnapshot = mainTerminalView?.renderer.committedAtlasSnapshot()
+                bufferSets[committedSetIndex].atlasTextureSnapshot = committedAtlas
             }
             // Merge the write set's staged scroll into the global accumulator.
             // Done here (under lock, after committedSetIndex update) so draw()
@@ -1431,8 +1440,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // external window. Only displace it when the cursor is on a grid THIS
         // surface draws — its own, or one it hosts as a layer; otherwise say
         // nothing and let the owner's value stand.
-        guard let renderer = mainTerminalView?.renderer,
-              renderer.shaderCursorBelongs(toGrid: ownerGridId) else { return nil }
+        guard shared.shaderCursor.belongs(toGrid: ownerGridId) else { return nil }
         // `offset` is the owner grid's EFFECTIVE displacement, resolved by the
         // caller the same way drawHostedLayers resolves a layer's: the grid's
         // own offset when it scrolls in its own right, the root's when it only
@@ -2152,9 +2160,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         if reanchor {
             // Window move: no commit will come to publish a staged value, and
             // the cursor has not moved relative to its text.
-            renderer.reanchorCursorShaderState(rect: rect, gridId: owner)
+            shared.shaderCursor.reanchor(rect: rect, gridId: owner)
         } else {
-            renderer.setCursorShaderState(rect: rect, color: color, gridId: owner)
+            shared.shaderCursor.stage(rect: rect, color: color, gridId: owner)
         }
     }
 
@@ -3686,18 +3694,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     // view's draw cadence, and this window routinely draws a
                     // frame ahead of it — which put the cursor shader a frame
                     // of finger travel away from the cursor.
-                    renderer.evaluateCursorShaderChange(
+                    shared.shaderCursor.evaluate(
                         scrollOffsetPx: cursorScrollOffsetPxForShader(
                             ownerGridId: cursorOwnerSnapshot,
                             offset: cursorOwnerOffset,
                             viewportHeightPx: viewportMetrics.fragmentHeight
                         )
                     )
-                    return renderer.makeCustomShaderUniforms(
+                    // This surface's own scale, because the rect the log line
+                    // carries is in ITS drawable pixels. Reading it off the
+                    // main renderer, which is what calling through it did,
+                    // reported the main window's — the same number only while
+                    // every window sits on one display.
+                    return self.shared.makeShaderUniforms(
                         screenResolution: screenRes,
                         windowOffset: windowOffset,
                         windowSize: view.drawableSize,
-                        timing: shaderTiming
+                        backingScale: self.window?.backingScaleFactor ?? 2.0,
+                        timing: self.shaderTiming,
+                        lastLoggedCursor: &self.lastLoggedShaderCursor
                     )
                 }
             )

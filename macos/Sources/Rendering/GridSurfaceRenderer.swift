@@ -1803,76 +1803,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// don't ping-pong with draw order across views that share the
     /// renderer. Cursor state stays on the renderer because it
     /// reflects "the cursor", which is global across views.
-    public final class ShaderViewTimingState {
-        public var frameIndex: Int32 = 0
-        public var startTimeSec: CFTimeInterval = 0
-        public var lastTimeSec: CFTimeInterval = 0
-        public var emaFrameRate: Float = 60.0
-        public init() {}
-    }
-    /// Main window's timing state (used by MetalTerminalView's draw).
-    /// External views own their own ShaderViewTimingState instance and
-    /// pass it to makeCustomShaderUniforms.
-    public let mainShaderTiming = ShaderViewTimingState()
-    // Shadertoy iDate cache: Calendar(identifier:) construction plus
-    // dateComponents() ran every frame (up to 60Hz while an animated custom
-    // shader is active) purely to fill a uniform that effects use at
-    // wall-clock, not frame, granularity. Reuse the Calendar and recompute
-    // the components at most once per second.
-    private let shaderDateCalendar = Calendar(identifier: .gregorian)
-    private var shaderDateCacheSecond: Int = -1
-    private var shaderDateCache: (year: Float, month: Float, day: Float, secsInDay: Float) = (0, 0, 0, 0)
     /// Ping-pong render targets for multi-pass shader chains. Allocated
     /// only when pipelines.count > 1. Size matches backBufferSize.
     private let customShaderPong = SurfacePingPongTextures()
-    // Ghostty 1.1+ cursor uniform state (see `zonvie_shader_uniforms`).
-    //
-    // Held in SCREEN space — the smooth-scroll displacement already folded in
-    // — because that is what a cursor shader draws against and what "the
-    // cursor moved" has to mean. The rect the core measures is in vertex
-    // space, which shifts by a whole row on every scroll step while the
-    // displacement cancels it and the cursor stays put on the glass. Rotating
-    // on that would restart the trail every step, so it never plays out.
-    private var shaderCursorCurrent: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorPrevious: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorCurrentColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorPreviousColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorChangeTime: Float = 0
     /// Last cursor rect handed to a shader, so the log fires on change only.
+    /// Per-surface, because each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    /// The rect as the core measured it, and the grid it belongs to. Turned
-    /// into the screen-space state above by `evaluateCursorShaderChange`, once
-    /// the frame's displacement for that grid is known. Written under `lock`.
-    ///
-    /// This whole cluster is SHARED state living on one surface: there is one
-    /// cursor across the main window and every external one, and the shader
-    /// trails it wherever it goes. ExternalGridView therefore asks this
-    /// renderer for permission (`shaderCursorBelongs(toGrid:)`) and publishes
-    /// through it, which is the last place an external surface still reaches
-    /// into the main one for something that is not the main window's own.
-    /// It belongs in `SharedRenderResources` alongside the atlas and the
-    /// pipelines; the move is ten stored members and ~156 lines whose
-    /// `*Locked` halves assume THIS surface's `lock`, so it is a round of its
-    /// own rather than a step inside one.
-    private var shaderCursorRawRect: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorRawColor: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    private var shaderCursorGridId: Int64 = 0
     /// Displacement of the cursor's grid as of the last offset rebuild. Cached
     /// because `updateScrollOffsets` is skipped entirely on idle frames, while
     /// the cursor still moves — the evaluation has to run every frame or the
     /// shader keeps whatever endpoints the last scrolled frame left it.
     private var shaderCursorScrollOffsetPx: Float = 0
-    /// Sub-pixel movement is not a cursor move; it is the ease sliding the
-    /// cursor along. Rotating on it would restart the trail every frame.
-    private static let shaderCursorMoveEpsilonPx: Float = 0.5
-    /// Cursor state measured during a flush, held until that flush commits.
-    ///
-    /// The rect describes the cursor vertices of the flush that measured it,
-    /// and those only reach the screen at commit. Publishing at submit put the
-    /// NEXT flush's cursor position into the uniforms while the screen still
-    /// showed the previous one — a row apart mid-scroll, which is a cursor
-    /// shader firing off the cursor for that frame.
-    private var stagedShaderCursor: (rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64)?
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -2076,9 +2017,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         // Same reason: a cursor measured by a bracket that never committed
         // describes vertices that never reached the screen.
-        lock.lock()
-        stagedShaderCursor = nil
-        lock.unlock()
+        shared.shaderCursor.dropStaged()
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         layerGridsPreparedThisFlush = false
@@ -2397,7 +2336,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         // These steps reached the screen, so there is nothing left to replay.
         pendingRetentionReplay.removeAll(keepingCapacity: true)
-        publishCursorShaderStateLocked()
+        shared.shaderCursor.publish()
         commitRevision &+= 1
         let rev = commitRevision
         serviceSurfaceRowStorageRetirement(
@@ -2548,15 +2487,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return surfaceHadRecentCommit(lastCommitTime: t, withinNs: withinNs)
     }
 
-    /// Returns the committed atlas texture for external grid views.
-    /// Uses same lock + committed state as vertex data.
-    func committedAtlasSnapshot() -> MTLTexture? {
-        lock.lock()
-        let tex = committedAtlasTexture
-        lock.unlock()
-        return tex
-    }
-
 
     /// Update the default Neovim background color (for clear color in viewport edges).
     /// Called from core thread during flush.
@@ -2668,7 +2598,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // edge of the cursor rect (center = y - h/2, rect = y-h..y).
         // Pass bottom-edge so the SDF renders over the actual cursor.
         let c0 = verts[0].color
-        setCursorShaderState(
+        shared.shaderCursor.stage(
             rect: (xPx, botPx, rightPx - xPx, botPx - topPx),
             color: (c0.x, c0.y, c0.z, c0.w),
             gridId: verts[0].grid_id
@@ -2735,7 +2665,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // (move_all) translates every vertex it owns.
         var cursorScrollOffsetPx: Float = 0
         for info in offsets {
-            if info.gridId == shaderCursorGridId {
+            if shared.shaderCursor.belongs(toGrid: info.gridId) {
                 cursorScrollOffsetPx = info.offsetYPx
             }
             scrollOffsetData.append(Self.computeScrollOffset(
@@ -2778,7 +2708,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // This surface owns the cursor's grid whenever it appears in its own
         // offsets, and a grid with no entry is simply not displaced.
         shaderCursorScrollOffsetPx = cursorScrollOffsetPx
-        evaluateCursorShaderChangeLocked(scrollOffsetPx: cursorScrollOffsetPx)
+        shared.shaderCursor.evaluate(scrollOffsetPx: cursorScrollOffsetPx)
     }
 
     /// Fold the cursor's current displacement into the shader endpoints for a
@@ -2794,8 +2724,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// before going idle ran with an empty offset set.
     func refreshCursorShaderState() {
         lock.lock()
-        defer { lock.unlock() }
-        evaluateCursorShaderChangeLocked(scrollOffsetPx: shaderCursorScrollOffsetPx)
+        let offsetPx = shaderCursorScrollOffsetPx
+        lock.unlock()
+        shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx)
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
@@ -4698,10 +4629,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 sampler: shared.sampler,
                 bilinearSampler: shared.bilinearSampler,
                 makeUniforms: {
-                    makeCustomShaderUniforms(
+                    shared.makeShaderUniforms(
                         screenResolution: view.drawableSize,
                         windowOffset: .zero,
-                        windowSize: view.drawableSize
+                        windowSize: view.drawableSize,
+                        backingScale: backingScale,
+                        lastLoggedCursor: &lastLoggedShaderCursor
                     )
                 },
                 prepareCopy: { copyRPD in
@@ -5412,278 +5345,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
     }
 
-    /// Build a `zonvie_shader_uniforms` value for the current frame.
-    ///
-    /// `screenResolution` is always the MAIN window's drawable size, so
-    /// every view shares one coordinate space — stars and other effects
-    /// line up seamlessly across ext-cmdline / ext-popupmenu / extra OS
-    /// windows. `windowOffset` is the current view's top-left corner in
-    /// the main window's drawable pixels (top-left origin); `windowSize`
-    /// is the current view's own drawable size.
-    ///
-    /// Each caller passes the result inline via `setFragmentBytes`, so
-    /// multiple MTKViews animating at 60fps never race on a shared
-    /// buffer.
-    func makeCustomShaderUniforms(
-        screenResolution: CGSize,
-        windowOffset: CGPoint,
-        windowSize: CGSize,
-        timing: ShaderViewTimingState? = nil
-    ) -> zonvie_shader_uniforms {
-        let state = timing ?? mainShaderTiming
-        let now = CACurrentMediaTime()
-        if state.startTimeSec == 0 {
-            // External views (timing != mainShaderTiming) inherit the
-            // main view's iTime origin once main has started so iTime
-            // and iTimeCursorChange (which the main path computes
-            // against mainShaderTiming.startTimeSec) stay in the same
-            // time base across the whole app.
-            if state !== mainShaderTiming, mainShaderTiming.startTimeSec != 0 {
-                state.startTimeSec = mainShaderTiming.startTimeSec
-            } else {
-                state.startTimeSec = now
-            }
-            state.lastTimeSec = now
-        }
-        let iTime = Float(now - state.startTimeSec)
-        let dt = Float(max(0, now - state.lastTimeSec))
-        state.lastTimeSec = now
-        if dt > 0 {
-            let instant = 1.0 / dt
-            state.emaFrameRate = state.emaFrameRate * 0.9 + instant * 0.1
-        }
-
-        var uniforms = zonvie_shader_uniforms()
-        uniforms.iResolution.0 = Float(screenResolution.width)
-        uniforms.iResolution.1 = Float(screenResolution.height)
-        uniforms.iResolution.2 = 1.0
-        uniforms.iTime = iTime
-        uniforms.iTimeDelta = dt
-        uniforms.iFrame = state.frameIndex
-        uniforms.iSampleRate = 44100.0
-        uniforms.iFrameRate = state.emaFrameRate
-        uniforms.iWindowOffset.0 = Float(windowOffset.x)
-        uniforms.iWindowOffset.1 = Float(windowOffset.y)
-        uniforms.iWindowSize.0 = Float(windowSize.width)
-        uniforms.iWindowSize.1 = Float(windowSize.height)
-        // Ghostty 1.1+ cursor uniforms. Snapshot together under `lock` —
-        // setCursorShaderState() (core/RPC thread) writes these same fields
-        // as one unit; reading them individually here could otherwise mix
-        // a new rect with a stale color/timestamp for one frame.
-        // Already in screen space: evaluateCursorShaderChange folded each
-        // endpoint's displacement in when it accepted that endpoint.
-        let (cursorCur, cursorPrev, cursorCurColor, cursorPrevColor, cursorChangeTime, cursorGrid): (
-            (Float, Float, Float, Float), (Float, Float, Float, Float),
-            (Float, Float, Float, Float), (Float, Float, Float, Float), Float, Int64
-        ) = {
-            lock.lock()
-            defer { lock.unlock() }
-            return (shaderCursorCurrent, shaderCursorPrevious, shaderCursorCurrentColor, shaderCursorPreviousColor, shaderCursorChangeTime, shaderCursorGridId)
-        }()
-        // Log the value the shader actually receives, not the one some
-        // upstream stage computed — the two came apart once already, when a
-        // re-projected rect stayed in the staging slot. Emitted only when it
-        // changes, so this stays off the per-frame cost.
-        if ZonvieCore.appLogEnabled, cursorCur != lastLoggedShaderCursor {
-            lastLoggedShaderCursor = cursorCur
-            // `scale` is this window's, because the rect is in ITS drawable
-            // pixels whatever grid published it — an external surface converts
-            // into this space before forwarding. It rides on the rect rather
-            // than on a resize line: resizeExternalWindows stopped carrying a
-            // shared one when each window started converting with its own, and
-            // the cmdline's window is skipped by that loop entirely.
-            ZonvieCore.appLog(
-                "[shader_cursor] x=\(cursorCur.0) y=\(cursorCur.1) w=\(cursorCur.2) h=\(cursorCur.3) grid=\(cursorGrid) scale=\(backingScale)"
-            )
-        }
-        uniforms.iCurrentCursor = cursorCur
-        uniforms.iPreviousCursor = cursorPrev
-        uniforms.iCurrentCursorColor = cursorCurColor
-        uniforms.iPreviousCursorColor = cursorPrevColor
-        uniforms.iTimeCursorChange = cursorChangeTime
-        // Shadertoy iDate: (year, month [1..12], day, seconds-in-day).
-        // Shadertoy's howto lists the fields as "Year, month, day,
-        // time in seconds" without specifying month indexing. Forward
-        // Calendar's .month component verbatim (already 1..12), which
-        // matches the most common interpretation.
-        // Recomputed at most once per wall-clock second (see
-        // shaderDateCache doc above) -- effects using iDate don't need
-        // finer than 1s granularity.
-        let wallDate = Date()
-        let wallSecond = Int(wallDate.timeIntervalSince1970)
-        if wallSecond != shaderDateCacheSecond {
-            shaderDateCacheSecond = wallSecond
-            let comp = shaderDateCalendar.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second, .nanosecond],
-                from: wallDate
-            )
-            let secsInDay: Float =
-                Float(comp.hour ?? 0) * 3600.0 +
-                Float(comp.minute ?? 0) * 60.0 +
-                Float(comp.second ?? 0) +
-                Float(comp.nanosecond ?? 0) / 1_000_000_000.0
-            shaderDateCache = (Float(comp.year ?? 0), Float(comp.month ?? 1), Float(comp.day ?? 0), secsInDay)
-        }
-        uniforms.iDate.0 = shaderDateCache.year
-        uniforms.iDate.1 = shaderDateCache.month
-        uniforms.iDate.2 = shaderDateCache.day
-        uniforms.iDate.3 = shaderDateCache.secsInDay
-        // iMouse unimplemented on macOS — stays zero.
-
-        state.frameIndex &+= 1
-        return uniforms
-    }
-
     /// Ghostty 1.1+ cursor uniform update. rect is (x, y, w, h) in
     /// drawable pixels within the shader "screen" universe (main
     /// window's drawable). color is straight RGBA in [0, 1]. No-op
     /// when incoming state matches the current state, so shaders keep
     /// seeing the last real change's iTimeCursorChange.
-    /// Whether the cursor rect the shader uniforms carry was measured on this
-    /// grid. The rect is shared between the main surface and every external
-    /// window — whoever submitted a cursor last owns it — so a surface must
-    /// not apply its own scroll displacement to a rect belonging to another
-    /// grid.
-    func shaderCursorBelongs(toGrid gridId: Int64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return shaderCursorGridId == gridId
-    }
-
-    /// Stage the cursor state a flush just measured. Published by
-    /// `publishCursorShaderState()` when that flush commits — see
-    /// `stagedShaderCursor` for why it cannot go straight out.
-    func setCursorShaderState(rect: (Float, Float, Float, Float), color: (Float, Float, Float, Float), gridId: Int64) {
-        // Called from the vertex-submit path (core/RPC thread), while
-        // makeCustomShaderUniforms() reads the published fields from the main
-        // thread during draw(in:). Guard with the existing `lock` (already
-        // used for other cross-thread snapshots in this class) so a torn
-        // rect/color combination is never observed mid-frame.
-        lock.lock()
-        stagedShaderCursor = (rect: rect, color: color, gridId: gridId)
-        lock.unlock()
-    }
-
-    /// Re-anchor the shader cursor after the WINDOW that owns it moved.
-    ///
-    /// Writes through rather than staging: setCursorShaderState only reaches the
-    /// uniforms at a commit, and a window drag produces none, so the shader
-    /// would keep burning at the pre-move position.
-    ///
-    /// Translates rather than replaces: the cursor did not move relative to its
-    /// text, so rotating previous/current would fire the cursor-move animation
-    /// and drag a trail from where the window used to be. Both endpoints shift
-    /// by the same delta and iTimeCursorChange is left alone.
-    ///
-    /// Ignored unless `gridId` still owns the shader cursor, so a window that
-    /// no longer has the cursor cannot hijack it by being dragged.
-    func reanchorCursorShaderState(rect: (Float, Float, Float, Float), gridId: Int64) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard shaderCursorGridId == gridId else { return }
-        let dx = rect.0 - shaderCursorRawRect.0
-        let dy = rect.1 - shaderCursorRawRect.1
-        guard dx != 0 || dy != 0 else { return }
-        shaderCursorRawRect = rect
-        shaderCursorCurrent = (
-            shaderCursorCurrent.0 + dx,
-            shaderCursorCurrent.1 + dy,
-            shaderCursorCurrent.2,
-            shaderCursorCurrent.3
-        )
-        shaderCursorPrevious = (
-            shaderCursorPrevious.0 + dx,
-            shaderCursorPrevious.1 + dy,
-            shaderCursorPrevious.2,
-            shaderCursorPrevious.3
-        )
-        // A cursor update that arrived during the drag is still waiting for a
-        // commit; move it too, or the commit would undo this re-anchor.
-        if let staged = stagedShaderCursor, staged.gridId == gridId {
-            stagedShaderCursor = (rect: rect, color: staged.color, gridId: staged.gridId)
-        }
-    }
-
-    /// Hand the staged cursor state to the shader uniforms, together with the
-    /// vertices it describes. Called from every surface's commit; a flush that
-    /// aborts instead drops it in `beginFlush`.
-    func publishCursorShaderState() {
-        lock.lock()
-        defer { lock.unlock() }
-        publishCursorShaderStateLocked()
-    }
-
-    /// Caller must hold `lock` (commitFlush publishes inside its own scope).
-    private func publishCursorShaderStateLocked() {
-        guard let staged = stagedShaderCursor else { return }
-        stagedShaderCursor = nil
-        shaderCursorRawRect = staged.rect
-        shaderCursorRawColor = staged.color
-        shaderCursorGridId = staged.gridId
-    }
-
-    /// Fold this frame's displacement of the cursor's grid into the shader's
-    /// cursor endpoints, rotating them only when the cursor actually moved ON
-    /// SCREEN.
-    ///
-    /// Called from each surface's pre-draw, where the displacement it is about
-    /// to render with is known. The measured rect alone cannot answer "did the
-    /// cursor move": a scroll step shifts it a whole row while the compensating
-    /// offset holds it still on the glass, and rotating there restarts the trail
-    /// every step so it never plays out.
-    ///
-    /// - Parameter scrollOffsetPx: displacement of the cursor's grid for this
-    ///   frame, or nil when the caller does not own that grid's cursor.
-    func evaluateCursorShaderChange(scrollOffsetPx: Float?) {
-        guard let scrollOffsetPx else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        evaluateCursorShaderChangeLocked(scrollOffsetPx: scrollOffsetPx)
-    }
-
-    /// Caller must hold `lock` (updateScrollOffsets evaluates inside its own
-    /// scope).
-    private func evaluateCursorShaderChangeLocked(scrollOffsetPx: Float) {
-        let rect = (
-            shaderCursorRawRect.0,
-            shaderCursorRawRect.1 + scrollOffsetPx,
-            shaderCursorRawRect.2,
-            shaderCursorRawRect.3
-        )
-        let color = shaderCursorRawColor
-        let eps = Self.shaderCursorMoveEpsilonPx
-        let sameRect =
-            abs(rect.0 - shaderCursorCurrent.0) < eps &&
-            abs(rect.1 - shaderCursorCurrent.1) < eps &&
-            abs(rect.2 - shaderCursorCurrent.2) < eps &&
-            abs(rect.3 - shaderCursorCurrent.3) < eps
-        let sameColor =
-            color.0 == shaderCursorCurrentColor.0 &&
-            color.1 == shaderCursorCurrentColor.1 &&
-            color.2 == shaderCursorCurrentColor.2 &&
-            color.3 == shaderCursorCurrentColor.3
-        if sameRect && sameColor {
-            // Keep the endpoint exact even when the move was below the
-            // threshold, so a slow ease does not accumulate drift.
-            shaderCursorCurrent = rect
-            return
-        }
-
-        shaderCursorPrevious = shaderCursorCurrent
-        shaderCursorPreviousColor = shaderCursorCurrentColor
-        shaderCursorCurrent = rect
-        shaderCursorCurrentColor = color
-        // The cursor change timestamp is reported in the same time
-        // base as the main view's iTime (mainShaderTiming.startTimeSec).
-        // External views use the same base because they share the
-        // shared start when they read iTime (see makeCustomShaderUniforms).
-        if mainShaderTiming.startTimeSec != 0 {
-            shaderCursorChangeTime = Float(CACurrentMediaTime() - mainShaderTiming.startTimeSec)
-        } else {
-            shaderCursorChangeTime = 0
-        }
-    }
-
     /// Load user-supplied custom post-process shaders listed in config.toml's
     /// `[shaders].paths`, cross-compile them to MSL, and create one pipeline
     /// state per entry. Called once alongside the bloom-pipeline construction.
