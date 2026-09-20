@@ -181,6 +181,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Written only under `lock` at commit; read by
     /// copyPlacementRowsUp.
     private var layerPlacementRowsUp: [Int64: Int] = [:]
+    /// The counter above as this frame's layer snapshot saw it, and the zero
+    /// the ledger's two halves are compared against. Both are drawn-thread
+    /// state, filled under `lock` alongside `layerSnapshot`.
+    private var placementRowsUpSnapshot: [Int64: Int] = [:]
+    private var floatDebtBaselineSnapshot: [Int64: FloatDebtBaseline] = [:]
 
     /// Hand the float ledger this surface's half, merging into storage the
     /// caller owns so the per-frame read costs one lock and no allocation.
@@ -188,6 +193,33 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         lock.lock()
         defer { lock.unlock() }
         for (gridId, rows) in layerPlacementRowsUp { out[gridId] = rows }
+    }
+
+    /// Rows of the anchor's compensation this hosted float is carrying that
+    /// its own placement has not performed — the same ledger the main surface
+    /// applies in GridSurfaceRenderer.applyFloatScrollDebt, computed against
+    /// the placement THIS frame draws.
+    ///
+    /// The anchor half comes from the main view, which owns the landed-rows
+    /// counter and moves it in the same step as the compensation it belongs
+    /// to; the placement half is this surface's own, latched with the layer
+    /// snapshot. Both counters run from whenever their grid appeared, so the
+    /// first frame a float is seen following fixes their common zero.
+    private func hostedFloatDebtPx(gridId: Int64, anchorGridId: Int64, cellHeightPx: Float) -> Float {
+        guard cellHeightPx > 0, let main = mainTerminalView else { return 0 }
+        let anchorRowsUp = main.anchorLandedRowsUpSnapshot(anchorGridId)
+        let placementRowsUp = placementRowsUpSnapshot[gridId] ?? 0
+        guard let baseline = floatDebtBaselineSnapshot[gridId] else {
+            floatDebtBaselineSnapshot[gridId] = FloatDebtBaseline(
+                anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
+            return 0
+        }
+        let rows = floatDebtRowsUp(
+            anchorRowsUp: anchorRowsUp,
+            placementRowsUp: placementRowsUp,
+            baseline: baseline
+        )
+        return Float(rows) * cellHeightPx
     }
 
     /// This surface's fixed-float mask, the same one the main renderer keeps.
@@ -840,10 +872,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// and a line missing `moved`/`committedY`/`drawY` is skipped by their
     /// `orelse continue` — silently, which is the vacuity their own comments
     /// warn about. A separate tag makes the separation explicit instead.
-    private func logHostedLayerDraw(layer: SurfaceLayer, encodedRows: Int, of rows: Int) {
+    private func logHostedLayerDraw(
+        layer: SurfaceLayer,
+        encodedRows: Int,
+        of rows: Int,
+        drawOriginPx: simd_float2,
+        bodilyMoved: Bool
+    ) {
         guard ZonvieCore.appLogEnabled else { return }
+        // Where it was committed and where it is actually drawn, under the same
+        // field names the main surface's `[layer_draw]` uses. The tag stays
+        // separate (see above) but the fields are the same three, so the same
+        // question — did this layer's drawn Y move further in one frame than a
+        // smooth scroll can — can be asked of a float an external window hosts.
+        // It could not be, before: this line carried only a row count.
         ZonvieCore.appLog(
             "[ext_layer_draw] surface=\(gridId) gridId=\(layer.gridId) rows=\(encodedRows) of=\(rows)"
+                + " committedY=\(layer.originPx.y) drawY=\(drawOriginPx.y) moved=\(bodilyMoved ? 1 : 0)"
         )
     }
 
@@ -2502,6 +2547,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             cursorLayerFollowsScrollSnapshot = cursorPlacement.followsScroll
             cursorLayerAnchorGridSnapshot = cursorPlacement.anchorGrid
             layerSnapshot.removeAll(keepingCapacity: true)
+            // Latched HERE, with the placements it describes. Read anywhere
+            // else it is a commit out of step with them: the counter is copied
+            // before the flush that publishes a placement and this snapshot is
+            // taken after it, which is the skew the main surface had.
+            placementRowsUpSnapshot.removeAll(keepingCapacity: true)
+            for (layerGridId, rows) in layerPlacementRowsUp {
+                placementRowsUpSnapshot[layerGridId] = rows
+            }
             for layer in committedSurfaceLayers where layer.gridId != gridId {
                 if let sets = gridBuffers.existingSets(for: layer.gridId) {
                     // This surface keeps no per-layer draw state, so every
@@ -3192,11 +3245,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 )
                 // The same debt the body gives back, or the cursor and the rows
                 // it sits on are drawn rows apart.
-                cursorDrawOrigin.y += mainTerminalView?.floatDebtPx(
+                cursorDrawOrigin.y += hostedFloatDebtPx(
                     gridId: cursorOwnerSnapshot,
                     anchorGridId: cursorLayerAnchorGridSnapshot,
                     cellHeightPx: Float(ch)
-                ) ?? 0
+                )
             }
 
             /// `glowPipeline` non-nil IS the glow pass. The caller binds it
@@ -3236,11 +3289,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         // length of the scroll — the correction the main
                         // renderer applies when it builds a float's offset, and
                         // which a float an external window hosts never got.
-                        origin.y += mainTerminalView?.floatDebtPx(
+                        origin.y += hostedFloatDebtPx(
                             gridId: layer.gridId,
                             anchorGridId: layer.anchorGrid,
                             cellHeightPx: Float(ch)
-                        ) ?? 0
+                        )
                     }
                     let ratio: Float = glow ? 0.5 : 1
                     // A displaced origin is fractional mid-ease; floor it and
@@ -3318,7 +3371,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                                 glyphPipeline: shared.glyphPipeline, useTwoPass: use2Pass,
                                 unifiedBlurPipeline: shared.unifiedBlurPipeline)
                         }
-                        logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows)
+                        logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx)
                         continue
                     }
                     // Attenuate what this surface already extracted under the
@@ -3341,7 +3394,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         useTwoPass: !glow && use2Pass,
                         unifiedBlurPipeline: shared.unifiedBlurPipeline
                     )
-                    if !glow { logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows) }
+                    if !glow { logHostedLayerDraw(layer: layer, encodedRows: encodedRows, of: rows, drawOriginPx: origin, bodilyMoved: origin != layer.originPx) }
                 }
                 bindLayerTransform(encoder: encoder, viewportMetrics.layerTransform)
                 bindSingleSurfaceScrollOffset(encoder: encoder, offset: scrollOffsetSnapshot)

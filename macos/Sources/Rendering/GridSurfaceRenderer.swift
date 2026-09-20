@@ -1734,7 +1734,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// belongs to, and the zero the two halves are compared against. Both are
     /// protected by `lock` and consumed in `applyFloatScrollDebt`.
     private var scrollDebtAnchorRowsUp: [Int32: Int32] = [:]
-    private var scrollDebtBaseline: [Int32: Int32] = [:]
+    private var scrollDebtBaseline: [Int32: FloatDebtBaseline] = [:]
     /// A cell's height in the NDC the offsets above were built in, and in the
     /// pixels the cursor rect is measured in. Kept so the debt, which is
     /// counted in rows, can be paid in either set of units.
@@ -1779,16 +1779,22 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         for i in snapshot.indices {
             let gid = snapshot[i].grid_id
             guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { continue }
-            let placementRowsUp = Int32(clamping: layerPlacementRowsUp[Int64(gid)] ?? 0)
-            let paced = anchorRowsUp - placementRowsUp
+            let placementRowsUp = layerPlacementRowsUp[Int64(gid)] ?? 0
             guard let baseline = scrollDebtBaseline[gid] else {
-                scrollDebtBaseline[gid] = paced
+                scrollDebtBaseline[gid] = FloatDebtBaseline(
+                    anchorRowsUp: Int(anchorRowsUp), placementRowsUp: placementRowsUp)
                 continue
             }
-            let debtRows = paced - baseline
+            // The one definition of this subtraction, the one ScrollRetentionTests
+            // pins. Two more had grown beside it.
+            let debtRows = Int32(clamping: floatDebtRowsUp(
+                anchorRowsUp: Int(anchorRowsUp),
+                placementRowsUp: placementRowsUp,
+                baseline: baseline
+            ))
             if ZonvieCore.appLogEnabled, scrollDebtLastLogged[gid] != debtRows {
                 scrollDebtLastLogged[gid] = debtRows
-                ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=\(baseline)")
+                ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))")
             }
             guard debtRows != 0 else { continue }
             // offset_y is NDC and negated against the pixel offset the view

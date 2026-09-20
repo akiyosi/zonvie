@@ -224,6 +224,27 @@ final class ZonvieCore {
     /// surface while `externalGridViews` still holds the old view until the
     /// close's main-queue hop runs. Both reads happen under one hold, so there
     /// is no window between deciding and acting.
+    /// Grids some EXTERNAL surface places, for a caller hit-testing its own
+    /// surface's coordinate space.
+    ///
+    /// `isExternal` names a grid that IS a window of its own; it says nothing
+    /// about a float HOSTED by one. Such a float reports startRow/startCol in
+    /// its host surface's space, and the main window's hit test read those as
+    /// its own — a phantom region, sized and placed like the float, sitting
+    /// wherever those numbers happen to land in the main window.
+    ///
+    /// Staged map first, as resolveGridRoute reads it: a float's host is known
+    /// one flush before it is committed.
+    func collectExternallySurfacedGridIds(into out: inout [Int64]) {
+        out.removeAll(keepingCapacity: true)
+        externalGridViewsLock.lock()
+        defer { externalGridViewsLock.unlock() }
+        let owners = pendingGridSurfaceOwners ?? gridSurfaceOwners
+        for (gridId, ownerId) in owners where externalGridViews[ownerId] != nil {
+            out.append(gridId)
+        }
+    }
+
     func resolveGridRoute(gridId: Int64) -> GridRoute {
         if gridId == 1 { return .mainRoot }
         externalGridViewsLock.lock()
@@ -7054,7 +7075,15 @@ final class ZonvieCore {
             }
 
             self.externalGridViewsLock.lock()
-            let surfaceId = self.gridSurfaceOwners[gridId] ?? gridId
+            // The staged map first, the way resolveGridRoute reads it. A float
+            // opened on an external surface is placed by the layout of the
+            // flush that creates it, and the cursor moves onto it in that same
+            // flush — so the committed map does not name its host yet.
+            // Measured: gridId=5 resolved committed=nil, pending=4. Reading
+            // only the committed one made this fall through to `?? gridId`,
+            // find no window under that id, and order the MAIN window in front
+            // of the external one the cursor had just moved into.
+            let surfaceId = (self.pendingGridSurfaceOwners ?? self.gridSurfaceOwners)[gridId] ?? gridId
             // Whichever window is ordered in front below, every OTHER external
             // surface may end up behind it, and the window server will not say
             // so for another frame or two. Told here because this is the only
@@ -7069,7 +7098,7 @@ final class ZonvieCore {
                 if let gridView = self.externalGridViews[surfaceId] {
                     extWindow.makeFirstResponder(gridView)
                 }
-                ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId)")
+                ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId) surface=\(surfaceId)")
             } else if self.classifyExternalGridKind(gridId) != .normal {
                 // Cursor moved onto a synthetic decorated grid (cmdline /
                 // popupmenu / message) whose host window is not registered yet:
@@ -7081,7 +7110,7 @@ final class ZonvieCore {
             } else {
                 if let mainWindow = self.terminalView?.window {
                     mainWindow.makeKeyAndOrderFront(nil)
-                    ZonvieCore.appLog("[cursor_grid_changed] activated main window (cursor on gridId=\(gridId))")
+                    ZonvieCore.appLog("[cursor_grid_changed] activated main window (cursor on gridId=\(gridId) surface=\(surfaceId))")
                 }
             }
         }

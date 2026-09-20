@@ -275,16 +275,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// Guarded by scrollOffsetLock.
     private var anchorLandedRowsUp: [Int64: Int] = [:]
 
-    /// Where each following float's debt was last known to be zero: the two
-    /// counters above as they stood when the float began following. Without a
-    /// common zero the running totals, which start whenever each grid first
-    /// appears, would never agree. Guarded by scrollOffsetLock.
-    private var floatDebtBaseline: [Int64: FloatDebtBaseline] = [:]
-
-    /// The renderer's placement travel, copied once per frame into storage this
-    /// view owns. Main thread only, used inside updateScrollShaderOffset.
-    private var placementRowsUpScratch: [Int64: Int] = [:]
-
     /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
     /// a trackpad gesture). Guarded by scrollOffsetLock.
     private var smoothScrollGrids: Set<Int64> = []
@@ -1945,11 +1935,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         let grids = core.getVisibleGridsCached()
         // The float ledger's other half, read once per frame under the
         // renderer's lock rather than per float.
-        renderer.copyPlacementRowsUp(into: &placementRowsUpScratch)
         // The external surfaces' half of the same ledger. Merged after the main
         // renderer's, which clears the scratch; the two never name the same
         // grid, because a grid is placed by exactly one surface.
-        core.appendExternalPlacementRowsUp(into: &placementRowsUpScratch)
         gridInfoMapScratch.removeAll(keepingCapacity: true)
         for g in grids { gridInfoMapScratch[g.gridId] = g }
         let gridInfoMap = gridInfoMapScratch
@@ -1971,14 +1959,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             scrollEdgeBlocked.removeValue(forKey: key)
         }
         // A destroyed grid's ledger describes a float that no longer exists,
-        // and its id is reused by the next float a scroll creates.
-        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
-        for key in floatDebtBaseline.keys where !visibleGridIdsScratch.contains(key) {
-            scrollOffsetStaleKeysScratch.append(key)
-        }
-        for key in scrollOffsetStaleKeysScratch {
-            floatDebtBaseline.removeValue(forKey: key)
-        }
+        // and its id is reused by the next float a scroll creates. The
+        // baselines live with the surfaces that draw the floats now; only the
+        // anchor counter is still this view's.
         scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
         for key in anchorLandedRowsUp.keys where !visibleGridIdsScratch.contains(key) {
             scrollOffsetStaleKeysScratch.append(key)
@@ -3179,6 +3162,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// Reused by both hit tests below; see the renderer's
     /// `collectMouseDisabledLayerGridIds`.
     private var mouseDisabledGridsScratch: [Int64] = []
+    /// Grids an external surface places. Same lifetime and reuse as the scratch
+    /// above; both are read once per hit test.
+    private var externallySurfacedGridsScratch: [Int64] = []
 
     private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
@@ -3232,11 +3218,15 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // underneath. `zonvie_grid_info` carries no mouse field, so the answer
         // comes from the layer list instead.
         renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
+        core.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
 
         for grid in grids {
             // External grids are separate top-level windows reported at (0,0);
             // they must not be hit by the main window's coordinate-space test.
             if grid.isExternal { continue }
+            // Nor a float one of them HOSTS, which is not itself external but
+            // reports its position in that surface's space.
+            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
             if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
             let inRowRange = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
             let inColRange = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
@@ -3329,10 +3319,13 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // otherwise take the gesture, ease its own pixels, get no grid_scroll
         // back, and snap — while the window under it never moved.
         renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
+        core.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
         for grid in grids {
             // External grids are separate top-level windows reported at (0,0);
             // exclude them from the main window's scroll-target resolution.
             if grid.isExternal { continue }
+            // Same for a float an external surface hosts; see hitTestGrid.
+            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
             if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
             let inRow = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
             let inCol = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
@@ -3452,52 +3445,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
     /// The anchor's landed-rows counter, read under the lock that writes it
     /// alongside the compensation it belongs to, so the pair travels together.
-    private func anchorLandedRowsUpSnapshot(_ anchorGridId: Int64) -> Int {
+    func anchorLandedRowsUpSnapshot(_ anchorGridId: Int64) -> Int {
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
         return anchorLandedRowsUp[anchorGridId] ?? 0
-    }
-
-    /// Rows of the anchor's compensation this float has not been re-placed
-    /// for. Seeds the baseline on the float's first frame of following, so a
-    /// float that appears mid-scroll starts square rather than inheriting the
-    /// whole history of a scroll it was not present for.
-    ///
-    /// Takes `scrollOffsetLock`: processPendingScrollClears writes the anchor
-    /// counter from the core thread. placementRowsUpScratch is main-thread
-    /// only, refreshed once per frame by updateScrollShaderOffset.
-    /// The debt in pixels, for a caller that displaces a float bodily rather
-    /// than through a ScrollOffset entry. The external surfaces move a
-    /// following layer that way, so this is how they reach the same correction
-    /// the main renderer applies to a float's offset.
-    ///
-    /// Diverges from the main surface deliberately, and not for a good reason:
-    /// the main surface pays the debt in GridSurfaceRenderer.applyFloatScrollDebt,
-    /// at the committed snapshot, because `placementRowsUpScratch` is copied
-    /// before the flush that publishes a placement and the snapshot is taken
-    /// after it. This path still reads the scratch and so still has that
-    /// one-commit skew; it is left as it was because no test exercises it and
-    /// the skew has only ever been measured on the main surface.
-    func floatDebtPx(gridId: Int64, anchorGridId: Int64, cellHeightPx: Float) -> Float {
-        guard cellHeightPx > 0 else { return 0 }
-        return Float(floatDebtRows(gridId: gridId, anchorGridId: anchorGridId)) * cellHeightPx
-    }
-
-    private func floatDebtRows(gridId: Int64, anchorGridId: Int64) -> Int {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        let anchorRowsUp = anchorLandedRowsUp[anchorGridId] ?? 0
-        let placementRowsUp = placementRowsUpScratch[gridId] ?? 0
-        guard let baseline = floatDebtBaseline[gridId] else {
-            floatDebtBaseline[gridId] = FloatDebtBaseline(
-                anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
-            return 0
-        }
-        return floatDebtRowsUp(
-            anchorRowsUp: anchorRowsUp,
-            placementRowsUp: placementRowsUp,
-            baseline: baseline
-        )
     }
 
     private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
