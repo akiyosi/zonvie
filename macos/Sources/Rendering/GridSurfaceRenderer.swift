@@ -1232,8 +1232,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // baked into the committed vertices.
     // draw() uses these to set the Metal viewport, preventing stretching when
     // drawableSize changes between flushes.
-    private var committedDrawableW: UInt32 = 0 // Protected by lock
-    private var committedDrawableH: UInt32 = 0 // Protected by lock
+    /// Shared with ExternalGridView. This surface measures in DRAWABLE PIXELS:
+    /// its grid is the window, so the viewport comes from the drawable size.
+    /// Protected by `lock`.
+    private var committedExtent = SurfaceCommittedExtent()
     // Layout associated with the last committed MAIN state. Cursor-only
     // commits also refresh committedDrawable*, so they cannot be used to
     // decide whether sparse row metadata crossed a layout transition.
@@ -2372,8 +2374,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         if didCursorWrite {
             cursorOwner.commit()
         }
-        committedDrawableW = drawableW
-        committedDrawableH = drawableH
+        committedExtent.commit(width: drawableW, height: drawableH)
         committedAtlasTexture = publishedAtlasTexture  // same lock as vertex state
         // Publish this bracket's smooth-scroll retention together with the
         // vertices it belongs to: a retained row shown against pre-scroll
@@ -3081,8 +3082,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let cursorOnlyCommitSnapshot: Bool
 
             let snappedBgRGB: UInt32
-            let snappedCommittedDrawableW: UInt32
-            let snappedCommittedDrawableH: UInt32
+            let snappedCommittedExtent: SurfaceCommittedExtent
 
             lock.lock()
             if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
@@ -3160,8 +3160,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             cursorLayerOriginSnapshot = committedCursorLayerOriginPx
             cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
             snappedBgRGB = defaultBgRGB
-            snappedCommittedDrawableW = committedDrawableW
-            snappedCommittedDrawableH = committedDrawableH
+            snappedCommittedExtent = committedExtent
             lock.unlock()
 
             defer {
@@ -3402,15 +3401,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // --- Step 2: Pre-compute shared values for loadAction gate and draw branching ---
             let cellWi = max(1, UInt32(cw.rounded(.up)))
             let cellHi = max(1, UInt32(ch.rounded(.up)))
-            let drawableWi: UInt32
-            let drawableHi: UInt32
-            if snappedCommittedDrawableW > 0 && snappedCommittedDrawableH > 0 {
-                drawableWi = snappedCommittedDrawableW
-                drawableHi = snappedCommittedDrawableH
-            } else {
-                drawableWi = max(1, UInt32(view.drawableSize.width))
-                drawableHi = max(1, UInt32(view.drawableSize.height))
-            }
+            let (drawableWi, drawableHi) = snappedCommittedExtent.resolved(
+                liveWidth: max(1, UInt32(view.drawableSize.width)),
+                liveHeight: max(1, UInt32(view.drawableSize.height))
+            )
             let vpWidth = Double((drawableWi / cellWi) * cellWi)
             let vpHeight = Double((drawableHi / cellHi) * cellHi)
             // The root layer drives the pixel space core vertices arrive in.
