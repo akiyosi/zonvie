@@ -1503,6 +1503,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         if changed {
             lastCellWidthPx = cw
             lastCellHeightPx = ch
+            // The back texture now holds pixels laid out at the OLD cell size,
+            // and a metrics change does not resize the drawable — so
+            // `ensureBackBuffer` does not fire and nothing else drops this
+            // latch. Every row the new layout covers is redrawn, but a layout
+            // that got SHORTER leaves a strip below it that no row reaches, and
+            // `.load` would keep the old pixels there. ExternalGridView has
+            // always cleared this from `notifyFontChanged`; the main surface
+            // was only ever told to redraw.
+            hasPresentedOnce = false
         }
         lock.unlock()
         guard changed, let cb = onCellMetricsChanged else { return }
