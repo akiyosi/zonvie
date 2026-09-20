@@ -487,8 +487,75 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// The cursor owner both surfaces now share, against the bracket protocol
+    /// each of them wrote out.
+    ///
+    ///     stage      pendingCursorGridId = id
+    ///     commit     committedCursorGridId = pendingCursorGridId
+    ///     abandon    pendingCursorGridId = committedCursorGridId
+    ///     guard      count != 0 || pendingCursorGridId == id
+    ///
+    /// The guard is what this is really protecting: a cursor CLEAR arrives for
+    /// whichever grid lost the cursor, so accepting one from a grid that does
+    /// not own it erases a cursor still on screen. Every ordering of stage,
+    /// commit and abandon over a set of owners is enumerated, including the two
+    /// roots the surfaces start from — 1 for main, nil for external.
+    private static func verifyCursorOwner() {
+        let owners: [Int64?] = [nil, 1, 4, 7]
+        for initial in owners {
+            for first in owners {
+                for second in owners {
+                    // Stage, then commit: both halves become the staged owner
+                    // and only that owner may clear.
+                    var committing = SurfaceCursorOwner(initial: initial)
+                    committing.stage(first)
+                    committing.commit()
+                    committing.stage(second)
+                    for probe in owners {
+                        guard let probe else { continue }
+                        check(committing.owns(probe), second == probe,
+                              "owns after stage init=\(String(describing: initial))"
+                                + " staged=\(String(describing: second)) probe=\(probe)")
+                    }
+
+                    // Stage, then abandon: the staged owner goes back to what
+                    // is on screen, which is the committed one.
+                    var abandoning = SurfaceCursorOwner(initial: initial)
+                    abandoning.stage(first)
+                    abandoning.commit()
+                    abandoning.stage(second)
+                    abandoning.restoreStagedFromCommitted()
+                    if abandoning.staged != first {
+                        failures += 1
+                        print("FAIL: an abandoned bracket left"
+                            + " \(String(describing: abandoning.staged)) staged,"
+                            + " expected \(String(describing: first))")
+                    }
+                    if abandoning.committed != first {
+                        failures += 1
+                        print("FAIL: abandoning moved what is on screen")
+                    }
+                }
+            }
+        }
+
+        // A nil start owns nothing at all — the case that drops a clear
+        // arriving before any cursor has been staged.
+        let fresh = SurfaceCursorOwner(initial: nil)
+        for probe in Int64(0)...Int64(8) where fresh.owns(probe) {
+            failures += 1
+            print("FAIL: a nil owner claimed grid \(probe)")
+        }
+        let rooted = SurfaceCursorOwner(initial: 1)
+        if !rooted.owns(1) || rooted.owns(2) {
+            failures += 1
+            print("FAIL: a rooted owner does not own exactly its root")
+        }
+    }
+
     static func main() {
         verifyMainSurface()
+        verifyCursorOwner()
         verifyScrollOffsetLatch()
         verifyExternalSurface()
         verifyMainLoadAction()

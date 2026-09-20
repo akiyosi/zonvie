@@ -441,3 +441,51 @@ struct SurfaceScrollOffsetLatch {
         previousFrameWasActive = previous
     }
 }
+
+
+/// Which grid this surface's one cursor belongs to, staged inside a flush
+/// bracket and published by that bracket's commit.
+///
+/// A surface draws one cursor but many grids can own it, and a cursor CLEAR
+/// arrives for whichever grid lost it rather than only for the one holding it —
+/// so taking a clear from a grid that does not own the cursor erases one that is
+/// still on screen. Both surfaces carried that guard, and both carried the same
+/// bracket protocol around it: stage into pending, publish on commit, put
+/// pending back from committed when a bracket is abandoned.
+///
+/// What each surface calls "no particular layer" differs and stays theirs. The
+/// main surface's root IS grid 1, so it starts at 1 and never holds nil; an
+/// external surface starts at nil, meaning nothing has been staged yet, which
+/// is why `owns` compares the stored value rather than resolving a root — a nil
+/// owner owns nothing, and on the main surface there is no nil to resolve.
+struct SurfaceCursorOwner {
+    private(set) var staged: Int64?
+    private(set) var committed: Int64?
+
+    init(initial: Int64?) {
+        staged = initial
+        committed = initial
+    }
+
+    /// Does the grid being submitted own the cursor this bracket has staged?
+    func owns(_ gridId: Int64) -> Bool {
+        staged == gridId
+    }
+
+    mutating func stage(_ gridId: Int64?) {
+        staged = gridId
+    }
+
+    /// Publish what the bracket staged.
+    mutating func commit() {
+        committed = staged
+    }
+
+    /// Put the staged owner back to what is on screen. A bracket that is
+    /// abandoned must not leave a half-moved cursor staged, or the next
+    /// bracket's clear from the true owner is dropped as coming from a
+    /// non-owner and a cursor stays drawn where it no longer is.
+    mutating func restoreStagedFromCommitted() {
+        staged = committed
+    }
+}
