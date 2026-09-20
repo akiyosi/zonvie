@@ -7055,7 +7055,15 @@ final class ZonvieCore {
 
             self.externalGridViewsLock.lock()
             let surfaceId = self.gridSurfaceOwners[gridId] ?? gridId
+            // Whichever window is ordered in front below, every OTHER external
+            // surface may end up behind it, and the window server will not say
+            // so for another frame or two. Told here because this is the only
+            // place that knows it without waiting. The one being activated is
+            // excluded: it is the window coming to the front, and holding its
+            // frames back would freeze the surface that just took focus.
+            let suspects = self.externalGridViews.filter { $0.key != surfaceId }.map { $0.value }
             self.externalGridViewsLock.unlock()
+            for view in suspects { view.markOcclusionSuspect() }
             if let extWindow = self.externalWindows[surfaceId] {
                 extWindow.makeKeyAndOrderFront(nil)
                 if let gridView = self.externalGridViews[surfaceId] {
@@ -7925,6 +7933,13 @@ final class ZonvieCore {
 
         updateMiniPositions()
         miniWindows[miniId]?.window?.orderFront(nil)
+        // Name the window the way the OS window list does, so a harness that
+        // observes windows from outside can tell a mini apart from the other
+        // message windows the app puts on screen. `windowNumber` IS the
+        // CGWindowID CGWindowListCopyWindowInfo reports.
+        if ZonvieCore.appLogEnabled, let number = miniWindows[miniId]?.window?.windowNumber {
+            ZonvieCore.appLog("[mini_window] mini=\(miniId) number=\(number)")
+        }
 
         if let timeout = timeout, timeout > 0 {
             let workItem = DispatchWorkItem { [weak self] in
