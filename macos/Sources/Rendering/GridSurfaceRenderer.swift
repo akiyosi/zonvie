@@ -3446,6 +3446,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // full update and wedges the redraw scheduler (didDrawFrame() never
             // fires). Restore a superset — all rows dirty, which also heals the
             // unapplied blit since committed vertices are already post-scroll.
+            //
+            // ExternalGridView restores EXACTLY what its draw consumed: its
+            // submitted rows, its layout-damage and cursor flags, its scroll
+            // accumulator. Two policies for one job, unmeasured against each
+            // other because the path runs only when a draw gives up, which no
+            // scenario provokes.
             func bailWithoutSubmit(_ reason: String) {
                 ZonvieCore.appLog("[WARNING] draw bailed (\(reason)); restoring dirty state for retry")
                 markAllRowsDirty()
@@ -3690,13 +3696,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 }
 
                 if refusalReason == nil, let p = plan {
-                    if scrollBlitEncoder == nil {
-                        scrollScratch.ensure(device: shared.device, drawableSize: backBufferSize, pixelFormat: backTex.pixelFormat)
-                        scrollBlitEncoder = cmd.makeBlitCommandEncoder()
-                    }
-                    if let blit = scrollBlitEncoder, let scratch = scrollScratch.texture {
-                        let t0 = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
-                        encodeRowScrollBlit(blit, backTexture: backTex, scratch: scratch, plan: p)
+                    let t0 = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
+                    // One encoder across every layer this frame moves, which is
+                    // why it is passed in rather than made here.
+                    if encodeSurfaceRowScrollBlit(
+                        plan: p,
+                        backTexture: backTex,
+                        scratch: scrollScratch,
+                        device: shared.device,
+                        backBufferSize: backBufferSize,
+                        commandBuffer: cmd,
+                        encoder: &scrollBlitEncoder
+                    ) {
                         useGpuScrollCopy = true
                         state.drawRows.append(contentsOf: p.dirtyRows)
                         state.drawBlitClearBand = p.localClearBand()
