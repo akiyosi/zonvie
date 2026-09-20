@@ -588,6 +588,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     // Allows bloom blur to bleed into the padding area around grid content.
     var viewportOriginPx: CGPoint = .zero
 
+    /// This surface's backing scale. Asked of the window rather than cached,
+    /// as GridSurfaceRenderer caches what `setBackingScale` tells it — a
+    /// surface that is its own view can just look. The fallback is the Retina
+    /// scale, used only between construction and the window being attached,
+    /// and stated here rather than at each of the seven sites that had it.
+    var backingScale: CGFloat { window?.backingScaleFactor ?? 2.0 }
+
     // --- Post-process bloom (neon glow) ---
     // Pipelines and sampler are shared from GridSurfaceRenderer.
     // Textures are per-view (sizes differ per window).
@@ -2120,7 +2127,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // surfaces. Keeping the mapping identical to the render path
         // preserves the Ghostty contract: iCurrentCursor == the cursor's
         // true on-screen rect.
-        let scale = Float(self.window?.backingScaleFactor ?? 2.0)
+        let scale = Float(backingScale)
         let vpOriginX = Float(viewportOriginPx.x) * scale
         let vpOriginY = Float(viewportOriginPx.y) * scale
         // The origin of the grid the cursor is on, which the draw path also
@@ -2197,12 +2204,22 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             rowHeightPx: rowHeightPx
         ) else { return nil }
 
-        scrollScratch.ensure(device: mtlDevice, drawableSize: backBufferSize, pixelFormat: backTexture.pixelFormat)
-        guard let scratch = scrollScratch.texture,
-              let blit = commandBuffer.makeBlitCommandEncoder()
-        else { return nil }
-        encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratch, plan: plan)
-        blit.endEncoding()
+        // One region, so the encoder starts nil and is ended straight after;
+        // GridSurfaceRenderer passes its own across a whole layer loop.
+        var blit: MTLBlitCommandEncoder? = nil
+        guard encodeSurfaceRowScrollBlit(
+            plan: plan,
+            backTexture: backTexture,
+            scratch: scrollScratch,
+            device: mtlDevice,
+            backBufferSize: backBufferSize,
+            commandBuffer: commandBuffer,
+            encoder: &blit
+        ) else {
+            blit?.endEncoding()
+            return nil
+        }
+        blit?.endEncoding()
 
         return (plan.clearTopPx, plan.clearBottomPx, plan.dirtyRows, plan.clampedRowEnd)
     }
@@ -2464,6 +2481,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // restoreScroll: pass false when the scroll blit has ALREADY been
             // committed into backTex (the drawable-nil site) — re-queueing the
             // scroll there would double-shift the already-shifted pixels.
+            /// Put back what this draw consumed, so a retry heals it.
+            ///
+            /// Restores EXACTLY that: the rows it submitted, the flags it
+            /// cleared, the scroll it took. GridSurfaceRenderer restores a
+            /// superset instead — every row dirty and every layer needing a
+            /// full redraw. Two policies for one job, unmeasured against each
+            /// other because the path runs only when a draw gives up, which no
+            /// scenario provokes.
             func bailWithoutSubmit(_ reason: String, restoreScroll: Bool = true) {
                 ZonvieCore.appLog("[WARNING][ExternalGridView] draw bailed (\(reason)); restoring dirty state for retry gridId=\(gridId)")
                 lock.lock()
@@ -2711,7 +2736,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // core bakes NDC with grid_h = viewport_rows * cellH.
             let vpWidth = Double(snapGridCols) * Double(cellWi)
             let vpHeight = Double(snapGridRows) * Double(cellHi)
-            let scale = view.window?.backingScaleFactor ?? 2.0
+            let scale = backingScale
             let vpOriginX = Double(viewportOriginPx.x) * Double(scale)
             let vpOriginY = Double(viewportOriginPx.y) * Double(scale)
             // The root layer drives the pixel space core vertices arrive in.
@@ -3710,7 +3735,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         screenResolution: screenRes,
                         windowOffset: windowOffset,
                         windowSize: view.drawableSize,
-                        backingScale: self.window?.backingScaleFactor ?? 2.0,
+                        backingScale: self.backingScale,
                         timing: self.shaderTiming,
                         lastLoggedCursor: &self.lastLoggedShaderCursor
                     )
@@ -3867,7 +3892,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         retention.setDepthRows(main.core?.getMouseScrollVer() ?? 0)
 
         let vpOriginYPxForGridTop = Float(viewportOriginPx.y)
-            * Float(self.window?.backingScaleFactor ?? 2.0)
+            * Float(backingScale)
 
         // Resolve every hosted grid's own offset, the way the main window's
         // layer pass does. Without this a float inside an external window only
@@ -4256,7 +4281,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     private func sendMouseEvent(button: String, action: String, event: NSEvent) {
         guard let main = mainTerminalView, let core = main.core else { return }
 
-        let scale = window?.backingScaleFactor ?? 2.0
+        let scale = backingScale
         let location = convert(event.locationInWindow, from: nil)
 
         // Convert to cell coordinates (flip Y)
@@ -4426,7 +4451,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         if deltaY == 0 && deltaX == 0 { return }
 
         let location = convert(event.locationInWindow, from: nil)
-        let scale = window?.backingScaleFactor ?? 2.0
+        let scale = backingScale
 
         // Flip Y coordinate (view origin is bottom-left, grid origin is top-left)
         let pointPx = CGPoint(x: location.x * scale,
@@ -4503,7 +4528,7 @@ extension ExternalGridView: IMEPreeditHost {
 
     var imePreeditCellSize: CGSize {
         guard let main = mainTerminalView else { return CGSize(width: 8, height: 16) }
-        let scale = window?.backingScaleFactor ?? 2.0
+        let scale = backingScale
         return CGSize(width: CGFloat(shared.cellWidthPx) / scale,
                       height: CGFloat(shared.cellHeightPx) / scale)
     }

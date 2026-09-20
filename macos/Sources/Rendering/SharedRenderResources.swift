@@ -452,6 +452,38 @@ final class SharedRenderResources {
     }
 }
 
+/// Encode one row-scroll blit through a scratch texture, making the encoder on
+/// first use.
+///
+/// The encoder is `inout` so a surface with several layers to move batches them
+/// into ONE blit encoder — which is what GridSurfaceRenderer does across its
+/// layer loop. ExternalGridView moves one region and ends the encoder straight
+/// after; it passes a local that starts nil.
+///
+/// Returns false when the scratch texture or the encoder could not be made. The
+/// caller then redraws those rows instead of moving them.
+func encodeSurfaceRowScrollBlit(
+    plan: RowScrollBlitPlan,
+    backTexture: MTLTexture,
+    scratch: SurfaceScrollScratchTexture,
+    device: MTLDevice,
+    backBufferSize: CGSize,
+    commandBuffer: MTLCommandBuffer,
+    encoder: inout MTLBlitCommandEncoder?
+) -> Bool {
+    if encoder == nil {
+        scratch.ensure(
+            device: device,
+            drawableSize: backBufferSize,
+            pixelFormat: backTexture.pixelFormat
+        )
+        encoder = commandBuffer.makeBlitCommandEncoder()
+    }
+    guard let blit = encoder, let scratchTexture = scratch.texture else { return false }
+    encodeRowScrollBlit(blit, backTexture: backTexture, scratch: scratchTexture, plan: plan)
+    return true
+}
+
 /// One surface's Shadertoy clock. Each surface counts its own frames, but they
 /// all measure `iTime` from the same start so a shader's phase matches across
 /// windows; `SharedRenderResources.shaderTimeBase` holds that start.
