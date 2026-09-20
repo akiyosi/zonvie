@@ -726,9 +726,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         pendingSurfaceLayers = layers
         // Removing or migrating the owner also removes its surface overlay.
         // Stage this with placement so abort preserves the old complete frame.
-        if !layers.contains(where: { $0.gridId == pendingCursorLayerGridId }) {
-            submitLayerCursor(gridId: pendingCursorLayerGridId, ptr: nil, count: 0)
-            pendingCursorLayerGridId = 1
+        if !layers.contains(where: { $0.gridId == (cursorOwner.staged ?? 1) }) {
+            submitLayerCursor(gridId: cursorOwner.staged ?? 1, ptr: nil, count: 0)
+            cursorOwner.stage(1)
         }
     }
 
@@ -764,14 +764,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Which layer the committed cursor belongs to. The surface draws one
     /// cursor, and it has to be placed with its own layer's transform.
-    private var pendingCursorLayerGridId: Int64 = 1
+    /// Shared with ExternalGridView. This surface's root is grid 1, so that is
+    /// what "no particular layer" means here and the owner is never nil.
+    private var cursorOwner = SurfaceCursorOwner(initial: 1)
     var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
-    private var committedCursorLayerGridId: Int64 = 1
 
     /// The committed cursor's layer origin within the surface.
     private var committedCursorLayerOriginPx: simd_float2 {
-        guard committedCursorLayerGridId != 1 else { return simd_float2(0, 0) }
-        return committedSurfaceLayers.first { $0.gridId == committedCursorLayerGridId }?.originPx
+        let owner = cursorOwner.committed ?? 1
+        guard owner != 1 else { return simd_float2(0, 0) }
+        return committedSurfaceLayers.first { $0.gridId == owner }?.originPx
             ?? simd_float2(0, 0)
     }
 
@@ -779,12 +781,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// vertices are in that grid's own pixel space.
     func submitLayerCursor(gridId: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
         // Cursor clears are grid-local even though the surface has one overlay.
-        guard count != 0 || pendingCursorLayerGridId == gridId else {
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(pendingCursorLayerGridId) reason=empty_nonowner")
+        guard count != 0 || cursorOwner.owns(gridId) else {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(cursorOwner.staged ?? 1) reason=empty_nonowner")
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=1 grid=\(gridId) vertices=\(count)")
-        pendingCursorLayerGridId = gridId
+        cursorOwner.stage(gridId)
         submitVerticesPartialRaw(
             mainPtr: nil,
             mainCount: 0,
@@ -2099,7 +2101,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // into the retry, where the `count != 0 || pending == id` guards would
         // drop the true owner's cursor clear and leave a cursor drawn where it
         // no longer is.
-        pendingCursorLayerGridId = committedCursorLayerGridId
+        cursorOwner.restoreStagedFromCommitted()
         bracketSourceShift.removeAll(keepingCapacity: true)
         bracketStagedGrids.removeAll(keepingCapacity: true)
         let retentionReplay = Self.smoothScrollEnabled ? pendingRetentionReplay : []
@@ -2275,7 +2277,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             state.flushDirtyRows.removeAll()
         }
         pendingSurfaceLayers = nil
-        pendingCursorLayerGridId = committedCursorLayerGridId
+        cursorOwner.restoreStagedFromCommitted()
         lock.unlock()
         flushHadLayerWork = false
         mainWritePrepared = false
@@ -2368,7 +2370,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
         }
         if didCursorWrite {
-            committedCursorLayerGridId = pendingCursorLayerGridId
+            cursorOwner.commit()
         }
         committedDrawableW = drawableW
         committedDrawableH = drawableH
@@ -3156,7 +3158,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 layerStateSnapshot.append(state)
             }
             cursorLayerOriginSnapshot = committedCursorLayerOriginPx
-            cursorOwnerGridSnapshot = committedCursorLayerGridId
+            cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
             snappedBgRGB = defaultBgRGB
             snappedCommittedDrawableW = committedDrawableW
             snappedCommittedDrawableH = committedDrawableH
@@ -6298,11 +6300,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let updateMain = (flags & UInt32(ZONVIE_VERT_UPDATE_MAIN)) != 0
         let updateCursor = (flags & UInt32(ZONVIE_VERT_UPDATE_CURSOR)) != 0
         if updateCursor && !updateMain {
-            guard count != 0 || pendingCursorLayerGridId == 1 else {
-                ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=1 owner=\(pendingCursorLayerGridId) reason=empty_nonowner")
+            guard count != 0 || cursorOwner.owns(1) else {
+                ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=1 owner=\(cursorOwner.staged ?? 1) reason=empty_nonowner")
                 return
             }
-            pendingCursorLayerGridId = 1
+            cursorOwner.stage(1)
             submitVerticesPartialRaw(
                 mainPtr: nil,
                 mainCount: 0,

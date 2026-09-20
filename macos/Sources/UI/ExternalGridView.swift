@@ -137,10 +137,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         // even when this flush does not submit any rows.
         flushHadContent = true
         tripleBufferLock.unlock()
-        if let owner = pendingCursorGridId,
+        if let owner = cursorOwner.staged,
            !layers.contains(where: { $0.gridId == owner }) {
             submitLayerCursor(gridId: owner, ptr: nil, count: 0)
-            pendingCursorGridId = gridId
+            cursorOwner.stage(gridId)
         }
     }
 
@@ -178,9 +178,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     /// of its own; rebuilt only when the rectangles change.
     private let fixedFloatMask = SurfaceFixedFloatMask()
     private var fixedFloatRectsScratch: [GridSurfaceRenderer.FixedFloatRect] = []
-    private var pendingCursorGridId: Int64?
+    /// Shared with GridSurfaceRenderer. Starts nil — nothing staged yet — and
+    /// a nil owner owns nothing, which is what makes a clear from a grid that
+    /// is not the owner get dropped before the first cursor arrives.
+    private var cursorOwner = SurfaceCursorOwner(initial: nil)
     var renderTraceFlushId: UInt64 = 0 // Core callback thread only.
-    private var committedCursorGridId: Int64?
 
     func submitLayerRow(gridId id: Int64, rowStart: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, totalRows: Int, totalCols: Int) {
         guard isInFlush, id != gridId else { return }
@@ -226,13 +228,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     func submitLayerCursor(gridId id: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
         guard isInFlush else { return }
         // Clearing another grid must not erase this surface's current cursor.
-        guard count != 0 || pendingCursorGridId == id else {
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(id) owner=\(pendingCursorGridId ?? 0) reason=empty_nonowner")
+        guard count != 0 || cursorOwner.owns(id) else {
+            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(id) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=\(gridId) grid=\(id) vertices=\(count)")
         writeBracketCursorVertices(ptr: ptr, count: count)
-        pendingCursorGridId = id
+        cursorOwner.stage(id)
         flushHadContent = true
         // The surface's own cursor path forwards its rect to the shared cursor
         // shader state; a layer's cursor is the same surface's one cursor and
@@ -1088,7 +1090,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         isInFlush = true
         flushHadContent = false
-        pendingCursorGridId = committedCursorGridId
+        cursorOwner.restoreStagedFromCommitted()
         return true
     }
 
@@ -1193,7 +1195,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         isInFlush = false
         tripleBufferLock.lock()
         pendingSurfaceLayers = nil
-        pendingCursorGridId = nil
+        cursorOwner.stage(nil)
         // Only a bracket that acquired a row set left one half-written.
         if bracketOpen, rowWritePrepared, writeSetIndex >= 0 {
             rowStateNeedsFullSync[writeSetIndex] = true
@@ -1253,7 +1255,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             }
             committedGridRows = gridRows
             committedGridCols = gridCols
-            committedCursorGridId = pendingCursorGridId
+            cursorOwner.commit()
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
                 // How far each hosted layer's committed placement has travelled,
@@ -1936,11 +1938,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
 
         let isCursorUpdate = (flags & 2) != 0  // ZONVIE_VERT_UPDATE_CURSOR
         if isCursorUpdate {
-            if count == 0 && pendingCursorGridId != gridId {
-                ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(gridId) owner=\(pendingCursorGridId ?? 0) reason=empty_nonowner")
+            if count == 0 && !cursorOwner.owns(gridId) {
+                ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(gridId) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
                 return
             }
-            pendingCursorGridId = gridId
+            cursorOwner.stage(gridId)
             tripleBufferLock.lock()
             lastKnownCursorRow = rowStart
             cursorDirty = true
@@ -2458,7 +2460,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             // follows the scroll, and the shader effect that has to land on the
             // same cursor. Asking again later is how the body and the effect
             // came to answer different flushes.
-            cursorOwnerSnapshot = committedCursorGridId ?? gridId
+            cursorOwnerSnapshot = cursorOwner.committed ?? gridId
             cursorLayerOriginSnapshot = committedSurfaceLayers.first {
                 $0.gridId == cursorOwnerSnapshot
             }?.originPx ?? .zero
