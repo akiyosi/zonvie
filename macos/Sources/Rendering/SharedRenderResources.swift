@@ -660,8 +660,11 @@ final class SurfaceShaderCursor {
     ///
     /// - Parameter scrollOffsetPx: displacement of the cursor's grid for this
     ///   frame, or nil when the caller does not own that grid's cursor.
-    func evaluate(scrollOffsetPx: Float?) {
-        guard let scrollOffsetPx else { return }
+    /// Returns true when the endpoints moved, so the caller's draw gate can
+    /// treat it as work: the rect is a whole-surface fragment input.
+    @discardableResult
+    func evaluate(scrollOffsetPx: Float?) -> Bool {
+        guard let scrollOffsetPx else { return false }
         lock.lock()
         defer { lock.unlock() }
         let rect = (rawRect.0, rawRect.1 + scrollOffsetPx, rawRect.2, rawRect.3)
@@ -681,7 +684,7 @@ final class SurfaceShaderCursor {
             // Keep the endpoint exact even when the move was below the
             // threshold, so a slow ease does not accumulate drift.
             current = rect
-            return
+            return false
         }
 
         previous = current
@@ -693,5 +696,6 @@ final class SurfaceShaderCursor {
         changeTimeSec = timeBase.startTimeSec != 0
             ? Float(CACurrentMediaTime() - timeBase.startTimeSec)
             : 0
+        return true
     }
 }
