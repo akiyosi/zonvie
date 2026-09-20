@@ -3276,6 +3276,13 @@ pub const FlushCtx = struct {
 
         // Row shifts are grid-local. Resolve their destination before any
         // callback can route a moved grid using the previous surface's layout.
+        //
+        // The SECOND publish of this flush: `notifySurfaceLayouts` already ran
+        // one, for its own ordering (a surface must exist on the frontend
+        // before its layout arrives). Neither is redundant — they answer
+        // different "before what" questions — and a frontend stages layers and
+        // promotes them at commit, so publishing twice is idempotent. Removing
+        // either one breaks the ordering the other does not cover.
         _ = notifyExternalWindowChanges(ctx.core);
         publishSurfaceLayouts(ctx.core);
         if (ctx.core.flush_aborted) return;
@@ -4667,6 +4674,10 @@ fn emitSurfaceLayout(self: *Core, surface_id: i64) bool {
 /// Publish every live surface's layer list, then drain the destroyed-grid
 /// queue. Runs inside the flush bracket after external-window lifecycle, so a
 /// surface always exists on the frontend before its layout arrives.
+///
+/// A flush publishes layouts TWICE: once here, and once again before row-shift
+/// dispatch, which needs a moved grid's destination resolved before any
+/// callback routes it. See that site for why neither is redundant.
 pub fn notifySurfaceLayouts(self: *Core) void {
     publishSurfaceLayouts(self);
     if (self.flush_aborted) return;
