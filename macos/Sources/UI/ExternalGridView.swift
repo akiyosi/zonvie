@@ -81,6 +81,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
     /// Track if we've presented at least once (for loadAction optimization)
     private var hasPresentedOnce = false
+    /// Until this moment, `occlusionState` may still describe this window as it
+    /// stood BEFORE the app itself ordered another window in front of it. See
+    /// markOcclusionSuspect.
+    private var occlusionSuspectUntil: CFAbsoluteTime = 0
+    /// Measured at 25-36ms — about two vsyncs — between the app ordering a
+    /// window in front and the server publishing the occlusion that follows
+    /// from it. 100ms leaves margin without being long enough to be seen: the
+    /// window it holds back has just lost focus.
+    private static let occlusionSuspectSeconds: CFTimeInterval = 0.1
     private let redrawScheduler = SurfaceRedrawScheduler()
 
     // --- IME / NSTextInputClient support ---
@@ -2031,6 +2040,29 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     }
 
     /// Request a redraw after vertices are submitted.
+    /// The app just ordered some window in front; this one may now be covered
+    /// and does not know it yet.
+    ///
+    /// `occlusionState` is published asynchronously by the window server, so
+    /// for a frame or two after a window is covered it still reports
+    /// `.visible` — while its layer has already stopped being composited, so
+    /// `currentDrawable` has no drawable to return and burns its full
+    /// one-second timeout on the MAIN thread. Every run of
+    /// extfloat_resize_shader_stall shows one or two such frames right after
+    /// `[cursor_grid_changed] activated main window`, and the runs that fail
+    /// are the ones where one of them had to pay: the nine recorded failures
+    /// stall 1008-1018ms, which is that timeout and nothing else.
+    ///
+    /// The app knows it ordered the window in front — that is not asynchronous
+    /// — so the frames in between are skipped rather than guessed at. A window
+    /// that turns out to still be visible loses at most 100ms of animation on
+    /// a focus change.
+    func markOcclusionSuspect() {
+        occlusionSuspectUntil = CFAbsoluteTimeGetCurrent() + Self.occlusionSuspectSeconds
+        // The frames skipped below are frames the animation still owes.
+        requestRedraw()
+    }
+
     func requestRedraw() {
         redrawScheduler.requestRedraw(rect: nil, bounds: bounds, window: window) { [weak self] redrawRect in
             guard let self else { return }
@@ -2261,10 +2293,22 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         autoreleasepool {
             FrameTracer.trace(.drawBegin, seq: UInt32(truncatingIfNeeded: gridId))
             var finishedRedraw = false
+            // The external draw logs nothing after it acquires its drawable,
+            // so a stall inside it was indistinguishable from one outside it —
+            // the main surface has `draw_total` and this one had nothing. Only
+            // when a frame is already far too slow to be a frame, so the line
+            // cannot become the thing it is measuring.
+            let probeT0 = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
             defer {
                 FrameTracer.trace(.drawEnd, seq: UInt32(truncatingIfNeeded: gridId))
                 if !finishedRedraw {
                     redrawScheduler.didDrawFrame()
+                }
+                if probeT0 > 0 {
+                    let ms = (CFAbsoluteTimeGetCurrent() - probeT0) * 1000
+                    if ms > 40 {
+                        ZonvieCore.appLog("[ext_draw_slow] gridId=\(gridId) ms=\(String(format: "%.1f", ms)) presented=\(finishedRedraw)")
+                    }
                 }
             }
 
@@ -2297,6 +2341,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // popupmenu panel empty until the notification lands — and a
             // window with nothing on screen yet has no stale content worth
             // protecting, so it is allowed to pay the acquire once.
+            // Ahead of the guard below, because the state that guard reads is
+            // the stale one during this window. hasPresentedOnce for the same
+            // reason the guard has it: a window with nothing on screen yet has
+            // nothing to protect and must be allowed to draw its first frame.
+            if hasPresentedOnce, CFAbsoluteTimeGetCurrent() < occlusionSuspectUntil {
+                ZonvieCore.appLog("[ext_draw_defer] gridId=\(gridId) occlusion not settled yet; skipping frame")
+                requestRedraw()
+                return
+            }
+
             if hasPresentedOnce, let win = view.window,
                win.isMiniaturized || !win.occlusionState.contains(.visible) {
                 ZonvieCore.appLog("[ext_draw_skip] gridId=\(gridId) window not visible; skipping frame")

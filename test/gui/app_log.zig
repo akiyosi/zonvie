@@ -24,7 +24,7 @@ const max_log_bytes = 256 * 1024 * 1024;
 
 /// Parse the app clock (in milliseconds) out of one log line.
 /// Lines look like `[zonvie] [ 1234.567ms] rest…`; anything else -> null.
-fn lineTimestampMs(line: []const u8) ?f64 {
+pub fn lineTimestampMs(line: []const u8) ?f64 {
     const prefix = "[zonvie] [";
     if (!std.mem.startsWith(u8, line, prefix)) return null;
     const rest = line[prefix.len..];

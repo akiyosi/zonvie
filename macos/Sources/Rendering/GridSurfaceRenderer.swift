@@ -1730,6 +1730,25 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// rowsDelta. Only commitFlush writes it; copyPlacementRowsUp reads it.
     /// Protected by `lock`.
     private var layerPlacementRowsUp: [Int64: Int] = [:]
+    /// The float-debt ledger's anchor half, published with the offsets it
+    /// belongs to, and the zero the two halves are compared against. Both are
+    /// protected by `lock` and consumed in `applyFloatScrollDebt`.
+    private var scrollDebtAnchorRowsUp: [Int32: Int32] = [:]
+    private var scrollDebtBaseline: [Int32: Int32] = [:]
+    /// A cell's height in the NDC the offsets above were built in, and in the
+    /// pixels the cursor rect is measured in. Kept so the debt, which is
+    /// counted in rows, can be paid in either set of units.
+    private var scrollDebtCellHeightNDC: Float = 0
+    private var scrollDebtCellHeightPx: Float = 0
+    /// Last debt logged per grid. The ledger had no logging at all, and the
+    /// `[renderer] scroll offset` line reports the offset BEFORE the debt is
+    /// paid, so a float held by the ledger looked identical to one that was
+    /// not. One line per transition rather than per frame: a run holds a
+    /// handful of distinct debts, and a per-frame line changes the very
+    /// timing this pays for.
+    private var scrollDebtLastLogged: [Int32: Int32] = [:]
+    /// Last value `[main_visibility]` reported, so the line is a transition.
+    private var lastWindowHiddenLogged = false
 
     /// Hand the float ledger the placement travel it needs, into storage the
     /// caller owns, so the per-frame read costs one lock and no allocation.
@@ -1738,6 +1757,54 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         defer { lock.unlock() }
         out.removeAll(keepingCapacity: true)
         for (gridId, rows) in layerPlacementRowsUp { out[gridId] = rows }
+    }
+
+    /// Withhold the part of a following float's compensation that stands for
+    /// scroll steps its own placement has not performed — or lend it the part
+    /// its placement has already performed and the anchor has not landed yet.
+    ///
+    /// Called with `lock` held, from the frame's committed snapshot, because
+    /// that is the only point where the placement this frame DRAWS and the
+    /// counter describing it are the same commit. Built with the offsets
+    /// instead, the counter is copied before the flush that publishes the
+    /// placement and the snapshot is taken after it, so a float whose
+    /// `win_float_pos` arrives a frame ahead of its anchor's `grid_scroll` is
+    /// drawn with the debt reading zero — a whole 'mousescroll' step of jump,
+    /// then the same jump back when the compensation lands.
+    ///
+    /// Both counters run from whenever their grid appeared, so the first frame
+    /// a float is seen following fixes the zero they are compared against.
+    private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset]) {
+        guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return }
+        for i in snapshot.indices {
+            let gid = snapshot[i].grid_id
+            guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { continue }
+            let placementRowsUp = Int32(clamping: layerPlacementRowsUp[Int64(gid)] ?? 0)
+            let paced = anchorRowsUp - placementRowsUp
+            guard let baseline = scrollDebtBaseline[gid] else {
+                scrollDebtBaseline[gid] = paced
+                continue
+            }
+            let debtRows = paced - baseline
+            if ZonvieCore.appLogEnabled, scrollDebtLastLogged[gid] != debtRows {
+                scrollDebtLastLogged[gid] = debtRows
+                ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=\(baseline)")
+            }
+            guard debtRows != 0 else { continue }
+            // offset_y is NDC and negated against the pixel offset the view
+            // built (see computeScrollOffset), so withholding pixels adds here.
+            snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
+            // The cursor rect is displaced by this grid's offset in pixels, and
+            // it was the debt-paid offset before this subtraction moved here.
+            // A cursor left on the raw one would sit a whole step off the rows
+            // it belongs to for the length of the mismatch.
+            if shared.shaderCursor.belongs(toGrid: Int64(gid)) {
+                shaderCursorScrollOffsetPx -= Float(debtRows) * scrollDebtCellHeightPx
+                if shared.shaderCursor.evaluate(scrollOffsetPx: shaderCursorScrollOffsetPx) {
+                    shaderCursorMovedThisFrame = true
+                }
+            }
+        }
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -2332,6 +2399,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
                     staged.contains { $0.gridId == entry.key }
                 }
+                scrollDebtBaseline = scrollDebtBaseline.filter { entry in
+                    staged.contains { $0.gridId == Int64(entry.key) }
+                }
+                // Or the next float to take this id inherits the last one's
+                // debt as its "already logged" value and says nothing.
+                scrollDebtLastLogged = scrollDebtLastLogged.filter { entry in
+                    staged.contains { $0.gridId == Int64(entry.key) }
+                }
             }
         }
         if didCursorWrite {
@@ -2642,6 +2717,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // fixed floats with a STRICTLY higher zindex, so a float scrolling
         // above its own backdrop keeps drawing.
         var zindex: Int32 = 0
+        // Rows the anchor this float follows has landed, for the float debt
+        // (see applyFloatScrollDebt). Non-nil only for a following float, and
+        // raw rather than differenced: the other half of the subtraction is
+        // only readable under this renderer's lock, so the subtraction itself
+        // has to happen there.
+        var debtAnchorRowsUp: Int32? = nil
     }
 
     /// - Parameters:
@@ -2676,9 +2757,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // carry DECO_SCROLLABLE (flush.zig), and a bodily-moved float
         // (move_all) translates every vertex it owns.
         var cursorScrollOffsetPx: Float = 0
+        scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
+        scrollDebtCellHeightNDC = cellHeightNDC
+        scrollDebtCellHeightPx = cellHeightPx
         for info in offsets {
             if shared.shaderCursor.belongs(toGrid: info.gridId) {
                 cursorScrollOffsetPx = info.offsetYPx
+            }
+            if let anchorRowsUp = info.debtAnchorRowsUp {
+                scrollDebtAnchorRowsUp[Int32(clamping: info.gridId)] = anchorRowsUp
             }
             scrollOffsetData.append(Self.computeScrollOffset(
                 info: info,
@@ -2842,7 +2929,19 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // asking for a frame every vsync regardless of visibility.
         // ExternalGridView.draw carries the same guard, where the block was
         // first measured at ~1s per attempt.
-        if let window = view.window, window.isMiniaturized || !window.occlusionState.contains(.visible) {
+        let windowIsHidden = view.window.map {
+            $0.isMiniaturized || !$0.occlusionState.contains(.visible)
+        } ?? false
+        if windowIsHidden != lastWindowHiddenLogged {
+            lastWindowHiddenLogged = windowIsHidden
+            // A transition, not a frame: this path returns before
+            // `[draw] draw(in:) called`, so a window the server calls hidden
+            // leaves a gap in the draw series that is indistinguishable from a
+            // main thread blocked in `currentDrawable`. Both are ~1s in the
+            // field, and only this line tells them apart.
+            ZonvieCore.appLog("[main_visibility] hidden=\(windowIsHidden) miniaturized=\(view.window?.isMiniaturized ?? false)")
+        }
+        if windowIsHidden {
             // Drain the scroll clears anyway: they are appended from the core
             // thread and drained ONLY inside draw(), so a window left covered
             // for an hour with a background :terminal scrolling would leave an
@@ -2988,7 +3087,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // combined smoothScrolling). Latched as the previous frame
             // below so the one-frame extension does not self-latch.
             let hadActiveScrollOffsetThisFrame: Bool
-            let scrollSnapshot: [ScrollOffset]  // Snapshot for setVertexBytes (no GPU/CPU race)
+            // Snapshot for setVertexBytes (no GPU/CPU race). `var` for the
+            // float debt below, which is COW-free until a float actually owes
+            // one — the common frame copies nothing.
+            var scrollSnapshot: [ScrollOffset]
             let retainedSnapshot: [RetainedScrollRow]  // Rows kept alive across a smooth-scroll step
             let fixedFloatBandsSnapshot: [FixedFloatBand]  // Snapshots for setFragmentBytes
             let fixedFloatIntervalsSnapshot: [FixedFloatInterval]
@@ -3044,6 +3146,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive
             smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            applyFloatScrollDebt(to: &scrollSnapshot)
             // Retire retained rows whose grid is no longer displaced. Also here,
             // not only in updateScrollOffsets: the view skips that function once
             // nothing is easing, so a grid that scrolled without ever being

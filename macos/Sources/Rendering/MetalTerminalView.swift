@@ -3422,10 +3422,12 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 }
             }
             guard let offsetYPx = followedOffsetYPx, let followedGridId else { continue }
-            // Withhold the part of the anchor's compensation that stands for
-            // scroll steps this float has not been re-placed for yet.
-            let debtRows = floatDebtRows(gridId: floatGrid.gridId, anchorGridId: followedGridId)
-            let effectiveOffsetYPx = offsetYPx - Float(debtRows) * cellHeightPx
+            // The anchor half of the float debt, handed down raw. The other
+            // half — how far this float's own placement has travelled — is only
+            // consistent with the placement a frame draws inside the renderer's
+            // own lock, so GridSurfaceRenderer.applyFloatScrollDebt does the
+            // subtraction there rather than here.
+            let debtAnchorRowsUp = Int32(clamping: anchorLandedRowsUpSnapshot(followedGridId))
             // A partial offset set can split a float from its anchor. Signal
             // overflow so the caller disables the whole transform for this
             // frame instead of silently truncating semantic state.
@@ -3435,16 +3437,25 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
             offsets.append(GridSurfaceRenderer.ScrollOffsetInfo(
                 gridId: floatGrid.gridId,
-                offsetYPx: effectiveOffsetYPx,
+                offsetYPx: offsetYPx,
                 gridTopYNDC: gridTopYNDC,
                 gridRows: floatGrid.rows,
                 marginTop: 0,
                 marginBottom: 0,
                 clipToContent: false,
-                zindex: Int32(clamping: floatGrid.zindex)
+                zindex: Int32(clamping: floatGrid.zindex),
+                debtAnchorRowsUp: debtAnchorRowsUp
             ))
         }
         return true
+    }
+
+    /// The anchor's landed-rows counter, read under the lock that writes it
+    /// alongside the compensation it belongs to, so the pair travels together.
+    private func anchorLandedRowsUpSnapshot(_ anchorGridId: Int64) -> Int {
+        scrollOffsetLock.lock()
+        defer { scrollOffsetLock.unlock() }
+        return anchorLandedRowsUp[anchorGridId] ?? 0
     }
 
     /// Rows of the anchor's compensation this float has not been re-placed
@@ -3458,7 +3469,15 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// The debt in pixels, for a caller that displaces a float bodily rather
     /// than through a ScrollOffset entry. The external surfaces move a
     /// following layer that way, so this is how they reach the same correction
-    /// the main renderer applies when it builds the float's offset.
+    /// the main renderer applies to a float's offset.
+    ///
+    /// Diverges from the main surface deliberately, and not for a good reason:
+    /// the main surface pays the debt in GridSurfaceRenderer.applyFloatScrollDebt,
+    /// at the committed snapshot, because `placementRowsUpScratch` is copied
+    /// before the flush that publishes a placement and the snapshot is taken
+    /// after it. This path still reads the scratch and so still has that
+    /// one-commit skew; it is left as it was because no test exercises it and
+    /// the skew has only ever been measured on the main surface.
     func floatDebtPx(gridId: Int64, anchorGridId: Int64, cellHeightPx: Float) -> Float {
         guard cellHeightPx > 0 else { return 0 }
         return Float(floatDebtRows(gridId: gridId, anchorGridId: anchorGridId)) * cellHeightPx
