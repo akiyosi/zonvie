@@ -25,6 +25,7 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
+const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_extwin_float_trackpad_scroll.log";
 const max_windows = 16;
@@ -109,6 +110,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "row={d}, col={d}, width={d}, height={d}, style=\"minimal\"}}) return 1 end)()')",
         .{ float_row, float_col, float_cols, float_rows },
     );
+    const t_float = try app_log.nowMs(alloc, log_path);
     try g.exec(open_float);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
@@ -117,6 +119,27 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // path was never broken, and would pass for the wrong reason.
     if (try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_float).win == _G.z_anchor) and 1 or 0')") != 1) {
         return error.FloatNotAnchoredToExternal;
+    }
+
+    // Opening the float moved the cursor onto a grid the EXTERNAL surface
+    // hosts, and the app makes key whichever window owns the cursor's grid. It
+    // resolved that owner from the COMMITTED map, which does not name the host
+    // until the flush that places the float commits — one flush later — so it
+    // found no window under the float's own id, fell through to the main
+    // window, and took key status away from the window the cursor had just
+    // entered. Measured at the decision: `gridId=5 committed=nil pending=4`.
+    //
+    // Asserted on the app's own line rather than on z-order: an external
+    // window sits at `.floating` while the main window is `.normal`, so
+    // ordering the main window front cannot actually put it over one — the
+    // harm is key status, not stacking. Asserted here rather than after the
+    // refocus below, which resolves the host anyway and would hide it.
+    if (try app_log.containsSince(alloc, log_path, "activated main window", t_float)) {
+        std.debug.print(
+            "[gui] entering a float the external window hosts made the MAIN window key\n",
+            .{},
+        );
+        return error.HostWindowLostKeyToMain;
     }
     const window_count = platform.windowsForPid(g.app_pid, &before_buf);
     if (window_count != before_count + 1) {
