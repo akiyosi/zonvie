@@ -1506,14 +1506,26 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // and returned by defer, so appending/scroll expansion reuses capacity
     // without a live property alias that would trigger Array COW detaches.
     private var dirtyRowsScratch: [Int] = []
-    /// Per-frame snapshots taken under `lock`: the committed layer list and,
-    /// index-aligned, each layer's buffer sets. Reused across frames.
-    private var layerSnapshot: [SurfaceLayer] = []
-    private var layerSetsSnapshot: [[SurfaceBufferSet]] = []
-    /// Index-aligned with `layerSnapshot` as well: the draw state of the grid
-    /// each layer places, nil for the root grid and for a grid that has not
-    /// submitted anything yet. Reused across frames.
-    private var layerStateSnapshot: [LayerDrawState?] = []
+    /// One layer this frame draws, and everything the draw needs about it.
+    ///
+    /// These were three arrays read at the same index, which the declarations
+    /// had to keep saying were "index-aligned" — a pairing the type system did
+    /// not hold, so any append that missed one array silently paired a layer
+    /// with another layer's buffers. ExternalGridView never had that shape; it
+    /// carries one array of pairs. One array of one struct is the same idea
+    /// with the draw state this surface additionally keeps.
+    private struct LayerFrameEntry {
+        let layer: SurfaceLayer
+        /// Every buffer set this layer's grid owns, or empty for one that has
+        /// never submitted.
+        let sets: [SurfaceBufferSet]
+        /// The draw state of the grid the layer places: nil for the root and
+        /// for a grid that has not submitted anything yet.
+        let state: LayerDrawState?
+    }
+
+    /// Per-frame snapshot taken under `lock`, reused across frames.
+    private var layerSnapshot: [LayerFrameEntry] = []
     /// Per-grid dirty/scroll bookkeeping for the surface's non-root layers.
     /// Protected by `lock`; an entry is created when a grid first submits a row
     /// or a scroll and released when the grid is destroyed.
@@ -3133,11 +3145,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             layerSnapshot.removeAll(keepingCapacity: true)
-            layerSetsSnapshot.removeAll(keepingCapacity: true)
-            layerStateSnapshot.removeAll(keepingCapacity: true)
             for layer in committedSurfaceLayers {
-                layerSnapshot.append(layer)
-                layerSetsSnapshot.append(gridBuffers.existingSets(for: layer.gridId) ?? [])
                 // Only a grid the committed layout places is consumed. Work
                 // staged for one not on screen yet waits for the layout that
                 // places it, which marks it fully dirty (see commitFlush).
@@ -3155,7 +3163,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         anyLayerWork = true
                     }
                 }
-                layerStateSnapshot.append(state)
+                layerSnapshot.append(LayerFrameEntry(
+                    layer: layer,
+                    sets: gridBuffers.existingSets(for: layer.gridId) ?? [],
+                    state: state
+                ))
             }
             cursorLayerOriginSnapshot = committedCursorLayerOriginPx
             cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
@@ -3408,7 +3420,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let vpWidth = Double((drawableWi / cellWi) * cellWi)
             let vpHeight = Double((drawableHi / cellHi) * cellHi)
             // The root layer drives the pixel space core vertices arrive in.
-            let rootLayerOrigin = layerSnapshot.first?.originPx ?? simd_float2(0, 0)
+            let rootLayerOrigin = layerSnapshot.first?.layer.originPx ?? simd_float2(0, 0)
             let viewportMetrics = SurfaceViewportMetrics(
                 viewportWidth: vpWidth,
                 viewportHeight: vpHeight,
@@ -3592,7 +3604,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Asked for by both the blit decision below and the layer draw
             // loop, which have to agree on how tall the layer is.
             func layerResolvableRowCount(_ li: Int, _ layer: SurfaceLayer) -> Int {
-                let sets = layerSetsSnapshot[li]
+                let sets = layerSnapshot[li].sets
                 guard sets.count == 3 else { return 0 }
                 return min(sets[csi].rowLogicalToSlot.count, layer.rows)
             }
@@ -3645,7 +3657,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 var plan = p.cValue
 
                 for mi in (li + 1)..<layerSnapshot.count {
-                    let above = layerSnapshot[mi]
+                    let above = layerSnapshot[mi].layer
                     guard above.rows > 0, above.cols > 0 else { continue }
                     var over = zonvie_over_blit_rows()
                     guard zonvie_core_row_scroll_over_blit_rows(
@@ -3663,7 +3675,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // The covering layer puts itself back. A layer with no draw
                     // state redraws every row anyway, so there is nothing to
                     // mark for it.
-                    if over.has_above != 0, let aboveState = layerStateSnapshot[mi] {
+                    if over.has_above != 0, let aboveState = layerSnapshot[mi].state {
                         aboveState.drawRows.append(
                             contentsOf: Int(over.above_first)...Int(over.above_last))
                     }
@@ -3691,8 +3703,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             var useGpuScrollCopy = false
             var scrollBlitEncoder: MTLBlitCommandEncoder? = nil
             acceptedBlitRectsPx.removeAll(keepingCapacity: true)
-            for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                guard let state = layerStateSnapshot[li], let scroll = state.drawScroll else { continue }
+            for (li, entry) in layerSnapshot.enumerated().dropFirst() {
+                let layer = entry.layer
+                guard let state = entry.state, let scroll = state.drawScroll else { continue }
                 state.drawScroll = nil
 
                 let originXPx = Int(layer.originPx.x.rounded(.down))
@@ -3840,8 +3853,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if layerSnapshot.count > 1 && bandRowHeightPx > 0 {
                 for row in dirtyRows {
                     let bandTopPx = row * bandRowHeightPx
-                    for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                        guard let state = layerStateSnapshot[li] else { continue }
+                    for entry in layerSnapshot.dropFirst() {
+                        let layer = entry.layer
+                        guard let state = entry.state else { continue }
                         guard let rows = layerRowsUnderBand(
                             bandTopPx: bandTopPx,
                             bandBottomPx: bandTopPx + bandRowHeightPx,
@@ -3870,8 +3884,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 let rowHeightPx = Int(cellHi)
                 guard rowHeightPx > 0 else { return }
                 for mi in (li + 1)..<layerSnapshot.count {
-                    let above = layerSnapshot[mi]
-                    guard let aboveState = layerStateSnapshot[mi], above.cols > 0 else { continue }
+                    let above = layerSnapshot[mi].layer
+                    guard let aboveState = layerSnapshot[mi].state, above.cols > 0 else { continue }
                     let aLeftPx = Int(above.originPx.x.rounded(.down))
                     let aRightPx = aLeftPx + above.cols * Int(cellWi)
                     guard aLeftPx < rightPx, aRightPx > leftPx else { continue }
@@ -3891,8 +3905,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // layer above, doubling the count per overlapping layer. The
             // frontmost layer marks nothing but is normalized here too, so no
             // separate pass follows.
-            for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                guard let state = layerStateSnapshot[li] else { continue }
+            for (li, entry) in layerSnapshot.enumerated().dropFirst() {
+                let layer = entry.layer
+                guard let state = entry.state else { continue }
                 surfaceSortAndDeduplicateRows(&state.drawRows)
                 guard layer.rows > 0, layer.cols > 0, bandRowHeightPx > 0 else { continue }
                 let leftPx = Int(layer.originPx.x.rounded(.down))
@@ -4271,15 +4286,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // core's layout contract requires.
             if layerSnapshot.count > 1 {
                 enc.setRenderPipelineState(pipeline!)
-                for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                    let sets = layerSetsSnapshot[li]
+                for (li, entry) in layerSnapshot.enumerated().dropFirst() {
+                    let layer = entry.layer
+                    let sets = entry.sets
                     guard sets.count == 3 else { continue }
                     let set = sets[csi]
                     let rowCount = layerResolvableRowCount(li, layer)
                     guard rowCount > 0 else { continue }
                     // What this layer owes the frame; nil for a grid with no
                     // draw state, which is treated as owing everything.
-                    let st = layerStateSnapshot[li]
+                    let st = entry.state
 
                     // A layer this frame displaces bodily (move_all: a float
                     // following its anchor's smooth scroll) is drawn at a
@@ -4580,8 +4596,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // editor row is one of these, so extracting only the root
                     // grid leaves the whole screen unlit.
                     if layerSnapshot.count > 1 {
-                        for (li, layer) in layerSnapshot.enumerated().dropFirst() {
-                            let sets = layerSetsSnapshot[li]
+                        for entry in layerSnapshot.dropFirst() {
+                            let layer = entry.layer
+                            let sets = entry.sets
                             guard sets.count == 3 else { continue }
                             let set = sets[csi]
                             let rowCount = min(set.rowLogicalToSlot.count, layer.rows)
