@@ -3139,7 +3139,21 @@ pub const Core = struct {
     /// arms bounded maintenance retries. Upload/create failures use
     /// flush_aborted and still return null, immediately rejecting the whole
     /// transaction rather than publishing a blank.
-    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+    /// Rasterize one glyph through a frontend callback, time it, and pack the
+    /// result into the atlas.
+    ///
+    /// The two entry points below differ in one callback and one decision, and
+    /// both had the whole body written out. `arm_transient_retry` is required
+    /// rather than defaulted so a third caller has to answer it: it arms the
+    /// bounded reprobe that recovers a glyph the rasterizer failed to produce
+    /// once, and the two existing callers answer it differently — see each.
+    fn ensureGlyphRasterized(
+        self: *Core,
+        key: u32,
+        style_flags: u32,
+        rasterize: c_api.RasterizeGlyphFn,
+        arm_transient_retry: bool,
+    ) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
         defer if (log_on) {
@@ -3150,10 +3164,10 @@ pub const Core = struct {
 
         if (!self.ensureAtlasInit()) return null;
 
-        // Ask frontend to rasterize (no packing / UV)
+        // Ask the frontend to rasterize (no packing / UV).
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
+        const ok = rasterize(self.ctx, key, style_flags, &bm);
         if (log_on) {
             const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
             self.perf_rasterize_ns_total +%= dt;
@@ -3161,11 +3175,23 @@ pub const Core = struct {
         }
         if (self.flush_aborted) return null;
         if (ok == 0) {
-            self.recordTransientGlyphNegative();
+            if (arm_transient_retry) self.recordTransientGlyphNegative();
             return blankGlyphEntry(&bm);
         }
 
         return self.packAndUploadBitmap(&bm);
+    }
+
+    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+        return self.ensureGlyphRasterized(
+            scalar,
+            style_flags,
+            self.cb.on_rasterize_glyph.?,
+            // A scalar that failed to rasterize is the case the bounded
+            // reprobe exists for: a font the frontend had not finished
+            // loading yet answers on a later attempt.
+            true,
+        );
     }
 
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
@@ -3174,30 +3200,17 @@ pub const Core = struct {
     /// primary-face misses commonly succeed through the caller's scalar/fallback
     /// font path. Only a final scalar miss starts the bounded retry episode.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
-        const log_on = self.log.cb != null;
-        const t_total: i128 = if (log_on) clock.nowNs() else 0;
-        defer if (log_on) {
-            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_total));
-            self.perf_atlas_total_ns_total +%= dt;
-            self.perf_atlas_total_calls +%= 1;
-        };
-
-        if (!self.ensureAtlasInit()) return null;
-
-        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
-        const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = self.cb.on_rasterize_glyph_by_id.?(self.ctx, glyph_id, style_flags, &bm);
-        if (log_on) {
-            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
-            self.perf_rasterize_ns_total +%= dt;
-            self.perf_rasterize_calls +%= 1;
-        }
-        if (self.flush_aborted) return null;
-        if (ok == 0) {
-            return blankGlyphEntry(&bm);
-        }
-
-        return self.packAndUploadBitmap(&bm);
+        return self.ensureGlyphRasterized(
+            glyph_id,
+            style_flags,
+            self.cb.on_rasterize_glyph_by_id.?,
+            // NOT armed, which is how this path has always behaved. A shaped
+            // glyph that fails to rasterize caches a blank and is not
+            // reprobed. Nothing on record says that was decided rather than
+            // omitted — the two bodies were maintained apart — so it is
+            // preserved here and named, not quietly changed.
+            false,
+        );
     }
 
     /// Reset core atlas: clear packer, invalidate cache, recreate texture.
