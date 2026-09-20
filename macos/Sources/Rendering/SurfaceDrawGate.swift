@@ -69,6 +69,17 @@ struct SurfaceIdleTerms {
     /// be re-encoded even with nothing else to say.
     var shaderAnimates = false
 
+    /// The cursor rect a custom shader draws against moved.
+    ///
+    /// It is an input to the FRAGMENT stage over the whole surface, so moving
+    /// it changes pixels everywhere the chain runs — and it moves on frames
+    /// with no dirty row, no layer work and no blink, because the rect is
+    /// published at commit and folded into screen space at pre-draw. Without
+    /// this term the gate skipped every frame after such a commit and the
+    /// cursor effect stayed where it last happened to be encoded, for as long
+    /// as nothing else asked for a frame.
+    var shaderCursorMoved = false
+
     /// The decision and every term behind it, for `ZONVIE_DRAW_TRACE=1`.
     ///
     /// Built here rather than at the two call sites, which is where the field
@@ -84,6 +95,7 @@ struct SurfaceIdleTerms {
             + " dirty=\(hasDirtyRows ? 1 : 0) rect=\(hasDirtyRect ? 1 : 0)"
             + " layerWork=\(hasLayerWork ? 1 : 0) scroll=\(hasStagedScroll ? 1 : 0)"
             + " scrollOff=\(scrollOffsetChanged ? 1 : 0) smooth=\(isSmoothScrolling ? 1 : 0)"
+            + " shaderCur=\(shaderCursorMoved ? 1 : 0)"
             + " blink=\(blinkStateChanged ? 1 : 0) sizeChg=\(drawableSizeChanged ? 1 : 0)"
             + " anim=\(shaderAnimates ? 1 : 0)"
             + " -> \(skipsFrame ? "skip" : "draw")"
@@ -105,6 +117,7 @@ struct SurfaceIdleTerms {
             && !blinkStateChanged
             && !drawableSizeChanged
             && !shaderAnimates
+            && !shaderCursorMoved
     }
 }
 

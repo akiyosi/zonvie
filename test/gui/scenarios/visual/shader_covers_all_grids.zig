@@ -77,6 +77,30 @@ fn bandCentroidX(img: driver.capture.Image, y0: usize, y1: usize) struct { x: f6
 /// pinned to the top-left window produces a left-half band all by itself,
 /// and an origin error of a few cells, or one that used the anchor grid
 /// instead of the layer, stays inside the half it belongs to.
+/// Capture until the cursor band's centroid has moved away from `from_x`, or
+/// the deadline passes. Returns the last capture either way; the caller's
+/// assertion decides.
+fn captureBandMoved(
+    g: *Gui,
+    from_x: f64,
+    y0: usize,
+    y1: usize,
+    timeout_ms: u64,
+) !driver.capture.Image {
+    // Wider than a cell, so a sub-cell shimmer in the band's own pixels does
+    // not read as the move.
+    const moved_px: f64 = 40;
+    var timer = gui_io.Timer.start();
+    while (true) {
+        var img = try g.captureStable(crop, timeout_ms);
+        const band = bandCentroidX(img, y0, y1);
+        if (band.n >= min_band_px and @abs(band.x - from_x) > moved_px) return img;
+        if (timer.read() / std.time.ns_per_ms >= timeout_ms) return img;
+        img.deinit(g.alloc);
+        gui_io.sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
 fn expectedBandX(g: *Gui, cell_w: f64) !f64 {
     const win_col = try g.evalInt("win_screenpos(0)[1]");
     return @as(f64, @floatFromInt(win_col - 1)) * cell_w;
@@ -152,9 +176,22 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Move the cursor into the OTHER split. Its grid is drawn as a layer at a
     // non-zero origin, which is the case the grid-local vertices do not carry.
     try g.exec("execute('wincmd l')");
-    gui_io.sleepNs(600 * std.time.ns_per_ms);
 
-    var right_img = try g.captureStable(crop, 8000);
+    // Wait for the band to MOVE, not for the screen to settle.
+    //
+    // `captureStable` returns as soon as two consecutive captures match, so a
+    // screen still showing the previous phase — stale but unchanging — comes
+    // back in ~300ms and its 8s timeout never engages. That read the LEFT
+    // phase's image for the RIGHT phase's assertion whenever the redraw landed
+    // more than about a second after the window change, which is the whole of
+    // this scenario's recorded flakiness (2 runs in 8, always the same numbers:
+    // the left band's x with exactly half its pixels, because a band at column
+    // one is half outside the window).
+    //
+    // A cursor uniform that genuinely never follows the cursor makes this time
+    // out and then fails the same assertion below, so the wait cannot hide a
+    // regression.
+    var right_img = try captureBandMoved(g, left_band.x, y0, y1, 8000);
     defer right_img.deinit(alloc);
 
     const right_band = bandCentroidX(right_img, y0, y1);

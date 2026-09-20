@@ -1823,6 +1823,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// the cursor still moves — the evaluation has to run every frame or the
     /// shader keeps whatever endpoints the last scrolled frame left it.
     private var shaderCursorScrollOffsetPx: Float = 0
+    /// Set by the pre-draw when the shader's cursor rect moved; consumed by
+    /// this frame's idle gate. Draw thread only.
+    private var shaderCursorMovedThisFrame = false
 
     private func ensureBackBuffer(drawableSize: CGSize, pixelFormat: MTLPixelFormat) {
         if backBuffer != nil, backBufferSize == drawableSize { return }
@@ -2735,7 +2738,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         let offsetPx = shaderCursorScrollOffsetPx
         lock.unlock()
-        shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx)
+        // Latched for the gate below: a moved cursor rect is whole-surface
+        // fragment work, and this runs in the pre-draw that precedes the gate.
+        if shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx) {
+            shaderCursorMovedThisFrame = true
+        }
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
@@ -3225,9 +3232,20 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 isSmoothScrolling: smoothScrolling,
                 blinkStateChanged: blinkStateChanged,
                 drawableSizeChanged: drawableSizeChanged,
-                shaderAnimates: shared.anyCustomShaderNeedsAnimation
+                shaderAnimates: shared.anyCustomShaderNeedsAnimation,
+                shaderCursorMoved: shaderCursorMovedThisFrame
             )
             let idleGateSkips = idleTerms.skipsFrame
+            // The defect this gate term exists for, stated as a check: a frame
+            // skipped while the shader is still showing an older cursor rect
+            // means nothing will ask for the new one again. It fired fifteen
+            // times in a row on a failing run and zero times after the fix, so
+            // it is the signal to look for if the effect ever sticks again.
+            // Costs one comparison on an already-skipped frame.
+            if idleGateSkips, ZonvieCore.appLogEnabled,
+               shared.shaderCursor.snapshot().current.0 != lastLoggedShaderCursor.0 {
+                ZonvieCore.appLog("[shader_cursor_stale] " + idleTerms.traceLine(surface: 1))
+            }
             ZonvieCore.drawTrace(idleTerms.traceLine(surface: 1))
             if idleGateSkips {
                 // Still reset redrawPending so future redraws are not blocked.
@@ -4636,6 +4654,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Shared with ExternalGridView: the chain-or-copy ladder is one
             // function now, and the two closures are the only places the
             // surfaces differ.
+            // Cleared HERE, not at the gate: between the two this frame can
+            // still give up (no drawable, semaphore busy, no back buffer), and
+            // clearing early stranded the signal — `evaluate` reports a move
+            // once, so a frame that consumed it and then bailed left every
+            // later frame with nothing to say and the effect at its old place.
+            shaderCursorMovedThisFrame = false
             let presentation = encodeSurfaceBackBufferToDrawable(
                 cmd: cmd,
                 backTex: backTex,
