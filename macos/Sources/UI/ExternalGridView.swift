@@ -97,7 +97,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var unifiedBlurPipeline: MTLRenderPipelineState? { shared.unifiedBlurPipeline }
 
     /// Scroll-offset publication and the font generation: `scrollOffsetData`,
-    /// `lastPresentedScrollOffsetData`, `lastPresentedScrollOffsetActive`,
+    /// `lastPresentedScrollOffsetData`, `scrollOffsetLatch`,
     /// `retention`'s published set, and the committed font generation.
     ///
     /// One of **three** locks on this surface where the main surface has one.
@@ -465,7 +465,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     // Scroll offset data stored as value-type; passed to GPU via setVertexBytes
     // to avoid shared MTLBuffer GPU/CPU race.
     private var scrollOffsetData: GridSurfaceRenderer.ScrollOffset?
-    private var scrollOffsetActive: Bool = false
+    /// Shared with GridSurfaceRenderer. This surface latches the previous
+    /// frame when it PRESENTS one; the main surface latches when it commits to
+    /// drawing one and rolls the latch back if that frame is abandoned.
+    /// Guarded by `lock`, with the rest of the scroll-offset publication.
+    private var scrollOffsetLatch = SurfaceScrollOffsetLatch()
     /// One offset per hosted grid that is scrolling in its own right, sorted by
     /// grid id for `surfaceScrollOffset`'s binary search. The root's own offset
     /// stays in `scrollOffsetData`: that is the one the surface-wide passes
@@ -480,7 +484,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private var lastPresentedHostedScrollOffsetData: [GridSurfaceRenderer.ScrollOffset] = []
     private var hostedLayerOriginScratch: [(gridId: Int64, originYPx: Float, z: Int32)] = []
     private var lastPresentedScrollOffsetData: GridSurfaceRenderer.ScrollOffset?
-    private var lastPresentedScrollOffsetActive: Bool = false
+
     /// Rows scrolled off this window's edge, kept alive so the band the
     /// smooth-scroll offset opens shows them instead of the edge row's
     /// background stretched over it. Same mechanism the main surface uses;
@@ -3104,7 +3108,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             let hostedScrollOffsetSnapshot: [GridSurfaceRenderer.ScrollOffset]
             do {
                 lock.lock()
-                scrollOffsetSnapshot = scrollOffsetActive ? scrollOffsetData : nil
+                scrollOffsetSnapshot = scrollOffsetLatch.isActive ? scrollOffsetData : nil
                 hostedScrollOffsetSnapshot = hostedScrollOffsetData  // Value-type copy
                 lock.unlock()
             }
@@ -3966,7 +3970,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             defer { lock.unlock() }
 
             scrollOffsetData = scrollOffset
-            scrollOffsetActive = true
+            scrollOffsetLatch.setActive(true)
             hostedScrollOffsetData.removeAll(keepingCapacity: true)
             hostedScrollOffsetData.append(contentsOf: hostedScrollOffsetScratch)
             return true  // Scroll offset is active
@@ -3980,7 +3984,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
             defer { lock.unlock() }
 
             scrollOffsetData = nil
-            scrollOffsetActive = false
+            scrollOffsetLatch.setActive(false)
             hostedScrollOffsetData.removeAll(keepingCapacity: true)
             hostedScrollOffsetData.append(contentsOf: hostedScrollOffsetScratch)
             // A hosted grid easing on its own keeps this surface in a smooth
@@ -4012,7 +4016,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         lock.lock()
         defer { lock.unlock() }
 
-        if scrollOffsetActive != lastPresentedScrollOffsetActive {
+        if scrollOffsetLatch.isActive != scrollOffsetLatch.previousFrameWasActive {
             return true
         }
         // A hosted grid easing while the root stands still changes this
@@ -4027,7 +4031,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
         where !scrollOffsetsEqual(offset, lastPresentedHostedScrollOffsetData[index]) {
             return true
         }
-        if !scrollOffsetActive {
+        if !scrollOffsetLatch.isActive {
             return false
         }
         return !scrollOffsetsEqual(scrollOffsetData, lastPresentedScrollOffsetData)
@@ -4036,14 +4040,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate {
     private func wasScrollOffsetActiveInLastPresentedFrame() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        return lastPresentedScrollOffsetActive || !lastPresentedHostedScrollOffsetData.isEmpty
+        // A hosted grid that was easing counts too, which is why this is not
+        // simply `scrollOffsetLatch.previousFrameWasActive`.
+        return scrollOffsetLatch.previousFrameWasActive
+            || !lastPresentedHostedScrollOffsetData.isEmpty
     }
 
     private func markScrollOffsetStatePresented() {
         lock.lock()
         defer { lock.unlock() }
 
-        lastPresentedScrollOffsetActive = scrollOffsetActive
+        scrollOffsetLatch.latch(scrollOffsetLatch.isActive)
         lastPresentedScrollOffsetData = scrollOffsetData
         lastPresentedHostedScrollOffsetData.removeAll(keepingCapacity: true)
         lastPresentedHostedScrollOffsetData.append(contentsOf: hostedScrollOffsetData)
