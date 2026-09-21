@@ -1263,12 +1263,24 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// One-shot retry pending for updateScrollbarIfNeeded (main thread only).
     private var scrollbarRetryScheduled = false
 
+    /// The grid this surface's knob is showing, kept across a busy lock.
+    private var lastScrollbarGrid: Int64 = 1
+    /// Last grid `[scrollbar]` named, so the line is a transition.
+    private var lastScrollbarGridLogged: Int64 = 0
+
     func updateScrollbarIfNeeded() {
         let config = ZonvieConfig.shared.scrollbar
         guard config.enabled else { return }
         guard let core else { return }
+        // The grid THIS surface draws, not the cursor's wherever it is: asking
+        // for -1 made the main window's knob follow a scroll in an external
+        // window, which draws none of that content.
+        // On a busy lock keep the grid the knob is already showing, so the
+        // stale-viewport retry below still runs — returning here would skip it.
+        let scrollbarGrid = core.scrollbarGridNonBlocking(surfaceId: 1) ?? lastScrollbarGrid
+        lastScrollbarGrid = scrollbarGrid
         var lockBusy = false
-        let viewportOrStale = core.getViewportNonBlocking(gridId: -1, lockBusy: &lockBusy)
+        let viewportOrStale = core.getViewportNonBlocking(gridId: scrollbarGrid, lockBusy: &lockBusy)
         if lockBusy, !scrollbarRetryScheduled {
             // grid_mu was held (core thread mid-handleRedraw): the value above
             // is the one-flush-stale cache. This update runs once per flush, so
@@ -1301,6 +1313,14 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         if viewportChanged {
             pageScrollTime = 0  // Clear guard on real viewport update
+            // One line per change, not per flush. Which grid a surface's knob
+            // follows had no trace at all, and "the main window's scrollbar
+            // moved when an external window scrolled" was reported from the
+            // screen because there was nothing else to read.
+            if ZonvieCore.appLogEnabled, scrollbarGrid != lastScrollbarGridLogged || viewport.topline != lastViewportTopline {
+                lastScrollbarGridLogged = scrollbarGrid
+                ZonvieCore.appLog("[scrollbar] surface=1 grid=\(scrollbarGrid) topline=\(viewport.topline) lineCount=\(viewport.lineCount)")
+            }
             lastViewportTopline = viewport.topline
             lastViewportLineCount = viewport.lineCount
             lastViewportBotline = viewport.botline

@@ -3052,6 +3052,18 @@ final class ZonvieCore {
         return (hit.grid_id, hit.row, hit.col)
     }
 
+    /// The grid this surface's scrollbar should show: the cursor's grid when
+    /// this surface composites it, and the surface's own root otherwise.
+    ///
+    /// nil when the core's grid lock was held, which means "leave the knob
+    /// where it is" — the same answer a busy viewport read already gives.
+    func scrollbarGridNonBlocking(surfaceId: Int64) -> Int64? {
+        guard let core else { return nil }
+        var grid: Int64 = 0
+        guard zonvie_core_try_scrollbar_grid(core, surfaceId, &grid) != 0 else { return nil }
+        return grid
+    }
+
     /// Viewport info for scrollbar rendering (Swift-friendly wrapper)
     struct ViewportInfo {
         var gridId: Int64
