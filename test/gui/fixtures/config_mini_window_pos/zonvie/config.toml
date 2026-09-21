@@ -1,0 +1,6 @@
+# Fixture for mini_message_hosted_float_anchor: anchor the mini popup to the
+# WINDOW the cursor is in rather than to its grid. That mode asked "is the
+# cursor's grid a float?" and sent the message to the main window when it was,
+# which is wrong for a float an external window hosts.
+[messages.msg_pos]
+mini = "window"

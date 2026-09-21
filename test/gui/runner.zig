@@ -476,6 +476,16 @@ test "gui:extwin_float_trackpad_scroll" {
     }
 }
 
+test "gui:mini_message_hosted_float_anchor" {
+    // macOS only: the external window and its compositing are macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/mini_message_hosted_float_anchor.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:scrollbar_follows_own_surface" {
     // macOS only: ExternalGridView and the window enumeration are macOS
     // frontend code.

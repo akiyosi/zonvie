@@ -8136,16 +8136,7 @@ final class ZonvieCore {
             // Window-based: bottom-right of the window where cursor is.
             // A float grid (e.g. telescope prompt) is not a window — anchor
             // to the main window instead of the float's host.
-            let cursorPos = getCursorPositionNonBlocking()
-            let targetWindow: NSWindow
-            if isFloatGrid(cursorPos.gridId) {
-                targetWindow = mainWindow
-            } else if let extWindow = externalWindows[cursorPos.gridId] {
-                // Cursor is in an external window
-                targetWindow = extWindow
-            } else {
-                targetWindow = mainWindow
-            }
+            let targetWindow = windowCompositingCursorGrid(mainWindow)
             let targetFrame = targetWindow.frame
             let targetContentRect = targetWindow.contentLayoutRect
             anchorX = targetFrame.origin.x + targetContentRect.width
@@ -8188,9 +8179,14 @@ final class ZonvieCore {
             //
             // Resolved from `targetGrid`, not from the cursor grid: the float
             // walk above can land on a grid hosted by an external window.
+            // Which surface composites the anchor grid, not whether the grid
+            // IS a window: a grid an external window merely contains answers
+            // no to the second and yes to the first.
             let anchorWindow: NSWindow = {
-                guard let g = targetGrid, g.isExternal,
-                      let external = externalWindows[g.gridId] else { return mainWindow }
+                guard let g = targetGrid,
+                      let raw = cachedVisibleGridsRaw.first(where: { $0.grid_id == g.gridId }),
+                      let external = externalWindows[raw.placed_by_surface]
+                else { return mainWindow }
                 return external
             }()
             let anchorFrame = anchorWindow.frame
@@ -8287,10 +8283,26 @@ final class ZonvieCore {
 
     /// True if the grid is a float (zindex > 0) per the cached visible grids.
     /// Synthetic grids (cmdline/message) are not in the list and return false.
-    private func isFloatGrid(_ gridId: Int64) -> Bool {
-        guard let g = getVisibleGridsCached().first(where: { $0.gridId == gridId }) else { return false }
-        return g.zindex > 0
+    /// The window that actually composites the grid the cursor is on.
+    ///
+    /// "Is this a float" is not that question, and answering it instead put an
+    /// ext-message on the MAIN window whenever the cursor was in a float an
+    /// EXTERNAL window hosts — the one surface that float is certainly not
+    /// drawn in. The core knows which surface places a grid
+    /// (`zonvie_grid_info.placed_by_surface`); that is the answer, and it
+    /// covers a grid an external window merely contains as well as one it is.
+    ///
+    /// Reads the snapshot getVisibleGridsCached() last took, so it refreshes
+    /// it first: this runs when a message is placed, not per frame.
+    private func windowCompositingCursorGrid(_ mainWindow: NSWindow) -> NSWindow {
+        let cursorGrid = getCursorPositionNonBlocking().gridId
+        _ = getVisibleGridsCached()
+        guard let g = cachedVisibleGridsRaw.first(where: { $0.grid_id == cursorGrid }),
+              let external = externalWindows[g.placed_by_surface]
+        else { return mainWindow }
+        return external
     }
+
 
     /// Walk anchorGrid links from a float until a non-float grid is reached.
     /// Returns nil when the chain dead-ends or exceeds the hop guard, so
@@ -8325,16 +8337,7 @@ final class ZonvieCore {
             // Window-based: use the window where cursor is.
             // A float grid (e.g. telescope prompt) is not a window — anchor
             // to the main window instead of the float's host.
-            let cursorPos = getCursorPositionNonBlocking()
-            let targetWindow: NSWindow
-            if isFloatGrid(cursorPos.gridId) {
-                targetWindow = mainWindow
-            } else if let extWindow = externalWindows[cursorPos.gridId] {
-                // Cursor is in an external window
-                targetWindow = extWindow
-            } else {
-                targetWindow = mainWindow
-            }
+            let targetWindow = windowCompositingCursorGrid(mainWindow)
             let targetFrame = targetWindow.frame
             let targetContentRect = targetWindow.contentLayoutRect
             let contentOriginY = targetFrame.origin.y + (targetFrame.height - targetContentRect.height - targetContentRect.origin.y)
