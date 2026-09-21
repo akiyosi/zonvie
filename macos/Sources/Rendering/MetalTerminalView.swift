@@ -917,13 +917,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         needsLayout = true
 
         // Configure layer transparency based on blur setting
-        if ZonvieConfig.shared.blurEnabled {
-            self.layer?.isOpaque = false
-            self.layer?.backgroundColor = NSColor.clear.cgColor
-        } else {
-            self.layer?.isOpaque = true
-            self.layer?.backgroundColor = NSColor.black.cgColor
-        }
+        applyLayerTransparency()
 
         // The IME preedit overlay is added to this view lazily by IMEPreeditController.
 
@@ -932,6 +926,20 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         // Accept file drops via drag & drop
         registerForDraggedTypes([.fileURL])
+    }
+
+    /// The layer's transparency, which follows the blur setting. Applied when
+    /// the view is set up and again once it has a window: the second call is
+    /// not a repeat of the first, it is the point at which AppKit has a layer
+    /// to apply it to.
+    private func applyLayerTransparency() {
+        if ZonvieConfig.shared.blurEnabled {
+            self.layer?.isOpaque = false
+            self.layer?.backgroundColor = NSColor.clear.cgColor
+        } else {
+            self.layer?.isOpaque = true
+            self.layer?.backgroundColor = NSColor.black.cgColor
+        }
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -963,13 +971,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             window?.acceptsMouseMovedEvents = true
 
             // Ensure layer transparency settings are applied after window is available
-            if ZonvieConfig.shared.blurEnabled {
-                self.layer?.isOpaque = false
-                self.layer?.backgroundColor = NSColor.clear.cgColor
-            } else {
-                self.layer?.isOpaque = true
-                self.layer?.backgroundColor = NSColor.black.cgColor
-            }
+            applyLayerTransparency()
         } else {
             msgTimer?.invalidate()
             msgTimer = nil
@@ -1023,12 +1025,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             dragGridCache = DragGridCache(
                 gridId: grid.gridId,
                 startCol: grid.startCol,
-                band: GridRowBand(
-                    startRow: grid.startRow,
-                    rows: grid.rows,
-                    marginTop: grid.marginTop,
-                    marginBottom: grid.marginBottom
-                )
+                band: GridRowBand(of: grid)
             )
         }
 
@@ -1116,39 +1113,22 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         // For drag events, use cached grid info to prevent oscillation during separator dragging
         if action == "drag", let cache = dragGridCache {
-            // Calculate coordinates using cached grid position.
-            // Use integer-rounded cell dimensions to match core grid math.
-            let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-
-            guard renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return }
-
-            // Rounded UP, as hitTestGrid and the core's updateLayoutPx do.
-            // Rounding to nearest here put the press and the drag on different
-            // cell widths whenever the fractional part was below a half, so the
-            // two disagreed about the column of the same pixel.
-            let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.up))))
-            let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.up))))
-            let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
-
-            let pointPx: CGPoint
-            if isFlipped {
-                pointPx = CGPoint(x: location.x * scale, y: location.y * scale)
-            } else {
-                pointPx = CGPoint(x: location.x * scale, y: drawableH - location.y * scale)
-            }
-
-            let globalCol = Int32(pointPx.x / cellW)
+            // The cached grid, but the CURRENT geometry: dragging a separator
+            // resizes the grids, and the cache exists so the coordinates stay
+            // in the grid the press chose, not so they freeze.
+            guard let g = pointerGeometry(at: location) else { return }
+            let globalCol = g.globalCol
 
             scrollOffsetLock.lock()
-            let dragOffsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[cache.gridId] ?? 0, cellHeightPx: cellH)
+            let dragOffsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[cache.gridId] ?? 0, cellHeightPx: g.cellH)
             scrollOffsetLock.unlock()
 
             // The band the press cached, not the grid as it stands now: a drag
             // that resizes the grids would otherwise answer a different
             // question part-way through, which is why the cache exists.
             let localRow = scrollAdjustedLocalRow(
-                pointPxY: pointPx.y,
-                cellHeightPx: cellH,
+                pointPxY: g.pointPx.y,
+                cellHeightPx: g.cellH,
                 band: cache.band,
                 scrollOffsetPx: dragOffsetPx
             )
@@ -3192,36 +3172,58 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// above; both are read once per hit test.
     private var externallySurfacedGridsScratch: [Int64] = []
 
-    private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let core else { return (1, 0, 0) }
+    /// A view point in the drawable's pixel space, with the cell grid it is
+    /// read against and the cell it lands in.
+    private struct PointerGeometry {
+        var pointPx: CGPoint
+        var cellW: CGFloat
+        var cellH: CGFloat
+        var globalRow: Int32
+        var globalCol: Int32
+    }
 
+    /// Where a view point lands in the core's cell grid.
+    ///
+    /// Written out twice before — once for the hit test, once for the drag —
+    /// and the two diverged: the drag rounded the cell size to NEAREST while
+    /// the hit test and the core's `updateLayoutPx` round UP, so a press and
+    /// the drag that followed it disagreed about the column of the same pixel
+    /// whenever the fractional part was below a half.
+    ///
+    /// nil before the renderer has cell metrics, which is what both call sites
+    /// bailed on separately.
+    private func pointerGeometry(at point: CGPoint) -> PointerGeometry? {
+        guard renderer.cellWidthPx > 0, renderer.cellHeightPx > 0 else { return nil }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-
-        // Early return when renderer is uninitialized (cellMetrics not yet available).
-        guard renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return (1, 0, 0) }
-
-        // Use integer-rounded cell dimensions to match core grid math exactly.
-        // The core receives these rounded values via updateLayoutPx and uses them
-        // for row/col computation and vertex positioning.
+        // Integer-rounded to match the core's grid math exactly: it receives
+        // these values through updateLayoutPx and uses them for row/col
+        // computation and vertex positioning.
         let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.up))))
         let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.up))))
-
-        // Compute integer drawable height from current bounds (same formula as
-        // updateDrawableSizeIfPossible). This avoids depending on the stored
-        // drawableSize property which may lag behind bounds during resize.
+        // From the current bounds, the same formula updateDrawableSizeIfPossible
+        // uses: the stored drawableSize can lag behind bounds during a resize.
         let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
+        // NSView is bottom-origin; the drawable is top-origin.
+        let pointPx = isFlipped
+            ? CGPoint(x: point.x * scale, y: point.y * scale)
+            : CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
+        return PointerGeometry(
+            pointPx: pointPx,
+            cellW: cellW,
+            cellH: cellH,
+            globalRow: Int32(pointPx.y / cellH),
+            globalCol: Int32(pointPx.x / cellW)
+        )
+    }
 
-        // Convert point to drawable pixel coordinates (top-origin).
-        let pointPx: CGPoint
-        if isFlipped {
-            pointPx = CGPoint(x: point.x * scale, y: point.y * scale)
-        } else {
-            // NSView is bottom-origin, convert to top-origin
-            pointPx = CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
-        }
-
-        let globalCol = Int32(pointPx.x / cellW)
-        let globalRow = Int32(pointPx.y / cellH)
+    private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
+        guard let core else { return (1, 0, 0) }
+        // Early return when renderer is uninitialized (cellMetrics not yet available).
+        guard let g = pointerGeometry(at: point) else { return (1, 0, 0) }
+        let cellH = g.cellH
+        let pointPx = g.pointPx
+        let globalCol = g.globalCol
+        let globalRow = g.globalRow
 
         let grids = core.getVisibleGridsCached()
 
@@ -3232,42 +3234,18 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         // Find grid with highest zindex containing this point
         var bestGridId: Int64 = 1  // default to global grid
-        var bestZindex: Int64 = Int64.min
         var localRow: Int32 = globalRow
         var localCol: Int32 = globalCol
 
-        // A float that refuses the mouse is not a target and does not shadow
-        // one: Neovim looks the window up by handle, rejects it, and returns
-        // without re-resolving (mouse.c's mouse_find_grid_win, then
-        // mouse_find_win_inner's `else if (*gridp > 1) return NULL`), so naming
-        // it swallows the click instead of letting it reach what is drawn
-        // underneath. `zonvie_grid_info` carries no mouse field, so the answer
-        // comes from the layer list instead.
-        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
-        core.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
-
-        for grid in grids {
-            // External grids are separate top-level windows reported at (0,0);
-            // they must not be hit by the main window's coordinate-space test.
-            if grid.isExternal { continue }
-            // Nor a float one of them HOSTS, which is not itself external but
-            // reports its position in that surface's space.
-            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
-            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
-            let inRowRange = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
-            let inColRange = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
-
-            if inRowRange && inColRange {
-                // Prefer higher zindex; if same zindex, prefer grid_id > 1 (actual windows over background)
-                let dominated = grid.zindex > bestZindex ||
-                    (grid.zindex == bestZindex && grid.gridId > 1 && bestGridId == 1)
-                if dominated {
-                    bestZindex = grid.zindex
-                    bestGridId = grid.gridId
-                    localRow = globalRow - grid.startRow
-                    localCol = globalCol - grid.startCol
-                }
-            }
+        if let best = pointerTargetGrid(
+            globalRow: globalRow,
+            globalCol: globalCol,
+            grids: grids,
+            requireScrollable: false
+        ) {
+            bestGridId = best.gridId
+            localRow = globalRow - best.startRow
+            localCol = globalCol - best.startCol
         }
 
         // Adjust for smooth scroll offset: during scrolling, content rows are
@@ -3281,12 +3259,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             localRow = scrollAdjustedLocalRow(
                 pointPxY: pointPx.y,
                 cellHeightPx: cellH,
-                band: GridRowBand(
-                    startRow: grid.startRow,
-                    rows: grid.rows,
-                    marginTop: grid.marginTop,
-                    marginBottom: grid.marginBottom
-                ),
+                band: GridRowBand(of: grid),
                 scrollOffsetPx: offsetPx
             )
         }
@@ -3308,53 +3281,66 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         return grid.lineCount > contentRows
     }
 
+    /// The grid a cell position names, by the rules every pointer path shares.
+    ///
+    /// `requireScrollable` is the wheel's own extra rule: a float showing all
+    /// of its content does not capture scroll and is transparent here, so a
+    /// scrollable grid beneath it still wins. A click has no such rule.
+    ///
+    /// One function because there were two, and the exclusion a float hosted by
+    /// an external surface needs had to be written into both of them.
+    private func pointerTargetGrid(
+        globalRow: Int32,
+        globalCol: Int32,
+        grids: [ZonvieCore.GridInfo],
+        requireScrollable: Bool
+    ) -> ZonvieCore.GridInfo? {
+        // A float that refuses the mouse is not a target and does not shadow
+        // one: Neovim looks the window up by handle, rejects it, and returns
+        // without re-resolving (mouse.c's mouse_find_grid_win, then
+        // mouse_find_win_inner's `else if (*gridp > 1) return NULL`), so naming
+        // it swallows the event instead of letting it reach what is drawn
+        // underneath. `zonvie_grid_info` carries no mouse field, so the answer
+        // comes from the layer list instead.
+        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
+        core?.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
+        var best: ZonvieCore.GridInfo?
+        for grid in grids {
+            // External grids are separate top-level windows reported at (0,0),
+            // and so is a float one of them HOSTS — not itself external, but
+            // reporting its position in that surface's space.
+            if grid.isExternal { continue }
+            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
+            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
+            guard globalRow >= grid.startRow, globalRow < grid.startRow + grid.rows,
+                  globalCol >= grid.startCol, globalCol < grid.startCol + grid.cols
+            else { continue }
+            if requireScrollable, grid.zindex > 0, !isFloatLogicallyScrollable(grid) { continue }
+            // Higher zindex wins; at equal zindex an actual window beats the
+            // background grid.
+            let dominated = best == nil || grid.zindex > best!.zindex ||
+                (grid.zindex == best!.zindex && grid.gridId > 1 && best!.gridId == 1)
+            if dominated { best = grid }
+        }
+        return best
+    }
+
     /// Resolve which grid a scroll at `point` should target. A non-scrollable
     /// float overlay is transparent to scrolling, so the scroll falls through to
     /// the topmost window beneath it (req #1). Returns grid-local row/col.
     private func resolveScrollTarget(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let core, renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return (1, 0, 0) }
-        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
-        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
-        let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
-        let pointPx: CGPoint = isFlipped
-            ? CGPoint(x: point.x * scale, y: point.y * scale)
-            : CGPoint(x: point.x * scale, y: drawableH - point.y * scale)
-        let globalCol = Int32(pointPx.x / cellW)
-        let globalRow = Int32(pointPx.y / cellH)
-
-        let grids = core.getVisibleGridsCached()
-
-        // Pick the topmost (highest zindex) grid at this point that can actually
-        // receive scroll: a window (zindex 0) or a logically-scrollable float.
-        // Non-scrollable floats are transparent to scrolling and skipped, so a
-        // scrollable grid directly beneath one — be it another float or the base
-        // window — shows through (req #1).
-        var target: ZonvieCore.GridInfo?
-        var bestZ = Int64.min
-        // Same rule as the click path, and a separate question from
-        // scrollability below: ExternalGridView applies both independently.
-        // A float that refuses the mouse but IS logically scrollable would
-        // otherwise take the gesture, ease its own pixels, get no grid_scroll
-        // back, and snap — while the window under it never moved.
-        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
-        core.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
-        for grid in grids {
-            // External grids are separate top-level windows reported at (0,0);
-            // exclude them from the main window's scroll-target resolution.
-            if grid.isExternal { continue }
-            // Same for a float an external surface hosts; see hitTestGrid.
-            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
-            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
-            let inRow = globalRow >= grid.startRow && globalRow < grid.startRow + grid.rows
-            let inCol = globalCol >= grid.startCol && globalCol < grid.startCol + grid.cols
-            guard inRow && inCol else { continue }
-            // Skip non-scrollable floats — they do not capture scroll.
-            if grid.zindex > 0 && !isFloatLogicallyScrollable(grid) { continue }
-            let dominated = target == nil || grid.zindex > bestZ ||
-                (grid.zindex == bestZ && grid.gridId > 1 && target!.gridId == 1)
-            if dominated { target = grid; bestZ = grid.zindex }
-        }
+        guard let core, let geo = pointerGeometry(at: point) else { return (1, 0, 0) }
+        let globalRow = geo.globalRow
+        let globalCol = geo.globalCol
+        // Non-scrollable floats are transparent to scrolling, so a scrollable
+        // grid directly beneath one — another float or the base window — shows
+        // through (req #1).
+        let target = pointerTargetGrid(
+            globalRow: globalRow,
+            globalCol: globalCol,
+            grids: core.getVisibleGridsCached(),
+            requireScrollable: true
+        )
         guard let g = target else { return (1, globalRow, globalCol) }
         return (g.gridId, globalRow - g.startRow, globalCol - g.startCol)
     }
@@ -3973,5 +3959,19 @@ extension MetalTerminalView {
             core.sendCommand("drop \(paths)")
         }
         return true
+    }
+}
+
+/// The band a grid's sub-row ease actually moves, from the grid the core
+/// reports. Lives here rather than beside GridRowBand because MetalTypes.swift
+/// is compiled standalone by the Swift test steps and must not name ZonvieCore.
+private extension GridRowBand {
+    init(of grid: ZonvieCore.GridInfo) {
+        self.init(
+            startRow: grid.startRow,
+            rows: grid.rows,
+            marginTop: grid.marginTop,
+            marginBottom: grid.marginBottom
+        )
     }
 }

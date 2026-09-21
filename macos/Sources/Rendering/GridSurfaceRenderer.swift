@@ -559,6 +559,7 @@ func captureSurfaceLayerScrollStep(
        )
     {
         retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+        // Claim the step so the row-shift capture stands down for this grid.
         lock.lock()
         bracketStagedGrids.insert(gridId)
         lock.unlock()
@@ -1483,6 +1484,85 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     private var lastCellWidthPx: Float = 0
     private var lastCellHeightPx: Float = 0
+
+    /// Compile the configured custom shaders. Run twice — once for the surface
+    /// set and once for the decorated variant, which is always opaque — and
+    /// only `preserveAlpha` differs between them.
+    private func loadCustomShaders(
+        _ paths: [String],
+        lib: MTLLibrary,
+        vsCustomPost: MTLFunction,
+        copyVertexDesc: MTLVertexDescriptor,
+        pixelFormat: MTLPixelFormat,
+        preserveAlpha: Bool
+    ) -> [CustomShaderPipeline] {
+        var out: [CustomShaderPipeline] = []
+        for path in paths {
+            if let loaded = CustomShaderPipeline.load(
+                device: shared.device,
+                library: lib,
+                vsCustomPost: vsCustomPost,
+                copyVertexDescriptor: copyVertexDesc,
+                sourcePath: (path as NSString).expandingTildeInPath,
+                pixelFormat: pixelFormat,
+                preserveAlpha: preserveAlpha
+            ) {
+                out.append(loaded)
+            }
+        }
+        return out
+    }
+
+    /// The blend every glyph-drawing pipeline uses: straight `over`, leaving
+    /// the destination's own alpha. Three pipelines set it — the main one on
+    /// each of the two creation paths, and the 2-pass glyph pass — and they
+    /// have to agree, because they draw the same vertices into the same
+    /// texture. The other blends in this file are deliberately different modes.
+    private static func applyGlyphOverBlend(_ a: MTLRenderPipelineColorAttachmentDescriptor) {
+        a.isBlendingEnabled = true
+        a.rgbBlendOperation = .add
+        a.sourceRGBBlendFactor = .sourceAlpha
+        a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+        a.alphaBlendOperation = .add
+        a.sourceAlphaBlendFactor = .one
+        a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+    }
+
+    /// The main glyph pipeline. Built on both creation paths — through the XPC
+    /// compiler and from the binary archive — and blending is on so glyph
+    /// coverage composites over the background it is drawn onto.
+    private static func makeGlyphPipelineDescriptor(
+        vs: MTLFunction?,
+        fs: MTLFunction?,
+        vertexDescriptor: MTLVertexDescriptor,
+        pixelFormat: MTLPixelFormat
+    ) -> MTLRenderPipelineDescriptor {
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = vs
+        d.fragmentFunction = fs
+        d.vertexDescriptor = vertexDescriptor
+        d.colorAttachments[0].pixelFormat = pixelFormat
+        if let a = d.colorAttachments[0] { applyGlyphOverBlend(a) }
+        return d
+    }
+
+    /// The copy pipeline (what replaced the blit). Built on both creation
+    /// paths — through the XPC compiler and from the binary archive — and it
+    /// never blends: it overwrites.
+    private static func makeCopyPipelineDescriptor(
+        vsCopy: MTLFunction?,
+        fsCopy: MTLFunction?,
+        vertexDescriptor: MTLVertexDescriptor,
+        pixelFormat: MTLPixelFormat
+    ) -> MTLRenderPipelineDescriptor {
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = vsCopy
+        d.fragmentFunction = fsCopy
+        d.vertexDescriptor = vertexDescriptor
+        d.colorAttachments[0].pixelFormat = pixelFormat
+        d.colorAttachments[0]?.isBlendingEnabled = false
+        return d
+    }
 
     /// Fan a cell-metric change out to every surface, at most once per change.
     ///
@@ -4392,6 +4472,22 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
                     // What one row of this layer owes the encoder. Shared by both
                     // arms below so the gated path resolves rows the same way.
+                    /// Paint one empty layer row with the surface background.
+                    /// Both arms below reach it — the full-redraw arm decides a
+                    /// row is empty from the buffer slot, the gated arm from
+                    /// resolveLayerRow — and the band itself is the same band.
+                    func clearEmptyLayerRow(_ enc: MTLRenderCommandEncoder, _ row: Int) {
+                        let topPx = row * Int(cellHi)
+                        drawSurfaceBackgroundClearBand(
+                            enc,
+                            clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
+                            xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
+                            drawableHeight: Float(rowCount * Int(cellHi)),
+                            bgRGB: snappedBgRGB,
+                            gridId: layer.gridId
+                        )
+                    }
+
                     func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                         if row >= retainedBase {
                             let i = row - retainedBase
@@ -4438,15 +4534,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                 let empty = slot < 0 || slot >= set.rowState.buffers.count
                                     || set.rowState.buffers[slot] == nil || set.rowState.counts[slot] == 0
                                 guard empty else { continue }
-                                let topPx = row * Int(cellHi)
-                                drawSurfaceBackgroundClearBand(
-                                    enc,
-                                    clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
-                                    xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
-                                    drawableHeight: Float(rowCount * Int(cellHi)),
-                                    bgRGB: snappedBgRGB,
-                                    gridId: layer.gridId
-                                )
+                                clearEmptyLayerRow(enc, row)
                                 encodedRows += 1
                             }
                             enc.setRenderPipelineState(shared.pipeline!)
@@ -4491,15 +4579,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             enc.setRenderPipelineState(use2Pass ? (shared.backgroundPipeline ?? shared.pipeline!) : shared.pipeline!)
                             for row in dirtyLayerRows where resolveLayerRow(row) == nil {
                                 guard row >= 0, row < rowCount else { continue }
-                                let topPx = row * Int(cellHi)
-                                drawSurfaceBackgroundClearBand(
-                                    enc,
-                                    clearBand: (clearTopPx: topPx, clearBottomPx: topPx + Int(cellHi)),
-                                    xRangePx: (leftPx: 0, rightPx: Float(widthPx)),
-                                    drawableHeight: Float(rowCount * Int(cellHi)),
-                                    bgRGB: snappedBgRGB,
-                                    gridId: layer.gridId
-                                )
+                                clearEmptyLayerRow(enc, row)
                                 encodedRows += 1
                             }
                         }
@@ -5246,22 +5326,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Binary archive miss - need to compile pipeline
         ZonvieCore.appLog("[Renderer] Binary archive miss, compiling pipeline...")
 
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vs
-        desc.fragmentFunction = fs
-        desc.vertexDescriptor = vertexDesc
-        desc.colorAttachments[0].pixelFormat = pixelFormat
-
-        // Enable blending so glyph coverage (alpha) composites correctly over background.
-        if let a = desc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.sourceRGBBlendFactor = .sourceAlpha
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.alphaBlendOperation = .add
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
+        let desc = Self.makeGlyphPipelineDescriptor(
+            vs: vs, fs: fs, vertexDescriptor: vertexDesc, pixelFormat: pixelFormat
+        )
 
         // Create main pipeline state (this requires XPC compiler service)
         do {
@@ -5275,15 +5342,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         // Create copy pipeline (replaces Blit)
-        let copyDesc = MTLRenderPipelineDescriptor()
-        copyDesc.vertexFunction = vsCopy
-        copyDesc.fragmentFunction = fsCopy
-        copyDesc.vertexDescriptor = copyVertexDesc
-        copyDesc.colorAttachments[0].pixelFormat = pixelFormat
-        // No blending - just overwrite
-        if let a = copyDesc.colorAttachments[0] {
-            a.isBlendingEnabled = false
-        }
+        let copyDesc = Self.makeCopyPipelineDescriptor(
+            vsCopy: vsCopy, fsCopy: fsCopy,
+            vertexDescriptor: copyVertexDesc, pixelFormat: pixelFormat
+        )
 
         do {
             shared.copyPipeline = try shared.device.makeRenderPipelineState(descriptor: copyDesc)
@@ -5341,13 +5403,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         glyphDesc.vertexDescriptor = vertexDesc
         glyphDesc.colorAttachments[0].pixelFormat = pixelFormat
         if let a = glyphDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.sourceRGBBlendFactor = .sourceAlpha
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.alphaBlendOperation = .add
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            Self.applyGlyphOverBlend(a)
         }
 
         do {
@@ -5531,41 +5587,23 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[Renderer] WARNING: Missing vs_custom_post shader (custom shaders disabled)")
             return
         }
-        for path in config.paths {
-            let expanded = (path as NSString).expandingTildeInPath
-            if let loaded = CustomShaderPipeline.load(
-                device: shared.device,
-                library: lib,
-                vsCustomPost: vsCustomPost,
-                copyVertexDescriptor: copyVertexDesc,
-                sourcePath: expanded,
-                pixelFormat: pixelFormat,
-                preserveAlpha: config.preserveAlpha
-            ) {
-                shared.customShaderPipelines.append(loaded)
-                if loaded.needsAnimation {
-                    shared.anyCustomShaderNeedsAnimation = true
-                }
-            }
+        for loaded in loadCustomShaders(
+            config.paths, lib: lib, vsCustomPost: vsCustomPost,
+            copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat,
+            preserveAlpha: config.preserveAlpha
+        ) {
+            shared.customShaderPipelines.append(loaded)
+            if loaded.needsAnimation { shared.anyCustomShaderNeedsAnimation = true }
         }
         // Decorated variant: always opaque (preserve_alpha OFF). Only a
         // separate compile is needed when the main set is NOT already opaque;
         // otherwise alias it to avoid a redundant compile.
         if config.preserveAlpha {
-            for path in config.paths {
-                let expanded = (path as NSString).expandingTildeInPath
-                if let loaded = CustomShaderPipeline.load(
-                    device: shared.device,
-                    library: lib,
-                    vsCustomPost: vsCustomPost,
-                    copyVertexDescriptor: copyVertexDesc,
-                    sourcePath: expanded,
-                    pixelFormat: pixelFormat,
-                    preserveAlpha: false
-                ) {
-                    shared.customShaderPipelinesDecorated.append(loaded)
-                }
-            }
+            shared.customShaderPipelinesDecorated = loadCustomShaders(
+                config.paths, lib: lib, vsCustomPost: vsCustomPost,
+                copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat,
+                preserveAlpha: false
+            )
         } else {
             shared.customShaderPipelinesDecorated = shared.customShaderPipelines
         }
@@ -5598,30 +5636,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         guard let archive = binaryArchive else { return false }
 
         // Create main pipeline descriptor
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vs
-        desc.fragmentFunction = fs
-        desc.vertexDescriptor = vertexDesc
-        desc.colorAttachments[0].pixelFormat = pixelFormat
+        let desc = Self.makeGlyphPipelineDescriptor(
+            vs: vs, fs: fs, vertexDescriptor: vertexDesc, pixelFormat: pixelFormat
+        )
 
-        if let a = desc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.sourceRGBBlendFactor = .sourceAlpha
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.alphaBlendOperation = .add
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
-
-        let copyDesc = MTLRenderPipelineDescriptor()
-        copyDesc.vertexFunction = vsCopy
-        copyDesc.fragmentFunction = fsCopy
-        copyDesc.vertexDescriptor = copyVertexDesc
-        copyDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = copyDesc.colorAttachments[0] {
-            a.isBlendingEnabled = false
-        }
+        let copyDesc = Self.makeCopyPipelineDescriptor(
+            vsCopy: vsCopy, fsCopy: fsCopy,
+            vertexDescriptor: copyVertexDesc, pixelFormat: pixelFormat
+        )
 
         // Try to create pipelines from archive
         desc.binaryArchives = [archive]
@@ -5959,7 +5981,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
-        // Claim the step so the row-shift capture stands down for this grid.
         lock.lock()
         bracketStagedGrids.insert(gridId)
         lock.unlock()

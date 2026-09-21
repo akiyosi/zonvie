@@ -187,6 +187,19 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     private var placementRowsUpSnapshot: [Int64: Int] = [:]
     private var floatDebtBaselineSnapshot: [Int64: FloatDebtBaseline] = [:]
 
+    /// Clear what the bracket staged and mark it closed. Called with `lock`
+    /// held, from both arms of commitFlush: a bracket that rotated buffers and
+    /// one that carried no content leave the same staging behind, and what
+    /// "closed" means must not drift between them.
+    private func closeFlushBracketLocked() {
+        flushChangedRows.removeAll()
+        flushGeneratedRows.removeAll()
+        flushHasStructuralRowChange = false
+        rowWritePrepared = false
+        writeSetIndex = -1
+        bracketOpen = false
+    }
+
     /// Hand the float ledger this surface's half, merging into storage the
     /// caller owns so the per-frame read costs one lock and no allocation.
     func copyPlacementRowsUp(into out: inout [Int64: Int]) {
@@ -1439,23 +1452,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             if !pendingDirtyRows.isEmpty || pendingScrollAccum != nil {
                 lastCommitTime = mach_absolute_time()
             }
-            flushChangedRows.removeAll()
-            flushGeneratedRows.removeAll()
-            flushHasStructuralRowChange = false
-            rowWritePrepared = false
-            writeSetIndex = -1
-            bracketOpen = false
+            closeFlushBracketLocked()
             lock.unlock()
         } else {
             // Contentless bracket: nothing rotates. Close the bracket flag
             lock.lock()
             cursorWriteSetIndex = -1
-            flushChangedRows.removeAll()
-            flushGeneratedRows.removeAll()
-            flushHasStructuralRowChange = false
-            rowWritePrepared = false
-            writeSetIndex = -1
-            bracketOpen = false
+            closeFlushBracketLocked()
             lock.unlock()
         }
         isInFlush = false
@@ -4923,31 +4926,39 @@ extension ExternalGridView: NSTextInputClient {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        let config = ZonvieConfig.shared.scrollbar
-        if config.enabled && config.isHover && !isDecoratedSurface {
-            let locationInView = convert(event.locationInWindow, from: nil)
-            let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-            if locationInView.x >= bounds.width - scrollerWidth {
+        if hoverScrollbarEnabled {
+            if pointerIsOverScrollbarStrip(event) {
                 showScrollbar()
             }
         }
         super.mouseEntered(with: event)
     }
 
-    override func mouseExited(with event: NSEvent) {
+    /// Whether this surface shows its scrollbar on hover. Three pointer
+    /// handlers ask it, and a decorated surface — cmdline, popupmenu, message —
+    /// never does.
+    private var hoverScrollbarEnabled: Bool {
         let config = ZonvieConfig.shared.scrollbar
-        if config.enabled && config.isHover && !isDecoratedSurface {
+        return config.enabled && config.isHover && !isDecoratedSurface
+    }
+
+    /// Whether the pointer is over the strip the scrollbar occupies.
+    private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
+        let locationInView = convert(event.locationInWindow, from: nil)
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        return locationInView.x >= bounds.width - scrollerWidth
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if hoverScrollbarEnabled {
             hideScrollbar()
         }
         super.mouseExited(with: event)
     }
 
     override func mouseMoved(with event: NSEvent) {
-        let config = ZonvieConfig.shared.scrollbar
-        if config.enabled && config.isHover && !isDecoratedSurface {
-            let locationInView = convert(event.locationInWindow, from: nil)
-            let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-            if locationInView.x >= bounds.width - scrollerWidth {
+        if hoverScrollbarEnabled {
+            if pointerIsOverScrollbarStrip(event) {
                 showScrollbar()
             } else {
                 hideScrollbar()
