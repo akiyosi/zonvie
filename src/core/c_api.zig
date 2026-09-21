@@ -1,5 +1,6 @@
 const std = @import("std");
 const pointer_target = @import("pointer_target.zig");
+const scrollbar_metrics = @import("scrollbar_metrics.zig");
 const build_options = @import("build_options");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
@@ -1764,6 +1765,27 @@ pub export fn zonvie_core_resolve_pointer_grid(
     ) orelse return 0;
     out.?.* = hit;
     return 1;
+}
+
+pub const zonvie_scrollbar_metrics = scrollbar_metrics.Metrics;
+
+/// Whether a viewport needs a scrollbar, and where its knob sits on the track.
+///
+/// Pure: no core pointer, no lock, no allocation. Takes the three numbers a
+/// frontend already has from `zonvie_core_get_viewport*`, because both had
+/// written this arithmetic out and their answers differed at three corners --
+/// a zero-row viewport, a window showing its whole buffer, and a window
+/// scrolled past the last line.
+///
+/// Track rectangles and a minimum knob height are chrome and stay with the
+/// caller: this says how far down and how tall, in fractions.
+pub export fn zonvie_core_scrollbar_metrics(
+    topline: i64,
+    botline: i64,
+    line_count: i64,
+    out: ?*scrollbar_metrics.Metrics,
+) callconv(.c) void {
+    if (out) |o| o.* = scrollbar_metrics.compute(topline, botline, line_count);
 }
 
 /// The grid a surface's scrollbar should show. `surface_id` is 1 for the main

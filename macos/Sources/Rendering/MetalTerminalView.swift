@@ -1336,10 +1336,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         let config = ZonvieConfig.shared.scrollbar
         guard config.enabled else { return }
 
-        let visibleLines = viewport.botline - viewport.topline
-        let isScrollable = viewport.lineCount > visibleLines
+        let metrics = viewport.scrollbarMetrics
 
-        if !isScrollable {
+        if metrics.is_scrollable == 0 {
             if config.isAlways {
                 // For "always" mode, keep visible but show full-size knob
                 verticalScroller.isHidden = false
@@ -1352,8 +1351,8 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         }
 
         verticalScroller.isHidden = false
-        verticalScroller.doubleValue = viewport.scrollPosition
-        verticalScroller.knobProportion = viewport.knobProportion
+        verticalScroller.doubleValue = metrics.scroll_position
+        verticalScroller.knobProportion = metrics.knob_proportion
     }
 
     private func showScrollbar() {
