@@ -3397,6 +3397,27 @@ pub const Core = struct {
 
     /// Get list of visible grids for hit-testing.
     /// Returns number of grids written (up to out.len).
+    /// The grid a surface's scrollbar should show: the cursor's grid when this
+    /// surface composites it, and the surface's own root otherwise.
+    ///
+    /// Both frontends asked for grid -1 — the cursor's grid, wherever it is —
+    /// on the MAIN window, so moving the cursor into an external window made
+    /// the main window's knob follow content it does not draw. Both asked an
+    /// external window for its own root, so a float that window hosts scrolled
+    /// without moving the knob beside it. One surface, one rule.
+    ///
+    /// Null when grid_mu is held; the caller keeps the knob where it is, which
+    /// is what it already does for a busy viewport read.
+    pub fn tryScrollbarGridForSurface(self: *Core, surface_id: i64) ?i64 {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock(clock.io());
+        const cursor_grid = self.grid.cursor_grid;
+        if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
+            if (owner == surface_id) return cursor_grid;
+        }
+        return surface_id;
+    }
+
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());

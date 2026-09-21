@@ -1766,6 +1766,21 @@ pub export fn zonvie_core_resolve_pointer_grid(
     return 1;
 }
 
+/// The grid a surface's scrollbar should show. `surface_id` is 1 for the main
+/// window and the grid id of an external window for its own. Returns 1 and
+/// fills `out_grid` on success, 0 when grid_mu was held — on 0 the caller
+/// leaves its knob where it is.
+pub export fn zonvie_core_try_scrollbar_grid(
+    p: ?*zonvie_core,
+    surface_id: i64,
+    out_grid: ?*i64,
+) callconv(.c) c_int {
+    if (p == null or out_grid == null) return 0;
+    const g = asBox(p.?).core.tryScrollbarGridForSurface(surface_id) orelse return 0;
+    out_grid.?.* = g;
+    return 1;
+}
+
 pub export fn zonvie_core_get_visible_grids(
     p: ?*zonvie_core,
     out_grids: ?[*]GridInfo,

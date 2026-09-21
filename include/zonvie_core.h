@@ -1433,6 +1433,23 @@ ZONVIE_API int zonvie_core_resolve_pointer_grid(
     int require_scrollable,
     zonvie_pointer_hit *out);
 
+/* The grid a surface's scrollbar should show: the cursor's grid when this
+   surface composites it, and the surface's own root otherwise. `surface_id` is
+   1 for the main window and the grid id of an external window for its own.
+
+   Both frontends used to ask for grid -1 on the main window — the cursor's
+   grid, wherever it was — so moving the cursor into an external window made
+   the main window's knob follow content it does not draw. Both asked an
+   external window for its own root, so a float that window hosts scrolled
+   without moving the knob beside it.
+
+   Returns 1 and fills `out_grid` on success, 0 when the core's grid lock was
+   held; on 0 the caller leaves its knob where it is. */
+ZONVIE_API int zonvie_core_try_scrollbar_grid(
+    zonvie_core *core,
+    int64_t surface_id,
+    int64_t *out_grid);
+
 /* Viewport info for scrollbar rendering */
 typedef struct zonvie_viewport_info {
     int64_t grid_id;      /* Grid ID (1 = global grid) */

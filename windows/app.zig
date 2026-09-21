@@ -51,6 +51,7 @@ pub const zonvie_core_try_get_cursor_blink = core.zonvie_core_try_get_cursor_bli
 pub const zonvie_core_send_mouse_scroll = core.zonvie_core_send_mouse_scroll;
 pub const zonvie_core_resolve_pointer_grid = core.zonvie_core_resolve_pointer_grid;
 pub const zonvie_pointer_hit = core.zonvie_pointer_hit;
+pub const zonvie_core_try_scrollbar_grid = core.zonvie_core_try_scrollbar_grid;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;

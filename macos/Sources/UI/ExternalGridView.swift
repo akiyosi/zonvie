@@ -84,6 +84,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Until this moment, `occlusionState` may still describe this window as it
     /// stood BEFORE the app itself ordered another window in front of it. See
     /// markOcclusionSuspect.
+    /// The grid this surface's knob is showing, kept across a busy lock.
+    private lazy var lastScrollbarGrid: Int64 = gridId
+    /// Last grid `[scrollbar]` named, so the line is a transition.
+    private var lastScrollbarGridLogged: Int64 = 0
     private var occlusionSuspectUntil: CFAbsoluteTime = 0
     /// Measured at 25-36ms — about two vsyncs — between the app ordering a
     /// window in front and the server publishing the occlusion that follows
@@ -4813,13 +4817,24 @@ extension ExternalGridView: NSTextInputClient {
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled && !isDecoratedSurface else { return }
         guard let main = mainTerminalView, let core = main.core else { return }
-        guard let viewport = core.getViewportNonBlocking(gridId: gridId) else { return }
+        // The cursor's grid when this surface composites it — a float this
+        // window hosts is this window's content — and this window's own root
+        // otherwise. Asking only for the root left the knob still while a
+        // hosted float scrolled.
+        // On a busy lock keep the grid the knob is already showing.
+        let scrollbarGrid = core.scrollbarGridNonBlocking(surfaceId: gridId) ?? lastScrollbarGrid
+        lastScrollbarGrid = scrollbarGrid
+        guard let viewport = core.getViewportNonBlocking(gridId: scrollbarGrid) else { return }
 
         let viewportChanged = viewport.topline != lastViewportTopline ||
                               viewport.lineCount != lastViewportLineCount ||
                               viewport.botline != lastViewportBotline
 
         if viewportChanged {
+            if ZonvieCore.appLogEnabled, scrollbarGrid != lastScrollbarGridLogged || viewport.topline != lastViewportTopline {
+                lastScrollbarGridLogged = scrollbarGrid
+                ZonvieCore.appLog("[scrollbar] surface=\(gridId) grid=\(scrollbarGrid) topline=\(viewport.topline) lineCount=\(viewport.lineCount)")
+            }
             lastViewportTopline = viewport.topline
             lastViewportLineCount = viewport.lineCount
             lastViewportBotline = viewport.botline

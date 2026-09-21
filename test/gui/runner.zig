@@ -476,6 +476,17 @@ test "gui:extwin_float_trackpad_scroll" {
     }
 }
 
+test "gui:scrollbar_follows_own_surface" {
+    // macOS only: ExternalGridView and the window enumeration are macOS
+    // frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/scrollbar_follows_own_surface.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_float_stack_scroll_continuity" {
     // macOS only: ExternalGridView hosts the layer and the trackpad gesture
     // is driven through macos_window.zig.
