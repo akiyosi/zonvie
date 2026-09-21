@@ -172,6 +172,20 @@ fn scrollbarGeometryFor(
     };
 }
 
+/// The grid this surface's scrollbar should show. The core answers it — the
+/// cursor's grid when this surface composites it, the surface's own root
+/// otherwise — because both frontends were asking for -1 on the main window
+/// and following a scroll in a window they do not draw.
+///
+/// Falls back to the surface's own root when the core's grid lock is held,
+/// which is the same grid the knob is already showing.
+fn scrollbarGrid(app: *App, surface_id: i64) i64 {
+    const corep = app.corep orelse return surface_id;
+    var grid: i64 = surface_id;
+    if (app_mod.zonvie_core_try_scrollbar_grid(corep, surface_id, &grid) == 0) return surface_id;
+    return grid;
+}
+
 pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
     // Only titlebar mode occupies vertical space above the terminal; sidebar
     // mode shifts content horizontally and must keep the track at the top.
@@ -181,14 +195,14 @@ pub fn getScrollbarGeometry(app: *App, client_width: i32, client_height: i32) ap
         @floatFromInt(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
     else
         0;
-    return scrollbarGeometryFor(app, -1, client_width, client_height, app.dpi_scale, tabbar_offset);
+    return scrollbarGeometryFor(app, scrollbarGrid(app, 1), client_width, client_height, app.dpi_scale, tabbar_offset);
 }
 
 pub fn getScrollbarGeometryForExternal(app: *App, grid_id: i64, client_width: i32, client_height: i32, dpi_scale: f32) app_mod.ScrollbarGeometry {
     // No tabline sits above an external window's content, so no top offset.
     // dpi_scale is this window's own monitor DPI, which may differ from
     // app.dpi_scale on a mixed-DPI multi-monitor setup.
-    return scrollbarGeometryFor(app, grid_id, client_width, client_height, dpi_scale, 0);
+    return scrollbarGeometryFor(app, scrollbarGrid(app, grid_id), client_width, client_height, dpi_scale, 0);
 }
 
 /// Emit the track and knob quads for a scrollbar whose geometry is already
@@ -574,7 +588,7 @@ pub fn scrollbarMouseDown(hwnd: c.HWND, app: *App, mouse_x: i32, mouse_y: i32) b
             app.scrollbar_drag_start_y = mouse_y;
 
             var vp: app_mod.ViewportInfo = undefined;
-            if (getViewportNonBlocking(app, -1, &vp) != .none) {
+            if (getViewportNonBlocking(app, scrollbarGrid(app, 1), &vp) != .none) {
                 app.scrollbar_drag_start_topline = vp.topline;
             }
 
@@ -622,7 +636,7 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
     if (!geom.is_scrollable) return;
 
     var vp: app_mod.ViewportInfo = undefined;
-    if (getViewportNonBlocking(app, -1, &vp) == .none) return;
+    if (getViewportNonBlocking(app, scrollbarGrid(app, 1), &vp) == .none) return;
 
     const visible_lines = vp.botline - vp.topline;
     if (visible_lines <= 0) return;
@@ -750,7 +764,7 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
 
     // Get current viewport info
     var vp: app_mod.ViewportInfo = undefined;
-    switch (getViewportNonBlocking(app, -1, &vp)) {
+    switch (getViewportNonBlocking(app, scrollbarGrid(app, 1), &vp)) {
         .fresh => {},
         .none => return,
         .cached => {
