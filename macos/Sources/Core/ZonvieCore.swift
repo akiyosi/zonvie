@@ -3080,18 +3080,24 @@ final class ZonvieCore {
         var curcol: Int64      // Current cursor column
         var scrollDelta: Int64 // Lines scrolled since last update
 
-        /// Calculate scrollbar thumb position (0.0 to 1.0)
-        var scrollPosition: Double {
-            guard lineCount > 0 else { return 0 }
-            let visibleLines = botline - topline
-            let scrollRange = max(1, lineCount - visibleLines)
-            return Double(topline) / Double(scrollRange)
-        }
-
-        /// Calculate scrollbar thumb proportion (0.0 to 1.0)
-        var knobProportion: Double {
-            guard lineCount > 0 else { return 1.0 }
-            return min(1.0, Double(botline - topline) / Double(lineCount))
+        /// Whether a scrollbar is needed, how far down its knob sits and how
+        /// much of the track it covers.
+        ///
+        /// The core answers it (`zonvie_core_scrollbar_metrics`). This was
+        /// written out here and again in `windows/ui/scrollbar.zig`, and the
+        /// two disagreed at three corners: a zero-row viewport, which only
+        /// Windows refused to call scrollable; a window showing its whole
+        /// buffer, where dividing by `max(1, lineCount - visible)` reported
+        /// `topline` as the position rather than 0; and a window scrolled past
+        /// the last line, where neither clamped and Windows drew its knob
+        /// below the bottom of its own track.
+        ///
+        /// One C call per scrollbar update, which happens on a viewport
+        /// change rather than per frame.
+        var scrollbarMetrics: zonvie_scrollbar_metrics {
+            var m = zonvie_scrollbar_metrics()
+            zonvie_core_scrollbar_metrics(topline, botline, lineCount, &m)
+            return m
         }
 
         /// Single mapping point from the C ABI struct, shared by the blocking
