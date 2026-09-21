@@ -8182,13 +8182,7 @@ final class ZonvieCore {
             // Which surface composites the anchor grid, not whether the grid
             // IS a window: a grid an external window merely contains answers
             // no to the second and yes to the first.
-            let anchorWindow: NSWindow = {
-                guard let g = targetGrid,
-                      let raw = cachedVisibleGridsRaw.first(where: { $0.grid_id == g.gridId }),
-                      let external = externalWindows[raw.placed_by_surface]
-                else { return mainWindow }
-                return external
-            }()
+            let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
             let anchorFrame = anchorWindow.frame
             let anchorContentRect = anchorWindow.contentLayoutRect
 
@@ -8283,6 +8277,23 @@ final class ZonvieCore {
 
     /// True if the grid is a float (zindex > 0) per the cached visible grids.
     /// Synthetic grids (cmdline/message) are not in the list and return false.
+    /// The external window that composites `grid`, or nil when the main window
+    /// does — which is also the answer for a grid that is not placed at all.
+    ///
+    /// Both message-placement branches had this written out, as copies of each
+    /// other — the comment on the second said so — and they asked `isExternal`,
+    /// which answers "is this grid a window of its own" rather than "who draws
+    /// it". The two differ only for a grid an external surface places without
+    /// being, and the anchor walk above always lands on an external ROOT, so no
+    /// reachable state was measured where the answers differ: this is one
+    /// question in one place, not a behaviour change.
+    private func windowCompositing(_ grid: GridInfo?) -> NSWindow? {
+        guard let grid,
+              let raw = cachedVisibleGridsRaw.first(where: { $0.grid_id == grid.gridId })
+        else { return nil }
+        return externalWindows[raw.placed_by_surface]
+    }
+
     /// The window that actually composites the grid the cursor is on.
     ///
     /// "Is this a float" is not that question, and answering it instead put an
@@ -8379,15 +8390,7 @@ final class ZonvieCore {
                 targetGrid = grids.first { $0.gridId == 1 }
             }
 
-            // Same resolution updateMiniPositions' `.grid` branch makes, for
-            // the same reason: an external grid is reported at (0,0) and is a
-            // window of its own, so measuring it against the MAIN window's
-            // origin puts the panel over the wrong window entirely.
-            let anchorWindow: NSWindow = {
-                guard let g = targetGrid, g.isExternal,
-                      let external = externalWindows[g.gridId] else { return mainWindow }
-                return external
-            }()
+            let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
             let anchorFrame = anchorWindow.frame
             let anchorContentRect = anchorWindow.contentLayoutRect
 
