@@ -197,6 +197,66 @@ fn tally(alloc: std.mem.Allocator, since_ms: f64, cell_px: f64) !Tally {
     return t;
 }
 
+/// No grid an external window composites may appear in the MAIN renderer's
+/// float-debt ledger.
+///
+/// Both surfaces log `[float_debt]`; only the external one's line carries
+/// `surface=`. A grid id on both lists means the main renderer built a scroll
+/// offset for a float it does not draw -- and then a debt against it that
+/// diverges without bound, because its own placement counter never moves for a
+/// layer it never places. `appendFloatScrollOffsets` walked every visible grid
+/// and asked only `zindex > 0`, which is true of a float whatever window draws
+/// it.
+///
+/// Read over the whole log: the scenario deletes it at startup, so every line
+/// in it is this run's, and a window bounded by a timestamp could exclude the
+/// external surface's lines, which land on the first displaced frame.
+fn assertLedgerIsPerSurface(alloc: std.mem.Allocator) !void {
+    const lines = try app_log.linesSince(alloc, log_path, "[float_debt]", 0);
+    defer alloc.free(lines);
+
+    var hosted = std.AutoHashMap(i64, void).init(alloc);
+    defer hosted.deinit();
+    var on_main = std.AutoHashMap(i64, void).init(alloc);
+    defer on_main.deinit();
+
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    while (it.next()) |line| {
+        const gid = app_log.field(line, "gridId") orelse continue;
+        const id: i64 = @intFromFloat(gid);
+        if (app_log.field(line, "surface") != null) {
+            try hosted.put(id, {});
+        } else {
+            try on_main.put(id, {});
+        }
+    }
+
+    // Anti-vacuity: with no external-surface line there is nothing to compare,
+    // and an empty left side would pass on a run where the floats never
+    // reached the external surface's ledger at all.
+    if (hosted.count() == 0) {
+        std.debug.print(
+            "[gui] no hosted float reached the external surface's float ledger — " ++
+                "nothing to compare the main renderer's against\n",
+            .{},
+        );
+        return error.NoHostedFloatLedger;
+    }
+
+    var bad: usize = 0;
+    var keys = hosted.keyIterator();
+    while (keys.next()) |gid| {
+        if (!on_main.contains(gid.*)) continue;
+        bad += 1;
+        std.debug.print(
+            "[gui] grid {d} is composited by the external window, yet the main renderer " ++
+                "keeps a scroll offset and a float-debt ledger for it\n",
+            .{gid.*},
+        );
+    }
+    if (bad != 0) return error.MainLedgerHoldsForeignGrid;
+}
+
 pub fn run(alloc: std.mem.Allocator) !void {
     if (!platform.accessibilityTrusted()) {
         std.debug.print(
@@ -346,6 +406,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         );
         return error.FloatsNeverReplaced;
     }
+
+    try assertLedgerIsPerSurface(alloc);
 
     if (t.jumps > jump_threshold) {
         std.debug.print(
