@@ -23,6 +23,30 @@ private final class MainThreadCallbackState<Result>: @unchecked Sendable {
     var isCancelled = false
 }
 
+extension NSScroller {
+    /// Show this scroller for `metrics`, or hide it when nothing scrolls.
+    ///
+    /// `alwaysVisible` is the config's "always" mode, which keeps the scroller
+    /// on screen with a full-size knob instead of hiding it.
+    ///
+    /// Both surfaces had this written out, identical but for one comment, and
+    /// both had to be edited together when the arithmetic behind `metrics`
+    /// moved into the core.
+    func apply(_ metrics: zonvie_scrollbar_metrics, alwaysVisible: Bool) {
+        guard metrics.is_scrollable != 0 else {
+            isHidden = !alwaysVisible
+            if alwaysVisible {
+                doubleValue = 0
+                knobProportion = 1.0
+            }
+            return
+        }
+        isHidden = false
+        doubleValue = metrics.scroll_position
+        knobProportion = metrics.knob_proportion
+    }
+}
+
 final class ZonvieCore {
     private var core: OpaquePointer?
     private var ctxPtr: UnsafeMutableRawPointer?
@@ -8157,28 +8181,8 @@ final class ZonvieCore {
 
         case .grid:
             // Grid-based: bottom-right of the grid where cursor is
-            let cursorPos = getCursorPositionNonBlocking()
-            let cursorGridId = cursorPos.gridId
             let grids = getVisibleGridsCached()
-            var targetGrid: GridInfo?
-
-            for grid in grids {
-                if grid.gridId == cursorGridId {
-                    targetGrid = grid
-                    break
-                }
-            }
-
-            // Cursor inside a float (e.g. telescope prompt): anchor to the
-            // non-float grid the float hangs off instead of the float itself.
-            if let g = targetGrid, g.zindex > 0 {
-                targetGrid = resolveNonFloatAnchorGrid(of: g, in: grids)
-            }
-
-            // Fallback to global grid (id=1) if not found
-            if targetGrid == nil {
-                targetGrid = grids.first { $0.gridId == 1 }
-            }
+            let targetGrid = cursorAnchorGrid(in: grids)
 
             // An external grid is a window of its own. The core reports it at
             // (0,0) with no placement inside the main window
@@ -8287,8 +8291,6 @@ final class ZonvieCore {
         )
     }
 
-    /// True if the grid is a float (zindex > 0) per the cached visible grids.
-    /// Synthetic grids (cmdline/message) are not in the list and return false.
     /// The external window that composites `grid`, or nil when the main window
     /// does — which is also the answer for a grid that is not placed at all.
     ///
@@ -8326,6 +8328,25 @@ final class ZonvieCore {
         return external
     }
 
+
+    /// The grid an ext-UI element should be measured against: the one the
+    /// cursor is in, or — when that is a float — the window grid the float
+    /// hangs off. Grid 1 when neither is found.
+    ///
+    /// Written out twice, in `updateMiniPositions`' `.grid` branch and in
+    /// `getExtFloatTargetFrame`. `7df3136` and `62b92ab` each removed one
+    /// layer ABOVE this one — the anchor window it feeds — and left the walk
+    /// that produces the grid duplicated underneath both times.
+    private func cursorAnchorGrid(in grids: [GridInfo]) -> GridInfo? {
+        let cursorGridId = getCursorPositionNonBlocking().gridId
+        var target = grids.first { $0.gridId == cursorGridId }
+        // Cursor inside a float (e.g. telescope prompt): anchor to the
+        // non-float grid the float hangs off instead of the float itself.
+        if let g = target, g.zindex > 0 {
+            target = resolveNonFloatAnchorGrid(of: g, in: grids)
+        }
+        return target ?? grids.first { $0.gridId == 1 }
+    }
 
     /// Walk anchorGrid links from a float until a non-float grid is reached.
     /// Returns nil when the chain dead-ends or exceeds the hop guard, so
@@ -8380,27 +8401,8 @@ final class ZonvieCore {
             let cellWidthPx = CGFloat(renderer.cellWidthPx)
             let cellHeightPx = CGFloat(renderer.cellHeightPx)
 
-            let cursorPos = getCursorPositionNonBlocking()
-            let cursorGridId = cursorPos.gridId
             let grids = getVisibleGridsCached()
-            var targetGrid: GridInfo?
-
-            for grid in grids {
-                if grid.gridId == cursorGridId {
-                    targetGrid = grid
-                    break
-                }
-            }
-
-            // Cursor inside a float (e.g. telescope prompt): anchor to the
-            // non-float grid the float hangs off instead of the float itself.
-            if let g = targetGrid, g.zindex > 0 {
-                targetGrid = resolveNonFloatAnchorGrid(of: g, in: grids)
-            }
-
-            if targetGrid == nil {
-                targetGrid = grids.first { $0.gridId == 1 }
-            }
+            let targetGrid = cursorAnchorGrid(in: grids)
 
             let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
             let anchorFrame = anchorWindow.frame

@@ -4917,22 +4917,7 @@ extension ExternalGridView: NSTextInputClient {
         let config = ZonvieConfig.shared.scrollbar
         guard config.enabled else { return }
 
-        let metrics = viewport.scrollbarMetrics
-
-        if metrics.is_scrollable == 0 {
-            if config.isAlways {
-                verticalScroller.isHidden = false
-                verticalScroller.doubleValue = 0
-                verticalScroller.knobProportion = 1.0
-            } else {
-                verticalScroller.isHidden = true
-            }
-            return
-        }
-
-        verticalScroller.isHidden = false
-        verticalScroller.doubleValue = metrics.scroll_position
-        verticalScroller.knobProportion = metrics.knob_proportion
+        verticalScroller.apply(viewport.scrollbarMetrics, alwaysVisible: config.isAlways)
     }
 
     private func showScrollbar() {
