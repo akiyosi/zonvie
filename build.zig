@@ -494,6 +494,17 @@ pub fn build(b: *std.Build) !void {
     const pointer_target_tests = b.addTest(.{ .root_module = pointer_target_test_mod });
     test_step.dependOn(&b.addRunArtifact(pointer_target_tests).step);
 
+    // Whether a viewport needs a scrollbar and where its knob sits. Same
+    // shape: the arithmetic both frontends had written out, with the corners
+    // their two versions disagreed about pinned by the tests.
+    const scrollbar_metrics_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/scrollbar_metrics.zig"),
+    });
+    const scrollbar_metrics_tests = b.addTest(.{ .root_module = scrollbar_metrics_test_mod });
+    test_step.dependOn(&b.addRunArtifact(scrollbar_metrics_tests).step);
+
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,

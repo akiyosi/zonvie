@@ -119,8 +119,13 @@ fn scrollbarGeometryFor(
         .is_scrollable = false,
     };
 
-    const visible_lines = vp.botline - vp.topline;
-    const is_scrollable = vp.line_count > visible_lines and visible_lines > 0;
+    // The rule is the core's (`zonvie_core_scrollbar_metrics`). It was written
+    // out here and again in the macOS frontend, and the two answers differed at
+    // three corners -- and the second site in THIS file disagreed with the one
+    // above it, lacking the zero-row guard.
+    var metrics: app_mod.zonvie_scrollbar_metrics = undefined;
+    app_mod.zonvie_core_scrollbar_metrics(vp.topline, vp.botline, vp.line_count, &metrics);
+    const is_scrollable = metrics.is_scrollable != 0;
 
     const cw: f32 = @floatFromInt(client_width);
     const ch: f32 = @floatFromInt(client_height);
@@ -148,18 +153,14 @@ fn scrollbarGeometryFor(
         };
     }
 
-    // Knob size proportional to visible portion
-    const visible_f: f32 = @floatFromInt(visible_lines);
-    const total_f: f32 = @floatFromInt(@max(1, vp.line_count));
-    const knob_proportion = @min(1.0, visible_f / total_f);
-    var knob_height = track_height * knob_proportion;
+    // Fractions from the core; the minimum knob height is this frontend's own
+    // chrome, and clamping the knob into the track is what the core's clamped
+    // position buys -- a window scrolled past EOF used to place it below
+    // `track_bottom`.
+    var knob_height = track_height * @as(f32, @floatCast(metrics.knob_proportion));
     knob_height = @max(sb_min_knob, knob_height);
-
-    // Knob position
-    const scroll_range = total_f - visible_f;
-    const scroll_pos: f32 = if (scroll_range > 0) @as(f32, @floatFromInt(vp.topline)) / scroll_range else 0;
     const knob_travel = track_height - knob_height;
-    const knob_top = track_top + knob_travel * scroll_pos;
+    const knob_top = track_top + knob_travel * @as(f32, @floatCast(metrics.scroll_position));
 
     return .{
         .track_left = track_left,
@@ -792,10 +793,10 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     app.last_viewport_line_count = vp.line_count;
     app.last_viewport_botline = vp.botline;
 
-    const visible_lines = vp.botline - vp.topline;
-    const is_scrollable = vp.line_count > visible_lines;
+    var metrics: app_mod.zonvie_scrollbar_metrics = undefined;
+    app_mod.zonvie_core_scrollbar_metrics(vp.topline, vp.botline, vp.line_count, &metrics);
 
-    if (!is_scrollable and !app.config.scrollbar.isAlways()) {
+    if (metrics.is_scrollable == 0 and !app.config.scrollbar.isAlways()) {
         hideScrollbar(hwnd, app);
         return;
     }

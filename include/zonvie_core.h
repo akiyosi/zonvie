@@ -1433,6 +1433,37 @@ ZONVIE_API int zonvie_core_resolve_pointer_grid(
     int require_scrollable,
     zonvie_pointer_hit *out);
 
+/* How a viewport's scrollbar should look, filled by
+   zonvie_core_scrollbar_metrics. Fractions, not pixels: the track rectangle
+   and a minimum knob height are chrome and stay with the frontend. */
+typedef struct zonvie_scrollbar_metrics {
+    /* 1 when the buffer holds more lines than the viewport shows. */
+    uint8_t is_scrollable;
+    /* Where the knob sits along its travel: 0 at the top, 1 at the bottom.
+       Defined even when nothing scrolls, where it is 0. */
+    double scroll_position;
+    /* How much of the track the knob covers, 0..1. */
+    double knob_proportion;
+} zonvie_scrollbar_metrics;
+
+/* Whether a viewport needs a scrollbar and where its knob sits.
+
+   `botline` is exclusive, and Neovim reports it past `line_count` for a window
+   showing the region beyond the last line.
+
+   Both frontends had this arithmetic written out and their answers differed at
+   three corners: a zero-row viewport (one called it scrollable), a window
+   showing its whole buffer (one reported `topline` as the position rather than
+   0), and a window scrolled past EOF (neither clamped, and one drew its knob
+   below the bottom of its own track).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_scrollbar_metrics(
+    int64_t topline,
+    int64_t botline,
+    int64_t line_count,
+    zonvie_scrollbar_metrics *out);
+
 /* The grid a surface's scrollbar should show: the cursor's grid when this
    surface composites it, and the surface's own root otherwise. `surface_id` is
    1 for the main window and the grid id of an external window for its own.
