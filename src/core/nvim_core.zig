@@ -3380,8 +3380,10 @@ pub const Core = struct {
     /// Scroll view to specified line number (1-based).
     /// If use_bottom is true, positions the line at the bottom of the screen (zb).
     /// Otherwise, positions at the top (zt).
-    pub fn scrollToLine(self: *Core, line: i64, use_bottom: bool) void {
-        self.requestScrollToLine(line, use_bottom) catch |e| {
+    /// `grid_id` names the window to scroll — the surface whose scrollbar was
+    /// dragged, not whichever one holds the cursor.
+    pub fn scrollToLine(self: *Core, grid_id: i64, line: i64, use_bottom: bool) void {
+        self.requestScrollToLine(grid_id, line, use_bottom) catch |e| {
             self.log.write("scrollToLine err: {any}\n", .{e});
         };
     }
@@ -5527,35 +5529,48 @@ pub const Core = struct {
 
     /// Scroll view to specified line number (1-based) via nvim_exec_lua.
     /// If use_bottom is true, positions the line at the bottom (zb), otherwise at the top (zt).
-    fn requestScrollToLine(self: *Core, line: i64, use_bottom: bool) !void {
+    fn requestScrollToLine(self: *Core, grid_id: i64, line: i64, use_bottom: bool) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
         try self.sendRequestHeader(&buf, id, "nvim_exec_lua");
 
-        // Lua code: args are passed as varargs
-        // arg1 = line number, arg2 = use_bottom (0 or 1)
-        // Use normal command to scroll (same approach as nvim-scrollview)
-        // Temporarily set scrolloff=0 to allow scrolling to the very end of file
+        // Resolve grid_id -> Neovim winid, exactly as requestPageScroll does:
+        // a drag on one window's scrollbar must move THAT window, and this ran
+        // on the current one, so dragging the main window's knob scrolled an
+        // external window whenever the cursor was in it.
+        const winid: i64 = blk: {
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
+            break :blk self.grid.getWinId(grid_id) orelse 0;
+        };
+
+        // Lua code: args are passed as varargs.
+        // Temporarily set scrolloff=0 to allow scrolling to the very end of
+        // file; inside nvim_win_call `vim.wo` is the target window's.
         const lua_code =
-            \\local line, use_bottom = select(1, ...), select(2, ...)
-            \\local so = vim.wo.scrolloff
-            \\vim.wo.scrolloff = 0
-            \\if use_bottom == 1 then
-            \\  vim.cmd('keepjumps normal! ' .. line .. 'Gzb')
-            \\else
-            \\  vim.cmd('keepjumps normal! ' .. line .. 'Gzt')
-            \\end
-            \\vim.wo.scrolloff = so
+            \\local line, use_bottom, winid = ...
+            \\local win = winid > 0 and winid or vim.api.nvim_get_current_win()
+            \\vim.api.nvim_win_call(win, function()
+            \\  local so = vim.wo.scrolloff
+            \\  vim.wo.scrolloff = 0
+            \\  if use_bottom == 1 then
+            \\    vim.cmd('keepjumps normal! ' .. line .. 'Gzb')
+            \\  else
+            \\    vim.cmd('keepjumps normal! ' .. line .. 'Gzt')
+            \\  end
+            \\  vim.wo.scrolloff = so
+            \\end)
         ;
 
         // nvim_exec_lua(code, args) - args is array with two integers
         try rpc.packArray(&buf, self.alloc, 2);
         try rpc.packStr(&buf, self.alloc, lua_code);
-        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packArray(&buf, self.alloc, 3);
         try rpc.packInt(&buf, self.alloc, line);
         try rpc.packInt(&buf, self.alloc, if (use_bottom) @as(i64, 1) else @as(i64, 0));
+        try rpc.packInt(&buf, self.alloc, winid);
 
         try self.sendRaw(buf.items);
 

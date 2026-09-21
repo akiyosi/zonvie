@@ -18,6 +18,14 @@
 // with whatever window is frontmost under the pointer, and that race is not
 // what this measures.
 //
+// Covers what each knob SHOWS. What it ACTS on — page and drag — reads the
+// same expression (`scrollbarInteractionGrid`, which is
+// `scrollbarGridNonBlocking` for this surface), so it cannot disagree with the
+// display without that expression changing. Triggering it would mean clicking
+// a track that auto-hides, at coordinates measured from a window that may not
+// be frontmost, which is the fragility this file's keyboard scrolling exists
+// to avoid. `[scrollbar_action]` records the decision instead.
+//
 // macOS-only: ExternalGridView and the window enumeration are macOS frontend.
 
 const std = @import("std");
