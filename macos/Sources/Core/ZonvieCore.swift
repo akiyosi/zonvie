@@ -4905,13 +4905,13 @@ final class ZonvieCore {
             // Pipeline readiness precedes AppKit host construction. A failed
             // Metal build is retried by the renderer with bounded backoff, so
             // a permanent failure cannot create/close NSWindows at 10 Hz.
-            guard renderer.ensurePipelineReady(view: mainView),
+            guard renderer.shared.ensurePipelineReady(view: mainView),
                   renderer.shared.pipeline != nil,
                   renderer.shared.sampler != nil else {
                 ZonvieCore.appLog("[external_window] renderer pipelines not ready, queuing request for gridId=\(gridId)")
                 self.queuePendingExternalWindowRequest(
                     PendingExternalWindowRequest(gridId: gridId, win: win, rows: rows, cols: cols, startRow: startRow, startCol: startCol, lifecycleToken: lifecycleToken, sessionGeneration: sessionGeneration),
-                    retryAfter: renderer.pipelineRetryDelay()
+                    retryAfter: renderer.shared.pipelineRetryDelay()
                 )
                 return
             }

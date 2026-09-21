@@ -1019,6 +1019,56 @@ func resolveSurfaceGridRow(_ set: SurfaceBufferSet, row: Int, cellHeightPx: Floa
     return (set.rowState.counts[slot], buffer, Float(row - source) * cellHeightPx)
 }
 
+/// Refill `scratch` with the indices in `retained` that belong to `gridId` at
+/// this cell height, and return how many there are. The list is the surface's
+/// persistent scratch, so a layer costs no allocation per frame. A row whose
+/// cell height no longer matches is dropped: a font or linespace change
+/// invalidated the geometry the copy was built with.
+@discardableResult
+func collectSurfaceLayerRetainedRows(
+    gridId: Int64,
+    retained: [RetainedScrollRow],
+    cellHeightPx: Float,
+    into scratch: inout [Int]
+) -> Int {
+    scratch.removeAll(keepingCapacity: true)
+    for (i, r) in retained.enumerated()
+    where r.gridId == gridId && r.cellHeightPx == cellHeightPx {
+        scratch.append(i)
+    }
+    return scratch.count
+}
+
+/// Resolve one row of a layer's draw range: the layer's own rows first, then
+/// the rows its smooth scroll retained (`retainedIndices` into `retained`),
+/// all in the layer's grid-local space. A row past `rowCount` resolves to
+/// nothing even when the buffer set still holds it: the layer's placement
+/// says how tall it is, and a dirty row can name a row the layer lost.
+func resolveSurfaceLayerRow(
+    _ row: Int,
+    set: SurfaceBufferSet,
+    rowCount: Int,
+    retained: [RetainedScrollRow],
+    retainedIndices: [Int],
+    cellHeightPx: Float
+) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+    if row >= rowCount {
+        let i = row - rowCount
+        guard i < retainedIndices.count else { return nil }
+        let r = retained[retainedIndices[i]]
+        return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * cellHeightPx)
+    }
+    guard row >= 0 else { return nil }
+    return resolveSurfaceGridRow(set, row: row, cellHeightPx: cellHeightPx)
+}
+
+/// A layer drawn at a fractional origin is mid-ease. Its scissor floors the
+/// origin, so it has to cover the row of pixels the flooring would otherwise
+/// clip.
+func surfaceLayerScissorPadY(topPx: Float) -> Int {
+    topPx == topPx.rounded(.down) ? 0 : 1
+}
+
 final class SurfaceBufferSet {
     let rowState = SurfaceRowBufferState()
     var rowLogicalToSlot: [Int] = []        // logical row -> physical slot
