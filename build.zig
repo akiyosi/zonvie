@@ -350,6 +350,22 @@ pub fn build(b: *std.Build) !void {
         run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
         test_step.dependOn(&run_scroll_retention_test.step);
 
+        // The one rule that turns a pixel into a grid row while a sub-row ease
+        // is running. It had a second, band-less copy on the drag path, so a
+        // press and the drag after it disagreed about the same pixel.
+        const compile_scroll_row_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_scroll_row_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_scroll_row_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
+        compile_scroll_row_test.addFileArg(b.path("macos/Tests/ScrollAdjustedRowTests.swift"));
+        compile_scroll_row_test.addArg("-o");
+        const scroll_row_test_exe = compile_scroll_row_test.addOutputFileArg("scroll-adjusted-row-tests");
+        const run_scroll_row_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_scroll_row_test.addFileArg(scroll_row_test_exe);
+        test_step.dependOn(&run_scroll_row_test.step);
+
         // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
         // back texture, and the vacated band always inside the rows the
         // caller redraws. The blit itself is checked against a real texture
