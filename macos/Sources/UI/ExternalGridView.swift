@@ -190,6 +190,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// state, filled under `lock` alongside `layerSnapshot`.
     private var placementRowsUpSnapshot: [Int64: Int] = [:]
     private var floatDebtBaselineSnapshot: [Int64: FloatDebtBaseline] = [:]
+    /// Last debt reported per layer, so `[float_debt]` is a transition line
+    /// rather than a per-frame one. The main surface keeps the same map; this
+    /// surface had the ledger and not the line, which is why the window a
+    /// float carries debt in could not be measured here.
+    private var hostedDebtLastLogged: [Int64: Int] = [:]
 
     /// Clear what the bracket staged and mark it closed. Called with `lock`
     /// held, from both arms of commitFlush: a bracket that rotated buffers and
@@ -222,13 +227,25 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// to; the placement half is this surface's own, latched with the layer
     /// snapshot. Both counters run from whenever their grid appeared, so the
     /// first frame a float is seen following fixes their common zero.
-    private func hostedFloatDebtPx(gridId: Int64, anchorGridId: Int64, cellHeightPx: Float) -> Float {
+    ///
+    /// `seedingBaseline` is false for the hit test: the DRAW defines the zero,
+    /// being the frame that first shows the float following. A press arriving
+    /// before that frame would otherwise fix the zero against a placement
+    /// snapshot no draw has filled, and the draw would inherit it.
+    private func hostedFloatDebtPx(
+        gridId: Int64,
+        anchorGridId: Int64,
+        cellHeightPx: Float,
+        seedingBaseline: Bool = true
+    ) -> Float {
         guard cellHeightPx > 0, let main = mainTerminalView else { return 0 }
         let anchorRowsUp = main.anchorLandedRowsUpSnapshot(anchorGridId)
         let placementRowsUp = placementRowsUpSnapshot[gridId] ?? 0
         guard let baseline = floatDebtBaselineSnapshot[gridId] else {
-            floatDebtBaselineSnapshot[gridId] = FloatDebtBaseline(
-                anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
+            if seedingBaseline {
+                floatDebtBaselineSnapshot[gridId] = FloatDebtBaseline(
+                    anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
+            }
             return 0
         }
         let rows = floatDebtRowsUp(
@@ -236,6 +253,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             placementRowsUp: placementRowsUp,
             baseline: baseline
         )
+        // The draw's reading is the surface's state; the hit test only reads it.
+        if seedingBaseline, ZonvieCore.appLogEnabled, hostedDebtLastLogged[gridId] != rows {
+            hostedDebtLastLogged[gridId] = rows
+            ZonvieCore.appLog(
+                "[float_debt] surface=\(self.gridId) gridId=\(gridId) rows=\(rows)"
+                    + " anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp)"
+                    + " base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))"
+            )
+        }
         return Float(rows) * cellHeightPx
     }
 
@@ -4303,11 +4329,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         main: MetalTerminalView
     ) -> (x: CGFloat, y: CGFloat, ownOffsetPx: CGFloat)? {
         let ownOffsetPx = main.visualScrollOffsetPx(gridId: layer.gridId, cellHeightPx: cellH)
-        // drawHostedLayers moves the whole layer with the root only when the
-        // layer has no ease of its own; otherwise its frame stays put and the
-        // shader displaces the rows inside it.
-        let originY = CGFloat(layer.originPx.y)
-            + (ownOffsetPx == 0 && layer.followsScroll ? rootOffsetPx : 0)
+        let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
+                                             rootOffsetPx: rootOffsetPx, cellH: cellH)
         let x = pointPx.x - CGFloat(layer.originPx.x)
         let y = pointPx.y - originY
         guard x >= 0, y >= 0,
@@ -4317,25 +4340,60 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         return (x, y, ownOffsetPx)
     }
 
+    /// Where a hosted layer's rows are DRAWN on this surface, in surface
+    /// pixels, so the hit test reads the placement rather than its own account
+    /// of it.
+    ///
+    /// drawHostedLayers builds it from two terms: the anchor's displacement,
+    /// which moves a follower bodily rather than easing rows inside a frame
+    /// that stays put, and the float ledger's debt, giving back the rows this
+    /// float's own placement has already performed. Both hit-test sites
+    /// transcribed the first term and dropped the second, so for as long as a
+    /// float carried debt a press landed whole ROWS from where the float is
+    /// drawn -- and rebaseToPressGrid's comment already claimed it used the
+    /// drawn origin.
+    private func hostedLayerDrawOriginY(
+        _ layer: SurfaceLayer,
+        ownOffsetPx: CGFloat,
+        rootOffsetPx: CGFloat,
+        cellH: CGFloat
+    ) -> CGFloat {
+        guard ownOffsetPx == 0, layer.followsScroll else { return CGFloat(layer.originPx.y) }
+        let debtPx = hostedFloatDebtPx(
+            gridId: layer.gridId,
+            anchorGridId: layer.anchorGrid,
+            cellHeightPx: Float(cellH),
+            seedingBaseline: false
+        )
+        return CGFloat(layer.originPx.y) + rootOffsetPx + CGFloat(debtPx)
+    }
+
     /// The grid row a grid-local pixel names, undoing the sub-row ease the
-    /// frame drew with. Left alone outside the scrollable content area, the
-    /// way the main window's hit test leaves its margin rows alone.
+    /// frame drew with.
+    ///
+    /// The rule is `scrollAdjustedLocalRow`, which the main window's hit test
+    /// and drag both use; this file carried a third copy of it. The band is
+    /// stated with `startRow: 0` because these pixels are already the grid's
+    /// own -- the main window measures from the surface origin and subtracts
+    /// the grid's start row, and that is the whole difference between the two.
     private func scrolledRow(
         _ localY: CGFloat,
         offsetPx: CGFloat,
         cellH: CGFloat,
         info: ZonvieCore.GridInfo?
     ) -> Int32 {
-        let row = Int32(localY / cellH)
-        guard abs(offsetPx) > 0.001, let info else { return row }
-        // Margin rows (winbar, border) carry no DECO_SCROLLABLE, so the vertex
-        // shader left them where they statically belong while the content eased
-        // past them. A pixel ON one names that row: undoing an ease it never
-        // took would hand back a content row the user did not click.
-        guard row >= info.marginTop, row < info.rows - info.marginBottom else { return row }
-        let adjusted = Int32((localY - offsetPx) / cellH)
-        guard adjusted >= info.marginTop, adjusted < info.rows - info.marginBottom else { return row }
-        return adjusted
+        guard let info else { return cellH > 0 ? Int32(localY / cellH) : 0 }
+        return scrollAdjustedLocalRow(
+            pointPxY: localY,
+            cellHeightPx: cellH,
+            band: GridRowBand(
+                startRow: 0,
+                rows: info.rows,
+                marginTop: info.marginTop,
+                marginBottom: info.marginBottom
+            ),
+            scrollOffsetPx: offsetPx
+        )
     }
 
     /// The grid a press claimed. Neovim keeps a drag on the window the press
@@ -4366,8 +4424,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
         let rootOffsetPx = main.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
         let ownOffsetPx = main.visualScrollOffsetPx(gridId: pressed, cellHeightPx: cellH)
-        let originY = CGFloat(layer.originPx.y)
-            + (ownOffsetPx == 0 && layer.followsScroll ? rootOffsetPx : 0)
+        let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
+                                             rootOffsetPx: rootOffsetPx, cellH: cellH)
         let info = main.core?.getVisibleGridsCached().first { $0.gridId == pressed }
         // Deliberately unclamped to the layer rectangle: a drag that leaves the
         // float still belongs to it, and Neovim clamps the position into the
