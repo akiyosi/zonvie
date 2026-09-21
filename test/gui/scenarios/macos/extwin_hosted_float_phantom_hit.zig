@@ -13,8 +13,9 @@
 // The float here is deliberately placed so the phantom would cover the main
 // window's CENTRE, which is where the driver's trackpad gesture lands. Both
 // windows carry more lines than they show, so both CAN scroll — a float whose
-// content fits is transparent to scrolling by design (resolveScrollTarget's
-// isFloatLogicallyScrollable) and would pass for the wrong reason.
+// content fits is transparent to scrolling by design (the core's
+// `capturesScroll`, which `require_scrollable` applies) and would pass for the
+// wrong reason.
 //
 // Asserted on Neovim's own toplines rather than the app log: the main window
 // has to advance AND the float has to stand still. A fix that merely sent the

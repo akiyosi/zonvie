@@ -3289,19 +3289,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         return (bestGridId, localRow, localCol)
     }
 
-    /// True when the float has more buffer content than fits in its visible
-    /// area, i.e. it can scroll its own content. Floats that fully show their
-    /// content must not capture smooth scroll — it falls through to the window
-    /// beneath them (req #1). Uses the cached grid info (line_count) so the input
-    /// path never makes a blocking viewport query into the core.
-    func isFloatLogicallyScrollable(_ grid: ZonvieCore.GridInfo) -> Bool {
-        // Content rows = grid height minus border/winbar margins. Logical
-        // scrollability is position-independent: the buffer simply has more
-        // lines than fit in the visible content area.
-        let contentRows = Int64(max(0, grid.rows - grid.marginTop - grid.marginBottom))
-        return grid.lineCount > contentRows
-    }
-
     /// The grid a cell position names.
     ///
     /// The rule is the core's (`zonvie_core_resolve_pointer_grid`). It used to

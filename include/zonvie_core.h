@@ -1433,6 +1433,22 @@ ZONVIE_API int zonvie_core_resolve_pointer_grid(
     int require_scrollable,
     zonvie_pointer_hit *out);
 
+/* Whether a float can scroll its own content: it holds more buffer lines than
+   its content area shows, margins excluded. A float that already shows every
+   line is transparent to a wheel event, which reaches what is drawn under it.
+
+   zonvie_core_resolve_pointer_grid applies this itself when `require_scrollable`
+   is set. This is for a frontend that resolves a pointer against its own DRAWN
+   geometry instead of the cell positions that rule reads, and so needs the
+   predicate on its own.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API int zonvie_core_captures_scroll(
+    int32_t rows,
+    int32_t margin_top,
+    int32_t margin_bottom,
+    int64_t line_count);
+
 /* How a viewport's scrollbar should look, filled by
    zonvie_core_scrollbar_metrics. Fractions, not pixels: the track rectangle
    and a minimum knob height are chrome and stay with the frontend. */
