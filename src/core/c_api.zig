@@ -1767,6 +1767,29 @@ pub export fn zonvie_core_resolve_pointer_grid(
     return 1;
 }
 
+/// Whether a float can scroll its own content: it holds more buffer lines than
+/// its content area shows, margins excluded. A float that already shows every
+/// line is transparent to a wheel event.
+///
+/// `pointer_target.resolve` applies this itself; this is for a frontend that
+/// resolves a pointer against its own DRAWN geometry rather than the cell
+/// positions the rule reads — the external surface on macOS — and so needs the
+/// predicate without the rest. Scalars rather than the struct, so the caller
+/// passes what it has.
+pub export fn zonvie_core_captures_scroll(
+    rows: i32,
+    margin_top: i32,
+    margin_bottom: i32,
+    line_count: i64,
+) callconv(.c) c_int {
+    return @intFromBool(pointer_target.capturesScroll(.{
+        .rows = rows,
+        .margin_top = margin_top,
+        .margin_bottom = margin_bottom,
+        .line_count = line_count,
+    }));
+}
+
 pub const zonvie_scrollbar_metrics = scrollbar_metrics.Metrics;
 
 /// Whether a viewport needs a scrollbar, and where its knob sits on the track.
