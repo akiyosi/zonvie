@@ -1,4 +1,5 @@
 const std = @import("std");
+const pointer_target = @import("pointer_target.zig");
 const build_options = @import("build_options");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
@@ -275,6 +276,21 @@ pub const GridInfo = extern struct {
     // 1 if this grid is an external (separate top-level) window. Such grids are
     // reported with start (0,0) and must be excluded from main-window hit-testing.
     is_external: i32,
+    // win_float_pos' mouse_enabled: 0 for a float that refuses the mouse.
+    // A hit test MUST skip such a grid — Neovim rejects an event addressed to
+    // it without re-resolving, so naming it swallows the event.
+    mouse_enabled: i32,
+    // Which surface composites this grid: 1 for the main window, its own id
+    // for an external window, and the HOST's id for a float anchored inside
+    // one. A grid placed by another surface reports start_row/start_col in
+    // that surface's space, so a frontend must not hit-test it as its own.
+    placed_by_surface: i64,
+    // Neovim's composition index, and the core's tie-breaker after it. With
+    // zindex and grid_id these are the order a surface's layers are drawn in,
+    // back to front, so a frontend can say which of two grids is on top
+    // without inventing an order of its own.
+    compindex: i64,
+    draw_order: u64,
 };
 
 /// Viewport info for scrollbar rendering
@@ -1714,6 +1730,42 @@ pub export fn zonvie_core_set_background_opacity(p: ?*zonvie_core, opacity: f32)
 
 /// Get list of visible grids for hit-testing.
 /// Returns number of grids written (up to max_count).
+/// Where a pointer landed. `row`/`col` are the named grid's own cells.
+pub const zonvie_pointer_hit = pointer_target.Hit;
+
+/// Which grid a pointer at (`row`, `col`) of `surface_id` names, out of the
+/// grids the caller already has.
+///
+/// Pure: no core pointer, no lock, no allocation. The frontends call it from
+/// the input path with the snapshot they already hold, which is why it takes
+/// the array rather than reaching for one — the non-blocking cached query is
+/// what keeps that path off `grid_mu`.
+///
+/// Returns 1 and fills `out` on a hit, 0 when nothing matches. On 0 the caller
+/// keeps its own surface's grid and the unshifted position, which is what both
+/// frontends did with their own loops.
+pub export fn zonvie_core_resolve_pointer_grid(
+    grids: ?[*]const GridInfo,
+    count: usize,
+    surface_id: i64,
+    row: i32,
+    col: i32,
+    require_scrollable: c_int,
+    out: ?*pointer_target.Hit,
+) callconv(.c) c_int {
+    if (grids == null or out == null) return 0;
+    const hit = pointer_target.resolve(
+        GridInfo,
+        grids.?[0..count],
+        surface_id,
+        row,
+        col,
+        require_scrollable != 0,
+    ) orelse return 0;
+    out.?.* = hit;
+    return 1;
+}
+
 pub export fn zonvie_core_get_visible_grids(
     p: ?*zonvie_core,
     out_grids: ?[*]GridInfo,

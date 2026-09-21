@@ -1380,7 +1380,58 @@ typedef struct zonvie_grid_info {
     /* 1 if this grid is an external (separate top-level) window. Such grids are
      * reported with start (0,0) and must be excluded from main-window hit-testing. */
     int32_t is_external;
+    /* win_float_pos' mouse_enabled: 0 for a float that refuses the mouse. A
+     * hit test MUST skip such a grid — Neovim rejects an event addressed to it
+     * without re-resolving, so naming it swallows the event. */
+    int32_t mouse_enabled;
+    /* Which surface composites this grid: 1 for the main window, its own id
+     * for an external window, and the HOST's id for a float anchored inside
+     * one. A grid placed by another surface reports start_row/start_col in
+     * that surface's space, so a frontend must not hit-test it as its own. */
+    int64_t placed_by_surface;
+    /* Neovim's composition index, and the core's tie-breaker after it. With
+     * zindex and grid_id these are the order a surface's layers are drawn in,
+     * back to front, so a frontend can say which of two grids is on top
+     * without inventing an order of its own. */
+    int64_t compindex;
+    uint64_t draw_order;
 } zonvie_grid_info;
+
+/* Where a pointer lands, filled by zonvie_core_resolve_pointer_grid. `row`
+   and `col` are in the named grid's own cells. */
+typedef struct zonvie_pointer_hit {
+    int64_t grid_id;
+    int32_t row;
+    int32_t col;
+} zonvie_pointer_hit;
+
+/* Which grid a pointer at (row, col) of `surface_id` names, out of the grids
+   the caller already has. `surface_id` is 1 for the main window and the grid
+   id of an external window for its own surface.
+
+   The rule this applies was written out in each frontend and the two drifted:
+   one hit-tested floats another surface hosts, the other ignored the mouse
+   flag and the scrollability rule. It skips an external grid, a grid some
+   other surface composites, and a grid that refuses the mouse; it takes the
+   front-most of what is left by (zindex, compindex, draw_order, grid_id), the
+   same order the core sorts a surface's layers in.
+
+   `require_scrollable` is the wheel's extra rule: a float showing all of its
+   content does not capture scroll, and is skipped so a scrollable grid beneath
+   it still takes the event. Pass 0 for a click.
+
+   Pure — no core pointer, no lock — so it is safe on the input path with the
+   non-blocking cached grid snapshot. Returns 1 and fills `out` on a hit, 0
+   when nothing matches; on 0 the caller keeps its own surface's grid and the
+   position it was given. */
+ZONVIE_API int zonvie_core_resolve_pointer_grid(
+    const zonvie_grid_info *grids,
+    size_t count,
+    int64_t surface_id,
+    int32_t row,
+    int32_t col,
+    int require_scrollable,
+    zonvie_pointer_hit *out);
 
 /* Viewport info for scrollbar rendering */
 typedef struct zonvie_viewport_info {

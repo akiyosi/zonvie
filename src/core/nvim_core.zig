@@ -3450,6 +3450,12 @@ pub const Core = struct {
                 .anchor_grid = 1,
                 .follows_scroll = 0,
                 .is_external = 0,
+                // The container grid always accepts the mouse, belongs to the
+                // main surface, and sits behind everything drawn on it.
+                .mouse_enabled = 1,
+                .placed_by_surface = 1,
+                .compindex = 0,
+                .draw_order = 0,
             };
             written += 1;
         }
@@ -3487,6 +3493,12 @@ pub const Core = struct {
                     .anchor_grid = pos.anchor_grid,
                     .follows_scroll = if (pos.follows_scroll) 1 else 0,
                     .is_external = 0,
+                    .mouse_enabled = if (pos.mouse_enabled) 1 else 0,
+                    // The same answer flush.collectSurfaceLayerEntries uses to
+                    // decide whose layer list this grid belongs in.
+                    .placed_by_surface = self.grid.surfaceForGrid(gid) orelse 1,
+                    .compindex = layer.compindex,
+                    .draw_order = layer.order,
                 };
                 written += 1;
             }
@@ -3517,6 +3529,11 @@ pub const Core = struct {
                     .anchor_grid = 1,
                     .follows_scroll = 0,
                     .is_external = 1,
+                    // An external grid is the root of its own surface.
+                    .mouse_enabled = 1,
+                    .placed_by_surface = gid,
+                    .compindex = 0,
+                    .draw_order = 0,
                 };
                 written += 1;
             }

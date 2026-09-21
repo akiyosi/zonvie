@@ -1,6 +1,5 @@
 const std = @import("std");
 const app_mod = @import("app.zig");
-const wheel_target = @import("wheel_target.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
@@ -654,9 +653,9 @@ pub fn sendMouseButton(
 }
 
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
-/// external windows. `ext_window` is the surface this hwnd draws, or null for
-/// the main window; it is what carries the layer list a scroll is resolved
-/// against.
+/// external windows. `grid_id` is the surface this hwnd draws — 1 for the main
+/// window — and is all the core needs to resolve the target against, so this
+/// no longer reaches for the surface's layer list or takes `app.mu`.
 pub fn handleMouseWheel(
     hwnd: c.HWND,
     wParam: c.WPARAM,
@@ -664,7 +663,6 @@ pub fn handleMouseWheel(
     app: *App,
     grid_id: i64,
     horizontal: bool,
-    ext_window: ?*app_mod.ExternalWindow,
 ) void {
     // Extract scroll delta from high word of wParam
     const delta: i16 = @bitCast(@as(u16, @truncate(wParam >> 16)));
@@ -706,40 +704,25 @@ pub fn handleMouseWheel(
     var target_row: i32 = row;
     var target_col: i32 = col;
     {
-        // Both surfaces resolve the same way, against the LAYER list each one
-        // composites — see wheel_target.zig for the three rules the main
-        // window lost by reading the grid list instead, and for the one rule
-        // the wheel adds to the press path.
+        // The rule is the core's, for both surfaces and both frontends. It
+        // used to be a loop here and another in macOS's MetalTerminalView, and
+        // between them they held different parts of it: this one applied
+        // neither the mouse flag nor the scrollability rule on the main
+        // window, and that one hit-tested floats an external surface hosts.
         const grids: []const app_mod.GridInfo = if (corep) |cp| app.getVisibleGridsCached(cp) else &.{};
-        var scrollable_buf: [64]i64 = undefined;
-        const scrollable = wheel_target.collectScrollableGridIds(
-            app_mod.GridInfo,
-            grids,
-            &scrollable_buf,
-        );
-
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        const layers = if (ext_window) |ew| ew.tbs.committed_layers.slice() else app.tbs.committed_layers.slice();
-        // The main window's content is inset by the tabline and the sidebar;
-        // an external window has neither. Its layers are surface-local either
-        // way, so the point has to be too.
-        const origin = surfaceOriginPx(app, is_main_window);
-        const hit = wheel_target.resolve(
-            app_mod.SurfaceLayer,
-            layers,
+        var hit: app_mod.zonvie_pointer_hit = undefined;
+        if (grids.len > 0 and app_mod.zonvie_core_resolve_pointer_grid(
+            grids.ptr,
+            grids.len,
             grid_id,
-            px - origin.x,
-            py - origin.y,
-            cell_w,
-            row_h,
-            scrollable,
-        );
-        if (hit.grid_id != grid_id) {
-            const local = cellAt(hit.x_px, hit.y_px, cell_w, row_h, false);
+            row,
+            col,
+            1, // a wheel event: a float showing all its content lets it through
+            &hit,
+        ) != 0) {
             target_grid_id = hit.grid_id;
-            target_row = local.row;
-            target_col = local.col;
+            target_row = hit.row;
+            target_col = hit.col;
         }
     }
 

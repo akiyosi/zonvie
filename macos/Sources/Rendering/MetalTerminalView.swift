@@ -3164,14 +3164,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         )
     }
 
-    /// Hit-test to find which grid is at the given point (highest zindex wins)
-    /// Reused by both hit tests below; see the renderer's
-    /// `collectMouseDisabledLayerGridIds`.
-    private var mouseDisabledGridsScratch: [Int64] = []
-    /// Grids an external surface places. Same lifetime and reuse as the scratch
-    /// above; both are read once per hit test.
-    private var externallySurfacedGridsScratch: [Int64] = []
-
     /// A view point in the drawable's pixel space, with the cell grid it is
     /// read against and the cell it lands in.
     private struct PointerGeometry {
@@ -3237,15 +3229,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         var localRow: Int32 = globalRow
         var localCol: Int32 = globalCol
 
-        if let best = pointerTargetGrid(
-            globalRow: globalRow,
-            globalCol: globalCol,
-            grids: grids,
-            requireScrollable: false
-        ) {
-            bestGridId = best.gridId
-            localRow = globalRow - best.startRow
-            localCol = globalCol - best.startCol
+        if let hit = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: false) {
+            bestGridId = hit.gridId
+            localRow = hit.row
+            localCol = hit.col
         }
 
         // Adjust for smooth scroll offset: during scrolling, content rows are
@@ -3281,48 +3268,26 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         return grid.lineCount > contentRows
     }
 
-    /// The grid a cell position names, by the rules every pointer path shares.
+    /// The grid a cell position names.
     ///
-    /// `requireScrollable` is the wheel's own extra rule: a float showing all
-    /// of its content does not capture scroll and is transparent here, so a
-    /// scrollable grid beneath it still wins. A click has no such rule.
+    /// The rule is the core's (`zonvie_core_resolve_pointer_grid`). It used to
+    /// be here, and the Windows frontend had its own copy; between them they
+    /// held different parts of it, so a float another surface hosts was
+    /// hit-testable on one side and the mouse flag was ignored on the other.
     ///
-    /// One function because there were two, and the exclusion a float hosted by
-    /// an external surface needs had to be written into both of them.
+    /// nil when nothing matches, which leaves the caller on the container grid
+    /// with the position it was given.
     private func pointerTargetGrid(
         globalRow: Int32,
         globalCol: Int32,
-        grids: [ZonvieCore.GridInfo],
         requireScrollable: Bool
-    ) -> ZonvieCore.GridInfo? {
-        // A float that refuses the mouse is not a target and does not shadow
-        // one: Neovim looks the window up by handle, rejects it, and returns
-        // without re-resolving (mouse.c's mouse_find_grid_win, then
-        // mouse_find_win_inner's `else if (*gridp > 1) return NULL`), so naming
-        // it swallows the event instead of letting it reach what is drawn
-        // underneath. `zonvie_grid_info` carries no mouse field, so the answer
-        // comes from the layer list instead.
-        renderer.collectMouseDisabledLayerGridIds(into: &mouseDisabledGridsScratch)
-        core?.collectExternallySurfacedGridIds(into: &externallySurfacedGridsScratch)
-        var best: ZonvieCore.GridInfo?
-        for grid in grids {
-            // External grids are separate top-level windows reported at (0,0),
-            // and so is a float one of them HOSTS — not itself external, but
-            // reporting its position in that surface's space.
-            if grid.isExternal { continue }
-            if externallySurfacedGridsScratch.contains(grid.gridId) { continue }
-            if mouseDisabledGridsScratch.contains(grid.gridId) { continue }
-            guard globalRow >= grid.startRow, globalRow < grid.startRow + grid.rows,
-                  globalCol >= grid.startCol, globalCol < grid.startCol + grid.cols
-            else { continue }
-            if requireScrollable, grid.zindex > 0, !isFloatLogicallyScrollable(grid) { continue }
-            // Higher zindex wins; at equal zindex an actual window beats the
-            // background grid.
-            let dominated = best == nil || grid.zindex > best!.zindex ||
-                (grid.zindex == best!.zindex && grid.gridId > 1 && best!.gridId == 1)
-            if dominated { best = grid }
-        }
-        return best
+    ) -> (gridId: Int64, row: Int32, col: Int32)? {
+        core?.resolvePointerGrid(
+            surfaceId: 1,
+            row: globalRow,
+            col: globalCol,
+            requireScrollable: requireScrollable
+        )
     }
 
     /// Resolve which grid a scroll at `point` should target. A non-scrollable
@@ -3335,14 +3300,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // Non-scrollable floats are transparent to scrolling, so a scrollable
         // grid directly beneath one — another float or the base window — shows
         // through (req #1).
-        let target = pointerTargetGrid(
-            globalRow: globalRow,
-            globalCol: globalCol,
-            grids: core.getVisibleGridsCached(),
-            requireScrollable: true
-        )
-        guard let g = target else { return (1, globalRow, globalCol) }
-        return (g.gridId, globalRow - g.startRow, globalCol - g.startCol)
+        _ = core.getVisibleGridsCached()
+        let target = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: true)
+        guard let t = target else { return (1, globalRow, globalCol) }
+        return (t.gridId, t.row, t.col)
     }
 
     /// Give float windows the sub-cell scroll offset of the window they sit over,

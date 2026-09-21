@@ -6420,14 +6420,14 @@ pub export fn WndProc(
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
-                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false, null);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, false);
                 return 0;
             }
         },
 
         c.WM_MOUSEHWHEEL => {
             if (getApp(hwnd)) |app| {
-                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true, null);
+                input.handleMouseWheel(hwnd, wParam, lParam, app, 1, true);
                 return 0;
             }
         },

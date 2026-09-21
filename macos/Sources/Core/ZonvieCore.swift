@@ -224,26 +224,6 @@ final class ZonvieCore {
     /// surface while `externalGridViews` still holds the old view until the
     /// close's main-queue hop runs. Both reads happen under one hold, so there
     /// is no window between deciding and acting.
-    /// Grids some EXTERNAL surface places, for a caller hit-testing its own
-    /// surface's coordinate space.
-    ///
-    /// `isExternal` names a grid that IS a window of its own; it says nothing
-    /// about a float HOSTED by one. Such a float reports startRow/startCol in
-    /// its host surface's space, and the main window's hit test read those as
-    /// its own — a phantom region, sized and placed like the float, sitting
-    /// wherever those numbers happen to land in the main window.
-    ///
-    /// Staged map first, as resolveGridRoute reads it: a float's host is known
-    /// one flush before it is committed.
-    func collectExternallySurfacedGridIds(into out: inout [Int64]) {
-        out.removeAll(keepingCapacity: true)
-        externalGridViewsLock.lock()
-        defer { externalGridViewsLock.unlock() }
-        let owners = pendingGridSurfaceOwners ?? gridSurfaceOwners
-        for (gridId, ownerId) in owners where externalGridViews[ownerId] != nil {
-            out.append(gridId)
-        }
-    }
 
     func resolveGridRoute(gridId: Int64) -> GridRoute {
         if gridId == 1 { return .mainRoot }
@@ -2957,6 +2937,10 @@ final class ZonvieCore {
         )
     }
 
+    /// The same snapshot as `cachedVisibleGrids`, unconverted, for the core's
+    /// pointer resolver.
+    private var cachedVisibleGridsRaw: [zonvie_grid_info] = []
+
     /// Cached visible grids for non-blocking UI queries (main thread only).
     /// Pre-reserved to 16 elements to avoid reallocation in steady state.
     private var cachedVisibleGrids: [GridInfo] = {
@@ -3021,10 +3005,51 @@ final class ZonvieCore {
                 } else {
                     cachedVisibleGrids.append(info)
                 }
+                // The raw structs too: the core's pointer resolver reads them
+                // directly, and a Swift mirror would have to carry every field
+                // the rule reads — which is how the rule came to be written out
+                // twice in the first place.
+                if i < cachedVisibleGridsRaw.count {
+                    cachedVisibleGridsRaw[i] = visibleGridQueryBuffer[i]
+                } else {
+                    cachedVisibleGridsRaw.append(visibleGridQueryBuffer[i])
+                }
             }
+            while cachedVisibleGridsRaw.count > count { cachedVisibleGridsRaw.removeLast() }
             return cachedVisibleGrids
         }
         return cachedVisibleGrids
+    }
+
+    /// Which grid a pointer at (`row`, `col`) of `surfaceId` names.
+    ///
+    /// The rule lives in the core (`zonvie_core_resolve_pointer_grid`) because
+    /// both frontends had written it out and the two drifted: this one
+    /// hit-tested floats an external window hosts, and the Windows main-window
+    /// branch applied neither the mouse flag nor the scrollability rule.
+    ///
+    /// Reads the snapshot `getVisibleGridsCached()` last took, so callers
+    /// refresh it first — which every caller already does.
+    func resolvePointerGrid(
+        surfaceId: Int64,
+        row: Int32,
+        col: Int32,
+        requireScrollable: Bool
+    ) -> (gridId: Int64, row: Int32, col: Int32)? {
+        var hit = zonvie_pointer_hit()
+        let found = cachedVisibleGridsRaw.withUnsafeBufferPointer { buf in
+            zonvie_core_resolve_pointer_grid(
+                buf.baseAddress,
+                buf.count,
+                surfaceId,
+                row,
+                col,
+                requireScrollable ? 1 : 0,
+                &hit
+            )
+        }
+        guard found != 0 else { return nil }
+        return (hit.grid_id, hit.row, hit.col)
     }
 
     /// Viewport info for scrollbar rendering (Swift-friendly wrapper)
