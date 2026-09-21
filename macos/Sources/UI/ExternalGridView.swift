@@ -4305,7 +4305,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             else { continue }
             let info = grids.first { $0.gridId == layer.gridId }
             if requireScrollable {
-                guard let info, main.isFloatLogicallyScrollable(info) else { continue }
+                // The rule is the core's (`zonvie_core_captures_scroll`); this
+                // file had it written out in Swift. This resolver works in
+                // drawn pixels rather than cell positions, which is why it
+                // asks for the predicate instead of the whole resolve.
+                guard let info,
+                      zonvie_core_captures_scroll(
+                          info.rows, info.marginTop, info.marginBottom, info.lineCount) != 0
+                else { continue }
             }
             guard best == nil || layer.z > bestZ else { continue }
             bestZ = layer.z
