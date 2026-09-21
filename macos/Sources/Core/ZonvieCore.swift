@@ -2916,6 +2916,11 @@ final class ZonvieCore {
         // True if this is an external (separate top-level) window grid; excluded
         // from main-window hit-testing.
         var isExternal: Bool
+        // Which surface COMPOSITES this grid: 1 for the main window, an
+        // external window's own grid id for anything it draws. `isExternal`
+        // answers "is this a window of its own", which is a different question
+        // and the one nine defects on this branch asked by mistake.
+        var placedBySurface: Int64
     }
 
     private static func gridInfo(from grid: zonvie_grid_info) -> GridInfo {
@@ -2933,7 +2938,8 @@ final class ZonvieCore {
             lineCount: grid.line_count,
             anchorGrid: grid.anchor_grid,
             followsScroll: grid.follows_scroll != 0,
-            isExternal: grid.is_external != 0
+            isExternal: grid.is_external != 0,
+            placedBySurface: grid.placed_by_surface
         )
     }
 
