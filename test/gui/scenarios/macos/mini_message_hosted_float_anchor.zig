@@ -78,13 +78,22 @@ fn overlapFraction(inner: platform.Bounds, outer: platform.Bounds) f64 {
     return (w * h) / area;
 }
 
+/// Both placement modes reach a different resolution — `.window` asks which
+/// window the cursor's grid belongs to, `.grid` measures the anchor grid
+/// against the window that composites it — and each one had the defect in its
+/// own shape. `grid` is the default, so it needs no fixture.
 pub fn run(alloc: std.mem.Allocator) !void {
+    try check(alloc, "test/gui/fixtures/config_mini_window_pos", "window");
+    try check(alloc, "test/gui/fixtures/config", "grid");
+}
+
+fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
 
     var g = try Gui.init(alloc, .{
         .app_args = &.{ "--extmessages", "--log", log_path },
-        .config_dir = "test/gui/fixtures/config_mini_window_pos",
+        .config_dir = config_dir,
     });
     defer g.deinit();
     g.activateApp();
@@ -162,8 +171,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
             const in_ext = overlapFraction(w.bounds, ext_win.bounds);
             const in_main = overlapFraction(w.bounds, main_b);
             std.debug.print(
-                "[gui] mini #{d} ({d:.0},{d:.0},{d:.0},{d:.0}): {d:.0}% inside the external window, {d:.0}% inside the main one\n",
-                .{ w.number, w.bounds.x, w.bounds.y, w.bounds.w, w.bounds.h, in_ext * 100, in_main * 100 },
+                "[gui] {s} mode: mini #{d} ({d:.0},{d:.0},{d:.0},{d:.0}): {d:.0}% inside the external window, {d:.0}% inside the main one\n",
+                .{ mode, w.number, w.bounds.x, w.bounds.y, w.bounds.w, w.bounds.h, in_ext * 100, in_main * 100 },
             );
 
             if (in_ext < 0.5) {
