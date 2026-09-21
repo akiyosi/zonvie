@@ -4485,6 +4485,317 @@ fn drawBloomRowBuffers(
     }
 }
 
+/// Release the snapshot a paint took with `acquireForPaint`, once, from the
+/// paint's `defer`. Returns whether the window has to be invalidated again
+/// for dirty state that accumulated while it painted. A failed paint with an
+/// armed retry wake defers that, or the release would defeat the backoff; a
+/// successful atlas-reset transaction repaints every surface itself, and a
+/// failed one intentionally keeps the previous frame frozen, so neither may
+/// start a WM_PAINT loop here.
+pub fn releasePaintSnapshot(
+    tbs: *TripleBufferedSurface,
+    snapshot: PaintSnapshot,
+    retry: *const PaintRetryState,
+    atlas_reset_active: bool,
+) bool {
+    var layers = snapshot.layers;
+    layers.deinit();
+    const needs_reinvalidate = tbs.releaseFromPaint(snapshot.committed_index, snapshot.cursor_index);
+    return retry.shouldInvalidateAfterRelease(needs_reinvalidate) and !atlas_reset_active;
+}
+
+/// What every paint that produced no frame owes before it returns: the next
+/// paint of this surface is a full one, and the retry clock advances. Returns
+/// the wake to arm, if the retry state issued one.
+///
+/// A lost device gets no retry ticket: device recovery repaints every surface
+/// when it completes, and a paint retry armed against a lost device only
+/// fires into the recovery gate. The external driver used to arm one anyway;
+/// the main driver never did.
+///
+/// `app.mu` must be free: the surface flag is taken under it, the TBS flag
+/// under rotation_mu, never nested.
+pub fn failSurfacePaint(
+    app: *App,
+    surface: *SurfaceState,
+    tbs: *TripleBufferedSurface,
+    retry: *PaintRetryState,
+    device_lost: bool,
+) ?PaintRetryState.Ticket {
+    app.mu.lockUncancelable(core.clock.io());
+    surface.paint_full = true;
+    app.mu.unlock(core.clock.io());
+    tbs.rotation_mu.lockUncancelable(core.clock.io());
+    tbs.pending_paint_full = true;
+    tbs.rotation_mu.unlock(core.clock.io());
+    if (device_lost) return null;
+    return retry.fail();
+}
+
+/// What a surface owns across paints and lends to one row frame: its row VB
+/// array (already sized for the committed row count), its cursor VB, and the
+/// two facts the next paint reads back to place the remembered cursor row.
+pub const RowFrameSurface = struct {
+    row_vbs: []RowVB,
+    row_vb_retained_bytes: *usize,
+    pool: *const SlotPool,
+    cursor_vb: *?*c.ID3D11Buffer,
+    cursor_vb_bytes: *usize,
+    last_painted_cursor_row: *?u32,
+    last_painted_cursor_grid: *i64,
+};
+
+pub const RowFrameGlow = struct {
+    intensity: f32,
+    radius_scale: f32,
+    /// The cursor blooms only while it is drawn.
+    cursor_visible: bool,
+};
+
+/// Everything one row frame needs that the caller settled before it: the
+/// committed set, the redraw set, the cursor, the layer staleness verdict, and
+/// the viewport the rows are drawn into.
+pub const RowFrameInput = struct {
+    /// The grid this surface's root layer draws; a cursor on it is placed by
+    /// the root's transform, any other by its layer's.
+    root_grid_id: i64,
+    layers: []const SurfaceLayer,
+    row_map: []const RowMapping,
+    rows_to_draw: []const u32,
+    cursor_verts: []const Vertex,
+    /// The row the cursor callback named, grid-local to `cursor_grid`. Null
+    /// when the callback carried no cursor.
+    cursor_row: ?u32,
+    cursor_grid: i64,
+    /// The rows the overlay would otherwise erase: where the previous cursor
+    /// was baked into back_tex, and where this one lands. Both grid-local to
+    /// the cursor's own grid.
+    cursor_erase_rows: [2]?u32,
+    cursor_layer_origin: [2]f32,
+    blink_visible: bool,
+    force_full_rows: bool,
+    layer_layout_stale: bool,
+    layer_commit_stale: bool,
+    glow: ?RowFrameGlow,
+    draw_params: RowModeDrawParams,
+    log_enabled: bool,
+};
+
+pub const RowFrameOutcome = struct {
+    rows: RowModeDrawResult = .{},
+    layers: LayerDrawOutcome = .{},
+    cursor_overlay_failed: bool = false,
+    /// The row pass hit the physical VB budget. Nothing after it ran, so the
+    /// layer plan taken before the frame was never paid for; the caller
+    /// re-arms it and reports the budget to the core.
+    row_vb_budget_exceeded: bool = false,
+
+    /// A frame that must not be presented: rows missing from back_tex, a
+    /// layer plan spent without its frame, or a cursor that never landed.
+    pub fn incomplete(self: RowFrameOutcome) bool {
+        return self.rows.metrics.failed_rows != 0 or self.layers.incomplete() or self.cursor_overlay_failed;
+    }
+};
+
+/// One surface's row frame, root rows to bloom, in the order both paint
+/// drivers used to run it separately: root rows, hosted layers, cursor
+/// overlay, bloom. Snapshot, present rectangles, Present, and the chrome
+/// around the content stay with the caller.
+///
+/// Rules this frame settles once, where the two drivers used to differ:
+/// - The cursor's row is the one its callback named (`cursor_row`), never
+///   re-derived from the vertices' pixels.
+/// - The cursor's rows are claimed into the redraw set only when the layer
+///   plan is current: a stale frame is refused below, and a claim made
+///   against it would leak into the next plan.
+/// - A cursor on the root grid counts as redrawn when both of its rows are in
+///   `rows_to_draw`, layers or not. Both drivers put them there, and the
+///   overlay's erase branch double-blends a row that was already redrawn.
+/// - `app.mu` is held once, from the claim through the overlay: the layer
+///   rows the overlay redraws are the ones the plan was just spent on.
+/// - Any row-pass failure ends the frame before the layers and the cursor;
+///   the outcome refuses the present and the caller re-arms.
+/// - `last_painted_cursor_grid` is recorded whether or not the overlay
+///   succeeded, so a blink-off frame cannot leave the pair naming different
+///   paints.
+///
+/// `app.mu` must be free on entry. Bloom takes it itself for the layer
+/// storage it reads.
+pub fn drawSurfaceRowFrame(
+    g: *d3d11.Renderer,
+    app: *App,
+    surface: RowFrameSurface,
+    in: RowFrameInput,
+) RowFrameOutcome {
+    var out = RowFrameOutcome{};
+    const log_enabled = in.log_enabled;
+    const row_h_px = in.draw_params.row_h_px;
+
+    // TBS lock-free draw: the committed set is protected by refcount, so no
+    // app.mu is needed during VB upload + draw.
+    out.rows = drawRowModeSetupAndRowsFromSlots(
+        g,
+        &app.row_vb_budget,
+        surface.row_vb_retained_bytes,
+        in.row_map,
+        surface.pool,
+        surface.row_vbs,
+        in.rows_to_draw,
+        in.draw_params,
+    ) catch |e| {
+        out.row_vb_budget_exceeded = e == error.RowVBPhysicalBudgetExceeded;
+        if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
+        out.rows.metrics.failed_rows = 1;
+        return out;
+    };
+    if (out.rows.metrics.failed_rows != 0) return out;
+
+    const has_layers = in.layers.len > 1;
+    const layers_stale = in.layer_layout_stale or in.layer_commit_stale;
+    const cursor_on_root = in.cursor_grid == in.root_grid_id;
+    out.layers = .{ .stale_layout = in.layer_layout_stale, .stale_commit = in.layer_commit_stale };
+
+    {
+        // A layer's rows and a cursor inside one both live in layer storage
+        // the core thread can resize; hold app.mu from the claim to the
+        // overlay so the row the overlay redraws is the one the plan drew.
+        const needs_layer_lock = has_layers or !cursor_on_root;
+        if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
+        defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
+
+        // What row_already_redrawn promises drawCursorOverlay: this frame
+        // repainted the cursor's OWN grid's row, so blink-on needs only the
+        // cursor quad and blink-off needs nothing. A layer's rows have to be
+        // claimed here, after planLayerFrame settled the redraw set and
+        // before drawSurfaceLayers' defer clears it; the root's went into
+        // rows_to_draw before the frame, so membership decides there.
+        var cursor_row_redrawn = in.force_full_rows;
+        if (!cursor_row_redrawn and !layers_stale) {
+            var claimed = true;
+            for (in.cursor_erase_rows) |maybe_row| {
+                const r = maybe_row orelse continue;
+                if (cursor_on_root) {
+                    if (std.mem.indexOfScalar(u32, in.rows_to_draw, r) == null) claimed = false;
+                } else if (!markLayerCursorRow(
+                    app,
+                    in.layers,
+                    in.cursor_grid,
+                    r,
+                    @intCast(@max(1, app.cell_w_px)),
+                    row_h_px,
+                )) claimed = false;
+            }
+            cursor_row_redrawn = claimed;
+        }
+
+        // Non-root layers on top of the root grid, before the cursor so the
+        // cursor stays on top of everything.
+        if (has_layers and !layers_stale) {
+            out.layers = drawSurfaceLayers(
+                g,
+                app,
+                in.layers,
+                .{
+                    .x = @floatFromInt(in.draw_params.x_offset),
+                    .y = @floatFromInt(in.draw_params.y_offset),
+                    .w = @floatFromInt(rowModeViewportWidth(g, in.draw_params)),
+                    .h = @floatFromInt(in.draw_params.content_height),
+                },
+                in.draw_params.x_offset,
+                in.draw_params.y_offset,
+                in.draw_params.content_right,
+                row_h_px,
+                out.rows.ctx_ptr,
+                out.rows.rs_set_sc_fn,
+                log_enabled,
+            );
+            // Their pixels are in back_tex now; the present rects for this
+            // frame were already built by the caller. Only a layer that got
+            // one of those rects has its dirty flag consumed here: a layer the
+            // core made dirty after the rect loop has no rect covering it, so
+            // it keeps the flag and is presented by the next paint. The clear
+            // stays inside the same lock as the draw so a store landing
+            // between the two cannot be dropped; a present that then fails
+            // re-arms these flags.
+            for (in.layers[1..]) |layer| {
+                const state = app.layer_grids.get(layer.grid_id) orelse continue;
+                if (state.paint_has_present_rect) state.dirty = false;
+            }
+        }
+
+        // The cursor's own row in its layer. Blink-off redraws this instead
+        // of the root's row, which is empty under ext_multigrid. Read with
+        // the row itself, so a blink-off redraw uses the shift the layer draw
+        // above applied.
+        var cursor_layer_row: ?*RowVerts = null;
+        var cursor_layer_row_dy_px: f32 = 0;
+        if (!cursor_on_root) {
+            if (in.cursor_row) |row| {
+                if (app.layer_grids.get(in.cursor_grid)) |state| {
+                    if (row < state.rows_buf.items.len) {
+                        cursor_layer_row = &state.rows_buf.items[row];
+                        const origin_row: u32 = if (row < state.origin_rows.items.len)
+                            state.origin_rows.items[row]
+                        else
+                            row;
+                        cursor_layer_row_dy_px = @floatFromInt(
+                            (@as(i32, @intCast(row)) - @as(i32, @intCast(origin_row))) * row_h_px,
+                        );
+                    }
+                }
+            }
+        }
+
+        drawCursorOverlay(g, .{
+            .cursor_verts = in.cursor_verts,
+            .cursor_row = in.cursor_row,
+            .cursor_vb = surface.cursor_vb,
+            .cursor_vb_bytes = surface.cursor_vb_bytes,
+            .row_vbs = surface.row_vbs,
+            .row_map = in.row_map,
+            .pool = surface.pool,
+            .blink_visible = in.blink_visible,
+            .x_offset = in.draw_params.x_offset,
+            .y_offset = in.draw_params.y_offset,
+            .content_right = in.draw_params.content_right,
+            .content_width = rowModeViewportWidth(g, in.draw_params),
+            .content_height = in.draw_params.content_height,
+            .row_h_px = row_h_px,
+            .cursor_layer_origin_x_px = in.cursor_layer_origin[0],
+            .cursor_layer_origin_y_px = in.cursor_layer_origin[1],
+            .cursor_layer_row = cursor_layer_row,
+            .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
+            .ctx_ptr = out.rows.ctx_ptr,
+            .rs_set_sc_fn = out.rows.rs_set_sc_fn,
+            .last_painted_cursor_row = surface.last_painted_cursor_row,
+            .row_already_redrawn = cursor_row_redrawn,
+        }) catch |e| {
+            out.cursor_overlay_failed = true;
+            if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
+        };
+        // Paired with the row drawCursorOverlay just recorded, so the next
+        // paint can tell whether that row is one it can still place.
+        surface.last_painted_cursor_grid.* = in.cursor_grid;
+    }
+
+    if (in.glow) |glow| {
+        const bloom_cursor = if (glow.cursor_visible) in.cursor_verts else &[_]Vertex{};
+        // The blur reads this from the renderer rather than the call, so it
+        // has to be current before the passes run.
+        g.glow_radius_scale = glow.radius_scale;
+        drawBloomRowsOverlay(
+            g,
+            in.row_map,
+            surface.pool,
+            surface.row_vbs,
+            bloom_cursor,
+            glow.intensity,
+            in.draw_params,
+        );
+    }
+    return out;
+}
+
 /// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
 /// glow out of the per-paint heap and avoids copying every grid vertex.
 pub fn drawBloomRowsOverlay(
