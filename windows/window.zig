@@ -1132,6 +1132,10 @@ fn scheduleMainSizeReplay(hwnd: c.HWND, app: *App) void {
 
 fn scheduleMainPaintRetry(hwnd: c.HWND, app: *App) void {
     const ticket = app.paint_retry.fail() orelse return;
+    armMainPaintRetry(hwnd, app, ticket);
+}
+
+fn armMainPaintRetry(hwnd: c.HWND, app: *App, ticket: app_mod.PaintRetryState.Ticket) void {
     app.main_paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
     if (!scheduleReliableWindowMessage(
         hwnd,
@@ -1143,19 +1147,13 @@ fn scheduleMainPaintRetry(hwnd: c.HWND, app: *App) void {
 }
 
 fn recoverMainPaintFailure(hwnd: c.HWND, app: *App) void {
-    app.mu.lockUncancelable(core.clock.io());
-    app.surface.paint_full = true;
-    app.mu.unlock(core.clock.io());
-    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-    app.tbs.pending_paint_full = true;
-    app.tbs.rotation_mu.unlock(core.clock.io());
-
     var device_lost = false;
     if (app.renderer) |*renderer| device_lost = renderer.device_lost;
+    const ticket = app_mod.failSurfacePaint(app, &app.surface, &app.tbs, &app.paint_retry, device_lost);
     if (device_lost) {
         postDeviceLostRecovery(hwnd, app);
-    } else {
-        scheduleMainPaintRetry(hwnd, app);
+    } else if (ticket) |t| {
+        armMainPaintRetry(hwnd, app, t);
     }
 }
 
@@ -2201,19 +2199,14 @@ pub export fn WndProc(
                 // Step 1: TBS acquire (rotation_mu short lock).
                 // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
                 const tbs_snapshot = app.tbs.acquireForPaint(app.alloc);
-                defer {
-                    var layers = tbs_snapshot.layers;
-                    layers.deinit();
-                    const needs_reinvalidate = app.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
-                    if (app.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
-                        // A successful atlas-reset transaction repaints every
-                        // surface. Avoid a WM_PAINT loop while a failed reset
-                        // intentionally keeps the previous frame frozen.
-                        if (!app.atlas_reset_active.load(.seq_cst)) {
-                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                        }
-                    }
-                }
+                defer if (app_mod.releasePaintSnapshot(
+                    &app.tbs,
+                    tbs_snapshot,
+                    &app.paint_retry,
+                    app.atlas_reset_active.load(.seq_cst),
+                )) {
+                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                };
                 const committed = &app.tbs.sets[tbs_snapshot.committed_index];
                 const committed_cursor = &app.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
 
@@ -2905,10 +2898,7 @@ pub export fn WndProc(
                         // has to run.
                         const cursor_erase_rows: [2]?u32 = .{
                             app.last_painted_cursor_row,
-                            if (cursor_verts_snapshot.len != 0 and row_h_px > 0)
-                                app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px)
-                            else
-                                null,
+                            committed_cursor.last_cursor_row,
                         };
                         if (cursor_grid == 1) {
                             for (cursor_erase_rows) |maybe_row| {
@@ -3367,27 +3357,37 @@ pub export fn WndProc(
                             }
                             app.mu.unlock(core.clock.io());
                         }
-
-                        // TBS lock-free draw: committed set is protected by refcount,
-                        // no app.mu needed during VB upload + draw.
-                        var row_vb_budget_exceeded = false;
-                        const row_draw_result = app_mod.drawRowModeSetupAndRowsFromSlots(
-                            g,
-                            &app.row_vb_budget,
-                            &app.row_vb_retained_bytes,
-                            committed.row_map.items,
-                            &app.tbs.pool,
-                            app.row_vbs.items,
-                            rows_to_draw.items,
-                            row_draw_params,
-                        ) catch |e| blk: {
-                            row_vb_budget_exceeded = e == error.RowVBPhysicalBudgetExceeded;
-                            if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
-                            var failed_result = app_mod.RowModeDrawResult{};
-                            failed_result.metrics.failed_rows = 1;
-                            break :blk failed_result;
-                        };
-                        if (row_vb_budget_exceeded) {
+                        const row_frame = app_mod.drawSurfaceRowFrame(g, app, .{
+                            .row_vbs = app.row_vbs.items,
+                            .row_vb_retained_bytes = &app.row_vb_retained_bytes,
+                            .pool = &app.tbs.pool,
+                            .cursor_vb = &app.cursor_vb,
+                            .cursor_vb_bytes = &app.cursor_vb_bytes,
+                            .last_painted_cursor_row = &app.last_painted_cursor_row,
+                            .last_painted_cursor_grid = &app.last_painted_cursor_grid,
+                        }, .{
+                            .root_grid_id = 1,
+                            .layers = tbs_snapshot.layers.slice(),
+                            .row_map = committed.row_map.items,
+                            .rows_to_draw = rows_to_draw.items,
+                            .cursor_verts = cursor_verts_snapshot,
+                            .cursor_row = committed_cursor.last_cursor_row,
+                            .cursor_grid = cursor_grid,
+                            .cursor_erase_rows = cursor_erase_rows,
+                            .cursor_layer_origin = cursor_layer_origin,
+                            .blink_visible = app.cursor_blink_state,
+                            .force_full_rows = force_full_rows,
+                            .layer_layout_stale = layer_layout_stale,
+                            .layer_commit_stale = layer_commit_stale,
+                            .glow = if (glow_enabled) app_mod.RowFrameGlow{
+                                .intensity = glow_intensity,
+                                .radius_scale = glow_radius_scale,
+                                .cursor_visible = app.cursor_blink_state,
+                            } else null,
+                            .draw_params = row_draw_params,
+                            .log_enabled = log_enabled,
+                        });
+                        if (row_frame.row_vb_budget_exceeded) {
                             app.row_vb_budget_failed = true;
                             // Nothing reaches drawSurfaceLayers on this path,
                             // so the plan taken above is never paid for.
@@ -3405,6 +3405,7 @@ pub export fn WndProc(
                             .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
                         );
 
+                        const row_draw_result = row_frame.rows;
                         const drawn_rows = row_draw_result.metrics.drawn_rows;
                         const skipped_empty = row_draw_result.metrics.skipped_empty;
                         const failed_rows = row_draw_result.metrics.failed_rows;
@@ -3413,8 +3414,8 @@ pub export fn WndProc(
                         const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
                         const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
                         const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
-                        const ctx_ptr = row_draw_result.ctx_ptr;
-                        const rs_set_sc_fn = row_draw_result.rs_set_sc_fn;
+                        const layer_outcome = row_frame.layers;
+                        const cursor_overlay_failed = row_frame.cursor_overlay_failed;
 
                         if (log_enabled) {
                             applog.appLog(
@@ -3427,183 +3428,6 @@ pub export fn WndProc(
                                     .{ erow, rows_snapshot, row_verts_len },
                                 );
                             }
-                        }
-
-                        // The cursor's own row in its layer. Blink-off redraws
-                        // this instead of the root's row, which is empty under
-                        // ext_multigrid.
-                        // Only plain values are carried out of this block: a
-                        // pointer into rows_buf would dangle once the lock is
-                        // released, so the row is re-resolved below.
-                        var cursor_layer_row_index: ?usize = null;
-                        // What row_already_redrawn promises drawCursorOverlay:
-                        // this frame repainted the cursor's OWN grid's row, so
-                        // blink-on needs only the cursor quad and blink-off
-                        // needs nothing. A layer's rows have to be claimed here,
-                        // after planLayerFrame settled the redraw set and before
-                        // drawSurfaceLayers' defer clears it.
-                        var cursor_row_redrawn = force_full_rows;
-                        if (cursor_grid != 1 and cursor_verts_snapshot.len != 0 and row_h_px > 0) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            defer app.mu.unlock(core.clock.io());
-                            if (app.layer_grids.get(cursor_grid)) |state| {
-                                const local_row: usize =
-                                    app_mod.cursorRowFromVerts(cursor_verts_snapshot, row_h_px);
-                                if (local_row < state.rows_buf.items.len) cursor_layer_row_index = local_row;
-                                if (!cursor_row_redrawn) {
-                                    var claimed = true;
-                                    for (cursor_erase_rows) |maybe_row| {
-                                        const r = maybe_row orelse continue;
-                                        if (!app_mod.markLayerCursorRow(
-                                            app,
-                                            tbs_snapshot.layers.slice(),
-                                            cursor_grid,
-                                            r,
-                                            @intCast(@max(1, app.cell_w_px)),
-                                            row_h_px,
-                                        )) claimed = false;
-                                    }
-                                    cursor_row_redrawn = claimed;
-                                }
-                            }
-                        } else if (cursor_grid == 1 and !cursor_row_redrawn) {
-                            // Both rows went into rows_to_draw above, unless one
-                            // fell outside the committed row set.
-                            var claimed = true;
-                            for (cursor_erase_rows) |maybe_row| {
-                                const r = maybe_row orelse continue;
-                                if (std.mem.indexOfScalar(u32, rows_to_draw.items, r) == null)
-                                    claimed = false;
-                            }
-                            cursor_row_redrawn = claimed;
-                        }
-
-                        // Rows that never reached back_tex, and a plan the core
-                        // republished under. Either spends the layers' redraw
-                        // plan without producing the frame it named, so the
-                        // frame must not be presented: !render_ok re-arms every
-                        // layer below.
-                        var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
-                        // Non-root layers on top of the root grid, before the
-                        // cursor so the cursor stays on top of everything.
-                        if (tbs_snapshot.layers.len > 1 and !layer_layout_stale and !layer_commit_stale) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            layer_outcome = app_mod.drawSurfaceLayers(
-                                g,
-                                app,
-                                tbs_snapshot.layers.slice(),
-                                .{
-                                    .x = @floatFromInt(content_x_offset orelse 0),
-                                    .y = @floatFromInt(content_y_offset orelse 0),
-                                    .w = @floatFromInt(app_mod.rowModeViewportWidth(g, row_draw_params)),
-                                    .h = @floatFromInt(content_height),
-                                },
-                                content_x_offset_i32,
-                                content_y_offset_i32,
-                                content_right_i32,
-                                row_h_px,
-                                ctx_ptr,
-                                rs_set_sc_fn,
-                                log_enabled,
-                            );
-                            // Their pixels are in back_tex now; the present
-                            // rects for this frame were already built above.
-                            // Only a layer that got one of those rects has its
-                            // dirty flag consumed here — a layer the core made
-                            // dirty after the rect loop has no rect covering
-                            // it, so it keeps the flag and is presented by the
-                            // next paint. The clear stays inside the same lock
-                            // as the draw so a store landing between the two
-                            // cannot be dropped; a present that then fails
-                            // re-arms these flags below.
-                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
-                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
-                                if (state.paint_has_present_rect) state.dirty = false;
-                            }
-                            app.mu.unlock(core.clock.io());
-                        }
-
-                        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-                        var cursor_overlay_failed = false;
-                        // cursor_layer_row points into a layer's row storage,
-                        // which the core thread can resize; hold app.mu for as
-                        // long as the overlay dereferences it. The pointer is
-                        // resolved under this lock — between the capture above
-                        // and here the core thread can have resized rows_buf or
-                        // destroyed the grid, and a null falls back to the
-                        // root grid's row.
-                        if (cursor_layer_row_index != null) app.mu.lockUncancelable(core.clock.io());
-                        var cursor_layer_row: ?*app_mod.RowVerts = null;
-                        // Read with the row itself, so a blink-off redraw uses
-                        // the shift the layer draw above applied.
-                        var cursor_layer_row_dy_px: f32 = 0;
-                        if (cursor_layer_row_index) |local_row| {
-                            if (app.layer_grids.get(cursor_grid)) |state| {
-                                if (local_row < state.rows_buf.items.len) {
-                                    cursor_layer_row = &state.rows_buf.items[local_row];
-                                    const origin_row: u32 = if (local_row < state.origin_rows.items.len)
-                                        state.origin_rows.items[local_row]
-                                    else
-                                        @intCast(local_row);
-                                    cursor_layer_row_dy_px = @floatFromInt(
-                                        (@as(i32, @intCast(local_row)) - @as(i32, @intCast(origin_row))) * row_h_px,
-                                    );
-                                }
-                            }
-                        }
-                        app_mod.drawCursorOverlay(g, .{
-                            .cursor_verts = cursor_verts_snapshot,
-                            .cursor_row = committed_cursor.last_cursor_row,
-                            .cursor_vb = &app.cursor_vb,
-                            .cursor_vb_bytes = &app.cursor_vb_bytes,
-                            .row_vbs = app.row_vbs.items,
-                            .row_map = committed.row_map.items,
-                            .pool = &app.tbs.pool,
-                            .blink_visible = app.cursor_blink_state,
-                            .x_offset = content_x_offset_i32,
-                            .y_offset = content_y_offset_i32,
-                            .content_right = content_right_i32,
-                            .content_width = app_mod.rowModeViewportWidth(g, row_draw_params),
-                            .content_height = content_height,
-                            .row_h_px = row_h_px,
-                            .cursor_layer_origin_x_px = cursor_layer_origin[0],
-                            .cursor_layer_origin_y_px = cursor_layer_origin[1],
-                            .cursor_layer_row = cursor_layer_row,
-                            .cursor_layer_row_dy_px = cursor_layer_row_dy_px,
-                            .ctx_ptr = ctx_ptr,
-                            .rs_set_sc_fn = rs_set_sc_fn,
-                            .last_painted_cursor_row = &app.last_painted_cursor_row,
-                            .row_already_redrawn = cursor_row_redrawn,
-                        }) catch |e| {
-                            cursor_overlay_failed = true;
-                            if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
-                        };
-                        // Paired with the row drawCursorOverlay just recorded, so
-                        // the next paint can tell whether that row is one it can
-                        // still place. See cursor_grid_changed above.
-                        app.last_painted_cursor_grid = cursor_grid;
-                        if (cursor_layer_row_index != null) app.mu.unlock(core.clock.io());
-
-                        // Post-process bloom (neon glow) for row-mode
-                        if (glow_enabled) {
-                            const bloom_cursor = if (app.cursor_blink_state)
-                                cursor_verts_snapshot
-                            else
-                                &[_]core.Vertex{};
-                            // drawBloomRowsOverlay takes app.mu itself for the
-                            // layer storage it reads; app.mu must be free here.
-                            // The blur reads this from the renderer rather than the call, so it
-                            // has to be current before the passes run.
-                            g.glow_radius_scale = glow_radius_scale;
-                            app_mod.drawBloomRowsOverlay(
-                                g,
-                                committed.row_map.items,
-                                &app.tbs.pool,
-                                app.row_vbs.items,
-                                bloom_cursor,
-                                glow_intensity,
-                                row_draw_params,
-                            );
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {

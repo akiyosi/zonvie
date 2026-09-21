@@ -994,133 +994,48 @@ fn drawNormalExternalSurfaceRowMode(
         }
     }
 
-    // TBS lock-free draw: committed set is protected by refcount,
-    // no app.mu needed during VB upload + draw.
-    const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
-        g,
-        &app.row_vb_budget,
-        &ext_win.row_vb_retained_bytes,
-        tbs_committed.row_map.items,
-        &ext_win.tbs.pool,
-        ext_win.row_vbs.items,
-        rows_to_draw.items,
-        draw_params,
-    );
+    const row_frame = app_mod.drawSurfaceRowFrame(g, app, .{
+        .row_vbs = ext_win.row_vbs.items,
+        .row_vb_retained_bytes = &ext_win.row_vb_retained_bytes,
+        .pool = &ext_win.tbs.pool,
+        .cursor_vb = &ext_win.cursor_vb,
+        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
+        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
+        .last_painted_cursor_grid = &ext_win.last_painted_cursor_grid,
+    }, .{
+        .root_grid_id = grid_id,
+        .layers = tbs_snap.layers.slice(),
+        .row_map = tbs_committed.row_map.items,
+        .rows_to_draw = rows_to_draw.items,
+        .cursor_verts = tbs_cursor.verts.items,
+        .cursor_row = tbs_cursor.last_cursor_row,
+        .cursor_grid = tbs_snap.cursor_layer_grid_id,
+        .cursor_erase_rows = cursor_erase_rows,
+        .cursor_layer_origin = .{ @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px) },
+        .blink_visible = cursor_blink_visible,
+        .force_full_rows = force_full_rows,
+        .layer_layout_stale = layer_layout_stale,
+        .layer_commit_stale = layer_commit_stale,
+        .glow = if (glow_enabled) app_mod.RowFrameGlow{
+            .intensity = glow_intensity,
+            .radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else 1.0,
+            .cursor_visible = cursor_blink_visible,
+        } else null,
+        .draw_params = draw_params,
+        .log_enabled = log_enabled,
+    });
 
     if (log_enabled) {
         applog.appLog(
             "[win] drawNormalExtRowMode: grid_id={d} drawn={d} skipped={d} failed={d} rows_to_draw={d}\n",
-            .{ grid_id, result.metrics.drawn_rows, result.metrics.skipped_empty, result.metrics.failed_rows, rows_to_draw.items.len },
+            .{ grid_id, row_frame.rows.metrics.drawn_rows, row_frame.rows.metrics.skipped_empty, row_frame.rows.metrics.failed_rows, rows_to_draw.items.len },
         );
     }
-    if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
-
-    // Rows that never reached back_tex, and a plan the core republished under,
-    // counted like the root rows above.
-    var layer_outcome = app_mod.LayerDrawOutcome{ .stale_layout = layer_layout_stale, .stale_commit = layer_commit_stale };
-    {
-        const needs_layer_lock = has_layers or tbs_snap.cursor_layer_grid_id != grid_id;
-        if (needs_layer_lock) app.mu.lockUncancelable(core.clock.io());
-        defer if (needs_layer_lock) app.mu.unlock(core.clock.io());
-
-        // What row_already_redrawn promises drawCursorOverlay: this frame
-        // repainted the cursor's OWN grid's row, so blink-on needs only the
-        // cursor quad and blink-off needs nothing. A layer's rows have to be
-        // claimed here, after planLayerFrame settled the redraw set and before
-        // drawSurfaceLayers' defer clears it; the root's went into rows_to_draw
-        // above, so membership decides there.
-        var cursor_row_redrawn = force_full_rows;
-        if (has_layers and !force_full_rows and !layer_layout_stale and !layer_commit_stale) {
-            var claimed = true;
-            if (cursor_on_root) {
-                for (cursor_erase_rows) |maybe_row| {
-                    const r = maybe_row orelse continue;
-                    if (std.mem.indexOfScalar(u32, rows_to_draw.items, r) == null) claimed = false;
-                }
-            } else {
-                for (cursor_erase_rows) |maybe_row| {
-                    const r = maybe_row orelse continue;
-                    if (!app_mod.markLayerCursorRow(
-                        app,
-                        tbs_snap.layers.slice(),
-                        tbs_snap.cursor_layer_grid_id,
-                        r,
-                        @intCast(@max(1, app.cell_w_px)),
-                        row_h_px,
-                    )) claimed = false;
-                }
-            }
-            cursor_row_redrawn = claimed;
-        }
-
-        if (has_layers and !layer_layout_stale and !layer_commit_stale) {
-            layer_outcome = app_mod.drawSurfaceLayers(g, app, tbs_snap.layers.slice(), .{
-                .x = 0,
-                .y = 0,
-                .w = @floatFromInt(app_mod.rowModeViewportWidth(g, draw_params)),
-                .h = @floatFromInt(draw_params.content_height),
-            }, 0, 0, content_right, row_h_px, result.ctx_ptr, result.rs_set_sc_fn, log_enabled);
-            // Only a layer that got one of the rectangles published above has
-            // its dirty flag consumed: one the core made dirty after that loop
-            // has no rect covering it, so it keeps the flag and the next paint
-            // presents it. A present that then fails re-arms these.
-            for (tbs_snap.layers.slice()[1..]) |layer| {
-                const state = app.layer_grids.get(layer.grid_id) orelse continue;
-                if (state.paint_has_present_rect) state.dirty = false;
-            }
-        }
-        var cursor_origin_x: f32 = 0;
-        var cursor_origin_y: f32 = 0;
-        var cursor_layer_row: ?*app_mod.RowVerts = null;
-        var cursor_row_dy_px: f32 = 0;
-        if (!cursor_on_root) {
-            cursor_origin_x = @floatFromInt(cursor_layer_x_px);
-            cursor_origin_y = @floatFromInt(cursor_layer_y_px);
-            if (app.layer_grids.get(tbs_snap.cursor_layer_grid_id)) |state| {
-                if (tbs_cursor.last_cursor_row) |row| {
-                    if (row < state.rows_buf.items.len) {
-                        cursor_layer_row = &state.rows_buf.items[row];
-                        if (row < state.origin_rows.items.len) {
-                            cursor_row_dy_px = @floatFromInt((@as(i32, @intCast(row)) - @as(i32, @intCast(state.origin_rows.items[row]))) * row_h_px);
-                        }
-                    }
-                }
-            }
-        }
-        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-        try app_mod.drawCursorOverlay(g, .{
-            .cursor_verts = tbs_cursor.verts.items,
-            .cursor_row = tbs_cursor.last_cursor_row,
-            .cursor_vb = &ext_win.cursor_vb,
-            .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
-            .row_vbs = ext_win.row_vbs.items,
-            .row_map = tbs_committed.row_map.items,
-            .pool = &ext_win.tbs.pool,
-            .blink_visible = cursor_blink_visible,
-            .content_right = content_right,
-            .content_width = app_mod.rowModeViewportWidth(g, draw_params),
-            .content_height = draw_params.content_height,
-            .row_h_px = row_h_px,
-            .ctx_ptr = result.ctx_ptr,
-            .rs_set_sc_fn = result.rs_set_sc_fn,
-            .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-            .row_already_redrawn = cursor_row_redrawn,
-            .cursor_layer_origin_x_px = cursor_origin_x,
-            .cursor_layer_origin_y_px = cursor_origin_y,
-            .cursor_layer_row = cursor_layer_row,
-            .cursor_layer_row_dy_px = cursor_row_dy_px,
-        });
-        // Paired with the row drawCursorOverlay just recorded: the next paint
-        // reads both to decide whether the remembered row is still one it can
-        // place. Set even when the overlay recorded no row, so a blink-off
-        // frame cannot leave the pair naming different paints.
-        ext_win.last_painted_cursor_grid = tbs_snap.cursor_layer_grid_id;
-    }
-
+    if (row_frame.row_vb_budget_exceeded) return error.RowVBPhysicalBudgetExceeded;
     // This frame is incomplete: fail the paint the same way a root row does,
     // rather than present missing or mismatched rows and let the consumed
     // redraw plan make them permanent.
-    if (layer_outcome.incomplete()) return error.RowVBRenderFailed;
+    if (row_frame.incomplete()) return error.RowVBRenderFailed;
 
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
@@ -1192,30 +1107,6 @@ fn drawNormalExternalSurfaceRowMode(
             .right = @intCast(g.width),
             .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
-    }
-
-    // Bloom/glow post-process.
-    // Cursor verts are stored separately from the row VBs.
-    // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
-    if (glow_enabled) {
-        const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
-        // drawBloomRowsOverlay takes app.mu itself for the layer storage it
-        // reads; app.mu must be free here.
-        // The blur reads this from the renderer rather than the call, so it
-        // has to be current before the passes run.
-        g.glow_radius_scale = if (app.corep) |cp|
-            core.zonvie_core_get_glow_radius_scale(cp)
-        else
-            1.0;
-        app_mod.drawBloomRowsOverlay(
-            g,
-            tbs_committed.row_map.items,
-            &ext_win.tbs.pool,
-            ext_win.row_vbs.items,
-            bloom_cursor,
-            glow_intensity,
-            draw_params,
-        );
     }
 
     // Scrollbar overlay. Capture the clean, fully-composited strip after
@@ -3545,34 +3436,35 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
 }
 
 fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
-    var post_device_recovery = false;
+    var device_lost = false;
     var main_hwnd: ?c.HWND = null;
-    var retry_ticket: ?app_mod.PaintRetryState.Ticket = null;
     app.mu.lockUncancelable(core.clock.io());
     const ext_win = app.external_windows.get(grid_id);
     if (ext_win) |ew| {
-        ew.surface.paint_full = true;
         ew.needs_redraw = true;
-        retry_ticket = ew.paint_retry.fail();
-        if (ew.renderer.device_lost) {
-            post_device_recovery = true;
-            main_hwnd = app.hwnd;
-        }
+        device_lost = ew.renderer.device_lost;
+        main_hwnd = app.hwnd;
     }
     app.mu.unlock(core.clock.io());
-    if (ext_win) |ew| {
-        ew.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ew.tbs.pending_paint_full = true;
-        ew.tbs.rotation_mu.unlock(core.clock.io());
+    const ew = ext_win orelse return;
+    const ticket = app_mod.failSurfacePaint(app, &ew.surface, &ew.tbs, &ew.paint_retry, device_lost);
+    if (device_lost) {
+        if (main_hwnd) |target| window_mod.postDeviceLostRecovery(target, app);
+    } else if (ticket) |t| {
+        armExternalPaintRetry(app, hwnd, ew, t);
     }
-    if (retry_ticket) |ticket| {
-        if (ext_win) |ew| armExternalPaintRetry(app, hwnd, ew, ticket);
-    }
-    if (post_device_recovery) {
-        if (main_hwnd) |target| {
-            window_mod.postDeviceLostRecovery(target, app);
-        }
-    }
+}
+
+/// Abandon a paint that has taken its reference but not yet installed the
+/// `finishExternalWindowPaint` defer. `app.mu` is still held at that point and
+/// the reference has to be released under it, which the deferred release
+/// cannot do (it takes `app.mu` itself). Nothing else the deferred release
+/// does applies here: a close cannot have become pending while this thread
+/// held `app.mu`. Unlocks `app.mu`.
+fn abandonExternalPaintBeforeDeferLocked(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hwnd: c.HWND) void {
+    ext_win.paint_ref_count -= 1;
+    app.mu.unlock(core.clock.io());
+    requeueExternalFullPaint(app, grid_id, hwnd);
 }
 
 fn completeExternalPaintRetry(ext_win: *app_mod.ExternalWindow) void {
@@ -3714,16 +3606,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // TBS: acquire committed set for painting (lock-free vertex reads).
     const tbs_snapshot = ext_win.tbs.acquireForPaint(app.alloc);
-    defer {
-        var layers = tbs_snapshot.layers;
-        layers.deinit();
-        const needs_reinvalidate = ext_win.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
-        if (ext_win.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
-            if (!app.atlas_reset_active.load(.seq_cst)) {
-                _ = c.InvalidateRect(hwnd, null, 0);
-            }
-        }
-    }
+    defer if (app_mod.releasePaintSnapshot(
+        &ext_win.tbs,
+        tbs_snapshot,
+        &ext_win.paint_retry,
+        app.atlas_reset_active.load(.seq_cst),
+    )) {
+        _ = c.InvalidateRect(hwnd, null, 0);
+    };
     const tbs_committed = &ext_win.tbs.sets[tbs_snapshot.committed_index];
     const tbs_cursor = &ext_win.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
     // Shared font/cell/linespace metrics are protected by app.mu. Pair the
@@ -3878,14 +3768,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             ext_win.surface.verts.items,
             vert_count,
         )) {
-            ext_win.surface.paint_full = true;
-            ext_win.needs_redraw = true;
-            ext_win.paint_ref_count -= 1;
-            app.mu.unlock(core.clock.io());
-            ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-            ext_win.tbs.pending_paint_full = true;
-            ext_win.tbs.rotation_mu.unlock(core.clock.io());
-            requeueExternalFullPaint(app, grid_id, hwnd);
+            abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
             return;
         }
@@ -3893,14 +3776,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         const cursor_items = tbs_cursor.verts.items;
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
-                ext_win.surface.paint_full = true;
-                ext_win.needs_redraw = true;
-                ext_win.paint_ref_count -= 1;
-                app.mu.unlock(core.clock.io());
-                ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                ext_win.tbs.pending_paint_full = true;
-                ext_win.tbs.rotation_mu.unlock(core.clock.io());
-                requeueExternalFullPaint(app, grid_id, hwnd);
+                abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
                 return;
             };
             ext_win.paint_scratch.appendSliceAssumeCapacity(cursor_items);
@@ -3928,13 +3804,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
     }
     if (!dirty_snapshot_ok) {
-        ext_win.surface.paint_full = true;
-        ext_win.paint_ref_count -= 1;
-        app.mu.unlock(core.clock.io());
-        ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ext_win.tbs.pending_paint_full = true;
-        ext_win.tbs.rotation_mu.unlock(core.clock.io());
-        requeueExternalFullPaint(app, grid_id, hwnd);
+        abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
         return;
     }
     var ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
