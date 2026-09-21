@@ -1926,6 +1926,18 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         }
     }
 
+    /// Whether the MAIN window composites this grid.
+    ///
+    /// The scroll offsets, the float debt ledger and the fixed-float mask this
+    /// file builds are all the main renderer's, and none of them has any use
+    /// for a grid an external window draws: such a grid reports its start row
+    /// and column in THAT surface's space, so the numbers describe a region of
+    /// the wrong window. `isExternal` is the adjacent question -- "is this a
+    /// window of its own" -- and misses exactly the floats such a window hosts.
+    private func mainSurfaceDraws(_ grid: ZonvieCore.GridInfo) -> Bool {
+        grid.placedBySurface == 1
+    }
+
     private func updateScrollShaderOffset() {
         guard let core else { return }
 
@@ -2017,6 +2029,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 scrollOffsetStaleKeysScratch.append(gridId)
                 continue
             }
+            // Pruned above whatever surface draws it -- the map is this view's
+            // and every surface reads its offsets from it -- but only entered
+            // here when the MAIN renderer is the one drawing it.
+            guard mainSurfaceDraws(info) else { continue }
 
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
@@ -2072,7 +2088,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         fixedFloatRectsScratch.removeAll(keepingCapacity: true)
         if scrollOffsetsComplete && !scrollOffsetInfoScratch.isEmpty {
             let cellW = Float(renderer.cellWidthPx)
-            for g in grids where g.zindex > 0 && g.gridId != 1 && !g.followsScroll {
+            for g in grids
+                where g.zindex > 0 && g.gridId != 1 && !g.followsScroll && mainSurfaceDraws(g)
+            {
                 // A directly-scrolled float stays in the mask: the z-aware
                 // guard compares its own zindex against the mask segment's, so
                 // it cannot self-discard, while lower-z content scrolled in
@@ -3365,6 +3383,12 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         for floatGrid in grids {
             guard floatGrid.zindex > 0, floatGrid.gridId != 1 else { continue }
+            // Not covered by the filter on the offsets above: an
+            // editor-anchored float takes the overlap branch below, and a
+            // foreign float's start row and column are numbers in ANOTHER
+            // surface's space, which can overlap a main-window source by
+            // arithmetic alone.
+            guard mainSurfaceDraws(floatGrid) else { continue }
             // Only buffer-tracking floats (repositioned on scroll) pixel-follow.
             // A fixed editor overlay never repositions and must stay put.
             guard floatGrid.followsScroll else { continue }
