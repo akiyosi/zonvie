@@ -3383,9 +3383,11 @@ final class ZonvieCore {
 
     /// Scroll to specific line (1-based) - used for scrollbar knob drag
     /// If useBottom is true, positions line at screen bottom (zb), otherwise at top (zt).
-    func scrollToLine(_ line: Int64, useBottom: Bool = false) {
+    /// `gridId` names the window to scroll — the surface whose scrollbar was
+    /// dragged, not whichever one holds the cursor.
+    func scrollToLine(gridId: Int64, _ line: Int64, useBottom: Bool = false) {
         guard let core else { return }
-        zonvie_core_scroll_to_line(core, line, useBottom)
+        zonvie_core_scroll_to_line(core, gridId, line, useBottom)
     }
 
     /// Scroll a window by one page (Neovim's <C-f>/<C-b>).

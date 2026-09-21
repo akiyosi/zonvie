@@ -4813,6 +4813,15 @@ extension ExternalGridView: NSTextInputClient {
     }
 
     /// Update scrollbar if viewport has changed (called after rendering)
+    /// The grid this surface's scrollbar ACTS on, which has to be the one it
+    /// shows — a float this window hosts included. Dragging ran against the
+    /// cursor's window, so this knob scrolled whatever held the cursor.
+    private var scrollbarInteractionGrid: Int64 {
+        let g = mainTerminalView?.core?.scrollbarGridNonBlocking(surfaceId: gridId) ?? lastScrollbarGrid
+        ZonvieCore.appLog("[scrollbar_action] surface=\(gridId) grid=\(g)")
+        return g
+    }
+
     func updateScrollbarIfNeeded() {
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled && !isDecoratedSurface else { return }
@@ -4907,18 +4916,18 @@ extension ExternalGridView: NSTextInputClient {
         switch sender.hitPart {
         case .decrementPage:
             let newTopline = max(1, viewport.topline - (visibleLines - 2) + 1)
-            core.scrollToLine(newTopline, useBottom: false)
+            core.scrollToLine(gridId: scrollbarInteractionGrid, newTopline, useBottom: false)
 
         case .incrementPage:
             let newTopline = min(viewport.lineCount - visibleLines + 1, viewport.topline + (visibleLines - 2) + 1)
             let targetLine = max(1, newTopline)
-            core.scrollToLine(targetLine, useBottom: false)
+            core.scrollToLine(gridId: scrollbarInteractionGrid, targetLine, useBottom: false)
 
         case .knob, .knobSlot:
             let scrollRange = max(1, viewport.lineCount - visibleLines)
             let targetTopline = Int64(sender.doubleValue * Double(scrollRange)) + 1
             let clampedTopline = max(1, min(targetTopline, viewport.lineCount - visibleLines + 1))
-            core.scrollToLine(clampedTopline, useBottom: false)
+            core.scrollToLine(gridId: scrollbarInteractionGrid, clampedTopline, useBottom: false)
 
         default:
             break

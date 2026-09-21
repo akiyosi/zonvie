@@ -363,8 +363,8 @@ pub fn hideScrollbarForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.Exter
 pub fn scrollbarPageScrollForExternal(app: *App, grid_id: i64, direction: i8) void {
     const corep = app.corep orelse return;
 
-    // Single RPC call targeting the specific grid's window via winid.
-    app_mod.zonvie_core_page_scroll(corep, grid_id, direction > 0);
+    // The grid this window's knob shows, so a float it hosts pages too.
+    app_mod.zonvie_core_page_scroll(corep, scrollbarGrid(app, grid_id), direction > 0);
 }
 
 /// Handle scrollbar mouse down for external window
@@ -470,14 +470,15 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     if (now - ext_win.scrollbar_last_update < app_mod.SCROLLBAR_THROTTLE_MS) return;
     ext_win.scrollbar_last_update = now;
 
-    // Send scroll command to Neovim
-    app_mod.zonvie_core_scroll_to_line(corep, target_line, use_bottom);
+    // The grid this window's knob shows — dragging it ran against whatever
+    // window held the cursor.
+    app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, grid_id), target_line, use_bottom);
 
     ext_win.scrollbar_pending_line = -1;
 }
 
 /// Handle scrollbar mouse up for external window
-pub fn scrollbarMouseUpForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, _: i64) void {
+pub fn scrollbarMouseUpForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64) void {
     if (ext_win.scrollbar_dragging) {
         ext_win.scrollbar_dragging = false;
         _ = c.ReleaseCapture();
@@ -485,7 +486,7 @@ pub fn scrollbarMouseUpForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.Ex
         // Flush any pending scroll on mouse up
         if (ext_win.scrollbar_pending_line >= 0) {
             if (app.corep) |corep| {
-                app_mod.zonvie_core_scroll_to_line(corep, ext_win.scrollbar_pending_line, ext_win.scrollbar_pending_use_bottom);
+                app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, grid_id), ext_win.scrollbar_pending_line, ext_win.scrollbar_pending_use_bottom);
             }
             ext_win.scrollbar_pending_line = -1;
         }
@@ -685,7 +686,7 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
         if (applog.isEnabled()) applog.appLog("[scrollbar] mouseMove y={d} ratio={d:.3} line={d} bottom={any} (sending)\n", .{
             mouse_y, scroll_ratio, target_line, use_bottom,
         });
-        app_mod.zonvie_core_scroll_to_line(corep, target_line, use_bottom);
+        app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, 1), target_line, use_bottom);
         app.scrollbar_last_scroll_time = now;
         app.scrollbar_pending_line = -1; // Clear pending
     }
@@ -700,9 +701,10 @@ pub fn scrollbarPageScroll(app: *App, direction: i8) void {
 
     if (applog.isEnabled()) applog.appLog("[scrollbar] scrollbarPageScroll: direction={d}\n", .{direction});
 
-    // Single RPC call using Neovim's native <C-f>/<C-b> for exact page scroll.
-    // grid_id=-1: target the cursor grid (current window).
-    app_mod.zonvie_core_page_scroll(corep, -1, direction > 0);
+    // The grid this scrollbar SHOWS, which is the one it has to act on:
+    // grid -1 is the cursor's window, so this paged an external window
+    // whenever the cursor was in one.
+    app_mod.zonvie_core_page_scroll(corep, scrollbarGrid(app, 1), direction > 0);
 }
 
 /// Handle scrollbar mouse up
@@ -712,7 +714,7 @@ pub fn scrollbarMouseUp(hwnd: c.HWND, app: *App) void {
         if (app.scrollbar_pending_line > 0) {
             if (app.corep) |corep| {
                 if (applog.isEnabled()) applog.appLog("[scrollbar] mouseUp sending pending line={d} bottom={any}\n", .{ app.scrollbar_pending_line, app.scrollbar_pending_use_bottom });
-                app_mod.zonvie_core_scroll_to_line(corep, app.scrollbar_pending_line, app.scrollbar_pending_use_bottom);
+                app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, 1), app.scrollbar_pending_line, app.scrollbar_pending_use_bottom);
             }
             app.scrollbar_pending_line = -1;
         }

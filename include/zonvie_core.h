@@ -1651,9 +1651,12 @@ ZONVIE_API void zonvie_core_send_mouse_scroll(
 
 /* Scroll view to specified line number (1-based).
    If use_bottom is true, positions line at screen bottom (zb), otherwise at top (zt).
-   Used for scrollbar dragging. */
+   Used for scrollbar dragging.
+   grid_id: the window to scroll — the surface whose scrollbar was dragged, not
+   whichever one holds the cursor. Pass -1 for the cursor's window. */
 ZONVIE_API void zonvie_core_scroll_to_line(
     zonvie_core *core,
+    int64_t grid_id,
     int64_t line,
     bool use_bottom
 );
