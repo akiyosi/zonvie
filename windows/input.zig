@@ -1,5 +1,6 @@
 const std = @import("std");
 const app_mod = @import("app.zig");
+const wheel_target = @import("wheel_target.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
@@ -652,21 +653,6 @@ pub fn sendMouseButton(
     );
 }
 
-/// Whether a float captures scroll at all. One that already shows every line
-/// of its buffer does not: the event falls through to the window it is drawn
-/// over, the same rule the macOS resolution applies
-/// (MetalTerminalView.isFloatLogicallyScrollable). A grid the cached snapshot
-/// does not carry is treated as not capturing, so a layer whose viewport has
-/// not been reported yet shadows nothing.
-fn layerCapturesScroll(grids: []const app_mod.GridInfo, grid_id: i64) bool {
-    for (grids) |g| {
-        if (g.grid_id != grid_id) continue;
-        const content_rows: i64 = @max(0, @as(i64, g.rows) - @as(i64, g.margin_top) - @as(i64, g.margin_bottom));
-        return g.line_count > content_rows;
-    }
-    return false;
-}
-
 /// Shared WM_MOUSEWHEEL / WM_MOUSEHWHEEL handler for the main window and
 /// external windows. `ext_window` is the surface this hwnd draws, or null for
 /// the main window; it is what carries the layer list a scroll is resolved
@@ -719,50 +705,41 @@ pub fn handleMouseWheel(
     var target_grid_id: i64 = grid_id;
     var target_row: i32 = row;
     var target_col: i32 = col;
-    if (is_main_window) {
-        if (corep) |cp| {
-            const vg = app.getVisibleGridsCached(cp);
-            var best_zindex: i64 = -1;
-            for (vg) |g| {
-                if (row >= g.start_row and row < g.start_row + g.rows and
-                    col >= g.start_col and col < g.start_col + g.cols and
-                    g.zindex > best_zindex)
-                {
-                    best_zindex = g.zindex;
-                    target_grid_id = g.grid_id;
-                    target_row = row - g.start_row;
-                    target_col = col - g.start_col;
-                }
-            }
-        }
-    } else if (ext_window) |ew| {
-        // A float anchored inside this window is one of its layers, not a
-        // window of its own. Neovim does no z-order test once the UI names a
-        // grid -- it looks the window up by handle and clamps the position
-        // into it (mouse.c, mouse_find_grid_win) -- so a scroll over such a
-        // float has to name it here, or it scrolls the window behind it. Same
-        // back-to-front resolution the press path does (resolveMouseTarget),
-        // with the extra rule that a float showing all of its content lets the
-        // scroll through.
+    {
+        // Both surfaces resolve the same way, against the LAYER list each one
+        // composites — see wheel_target.zig for the three rules the main
+        // window lost by reading the grid list instead, and for the one rule
+        // the wheel adds to the press path.
         const grids: []const app_mod.GridInfo = if (corep) |cp| app.getVisibleGridsCached(cp) else &.{};
+        var scrollable_buf: [64]i64 = undefined;
+        const scrollable = wheel_target.collectScrollableGridIds(
+            app_mod.GridInfo,
+            grids,
+            &scrollable_buf,
+        );
+
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        const layers = ew.tbs.committed_layers.slice();
-        if (layers.len > 1 and cell_w != 0 and row_h != 0) {
-            const cw: i32 = @intCast(cell_w);
-            const rh: i32 = @intCast(row_h);
-            for (layers[1..]) |layer| {
-                if (!layer.mouse_enabled) continue;
-                const w: i32 = @as(i32, @intCast(layer.cols)) * cw;
-                const h: i32 = @as(i32, @intCast(layer.rows)) * rh;
-                if (px < layer.x_px or px >= layer.x_px + w) continue;
-                if (py < layer.y_px or py >= layer.y_px + h) continue;
-                if (!layerCapturesScroll(grids, layer.grid_id)) continue;
-                const local = clientPxToCell(app, false, px - layer.x_px, py - layer.y_px, cell_w, row_h, false);
-                target_grid_id = layer.grid_id;
-                target_row = local.row;
-                target_col = local.col;
-            }
+        const layers = if (ext_window) |ew| ew.tbs.committed_layers.slice() else app.tbs.committed_layers.slice();
+        // The main window's content is inset by the tabline and the sidebar;
+        // an external window has neither. Its layers are surface-local either
+        // way, so the point has to be too.
+        const origin = surfaceOriginPx(app, is_main_window);
+        const hit = wheel_target.resolve(
+            app_mod.SurfaceLayer,
+            layers,
+            grid_id,
+            px - origin.x,
+            py - origin.y,
+            cell_w,
+            row_h,
+            scrollable,
+        );
+        if (hit.grid_id != grid_id) {
+            const local = cellAt(hit.x_px, hit.y_px, cell_w, row_h, false);
+            target_grid_id = hit.grid_id;
+            target_row = local.row;
+            target_col = local.col;
         }
     }
 
