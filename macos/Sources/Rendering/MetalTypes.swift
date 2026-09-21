@@ -2920,6 +2920,50 @@ func displacedLayerOriginPx(
     return simd_float2(originPx.x, originPx.y - offset.offset_y * viewportHeightPx / 2)
 }
 
+/// The rows of a grid a pixel may be mapped into, and the band of them the
+/// sub-row ease actually moves.
+struct GridRowBand: Equatable {
+    var startRow: Int32
+    var rows: Int32
+    var marginTop: Int32
+    var marginBottom: Int32
+}
+
+/// The grid-local row a pixel names, with the sub-row ease undone only where
+/// the ease moved that pixel.
+///
+/// Content rows carry DECO_SCROLLABLE and the shader displaces them by the
+/// grid's scroll offset. Margin rows — a winbar, a border, the fixed bands a
+/// float keeps — do not (Shaders.metal), so the shader left them where they
+/// statically belong while the content eased past them. Undoing an ease such a
+/// row never took names a content row for a pixel the user clicked on a margin:
+/// measured at marginTop=1, cell 20px, offset -20px, y=10px giving row 1
+/// instead of 0.
+///
+/// Both rows have to be content rows — the drawn one because that is where the
+/// pixel is, the adjusted one because that is where the answer would land.
+///
+/// One function because there were two: `hitTestGrid` carried this rule and the
+/// drag path applied the offset with no band check at all, so a press and the
+/// drag that followed it disagreed about the same pixel.
+func scrollAdjustedLocalRow(
+    pointPxY: CGFloat,
+    cellHeightPx: CGFloat,
+    band: GridRowBand,
+    scrollOffsetPx: CGFloat
+) -> Int32 {
+    guard cellHeightPx > 0 else { return 0 }
+    let drawnLocal = Int32(pointPxY / cellHeightPx) - band.startRow
+    guard abs(scrollOffsetPx) > 0.001 else { return drawnLocal }
+    let adjustedLocal = Int32((pointPxY - scrollOffsetPx) / cellHeightPx) - band.startRow
+    let contentTop = band.marginTop
+    let contentBottom = band.rows - band.marginBottom
+    guard drawnLocal >= contentTop, drawnLocal < contentBottom,
+          adjustedLocal >= contentTop, adjustedLocal < contentBottom
+    else { return drawnLocal }
+    return adjustedLocal
+}
+
 /// A float's two running counters as they stood when its debt was last zero.
 struct FloatDebtBaseline: Equatable {
     var anchorRowsUp: Int

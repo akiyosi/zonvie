@@ -275,6 +275,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// Guarded by scrollOffsetLock.
     private var anchorLandedRowsUp: [Int64: Int] = [:]
 
+    /// The anchor counters as the frame's offsets saw them. Main thread only,
+    /// filled inside the hold that reads scrollOffsetPx.
+    private var anchorLandedRowsUpScratch: [Int64: Int] = [:]
+
     /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
     /// a trackpad gesture). Guarded by scrollOffsetLock.
     private var smoothScrollGrids: Set<Int64> = []
@@ -1000,8 +1004,11 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// position part-way through the drag.
     private struct DragGridCache {
         var gridId: Int64
-        var startRow: Int32
         var startCol: Int32
+        /// The rows the press landed in, so the drag can apply the same
+        /// content-band rule the press did. Carrying only the origin left the
+        /// drag undoing an ease on margin rows that never took one.
+        var band: GridRowBand
     }
     private var dragGridCache: DragGridCache? = nil
 
@@ -1015,8 +1022,13 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         if let grid = core?.getVisibleGridsCached().first(where: { $0.gridId == gridId }) {
             dragGridCache = DragGridCache(
                 gridId: grid.gridId,
-                startRow: grid.startRow,
-                startCol: grid.startCol
+                startCol: grid.startCol,
+                band: GridRowBand(
+                    startRow: grid.startRow,
+                    rows: grid.rows,
+                    marginTop: grid.marginTop,
+                    marginBottom: grid.marginBottom
+                )
             )
         }
 
@@ -1110,8 +1122,12 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
             guard renderer.cellWidthPx > 0 && renderer.cellHeightPx > 0 else { return }
 
-            let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero))))
-            let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+            // Rounded UP, as hitTestGrid and the core's updateLayoutPx do.
+            // Rounding to nearest here put the press and the drag on different
+            // cell widths whenever the fractional part was below a half, so the
+            // two disagreed about the column of the same pixel.
+            let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.up))))
+            let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.up))))
             let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
 
             let pointPx: CGPoint
@@ -1122,19 +1138,20 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             }
 
             let globalCol = Int32(pointPx.x / cellW)
-            var globalRow = Int32(pointPx.y / cellH)
 
-            // Adjust for smooth scroll offset (same logic as hitTestGrid)
             scrollOffsetLock.lock()
             let dragOffsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[cache.gridId] ?? 0, cellHeightPx: cellH)
             scrollOffsetLock.unlock()
-            if abs(dragOffsetPx) > 0.001 {
-                let adjustedPxY = pointPx.y - CGFloat(dragOffsetPx)
-                globalRow = Int32(adjustedPxY / cellH)
-            }
 
-            // Use cached startRow/startCol for consistent coordinate conversion
-            let localRow = globalRow - cache.startRow
+            // The band the press cached, not the grid as it stands now: a drag
+            // that resizes the grids would otherwise answer a different
+            // question part-way through, which is why the cache exists.
+            let localRow = scrollAdjustedLocalRow(
+                pointPxY: pointPx.y,
+                cellHeightPx: cellH,
+                band: cache.band,
+                scrollOffsetPx: dragOffsetPx
+            )
             let localCol = globalCol - cache.startCol
 
             core.sendMouseInput(
@@ -2007,6 +2024,15 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         for key in scrollOffsetStaleKeysScratch {
             scrollOffsetPx.removeValue(forKey: key)
         }
+        // The anchor counters, taken with the offsets they belong to.
+        // processPendingScrollClears moves a grid's landed rows and its
+        // compensation in the same iteration of the same lock; read in a
+        // second acquisition, the float ledger could be handed a counter from
+        // after a landing and an offset from before it, and withhold nothing
+        // for a row the compensation had just gained. Measured as a 33.1px
+        // step with the placement standing still.
+        anchorLandedRowsUpScratch.removeAll(keepingCapacity: true)
+        for (gridId, rows) in anchorLandedRowsUp { anchorLandedRowsUpScratch[gridId] = rows }
         scrollOffsetLock.unlock()
 
         // Propagate the underlying window's sub-cell offset to float windows that
@@ -3251,25 +3277,18 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[bestGridId] ?? 0, cellHeightPx: cellH)
         scrollOffsetLock.unlock()
 
-        if adjustForSmoothScroll, abs(offsetPx) > 0.001, let grid = grids.first(where: { $0.gridId == bestGridId }) {
-            // Content at static pixel Y is displayed at visual pixel Y + scrollOffsetPx.
-            // Reverse: static Y = visual Y - scrollOffsetPx.
-            let adjustedPxY = pointPx.y - CGFloat(offsetPx)
-            let adjustedGlobalRow = Int32(adjustedPxY / cellH)
-            let adjustedLocalRow = adjustedGlobalRow - grid.startRow
-
-            // Only apply adjustment within the scrollable content area (not
-            // margins) — and only when the pixel was on a content row to begin
-            // with. Margin rows carry no DECO_SCROLLABLE, so the shader left
-            // them where they statically belong while the content eased past
-            // them; undoing an ease such a row never took would name a content
-            // row the user did not click.
-            let contentTop = grid.marginTop
-            let contentBottom = grid.rows - grid.marginBottom
-            if localRow >= contentTop, localRow < contentBottom,
-               adjustedLocalRow >= contentTop, adjustedLocalRow < contentBottom {
-                localRow = adjustedLocalRow
-            }
+        if adjustForSmoothScroll, let grid = grids.first(where: { $0.gridId == bestGridId }) {
+            localRow = scrollAdjustedLocalRow(
+                pointPxY: pointPx.y,
+                cellHeightPx: cellH,
+                band: GridRowBand(
+                    startRow: grid.startRow,
+                    rows: grid.rows,
+                    marginTop: grid.marginTop,
+                    marginBottom: grid.marginBottom
+                ),
+                scrollOffsetPx: offsetPx
+            )
         }
 
         ZonvieCore.appLog("[hitTest] result: gridId=\(bestGridId) localRow=\(localRow) localCol=\(localCol) scrollOffset=\(offsetPx)")
@@ -3420,7 +3439,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             // consistent with the placement a frame draws inside the renderer's
             // own lock, so GridSurfaceRenderer.applyFloatScrollDebt does the
             // subtraction there rather than here.
-            let debtAnchorRowsUp = Int32(clamping: anchorLandedRowsUpSnapshot(followedGridId))
+            let debtAnchorRowsUp = Int32(clamping: anchorLandedRowsUpScratch[followedGridId] ?? 0)
             // A partial offset set can split a float from its anchor. Signal
             // overflow so the caller disables the whole transform for this
             // frame instead of silently truncating semantic state.
@@ -3443,8 +3462,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         return true
     }
 
-    /// The anchor's landed-rows counter, read under the lock that writes it
-    /// alongside the compensation it belongs to, so the pair travels together.
+    /// The anchor's landed-rows counter. The main surface does not use this —
+    /// it takes the whole map with the offsets, in one hold — but an external
+    /// surface has no access to that hold and asks per layer at draw time.
     func anchorLandedRowsUpSnapshot(_ anchorGridId: Int64) -> Int {
         scrollOffsetLock.lock()
         defer { scrollOffsetLock.unlock() }
