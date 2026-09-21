@@ -1039,7 +1039,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         // Send any pending scrollbar position
         if pendingScrollLine > 0 {
-            core?.scrollToLine(pendingScrollLine, useBottom: pendingScrollUseBottom)
+            core?.scrollToLine(gridId: scrollbarInteractionGrid, pendingScrollLine, useBottom: pendingScrollUseBottom)
             pendingScrollLine = -1
         }
 
@@ -1387,17 +1387,30 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         }
     }
 
+    /// The grid this surface's scrollbar ACTS on, which has to be the one it
+    /// shows. Page and drag both ran against grid -1 — the cursor's window —
+    /// so the main window's knob paged an external window whenever the cursor
+    /// was in it, while displaying its own content.
+    private var scrollbarInteractionGrid: Int64 {
+        let g = core?.scrollbarGridNonBlocking(surfaceId: 1) ?? lastScrollbarGrid
+        // Rare — a page or a drag, not a frame — and it is the only trace of
+        // which window a scrollbar acts on.
+        ZonvieCore.appLog("[scrollbar_action] surface=1 grid=\(g)")
+        return g
+    }
+
     @objc private func scrollerDidScroll(_ sender: NSScroller) {
         guard let core else { return }
 
         // Viewport may be nil if Neovim hasn't sent win_viewport for the cursor grid yet
         // (e.g., after window split with no content change). pageScroll doesn't need viewport.
-        let viewport = core.getViewportNonBlocking(gridId: -1)
+        let target = scrollbarInteractionGrid
+        let viewport = core.getViewportNonBlocking(gridId: target)
 
         switch sender.hitPart {
         case .decrementPage:
             // Click above knob - page up (single RPC, Neovim-native <C-b>)
-            core.pageScroll(gridId: -1, forward: false)
+            core.pageScroll(gridId: target, forward: false)
             // Update knob position immediately (estimated) and guard against revert
             if let viewport {
                 let visibleLines = viewport.botline - viewport.topline
@@ -1409,7 +1422,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
         case .incrementPage:
             // Click below knob - page down (single RPC, Neovim-native <C-f>)
-            core.pageScroll(gridId: -1, forward: true)
+            core.pageScroll(gridId: target, forward: true)
             // Update knob position immediately (estimated) and guard against revert
             if let viewport {
                 let visibleLines = viewport.botline - viewport.topline
@@ -1444,7 +1457,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             // Throttle: only send if enough time has passed
             let now = CFAbsoluteTimeGetCurrent()
             if now - lastScrollbarDragTime >= Self.scrollbarThrottleInterval {
-                core.scrollToLine(targetLine, useBottom: useBottom)
+                core.scrollToLine(gridId: scrollbarInteractionGrid, targetLine, useBottom: useBottom)
                 lastScrollbarDragTime = now
                 pendingScrollLine = -1
             }

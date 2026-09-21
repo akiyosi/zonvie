@@ -2091,12 +2091,13 @@ pub export fn zonvie_core_send_mouse_scroll(
 /// If use_bottom is true, positions line at screen bottom (zb), otherwise at top (zt).
 pub export fn zonvie_core_scroll_to_line(
     p: ?*zonvie_core,
+    grid_id: i64,
     line: i64,
     use_bottom: bool,
 ) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.scrollToLine(line, use_bottom);
+    box.core.scrollToLine(grid_id, line, use_bottom);
 }
 
 /// Scroll a window by one page (Neovim's <C-f>/<C-b>).
