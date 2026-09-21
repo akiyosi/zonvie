@@ -886,10 +886,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // the build sites write `shared.x` directly, which keeps "who writes these"
     // answerable by searching for `shared.`.
     /// Also read by ExternalGridView for the shared back-buffer copy.
-    private var initializationError: String?
-    private var pipelineNeedsBuilding = true
-    private var pipelineRetryDelaySeconds: TimeInterval = 0.1
-    private var pipelineRetryNotBefore: CFAbsoluteTime = 0
     private weak var viewForPipeline: MTKView?
 
     // 2-pass rendering pipelines for blur support
@@ -904,17 +900,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // Copy pipeline for backBuffer -> drawable (replaces MTLBlitCommandEncoder)
     // Using render pipeline instead of blit avoids XPC compiler issues after fork()
 
-    // Binary archive for caching compiled pipeline states
-    // This avoids XPC compiler service calls after first successful compilation
-    private var binaryArchive: MTLBinaryArchive?
-
-    /// Path to the binary archive file for caching pipeline states
-    static var binaryArchivePath: URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let zonvieDir = appSupport.appendingPathComponent("zonvie", isDirectory: true)
-        try? FileManager.default.createDirectory(at: zonvieDir, withIntermediateDirectories: true)
-        return zonvieDir.appendingPathComponent("pipeline_cache.metallib")
-    }
 
 
     /// Everything this surface publishes across threads: the buffer sets and
@@ -1462,85 +1447,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var lastCellWidthPx: Float = 0
     private var lastCellHeightPx: Float = 0
 
-    /// Compile the configured custom shaders. Run twice — once for the surface
-    /// set and once for the decorated variant, which is always opaque — and
-    /// only `preserveAlpha` differs between them.
-    private func loadCustomShaders(
-        _ paths: [String],
-        lib: MTLLibrary,
-        vsCustomPost: MTLFunction,
-        copyVertexDesc: MTLVertexDescriptor,
-        pixelFormat: MTLPixelFormat,
-        preserveAlpha: Bool
-    ) -> [CustomShaderPipeline] {
-        var out: [CustomShaderPipeline] = []
-        for path in paths {
-            if let loaded = CustomShaderPipeline.load(
-                device: shared.device,
-                library: lib,
-                vsCustomPost: vsCustomPost,
-                copyVertexDescriptor: copyVertexDesc,
-                sourcePath: (path as NSString).expandingTildeInPath,
-                pixelFormat: pixelFormat,
-                preserveAlpha: preserveAlpha
-            ) {
-                out.append(loaded)
-            }
-        }
-        return out
-    }
-
-    /// The blend every glyph-drawing pipeline uses: straight `over`, leaving
-    /// the destination's own alpha. Three pipelines set it — the main one on
-    /// each of the two creation paths, and the 2-pass glyph pass — and they
-    /// have to agree, because they draw the same vertices into the same
-    /// texture. The other blends in this file are deliberately different modes.
-    private static func applyGlyphOverBlend(_ a: MTLRenderPipelineColorAttachmentDescriptor) {
-        a.isBlendingEnabled = true
-        a.rgbBlendOperation = .add
-        a.sourceRGBBlendFactor = .sourceAlpha
-        a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        a.alphaBlendOperation = .add
-        a.sourceAlphaBlendFactor = .one
-        a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-    }
-
-    /// The main glyph pipeline. Built on both creation paths — through the XPC
-    /// compiler and from the binary archive — and blending is on so glyph
-    /// coverage composites over the background it is drawn onto.
-    private static func makeGlyphPipelineDescriptor(
-        vs: MTLFunction?,
-        fs: MTLFunction?,
-        vertexDescriptor: MTLVertexDescriptor,
-        pixelFormat: MTLPixelFormat
-    ) -> MTLRenderPipelineDescriptor {
-        let d = MTLRenderPipelineDescriptor()
-        d.vertexFunction = vs
-        d.fragmentFunction = fs
-        d.vertexDescriptor = vertexDescriptor
-        d.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = d.colorAttachments[0] { applyGlyphOverBlend(a) }
-        return d
-    }
-
-    /// The copy pipeline (what replaced the blit). Built on both creation
-    /// paths — through the XPC compiler and from the binary archive — and it
-    /// never blends: it overwrites.
-    private static func makeCopyPipelineDescriptor(
-        vsCopy: MTLFunction?,
-        fsCopy: MTLFunction?,
-        vertexDescriptor: MTLVertexDescriptor,
-        pixelFormat: MTLPixelFormat
-    ) -> MTLRenderPipelineDescriptor {
-        let d = MTLRenderPipelineDescriptor()
-        d.vertexFunction = vsCopy
-        d.fragmentFunction = fsCopy
-        d.vertexDescriptor = vertexDescriptor
-        d.colorAttachments[0].pixelFormat = pixelFormat
-        d.colorAttachments[0]?.isBlendingEnabled = false
-        return d
-    }
-
     /// Fan a cell-metric change out to every surface, at most once per change.
     ///
     /// Both `draw(in:)` and the callbacks that change the metrics (guifont,
@@ -2050,8 +1956,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Defer pipeline building to first draw to avoid XPC errors during init
         // when multiple instances start simultaneously
         self.viewForPipeline = view
-        self.pipelineNeedsBuilding = true
-        buildSampler()
+        shared.buildSampler()
 
         // Create background alpha buffer for shader
         backgroundAlphaBuffer = shared.device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
@@ -2076,60 +1981,32 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // (buildScrollOffsetBuffers removed: scroll data now passed via setVertexBytes)
 
-    /// Ensure pipeline is ready for use by external grid views.
-    /// Called before creating ExternalGridView to guarantee shared pipeline availability.
-    /// This builds the pipeline synchronously if not already done.
-    @discardableResult
-    func ensurePipelineReady(view: MTKView) -> Bool {
-        if shared.pipeline != nil && shared.sampler != nil {
-            pipelineRetryDelaySeconds = 0.1
-            pipelineRetryNotBefore = 0
-            return true
-        }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        guard pipelineNeedsBuilding, now >= pipelineRetryNotBefore else { return false }
-
-        pipelineNeedsBuilding = false
-        if shared.sampler == nil { buildSampler() }
-        buildPipeline(view: view)
-        if shared.pipeline != nil && shared.sampler != nil {
-            initializationError = nil
-            pipelineRetryDelaySeconds = 0.1
-            pipelineRetryNotBefore = 0
-            ZonvieCore.appLog("[Renderer] Pipeline built on demand")
-            return true
-        }
-
-        // Shader compiler/XPC failures can be transient. Keep the renderer
-        // retryable, but cap attempts so a permanent failure cannot spin the
-        // draw loop or external-window lifecycle at 10 Hz.
-        let retryDelay = pipelineRetryDelaySeconds
-        pipelineNeedsBuilding = true
-        pipelineRetryNotBefore = now + retryDelay
-        pipelineRetryDelaySeconds = min(pipelineRetryDelaySeconds * 2, 5.0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self, weak view] in
-            guard let self, let view,
-                  self.shared.pipeline == nil,
-                  CFAbsoluteTimeGetCurrent() >= self.pipelineRetryNotBefore else { return }
-            if let terminalView = view as? MetalTerminalView {
-                terminalView.requestRedraw()
-            } else {
-                view.setNeedsDisplay(view.bounds)
-            }
-        }
-        return false
-    }
-
-    func pipelineRetryDelay() -> TimeInterval {
-        max(0.1, pipelineRetryNotBefore - CFAbsoluteTimeGetCurrent())
-    }
-
     // MARK: - Triple Buffer Flush Bracket
 
     /// Called from on_flush_begin callback (core thread).
     /// Deep-copies committed data into write set so partial updates overwrite cleanly.
     /// Picks a buffer set that is not committed and not GPU in-flight.
+    ///
+    /// The flush bracket, stage by stage, against `ExternalGridView`'s. The
+    /// two are not one implementation on purpose: the shared parts
+    /// (`pickFreeBufferSetIndex`, `syncSurfaceWriteSetRowState`, the atlas
+    /// transaction on `shared`) already are, and what is left differs in
+    /// what each surface's root grid IS (see `prepareLayerGridsForWrite`).
+    ///
+    /// | stage | this surface | ExternalGridView |
+    /// |---|---|---|
+    /// | begin | drop while row capacity provisions; `retention.beginFlush`; drop the staged shader cursor; reseed the cursor owner | same drop; `carriedDirtyRows`; font generation; `bracketStagedGrids` |
+    /// | first row write | `prepareMainWriteState`: pick set, sync rows, `prepareLayerGridsForWrite` | `prepareRowWriteState`: pick set, copy each layer grid's row state, `retention.beginFlush`, capture retained rows, sync rows |
+    /// | abort | `endBracketWithoutPublishing`, from all three exits | `cancelFlush` |
+    /// | commit | retained rows published; `pendingCursorOnlyCommit` | font generation verdict; `cursorOnlyCommit`; `layoutContracted` |
+    ///
+    /// `retention.beginFlush` sits at begin here and at the first row write
+    /// there because of where each surface CAPTURES: this surface captures on
+    /// the grid_scroll callback, which can arrive before any row write, so the
+    /// discard has to precede the whole bracket; the external surface captures
+    /// in `prepareRowWriteState`, right before the sync overwrites the rows it
+    /// copies from, and discards just ahead of that. A cursor-only bracket
+    /// therefore discards here and not there.
     enum BeginFlushResult {
         case proceed                   // Normal flush, no special action needed
         case proceedWithInvalidation   // Flush OK, but core glyph cache invalidation needed
@@ -3028,11 +2905,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             // Deferred pipeline initialization: build pipeline on first draw
             // This avoids XPC errors when multiple instances start simultaneously
-            _ = ensurePipelineReady(view: view)
+            _ = shared.ensurePipelineReady(view: view)
 
             // Graceful degradation: if GPU initialization failed, skip rendering
             guard shared.pipeline != nil, shared.sampler != nil else {
-                if let error = initializationError {
+                if let error = shared.initializationError {
                     ZonvieCore.appLog("[draw] Skipping render due to initialization error: \(error)")
                 }
                 (view as? MetalTerminalView)?.notifyDrawIdle()
@@ -3709,12 +3586,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Retained rows of this layer at the current cell height, collected
             // into `retainedIndexScratch`; the draw loop refills it per layer.
             func collectLayerRetainedRows(_ gridId: Int64) -> Int {
-                retainedIndexScratch.removeAll(keepingCapacity: true)
-                for (i, r) in retainedSnapshot.enumerated()
-                where r.gridId == gridId && r.cellHeightPx == Float(cellHi) {
-                    retainedIndexScratch.append(i)
-                }
-                return retainedIndexScratch.count
+                collectSurfaceLayerRetainedRows(
+                    gridId: gridId,
+                    retained: retainedSnapshot,
+                    cellHeightPx: Float(cellHi),
+                    into: &retainedIndexScratch
+                )
             }
 
             // Why a layer has to redraw every row instead of only the rows it
@@ -4429,9 +4306,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     let originY = Int(drawOriginPx.y.rounded(.down))
                     let widthPx = layer.cols * Int(cellWi)
                     let heightPx = rowCount * Int(cellHi)
-                    // A displaced origin is fractional mid-ease; cover the row
-                    // of pixels the flooring above would otherwise clip.
-                    let scissorPadY = drawOriginPx.y == drawOriginPx.y.rounded(.down) ? 0 : 1
+                    let scissorPadY = surfaceLayerScissorPadY(topPx: drawOriginPx.y)
                     if let rect = clampScissor(
                         x: originX, y: originY, width: widthPx, height: heightPx + scissorPadY,
                         targetWidth: backTex.width, targetHeight: backTex.height
@@ -4445,7 +4320,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     // retained; both in its grid-local space. The index list is
                     // reused so a layer costs no allocation per frame.
                     let retainedForLayerCount = collectLayerRetainedRows(layer.gridId)
-                    let retainedBase = rowCount
 
                     // What one row of this layer owes the encoder. Shared by both
                     // arms below so the gated path resolves rows the same way.
@@ -4466,17 +4340,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     }
 
                     func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                        if row >= retainedBase {
-                            let i = row - retainedBase
-                            // Only the full-redraw arm asks for retained rows;
-                            // on the gated arm there are none by construction,
-                            // and a dirty row can name a row the layer lost.
-                            guard i < self.retainedIndexScratch.count else { return nil }
-                            let r = retainedSnapshot[self.retainedIndexScratch[i]]
-                            return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
-                        }
-                        guard row >= 0, row < rowCount else { return nil }
-                        return resolveSurfaceGridRow(set, row: row, cellHeightPx: Float(cellHi))
+                        // Only the full-redraw arm asks for retained rows; on
+                        // the gated arm there are none by construction.
+                        resolveSurfaceLayerRow(
+                            row,
+                            set: set,
+                            rowCount: rowCount,
+                            retained: retainedSnapshot,
+                            retainedIndices: self.retainedIndexScratch,
+                            cellHeightPx: Float(cellHi)
+                        )
                     }
 
                     // Why this layer cannot be drawn from its dirty rows alone:
@@ -5239,546 +5112,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             (view as? MetalTerminalView)?.didDrawFrame()
         }
-    }
-
-    private func buildPipeline(view: MTKView) {
-        guard let lib = shared.device.makeDefaultLibrary() else {
-            initializationError = "Failed to make default library"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-        guard let vs = lib.makeFunction(name: "vs_main") else {
-            initializationError = "Missing vs_main shader function"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-
-        // IMPORTANT: Shaders.metal defines fragment function as "ps_main".
-        guard let fs = lib.makeFunction(name: "ps_main") else {
-            initializationError = "Missing ps_main shader function"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-
-        // Copy shaders for backBuffer -> drawable copy (replaces Blit)
-        guard let vsCopy = lib.makeFunction(name: "vs_copy") else {
-            initializationError = "Missing vs_copy shader function"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-        guard let fsCopy = lib.makeFunction(name: "ps_copy") else {
-            initializationError = "Missing ps_copy shader function"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-
-        guard let vertexDesc = Self.makeVertexDescriptor() else {
-            initializationError = "Failed to create vertex descriptor"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-
-        guard let copyVertexDesc = Self.makeCopyVertexDescriptor() else {
-            initializationError = "Failed to create copy vertex descriptor"
-            ZonvieCore.appLog("ERROR: \(initializationError!)")
-            return
-        }
-
-        let pixelFormat = view.colorPixelFormat
-
-        // Try to load from binary archive first (avoids XPC compiler service)
-        if loadPipelineFromArchive(lib: lib, vs: vs, fs: fs, vsCopy: vsCopy, fsCopy: fsCopy, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat) {
-            ZonvieCore.appLog("[Renderer] Pipeline loaded from binary archive")
-            // Build 2-pass pipelines for blur support (also from archive)
-            if blurEnabled {
-                _ = build2PassPipelinesAndGetDescriptors(lib: lib, vs: vs, vertexDesc: vertexDesc, pixelFormat: pixelFormat)
-            }
-            // Build bloom pipelines for neon glow
-            buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
-            buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
-            buildCopyVertexBuffer()
-            return
-        }
-
-        // Binary archive miss - need to compile pipeline
-        ZonvieCore.appLog("[Renderer] Binary archive miss, compiling pipeline...")
-
-        let desc = Self.makeGlyphPipelineDescriptor(
-            vs: vs, fs: fs, vertexDescriptor: vertexDesc, pixelFormat: pixelFormat
-        )
-
-        // Create main pipeline state (this requires XPC compiler service)
-        do {
-            ZonvieCore.appLog("[Renderer] Creating pipeline state via XPC compiler...")
-            shared.pipeline = try shared.device.makeRenderPipelineState(descriptor: desc)
-            ZonvieCore.appLog("[Renderer] Pipeline created successfully!")
-        } catch {
-            initializationError = "Failed to make pipeline state: \(error)"
-            ZonvieCore.appLog("[Renderer] ERROR: \(initializationError!)")
-            return
-        }
-
-        // Create copy pipeline (replaces Blit)
-        let copyDesc = Self.makeCopyPipelineDescriptor(
-            vsCopy: vsCopy, fsCopy: fsCopy,
-            vertexDescriptor: copyVertexDesc, pixelFormat: pixelFormat
-        )
-
-        do {
-            shared.copyPipeline = try shared.device.makeRenderPipelineState(descriptor: copyDesc)
-            ZonvieCore.appLog("[Renderer] Copy pipeline created successfully!")
-        } catch {
-            ZonvieCore.appLog("[Renderer] ERROR: Failed to make copy pipeline: \(error)")
-            // Non-fatal: we can still render, just might have issues
-        }
-
-        buildCopyVertexBuffer()
-
-        // Build 2-pass pipelines for blur support
-        var bgDesc: MTLRenderPipelineDescriptor? = nil
-        var glyphDesc: MTLRenderPipelineDescriptor? = nil
-        if blurEnabled {
-            (bgDesc, glyphDesc) = build2PassPipelinesAndGetDescriptors(lib: lib, vs: vs, vertexDesc: vertexDesc, pixelFormat: pixelFormat)
-        }
-
-        // Build bloom pipelines for neon glow (always, glow check is at draw time)
-        buildBloomPipelines(lib: lib, vs: vs, vertexDesc: vertexDesc, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
-        buildCustomShaderPipelines(lib: lib, copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat)
-
-        // Cache all pipelines to binary archive for future use
-        cacheToArchive(mainDesc: desc, bgDesc: bgDesc, glyphDesc: glyphDesc, copyDesc: copyDesc)
-    }
-
-    private func build2PassPipelinesAndGetDescriptors(lib: MTLLibrary, vs: MTLFunction, vertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) -> (MTLRenderPipelineDescriptor?, MTLRenderPipelineDescriptor?) {
-        guard let fsBg = lib.makeFunction(name: "ps_background") else {
-            ZonvieCore.appLog("ERROR: Missing ps_background shader function")
-            return (nil, nil)
-        }
-        guard let fsGlyph = lib.makeFunction(name: "ps_glyph") else {
-            ZonvieCore.appLog("ERROR: Missing ps_glyph shader function")
-            return (nil, nil)
-        }
-
-        let bgDesc = MTLRenderPipelineDescriptor()
-        bgDesc.vertexFunction = vs
-        bgDesc.fragmentFunction = fsBg
-        bgDesc.vertexDescriptor = vertexDesc
-        bgDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = bgDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
-            a.sourceRGBBlendFactor = .one
-            a.destinationRGBBlendFactor = .zero
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .zero
-        }
-
-        let glyphDesc = MTLRenderPipelineDescriptor()
-        glyphDesc.vertexFunction = vs
-        glyphDesc.fragmentFunction = fsGlyph
-        glyphDesc.vertexDescriptor = vertexDesc
-        glyphDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = glyphDesc.colorAttachments[0] {
-            Self.applyGlyphOverBlend(a)
-        }
-
-        do {
-            shared.backgroundPipeline = try shared.device.makeRenderPipelineState(descriptor: bgDesc)
-            shared.glyphPipeline = try shared.device.makeRenderPipelineState(descriptor: glyphDesc)
-            ZonvieCore.appLog("[Renderer] 2-pass pipelines created for blur support")
-        } catch {
-            ZonvieCore.appLog("[Renderer] ERROR: Failed to make 2-pass pipeline states: \(error)")
-            return (nil, nil)
-        }
-
-        // Unified single-pass pipeline that supersedes 2-pass when available.
-        // Pipeline blend disabled — ps_unified_blur reads tile via
-        // raster_order_group and writes the final composited pixel directly.
-        if let fsUnified = lib.makeFunction(name: "ps_unified_blur") {
-            let uDesc = MTLRenderPipelineDescriptor()
-            uDesc.vertexFunction = vs
-            uDesc.fragmentFunction = fsUnified
-            uDesc.vertexDescriptor = vertexDesc
-            uDesc.colorAttachments[0].pixelFormat = pixelFormat
-            if let a = uDesc.colorAttachments[0] {
-                a.isBlendingEnabled = false  // shader does manual alpha blend via tile read
-            }
-            do {
-                shared.unifiedBlurPipeline = try shared.device.makeRenderPipelineState(descriptor: uDesc)
-                ZonvieCore.appLog("[Renderer] unified blur pipeline created (1-pass programmable blending)")
-            } catch {
-                ZonvieCore.appLog("[Renderer] WARNING: unified blur pipeline build failed; 2-pass fallback in use: \(error)")
-                shared.unifiedBlurPipeline = nil
-            }
-        } else {
-            ZonvieCore.appLog("[Renderer] WARNING: ps_unified_blur shader not found; 2-pass fallback in use")
-        }
-
-        return (bgDesc, glyphDesc)
-    }
-
-    /// Build bloom pipelines for post-process neon glow.
-    /// Called once during pipeline initialization and also from archive path.
-    private func buildBloomPipelines(lib: MTLLibrary, vs: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) {
-        guard let fsExtract = lib.makeFunction(name: "ps_glow_extract") else {
-            ZonvieCore.appLog("WARNING: Missing ps_glow_extract shader (bloom disabled)")
-            return
-        }
-        guard let fsOcclude = lib.makeFunction(name: "ps_glow_occlude") else {
-            ZonvieCore.appLog("WARNING: Missing ps_glow_occlude shader (bloom disabled)")
-            return
-        }
-        guard let fsKawaseDown = lib.makeFunction(name: "ps_kawase_down") else {
-            ZonvieCore.appLog("WARNING: Missing ps_kawase_down shader (bloom disabled)")
-            return
-        }
-        guard let fsKawaseUp = lib.makeFunction(name: "ps_kawase_up") else {
-            ZonvieCore.appLog("WARNING: Missing ps_kawase_up shader (bloom disabled)")
-            return
-        }
-        guard let fsComposite = lib.makeFunction(name: "ps_glow_composite") else {
-            ZonvieCore.appLog("WARNING: Missing ps_glow_composite shader (bloom disabled)")
-            return
-        }
-        guard let vsCopy = lib.makeFunction(name: "vs_copy") else {
-            ZonvieCore.appLog("WARNING: Missing vs_copy shader for bloom (bloom disabled)")
-            return
-        }
-
-        // Glow extract: same vertex layout as main, sourceAlpha blend, render to 1/4 res
-        let extractDesc = MTLRenderPipelineDescriptor()
-        extractDesc.vertexFunction = vs
-        extractDesc.fragmentFunction = fsExtract
-        extractDesc.vertexDescriptor = vertexDesc
-        extractDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = extractDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
-            a.sourceRGBBlendFactor = .one
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
-
-        // Glow occlude: same vertex layout as extract, and the destination is
-        // scaled by the background's alpha instead of adding to it.
-        let occludeDesc = MTLRenderPipelineDescriptor()
-        occludeDesc.vertexFunction = vs
-        occludeDesc.fragmentFunction = fsOcclude
-        occludeDesc.vertexDescriptor = vertexDesc
-        occludeDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = occludeDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
-            a.sourceRGBBlendFactor = .zero
-            a.destinationRGBBlendFactor = .oneMinusSourceAlpha
-            a.sourceAlphaBlendFactor = .zero
-            a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
-        }
-
-        // Kawase down/up: fullscreen quad, no blending
-        let kawaseDownDesc = MTLRenderPipelineDescriptor()
-        kawaseDownDesc.vertexFunction = vsCopy
-        kawaseDownDesc.fragmentFunction = fsKawaseDown
-        kawaseDownDesc.vertexDescriptor = copyVertexDesc
-        kawaseDownDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = kawaseDownDesc.colorAttachments[0] {
-            a.isBlendingEnabled = false
-        }
-
-        let kawaseUpDesc = MTLRenderPipelineDescriptor()
-        kawaseUpDesc.vertexFunction = vsCopy
-        kawaseUpDesc.fragmentFunction = fsKawaseUp
-        kawaseUpDesc.vertexDescriptor = copyVertexDesc
-        kawaseUpDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = kawaseUpDesc.colorAttachments[0] {
-            a.isBlendingEnabled = false
-        }
-
-        // Composite: additive blend (ONE, ONE)
-        let compositeDesc = MTLRenderPipelineDescriptor()
-        compositeDesc.vertexFunction = vsCopy
-        compositeDesc.fragmentFunction = fsComposite
-        compositeDesc.vertexDescriptor = copyVertexDesc
-        compositeDesc.colorAttachments[0].pixelFormat = pixelFormat
-        if let a = compositeDesc.colorAttachments[0] {
-            a.isBlendingEnabled = true
-            a.rgbBlendOperation = .add
-            a.alphaBlendOperation = .add
-            a.sourceRGBBlendFactor = .one
-            a.destinationRGBBlendFactor = .one
-            a.sourceAlphaBlendFactor = .one
-            a.destinationAlphaBlendFactor = .one
-        }
-
-        do {
-            shared.glowExtractPipeline = try shared.device.makeRenderPipelineState(descriptor: extractDesc)
-            shared.glowOccludePipeline = try shared.device.makeRenderPipelineState(descriptor: occludeDesc)
-            shared.kawaseDownPipeline = try shared.device.makeRenderPipelineState(descriptor: kawaseDownDesc)
-            shared.kawaseUpPipeline = try shared.device.makeRenderPipelineState(descriptor: kawaseUpDesc)
-            shared.glowCompositePipeline = try shared.device.makeRenderPipelineState(descriptor: compositeDesc)
-            ZonvieCore.appLog("[Renderer] Bloom pipelines created successfully")
-        } catch {
-            ZonvieCore.appLog("[Renderer] ERROR: Failed to create bloom pipelines: \(error)")
-        }
-
-        // Bilinear sampler for blur passes
-        if shared.bilinearSampler == nil {
-            let samplerDesc = MTLSamplerDescriptor()
-            samplerDesc.minFilter = .linear
-            samplerDesc.magFilter = .linear
-            samplerDesc.mipFilter = .notMipmapped
-            samplerDesc.sAddressMode = .clampToEdge
-            samplerDesc.tAddressMode = .clampToEdge
-            shared.bilinearSampler = shared.device.makeSamplerState(descriptor: samplerDesc)
-        }
-
-        // Intensity buffer is now managed by SurfaceGlowTextures.ensureIntensityBuffer()
-    }
-
-    /// Ghostty 1.1+ cursor uniform update. rect is (x, y, w, h) in
-    /// drawable pixels within the shader "screen" universe (main
-    /// window's drawable). color is straight RGBA in [0, 1]. No-op
-    /// when incoming state matches the current state, so shaders keep
-    /// seeing the last real change's iTimeCursorChange.
-    /// Load user-supplied custom post-process shaders listed in config.toml's
-    /// `[shaders].paths`, cross-compile them to MSL, and create one pipeline
-    /// state per entry. Called once alongside the bloom-pipeline construction.
-    private func buildCustomShaderPipelines(
-        lib: MTLLibrary,
-        copyVertexDesc: MTLVertexDescriptor,
-        pixelFormat: MTLPixelFormat
-    ) {
-        let config = ZonvieConfig.shared.shaders
-        shared.customShaderPostProcess = config.postProcess
-        shared.customShaderPipelines.removeAll()
-        shared.customShaderPipelinesDecorated.removeAll()
-        shared.anyCustomShaderNeedsAnimation = false
-        if !config.enabled || config.paths.isEmpty {
-            return
-        }
-        guard let vsCustomPost = lib.makeFunction(name: "vs_custom_post") else {
-            ZonvieCore.appLog("[Renderer] WARNING: Missing vs_custom_post shader (custom shaders disabled)")
-            return
-        }
-        for loaded in loadCustomShaders(
-            config.paths, lib: lib, vsCustomPost: vsCustomPost,
-            copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat,
-            preserveAlpha: config.preserveAlpha
-        ) {
-            shared.customShaderPipelines.append(loaded)
-            if loaded.needsAnimation { shared.anyCustomShaderNeedsAnimation = true }
-        }
-        // Decorated variant: always opaque (preserve_alpha OFF). Only a
-        // separate compile is needed when the main set is NOT already opaque;
-        // otherwise alias it to avoid a redundant compile.
-        if config.preserveAlpha {
-            shared.customShaderPipelinesDecorated = loadCustomShaders(
-                config.paths, lib: lib, vsCustomPost: vsCustomPost,
-                copyVertexDesc: copyVertexDesc, pixelFormat: pixelFormat,
-                preserveAlpha: false
-            )
-        } else {
-            shared.customShaderPipelinesDecorated = shared.customShaderPipelines
-        }
-        ZonvieCore.appLog("[Renderer] Loaded \(shared.customShaderPipelines.count)/\(config.paths.count) custom shaders (decorated=\(shared.customShaderPipelinesDecorated.count)), anyNeedsAnimation=\(shared.anyCustomShaderNeedsAnimation)")
-    }
-
-    private func loadPipelineFromArchive(lib: MTLLibrary, vs: MTLFunction, fs: MTLFunction, vsCopy: MTLFunction, fsCopy: MTLFunction, vertexDesc: MTLVertexDescriptor, copyVertexDesc: MTLVertexDescriptor, pixelFormat: MTLPixelFormat) -> Bool {
-        let archivePath = Self.binaryArchivePath
-        ZonvieCore.appLog("[Renderer] loadPipelineFromArchive: checking \(archivePath.path)")
-
-        guard FileManager.default.fileExists(atPath: archivePath.path) else {
-            ZonvieCore.appLog("[Renderer] loadPipelineFromArchive: archive NOT FOUND")
-            return false
-        }
-        ZonvieCore.appLog("[Renderer] loadPipelineFromArchive: archive EXISTS, loading...")
-
-        let archiveDesc = MTLBinaryArchiveDescriptor()
-        archiveDesc.url = archivePath
-
-        do {
-            binaryArchive = try shared.device.makeBinaryArchive(descriptor: archiveDesc)
-            ZonvieCore.appLog("[Renderer] Loaded binary archive from \(archivePath.path)")
-        } catch {
-            ZonvieCore.appLog("[Renderer] Failed to load binary archive: \(error)")
-            // Delete corrupted archive
-            try? FileManager.default.removeItem(at: archivePath)
-            return false
-        }
-
-        guard let archive = binaryArchive else { return false }
-
-        // Create main pipeline descriptor
-        let desc = Self.makeGlyphPipelineDescriptor(
-            vs: vs, fs: fs, vertexDescriptor: vertexDesc, pixelFormat: pixelFormat
-        )
-
-        let copyDesc = Self.makeCopyPipelineDescriptor(
-            vsCopy: vsCopy, fsCopy: fsCopy,
-            vertexDescriptor: copyVertexDesc, pixelFormat: pixelFormat
-        )
-
-        // Try to create pipelines from archive
-        desc.binaryArchives = [archive]
-        copyDesc.binaryArchives = [archive]
-
-        do {
-            shared.pipeline = try shared.device.makeRenderPipelineState(descriptor: desc)
-            shared.copyPipeline = try shared.device.makeRenderPipelineState(descriptor: copyDesc)
-            ZonvieCore.appLog("[Renderer] All pipelines loaded from archive successfully")
-            return true
-        } catch {
-            ZonvieCore.appLog("[Renderer] Failed to create pipeline from archive: \(error)")
-            // Archive might be stale, delete it
-            try? FileManager.default.removeItem(at: archivePath)
-            binaryArchive = nil
-            return false
-        }
-    }
-
-    /// Cache successfully created pipelines to binary archive for future use
-    /// This avoids XPC compiler service calls on subsequent launches
-    private func cacheToArchive(mainDesc: MTLRenderPipelineDescriptor?, bgDesc: MTLRenderPipelineDescriptor?, glyphDesc: MTLRenderPipelineDescriptor?, copyDesc: MTLRenderPipelineDescriptor?) {
-        let archivePath = Self.binaryArchivePath
-        ZonvieCore.appLog("[Renderer] cacheToArchive: starting, path=\(archivePath.path)")
-
-        // Create new empty archive
-        let archiveDesc = MTLBinaryArchiveDescriptor()
-        do {
-            let archive = try shared.device.makeBinaryArchive(descriptor: archiveDesc)
-            ZonvieCore.appLog("[Renderer] cacheToArchive: created empty archive")
-
-            // Add successfully compiled pipeline descriptors
-            if let desc = mainDesc {
-                try archive.addRenderPipelineFunctions(descriptor: desc)
-                ZonvieCore.appLog("[Renderer] cacheToArchive: added main pipeline")
-            }
-            if let desc = bgDesc {
-                try archive.addRenderPipelineFunctions(descriptor: desc)
-                ZonvieCore.appLog("[Renderer] cacheToArchive: added background pipeline")
-            }
-            if let desc = glyphDesc {
-                try archive.addRenderPipelineFunctions(descriptor: desc)
-                ZonvieCore.appLog("[Renderer] cacheToArchive: added glyph pipeline")
-            }
-            if let desc = copyDesc {
-                try archive.addRenderPipelineFunctions(descriptor: desc)
-                ZonvieCore.appLog("[Renderer] cacheToArchive: added copy pipeline")
-            }
-
-            // Serialize to disk
-            try archive.serialize(to: archivePath)
-            ZonvieCore.appLog("[Renderer] cacheToArchive: SUCCESS - saved to \(archivePath.path)")
-        } catch {
-            ZonvieCore.appLog("[Renderer] cacheToArchive: FAILED - \(error)")
-        }
-    }
-
-    private static func makeVertexDescriptor() -> MTLVertexDescriptor? {
-        let vd = MTLVertexDescriptor()
-        let stride = MemoryLayout<Vertex>.stride
-
-        guard
-            let offPos = MemoryLayout<Vertex>.offset(of: \.position),
-            let offUV  = MemoryLayout<Vertex>.offset(of: \.texCoord),
-            let offCol = MemoryLayout<Vertex>.offset(of: \.color),
-            let offGridId = MemoryLayout<Vertex>.offset(of: \.grid_id),
-            let offDecoFlags = MemoryLayout<Vertex>.offset(of: \.deco_flags),
-            let offDecoPhase = MemoryLayout<Vertex>.offset(of: \.deco_phase)
-        else {
-            ZonvieCore.appLog("[Renderer] Vertex layout mismatch. Expected fields: position/texCoord/color/grid_id/deco_flags/deco_phase")
-            return nil
-        }
-
-        vd.attributes[0].format = .float2
-        vd.attributes[0].offset = offPos
-        vd.attributes[0].bufferIndex = 0
-
-        vd.attributes[1].format = .float2
-        vd.attributes[1].offset = offUV
-        vd.attributes[1].bufferIndex = 0
-
-        vd.attributes[2].format = .float4
-        vd.attributes[2].offset = offCol
-        vd.attributes[2].bufferIndex = 0
-
-        // grid_id: Int64 in struct, but shader uses lower 32 bits -> use .int
-        vd.attributes[3].format = .int
-        vd.attributes[3].offset = offGridId
-        vd.attributes[3].bufferIndex = 0
-
-        // deco_flags: UInt32 -> .uint
-        vd.attributes[4].format = .uint
-        vd.attributes[4].offset = offDecoFlags
-        vd.attributes[4].bufferIndex = 0
-
-        // deco_phase: Float -> .float
-        vd.attributes[5].format = .float
-        vd.attributes[5].offset = offDecoPhase
-        vd.attributes[5].bufferIndex = 0
-
-        vd.layouts[0].stride = stride
-        vd.layouts[0].stepFunction = .perVertex
-        vd.layouts[0].stepRate = 1
-
-        return vd
-    }
-
-    /// Vertex descriptor for copy pipeline (simple position + texcoord)
-    private static func makeCopyVertexDescriptor() -> MTLVertexDescriptor? {
-        let vd = MTLVertexDescriptor()
-        // CopyVertex: float2 position + float2 texCoord = 16 bytes
-        let stride = MemoryLayout<SIMD2<Float>>.stride * 2  // 16 bytes
-
-        // position: float2 at offset 0
-        vd.attributes[0].format = .float2
-        vd.attributes[0].offset = 0
-        vd.attributes[0].bufferIndex = 0
-
-        // texCoord: float2 at offset 8
-        vd.attributes[1].format = .float2
-        vd.attributes[1].offset = MemoryLayout<SIMD2<Float>>.stride
-        vd.attributes[1].bufferIndex = 0
-
-        vd.layouts[0].stride = stride
-        vd.layouts[0].stepFunction = .perVertex
-        vd.layouts[0].stepRate = 1
-
-        return vd
-    }
-
-    private func buildSampler() {
-        let s = MTLSamplerDescriptor()
-        s.minFilter = .nearest
-        s.magFilter = .nearest
-        s.mipFilter = .notMipmapped
-        s.sAddressMode = .clampToEdge
-        s.tAddressMode = .clampToEdge
-        shared.sampler = shared.device.makeSamplerState(descriptor: s)
-    }
-
-    /// Build vertex buffer for fullscreen quad copy (replaces Blit)
-    /// Quad covers NDC space (-1,-1) to (1,1) with UV (0,0) to (1,1)
-    private func buildCopyVertexBuffer() {
-        // Fullscreen quad: 2 triangles, 6 vertices
-        // Each vertex: position (float2) + texCoord (float2) = 16 bytes
-        // Note: UV.y is flipped (1-v) because Metal texture origin is top-left
-        var vertices: [Float] = [
-            // Triangle 1
-            -1.0, -1.0,  0.0, 1.0,  // bottom-left
-             1.0, -1.0,  1.0, 1.0,  // bottom-right
-             1.0,  1.0,  1.0, 0.0,  // top-right
-            // Triangle 2
-            -1.0, -1.0,  0.0, 1.0,  // bottom-left
-             1.0,  1.0,  1.0, 0.0,  // top-right
-            -1.0,  1.0,  0.0, 0.0,  // top-left
-        ]
-        let size = vertices.count * MemoryLayout<Float>.stride
-        shared.copyVertexBuffer = shared.device.makeBuffer(bytes: &vertices, length: size, options: .storageModeShared)
     }
 
     // safeNeededBytes / growCapacity are provided by MetalTypes.swift as
