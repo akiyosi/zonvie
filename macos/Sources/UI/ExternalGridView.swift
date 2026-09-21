@@ -1114,6 +1114,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// it spends no vertex generation first. The ledger only arms on a real
     /// allocation failure (b83ff29, 4b1ad75), so this is a rare, transient
     /// state, not a per-flush cost.
+    ///
+    /// The stage-by-stage table against `GridSurfaceRenderer.beginFlush` is
+    /// on that declaration, including why `retention.beginFlush` runs from
+    /// `prepareRowWriteState` here and from `beginFlush` there.
     @discardableResult
     func beginFlush() -> Bool {
         lock.lock()
@@ -3329,11 +3333,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         )
                     }
                     let ratio: Float = glow ? 0.5 : 1
-                    // A displaced origin is fractional mid-ease; floor it and
-                    // cover the row of pixels that flooring would otherwise
-                    // clip, as the main renderer's layer pass does.
                     let scissorTopPx = (Float(vpOriginY) + origin.y) * ratio
-                    let scissorPadY = scissorTopPx == scissorTopPx.rounded(.down) ? 0 : 1
+                    let scissorPadY = surfaceLayerScissorPadY(topPx: scissorTopPx)
                     guard let scissor = clampScissor(
                         x: Int(((Float(vpOriginX) + origin.x) * ratio).rounded(.down)),
                         y: Int(scissorTopPx.rounded(.down)),
@@ -3346,25 +3347,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     bindLayerTransform(encoder: encoder, LayerTransform(originPx: origin, extentPx: extent))
                     bindSingleSurfaceScrollOffset(encoder: encoder, offset: layerOffset)
                     // This layer's rows, then the rows its own smooth scroll
-                    // retained, both in its grid-local space. The index list is
-                    // reused so a layer costs no allocation per frame. Same
-                    // shape as the main renderer's layer pass.
-                    retainedIndexScratch.removeAll(keepingCapacity: true)
-                    for (i, r) in retainedSnapshot.enumerated()
-                    where r.gridId == layer.gridId && r.cellHeightPx == Float(cellHi) {
-                        retainedIndexScratch.append(i)
-                    }
-                    let retainedForLayerCount = retainedIndexScratch.count
-                    let retainedBase = rows
+                    // retained, both in its grid-local space; the same
+                    // resolution the main renderer's layer pass uses.
+                    let retainedForLayerCount = collectSurfaceLayerRetainedRows(
+                        gridId: layer.gridId,
+                        retained: retainedSnapshot,
+                        cellHeightPx: Float(cellHi),
+                        into: &retainedIndexScratch
+                    )
                     let scratch = retainedIndexScratch
                     func resolveLayerRow(_ row: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                        if row >= retainedBase {
-                            let i = row - retainedBase
-                            guard i < scratch.count else { return nil }
-                            let r = retainedSnapshot[scratch[i]]
-                            return (r.count, r.buffer, Float(r.targetRow - r.sourceRow) * Float(cellHi))
-                        }
-                        return resolveSurfaceGridRow(set, row: row, cellHeightPx: Float(cellHi))
+                        resolveSurfaceLayerRow(
+                            row,
+                            set: set,
+                            rowCount: rows,
+                            retained: retainedSnapshot,
+                            retainedIndices: scratch,
+                            cellHeightPx: Float(cellHi)
+                        )
                     }
                     if partialHostedContents && !glow {
                         // Recompose each dirty surface band back-to-front.
