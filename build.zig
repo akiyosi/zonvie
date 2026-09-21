@@ -483,6 +483,17 @@ pub fn build(b: *std.Build) !void {
 
     // Message routing tests. msg_route.zig is std-only, so it is exposed as a
     // standalone module rather than pulled in through zonvie_core.
+    // Which grid a pointer names. The rule both frontends were applying
+    // separately, hoisted here; pure and inline-tested, so it runs on the
+    // build host rather than needing a Windows one.
+    const pointer_target_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/pointer_target.zig"),
+    });
+    const pointer_target_tests = b.addTest(.{ .root_module = pointer_target_test_mod });
+    test_step.dependOn(&b.addRunArtifact(pointer_target_tests).step);
+
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -550,19 +561,6 @@ pub fn build(b: *std.Build) !void {
         .root_module = windows_render_helpers_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
-
-    // Which grid a wheel event names, for either Windows surface. Reads only
-    // layer geometry and grid line counts, so it runs on the build host; the
-    // rules it pins are the ones the main window's branch did not have.
-    const windows_wheel_target_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("windows/wheel_target_test.zig"),
-    });
-    const windows_wheel_target_tests = b.addTest(.{
-        .root_module = windows_wheel_target_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(windows_wheel_target_tests).step);
 
     // Platform-independent placement tests for the ext_messages floats.
     const windows_msg_float_layout_test_mod = b.createModule(.{
