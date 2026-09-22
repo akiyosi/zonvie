@@ -567,6 +567,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// stays in `scrollOffsetData`: that is the one the surface-wide passes
     /// bind. Published under `lock`, like `scrollOffsetData`.
     private var hostedScrollOffsetData: [GridSurfaceRenderer.ScrollOffset] = []
+    /// The viewport height `scrollOffsetData` and `hostedScrollOffsetData`
+    /// were converted to NDC against. Written under `lock` with them.
+    private var scrollOffsetViewportHeight: Float = 0
     /// Built outside `lock` (resolving an offset takes the main view's own
     /// locks) and copied in, so neither lock is ever held while taking the
     /// other. Persistent, so a scrolled frame does no heap work for it.
@@ -660,6 +663,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Last cursor rect this surface handed its shader, so the log fires on
     /// change only. Per-surface: each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
+    private var lastLoggedCursorFrame: (Int, Float, Float) = (-1, 0, 0)
     /// Ping-pong render targets for multi-pass custom shader chains.
     /// Allocated lazily inside draw() when pipelines.count > 1.
     private let customShaderPong = SurfacePingPongTextures()
@@ -1549,13 +1553,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     private func cursorScrollOffsetPxForShader(
         ownerGridId: Int64,
         offset: GridSurfaceRenderer.ScrollOffset?,
-        viewportHeightPx: Float
+        viewportHeightPx: Float,
+        raw: SurfaceShaderCursor.Raw
     ) -> Float? {
         // The cursor rect is shared with the main surface and every other
         // external window. Only displace it when the cursor is on a grid THIS
         // surface draws — its own, or one it hosts as a layer; otherwise say
-        // nothing and let the owner's value stand.
-        guard shared.shaderCursor.belongs(toGrid: ownerGridId) else { return nil }
+        // nothing and let the owner's value stand. Asked of the frame's own
+        // snapshot of the rect, not the live value.
+        guard raw.gridId == ownerGridId else { return nil }
         // `offset` is the owner grid's EFFECTIVE displacement, resolved by the
         // caller the same way drawHostedLayers resolves a layer's: the grid's
         // own offset when it scrolls in its own right, the root's when it only
@@ -2507,6 +2513,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             let lastKnownCursorRowSnapshot: Int
             let cursorBlinkStateSnapshot: Bool
             let committedFontIsCurrent: Bool
+            // The shader cursor's measured rect as of this commit. Taken under
+            // the same hold as the committed set, because commitFlush publishes
+            // it under that lock: the uniforms closure below evaluates THIS
+            // value, not whatever a commit landing later in the frame put
+            // there — which was a rect a row step ahead of the rows drawn.
+            let cursorShaderRawSnapshot: SurfaceShaderCursor.Raw
+            let scrollOffsetSnapshot: GridSurfaceRenderer.ScrollOffset?
+            let hostedScrollOffsetSnapshot: [GridSurfaceRenderer.ScrollOffset]
+            let cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset?
+            let cursorShaderOffsetPx: Float?
             // Latched with the committed set, not read later: commitFlush
             // publishes the retention inside this same lock, so taking it
             // afterwards can pair set N's vertices with set N+1's retained
@@ -2535,10 +2551,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // with set N+1's offset correction — a one-row jump mid-gesture. It
             // also ran `retention.clearPublished()` after the band had been
             // snapshotted, so a settled root still drew its stale retained rows.
-            mainTerminalView?.serviceSharedScrollStateForExternalView()
-            let hasScrollOffset = updateScrollShaderOffset()
-
-            lock.lock()
+            //
+            // Settled against THIS surface's commit, the way the main renderer
+            // settles against its own; shared with it. Returns with `lock` held.
+            var hasScrollOffset = false
+            settleSurfaceAgainstOwnCommit(
+                lock: lock,
+                commitRevision: { self.commitRevision },
+                service: {
+                    self.mainTerminalView?.serviceSharedScrollStateForExternalView()
+                    hasScrollOffset = self.updateScrollShaderOffset()
+                }
+            )
             if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
                 let terminal = rowCapacity.hardFailure
                 lock.unlock()
@@ -2577,6 +2601,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             cursorDirtySnapshot = cursorDirty
             cursorDirty = false
             lastKnownCursorRowSnapshot = lastKnownCursorRow
+            cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
             cursorBlinkStateSnapshot = blink.visibleLocked
             rootLayerOriginSnapshot = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
             layoutDamageSnapshot = pendingLayoutDamage
@@ -2614,6 +2639,30 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     layerSnapshot.append(SurfaceLayerFrame(layer: layer, set: sets[csi], state: nil))
                 }
             }
+            // The displacements this frame draws with, latched with the rows
+            // and the cursor rect they belong to. Only this thread writes
+            // them, so reading them here rather than at the passes below
+            // changes nothing about their value — only that the shader cursor
+            // can be evaluated against them now, under the same hold, which
+            // is the point the main renderer evaluates at too.
+            scrollOffsetSnapshot = scrollOffsetLatch.isActive ? scrollOffsetData : nil
+            hostedScrollOffsetSnapshot = hostedScrollOffsetData  // Value-type copy
+            // What displaces the cursor's own grid, resolved exactly as
+            // drawHostedLayers resolves a layer's: its own offset when it is
+            // scrolling in its own right, the root's when it merely follows,
+            // and nothing at all when it stands still. The body and the cursor
+            // have to answer the same offset or they are drawn a row apart.
+            cursorOwnerOffset = cursorOwnerSnapshot == gridId
+                ? scrollOffsetSnapshot
+                : (surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
+                    ?? (cursorLayerFollowsScrollSnapshot ? scrollOffsetSnapshot : nil))
+            cursorShaderOffsetPx = cursorScrollOffsetPxForShader(
+                ownerGridId: cursorOwnerSnapshot,
+                offset: cursorOwnerOffset,
+                viewportHeightPx: scrollOffsetViewportHeight,
+                raw: cursorShaderRawSnapshot
+            )
+            shared.shaderCursor.evaluate(scrollOffsetPx: cursorShaderOffsetPx, raw: cursorShaderRawSnapshot)
             lock.unlock()
             defer {
                 submittedDirtyRows.removeAll(keepingCapacity: true)
@@ -3266,27 +3315,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 clearAlpha: surfaceClearAlpha
             )
 
-            // Resolved before the surface pass so the cursor and glow passes
-            // below can use them even on a frame that encodes no surface pass.
-            // Bind scroll offset data via shared helper (no GPU/CPU race)
-            let scrollOffsetSnapshot: GridSurfaceRenderer.ScrollOffset?
-            let hostedScrollOffsetSnapshot: [GridSurfaceRenderer.ScrollOffset]
-            do {
-                lock.lock()
-                scrollOffsetSnapshot = scrollOffsetLatch.isActive ? scrollOffsetData : nil
-                hostedScrollOffsetSnapshot = hostedScrollOffsetData  // Value-type copy
-                lock.unlock()
-            }
-
-            // What displaces the cursor's own grid, resolved exactly as
-            // drawHostedLayers resolves a layer's: its own offset when it is
-            // scrolling in its own right, the root's when it merely follows,
-            // and nothing at all when it stands still. The body and the cursor
-            // have to answer the same offset or they are drawn a row apart.
-            let cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset? = cursorOwnerSnapshot == gridId
-                ? scrollOffsetSnapshot
-                : (surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
-                    ?? (cursorLayerFollowsScrollSnapshot ? scrollOffsetSnapshot : nil))
+            // `scrollOffsetSnapshot`, `hostedScrollOffsetSnapshot` and
+            // `cursorOwnerOffset` were latched with the committed snapshot
+            // above, so the cursor and glow passes below can use them even on
+            // a frame that encodes no surface pass.
             var cursorDrawOrigin = cursorLayerOriginSnapshot
             // A layer with an offset of its own keeps its origin: the shader
             // displaces its rows inside it. Only a follower is moved bodily.
@@ -3876,18 +3908,21 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         mainView: self.mainTerminalView,
                         selfView: self
                     )
-                    // Fold in the displacement THIS frame draws with before
-                    // reading the uniforms: the shared value follows the main
-                    // view's draw cadence, and this window routinely draws a
-                    // frame ahead of it — which put the cursor shader a frame
-                    // of finger travel away from the cursor.
-                    shared.shaderCursor.evaluate(
-                        scrollOffsetPx: cursorScrollOffsetPxForShader(
-                            ownerGridId: cursorOwnerSnapshot,
-                            offset: cursorOwnerOffset,
-                            viewportHeightPx: viewportMetrics.fragmentHeight
-                        )
-                    )
+                    // The cursor rect was evaluated with the committed snapshot
+                    // this frame draws, under the same hold; the uniforms read it.
+                    // The rect the shader gets beside the row and displacement
+                    // the body is drawn with THIS frame. Their difference is a
+                    // constant while the two describe the same commit; a rect
+                    // evaluated against a newer flush's cursor shows up as one
+                    // row step in it. Emitted on change only.
+                    if ZonvieCore.appLogEnabled, let offPx = cursorShaderOffsetPx {
+                        let y = self.shared.shaderCursor.snapshot().current.1
+                        let frame = (lastKnownCursorRowSnapshot, offPx, y)
+                        if frame != self.lastLoggedCursorFrame {
+                            self.lastLoggedCursorFrame = frame
+                            ZonvieCore.appLog("[ext_shader_cursor_frame] gridId=\(self.gridId) row=\(frame.0) offPx=\(offPx) y=\(y)")
+                        }
+                    }
                     // This surface's own scale, because the rect the log line
                     // carries is in ITS drawable pixels. Reading it off the
                     // main renderer, which is what calling through it did,
@@ -4046,6 +4081,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         let cellHi = max(1, UInt32(cellHeightPx.rounded(.up)))
         let viewportHeight = Float(rowsForHeight) * Float(cellHi)
         guard viewportHeight > 0 else { return false }
+        // The height every NDC below is built against, kept beside them so
+        // draw's snapshot can undo the conversion exactly rather than
+        // recompute the height on a cell size the core may have moved since.
+        lock.lock()
+        scrollOffsetViewportHeight = viewportHeight
+        lock.unlock()
 
         // The band a wheel event opens is as wide as the rows it moves, so
         // this window's retention has to keep that many. The main view sets

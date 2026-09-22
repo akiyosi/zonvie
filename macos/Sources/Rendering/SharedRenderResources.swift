@@ -678,13 +678,30 @@ final class SurfaceShaderCursor {
     ///   frame, or nil when the caller does not own that grid's cursor.
     /// Returns true when the endpoints moved, so the caller's draw gate can
     /// treat it as work: the rect is a whole-surface fragment input.
+    /// The measured rect as one value, for a surface that must evaluate the
+    /// cursor the frame it snapshotted draws. A surface takes it under its own
+    /// lock beside its committed set, so a commit landing later in the frame
+    /// (which publishes a newer rect here) cannot reach that frame's uniforms.
+    struct Raw {
+        var rect: Rect
+        var color: Color
+        var gridId: Int64
+    }
+
+    func rawSnapshot() -> Raw {
+        lock.lock()
+        defer { lock.unlock() }
+        return Raw(rect: rawRect, color: rawColor, gridId: gridId)
+    }
+
     @discardableResult
-    func evaluate(scrollOffsetPx: Float?) -> Bool {
+    func evaluate(scrollOffsetPx: Float?, raw: Raw? = nil) -> Bool {
         guard let scrollOffsetPx else { return false }
         lock.lock()
         defer { lock.unlock() }
-        let rect = (rawRect.0, rawRect.1 + scrollOffsetPx, rawRect.2, rawRect.3)
-        let color = rawColor
+        let base = raw ?? Raw(rect: rawRect, color: rawColor, gridId: gridId)
+        let rect = (base.rect.0, base.rect.1 + scrollOffsetPx, base.rect.2, base.rect.3)
+        let color = base.color
         let eps = Self.moveEpsilonPx
         let sameRect =
             abs(rect.0 - current.0) < eps &&

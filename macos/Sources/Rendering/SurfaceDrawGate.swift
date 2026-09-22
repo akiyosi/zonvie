@@ -540,6 +540,40 @@ struct SurfaceCommittedExtent {
     }
 }
 
+/// Settle a surface's frame-side scroll state against ITS OWN commit, and
+/// take the hold its committed snapshot is read under. Returns with `lock`
+/// held.
+///
+/// Three things describe one cursor on the glass — the committed rows, the
+/// cursor rect the shader is handed, and the displacement that cancels a row
+/// that just landed — and a frame must take all three from one commit. The
+/// main surface serviced its scroll state in a hook just before its hold and
+/// the external surface at the top of its draw; both left a window in which a
+/// commit could land after the service and before the hold, so the frame drew
+/// the new rows against the old displacement, one row step off. The external
+/// surface's window was wider, and it also evaluated the shader rect late in
+/// the frame, so that is where the step was seen. One rule now: service,
+/// take the hold, and if the commit revision moved in between, service again.
+/// Bounded so a commit storm cannot keep a frame from ever snapshotting.
+func settleSurfaceAgainstOwnCommit(
+    lock: NSLock,
+    commitRevision: () -> UInt64,
+    service: () -> Void,
+    maxAttempts: Int = 3
+) {
+    var attempts = 0
+    while true {
+        lock.lock()
+        let settled = commitRevision()
+        lock.unlock()
+        service()
+        lock.lock()
+        attempts += 1
+        if commitRevision() == settled || attempts >= maxAttempts { return }
+        lock.unlock()
+    }
+}
+
 /// A surface's cursor blink phase, and what its last frame drew with.
 ///
 /// Both surfaces kept the same two fields and the same lock-guarded accessor,

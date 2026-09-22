@@ -1737,8 +1737,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     ///
     /// Both counters run from whenever their grid appeared, so the first frame
     /// a float is seen following fixes the zero they are compared against.
-    private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset]) {
-        guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return }
+    ///
+    /// Returns the debt, in pixels, withheld from the grid that owns the
+    /// shader cursor: the cursor rect is displaced by that grid's offset, and
+    /// a cursor left on the raw one would sit a whole step off the rows it
+    /// belongs to for the length of the mismatch.
+    private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset], cursorGridId: Int64) -> Float {
+        var cursorDebtPx: Float = 0
+        guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return cursorDebtPx }
         for i in snapshot.indices {
             let gid = snapshot[i].grid_id
             guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { continue }
@@ -1763,17 +1769,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // offset_y is NDC and negated against the pixel offset the view
             // built (see computeScrollOffset), so withholding pixels adds here.
             snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
-            // The cursor rect is displaced by this grid's offset in pixels, and
-            // it was the debt-paid offset before this subtraction moved here.
-            // A cursor left on the raw one would sit a whole step off the rows
-            // it belongs to for the length of the mismatch.
-            if shared.shaderCursor.belongs(toGrid: Int64(gid)) {
-                shaderCursorScrollOffsetPx -= Float(debtRows) * scrollDebtCellHeightPx
-                if shared.shaderCursor.evaluate(scrollOffsetPx: shaderCursorScrollOffsetPx) {
-                    shaderCursorMovedThisFrame = true
-                }
+            if Int64(gid) == cursorGridId {
+                cursorDebtPx = Float(debtRows) * scrollDebtCellHeightPx
             }
         }
+        return cursorDebtPx
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -2740,31 +2740,30 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // This eliminates the GPU/CPU race on shared MTLBuffers.
         scrollOffsetLatch.setActive(count > 0)
         // This surface owns the cursor's grid whenever it appears in its own
-        // offsets, and a grid with no entry is simply not displaced.
+        // offsets, and a grid with no entry is simply not displaced. The rect
+        // is evaluated once per frame, in draw's committed snapshot, from this
+        // cached value; the frames that do not rebuild the offsets (nothing is
+        // scrolling, the cursor still moves) read the value the last rebuild
+        // left, which ran with an empty offset set.
         shaderCursorScrollOffsetPx = cursorScrollOffsetPx
-        shared.shaderCursor.evaluate(scrollOffsetPx: cursorScrollOffsetPx)
     }
 
-    /// Fold the cursor's current displacement into the shader endpoints for a
-    /// frame that did not rebuild the scroll offsets.
+    /// The displacement this surface folds into the shared cursor rect, or nil
+    /// when the cursor's grid is drawn by another surface.
     ///
-    /// `updateScrollOffsets` is the only place that knows a grid's
-    /// displacement, and the view skips it entirely once nothing is scrolling
-    /// — but the cursor still moves. Without this the shader endpoints stay at
-    /// whatever the last scrolled frame left, which from a cold start is a
-    /// zero rect at the drawable origin: a cursor shader draws nothing at all
-    /// until the first scroll (verified with the harness in tmp/cursorprobe).
-    /// The cached offset is correct on those frames because the last rebuild
-    /// before going idle ran with an empty offset set.
-    func refreshCursorShaderState() {
-        lock.lock()
-        let offsetPx = shaderCursorScrollOffsetPx
-        lock.unlock()
-        // Latched for the gate below: a moved cursor rect is whole-surface
-        // fragment work, and this runs in the pre-draw that precedes the gate.
-        if shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx) {
-            shaderCursorMovedThisFrame = true
-        }
+    /// The rect is one value for every surface, and each folds in the
+    /// displacement IT draws that grid with. A grid this surface does not draw
+    /// has no entry in its offsets, so the cached value is zero — and passing
+    /// that zero evaluated the rect without the ease an external window was
+    /// drawing it with, once per main frame, flicking the cursor shader a row
+    /// off the cursor. Nil is what the external surface answers for a grid it
+    /// does not draw (`cursorScrollOffsetPxForShader`); this is the same rule.
+    /// Asked of the frame's snapshot of the rect's grid, not the live value.
+    /// Caller holds `lock`: `committedSurfaceLayers` is written under it.
+    private func shaderCursorOffsetIfDrawnHereLocked(cursorGridId owner: Int64) -> Float? {
+        guard owner == 1 || committedSurfaceLayers.contains(where: { $0.gridId == owner })
+        else { return nil }
+        return shaderCursorScrollOffsetPx
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
@@ -2998,11 +2997,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Take in any reconciliation published since onPreDraw ran — most
-            // of all the one the guard band just waited for. Its rows are in
-            // the set latched below, so it belongs to this frame.
-            onBeforeCommittedSnapshot?()
-
             // === PERF LOG: lock取得開始 ===
             var t_lock_start: CFAbsoluteTime = 0
             if ZonvieCore.appLogEnabled {
@@ -3045,8 +3039,19 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             let snappedBgRGB: UInt32
             let snappedCommittedExtent: SurfaceCommittedExtent
+            // The shader cursor's measured rect as of this commit, taken under
+            // the same hold as the rows: commitFlush publishes it under `lock`.
+            let cursorShaderRawSnapshot: SurfaceShaderCursor.Raw
 
-            lock.lock()
+            // Take in any reconciliation published since onPreDraw ran — most
+            // of all the one the guard band just waited for. Its rows are in
+            // the set latched below, so it belongs to this frame. Shared with
+            // ExternalGridView; returns with `lock` held.
+            settleSurfaceAgainstOwnCommit(
+                lock: lock,
+                commitRevision: { self.commitRevision },
+                service: { self.onBeforeCommittedSnapshot?() }
+            )
             if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
                 let terminal = rowCapacity.hardFailure
                 lock.unlock()
@@ -3081,7 +3086,19 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive
             smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
-            applyFloatScrollDebt(to: &scrollSnapshot)
+            cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
+            let cursorDebtPx = applyFloatScrollDebt(
+                to: &scrollSnapshot,
+                cursorGridId: cursorShaderRawSnapshot.gridId
+            )
+            // The one evaluation of the shader cursor this frame, against the
+            // rect and the displacement of the commit it draws — the same
+            // point the external surface evaluates at. A moved rect is
+            // whole-surface fragment work, latched for the idle gate below.
+            if let offsetPx = shaderCursorOffsetIfDrawnHereLocked(cursorGridId: cursorShaderRawSnapshot.gridId),
+               shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx - cursorDebtPx, raw: cursorShaderRawSnapshot) {
+                shaderCursorMovedThisFrame = true
+            }
             // Retire retained rows whose grid is no longer displaced. Also here,
             // not only in updateScrollOffsets: the view skips that function once
             // nothing is easing, so a grid that scrolled without ever being
