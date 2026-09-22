@@ -265,13 +265,21 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // A bordered, winbar-carrying float composited into the MAIN window
     // (relative='editor', NOT external). Focused, so the wheel over the
     // window center scrolls it. Cursor deep enough to scroll both ways.
+    //
+    // Centred on the editor rather than placed at a fixed cell: the gesture
+    // lands on the window's centre, and the window is whatever frame the
+    // app restored from the last session — on a 192x46-cell frame a float
+    // at row 1 ended 30 rows above the pointer, so the nudge scrolled the
+    // base grid (no margin rows) and the scenario failed before measuring.
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "local lines = {} for i = 1, 400 do lines[i] = string.rep(\"line \" .. i .. \" \", 6) end " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, lines) " ++
+            "local w = " ++ std.fmt.comptimePrint("{d}", .{float_cols}) ++
+            " local h = " ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++ " " ++
             "_G.e2e_float = vim.api.nvim_open_win(b, true, " ++
-            "{relative=\"editor\", row=1, col=2, width=" ++ std.fmt.comptimePrint("{d}", .{float_cols}) ++
-            ", height=" ++ std.fmt.comptimePrint("{d}", .{float_rows}) ++ ", border=\"single\", " ++
+            "{relative=\"editor\", row=math.max(1, math.floor((vim.o.lines - h) / 2)), " ++
+            "col=math.max(2, math.floor((vim.o.columns - w) / 2)), width=w, height=h, border=\"single\", " ++
             // A footer bakes text into the BOTTOM border row (nvim 0.10+),
             // giving the bottom margin row glyphs the way the winbar gives
             // the top one — a corruption there moves many more pixels than
