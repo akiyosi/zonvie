@@ -1001,7 +1001,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // row this records is no longer valid. The blink fast path refuses a
         // non-root owner anyway; -1 says so without relying on that.
         lock.lock()
-        lastKnownCursorRow = -1
+        stagedCursorRow = -1
         lock.unlock()
         submitVerticesPartialRaw(
             mainPtr: nil,
@@ -1202,7 +1202,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// is on a layer. Recorded at submit the way ExternalGridView does it, in
     /// place of rediscovering it from the committed vertices on every frame.
     /// Protected by `lock`.
+    /// The root row of the committed cursor, or -1 when a layer owns it.
+    /// Published at commit from `stagedCursorRow`, with the cursor set it
+    /// describes: read at submit time it named the NEXT flush's cursor while
+    /// the frame drew the committed one — the same skew the shader rect had.
     private var lastKnownCursorRow: Int = -1
+    private var stagedCursorRow: Int = -1
     private var committedCursorSetIndex: Int = 0 // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
     // Complete row metadata is retained independently in all three sets. A
@@ -2301,6 +2306,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         if didCursorWrite {
             committedCursorSetIndex = cursorWriteSetIndex
+            lastKnownCursorRow = stagedCursorRow
         }
         // Layers and the vertices they place become visible together.
         if let staged = pendingSurfaceLayers {
@@ -2363,8 +2369,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         // These steps reached the screen, so there is nothing left to replay.
         pendingRetentionReplay.removeAll(keepingCapacity: true)
-        shared.shaderCursor.publish()
-        commitRevision &+= 1
+        shared.shaderCursor.publishCommitTail(
+            publishScrollClears: { onCommitPublished?() },
+            commitRevision: &commitRevision
+        )
         let rev = commitRevision
         serviceSurfaceRowStorageRetirement(
             bufferSets: bufferSets,
@@ -2500,7 +2508,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Aggregate Swift-side row submit cost (memcpy + slot remap) for this flush.
             ZonvieCore.appLogPerf("[perf] row_submit calls=\(perfRowSubmitCalls) verts=\(perfRowSubmitVerts) ns=\(perfRowSubmitNs)")
         }
-        onCommitPublished?()
         return true
     }
 
@@ -5392,7 +5399,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
             cursorOwner.stage(1)
             lock.lock()
-            lastKnownCursorRow = rowStart
+            stagedCursorRow = rowStart
             lock.unlock()
             submitVerticesPartialRaw(
                 mainPtr: nil,

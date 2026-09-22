@@ -2627,13 +2627,47 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         pendingScrollClearLock.unlock()
     }
 
-    /// Release everything staged during the flush that just committed. Called
-    /// from the renderer on the core thread with no renderer lock held.
+    /// Release what the main surface's commit landed. Called from the renderer
+    /// on the core thread with no renderer lock held.
+    ///
+    /// A grid an external surface draws is left staged for that surface's own
+    /// commit (`publishStagedScrollClears(ownedBy:)`): its rows land there, and
+    /// releasing its compensation here — a moment earlier, on the same thread
+    /// — let a draw of that surface pair the credit with rows it had not been
+    /// given yet, one row step early.
     func publishStagedScrollClears() {
+        publishStagedScrollClears { gridId in
+            switch core?.resolveGridRoute(gridId: gridId) {
+            case .externalRoot, .externalLayer: return false
+            default: return true
+            }
+        }
+    }
+
+    /// Release what `view`'s commit landed. Called under that view's lock.
+    func publishStagedScrollClears(ownedBy view: ExternalGridView) {
+        publishStagedScrollClears { gridId in
+            switch core?.resolveGridRoute(gridId: gridId) {
+            case .externalRoot(let owner): return owner === view
+            case .externalLayer(let host): return host === view
+            default: return false
+            }
+        }
+    }
+
+    private func publishStagedScrollClears(where owned: (Int64) -> Bool) {
         pendingScrollClearLock.lock()
         if !stagedScrollClear.isEmpty {
-            pendingScrollClear.append(contentsOf: stagedScrollClear)
-            stagedScrollClear.removeAll(keepingCapacity: true)
+            var kept = 0
+            for entry in stagedScrollClear {
+                if owned(entry.gridId) {
+                    pendingScrollClear.append(entry)
+                } else {
+                    stagedScrollClear[kept] = entry
+                    kept += 1
+                }
+            }
+            stagedScrollClear.removeLast(stagedScrollClear.count - kept)
         }
         pendingScrollClearLock.unlock()
     }

@@ -616,6 +616,19 @@ final class SurfaceShaderCursor {
         lock.unlock()
     }
 
+    /// What every surface's commit publishes last, in one order: the cursor
+    /// rect this bracket measured, then the scroll compensation for the rows
+    /// it landed, then the revision a draw settles against. Called under the
+    /// surface's own lock, so a draw's settle-and-hold sees all three as one
+    /// generation. The main surface used to release its compensation after
+    /// its lock, and the external surface's was released by the main
+    /// surface's commit.
+    func publishCommitTail(publishScrollClears: () -> Void, commitRevision: inout UInt64) {
+        publish()
+        publishScrollClears()
+        commitRevision &+= 1
+    }
+
     /// Drop a measurement whose flush never committed.
     func dropStaged() {
         lock.lock()
