@@ -1,0 +1,10 @@
+# Fixture for cursor-shader scenarios that need the MAIN window drawing
+# every frame: the probe reads iTime, so the app keeps its draw loop alive
+# the way a real cursor shader does.
+[window]
+blur = false
+opacity = 1.0
+
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/cursor_probe_anim.glsl"]

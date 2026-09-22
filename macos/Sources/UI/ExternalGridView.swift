@@ -700,7 +700,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         get { blink.isVisible(lock: lock) }
         set { blink.setVisible(newValue, lock: lock) }
     }
+    /// The root row of the committed cursor. Published at commit from
+    /// `stagedCursorRow`, with the cursor set it describes — as the main
+    /// renderer's is — so a frame's blink scissor and its cursor witness name
+    /// the cursor it draws, not the one the next flush will.
     private var lastKnownCursorRow: Int = -1
+    private var stagedCursorRow: Int = -1
 
     // Separate cursor vertex buffer (not part of row buffers, immune to GPU scroll copy).
     private var cursorDirty: Bool = false
@@ -1319,6 +1324,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // where it is — nothing about a row rotation ages the cursor.
             if cursorWriteSetIndex != -1 {
                 committedCursorSetIndex = cursorWriteSetIndex
+                lastKnownCursorRow = stagedCursorRow
                 cursorWriteSetIndex = -1
                 // Arm the redraw in the same lock that publishes the slot, the
                 // way flushDirtyRows is re-published for rows. Two ways this
@@ -1390,13 +1396,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 // leaves it for the next (see captureRetainedRowsForPendingScroll).
                 pendingGridScrollRows = 0
             }
-            shared.shaderCursor.publish()
             // Every commit bumps, as GridSurfaceRenderer's does. The revision
             // answers one question — "is the committed state a generation this
             // draw has not seen?" — and nothing else. Whether the back buffer may
             // be reused is asked of the CONTENT predicates below, which is what
-            // the suppression used to stand in for.
-            commitRevision &+= 1
+            // the suppression used to stand in for. The compensation for rows
+            // this commit landed is released here too, under `lock`, not at
+            // the main surface's commit.
+            shared.shaderCursor.publishCommitTail(
+                publishScrollClears: { mainTerminalView?.publishStagedScrollClears(ownedBy: self) },
+                commitRevision: &commitRevision
+            )
             if publishedRows {
                 serviceSurfaceRowStorageRetirement(
                     bufferSets: bufferSets,
@@ -2024,7 +2034,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             }
             cursorOwner.stage(gridId)
             lock.lock()
-            lastKnownCursorRow = rowStart
+            stagedCursorRow = rowStart
             cursorDirty = true
             lock.unlock()
             // A slot of this bracket's own, rotated in at commit. Reusing

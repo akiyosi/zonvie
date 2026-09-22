@@ -144,6 +144,16 @@ test "gui:extwin_keyboard_scroll_eases" {
     }
 }
 
+test "gui:extwin_trackpad_cursor_shader_tracks" {
+    // macOS only: the shader cursor plumbing is macOS frontend.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_trackpad_cursor_shader_tracks.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_scroll_cursor_shader_stays" {
     // macOS only: the shader cursor plumbing is macOS frontend.
     if (comptime builtin.os.tag == .macos) {
