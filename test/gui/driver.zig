@@ -208,8 +208,25 @@ pub const Gui = struct {
             try g.app_env.put(pair[0], pair[1]);
         }
 
-        // Optional home isolation (persisted app state, frame autosave).
-        if (opts.home_dir) |home| {
+        // Home isolation (persisted app state, frame autosave). A scenario
+        // may name the dir, for relaunch comparisons; otherwise every Gui
+        // gets a fresh one of its own. On macOS the app restores its window
+        // frame from NSUserDefaults, which live under HOME, so a scenario
+        // that did not isolate it ran at whatever frame the user's own
+        // zonvie — or the previous scenario's app — saved last. Two
+        // scenarios that assumed a geometry (a float under the window's
+        // centre, a margin band with no sub-cell remainder) failed or flaked
+        // on that alone. Windows keeps the opt-in: its persisted state under
+        // USERPROFILE has not been shown to matter, and the change has not
+        // had a hardware run.
+        const isolate_home = opts.home_dir != null or builtin.os.tag != .windows;
+        if (isolate_home) {
+            var home_buf: [128]u8 = undefined;
+            const home: []const u8 = opts.home_dir orelse blk: {
+                const fresh = try std.fmt.bufPrint(&home_buf, "tmp/gui_home/{d}_{d}", .{ currentPid(), seq });
+                std.Io.Dir.cwd().deleteTree(gui_io.io(), fresh) catch {};
+                break :blk fresh;
+            };
             std.Io.Dir.cwd().createDirPath(gui_io.io(), home) catch {};
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
