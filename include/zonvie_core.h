@@ -332,6 +332,14 @@ typedef void (*zonvie_on_external_window_close_fn)(
     int64_t grid_id
 );
 
+/* Grid ids the core reserves for the ext_* UI it surfaces as windows of
+   their own. Negative so they cannot collide with Neovim's. Values are
+   src/core/grid.zig's; each frontend used to restate them by hand. */
+#define ZONVIE_GRID_ID_CMDLINE     (-100)
+#define ZONVIE_GRID_ID_POPUPMENU   (-101)
+#define ZONVIE_GRID_ID_MESSAGE     (-102)
+#define ZONVIE_GRID_ID_MSG_HISTORY (-103)
+
 /* One grid placed on one surface. A surface is a single drawable: the main
    window, or one external window. Its surface_id is the id of its root grid
    (1 for the main window). layers[0] is always the root grid at (0,0). */

@@ -3293,42 +3293,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // In rowMode with no vertex updates and no dirty rows, skip rendering.
-            //
-            // This used to skip a new commit too, on the grounds that an empty
-            // non-scroll flush would otherwise reach a `.clear` loadAction and
-            // destroy the backbuffer a GPU-blit scroll depends on. That conflated
-            // "nothing to draw" with "do not clear": it also swallowed commits
-            // that DID carry something no other term expresses — a cursor moving
-            // inside a float the main surface hosts reaches `submitLayerCursor`,
-            // which marks no row and sets no layer work, so this gate was the
-            // only thing between it and a frame. And because the gate returns
-            // before `lastDrawnRevision` is assigned, a swallowed commit stayed
-            // unacknowledged, pinning `hasNewCommit` true and disabling the blink
-            // fast path and `skipMainPass` until something else rendered.
-            //
-            // It now respects the revision, as the idle gate above it already
-            // did, so `commitRevision` means the same thing on this surface as it
-            // does on ExternalGridView: a generation this draw has not seen.
-            // Whether the backbuffer may be reused stays where it belongs, in
-            // `shouldReusePreviousContents`. `dirtyRectPxOpt` joins it for the
-            // same reason — rect-only damage was consumed and then discarded here.
-            // Same animation exception as above.
-            // `shaderCursorMovedThisFrame` joins the list for the reason the
-            // paragraph above gives for `hasNewCommit`: this condition is a
-            // hand-written second copy of the idle gate's terms, so a term
-            // added to the shared `SurfaceIdleTerms` does not reach it. A
-            // cursor shader's rect moves on frames with no dirty row, no layer
-            // work and no blink, and this gate returned SILENTLY — sixteen
-            // frames in a row on a failing run, with nothing in the log and the
-            // effect left on the split the cursor came from.
-            if rowMode && dirtyRows.isEmpty && !anyLayerWork && !smoothScrolling && !blinkStateChanged && !drawableSizeChanged && hasPresentedOnceSnapshot && !shared.anyCustomShaderNeedsAnimation && !hasNewCommit && dirtyRectPxOpt == nil && !shaderCursorMovedThisFrame {
-                FrameTracer.trace(.drawSkipNoChange, a: 3)
-                (view as? MetalTerminalView)?.notifyDrawIdle()
-                (view as? MetalTerminalView)?.didDrawFrame()
-                return
-            }
-
             // Blink toggled with no cursor to draw: the toggle is invisible in
             // either state, so the whole draw cycle — drawable acquire, copy
             // pass (~2.9ms), present, next-vsync wake — is wasted. Skip and
