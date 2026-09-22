@@ -759,6 +759,14 @@ pub const PaintPolicy = struct {
     preserve_back: bool,
 };
 
+/// The cursor vertices a frame draws: all of them while the blink phase shows
+/// the cursor, none while it hides it. The main driver's flat path answered
+/// this inline and the decorated external path did not ask, so an ext-cmdline
+/// cursor never blinked.
+pub fn cursorVertsForFrame(comptime V: type, cursor: []const V, blink_visible: bool) []const V {
+    return if (blink_visible) cursor else &.{};
+}
+
 pub fn paintPolicy(in: PaintPolicyInputs) PaintPolicy {
     const force_full_rows =
         in.force_full or

@@ -3772,8 +3772,13 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
             return;
         }
-        // Append cursor vertices so decorated surfaces (cmdline) can render the cursor.
-        const cursor_items = tbs_cursor.verts.items;
+        // Append cursor vertices so decorated surfaces (cmdline) can render the
+        // cursor, on the blink phase the main driver's flat path uses.
+        const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
+            app_mod.Vertex,
+            tbs_cursor.verts.items,
+            ext_win.cursor_blink_state,
+        );
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
                 abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
