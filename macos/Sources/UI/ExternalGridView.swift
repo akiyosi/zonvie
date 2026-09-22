@@ -977,8 +977,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // instead so each cell renders with its own opaque bg; the popupmenu's
         // surrounding blur is still preserved by the container view's
         // transparent layer around the Metal viewport.
-        // -101 = POPUPMENU_GRID_ID (matches grid.zig:9 / ZonvieCore.popupmenuGridId)
-        if gridId == -101 { return 1.0 }
+        if gridId == ZonvieCore.popupmenuGridId { return 1.0 }
         return resolveSurfaceBackgroundAlpha(
             blurEnabled: blurEnabled,
             decoratedSurface: isDecoratedSurface,
@@ -1265,7 +1264,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         isInFlush = false
         lock.lock()
         pendingSurfaceLayers = nil
-        cursorOwner.stage(nil)
+        // The contract `SurfaceCursorOwner` documents and the main surface
+        // follows: an abandoned bracket puts the owner back to what is on
+        // screen, so the next bracket's clear from the true owner is accepted.
+        cursorOwner.restoreStagedFromCommitted()
         // Only a bracket that acquired a row set left one half-written.
         if bracketOpen, rowWritePrepared, writeSetIndex >= 0 {
             rowStateNeedsFullSync[writeSetIndex] = true
@@ -1349,6 +1351,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 // exists, and its id is reused by the next float a scroll makes.
                 if layerPlacementRowsUp.count > staged.count {
                     layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
+                        staged.contains { $0.gridId == entry.key }
+                    }
+                }
+                // Same for the debt ledger's zero and its last logged value, as
+                // the main surface prunes them: the next float to take the id
+                // would otherwise inherit the last one's baseline and start
+                // with a debt it never incurred.
+                if floatDebtBaselineSnapshot.count > staged.count {
+                    floatDebtBaselineSnapshot = floatDebtBaselineSnapshot.filter { entry in
+                        staged.contains { $0.gridId == entry.key }
+                    }
+                    hostedDebtLastLogged = hostedDebtLastLogged.filter { entry in
                         staged.contains { $0.gridId == entry.key }
                     }
                 }

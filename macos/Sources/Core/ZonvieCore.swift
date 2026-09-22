@@ -4673,16 +4673,14 @@ final class ZonvieCore {
         }
     }
 
-    /// Reserved grid ID for cmdline (must match CMDLINE_GRID_ID in grid.zig)
+    /// The core's reserved grid ids for the ext_* windows, from the ABI
+    /// header rather than restated here.
     // Not private: ExternalGridView checks it to decide whether a file drop
     // should insert a path into the cmdline instead of opening the file.
-    static let cmdlineGridId: Int64 = -100
-    /// Reserved grid ID for popupmenu (must match POPUPMENU_GRID_ID in grid.zig)
-    private static let popupmenuGridId: Int64 = -101
-    /// Reserved grid ID for messages (must match MESSAGE_GRID_ID in grid.zig)
-    private static let messageGridId: Int64 = -102
-    /// Reserved grid ID for message history (must match MSG_HISTORY_GRID_ID in grid.zig)
-    private static let msgHistoryGridId: Int64 = -103
+    static let cmdlineGridId = Int64(ZONVIE_GRID_ID_CMDLINE)
+    static let popupmenuGridId = Int64(ZONVIE_GRID_ID_POPUPMENU)
+    private static let messageGridId = Int64(ZONVIE_GRID_ID_MESSAGE)
+    private static let msgHistoryGridId = Int64(ZONVIE_GRID_ID_MSG_HISTORY)
     private static let specialWindowCornerRadius: CGFloat = 4.0
     private static let specialWindowBorderLayerName = "ZonvieSpecialWindowBorder"
 
