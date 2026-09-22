@@ -1576,9 +1576,6 @@ pub const Renderer = struct {
     pub fn presentFromBackRectsWithCursorNoResize(
         self: *Renderer,
         rects: []const c.RECT,
-        cursor_vb: ?*c.ID3D11Buffer,
-        cursor_vert_count: usize,
-        cursor_scissor: ?c.RECT,
         force_full_copy: bool,
         scroll_rect: ?*const c.RECT,
         scroll_offset: ?*const c.POINT,
@@ -1629,9 +1626,6 @@ pub const Renderer = struct {
             t_copy_ns = core.clock.nowNs();
         }
 
-        _ = cursor_vb;
-        _ = cursor_vert_count;
-        _ = cursor_scissor;
         if (log_enabled) {
             t_cursor_ns = core.clock.nowNs();
         }

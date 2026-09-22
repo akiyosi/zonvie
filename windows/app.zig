@@ -335,14 +335,12 @@ pub fn scrollbarReservedWidth(dpi_scale: f32) f32 {
 // Grid ID constants
 // =========================================================================
 
-/// Reserved grid ID for ext_cmdline (same as grid.zig CMDLINE_GRID_ID)
-pub const CMDLINE_GRID_ID: i64 = -100;
-/// Reserved grid ID for ext_popupmenu (same as grid.zig POPUPMENU_GRID_ID)
-pub const POPUPMENU_GRID_ID: i64 = -101;
-/// Reserved grid ID for ext_messages
-pub const MESSAGE_GRID_ID: i64 = -102;
-/// Reserved grid ID for msg_history (same as grid.zig MSG_HISTORY_GRID_ID)
-pub const MSG_HISTORY_GRID_ID: i64 = -103;
+/// The core's reserved grid ids for the ext_* windows, read from where they
+/// are defined rather than restated.
+pub const CMDLINE_GRID_ID: i64 = core.grid_mod.CMDLINE_GRID_ID;
+pub const POPUPMENU_GRID_ID: i64 = core.grid_mod.POPUPMENU_GRID_ID;
+pub const MESSAGE_GRID_ID: i64 = core.grid_mod.MESSAGE_GRID_ID;
+pub const MSG_HISTORY_GRID_ID: i64 = core.grid_mod.MSG_HISTORY_GRID_ID;
 
 // =========================================================================
 // Cmdline / message styling constants
@@ -6381,16 +6379,6 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
             core.zonvie_core_set_cmdline_default_cols(app.corep, @max(20, content_w / cw));
         }
     }
-}
-
-pub fn rowHeightPxFromClient(hwnd: c.HWND, rows: u32, fallback: u32) u32 {
-    // Always use the fallback (cell_h + linespace) as the authoritative row height.
-    // The division-based calculation (client_h / rows) is unreliable when Neovim's
-    // row count doesn't match the frontend's expected row count (e.g., during
-    // linespace changes where rows haven't been synchronized yet).
-    _ = hwnd;
-    _ = rows;
-    return fallback;
 }
 
 pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {

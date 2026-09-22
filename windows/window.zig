@@ -1408,10 +1408,9 @@ const CMDLINE_CORNER_RADIUS = app_mod.CMDLINE_CORNER_RADIUS;
 const MSG_PADDING = app_mod.MSG_PADDING;
 
 // Layout helpers are in app_mod (getEffectiveContentWidth, updateLayoutToCore,
-// rowHeightPxFromClient, updateRowsColsFromClientForce).
+// updateRowsColsFromClientForce).
 const getEffectiveContentWidth = app_mod.getEffectiveContentWidth;
 const updateLayoutToCore = app_mod.updateLayoutToCore;
-const rowHeightPxFromClient = app_mod.rowHeightPxFromClient;
 const updateRowsColsFromClientForce = app_mod.updateRowsColsFromClientForce;
 
 fn applyMainDpiState(app: *App, new_dpi: u32) void {
@@ -2236,6 +2235,12 @@ pub export fn WndProc(
                 const seed_pending_snapshot = app.seed_pending;
                 const seed_clear_pending_snapshot = app.seed_clear_pending;
                 const back_tex_valid_snapshot = app.back_tex_valid;
+                // The surface's own "repaint everything" request, consumed the
+                // way the external driver consumes its copy. Every setter also
+                // raised a seed flag or the TBS one, so this driver never read
+                // it; a setter that raises only this one now reaches a paint.
+                const surface_paint_full_snapshot = app.surface.paint_full;
+                app.surface.paint_full = false;
                 const row_valid_count_snapshot = app.row_valid_count;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
@@ -2639,6 +2644,7 @@ pub export fn WndProc(
                             .force_full =
                                 did_need_seed or
                                 paint_full_snapshot or
+                                surface_paint_full_snapshot or
                                 seed_clear_pending_snapshot or
                                 (seed_pending_snapshot and !back_tex_valid_snapshot),
                             .cursor_grid_changed = cursor_grid_changed,
@@ -2795,19 +2801,9 @@ pub export fn WndProc(
                             }
                         }
 
-                        const fallback_row_h: u32 = row_h_px_snapshot;
-                        const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
-                        const row_h_px_u32 = if (rows_mismatch)
-                            fallback_row_h
-                        else
-                            rowHeightPxFromClient(hwnd, rows_for_layout, fallback_row_h);
-                        const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
-                        if (log_enabled and (row_h_px_u32 != fallback_row_h or rows_mismatch)) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) row_h_px adjust rows={d} client_h={d} fallback={d} row_h={d}\n",
-                                .{ rows_for_layout, client.bottom, fallback_row_h, row_h_px_u32 },
-                            );
-                        }
+                        // cell_h + linespace, as the external driver reads it.
+                        const row_h_px_u32: u32 = row_h_px_snapshot;
+                        const row_h_px: i32 = @intCast(row_h_px_u32);
 
                         // Where the cursor's own layer sits, so the overlay is
                         // placed with that layer's transform rather than the
@@ -3043,12 +3039,16 @@ pub export fn WndProc(
                         // all-pairs containment scan reached O(rows^2) for
                         // alternating dirty rows on the accepted 20,000-row
                         // boundary.
+                        // Clamped to the back buffer, as the external driver
+                        // clamps: a rect past it is what the presenter turns
+                        // into full damage, and the client rect can be a
+                        // resize ahead of the buffer.
                         if (present_rects.items.len != 0) {
                             present_rects.items.len = render_helpers.clampPresentRects(
                                 c.RECT,
                                 present_rects.items,
-                                client.right,
-                                client.bottom,
+                                @intCast(g.width),
+                                @intCast(g.height),
                             );
                             present_rects.items.len = render_helpers.compactDamageRects(c.RECT, present_rects.items);
                         }
@@ -3507,8 +3507,8 @@ pub export fn WndProc(
                             present_rects.items.len = render_helpers.clampPresentRects(
                                 c.RECT,
                                 present_rects.items,
-                                client.right,
-                                client.bottom,
+                                @intCast(g.width),
+                                @intCast(g.height),
                             );
                         }
 
@@ -3606,9 +3606,6 @@ pub export fn WndProc(
 
                                 if (g.presentFromBackRectsWithCursorNoResize(
                                     present_rects_slice,
-                                    app.cursor_vb,
-                                    cursor_verts_snapshot.len,
-                                    cursor_rc_opt,
                                     force_full_present,
                                     null,
                                     null,

@@ -4068,9 +4068,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
         g.presentFromBackRectsWithCursorNoResize(
             ext_win.paint_present_rects.items,
-            null,
-            0,
-            null,
             force_full_present,
             null,
             null,
