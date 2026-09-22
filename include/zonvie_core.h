@@ -1260,6 +1260,46 @@ ZONVIE_API bool zonvie_core_row_scroll_merge(
     zonvie_row_scroll_merge *out
 );
 
+/* The cursor's rectangle on a surface, in surface pixels with y down; right
+   and bottom are exclusive. Both frontends computed this from the cursor's
+   grid-local vertices themselves, and the Windows main driver twice (an
+   integer rectangle for present damage, a float one for the shader uniform);
+   one bounds now, with the inflation as a separate step. */
+typedef struct zonvie_cursor_rect {
+    float left;
+    float top;
+    float right;
+    float bottom;
+} zonvie_cursor_rect;
+
+typedef struct zonvie_cursor_irect {
+    int32_t left;
+    int32_t top;
+    int32_t right;
+    int32_t bottom;
+} zonvie_cursor_irect;
+
+/* Fills *out with the vertex box moved by (origin_x_px, origin_y_px) -- the
+   origin that places the cursor's grid on the surface, a layer origin plus
+   any viewport offset. False, leaving *out untouched, when count is 0. */
+ZONVIE_API bool zonvie_core_cursor_rect(
+    const zonvie_vertex *verts,
+    size_t count,
+    float origin_x_px,
+    float origin_y_px,
+    zonvie_cursor_rect *out
+);
+
+/* Floors the near edges, ceils the far ones, clips to clip_w_px by clip_h_px.
+   False when nothing is left inside the surface: a damage consumer must not
+   be handed an empty rectangle. *out is untouched then. */
+ZONVIE_API bool zonvie_core_cursor_rect_inflate_clip(
+    const zonvie_cursor_rect *rect,
+    int32_t clip_w_px,
+    int32_t clip_h_px,
+    zonvie_cursor_irect *out
+);
+
 /* Build-time version string (from `git describe`), e.g. "v0.3.21" or
    "v0.3.21-9-g4eb0177". The returned pointer is static and null-terminated;
    never null. Not tied to a core instance. */

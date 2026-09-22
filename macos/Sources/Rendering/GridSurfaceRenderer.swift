@@ -2582,29 +2582,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private func updateCursorShaderStateFromVerts(cursorPtr: UnsafeRawPointer, cursorCount: Int) {
         guard cursorCount > 0 else { return }
         let verts = cursorPtr.bindMemory(to: Vertex.self, capacity: cursorCount)
-        var minX: Float = verts[0].position.x
-        var maxX: Float = minX
-        var minY: Float = verts[0].position.y
-        var maxY: Float = minY
-        for i in 0..<cursorCount {
-            let p = verts[i].position
-            if p.x < minX { minX = p.x }
-            if p.x > maxX { maxX = p.x }
-            if p.y < minY { minY = p.y }
-            if p.y > maxY { maxY = p.y }
-        }
         // Positions are grid-local pixels with y down, but the cursor uniforms
         // the shader reads are screen space, so every layer but the root needs
         // its origin added — otherwise the effect stays at the top-left window
         // whichever split the cursor is in.
+        // The same resolve the cursor body is placed with; this used to be a
+        // third scan of the layer list, with its own fallback.
         let cursorGridId = verts[0].grid_id
-        var layerOriginPx = simd_float2(0, 0)
-        if cursorGridId != 1 {
-            let layers = pendingSurfaceLayers ?? committedSurfaceLayers
-            if let layer = layers.first(where: { $0.gridId == cursorGridId }) {
-                layerOriginPx = layer.originPx
-            }
-        }
+        let layerOriginPx = resolveSurfaceCursorPlacement(
+            ownerGridId: cursorGridId,
+            rootGridId: 1,
+            layers: pendingSurfaceLayers ?? committedSurfaceLayers
+        ).originPx
         // backBufferSize is written under `lock` by ensureBackBuffer() (main
         // thread); read it under the same lock here since this runs on the
         // core/RPC thread and a resize can race with this cursor update.
@@ -2617,16 +2606,22 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // .zero — skip computing nonsensical (0,0,0,0) cursor-shader uniforms;
         // the next call (once a real size is known) will compute correctly.
         guard bufW > 0, bufH > 0 else { return }
-        let xPx = minX + layerOriginPx.x
-        let rightPx = maxX + layerOriginPx.x
-        let topPx = minY + layerOriginPx.y
-        let botPx = maxY + layerOriginPx.y
+        // The core's bounds, with the origin folded in: the same rectangle
+        // the Windows driver hands its shader and its damage from.
+        var rect = zonvie_cursor_rect()
+        guard zonvie_core_cursor_rect(
+            cursorPtr.assumingMemoryBound(to: zonvie_vertex.self),
+            cursorCount,
+            layerOriginPx.x,
+            layerOriginPx.y,
+            &rect
+        ) else { return }
         // Ghostty's cursor shaders treat iCurrentCursor.y as the BOTTOM
         // edge of the cursor rect (center = y - h/2, rect = y-h..y).
         // Pass bottom-edge so the SDF renders over the actual cursor.
         let c0 = verts[0].color
         shared.shaderCursor.stage(
-            rect: (xPx, botPx, rightPx - xPx, botPx - topPx),
+            rect: (rect.left, rect.bottom, rect.right - rect.left, rect.bottom - rect.top),
             color: (c0.x, c0.y, c0.z, c0.w),
             gridId: verts[0].grid_id
         )

@@ -2758,103 +2758,39 @@ pub export fn WndProc(
                             }
                         }
 
-                        const cursor_rc_opt: ?c.RECT = if (cursor_verts_snapshot.len != 0) blk: {
-                            var minx: f32 = cursor_verts_snapshot[0].position[0];
-                            var maxx: f32 = minx;
-                            var miny: f32 = cursor_verts_snapshot[0].position[1];
-                            var maxy: f32 = miny;
-                            for (cursor_verts_snapshot) |v| {
-                                if (v.position[0] < minx) minx = v.position[0];
-                                if (v.position[0] > maxx) maxx = v.position[0];
-                                if (v.position[1] < miny) miny = v.position[1];
-                                if (v.position[1] > maxy) maxy = v.position[1];
-                            }
-                            // Mirror the D3D11 viewport calculation from drawEx:
-                            //   viewport = (x_offset, y_offset, viewport_width, content_height)
-                            const vp_x: u32 = content_x_offset orelse 0;
-                            const vp_y: u32 = content_y_offset orelse 0;
-                            const base_w: u32 = content_width orelse @intCast(@max(1, client.right));
-                            const sidebar_w: u32 = sidebar_right_width orelse 0;
-                            const vp_w: u32 = if (base_w > vp_x + sidebar_w) base_w - vp_x - sidebar_w else 1;
-                            const vp_h: u32 = content_height;
-
-                            _ = vp_w;
-                            _ = vp_h;
-                            const x_off_f: f32 = @as(f32, @floatFromInt(vp_x)) + cursor_layer_x_px;
-                            const y_off_f: f32 = @as(f32, @floatFromInt(vp_y)) + cursor_layer_y_px;
-
-                            const l_f = x_off_f + minx;
-                            const r_f = x_off_f + maxx;
-                            const t_f = y_off_f + miny;
-                            const b_f = y_off_f + maxy;
-
-                            var l: i32 = @intFromFloat(@floor(l_f));
-                            var r: i32 = @intFromFloat(@ceil(r_f));
-                            var t: i32 = @intFromFloat(@floor(t_f));
-                            var b: i32 = @intFromFloat(@ceil(b_f));
-
-                            if (l < 0) l = 0;
-                            if (t < 0) t = 0;
-                            if (r > client.right) r = client.right;
-                            if (b > client.bottom) b = client.bottom;
-
-                            if (r <= l or b <= t) break :blk null;
-                            break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
+                        // Where the cursor's grid sits on the surface: its
+                        // layer's origin plus the content viewport's, the same
+                        // translation the row pass draws it with. One bounds
+                        // serves both the damage rectangle and the shader
+                        // uniform; they used to be two loops over the same
+                        // vertices, one integer and one float.
+                        const cursor_origin_x: f32 = @as(f32, @floatFromInt(content_x_offset orelse 0)) + cursor_layer_x_px;
+                        const cursor_origin_y: f32 = @as(f32, @floatFromInt(content_y_offset orelse 0)) + cursor_layer_y_px;
+                        const cursor_bounds = core.cursor_rect.bounds(
+                            core.Vertex,
+                            cursor_verts_snapshot,
+                            cursor_origin_x,
+                            cursor_origin_y,
+                        );
+                        // The damage consumer needs whole pixels, clipped to
+                        // the client; an empty result is dropped rather than
+                        // handed on.
+                        const cursor_rc_opt: ?c.RECT = if (cursor_bounds) |cb| blk: {
+                            const ir = core.cursor_rect.inflateClip(cb, client.right, client.bottom) orelse break :blk null;
+                            break :blk .{ .left = ir.left, .top = ir.top, .right = ir.right, .bottom = ir.bottom };
                         } else null;
 
-                        // Feed cursor state into the custom shader
-                        // uniforms (Ghostty 1.1+ iCurrentCursor /
-                        // iPreviousCursor / iTimeCursorChange etc.). No-op
-                        // when the rect + color match the last call.
-                        // Recompute the rect in floating point to avoid
-                        // the 1-pixel inflation that cursor_rc_opt picks
-                        // up from its floor/ceil integer rounding (the
-                        // dirty-rect consumer needs that, the shader
-                        // doesn't).
-                        if (cursor_verts_snapshot.len != 0) {
+                        // Feed cursor state into the custom shader uniforms
+                        // (Ghostty 1.1+ iCurrentCursor / iPreviousCursor /
+                        // iTimeCursorChange etc.). No-op when the rect + color
+                        // match the last call. Ghostty's cursor shaders read
+                        // the y component as the BOTTOM edge of the rect
+                        // (center is `y - h/2`, rect spans `y-h..y`).
+                        if (cursor_bounds) |cb| {
                             if (app.renderer) |*r_sh| {
-                                var minx_sh: f32 = cursor_verts_snapshot[0].position[0];
-                                var maxx_sh: f32 = minx_sh;
-                                var miny_sh: f32 = cursor_verts_snapshot[0].position[1];
-                                var maxy_sh: f32 = miny_sh;
-                                for (cursor_verts_snapshot) |v| {
-                                    if (v.position[0] < minx_sh) minx_sh = v.position[0];
-                                    if (v.position[0] > maxx_sh) maxx_sh = v.position[0];
-                                    if (v.position[1] < miny_sh) miny_sh = v.position[1];
-                                    if (v.position[1] > maxy_sh) maxy_sh = v.position[1];
-                                }
-                                const vp_x_sh: u32 = content_x_offset orelse 0;
-                                const vp_y_sh: u32 = content_y_offset orelse 0;
-                                const base_w_sh: u32 = content_width orelse @intCast(@max(1, client.right));
-                                const sidebar_w_sh: u32 = sidebar_right_width orelse 0;
-                                const vp_w_sh: u32 =
-                                    if (base_w_sh > vp_x_sh + sidebar_w_sh)
-                                        base_w_sh - vp_x_sh - sidebar_w_sh
-                                    else
-                                        1;
-                                _ = vp_w_sh;
-                                // The shader reads the cursor uniform in
-                                // screen space, so the layer origin belongs
-                                // here too: without it a cursor shader keeps
-                                // drawing over the top-left window whichever
-                                // split holds the cursor.
-                                const xo_sh: f32 = @as(f32, @floatFromInt(vp_x_sh)) + cursor_layer_x_px;
-                                const yo_sh: f32 = @as(f32, @floatFromInt(vp_y_sh)) + cursor_layer_y_px;
-                                const left_sh = xo_sh + minx_sh;
-                                const right_sh = xo_sh + maxx_sh;
-                                const top_sh = yo_sh + miny_sh;
-                                const bottom_sh = yo_sh + maxy_sh;
-                                // Ghostty's cursor shaders interpret the y
-                                // component as the BOTTOM edge of the
-                                // cursor rect (center is computed as
-                                // `y - h/2`, rect spans `y-h..y`). Pass
-                                // the bottom-edge so the shader renders
-                                // over the actual cursor, not one row
-                                // above it.
-                                const v0 = cursor_verts_snapshot[0];
                                 r_sh.setCursorShaderState(
-                                    .{ left_sh, bottom_sh, right_sh - left_sh, bottom_sh - top_sh },
-                                    v0.color,
+                                    .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                                    cursor_verts_snapshot[0].color,
                                 );
                             }
                         }
@@ -3561,6 +3497,19 @@ pub export fn WndProc(
                         // to all swapchain buffers.
                         if (scroll_shift_result.scroll_rect) |sr| {
                             present_rects.append(app.alloc, sr) catch {};
+                            // Clamped like every rect above it. applyScrollShift
+                            // clips this rect to the renderer width but not to
+                            // the client height, and a rect that clamps to
+                            // EMPTY inside the presenter marks every swapchain
+                            // buffer fully damaged (see clampBackDamageRect);
+                            // the external driver appends it before its clamp
+                            // for the same reason.
+                            present_rects.items.len = render_helpers.clampPresentRects(
+                                c.RECT,
+                                present_rects.items,
+                                client.right,
+                                client.bottom,
+                            );
                         }
 
                         if (log_enabled) applog.appLog(
@@ -3622,10 +3571,20 @@ pub export fn WndProc(
                                 // back_tex_valid_snapshot is true the swapchain has already been
                                 // synced to a complete frame, and partial present rects keep
                                 // DXGI from copying unchanged regions every paint.
+                                // A custom shader writes the complete current
+                                // swapchain buffer from inside the present
+                                // (drawCustomShaderPass), while the other
+                                // rotating buffers record only this frame's
+                                // partial damage. Mark them all full so
+                                // disabling the shader cannot expose stale
+                                // shader pixels outside the dirty rectangles.
+                                // The external driver has carried this term
+                                // since its present grew the shader pass.
                                 const force_full_present = force_full_rows or
                                     (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
                                     seed_clear or
-                                    present_rects_fallback_full;
+                                    present_rects_fallback_full or
+                                    g.custom_shader_pipelines.items.len != 0;
                                 const present_rects_slice: []const c.RECT =
                                     if (force_full_present) &[_]c.RECT{} else present_rects.items;
 

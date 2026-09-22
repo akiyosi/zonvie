@@ -571,6 +571,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// locks) and copied in, so neither lock is ever held while taking the
     /// other. Persistent, so a scrolled frame does no heap work for it.
     private var hostedScrollOffsetScratch: [GridSurfaceRenderer.ScrollOffset] = []
+    /// Root plus hosted offsets, for the per-grid retention prune. Persistent
+    /// so a scroll update costs no allocation.
+    private var pruneOffsetsScratch: [GridSurfaceRenderer.ScrollOffset] = []
     /// What `markScrollOffsetStatePresented` last froze, for the end-of-ease
     /// comparison the root's own `lastPresentedScrollOffsetData` makes.
     ///
@@ -2188,19 +2191,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         cursorGridId: Int64
     ) {
         guard count > 0 else { return }
-        var minX: Float = ptr[0].position.0
-        var maxX: Float = minX
-        var minY: Float = ptr[0].position.1
-        var maxY: Float = minY
-        for i in 0..<count {
-            let p = ptr[i].position
-            if p.0 < minX { minX = p.0 }
-            if p.0 > maxX { maxX = p.0 }
-            if p.1 < minY { minY = p.1 }
-            if p.1 > maxY { maxY = p.1 }
-        }
+        // Grid-local bounds from the core; the projection into the main
+        // window's screen space is applied on republish, where the two
+        // windows' positions are known.
+        var rect = zonvie_cursor_rect()
+        guard zonvie_core_cursor_rect(ptr, count, 0, 0, &rect) else { return }
         let c = ptr[0].color
-        lastForwardedCursorPx = (minX: minX, maxX: maxX, minY: minY, maxY: maxY)
+        lastForwardedCursorPx = (minX: rect.left, maxX: rect.right, minY: rect.top, maxY: rect.bottom)
         lastForwardedCursorColor = (c.0, c.1, c.2, c.3)
         lastForwardedCursorGridId = cursorGridId
         republishCursorShaderState()
@@ -2255,10 +2252,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // callout below. Resolved per call, not stored: a window move has to
         // reproject against the placement the surface holds now.
         lock.lock()
-        let layers = pendingSurfaceLayers ?? committedSurfaceLayers
-        let cursorOrigin = layers.first { $0.gridId == lastForwardedCursorGridId }?.originPx
-            ?? layers.first?.originPx
-            ?? simd_float2(0, 0)
+        // The same resolve the cursor body is placed with. The fallback this
+        // had of its own, the root layer's origin, is (0,0) by the core's
+        // layout contract, which is what the resolve answers for the root.
+        let cursorOrigin = resolveSurfaceCursorPlacement(
+            ownerGridId: lastForwardedCursorGridId,
+            rootGridId: gridId,
+            layers: pendingSurfaceLayers ?? committedSurfaceLayers
+        ).originPx
         lock.unlock()
         let leftPx = offX + vpOriginX + cursorOrigin.x + local.minX
         let rightPx = offX + vpOriginX + cursorOrigin.x + local.maxX
@@ -2944,7 +2945,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
             let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
-            let useGpuScrollCopy = rowMode
+            // Whether a scroll blit MAY run this frame. `useGpuScrollCopy`
+            // below is whether one DID, which is what the load action and
+            // the row-pass plan ask; the main surface has always answered
+            // them from the outcome, and this surface used to hand them the
+            // permission under the same name.
+            let mayGpuScrollCopy = rowMode
                 && !layoutDamageSnapshot
                 && committedFontIsCurrent
                 && hasNewCommit
@@ -3084,14 +3090,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             var dirtyRows: [Int] = []
             swap(&dirtyRows, &dirtyRowsScratch)
             dirtyRows.removeAll(keepingCapacity: true)
-            if useGpuScrollCopy || !hasPendingScroll {
+            if mayGpuScrollCopy || !hasPendingScroll {
                 dirtyRows.append(contentsOf: submittedDirtyRows)
             }
+            var useGpuScrollCopy = false
             defer {
                 dirtyRows.removeAll(keepingCapacity: true)
                 swap(&dirtyRows, &dirtyRowsScratch)
             }
-            if useGpuScrollCopy, let scroll = pendingScroll {
+            if mayGpuScrollCopy, let scroll = pendingScroll {
                 let scrollCopy = encodePendingScrollCopy(
                     commandBuffer: cmd,
                     backTexture: backTex,
@@ -3100,6 +3107,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     scroll: scroll
                 )
                 if let scrollCopy {
+                    useGpuScrollCopy = true
                     scrollClearBand = (
                         clearTopPx: scrollCopy.clearTopPx,
                         clearBottomPx: scrollCopy.clearBottomPx
@@ -4124,6 +4132,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             scrollOffsetLatch.setActive(true)
             hostedScrollOffsetData.removeAll(keepingCapacity: true)
             hostedScrollOffsetData.append(contentsOf: hostedScrollOffsetScratch)
+            // Retire retained rows of any grid this surface draws that is no
+            // longer displaced, per grid, as the main surface does every
+            // frame. The wholesale clear in the branch below only runs once
+            // the ROOT has no offset, so a hosted float's rows outlived its
+            // own ease while the root kept scrolling and were drawn into a
+            // layer that no longer had an offset to place them under.
+            // `smoothScrollSeeds` is read under the lock that published them.
+            pruneOffsetsScratch.removeAll(keepingCapacity: true)
+            pruneOffsetsScratch.append(scrollOffset)
+            pruneOffsetsScratch.append(contentsOf: hostedScrollOffsetScratch)
+            retention.pruneUndisplaced(offsets: pruneOffsetsScratch, seedGrids: smoothScrollSeeds)
             return true  // Scroll offset is active
         } else {
             // No offset. A retained row is only meaningful while the grid is
