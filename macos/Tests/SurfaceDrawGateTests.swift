@@ -606,6 +606,28 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// A precise gesture is handed to discrete scrolling only once one event
+    /// asks for more than the lookahead can request in one input: the events
+    /// it may send per input, each worth 'mousescroll' rows. Below that the
+    /// finger keeps its sub-row compensation. The old rule cut over at one
+    /// row of travel, which an ordinary flick crosses on most events.
+    private static func verifyFastScrollThreshold() {
+        func expect(_ actual: Double, _ expected: Double, _ what: String) {
+            if abs(actual - expected) > 1e-9 {
+                failures += 1
+                print("FAIL fast-scroll threshold \(what): got \(actual) expected \(expected)")
+            }
+        }
+        // 40px rows on a 2x display, three rows per wheel event, three
+        // events per input: 9 rows = 360px = 180pt.
+        expect(fastScrollThresholdPt(rowHeightPx: 40, rowsPerWheelEvent: 3, maxEventsPerInput: 3, scale: 2), 180, "ver=3")
+        expect(fastScrollThresholdPt(rowHeightPx: 40, rowsPerWheelEvent: 1, maxEventsPerInput: 3, scale: 2), 60, "ver=1")
+        // 'mousescroll' ver:0 disables mouse scrolling; the caller never
+        // reaches this with it, but the function must not answer zero, which
+        // would hand every gesture to discrete mode.
+        expect(fastScrollThresholdPt(rowHeightPx: 40, rowsPerWheelEvent: 0, maxEventsPerInput: 3, scale: 2), 20, "ver=0 falls back to one row")
+    }
+
     static func main() {
         verifyMainSurface()
         verifyCommittedExtent()
@@ -617,6 +639,7 @@ private enum SurfaceDrawGateTests {
         verifyIdleCounter()
         verifyMainRowPass()
         verifyExternalRowPass()
+        verifyFastScrollThreshold()
 
         // A term a surface does not have must never block its skip. The main
         // surface has no staged scroll, no scroll-offset latch and no cursor

@@ -218,6 +218,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// and tickScrollEdgeBounce to prevent stale zero-offset entries from keeping
     /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
     private static let scrollOffsetEpsilon: CGFloat = 1.0
+    /// Wheel events the lookahead may send for one scroll input. Also the
+    /// bound `fastScrollThresholdPt` derives the discrete cut-over from.
+    private static let maxLookaheadEventsPerInput = 3
 
     /// Upper bound on the total scroll-offset entry count (directly-scrolled
     /// windows + followed floats combined) passed to the renderer each
@@ -2266,7 +2269,15 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // Disable pixel scrolling for fast scrolling to prevent overwhelming Neovim
         // If deltaY is large (fast scroll), switch to cell-based scrolling
         if effectiveHasPrecise && edgeBlockedNow != true {
-            let fastScrollThreshold = rowHeightPx / scale  // ~20 points at 2x scale
+            // What the lookahead below can request in one input (see its
+            // `scrollCount < Self.maxLookaheadEventsPerInput`); the rule and
+            // its reasons are on the function.
+            let fastScrollThreshold = CGFloat(fastScrollThresholdPt(
+                rowHeightPx: Double(rowHeightPx),
+                rowsPerWheelEvent: rowsPerWheelEvent,
+                maxEventsPerInput: Self.maxLookaheadEventsPerInput,
+                scale: Double(scale)
+            ))
             if abs(deltaY) > fastScrollThreshold {
                 effectiveHasPrecise = false
                 // Clear any accumulated offset when switching to fast mode,
@@ -2429,7 +2440,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 let sendDirection: CGFloat = deltaYPx > 0 ? 1 : -1
                 // A row already asked for but not yet landed is already ahead.
                 var lookaheadPx = newOffset - sendDirection * rowHeightPx * CGFloat(alreadyPending)
-                while lookaheadPx * sendDirection > 0 && canSendNow && scrollCount < 3 {
+                while lookaheadPx * sendDirection > 0 && canSendNow && scrollCount < Self.maxLookaheadEventsPerInput {
                     core.sendMouseScroll(
                         gridId: gridId,
                         row: row,
