@@ -505,6 +505,16 @@ pub fn build(b: *std.Build) !void {
     const scrollbar_metrics_tests = b.addTest(.{ .root_module = scrollbar_metrics_test_mod });
     test_step.dependOn(&b.addRunArtifact(scrollbar_metrics_tests).step);
 
+    // The cursor's rectangle from its grid-local vertices. Same shape again:
+    // the bounds and the pixel inflation both frontends had written out.
+    const cursor_rect_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/cursor_rect.zig"),
+    });
+    const cursor_rect_tests = b.addTest(.{ .root_module = cursor_rect_test_mod });
+    test_step.dependOn(&b.addRunArtifact(cursor_rect_tests).step);
+
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,

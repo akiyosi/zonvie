@@ -19,6 +19,7 @@ pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
+pub const cursor_rect = @import("cursor_rect.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
@@ -1179,6 +1180,40 @@ pub const RowScrollMergeC = extern struct {
 comptime {
     if (@sizeOf(row_scroll.Staged) != 7 * 4) @compileError("zonvie_row_scroll layout drifted from the header");
     if (@offsetOf(RowScrollMergeC, "has_superseded") != 14 * 4) @compileError("field order drifted from the header");
+}
+
+comptime {
+    if (@sizeOf(cursor_rect.Rect) != 4 * 4) @compileError("zonvie_cursor_rect layout drifted from the header");
+    if (@sizeOf(cursor_rect.IntRect) != 4 * 4) @compileError("zonvie_cursor_irect layout drifted from the header");
+}
+
+/// The cursor's bounds on a surface: the vertex box moved to the origin that
+/// places its grid. False, leaving *out untouched, for no vertices.
+pub export fn zonvie_core_cursor_rect(
+    verts: ?[*]const Vertex,
+    count: usize,
+    origin_x_px: f32,
+    origin_y_px: f32,
+    out: ?*cursor_rect.Rect,
+) callconv(.c) bool {
+    const dst = out orelse return false;
+    const v = verts orelse return false;
+    dst.* = cursor_rect.bounds(Vertex, v[0..count], origin_x_px, origin_y_px) orelse return false;
+    return true;
+}
+
+/// The whole pixels a cursor rectangle touches, clipped to the surface. False
+/// when nothing is left inside it.
+pub export fn zonvie_core_cursor_rect_inflate_clip(
+    rect: ?*const cursor_rect.Rect,
+    clip_w_px: i32,
+    clip_h_px: i32,
+    out: ?*cursor_rect.IntRect,
+) callconv(.c) bool {
+    const r = rect orelse return false;
+    const dst = out orelse return false;
+    dst.* = cursor_rect.inflateClip(r.*, clip_w_px, clip_h_px) orelse return false;
+    return true;
 }
 
 /// Fold a row scroll into whatever is staged for the same grid. `existing` is
