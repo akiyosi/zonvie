@@ -1099,3 +1099,10 @@ test "the two styles are exclusive, so only one axis ever shifts" {
     try std.testing.expectEqual(@as(i32, 120), sidebar.x);
     try std.testing.expectEqual(@as(i32, 0), sidebar.y);
 }
+
+test "a blink-off frame draws no cursor vertices" {
+    const V = struct { x: f32 };
+    const cursor = [_]V{ .{ .x = 1 }, .{ .x = 2 } };
+    try std.testing.expectEqual(@as(usize, 2), helpers.cursorVertsForFrame(V, &cursor, true).len);
+    try std.testing.expectEqual(@as(usize, 0), helpers.cursorVertsForFrame(V, &cursor, false).len);
+}

@@ -2548,7 +2548,7 @@ pub export fn WndProc(
                             if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
                         }
                         if (non_row_draw) {
-                            const cursor_items: []const core.Vertex = if (app.cursor_blink_state) committed_cursor.verts.items else &.{};
+                            const cursor_items = render_helpers.cursorVertsForFrame(core.Vertex, committed_cursor.verts.items, app.cursor_blink_state);
                             if (g.drawEx(committed.flat_verts.items, cursor_items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                                 // Non-row-mode equivalent of row-mode's
