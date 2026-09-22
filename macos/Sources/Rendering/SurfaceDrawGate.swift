@@ -540,6 +540,30 @@ struct SurfaceCommittedExtent {
     }
 }
 
+/// The finger travel of one scroll event, in points, above which a precise
+/// gesture is handed to discrete wheel scrolling.
+///
+/// Discrete scrolling books nothing and drops the sub-row compensation, so
+/// every row it lands is a whole-row jump of the content — and of the cursor
+/// with it, which a cursor shader draws as a trail. It exists so a gesture
+/// faster than the lookahead can ask for rows does not run the picture past
+/// what has arrived. The old cut-over was ONE row of travel per event, which
+/// an ordinary flick crosses on most of its events: a real trackpad log
+/// switched fifteen times in one session at 22 to 29 points. The bound the
+/// lookahead actually has is what it may request per input — up to
+/// `maxEventsPerInput` wheel events, each 'mousescroll' rows — so that is the
+/// cut-over now. 'mousescroll' ver:0 disables mouse scrolling and never
+/// reaches this; it still answers one row rather than zero.
+func fastScrollThresholdPt(
+    rowHeightPx: Double,
+    rowsPerWheelEvent: Int,
+    maxEventsPerInput: Int,
+    scale: Double
+) -> Double {
+    let rows = max(1, rowsPerWheelEvent * maxEventsPerInput)
+    return rowHeightPx * Double(rows) / scale
+}
+
 /// Settle a surface's frame-side scroll state against ITS OWN commit, and
 /// take the hold its committed snapshot is read under. Returns with `lock`
 /// held.
