@@ -1125,7 +1125,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     @discardableResult
     func beginFlush() -> Bool {
         lock.lock()
-        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+        if rowCapacity.blocksDraw {
             lock.unlock()
             ZonvieCore.appLog("[ExternalGridView] beginFlush: waiting for row capacity provisioning gridId=\(gridId)")
             return false
@@ -1331,43 +1331,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             cursorOwner.commit()
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
-                // How far each hosted layer's committed placement has travelled,
-                // counted upwards to match on_grid_scroll's rowsDelta. The float
-                // ledger pairs this with the anchor's compensation so a float is
-                // not handed the offset for a step its own placement already
-                // performed. Accumulated here for the same reason the main
-                // renderer accumulates it at its own promotion: this is the only
-                // point a placement change is a discrete, known event.
-                let ledgerCellHeightPx = Float(shared.cellHeightPx ?? 0)
-                if ledgerCellHeightPx > 0 {
-                    for layer in staged where layer.gridId != gridId {
-                        guard let previous = committedSurfaceLayers.first(where: { $0.gridId == layer.gridId })
-                        else { continue }
-                        let rowsUp = Int(((previous.originPx.y - layer.originPx.y) / ledgerCellHeightPx).rounded())
-                        if rowsUp != 0 { layerPlacementRowsUp[layer.gridId, default: 0] += rowsUp }
-                    }
-                }
+                accumulateSurfaceLayerPlacementTravel(
+                    staged: staged,
+                    committed: committedSurfaceLayers,
+                    rootGridId: gridId,
+                    cellHeightPx: Float(shared.cellHeightPx ?? 0),
+                    into: &layerPlacementRowsUp
+                )
                 committedSurfaceLayers = staged
                 pendingSurfaceLayers = nil
-                // A destroyed grid's travel describes a layer that no longer
-                // exists, and its id is reused by the next float a scroll makes.
-                if layerPlacementRowsUp.count > staged.count {
-                    layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
-                        staged.contains { $0.gridId == entry.key }
-                    }
-                }
-                // Same for the debt ledger's zero and its last logged value, as
-                // the main surface prunes them: the next float to take the id
-                // would otherwise inherit the last one's baseline and start
-                // with a debt it never incurred.
-                if floatDebtBaselineSnapshot.count > staged.count {
-                    floatDebtBaselineSnapshot = floatDebtBaselineSnapshot.filter { entry in
-                        staged.contains { $0.gridId == entry.key }
-                    }
-                    hostedDebtLastLogged = hostedDebtLastLogged.filter { entry in
-                        staged.contains { $0.gridId == entry.key }
-                    }
-                }
+                pruneSurfaceLayerLedger(&layerPlacementRowsUp, to: staged)
+                pruneSurfaceLayerLedger(&floatDebtBaselineSnapshot, to: staged)
+                pruneSurfaceLayerLedger(&hostedDebtLastLogged, to: staged)
                 // Removing the last child must erase its old pixels too.
                 pendingLayoutDamage = true
             }
@@ -2518,7 +2493,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     hasScrollOffset = self.updateScrollShaderOffset()
                 }
             )
-            if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+            if rowCapacity.blocksDraw {
                 let terminal = rowCapacity.hardFailure
                 lock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity, seq: UInt32(truncatingIfNeeded: gridId))

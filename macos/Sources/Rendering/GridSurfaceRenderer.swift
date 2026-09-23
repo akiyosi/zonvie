@@ -1993,7 +1993,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     func beginFlush() -> BeginFlushResult {
         lock.lock()
-        if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+        if rowCapacity.blocksDraw {
             lock.unlock()
             ZonvieCore.appLog("[Renderer] beginFlush: waiting for row capacity provisioning")
             return .dropped
@@ -2286,20 +2286,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // anything the back texture holds for it: its rows are somewhere
             // else now, and a shift computed for the old rectangle would move
             // the wrong pixels.
+            accumulateSurfaceLayerPlacementTravel(
+                staged: staged,
+                committed: committedSurfaceLayers,
+                rootGridId: 1,
+                cellHeightPx: ledgerCellHeightPx,
+                into: &layerPlacementRowsUp
+            )
             for layer in staged where layer.gridId != 1 {
                 let previous = committedSurfaceLayers.first { $0.gridId == layer.gridId }
-                // How far this layer's committed placement has travelled, in
-                // rows, counted upwards to match on_grid_scroll's rowsDelta.
-                // The float ledger pairs the two: a float must not be handed
-                // the compensation for a scroll step its own placement has not
-                // performed yet. Accumulated here because this is the only
-                // point a placement change is a discrete, known event.
-                if let previous, ledgerCellHeightPx > 0 {
-                    let rowsUp = Int(((previous.originPx.y - layer.originPx.y) / ledgerCellHeightPx).rounded())
-                    if rowsUp != 0 {
-                        layerPlacementRowsUp[layer.gridId, default: 0] += rowsUp
-                    }
-                }
                 guard let state = layerDrawStates[layer.gridId] else { continue }
                 let unchanged = previous.map {
                     $0.originPx == layer.originPx && $0.rows == layer.rows && $0.cols == layer.cols
@@ -2311,21 +2306,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
             committedSurfaceLayers = staged
             pendingSurfaceLayers = nil
-            // A destroyed grid's travel describes a layer that no longer
-            // exists, and its id is reused by the next float a scroll creates.
-            if layerPlacementRowsUp.count > staged.count {
-                layerPlacementRowsUp = layerPlacementRowsUp.filter { entry in
-                    staged.contains { $0.gridId == entry.key }
-                }
-                scrollDebtBaseline = scrollDebtBaseline.filter { entry in
-                    staged.contains { $0.gridId == Int64(entry.key) }
-                }
-                // Or the next float to take this id inherits the last one's
-                // debt as its "already logged" value and says nothing.
-                scrollDebtLastLogged = scrollDebtLastLogged.filter { entry in
-                    staged.contains { $0.gridId == Int64(entry.key) }
-                }
-            }
+            pruneSurfaceLayerLedger(&layerPlacementRowsUp, to: staged)
+            pruneSurfaceLayerLedger(&scrollDebtBaseline, to: staged)
+            pruneSurfaceLayerLedger(&scrollDebtLastLogged, to: staged)
         }
         if didCursorWrite {
             cursorOwner.commit()
@@ -2996,7 +2979,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 commitRevision: { self.commitRevision },
                 service: { self.onBeforeCommittedSnapshot?() }
             )
-            if rowCapacity.provisioning || rowCapacity.requiredRows > 0 || rowCapacity.hardFailure {
+            if rowCapacity.blocksDraw {
                 let terminal = rowCapacity.hardFailure
                 lock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity)

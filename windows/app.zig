@@ -1119,6 +1119,22 @@ pub const TripleBufferedSurface = struct {
 
     /// Acquire the committed set for painting. Returns snapshot info.
     /// Caller must call releaseFromPaint when done.
+    /// Copy the rows `acquireForPaint` snapshotted as dirty into `keys`,
+    /// sorted and unique (the bitset iterates in order). False when the
+    /// list could not be grown, in which case it is left empty and the
+    /// caller abandons the paint. Both drivers had this loop inline.
+    pub fn snapshotDirtyRowKeys(
+        self: *const TripleBufferedSurface,
+        alloc: std.mem.Allocator,
+        keys: *std.ArrayListUnmanaged(u32),
+    ) bool {
+        keys.clearRetainingCapacity();
+        keys.ensureTotalCapacity(alloc, self.paint_dirty_snapshot.count()) catch return false;
+        var it = self.paint_dirty_snapshot.iterator(.{});
+        while (it.next()) |row_idx| keys.appendAssumeCapacity(@intCast(row_idx));
+        return true;
+    }
+
     /// Ask the next paint to redraw the whole surface. The one way either
     /// driver arms it; the main driver had the three lines inline at ten
     /// sites and the external one at one.
@@ -4405,6 +4421,39 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
 /// Draw scrollbar overlay into the current render target.
 /// Uploads scrollbar vertices to a dedicated VB and draws them at full viewport.
 /// Used by both main window and external window paint paths after row/flat drawing.
+/// Save the clean, fully composited track strip, then draw the alpha-blended
+/// overlay over it, so the next fade tick restores the copy instead of
+/// clearing and regenerating the row set. Returns the strip's rect for the
+/// present damage, or null when the track clamps away. Both drivers did the
+/// two steps in this order.
+pub fn drawScrollbarOverlayOverUnderlay(
+    g: *d3d11.Renderer,
+    vb_ptr: *?*c.ID3D11Buffer,
+    vb_bytes_ptr: *usize,
+    scrollbar_verts: []const Vertex,
+    track_rect: c.RECT,
+) !?c.RECT {
+    const captured_rect = (try g.captureScrollbarUnderlay(track_rect)) orelse return null;
+    try drawScrollbarOverlay(g, vb_ptr, vb_bytes_ptr, scrollbar_verts);
+    return captured_rect;
+}
+
+/// A frame that redraws every row still has to apply the row-buffer shift a
+/// scroll staged, or the stale slot order accumulates into the next partial
+/// frame. Both drivers had the four lines inline in their full-redraw arm.
+pub fn consumePendingVbShift(
+    alloc: std.mem.Allocator,
+    row_vbs: []RowVB,
+    shift_scratch: *std.ArrayListUnmanaged(RowVB),
+    vb_shift: i32,
+    scroll_row_start: u32,
+    scroll_row_end: u32,
+) void {
+    if (vb_shift == 0 or scroll_row_end <= scroll_row_start) return;
+    ensureShiftScratch(alloc, shift_scratch, @abs(vb_shift));
+    shiftRowVBs(row_vbs, vb_shift, scroll_row_start, scroll_row_end, shift_scratch.items);
+}
+
 pub fn drawScrollbarOverlay(
     g: *d3d11.Renderer,
     vb_ptr: *?*c.ID3D11Buffer,

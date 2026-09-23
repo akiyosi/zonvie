@@ -3675,6 +3675,53 @@ final class SurfaceRowCapacityLedger {
     init(maxRowBuffers: Int) {
         requiredVertexCounts = [Int](repeating: 0, count: maxRowBuffers)
     }
+
+    /// Neither a draw may take its committed snapshot nor a flush open its
+    /// bracket: rows are still being provisioned, or were found missing, or
+    /// cannot be provisioned at all. Both surfaces asked this with the same
+    /// three terms at both gates. Caller holds the surface lock that guards
+    /// the fields.
+    var blocksDraw: Bool {
+        provisioning || requiredRows > 0 || hardFailure
+    }
+}
+
+/// Accumulate how far each hosted layer's committed placement has travelled,
+/// in rows, counted upwards to match on_grid_scroll's rowsDelta.
+///
+/// The float ledger pairs this with the anchor's compensation so a float is
+/// not handed the offset for a scroll step its own placement has already
+/// performed. Accumulated at commit, on both surfaces, because that is the
+/// only point a placement change is a discrete, known event. Both surfaces
+/// had the arithmetic inline, character for character.
+func accumulateSurfaceLayerPlacementTravel(
+    staged: [SurfaceLayer],
+    committed: [SurfaceLayer],
+    rootGridId: Int64,
+    cellHeightPx: Float,
+    into rowsUp: inout [Int64: Int]
+) {
+    guard cellHeightPx > 0 else { return }
+    for layer in staged where layer.gridId != rootGridId {
+        guard let previous = committed.first(where: { $0.gridId == layer.gridId }) else { continue }
+        let travelled = Int(((previous.originPx.y - layer.originPx.y) / cellHeightPx).rounded())
+        if travelled != 0 { rowsUp[layer.gridId, default: 0] += travelled }
+    }
+}
+
+/// Drop a per-layer ledger's entries for grids the staged layout no longer
+/// places. A destroyed grid's entry describes a layer that no longer exists,
+/// and its id is reused by the next float a scroll makes — which would
+/// otherwise inherit the last one's travel, baseline or last-logged value.
+/// Only rebuilds the dictionary when something can have gone.
+func pruneSurfaceLayerLedger<Key: BinaryInteger, Value>(
+    _ ledger: inout [Key: Value],
+    to staged: [SurfaceLayer]
+) {
+    guard ledger.count > staged.count else { return }
+    ledger = ledger.filter { entry in
+        staged.contains { $0.gridId == Int64(entry.key) }
+    }
 }
 
 
