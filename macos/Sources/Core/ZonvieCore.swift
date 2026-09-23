@@ -1140,6 +1140,15 @@ final class ZonvieCore {
                 me.renderTraceFlushId &+= 1
                 me.terminalView?.renderer.renderTraceFlushId = me.renderTraceFlushId
                 ZonvieCore.renderTrace("flush=\(me.renderTraceFlushId) event=begin")
+                // The shader cursor has one staged slot for the whole flush,
+                // written by whichever surface draws the cursor. A measurement
+                // left by a flush that never committed describes vertices that
+                // never reached the screen, so it goes here, once per flush —
+                // not at a surface's bracket open: an external bracket opens
+                // lazily mid-flush and would drop a rect this flush already
+                // staged, and the main one returned early at its capacity gate
+                // before reaching the drop.
+                me.terminalView?.renderer.shared.shaderCursor.dropStaged()
                 let result = me.terminalView?.renderer.beginFlush() ?? .dropped
                 guard let corePtr = me.core else { return }
                 me.extViewsScratch.removeAll(keepingCapacity: true)
