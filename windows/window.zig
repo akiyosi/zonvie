@@ -2221,6 +2221,7 @@ pub export fn WndProc(
                 app.surface.paint_full = false;
                 const row_valid_count_snapshot = app.row_valid_count;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
+                const shared_metrics_gen_snapshot: u64 = app.shared_metrics_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
                 const row_h_px_snapshot: u32 = app.rowHeightPx();
                 const scrollbar_alpha_snapshot = app.scrollbar_alpha;
@@ -2234,6 +2235,7 @@ pub export fn WndProc(
                 var atlas_recreate_needed = false;
                 var atlas_recreate_w: u32 = 0;
                 var atlas_recreate_h: u32 = 0;
+                var atlas_generation: u64 = 0;
 
                 // If the glyph atlas was reset, all cached row vertex UVs are stale.
                 // Request a full re-seed so the core regenerates every row.
@@ -2250,6 +2252,7 @@ pub export fn WndProc(
                         if (reset_pending) a.atlas_reset_pending = false;
                         cur_atlas_w = a.atlas_w;
                         cur_atlas_h = a.atlas_h;
+                        atlas_generation = a.atlas_reset_generation;
                     }
                     if (reset_pending) {
                         // D3D creation/Release can pump messages. Capture the
@@ -2260,10 +2263,8 @@ pub export fn WndProc(
                         app.need_full_seed.store(true, .seq_cst);
                         app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
-                        // After atlas reset, external window paints may consume
-                        // shared pending_uploads before the main window sees them.
-                        // Schedule a full atlas upload to ensure all glyph data is present.
-                        app.atlas_full_upload_needed.store(true, .release);
+                        // The full atlas upload a reset owes is asked below of
+                        // the generation the reset bumped.
                     }
                 }
 
@@ -2319,7 +2320,7 @@ pub export fn WndProc(
                             a.atlas_reset_pending = true;
                             a.mu.unlock(core.clock.io());
                         }
-                        app.atlas_full_upload_needed.store(true, .release);
+                        app.atlas_upload.forceFull();
                         app.tbs.requestFullPaint();
                         scheduleMainPaintRetry(hwnd, app);
                         return 0;
@@ -2329,6 +2330,18 @@ pub export fn WndProc(
                 if (!paint_snapshot_ok) {
                     app.tbs.requestFullPaint();
                     scheduleMainPaintRetry(hwnd, app);
+                    return 0;
+                }
+
+                // A set generated against metrics this paint no longer has is
+                // refused before anything is drawn, as the external driver
+                // refuses it: drawn first, its rows reached back_tex at the old
+                // row height and only the present was refused. The present-time
+                // check below stays for a change landing during the draw. After
+                // the atlas recreate above, which this paint has already
+                // consumed the request for.
+                if (row_mode and committed_metrics_gen != shared_metrics_gen_snapshot) {
+                    recoverMainPaintFailure(hwnd, app);
                     return 0;
                 }
 
@@ -2361,11 +2374,10 @@ pub export fn WndProc(
                     if (gpu_ptr) |g| {
                         g.lockContext();
                         defer g.unlockContext();
-                        // Atomic read-then-clear: a plain load followed by a
-                        // separate store would let a NEW true set by the
-                        // core/RPC thread between them get silently
-                        // overwritten back to false, losing that signal.
-                        const need_full = app.atlas_full_upload_needed.swap(false, .acq_rel);
+                        // Shared with the external driver: a full upload is
+                        // owed whenever the atlas generation moved since the
+                        // last one this surface made.
+                        const need_full = app.atlas_upload.needsFull(atlas_generation);
                         if (need_full) {
                             if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
                         }
@@ -2373,12 +2385,13 @@ pub export fn WndProc(
                         if (upload.success) {
                             if (upload.cursor != app.atlas_upload_cursor) atlas_uploaded = true;
                             app.atlas_upload_cursor = upload.cursor;
+                            if (need_full) app.atlas_upload.fullUploaded(atlas_generation);
                         } else {
                             // Keep the cursor unchanged and promote every
                             // failure (including incremental upload) to a full
                             // retry. Do not draw this frame against a texture
                             // missing pixels referenced by committed UVs.
-                            app.atlas_full_upload_needed.store(true, .release);
+                            app.atlas_upload.forceFull();
                             app.tbs.requestFullPaint();
                             scheduleMainPaintRetry(hwnd, app);
                             if (log_enabled) applog.appLog("[win] atlas upload failed; requeued full paint\n", .{});
@@ -2801,12 +2814,16 @@ pub export fn WndProc(
                         const present_rects = &app.wm_paint_present_rects;
                         present_rects.clearRetainingCapacity();
                         var present_rects_fallback_full = false;
-                        // Reserve every possible rect before construction:
-                        // one span per dirty row, copied cursor/paint damage,
-                        // gutter, and scroll damage. If reservation fails we
-                        // still draw, but force a full back-buffer present so
-                        // a truncated rect list cannot consume TBS dirty state.
-                        const present_rect_capacity = rows_to_draw.items.len + paint_rects_snapshot.items.len + 6;
+                        // Reserve every rect this paint can add: one span per
+                        // dirty row, the copied paint damage, one per layer,
+                        // and nine singletons — restored and captured
+                        // scrollbar, rcPaint, gutter, cursor, three chrome
+                        // strips, scroll damage. The external driver reserves
+                        // its exact count the same way. Any rect that still
+                        // cannot be added forces a full present rather than a
+                        // truncated list consuming dirty state.
+                        const present_rect_capacity = rows_to_draw.items.len +
+                            paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 9;
                         present_rects.ensureTotalCapacity(app.alloc, present_rect_capacity) catch {
                             present_rects_fallback_full = true;
                         };
@@ -2862,7 +2879,9 @@ pub export fn WndProc(
                                         .right = client.right,
                                         .bottom = bot0,
                                     };
-                                    present_rects.append(app.alloc, rc0) catch {};
+                                    present_rects.append(app.alloc, rc0) catch {
+                                        present_rects_fallback_full = true;
+                                    };
 
                                     span_start = r;
                                     span_end = r + 1;
@@ -2880,10 +2899,14 @@ pub export fn WndProc(
                                     .right = client.right,
                                     .bottom = bot0,
                                 };
-                                present_rects.append(app.alloc, rc0) catch {};
+                                present_rects.append(app.alloc, rc0) catch {
+                                    present_rects_fallback_full = true;
+                                };
                             }
                         } else if (dirty != null) {
-                            present_rects.append(app.alloc, dirty.?) catch {};
+                            present_rects.append(app.alloc, dirty.?) catch {
+                                present_rects_fallback_full = true;
+                            };
                         }
 
                         // Add bottom gutter rect if client area extends beyond the grid area.
@@ -2903,17 +2926,23 @@ pub export fn WndProc(
                                     .right = client.right,
                                     .bottom = client.bottom,
                                 };
-                                present_rects.append(app.alloc, gutter_rc) catch {};
+                                present_rects.append(app.alloc, gutter_rc) catch {
+                                    present_rects_fallback_full = true;
+                                };
                             }
                         }
 
                         // Always include explicit paint rects (cursor damage) in present set.
                         if (paint_rects_snapshot.items.len != 0) {
-                            present_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch {};
+                            present_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch {
+                                present_rects_fallback_full = true;
+                            };
                         }
 
                         if (cursor_rc_opt) |cr| {
-                            present_rects.append(app.alloc, cr) catch {};
+                            present_rects.append(app.alloc, cr) catch {
+                                present_rects_fallback_full = true;
+                            };
                         }
 
                         // The chrome outside the content area — the tabline with
@@ -2935,7 +2964,9 @@ pub export fn WndProc(
                                     .top = 0,
                                     .right = client.right,
                                     .bottom = content_y_offset_i32,
-                                }) catch {};
+                                }) catch {
+                                    present_rects_fallback_full = true;
+                                };
                             }
                             if (content_x_offset_i32 > 0) {
                                 present_rects.append(app.alloc, .{
@@ -2943,7 +2974,9 @@ pub export fn WndProc(
                                     .top = 0,
                                     .right = content_x_offset_i32,
                                     .bottom = client.bottom,
-                                }) catch {};
+                                }) catch {
+                                    present_rects_fallback_full = true;
+                                };
                             }
                             if (sidebar_right_width) |rw| {
                                 const right_strip_left: i32 =
@@ -2954,7 +2987,9 @@ pub export fn WndProc(
                                         .top = 0,
                                         .right = client.right,
                                         .bottom = client.bottom,
-                                    }) catch {};
+                                    }) catch {
+                                        present_rects_fallback_full = true;
+                                    };
                                 }
                             }
                         }
@@ -3435,7 +3470,9 @@ pub export fn WndProc(
                         // CopySubresourceRegion in present copies the shifted pixels
                         // to all swapchain buffers.
                         if (scroll_shift_result.scroll_rect) |sr| {
-                            present_rects.append(app.alloc, sr) catch {};
+                            present_rects.append(app.alloc, sr) catch {
+                                present_rects_fallback_full = true;
+                            };
                             // Clamped like every rect above it. applyScrollShift
                             // clips this rect to the renderer width but not to
                             // the client height, and a rect that clamps to
@@ -5353,7 +5390,7 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
-                app.atlas_full_upload_needed.store(true, .release);
+                app.atlas_upload.forceFull();
                 app.tabline_render_sig = 0;
                 app.mu.lockUncancelable(core.clock.io());
                 app.surface.paint_full = true;
@@ -5508,7 +5545,7 @@ pub export fn WndProc(
                     // Force full atlas + content reseed on the fresh device.
                     ext_win.atlas_version = 0;
                     ext_win.atlas_upload_cursor = 0;
-                    ext_win.atlas_reset_generation = 0;
+                    ext_win.atlas_upload.forceFull();
                     ext_win.dpi_scale = @as(f32, @floatFromInt(ext_dpi)) / 96.0;
                     ext_win.surface.paint_full = true;
                     ext_win.needs_redraw = true;

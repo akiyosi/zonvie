@@ -4149,13 +4149,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             retention.pruneUndisplaced(offsets: pruneOffsetsScratch, seedGrids: smoothScrollSeeds)
             return true  // Scroll offset is active
         } else {
-            // No offset. A retained row is only meaningful while the grid is
-            // displaced: with no offset it would be drawn one row outside real
-            // content.
-            retention.clearPublished()
-
+            // The root has no offset. A retained row is only meaningful while
+            // its grid is displaced, so the root's go — but a hosted float
+            // still easing keeps its own, per grid, as in the branch above and
+            // on the main surface. Clearing every grid here cut the retained
+            // band out of a float's ease the frame the root stopped.
             lock.lock()
             defer { lock.unlock() }
+
+            pruneOffsetsScratch.removeAll(keepingCapacity: true)
+            pruneOffsetsScratch.append(contentsOf: hostedScrollOffsetScratch)
+            retention.pruneUndisplaced(offsets: pruneOffsetsScratch, seedGrids: smoothScrollSeeds)
 
             scrollOffsetData = nil
             // A hosted grid easing on its own keeps this surface in a smooth
@@ -4316,7 +4320,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         lock.unlock()
 
         var best: (gridId: Int64, row: Int32, col: Int32)?
-        var bestZ = Int.min
         for layer in layers where layer.gridId != gridId {
             // A float that refuses the mouse is not a target and does not
             // shadow one: Neovim rejects an event addressed to it without
@@ -4337,8 +4340,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                           info.rows, info.marginTop, info.marginBottom, info.lineCount) != 0
                 else { continue }
             }
-            guard best == nil || layer.z > bestZ else { continue }
-            bestZ = layer.z
+            // `layers` is the core's back-to-front order (zindex, compindex,
+            // draw_order, grid_id), the order zonvie_core_resolve_pointer_grid
+            // ranks by; the last layer holding the point is the front-most.
+            // A strict `z >` kept the FIRST of equal zindex, the one drawn
+            // behind — a third rule beside the core's and Windows'.
             best = (
                 layer.gridId,
                 scrolledRow(local.y, offsetPx: local.ownOffsetPx, cellH: cellH, info: info),

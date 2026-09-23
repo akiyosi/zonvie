@@ -475,6 +475,10 @@ pub const SurfaceState = struct {
     rows: u32 = 0,
     cols: u32 = 0,
     last_cursor_row: ?u32 = null,
+    // The shared metrics generation the vertices were last written against,
+    // as `VertexSet.metrics_gen` is for a TBS set. A decorated external
+    // surface paints from here, not from TBS, and had no such stamp.
+    metrics_gen: u64 = 0,
 
     pub fn ensureRowStorage(self: *SurfaceState, alloc: std.mem.Allocator, row: u32) bool {
         const need: usize = @intCast(row + 1);
@@ -2347,7 +2351,7 @@ pub const ExternalWindow = struct {
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
-    atlas_reset_generation: u64 = 0, // Last atlas_reset_generation this window has fully re-uploaded for
+    atlas_upload: render_pipeline_helpers.AtlasUploadLedger = .{},
     atlas_upload_cursor: u64 = 0, // Per-window cursor into renderer's pending_uploads queue
     // DPI scale of the monitor this external window is currently on (may
     // differ from app.dpi_scale on a mixed-DPI multi-monitor setup). Used
@@ -5257,12 +5261,10 @@ pub const App = struct {
     pending_core_glyph_invalidate: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // After atlas reset, external window paints may consume shared pending_uploads.
     // This flag ensures the main window uploads the full atlas to cover any missed regions.
-    // Atomic: set from the core/RPC thread (callbacks.zig), consumed via a
-    // read-then-clear on the UI thread (window.zig paint path). A plain bool
-    // read-then-write is a check-then-act race — a new true set by the RPC
-    // thread between the UI thread's read and its write-back-to-false gets
-    // silently lost. swap(false, .acq_rel) makes the read+clear atomic.
-    atlas_full_upload_needed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // What the main surface's texture last received in full. UI thread only:
+    // the core thread signals by bumping the atlas's generation under its
+    // `mu`, which the paint reads.
+    atlas_upload: render_pipeline_helpers.AtlasUploadLedger = .{},
 
     // Device-loss recovery state (WM_APP_DEVICE_LOST_RECOVER). `posted`
     // dedupes the paint-side trigger. Failed attempts drive a bounded

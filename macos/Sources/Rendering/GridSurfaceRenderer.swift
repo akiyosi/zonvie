@@ -932,7 +932,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// bracket; `commitFlush` promotes it so layers and vertices become visible
     /// in the same transaction.
     func setPendingSurfaceLayers(_ layers: [SurfaceLayer]) {
+        // Under `lock`, as abortFlush and commitFlush write it and as the
+        // external surface writes its own: every reader today is on the core
+        // thread, but the external one already has a main-thread reader, and
+        // one discipline means adding a reader here cannot race.
+        lock.lock()
         pendingSurfaceLayers = layers
+        lock.unlock()
         // Removing or migrating the owner also removes its surface overlay.
         // Stage this with placement so abort preserves the old complete frame.
         if !layers.contains(where: { $0.gridId == (cursorOwner.staged ?? 1) }) {
@@ -990,6 +996,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Publish the cursor layer for a grid the surface draws as a layer. The
     /// vertices are in that grid's own pixel space.
     func submitLayerCursor(gridId: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
+        // Outside a bracket there is nothing to stage into, and staging the
+        // owner anyway moves it for a cursor no commit will publish. The
+        // external surface has always refused here; the root path warns.
+        guard isInFlush else { return }
         // Cursor clears are grid-local even though the surface has one overlay.
         guard count != 0 || cursorOwner.owns(gridId) else {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=\(gridId) owner=\(cursorOwner.staged ?? 1) reason=empty_nonowner")
@@ -1172,7 +1182,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Committed layer list for the main surface, back-to-front. Replaced
     /// wholesale by on_surface_layout and promoted at commitFlush.
-    private var pendingSurfaceLayers: [SurfaceLayer]?   // Core thread only
+    private var pendingSurfaceLayers: [SurfaceLayer]?   // Written under lock; read on the core thread
     private var committedSurfaceLayers: [SurfaceLayer] = [
         SurfaceLayer(gridId: 1, anchorGrid: 1, originPx: simd_float2(0, 0), rows: 0, cols: 0, z: 0, followsScroll: false)
     ]                                                    // Protected by lock
@@ -2011,9 +2021,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
             lock.unlock()
         }
-        // Same reason: a cursor measured by a bracket that never committed
-        // describes vertices that never reached the screen.
-        shared.shaderCursor.dropStaged()
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         layerGridsPreparedThisFlush = false

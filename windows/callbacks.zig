@@ -1204,6 +1204,7 @@ pub fn onVerticesRow(
             }
             ext_win.surface.rows = total_rows;
             ext_win.surface.cols = total_cols;
+            ext_win.surface.metrics_gen = app.shared_metrics_gen;
             ext_win.needs_redraw = true;
             if (size_changed) {
                 ext_win.surface.paint_full = true;
@@ -2343,10 +2344,8 @@ pub fn onAtlasUpload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, hei
             // failure point is the dirty-rect enqueue (OOM). The core caches
             // the GlyphEntry as valid after this callback, so without
             // recovery the glyph would stay blank until an atlas reset.
-            // Recover from the mirror: schedule a full-atlas upload for the
-            // main window and bump the reset generation so every external
-            // window also re-uploads the full atlas from atlas_cpu.
-            app.atlas_full_upload_needed.store(true, .release);
+            // Recover from the mirror: bump the reset generation so every
+            // surface, main included, re-uploads the full atlas from atlas_cpu.
             a.mu.lockUncancelable(core.clock.io());
             a.atlas_reset_generation +%= 1;
             a.mu.unlock(core.clock.io());
