@@ -2970,6 +2970,30 @@ func displacedLayerOriginPx(
     return simd_float2(originPx.x, originPx.y - offset.offset_y * viewportHeightPx / 2)
 }
 
+/// The displacement, in pixels, a surface folds into the shared shader cursor
+/// rect this frame, or nil when the cursor is not this surface's to displace.
+///
+/// The rect is one value for every surface and each folds in the displacement
+/// IT draws the cursor's grid with. Two facts decide, the same way on both
+/// surfaces: the rect's grid is this surface's when it is the grid its own
+/// committed cursor owner names; and the displacement is recovered from the
+/// offset that grid is DRAWN with — debt and all — against the viewport height
+/// the NDC was built on, so the effect and the body cannot answer different
+/// numbers. The main surface used to take the pixels from the input side and
+/// fold the debt in separately; the external one recovered them here. Both are
+/// the same value while the height is the latched one, and this is the shorter
+/// road to it. A grid with no offset stands still, and so does its effect.
+func surfaceShaderCursorOffsetPx(
+    rawGridId: Int64,
+    ownerGridId: Int64,
+    offset: GridSurfaceRenderer.ScrollOffset?,
+    viewportHeightPx: Float
+) -> Float? {
+    guard rawGridId == ownerGridId else { return nil }
+    guard let offset, viewportHeightPx > 0, offset.offset_y.isFinite else { return 0 }
+    return -offset.offset_y * viewportHeightPx / 2.0
+}
+
 /// The rows of a grid a pixel may be mapped into, and the band of them the
 /// sub-row ease actually moves.
 struct GridRowBand: Equatable {

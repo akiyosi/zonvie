@@ -540,6 +540,22 @@ test "single sorted row insertion reports OOM without consuming scroll damage" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, success_rows.items);
 }
 
+test "cursor erase rows are claimed only for a root cursor and only in range" {
+    var rows: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows.deinit(std.testing.allocator);
+    try rows.append(std.testing.allocator, 5);
+
+    // A layer's cursor claims nothing from the root.
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 1, 2 }, 10, false);
+    try std.testing.expectEqualSlices(u32, &.{5}, rows.items);
+
+    // A root cursor claims where it was and where it lands, in order, and a
+    // row past the limit or absent is skipped.
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 7, null }, 10, true);
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 2, 10 }, 10, true);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7 }, rows.items);
+}
+
 test "cursor replacement dirties old and new rows" {
     var storage: [2]usize = undefined;
     try std.testing.expectEqualSlices(

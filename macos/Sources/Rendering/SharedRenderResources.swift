@@ -597,15 +597,6 @@ final class SurfaceShaderCursor {
         )
     }
 
-    /// Whether the cursor a shader is drawing belongs to this grid. A surface
-    /// asks before applying its own scroll displacement to the rect, so it does
-    /// not displace a rect belonging to another grid.
-    func belongs(toGrid grid: Int64) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return gridId == grid
-    }
-
     /// Stage the cursor state a flush just measured. Published by `publish()`
     /// when that flush commits — see `staged` for why it cannot go straight
     /// out. Called from the vertex-submit path (core/RPC thread) while a draw

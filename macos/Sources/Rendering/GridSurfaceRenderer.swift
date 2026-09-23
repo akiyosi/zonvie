@@ -997,12 +997,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=1 grid=\(gridId) vertices=\(count)")
         cursorOwner.stage(gridId)
-        // A layer's cursor is in that grid's rows, not the root's, so the root
-        // row this records is no longer valid. The blink fast path refuses a
-        // non-root owner anyway; -1 says so without relying on that.
-        lock.lock()
-        stagedCursorRow = -1
-        lock.unlock()
         submitVerticesPartialRaw(
             mainPtr: nil,
             mainCount: 0,
@@ -1198,16 +1192,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var cursorSlots: [SurfaceCursorSlot] = [
         SurfaceCursorSlot(), SurfaceCursorSlot(), SurfaceCursorSlot()
     ]
-    /// The root row the core last named for the cursor, or -1 when the cursor
-    /// is on a layer. Recorded at submit the way ExternalGridView does it, in
-    /// place of rediscovering it from the committed vertices on every frame.
-    /// Protected by `lock`.
-    /// The root row of the committed cursor, or -1 when a layer owns it.
-    /// Published at commit from `stagedCursorRow`, with the cursor set it
-    /// describes: read at submit time it named the NEXT flush's cursor while
-    /// the frame drew the committed one — the same skew the shader rect had.
-    private var lastKnownCursorRow: Int = -1
-    private var stagedCursorRow: Int = -1
     private var committedCursorSetIndex: Int = 0 // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
     // Complete row metadata is retained independently in all three sets. A
@@ -1703,11 +1687,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// protected by `lock` and consumed in `applyFloatScrollDebt`.
     private var scrollDebtAnchorRowsUp: [Int32: Int32] = [:]
     private var scrollDebtBaseline: [Int32: FloatDebtBaseline] = [:]
-    /// A cell's height in the NDC the offsets above were built in, and in the
-    /// pixels the cursor rect is measured in. Kept so the debt, which is
-    /// counted in rows, can be paid in either set of units.
+    /// A cell's height in the NDC the offsets above were built in, so the
+    /// debt, which is counted in rows, can be paid in them.
     private var scrollDebtCellHeightNDC: Float = 0
-    private var scrollDebtCellHeightPx: Float = 0
+    /// The viewport height those NDC were built against. Written under `lock`
+    /// with them; draw recovers the shader cursor's pixels from it.
+    private var scrollOffsetViewportHeight: Float = 0
     /// Last debt logged per grid. The ledger had no logging at all, and the
     /// `[renderer] scroll offset` line reports the offset BEFORE the debt is
     /// paid, so a float held by the ledger looked identical to one that was
@@ -1743,13 +1728,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Both counters run from whenever their grid appeared, so the first frame
     /// a float is seen following fixes the zero they are compared against.
     ///
-    /// Returns the debt, in pixels, withheld from the grid that owns the
-    /// shader cursor: the cursor rect is displaced by that grid's offset, and
-    /// a cursor left on the raw one would sit a whole step off the rows it
-    /// belongs to for the length of the mismatch.
-    private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset], cursorGridId: Int64) -> Float {
-        var cursorDebtPx: Float = 0
-        guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return cursorDebtPx }
+    /// The shader cursor is evaluated from the offsets this leaves, so the
+    /// debt withheld from the cursor's grid reaches its effect too.
+    private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset]) {
+        guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return }
         for i in snapshot.indices {
             let gid = snapshot[i].grid_id
             guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { continue }
@@ -1774,11 +1756,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // offset_y is NDC and negated against the pixel offset the view
             // built (see computeScrollOffset), so withholding pixels adds here.
             snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
-            if Int64(gid) == cursorGridId {
-                cursorDebtPx = Float(debtRows) * scrollDebtCellHeightPx
-            }
         }
-        return cursorDebtPx
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -1859,11 +1837,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Last cursor rect handed to a shader, so the log fires on change only.
     /// Per-surface, because each logs the rect IT hands its own shader.
     private var lastLoggedShaderCursor: (Float, Float, Float, Float) = (0, 0, 0, 0)
-    /// Displacement of the cursor's grid as of the last offset rebuild. Cached
-    /// because `updateScrollOffsets` is skipped entirely on idle frames, while
-    /// the cursor still moves — the evaluation has to run every frame or the
-    /// shader keeps whatever endpoints the last scrolled frame left it.
-    private var shaderCursorScrollOffsetPx: Float = 0
     /// Set by the pre-draw when the shader's cursor rect moved; consumed by
     /// this frame's idle gate. Draw thread only.
     private var shaderCursorMovedThisFrame = false
@@ -2306,7 +2279,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
         if didCursorWrite {
             committedCursorSetIndex = cursorWriteSetIndex
-            lastKnownCursorRow = stagedCursorRow
         }
         // Layers and the vertices they place become visible together.
         if let staged = pendingSurfaceLayers {
@@ -2692,20 +2664,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // the same reasoning), not unconditionally on every scrolled frame.
         scrollOffsetData.removeAll(keepingCapacity: true)
         scrollOffsetData.reserveCapacity(offsets.count)
-        // Taken in pixels straight from the input side rather than recovered
-        // from the NDC below: the NDC is built against a cell-snapped height
-        // that need not match the back buffer the cursor rect was measured in.
-        // Any entry for the cursor's grid displaces it: cursor vertices always
-        // carry DECO_SCROLLABLE (flush.zig), and a bodily-moved float
-        // (move_all) translates every vertex it owns.
-        var cursorScrollOffsetPx: Float = 0
         scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
         scrollDebtCellHeightNDC = cellHeightNDC
-        scrollDebtCellHeightPx = cellHeightPx
+        scrollOffsetViewportHeight = drawableHeight
         for info in offsets {
-            if shared.shaderCursor.belongs(toGrid: info.gridId) {
-                cursorScrollOffsetPx = info.offsetYPx
-            }
             if let anchorRowsUp = info.debtAnchorRowsUp {
                 scrollDebtAnchorRowsUp[Int32(clamping: info.gridId)] = anchorRowsUp
             }
@@ -2746,31 +2708,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
         // This eliminates the GPU/CPU race on shared MTLBuffers.
         scrollOffsetLatch.setActive(count > 0)
-        // This surface owns the cursor's grid whenever it appears in its own
-        // offsets, and a grid with no entry is simply not displaced. The rect
-        // is evaluated once per frame, in draw's committed snapshot, from this
-        // cached value; the frames that do not rebuild the offsets (nothing is
-        // scrolling, the cursor still moves) read the value the last rebuild
-        // left, which ran with an empty offset set.
-        shaderCursorScrollOffsetPx = cursorScrollOffsetPx
-    }
-
-    /// The displacement this surface folds into the shared cursor rect, or nil
-    /// when the cursor's grid is drawn by another surface.
-    ///
-    /// The rect is one value for every surface, and each folds in the
-    /// displacement IT draws that grid with. A grid this surface does not draw
-    /// has no entry in its offsets, so the cached value is zero — and passing
-    /// that zero evaluated the rect without the ease an external window was
-    /// drawing it with, once per main frame, flicking the cursor shader a row
-    /// off the cursor. Nil is what the external surface answers for a grid it
-    /// does not draw (`cursorScrollOffsetPxForShader`); this is the same rule.
-    /// Asked of the frame's snapshot of the rect's grid, not the live value.
-    /// Caller holds `lock`: `committedSurfaceLayers` is written under it.
-    private func shaderCursorOffsetIfDrawnHereLocked(cursorGridId owner: Int64) -> Float? {
-        guard owner == 1 || committedSurfaceLayers.contains(where: { $0.gridId == owner })
-        else { return nil }
-        return shaderCursorScrollOffsetPx
     }
 
     /// Arm (or, with a nil span, disarm) the retention capture for a grid.
@@ -3094,16 +3031,21 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
             cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
-            let cursorDebtPx = applyFloatScrollDebt(
-                to: &scrollSnapshot,
-                cursorGridId: cursorShaderRawSnapshot.gridId
-            )
+            applyFloatScrollDebt(to: &scrollSnapshot)
             // The one evaluation of the shader cursor this frame, against the
             // rect and the displacement of the commit it draws — the same
-            // point the external surface evaluates at. A moved rect is
-            // whole-surface fragment work, latched for the idle gate below.
-            if let offsetPx = shaderCursorOffsetIfDrawnHereLocked(cursorGridId: cursorShaderRawSnapshot.gridId),
-               shared.shaderCursor.evaluate(scrollOffsetPx: offsetPx - cursorDebtPx, raw: cursorShaderRawSnapshot) {
+            // point, and the same rule, as the external surface. The cursor's
+            // grid is displaced by whichever entry names it: cursor vertices
+            // always carry DECO_SCROLLABLE (flush.zig), and a bodily-moved
+            // float (move_all) translates every vertex it owns. A moved rect
+            // is whole-surface fragment work, latched for the idle gate below.
+            let cursorShaderOffsetPx = surfaceShaderCursorOffsetPx(
+                rawGridId: cursorShaderRawSnapshot.gridId,
+                ownerGridId: cursorOwner.committed ?? 1,
+                offset: scrollSnapshot.first { Int64($0.grid_id) == cursorShaderRawSnapshot.gridId },
+                viewportHeightPx: scrollOffsetViewportHeight
+            )
+            if shared.shaderCursor.evaluate(scrollOffsetPx: cursorShaderOffsetPx, raw: cursorShaderRawSnapshot) {
                 shaderCursorMovedThisFrame = true
             }
             // Retire retained rows whose grid is no longer displaced. Also here,
@@ -3147,7 +3089,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             }
             cursorLayerOriginSnapshot = committedCursorPlacement.originPx
             cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
-            lastKnownCursorRowSnapshot = lastKnownCursorRow
+            lastKnownCursorRowSnapshot = cursorOwner.committedRootRow
             snappedBgRGB = surfaceBgRGB
             snappedCommittedExtent = committedExtent
             lock.unlock()
@@ -5397,10 +5339,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=1 grid=1 owner=\(cursorOwner.staged ?? 1) reason=empty_nonowner")
                 return
             }
-            cursorOwner.stage(1)
-            lock.lock()
-            stagedCursorRow = rowStart
-            lock.unlock()
+            cursorOwner.stage(1, rootRow: rowStart)
             submitVerticesPartialRaw(
                 mainPtr: nil,
                 mainCount: 0,

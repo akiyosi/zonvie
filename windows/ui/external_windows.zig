@@ -787,13 +787,13 @@ fn drawNormalExternalSurfaceRowMode(
     // unchanged. This used to be claimed only when layers were present, and the
     // no-layer case was covered by the overlay's erase branch instead — a
     // full-content-width clear that the layer case already had to forbid.
-    if (cursor_on_root) {
-        for (cursor_erase_rows) |maybe_row| {
-            const r = maybe_row orelse continue;
-            if (r >= ext_rows) continue;
-            _ = render_pipeline_helpers.insertSortedRow(app.alloc, rows_to_draw, r);
-        }
-    }
+    render_pipeline_helpers.insertCursorEraseRows(
+        app.alloc,
+        rows_to_draw,
+        cursor_erase_rows,
+        ext_rows,
+        cursor_on_root,
+    );
 
     const has_cursor = tbs_cursor.verts.items.len > 0;
     // Publish it for the blink timer, which must not invalidate a surface whose
@@ -968,30 +968,18 @@ fn drawNormalExternalSurfaceRowMode(
             .log_enabled = log_enabled,
         });
 
-        // Layers paint whole; present each one that changed. Their rows are
-        // not in rows_to_draw, which only covers the root grid's own dirty
-        // rows. Under the same lock as the plan and the draw, so a store
-        // landing between them cannot have its flag dropped below.
-        const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
-        const client_right: i32 = @intCast(g.width);
-        const client_bottom: i32 = @intCast(draw_params.content_height);
-        for (tbs_snap.layers.slice()[1..]) |layer| {
-            const state = app.layer_grids.get(layer.grid_id) orelse continue;
-            state.paint_has_present_rect = false;
-            if (!state.dirty) continue;
-            const l: i32 = @max(0, layer.x_px);
-            const t: i32 = @max(0, layer.y_px);
-            const rc: c.RECT = .{
-                .left = l,
-                .top = t,
-                .right = @min(client_right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
-                .bottom = @min(client_bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
-            };
-            if (rc.right > rc.left and rc.bottom > rc.top) {
-                present_rects.appendAssumeCapacity(rc);
-                state.paint_has_present_rect = true;
-            }
-        }
+        // Under the same lock as the plan and the draw, so a store landing
+        // between them cannot have its flag dropped below. Reserved above.
+        app_mod.appendLayerPresentRects(
+            app,
+            tbs_snap.layers.slice(),
+            0,
+            0,
+            @intCast(g.width),
+            @intCast(draw_params.content_height),
+            row_h_px,
+            present_rects,
+        );
     }
 
     const row_frame = app_mod.drawSurfaceRowFrame(g, app, .{
@@ -2505,20 +2493,8 @@ pub export fn ExternalWndProc(
                     }
                 }
                 app.mu.unlock(core.clock.io());
-                if (app.wm_paint_in_progress or
-                    app.in_present_shader_animation_frame or
-                    app.glow_prepare_in_progress or
-                    app.device_lost_recovering or
-                    app.main_resize_in_progress or
-                    app.main_dpi_change_in_progress)
-                {
-                    // Reentrant WM_PAINT on the shared App/Renderer — see
-                    // the identical guard in window.zig's WM_PAINT handler
-                    // for why this must not call into g.lockContext().
-                    var ps_reentrant: c.PAINTSTRUCT = undefined;
-                    _ = c.BeginPaint(hwnd, &ps_reentrant);
-                    _ = c.EndPaint(hwnd, &ps_reentrant);
-                    app.wm_paint_reinvalidate_all = true;
+                if (app.paintReentrancyBlocked()) {
+                    app.consumeReentrantPaint(hwnd);
                     return 0;
                 }
                 app.wm_paint_in_progress = true;
@@ -3589,10 +3565,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Cover the committed-set and atlas-generation snapshots as well as the
     // draw. A reset that commits in the gap between those snapshots and a
     // late admission check would pair old vertex UVs with the new atlas.
-    if (!app.beginAtlasPaint()) {
-        ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ext_win.tbs.pending_paint_full = true;
-        ext_win.tbs.rotation_mu.unlock(core.clock.io());
+    if (!app.beginAtlasPaintOrRequestFull(&ext_win.tbs)) {
         app.mu.unlock(core.clock.io());
         return;
     }
@@ -4025,17 +3998,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
-                app.row_vb_budget_failed = true;
-                // Unlike every other failure here, this one does not requeue a
-                // full paint, so nothing would restore the per-layer redraw set
-                // planLayerFrame already swapped out. The main window re-arms
-                // on its own budget failure for the same reason.
-                if (tbs_snapshot.layers.len > 1) {
-                    app.mu.lockUncancelable(core.clock.io());
-                    app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
-                    app.mu.unlock(core.clock.io());
-                }
-                if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
                 return;
             }
             requeueExternalFullPaint(app, grid_id, hwnd);

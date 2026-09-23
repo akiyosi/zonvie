@@ -551,6 +551,38 @@ private enum SurfaceDrawGateTests {
             failures += 1
             print("FAIL: a rooted owner does not own exactly its root")
         }
+
+        // The root row travels with the owner through the same bracket: a
+        // root cursor names its row, a layer cursor names none (-1), and an
+        // abandoned bracket puts the row back with the owner. Both surfaces
+        // kept the row beside the owner and one of them forgot the -1.
+        var rowed = SurfaceCursorOwner(initial: 1)
+        rowed.stage(1, rootRow: 7)
+        if rowed.committedRootRow != -1 {
+            failures += 1
+            print("FAIL: a staged row was visible before commit")
+        }
+        rowed.commit()
+        if rowed.committedRootRow != 7 {
+            failures += 1
+            print("FAIL: commit did not publish the staged row")
+        }
+        rowed.stage(4)
+        if rowed.stagedRootRow != -1 {
+            failures += 1
+            print("FAIL: a layer cursor kept the root row \(rowed.stagedRootRow)")
+        }
+        rowed.restoreStagedFromCommitted()
+        if rowed.stagedRootRow != 7 || rowed.staged != 1 {
+            failures += 1
+            print("FAIL: abandoning did not put the row back with the owner")
+        }
+        rowed.stage(4)
+        rowed.commit()
+        if rowed.committedRootRow != -1 {
+            failures += 1
+            print("FAIL: a committed layer cursor still names a root row")
+        }
     }
 
     /// The committed extent both surfaces now share, against the two fallback

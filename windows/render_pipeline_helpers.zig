@@ -647,6 +647,27 @@ pub fn insertSortedRow(
     return true;
 }
 
+/// Claim the two root rows a cursor move touches — where the previous cursor
+/// was baked into the back texture and where this one lands — so they are
+/// repainted from the root's own vertices, which is what removes the previous
+/// cursor. Only for a cursor on the root: a layer's cursor rows are that
+/// grid's, and its layer repaints whole. Rows past `row_limit` are skipped.
+/// Both drivers collected the same pair.
+pub fn insertCursorEraseRows(
+    alloc: std.mem.Allocator,
+    rows: *std.ArrayListUnmanaged(u32),
+    erase_rows: [2]?u32,
+    row_limit: u32,
+    cursor_on_root: bool,
+) void {
+    if (!cursor_on_root) return;
+    for (erase_rows) |maybe_row| {
+        const r = maybe_row orelse continue;
+        if (r >= row_limit) continue;
+        _ = insertSortedRow(alloc, rows, r);
+    }
+}
+
 /// Return the in-bounds logical rows that must be redrawn when replacing a
 /// cursor overlay. The old row erases the previously presented cursor; the
 /// new row restores content before the replacement overlay is drawn.

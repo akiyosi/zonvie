@@ -1054,13 +1054,7 @@ fn armFlushRetryWake(hwnd: c.HWND, app: *App) void {
 /// deadline in serviceDeferredUiRetries runs with that flag set, and it is the
 /// path that picks the retry back up after this returns true.
 fn flushRetryReentrancyBlocked(app: *const App) bool {
-    return app.wm_paint_in_progress or
-        app.in_present_shader_animation_frame or
-        app.glow_prepare_in_progress or
-        app.device_lost_recovering or
-        app.external_window_create_in_progress or
-        app.main_resize_in_progress or
-        app.main_dpi_change_in_progress;
+    return app.paintReentrancyBlocked() or app.external_window_create_in_progress;
 }
 
 fn consumeFlushRetryWake(hwnd: c.HWND, app: *App) void {
@@ -2034,19 +2028,8 @@ pub export fn WndProc(
                 // same D3D immediate context — either one's DXGI Present()
                 // can pump the Win32 message queue and deliver this WM_PAINT
                 // reentrantly on the same thread.
-                if (app.wm_paint_in_progress or app.in_present_shader_animation_frame or app.glow_prepare_in_progress or app.device_lost_recovering or app.main_resize_in_progress or app.main_dpi_change_in_progress) {
-                    // Still consume BeginPaint/EndPaint so Windows stops
-                    // re-issuing WM_PAINT, but skip rendering entirely and
-                    // ask for a follow-up paint once the outer call finishes
-                    // instead of self-deadlocking / corrupting immediate
-                    // context state. device_lost_recovering: device/D2D/
-                    // swapchain creation in WM_APP_DEVICE_LOST_RECOVER can
-                    // pump messages and reenter WM_PAINT on this same UI
-                    // thread while that handler still holds app.mu.
-                    var ps_reentrant: c.PAINTSTRUCT = undefined;
-                    _ = c.BeginPaint(hwnd, &ps_reentrant);
-                    _ = c.EndPaint(hwnd, &ps_reentrant);
-                    app.wm_paint_reinvalidate_all = true;
+                if (app.paintReentrancyBlocked()) {
+                    app.consumeReentrantPaint(hwnd);
                     return 0;
                 }
                 // Also completes closes whose PostMessageW failed because the
@@ -2187,12 +2170,7 @@ pub export fn WndProc(
                 // not only the eventual draw. Otherwise a reset can commit
                 // between acquireForPaint() and a later admission check, leaving
                 // this paint with old UVs and the newly uploaded atlas.
-                if (!app.beginAtlasPaint()) {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
-                    return 0;
-                }
+                if (!app.beginAtlasPaintOrRequestFull(&app.tbs)) return 0;
                 defer app.endAtlasPaint();
 
                 // Step 1: TBS acquire (rotation_mu short lock).
@@ -2351,18 +2329,14 @@ pub export fn WndProc(
                             a.mu.unlock(core.clock.io());
                         }
                         app.atlas_full_upload_needed.store(true, .release);
-                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                        app.tbs.pending_paint_full = true;
-                        app.tbs.rotation_mu.unlock(core.clock.io());
+                        app.tbs.requestFullPaint();
                         scheduleMainPaintRetry(hwnd, app);
                         return 0;
                     }
                 }
 
                 if (!paint_snapshot_ok) {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
+                    app.tbs.requestFullPaint();
                     scheduleMainPaintRetry(hwnd, app);
                     return 0;
                 }
@@ -2414,9 +2388,7 @@ pub export fn WndProc(
                             // retry. Do not draw this frame against a texture
                             // missing pixels referenced by committed UVs.
                             app.atlas_full_upload_needed.store(true, .release);
-                            app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                            app.tbs.pending_paint_full = true;
-                            app.tbs.rotation_mu.unlock(core.clock.io());
+                            app.tbs.requestFullPaint();
                             scheduleMainPaintRetry(hwnd, app);
                             if (log_enabled) applog.appLog("[win] atlas upload failed; requeued full paint\n", .{});
                             return 0;
@@ -2681,9 +2653,7 @@ pub export fn WndProc(
                             total_rows_for_enum,
                             max_valid_row,
                         )) {
-                            app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                            app.tbs.pending_paint_full = true;
-                            app.tbs.rotation_mu.unlock(core.clock.io());
+                            app.tbs.requestFullPaint();
                             scheduleMainPaintRetry(hwnd, app);
                             return 0;
                         }
@@ -2695,11 +2665,7 @@ pub export fn WndProc(
                             app.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
                             app.mu.unlock(core.clock.io());
-                            {
-                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                app.tbs.pending_paint_full = true;
-                                app.tbs.rotation_mu.unlock(core.clock.io());
-                            }
+                            app.tbs.requestFullPaint();
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
 
@@ -2832,13 +2798,13 @@ pub export fn WndProc(
                             app.last_painted_cursor_row,
                             committed_cursor.last_cursor_row,
                         };
-                        if (cursor_grid == 1) {
-                            for (cursor_erase_rows) |maybe_row| {
-                                const r = maybe_row orelse continue;
-                                if (r >= max_valid_row) continue;
-                                _ = render_helpers.insertSortedRow(app.alloc, rows_to_draw, r);
-                            }
-                        }
+                        render_helpers.insertCursorEraseRows(
+                            app.alloc,
+                            rows_to_draw,
+                            cursor_erase_rows,
+                            max_valid_row,
+                            cursor_grid == 1,
+                        );
 
                         // Use persistent buffer to avoid per-frame alloc/free.
                         const present_rects = &app.wm_paint_present_rects;
@@ -3014,24 +2980,16 @@ pub export fn WndProc(
                         if (tbs_snapshot.layers.len > 1) {
                             app.mu.lockUncancelable(core.clock.io());
                             defer app.mu.unlock(core.clock.io());
-                            const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
-                            for (tbs_snapshot.layers.slice()[1..]) |layer| {
-                                const state = app.layer_grids.get(layer.grid_id) orelse continue;
-                                state.paint_has_present_rect = false;
-                                if (!state.dirty) continue;
-                                const l: i32 = @max(0, content_x_offset_i32 + layer.x_px);
-                                const t: i32 = @max(0, content_y_offset_i32 + layer.y_px);
-                                const rc: c.RECT = .{
-                                    .left = l,
-                                    .top = t,
-                                    .right = @min(client.right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
-                                    .bottom = @min(client.bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
-                                };
-                                if (rc.right > rc.left and rc.bottom > rc.top) {
-                                    present_rects.append(app.alloc, rc) catch continue;
-                                    state.paint_has_present_rect = true;
-                                }
-                            }
+                            app_mod.appendLayerPresentRects(
+                                app,
+                                tbs_snapshot.layers.slice(),
+                                content_x_offset_i32,
+                                content_y_offset_i32,
+                                client.right,
+                                client.bottom,
+                                row_h_px,
+                                present_rects,
+                            );
                         }
 
                         // Clamp first, then compact in place with O(n log n)
@@ -3197,9 +3155,7 @@ pub export fn WndProc(
                                 &app.row_vb_retained_bytes,
                                 need_len,
                             )) {
-                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                app.tbs.pending_paint_full = true;
-                                app.tbs.rotation_mu.unlock(core.clock.io());
+                                app.tbs.requestFullPaint();
                                 scheduleMainPaintRetry(hwnd, app);
                                 return 0;
                             }
@@ -3228,9 +3184,7 @@ pub export fn WndProc(
                                     content_y_offset_i32,
                                 );
                                 if (!scroll_shift_result.rows_complete) {
-                                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                    app.tbs.pending_paint_full = true;
-                                    app.tbs.rotation_mu.unlock(core.clock.io());
+                                    app.tbs.requestFullPaint();
                                     scheduleMainPaintRetry(hwnd, app);
                                     return 0;
                                 }
@@ -3324,15 +3278,7 @@ pub export fn WndProc(
                             .log_enabled = log_enabled,
                         });
                         if (row_frame.row_vb_budget_exceeded) {
-                            app.row_vb_budget_failed = true;
-                            // Nothing reaches drawSurfaceLayers on this path,
-                            // so the plan taken above is never paid for.
-                            if (tbs_snapshot.layers.len > 1) {
-                                app.mu.lockUncancelable(core.clock.io());
-                                app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
-                                app.mu.unlock(core.clock.io());
-                            }
-                            if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                            app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
                             return 0;
                         }
 
@@ -3660,11 +3606,7 @@ pub export fn WndProc(
                                     app.seed_clear_pending = true;
                                     app.mu.unlock(core.clock.io());
                                     // Also set TBS pending_paint_full for next paint cycle.
-                                    {
-                                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                        app.tbs.pending_paint_full = true;
-                                        app.tbs.rotation_mu.unlock(core.clock.io());
-                                    }
+                                    app.tbs.requestFullPaint();
                                     if (log_enabled) applog.appLog(
                                         "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
                                         .{ effective_rows, effective_row_valid_count },
@@ -3899,14 +3841,7 @@ pub export fn WndProc(
                 // here would self-deadlock. Replay the complete WM_SIZE path
                 // after recovery: rebuilding the swapchain from GetClientRect
                 // fixes GPU size, but does not resend rows/cols to Neovim.
-                if (app.device_lost_recovering or
-                    app.main_resize_in_progress or
-                    app.main_dpi_change_in_progress or
-                    app.wm_paint_in_progress or
-                    app.in_present_shader_animation_frame or
-                    app.glow_prepare_in_progress or
-                    app.external_window_create_in_progress)
-                {
+                if (app.paintReentrancyBlocked() or app.external_window_create_in_progress) {
                     app.main_size_replay_needed = true;
                     if (app.device_lost_recovering) scheduleMainSizeReplay(hwnd, app);
                     return 0;
@@ -5434,9 +5369,7 @@ pub export fn WndProc(
                 app.surface.paint_full = true;
                 app.mu.unlock(core.clock.io());
                 {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
+                    app.tbs.requestFullPaint();
                 }
 
                 // 5. External windows share the App device rebuilt above.

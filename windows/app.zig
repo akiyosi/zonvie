@@ -1119,6 +1119,15 @@ pub const TripleBufferedSurface = struct {
 
     /// Acquire the committed set for painting. Returns snapshot info.
     /// Caller must call releaseFromPaint when done.
+    /// Ask the next paint to redraw the whole surface. The one way either
+    /// driver arms it; the main driver had the three lines inline at ten
+    /// sites and the external one at one.
+    pub fn requestFullPaint(self: *TripleBufferedSurface) void {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        self.pending_paint_full = true;
+        self.rotation_mu.unlock(core.clock.io());
+    }
+
     pub fn acquireForPaint(self: *TripleBufferedSurface, alloc: std.mem.Allocator) PaintSnapshot {
         self.rotation_mu.lockUncancelable(core.clock.io());
         defer self.rotation_mu.unlock(core.clock.io());
@@ -3922,6 +3931,58 @@ pub fn rearmLayerDraw(app: *App, layers: []const SurfaceLayer) void {
     }
 }
 
+/// Layers paint whole; queue a present rect for each one that changed. Their
+/// rows are not in rows_to_draw, which only covers the root grid's own dirty
+/// rows. Caller holds `mu`, under the same hold as the plan, so a store
+/// landing between them cannot have its flag dropped. `x_offset`/`y_offset`
+/// is where the surface's content sits in its client area; `client_right`/
+/// `client_bottom` bound the rects. A rect that cannot be queued leaves the
+/// layer's flag clear, so its dirt is kept for the next paint.
+pub fn appendLayerPresentRects(
+    app: *App,
+    layers: []const SurfaceLayer,
+    x_offset: i32,
+    y_offset: i32,
+    client_right: i32,
+    client_bottom: i32,
+    row_h_px: i32,
+    present_rects: *std.ArrayListUnmanaged(c.RECT),
+) void {
+    if (layers.len <= 1) return;
+    const cell_w_i32: i32 = @intCast(@max(1, app.cell_w_px));
+    for (layers[1..]) |layer| {
+        const state = app.layer_grids.get(layer.grid_id) orelse continue;
+        state.paint_has_present_rect = false;
+        if (!state.dirty) continue;
+        const l: i32 = @max(0, x_offset + layer.x_px);
+        const t: i32 = @max(0, y_offset + layer.y_px);
+        const rc: c.RECT = .{
+            .left = l,
+            .top = t,
+            .right = @min(client_right, l + @as(i32, @intCast(layer.cols)) * cell_w_i32),
+            .bottom = @min(client_bottom, t + @as(i32, @intCast(layer.rows)) * row_h_px),
+        };
+        if (rc.right > rc.left and rc.bottom > rc.top) {
+            present_rects.append(app.alloc, rc) catch continue;
+            state.paint_has_present_rect = true;
+        }
+    }
+}
+
+/// A row frame refused for its vertex-buffer budget: nothing reaches
+/// drawSurfaceLayers on this path, so the plan taken for the layers is never
+/// paid for and has to be re-armed, and the core is told the budget failed.
+/// Unlike every other failure, this one does not requeue a full paint.
+pub fn failRowVbBudget(app: *App, layers: []const SurfaceLayer) void {
+    app.row_vb_budget_failed = true;
+    if (layers.len > 1) {
+        app.mu.lockUncancelable(core.clock.io());
+        rearmLayerDraw(app, layers);
+        app.mu.unlock(core.clock.io());
+    }
+    if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+}
+
 /// What one layer row's draw produced: whether anything was encoded for it
 /// (both arms count that for `[layer_draw]`), and whether a GPU step failed, so
 /// the row never reached back_tex. A failure has to travel out to the paint,
@@ -4523,9 +4584,7 @@ pub fn failSurfacePaint(
     app.mu.lockUncancelable(core.clock.io());
     surface.paint_full = true;
     app.mu.unlock(core.clock.io());
-    tbs.rotation_mu.lockUncancelable(core.clock.io());
-    tbs.pending_paint_full = true;
-    tbs.rotation_mu.unlock(core.clock.io());
+    tbs.requestFullPaint();
     if (device_lost) return null;
     return retry.fail();
 }
@@ -5497,6 +5556,43 @@ pub const App = struct {
 
     pub fn endAtlasPaint(self: *App) void {
         render_pipeline_helpers.endAtlasPaint(&self.atlas_paint_active);
+    }
+
+    /// `beginAtlasPaint` for a paint driver: a refused admission (an atlas
+    /// reset is committing) leaves the surface owing a full paint, since the
+    /// frame it would have drawn pairs old UVs with the new atlas. Both
+    /// drivers open their paint with this; the caller still owns the
+    /// `endAtlasPaint` defer and whatever it holds at the time.
+    pub fn beginAtlasPaintOrRequestFull(self: *App, tbs: *TripleBufferedSurface) bool {
+        if (self.beginAtlasPaint()) return true;
+        tbs.requestFullPaint();
+        return false;
+    }
+
+    /// Whether a WM_PAINT arriving now would re-enter a paint or another
+    /// owner of the D3D immediate context on this thread: another WM_PAINT
+    /// (g.lockContext() is a non-recursive mutex), the shader-animation
+    /// timer mid-Present, glow prepare, device-lost recovery, or a resize /
+    /// DPI change still holding `mu`. Any of their DXGI calls can pump the
+    /// message queue and deliver WM_PAINT reentrantly. Both drivers ask this;
+    /// the flush-retry and WM_SIZE gates add external-window creation to it.
+    pub fn paintReentrancyBlocked(self: *const App) bool {
+        return self.wm_paint_in_progress or
+            self.in_present_shader_animation_frame or
+            self.glow_prepare_in_progress or
+            self.device_lost_recovering or
+            self.main_resize_in_progress or
+            self.main_dpi_change_in_progress;
+    }
+
+    /// Consume a WM_PAINT that `paintReentrancyBlocked` refused: BeginPaint /
+    /// EndPaint so Windows stops re-issuing it, no rendering, and a follow-up
+    /// paint of every window once the outer call finishes.
+    pub fn consumeReentrantPaint(self: *App, hwnd: c.HWND) void {
+        var ps_reentrant: c.PAINTSTRUCT = undefined;
+        _ = c.BeginPaint(hwnd, &ps_reentrant);
+        _ = c.EndPaint(hwnd, &ps_reentrant);
+        self.wm_paint_reinvalidate_all = true;
     }
 
     pub fn ensureRowStorage(self: *App, row: u32) void {
