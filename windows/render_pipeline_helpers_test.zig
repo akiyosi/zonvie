@@ -540,6 +540,13 @@ test "single sorted row insertion reports OOM without consuming scroll damage" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, success_rows.items);
 }
 
+test "an atlas upload owes a full paint only when no root row was redrawn" {
+    try std.testing.expect(helpers.atlasUploadOwesFullPaint(true, false));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(true, true));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(false, false));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(false, true));
+}
+
 test "cursor erase rows are claimed only for a root cursor and only in range" {
     var rows: std.ArrayListUnmanaged(u32) = .empty;
     defer rows.deinit(std.testing.allocator);

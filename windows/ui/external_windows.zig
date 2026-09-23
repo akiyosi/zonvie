@@ -603,6 +603,8 @@ fn drawNormalExternalSurface(
 ) !bool {
     const log_enabled = applog.isEnabled();
     ext_win.paint_present_rects.clearRetainingCapacity();
+    // The flat path redraws every row; the row path narrows this.
+    ext_win.paint_drew_root_rows = true;
 
     // All normal modes share the same retained back_tex. Restore a prior
     // row/flat scrollbar before either path mutates or clears it.
@@ -820,6 +822,7 @@ fn drawNormalExternalSurfaceRowMode(
         }
         break :blk_dirty false;
     };
+    ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0 or force_full_rows;
     if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
         !has_scrollbar_work and !any_layer_dirty)
     {
@@ -2809,10 +2812,12 @@ pub export fn ExternalWndProc(
                     // not a window of its own, so the press has to say which
                     // grid it landed on -- Neovim trusts the id it is given.
                     const target = blk: {
+                        const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
                         app.mu.lockUncancelable(core.clock.io());
                         defer app.mu.unlock(core.clock.io());
                         break :blk input.resolveMouseTarget(
                             ext_window.?.tbs.committed_layers.slice(),
+                            grids,
                             grid_id.?,
                             x,
                             y,
@@ -4017,15 +4022,17 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             }
         }
 
+        // Asked for, not failed: this frame still presents what it drew, as
+        // the main driver's does.
+        if (render_pipeline_helpers.atlasUploadOwesFullPaint(ext_atlas_uploaded, ext_win.paint_drew_root_rows)) {
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: atlas uploaded with no root row drawn, repainting\n", .{});
+            app.mu.lockUncancelable(core.clock.io());
+            ext_win.surface.paint_full = true;
+            app.mu.unlock(core.clock.io());
+            ext_win.tbs.requestFullPaint();
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
         if (!force_full_present and ext_win.paint_present_rects.items.len == 0) {
-            // Glyphs uploaded for rows this frame did not draw become visible
-            // only at the next unrelated repaint, so ask for one — the main
-            // driver has always done this on the same condition.
-            if (ext_atlas_uploaded) {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: atlas uploaded with nothing drawn, repainting\n", .{});
-                requeueExternalFullPaint(app, grid_id, hwnd);
-                return;
-            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
             completeExternalPaintRetry(ext_win);
             return;

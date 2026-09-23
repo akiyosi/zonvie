@@ -2651,7 +2651,7 @@ pub export fn WndProc(
 
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
-                        if (atlas_uploaded and rows_to_draw.items.len == 0) {
+                        if (render_helpers.atlasUploadOwesFullPaint(atlas_uploaded, rows_to_draw.items.len != 0)) {
                             app.mu.lockUncancelable(core.clock.io());
                             app.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
