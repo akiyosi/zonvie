@@ -10,6 +10,12 @@ const window_mod = @import("../window.zig");
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 
+/// Face for every tab label. A null face let GDI pick the system bitmap font,
+/// whose one-pixel period abuts a following `z`'s bottom stroke, so
+/// "flush.zig" read as "flushzig". Japanese text falls back through font
+/// linking.
+const tab_font_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+
 // ---- Shared helpers for titlebar and sidebar tab operations ----
 
 /// Extract the display name (basename) from a tab entry.
@@ -909,7 +915,7 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                         c.CLIP_DEFAULT_PRECIS,
                         c.CLEARTYPE_QUALITY,
                         c.DEFAULT_PITCH | c.FF_DONTCARE,
-                        null,
+                        tab_font_face,
                     );
                     const old_font = c.SelectObject(hdc, hfont);
 
@@ -1238,7 +1244,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         c.CLIP_DEFAULT_PRECIS,
         c.CLEARTYPE_QUALITY,
         c.DEFAULT_PITCH | c.FF_DONTCARE,
-        null,
+        tab_font_face,
     );
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
@@ -1838,7 +1844,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         c.CLIP_DEFAULT_PRECIS,
         c.CLEARTYPE_QUALITY,
         c.DEFAULT_PITCH | c.FF_DONTCARE,
-        null,
+        tab_font_face,
     );
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
@@ -1988,7 +1994,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
             c.CLIP_DEFAULT_PRECIS,
             c.CLEARTYPE_QUALITY,
             c.DEFAULT_PITCH | c.FF_DONTCARE,
-            null,
+            tab_font_face,
         );
         const old_small_font = c.SelectObject(hdc, small_font);
         const new_tab_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
