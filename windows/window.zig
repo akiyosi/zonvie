@@ -2274,16 +2274,7 @@ pub export fn WndProc(
                 var paint_snapshot_ok = true;
 
                 if (row_mode) {
-                    const dirty_count = app.tbs.paint_dirty_snapshot.count();
-                    dirty_row_keys.ensureTotalCapacity(app.alloc, dirty_count) catch {
-                        paint_snapshot_ok = false;
-                    };
-                    if (paint_snapshot_ok) {
-                        var dit = app.tbs.paint_dirty_snapshot.iterator(.{});
-                        while (dit.next()) |row_idx| {
-                            dirty_row_keys.appendAssumeCapacity(@intCast(row_idx));
-                        }
-                    }
+                    paint_snapshot_ok = app.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
                 }
 
                 // Use committed.rows (content rows from core) as the baseline,
@@ -3190,12 +3181,14 @@ pub export fn WndProc(
                                 }
                             }
                         } else {
-                            // No scroll shift, but still apply pending vb shift to scroll region.
-                            if (tbs_snapshot.vb_shift != 0 and tbs_snapshot.scroll_row_end > tbs_snapshot.scroll_row_start) {
-                                const abs_shift: u32 = @intCast(if (tbs_snapshot.vb_shift < 0) -tbs_snapshot.vb_shift else tbs_snapshot.vb_shift);
-                                app_mod.ensureShiftScratch(app.alloc, &app.row_vbs_shift_scratch, abs_shift);
-                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end, app.row_vbs_shift_scratch.items);
-                            }
+                            app_mod.consumePendingVbShift(
+                                app.alloc,
+                                app.row_vbs.items,
+                                &app.row_vbs_shift_scratch,
+                                tbs_snapshot.vb_shift,
+                                tbs_snapshot.scroll_row_start,
+                                tbs_snapshot.scroll_row_end,
+                            );
                         }
 
                         // Per-layer dirty gating and GPU row scroll, in the
@@ -3488,22 +3481,19 @@ pub export fn WndProc(
                                     const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
                                     if (scrollbar_vert_count != 0) {
                                         if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
-                                            const captured_scrollbar_rect = g.captureScrollbarUnderlay(track_rect) catch |e| {
-                                                if (log_enabled) applog.appLog("captureScrollbarUnderlay failed: {any}\n", .{e});
+                                            const captured_scrollbar_rect = app_mod.drawScrollbarOverlayOverUnderlay(
+                                                g,
+                                                &app.scrollbar_vb,
+                                                &app.scrollbar_vb_bytes,
+                                                scrollbar_verts[0..scrollbar_vert_count],
+                                                track_rect,
+                                            ) catch |e| {
+                                                if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
                                                 break :present_frame;
                                             };
                                             if (captured_scrollbar_rect) |captured_rect| {
                                                 present_rects.append(app.alloc, captured_rect) catch {
                                                     present_rects_fallback_full = true;
-                                                };
-                                                app_mod.drawScrollbarOverlay(
-                                                    g,
-                                                    &app.scrollbar_vb,
-                                                    &app.scrollbar_vb_bytes,
-                                                    scrollbar_verts[0..scrollbar_vert_count],
-                                                ) catch |e| {
-                                                    if (log_enabled) applog.appLog("drawScrollbarOverlay failed: {any}\n", .{e});
-                                                    break :present_frame;
                                                 };
                                             }
                                         }
