@@ -700,13 +700,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         get { blink.isVisible(lock: lock) }
         set { blink.setVisible(newValue, lock: lock) }
     }
-    /// The root row of the committed cursor. Published at commit from
-    /// `stagedCursorRow`, with the cursor set it describes — as the main
-    /// renderer's is — so a frame's blink scissor and its cursor witness name
-    /// the cursor it draws, not the one the next flush will.
-    private var lastKnownCursorRow: Int = -1
-    private var stagedCursorRow: Int = -1
-
     // Separate cursor vertex buffer (not part of row buffers, immune to GPU scroll copy).
     private var cursorDirty: Bool = false
 
@@ -1324,7 +1317,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // where it is — nothing about a row rotation ages the cursor.
             if cursorWriteSetIndex != -1 {
                 committedCursorSetIndex = cursorWriteSetIndex
-                lastKnownCursorRow = stagedCursorRow
                 cursorWriteSetIndex = -1
                 // Arm the redraw in the same lock that publishes the slot, the
                 // way flushDirtyRows is re-published for rows. Two ways this
@@ -1541,57 +1533,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         lock.lock()
         pendingGridScrollRows += rowsDelta
         lock.unlock()
-    }
-
-    /// The displacement this window is currently drawing its grid with, in
-    /// main-window drawable pixels — the space `forwardExternalCursorToMainShader`
-    /// measures the cursor rect in.
-    ///
-    /// Taken from this view's own committed scroll offset rather than the
-    /// renderer's shared one, which follows the main view's draw cadence.
-    /// Returns 0 when nothing is displaced, which is also what the cursor
-    /// shader needs then.
-    /// Every input is the frame's own, passed in rather than re-read here.
-    /// The cursor body is placed from the committed snapshot draw(in:) takes
-    /// once, under one hold; a second read taken later in the same frame can
-    /// answer a flush that has committed since — or, worse, one that has not
-    /// committed at all, which is what `pendingSurfaceLayers` would have given.
-    /// The effect would then be displaced on one generation's placement while
-    /// the cursor it tracks was drawn on another's, and a lock around each read
-    /// does nothing about that: the two reads are individually consistent and
-    /// still disagree.
-    private func cursorScrollOffsetPxForShader(
-        ownerGridId: Int64,
-        offset: GridSurfaceRenderer.ScrollOffset?,
-        viewportHeightPx: Float,
-        raw: SurfaceShaderCursor.Raw
-    ) -> Float? {
-        // The cursor rect is shared with the main surface and every other
-        // external window. Only displace it when the cursor is on a grid THIS
-        // surface draws — its own, or one it hosts as a layer; otherwise say
-        // nothing and let the owner's value stand. Asked of the frame's own
-        // snapshot of the rect, not the live value.
-        guard raw.gridId == ownerGridId else { return nil }
-        // `offset` is the owner grid's EFFECTIVE displacement, resolved by the
-        // caller the same way drawHostedLayers resolves a layer's: the grid's
-        // own offset when it scrolls in its own right, the root's when it only
-        // follows the buffer, and nil when it stands still. A fixed float's
-        // cursor is drawn at a standstill, so its effect stands still with it.
-        guard let offset else { return 0 }
-        // Undo computeScrollOffset's NDC conversion against the viewport height
-        // THIS frame drew with -- the caller's own
-        // SurfaceViewportMetrics.fragmentHeight, which is the value the cursor
-        // body displaces itself by. Deriving it here from the renderer's cell
-        // height instead would recompute the same formula against a linespace
-        // the core may have changed since the frame measured it, and the effect
-        // would convert the offset on one height while the cursor it tracks was
-        // placed on another. Taking the number rather than its ingredients is
-        // what makes the two unable to disagree.
-        // Both terms of the shared `displacedLayerOriginPx` guard, for the same
-        // reason: this result is consumed as pixel geometry, and a non-finite
-        // offset propagates into a rounding that traps.
-        guard viewportHeightPx > 0, offset.offset_y.isFinite else { return 0 }
-        return -offset.offset_y * viewportHeightPx / 2.0
     }
 
     /// Tell this window which of its rows actually scroll. Called from the
@@ -2032,9 +1973,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(gridId) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
                 return
             }
-            cursorOwner.stage(gridId)
+            cursorOwner.stage(gridId, rootRow: rowStart)
             lock.lock()
-            stagedCursorRow = rowStart
             cursorDirty = true
             lock.unlock()
             // A slot of this bracket's own, rotated in at commit. Reusing
@@ -2533,6 +2473,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             let hostedScrollOffsetSnapshot: [GridSurfaceRenderer.ScrollOffset]
             let cursorOwnerOffset: GridSurfaceRenderer.ScrollOffset?
             let cursorShaderOffsetPx: Float?
+            /// The one evaluation moved the rect. Whole-surface fragment work,
+            /// so a term of the idle gate — as on the main surface. Evaluated
+            /// before the gate, a moved rect the gate then skipped was never
+            /// asked for again: the next evaluation finds it already current.
+            let shaderCursorMoved: Bool
             // Latched with the committed set, not read later: commitFlush
             // publishes the retention inside this same lock, so taking it
             // afterwards can pair set N's vertices with set N+1's retained
@@ -2610,7 +2555,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             pendingDirtyRows.removeAll()
             cursorDirtySnapshot = cursorDirty
             cursorDirty = false
-            lastKnownCursorRowSnapshot = lastKnownCursorRow
+            lastKnownCursorRowSnapshot = cursorOwner.committedRootRow
             cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
             cursorBlinkStateSnapshot = blink.visibleLocked
             rootLayerOriginSnapshot = committedSurfaceLayers.first?.originPx ?? simd_float2(0, 0)
@@ -2666,13 +2611,17 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 ? scrollOffsetSnapshot
                 : (surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
                     ?? (cursorLayerFollowsScrollSnapshot ? scrollOffsetSnapshot : nil))
-            cursorShaderOffsetPx = cursorScrollOffsetPxForShader(
+            // Shared with GridSurfaceRenderer. The height is the one every
+            // NDC above was built against, latched beside them rather than
+            // recomputed on a cell size the core may have moved since.
+            cursorShaderOffsetPx = surfaceShaderCursorOffsetPx(
+                rawGridId: cursorShaderRawSnapshot.gridId,
                 ownerGridId: cursorOwnerSnapshot,
                 offset: cursorOwnerOffset,
-                viewportHeightPx: scrollOffsetViewportHeight,
-                raw: cursorShaderRawSnapshot
+                viewportHeightPx: scrollOffsetViewportHeight
             )
-            shared.shaderCursor.evaluate(scrollOffsetPx: cursorShaderOffsetPx, raw: cursorShaderRawSnapshot)
+            shaderCursorMoved = shared.shaderCursor.evaluate(
+                scrollOffsetPx: cursorShaderOffsetPx, raw: cursorShaderRawSnapshot)
             lock.unlock()
             defer {
                 submittedDirtyRows.removeAll(keepingCapacity: true)
@@ -2880,7 +2829,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 isSmoothScrolling: smoothScrolling,
                 blinkStateChanged: blinkStateChanged,
                 drawableSizeChanged: drawableSizeChanged,
-                shaderAnimates: shaderAnimates
+                shaderAnimates: shaderAnimates,
+                shaderCursorMoved: shaderCursorMoved
             )
             let idleGateSkips = idleTerms.skipsFrame
             ZonvieCore.drawTrace(idleTerms.traceLine(surface: gridId))

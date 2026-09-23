@@ -477,9 +477,18 @@ struct SurfaceScrollOffsetLatch {
 /// external surface starts at nil, meaning nothing has been staged yet, which
 /// is why `owns` compares the stored value rather than resolving a root — a nil
 /// owner owns nothing, and on the main surface there is no nil to resolve.
+///
+/// The root row the core named for the cursor travels with the owner: -1
+/// whenever a layer owns it, because a layer's cursor is in that grid's rows,
+/// not the root's. Published with the owner so a frame's blink scissor names
+/// the cursor it draws, not the one the next flush will. Both surfaces kept
+/// this row beside the owner as two fields with the same bracket; one of them
+/// forgot the -1 when the cursor entered a layer.
 struct SurfaceCursorOwner {
     private(set) var staged: Int64?
     private(set) var committed: Int64?
+    private(set) var stagedRootRow: Int = -1
+    private(set) var committedRootRow: Int = -1
 
     init(initial: Int64?) {
         staged = initial
@@ -491,13 +500,17 @@ struct SurfaceCursorOwner {
         staged == gridId
     }
 
-    mutating func stage(_ gridId: Int64?) {
+    /// `rootRow` is the row a ROOT cursor sits on; a layer's cursor passes
+    /// none.
+    mutating func stage(_ gridId: Int64?, rootRow: Int = -1) {
         staged = gridId
+        stagedRootRow = rootRow
     }
 
     /// Publish what the bracket staged.
     mutating func commit() {
         committed = staged
+        committedRootRow = stagedRootRow
     }
 
     /// Put the staged owner back to what is on screen. A bracket that is
@@ -506,6 +519,7 @@ struct SurfaceCursorOwner {
     /// non-owner and a cursor stays drawn where it no longer is.
     mutating func restoreStagedFromCommitted() {
         staged = committed
+        stagedRootRow = committedRootRow
     }
 }
 
