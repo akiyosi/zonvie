@@ -666,9 +666,13 @@ fn drawNormalExternalSurface(
         );
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (try g.captureScrollbarUnderlay(track_rect)) |_| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
-                }
+                _ = try app_mod.drawScrollbarOverlayOverUnderlay(
+                    g,
+                    &ext_win.scrollbar_vb,
+                    &ext_win.scrollbar_vb_bytes,
+                    scrollbar_verts[0..scrollbar_vert_count],
+                    track_rect,
+                );
             }
         }
     }
@@ -914,12 +918,14 @@ fn drawNormalExternalSurfaceRowMode(
             }
         }
     } else {
-        // Consume pending shift state to avoid stale accumulation.
-        if (tbs_snap.vb_shift != 0 and tbs_snap.scroll_row_end > tbs_snap.scroll_row_start) {
-            const abs_shift: u32 = @intCast(if (tbs_snap.vb_shift < 0) -tbs_snap.vb_shift else tbs_snap.vb_shift);
-            app_mod.ensureShiftScratch(app.alloc, &ext_win.row_vbs_shift_scratch, abs_shift);
-            app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, tbs_snap.scroll_row_start, tbs_snap.scroll_row_end, ext_win.row_vbs_shift_scratch.items);
-        }
+        app_mod.consumePendingVbShift(
+            app.alloc,
+            ext_win.row_vbs.items,
+            &ext_win.row_vbs_shift_scratch,
+            tbs_snap.vb_shift,
+            tbs_snap.scroll_row_start,
+            tbs_snap.scroll_row_end,
+        );
     }
 
     // Damage for this frame. Reserved for every row span plus one rectangle
@@ -1113,8 +1119,13 @@ fn drawNormalExternalSurfaceRowMode(
         );
         if (scrollbar_vert_count != 0) {
             if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (try g.captureScrollbarUnderlay(track_rect)) |captured_rect| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
+                if (try app_mod.drawScrollbarOverlayOverUnderlay(
+                    g,
+                    &ext_win.scrollbar_vb,
+                    &ext_win.scrollbar_vb_bytes,
+                    scrollbar_verts[0..scrollbar_vert_count],
+                    track_rect,
+                )) |captured_rect| {
                     present_rects.appendAssumeCapacity(captured_rect);
                 }
             }
@@ -3770,16 +3781,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     dirty_row_keys.clearRetainingCapacity();
     var dirty_snapshot_ok = true;
     if (is_row_mode_normal) {
-        const dirty_count = ext_win.tbs.paint_dirty_snapshot.count();
-        dirty_row_keys.ensureTotalCapacity(app.alloc, dirty_count) catch {
-            dirty_snapshot_ok = false;
-        };
-        if (dirty_snapshot_ok) {
-            var dit = ext_win.tbs.paint_dirty_snapshot.iterator(.{});
-            while (dit.next()) |row_idx| {
-                dirty_row_keys.appendAssumeCapacity(@intCast(row_idx));
-            }
-        }
+        dirty_snapshot_ok = ext_win.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
     }
     if (!dirty_snapshot_ok) {
         abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
