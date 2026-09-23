@@ -64,6 +64,18 @@ pub fn capturesScroll(c: anytype) bool {
     return c.line_count > content_rows;
 }
 
+/// Whether a button press, release or drag addressed to `grid_id` may reach
+/// Neovim. The ids the core reserves for its own surfaces (cmdline,
+/// popupmenu, messages) are negative and name no Neovim window: forwarded,
+/// Neovim resolves the position against the screen instead, so a click on a
+/// message moved the cursor in the buffer behind it and a middle click pasted
+/// there. Windows refused these in its frontend and macOS sent them; the core
+/// refuses them now for both. Wheel events are not asked this: a message
+/// surface scrolls through its sentinel id.
+pub fn buttonReachesNeovim(grid_id: i64) bool {
+    return grid_id >= 0;
+}
+
 /// The grid at (`row`, `col`) of `surface_id`, in that grid's own cells.
 ///
 /// `require_scrollable` is the wheel's extra rule and a click's is false: a
@@ -221,6 +233,16 @@ test "a float's margins are not content, so a bordered float needs one line more
     try testing.expect(!capturesScroll(f));
     f.line_count = 9;
     try testing.expect(capturesScroll(f));
+}
+
+test "a button reaches Neovim for its own grids and never for a surface the core reserved" {
+    const grid_mod = @import("grid.zig");
+    try std.testing.expect(buttonReachesNeovim(0));
+    try std.testing.expect(buttonReachesNeovim(1));
+    try std.testing.expect(buttonReachesNeovim(1000));
+    for ([_]i64{ grid_mod.CMDLINE_GRID_ID, grid_mod.POPUPMENU_GRID_ID, grid_mod.MESSAGE_GRID_ID, grid_mod.MSG_HISTORY_GRID_ID }) |id| {
+        try std.testing.expect(!buttonReachesNeovim(id));
+    }
 }
 
 test "a point outside every grid resolves to nothing" {

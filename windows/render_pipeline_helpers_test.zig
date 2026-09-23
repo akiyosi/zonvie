@@ -540,6 +540,22 @@ test "single sorted row insertion reports OOM without consuming scroll damage" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, success_rows.items);
 }
 
+test "a surface owes a full atlas upload whenever the generation moved" {
+    var ledger: helpers.AtlasUploadLedger = .{};
+    // Never uploaded: owes one whatever the generation is, zero included.
+    try std.testing.expect(ledger.needsFull(0));
+    ledger.fullUploaded(0);
+    try std.testing.expect(!ledger.needsFull(0));
+    try std.testing.expect(ledger.needsFull(1));
+    // A failure owes one even at the generation it last uploaded.
+    ledger.fullUploaded(7);
+    ledger.forceFull();
+    try std.testing.expect(ledger.needsFull(7));
+    // The generation wraps; a ledger that compared with `<` stopped asking.
+    ledger.fullUploaded(std.math.maxInt(u64));
+    try std.testing.expect(ledger.needsFull(0));
+}
+
 test "an atlas upload owes a full paint only when no root row was redrawn" {
     try std.testing.expect(helpers.atlasUploadOwesFullPaint(true, false));
     try std.testing.expect(!helpers.atlasUploadOwesFullPaint(true, true));

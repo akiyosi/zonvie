@@ -1448,6 +1448,7 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     ext_win.surface.row_mode = pv.surface.row_mode;
     ext_win.surface.rows = pv.surface.rows;
     ext_win.surface.cols = pv.surface.cols;
+    ext_win.surface.metrics_gen = pv.metrics_gen;
     ext_win.needs_redraw = true;
 
     if (pv.surface.row_mode) {
@@ -2805,7 +2806,9 @@ pub export fn ExternalWndProc(
                     // the core forwards to Neovim unchanged, which resolves
                     // them against the screen instead: a click on a message
                     // moved the cursor in the buffer behind it, and a middle
-                    // click pasted there.
+                    // click pasted there. The core refuses such a button for
+                    // every frontend (pointer_target.buttonReachesNeovim);
+                    // returning here also keeps the press from capturing.
                     if (classifyExternalSurface(grid_id.?) != .normal) return 0;
 
                     // A float anchored inside this window is one of its layers,
@@ -3747,6 +3750,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Snapshot vertex data. Row-mode normal surfaces use TBS committed set
     // (lock-free via refcount). Decorated surfaces and flat-mode still need snapshot.
     var vert_count = ext_win.vert_count;
+    // Taken with the snapshot below, under the same app.mu hold.
+    const surface_metrics_gen = ext_win.surface.metrics_gen;
     if (!is_row_mode_normal) {
         if (!app_mod.snapshotSurfaceRows(
             app.alloc,
@@ -3819,7 +3824,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         current_atlas_reset_generation = a.atlas_reset_generation;
         a.mu.unlock(core.clock.io());
     }
-    const need_full_atlas_upload = ext_win.atlas_reset_generation < current_atlas_reset_generation;
+    const need_full_atlas_upload = ext_win.atlas_upload.needsFull(current_atlas_reset_generation);
 
     // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
 
@@ -3828,7 +3833,12 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
 
-    if (is_row_mode_normal and tbs_committed.metrics_gen != shared_metrics_gen_snapshot) {
+    // Vertices generated against metrics this paint no longer has are
+    // refused before any are drawn — the committed TBS set for a row-mode
+    // window, the snapshot of `surface` for a decorated or flat one, which
+    // had no such check. The main driver refuses the same way.
+    const painted_metrics_gen = if (is_row_mode_normal) tbs_committed.metrics_gen else surface_metrics_gen;
+    if (painted_metrics_gen != shared_metrics_gen_snapshot) {
         requeueExternalFullPaint(app, grid_id, hwnd);
         return;
     }
@@ -3915,7 +3925,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 if (upload.cursor != ext_win.atlas_upload_cursor) ext_atlas_uploaded = true;
                 ext_win.atlas_upload_cursor = upload.cursor;
                 if (need_full_atlas_upload) {
-                    ext_win.atlas_reset_generation = current_atlas_reset_generation;
+                    ext_win.atlas_upload.fullUploaded(current_atlas_reset_generation);
                 }
             } else {
                 // A full PAINT is not a full UPLOAD. flushAtlasUploads refuses
@@ -3925,8 +3935,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 // window ask for a full upload. Without forcing one here the
                 // next paint retried the identical incremental upload and this
                 // window stopped updating its pixels for good. The main driver
-                // promotes the same failure with `atlas_full_upload_needed`.
-                ext_win.atlas_reset_generation = 0;
+                // promotes the same failure the same way.
+                ext_win.atlas_upload.forceFull();
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }

@@ -17,6 +17,7 @@ const rpc_session = @import("rpc_session.zig");
 const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
+const pointer_target = @import("pointer_target.zig");
 const clock = @import("clock.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
@@ -3372,6 +3373,7 @@ pub const Core = struct {
         row: i32,
         col: i32,
     ) void {
+        if (!pointer_target.buttonReachesNeovim(grid_id)) return;
         self.requestMouseInput(button, action, modifier, grid_id, row, col) catch |e| {
             self.log.write("sendMouseInput err: {any}\n", .{e});
         };

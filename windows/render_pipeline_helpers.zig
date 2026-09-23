@@ -647,6 +647,30 @@ pub fn insertSortedRow(
     return true;
 }
 
+/// Which atlas generation a surface's texture last received in full. The
+/// atlas bumps its generation (under its own `mu`) on every reset and on every
+/// upload it could not queue, so a surface owes a full upload exactly when the
+/// generation moved since its last one. The main driver kept a flag set from
+/// three threads instead and the external driver compared with `<`, which
+/// wraps: `!=` is the answer both give now. `null` owes a full upload
+/// unconditionally — a surface that has never uploaded, a failed upload, a
+/// fresh device.
+pub const AtlasUploadLedger = struct {
+    uploaded_generation: ?u64 = null,
+
+    pub fn needsFull(self: AtlasUploadLedger, current_generation: u64) bool {
+        return self.uploaded_generation != current_generation;
+    }
+
+    pub fn fullUploaded(self: *AtlasUploadLedger, generation: u64) void {
+        self.uploaded_generation = generation;
+    }
+
+    pub fn forceFull(self: *AtlasUploadLedger) void {
+        self.uploaded_generation = null;
+    }
+};
+
 /// A paint that uploaded glyphs but redrew no root row leaves those glyphs
 /// invisible until an unrelated repaint: rows drawn before the upload sampled
 /// an atlas region that was still empty. Such a paint asks for a full one.
