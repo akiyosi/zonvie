@@ -349,8 +349,12 @@ pub const MSG_HISTORY_GRID_ID: i64 = core.grid_mod.MSG_HISTORY_GRID_ID;
 // --- Cmdline window styling constants (matching macOS) ---
 pub const CMDLINE_PADDING: u32 = 12; // Padding around content (pixels)
 pub const CMDLINE_ICON_SIZE: u32 = 18; // Icon size (pixels)
-pub const CMDLINE_ICON_MARGIN_LEFT: u32 = 2; // Left margin for icon (pixels)
-pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = 4; // Right margin for icon (pixels)
+// Measured from the content padding, so the icon sits at x = 12 and the text
+// at x = 44, where macOS puts them (its cmdlineIconMarginLeft is measured from
+// the window edge and already includes the padding). These were 2 and 4, which
+// drew the icon at 14 and the text at 36.
+pub const CMDLINE_ICON_MARGIN_LEFT: u32 = 0; // Left margin for icon (pixels)
+pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = 14; // Right margin for icon (pixels)
 pub const CMDLINE_BORDER_WIDTH: u32 = 1; // Border width (pixels)
 pub const CMDLINE_CORNER_RADIUS: f32 = 8.0; // Corner radius for rounded rect
 pub const CMDLINE_SCREEN_MARGIN: u32 = 40; // Margin from screen edges (matching macOS cmdlineScreenMargin)
@@ -2439,6 +2443,8 @@ pub const ExternalWindow = struct {
     // buffer queue. Persistent so partial external paints allocate only when
     // the grid's high-water row count grows.
     paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
+    // Whether the last paint drew any root row, for atlasUploadOwesFullPaint.
+    paint_drew_root_rows: bool = false,
 
     pub fn recomputeVertCount(self: *ExternalWindow) void {
         self.vert_count = self.surface.recomputeVertCount();

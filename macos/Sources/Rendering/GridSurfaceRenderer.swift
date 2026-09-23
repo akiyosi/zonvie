@@ -1326,7 +1326,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Revision whose guard band already ran to its deadline without a commit
     /// arriving. Render thread only.
     private var guardBandTimedOutRevision: UInt64 = .max
-    private var lastDrawnDrawableSize: CGSize = .zero // Render thread only
     // Whether the most-recently-rendered frame had an active scroll offset,
     // which extends smoothScrolling for one frame past the offset reaching zero
     // (as ExternalGridView's wasScrollOffsetActiveInLastPresentedFrame does).
@@ -1411,7 +1410,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     private var committedAtlasTexture: MTLTexture?  // Protected by lock
 
-    private var backingScale: CGFloat = 1.0
+    private var backingScale: CGFloat = surfaceFallbackBackingScale
 
     var onCellMetricsChanged: ((Float, Float) -> Void)?
 
@@ -3180,7 +3179,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Check if drawable size changed since last render (window resize).
             // Must re-render with current viewport even if vertices haven't changed,
             // otherwise macOS stretches the old frame to the new window size.
-            let drawableSizeChanged = view.drawableSize != lastDrawnDrawableSize
+            let drawableSizeChanged = surfaceDrawableSizeChanged(
+                backBufferSize: backBuffer == nil ? nil : backBufferSize,
+                drawableSize: view.drawableSize
+            )
 
             // "Blink-only frame" = blinkStateChanged is the ONLY change this draw.
             // Used both for skipMainPass later AND for the cursor==0 skipFrame
@@ -3280,13 +3282,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Snapshot pre-frame skip-gate state so an acquisition failure
             // below (bailWithoutSubmit) can un-consume it for retry.
             let prevDrawnRevision = lastDrawnRevision
-            let prevDrawnDrawableSize = lastDrawnDrawableSize
             var prevDrawnHadActiveScrollOffset = false
             let prevRenderedBlinkState = blink.lastRendered
 
-            // Track that we've consumed this revision and drawable size
+            // Track that we've consumed this revision
             lastDrawnRevision = currentCommitRevision
-            lastDrawnDrawableSize = view.drawableSize
             // Latch the raw active flag, NOT the combined
             // smoothScrolling: the combined value would latch true forever.
             prevDrawnHadActiveScrollOffset = scrollOffsetLatch.latch(hadActiveScrollOffsetThisFrame)
@@ -3315,12 +3315,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             let use2Pass = blurEnabled && shared.backgroundPipeline != nil && shared.glyphPipeline != nil
 
-            let safeRowCount: Int
-            if rowMode {
-                safeRowCount = min(min(rowBuffersSnapshot.count, rowCountsSnapshot.count), rowLogicalToSlotSnapshot.count)
-            } else {
-                safeRowCount = 0
-            }
+            // Logical rows, as on the external surface: the slot a row maps to
+            // is bounds-checked per row in resolvedRowState, which is the one
+            // place a row's buffers are read.
+            let safeRowCount = rowMode ? rowLogicalToSlotSnapshot.count : 0
             // Glow must be checked early — it disables partial-redraw
             // optimizations, because additive bloom accumulates brightness when
             // the back buffer preserves previous glow. It is also disabled for
@@ -3448,7 +3446,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     lock.unlock()
                 }
                 lastDrawnRevision = prevDrawnRevision
-                lastDrawnDrawableSize = prevDrawnDrawableSize
                 scrollOffsetLatch.restore(previousFrameWasActive: prevDrawnHadActiveScrollOffset)
                 blink.lastRendered = prevRenderedBlinkState
                 (view as? MetalTerminalView)?.didDrawFrame()
@@ -5310,7 +5307,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return seeds
     }
 
-    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0, totalCols: Int = 0) {
+    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int, totalCols: Int) {
         guard isInFlush else {
             ZonvieCore.appLog("[WARNING] submitVerticesRowRaw called outside flush bracket")
             return
@@ -5360,8 +5357,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
         let sourceSet = bufferSets[flushSourceSetIndex]
         let changesRowStructure = !sourceSet.rowState.usingRowBuffers
-            || (totalRows > 0 && totalRows != sourceSet.knownTotalRows)
-            || (totalCols > 0 && totalCols != sourceSet.knownTotalCols)
+            || totalRows != sourceSet.knownTotalRows
+            || totalCols != sourceSet.knownTotalCols
         // Allocate synchronously: the async pre-provisioning gate this replaced
         // does not converge under sustained scroll (same reasoning as
         // ExternalGridView.applyRowScroll). requirePreparedRowCapacity below
