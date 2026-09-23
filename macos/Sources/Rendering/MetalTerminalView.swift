@@ -317,7 +317,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// (SurfaceDrawGate.swift) and the mode switching is SurfaceDrawLoopHost
     /// (SurfaceDrawLoop.swift). The threshold is this surface's own — see
     /// DrawLoopIdleCounter on why the two differ.
-    var drawLoopIdleCounter = DrawLoopIdleCounter(threshold: 15)
+    var drawLoopIdleCounter = DrawLoopIdleCounter()
     let drawLoopTraceName = "main"
 
     // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
@@ -1616,7 +1616,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
 
 
-    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int = 0, totalCols: Int = 0) {
+    func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int, totalCols: Int) {
         processPendingScrollClears()
 
         renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
@@ -2656,7 +2656,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     }
 
     /// Release what `view`'s commit landed. Called under that view's lock.
-    func publishStagedScrollClears(ownedBy view: ExternalGridView) {
+    /// Returns how many entries were released.
+    @discardableResult
+    func publishStagedScrollClears(ownedBy view: ExternalGridView) -> Int {
         publishStagedScrollClears { gridId in
             switch core?.resolveGridRoute(gridId: gridId) {
             case .externalRoot(let owner): return owner === view
@@ -2666,13 +2668,16 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         }
     }
 
-    private func publishStagedScrollClears(where owned: (Int64) -> Bool) {
+    @discardableResult
+    private func publishStagedScrollClears(where owned: (Int64) -> Bool) -> Int {
         pendingScrollClearLock.lock()
+        var released = 0
         if !stagedScrollClear.isEmpty {
             var kept = 0
             for entry in stagedScrollClear {
                 if owned(entry.gridId) {
                     pendingScrollClear.append(entry)
+                    released += 1
                 } else {
                     stagedScrollClear[kept] = entry
                     kept += 1
@@ -2681,6 +2686,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             stagedScrollClear.removeLast(stagedScrollClear.count - kept)
         }
         pendingScrollClearLock.unlock()
+        return released
     }
 
     /// Per-frame scroll edge tick. Called from onPreDraw and from external

@@ -268,8 +268,9 @@ struct SurfaceLoadActionTerms {
 /// the three statements that move them — and one of them had since grown a
 /// clause the other never got. The thresholds had drifted too (15 frames on the
 /// main surface, 10 on an external one) with nothing on either side recording
-/// why, so each surface keeps its own number here and the divergence is at
-/// least visible in one place now.
+/// why. One number now: the main surface's, the longer one, since stopping a
+/// loop early mid-scroll stutters and running five frames longer costs a
+/// quarter of a vsync-second of idle encoding.
 struct DrawLoopIdleCounter {
     /// Consecutive frames that produced nothing.
     private(set) var idleFrames = 0
@@ -277,7 +278,9 @@ struct DrawLoopIdleCounter {
     /// How many of those are allowed before the loop stops.
     let threshold: Int
 
-    init(threshold: Int) {
+    static let surfaceThreshold = 15
+
+    init(threshold: Int = DrawLoopIdleCounter.surfaceThreshold) {
         self.threshold = threshold
     }
 

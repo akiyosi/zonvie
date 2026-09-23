@@ -60,6 +60,22 @@ final class SparseRowSet {
     }
 }
 
+/// The drawable no longer matches the back buffer this surface keeps across
+/// frames, so the frame it holds would be stretched. Nil when no back buffer
+/// exists yet: the first frame is forced whole by `hasPresentedOnce` instead,
+/// as is every frame after a reallocation. The main surface compared against
+/// the size of its last DRAW, with a restore on bail; the back buffer is the
+/// thing that actually holds the stale pixels.
+func surfaceDrawableSizeChanged(backBufferSize: CGSize?, drawableSize: CGSize) -> Bool {
+    guard let backBufferSize else { return false }
+    return backBufferSize != drawableSize
+}
+
+/// The backing scale a surface assumes before its window tells it: the
+/// Retina scale. Both surfaces had a fallback, 1.0 on one and 2.0 on the
+/// other.
+let surfaceFallbackBackingScale: CGFloat = 2.0
+
 struct DrawableSize {
     var width: Float
     var height: Float
@@ -3334,6 +3350,19 @@ final class SurfaceFixedFloatMask {
     /// partial mask, which would let shifted content bleed through an omitted
     /// float.
     static let maxRects = 16
+
+    /// Whether a surface's committed layers hold more fixed floats than a
+    /// mask can represent: the rects `update` would be handed while a scroll
+    /// eases are exactly these. Answerable before any offset is applied, so a
+    /// surface can drop its transform in the same snapshot that latches it.
+    static func overflows(layers: [SurfaceLayer], rootGridId: Int64) -> Bool {
+        var count = 0
+        for layer in layers where layer.z > 0 && layer.gridId != rootGridId && !layer.followsScroll {
+            count += 1
+            if count > maxRects { return true }
+        }
+        return false
+    }
 
     private(set) var bands: [GridSurfaceRenderer.FixedFloatBand] = []
     private(set) var intervals: [GridSurfaceRenderer.FixedFloatInterval] = []

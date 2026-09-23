@@ -268,11 +268,13 @@ pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOr
 /// the way ExternalWndProc has resolved its own since 5e7e9cb. Takes app.mu,
 /// which is what the committed layer list is protected by.
 pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
+    const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
     const origin = surfaceOriginPx(app, true);
     return resolveMouseTarget(
         app.tbs.committed_layers.slice(),
+        grids,
         1,
         x - origin.x,
         y - origin.y,
@@ -551,34 +553,38 @@ pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
 /// compositor. So a surface that composites layers has to answer the question
 /// itself or every click lands in the window behind the one under the pointer.
 ///
-/// `layers` is the surface's committed layer list, root first, back to front;
-/// the last containing layer wins. Caller holds app.mu, which is what the
-/// layer list is protected by.
+/// Which grid is chosen is the core's rule (`zonvie_core_resolve_pointer_grid`),
+/// the one the wheel path and macOS use: it skips a grid that refuses the
+/// mouse — Neovim rejects an event addressed to it without re-resolving —
+/// and takes the front-most by the order the core sorts layers in. This used
+/// to be a pixel loop here where the last layer in list order won, a third
+/// rule beside the wheel's and macOS's. The pixel rebase into the chosen
+/// layer stays local: `layers` is what this surface drew, and a grid the
+/// cached snapshot names but the drawn list does not falls back to the root.
+/// Caller holds app.mu, which is what the layer list is protected by;
+/// `grids` is the non-blocking cached snapshot.
 pub fn resolveMouseTarget(
     layers: []const app_mod.SurfaceLayer,
+    grids: []const app_mod.GridInfo,
     root_grid_id: i64,
     x: i32,
     y: i32,
     cell_w: u32,
     row_h: u32,
 ) MouseTarget {
-    var target = MouseTarget{ .grid_id = root_grid_id, .x = x, .y = y };
-    if (cell_w == 0 or row_h == 0 or layers.len <= 1) return target;
-    const cw: i32 = @intCast(cell_w);
-    const rh: i32 = @intCast(row_h);
-    for (layers[1..]) |layer| {
-        // A float that refuses the mouse is not a target and does not shadow
-        // one: Neovim rejects an event addressed to it without re-resolving,
-        // so picking it would swallow the click instead of letting it through
-        // to the window it is drawn over.
-        if (!layer.mouse_enabled) continue;
-        const w: i32 = @as(i32, @intCast(layer.cols)) * cw;
-        const h: i32 = @as(i32, @intCast(layer.rows)) * rh;
-        if (x < layer.x_px or x >= layer.x_px + w) continue;
-        if (y < layer.y_px or y >= layer.y_px + h) continue;
-        target = .{ .grid_id = layer.grid_id, .x = x - layer.x_px, .y = y - layer.y_px };
-    }
-    return target;
+    const target = MouseTarget{ .grid_id = root_grid_id, .x = x, .y = y };
+    if (cell_w == 0 or row_h == 0 or layers.len <= 1 or grids.len == 0) return target;
+    var hit: app_mod.zonvie_pointer_hit = undefined;
+    if (app_mod.zonvie_core_resolve_pointer_grid(
+        grids.ptr,
+        grids.len,
+        root_grid_id,
+        @divFloor(y, @as(i32, @intCast(row_h))),
+        @divFloor(x, @as(i32, @intCast(cell_w))),
+        0, // a click
+        &hit,
+    ) == 0) return target;
+    return rebaseToGrid(layers, root_grid_id, hit.grid_id, x, y);
 }
 
 /// Rebase a surface-local point into the layer a press already chose, for the

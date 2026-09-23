@@ -551,7 +551,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// (SurfaceDrawGate.swift) and the mode switching is SurfaceDrawLoopHost
     /// (SurfaceDrawLoop.swift). The threshold is this surface's own — see
     /// DrawLoopIdleCounter on why the two differ.
-    var drawLoopIdleCounter = DrawLoopIdleCounter(threshold: 10)
+    var drawLoopIdleCounter = DrawLoopIdleCounter()
     var drawLoopTraceName: String { "surface \(gridId)" }
 
     // Scroll offset data stored as value-type; passed to GPU via setVertexBytes
@@ -681,10 +681,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
     /// This surface's backing scale. Asked of the window rather than cached,
     /// as GridSurfaceRenderer caches what `setBackingScale` tells it — a
-    /// surface that is its own view can just look. The fallback is the Retina
-    /// scale, used only between construction and the window being attached,
-    /// and stated here rather than at each of the seven sites that had it.
-    var backingScale: CGFloat { window?.backingScaleFactor ?? 2.0 }
+    /// surface that is its own view can just look. The fallback is used only
+    /// between construction and the window being attached.
+    var backingScale: CGFloat { window?.backingScaleFactor ?? surfaceFallbackBackingScale }
 
     // --- Post-process bloom (neon glow) ---
     // Pipelines and sampler are shared from GridSurfaceRenderer.
@@ -1490,6 +1489,14 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // Contentless bracket: nothing rotates. Close the bracket flag
             lock.lock()
             cursorWriteSetIndex = -1
+            // Released here too, as the main surface releases at every commit:
+            // compensation left staged would ride out on the next commit that
+            // does carry rows, paired with rows it does not describe. The
+            // revision is not bumped — nothing this draw has not seen landed.
+            let released = mainTerminalView?.publishStagedScrollClears(ownedBy: self) ?? 0
+            if released > 0 {
+                ZonvieCore.appLog("[ext_commit] contentless bracket released \(released) scroll clears gridId=\(gridId)")
+            }
             closeFlushBracketLocked()
             lock.unlock()
         }
@@ -2575,8 +2582,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // changes nothing about their value — only that the shader cursor
             // can be evaluated against them now, under the same hold, which
             // is the point the main renderer evaluates at too.
-            scrollOffsetSnapshot = scrollOffsetLatch.isActive ? scrollOffsetData : nil
-            hostedScrollOffsetSnapshot = hostedScrollOffsetData  // Value-type copy
+            // More fixed floats than the mask can hold drops the whole scroll
+            // transform for the frame, as the main surface does: a partial
+            // mask lets shifted content bleed through an omitted float, and
+            // clearing the mask alone left every offset applied unmasked.
+            let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(layers: committedSurfaceLayers, rootGridId: gridId)
+            scrollOffsetSnapshot = scrollOffsetLatch.isActive && !fixedFloatOverflow ? scrollOffsetData : nil
+            hostedScrollOffsetSnapshot = fixedFloatOverflow ? [] : hostedScrollOffsetData  // Value-type copy
             // What displaces the cursor's own grid, resolved exactly as
             // drawHostedLayers resolves a layer's: its own offset when it is
             // scrolling in its own right, the root's when it merely follows,
@@ -2727,7 +2739,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             let blinkStateChanged = cursorBlinkStateSnapshot != blink.lastRendered
             blink.lastRendered = cursorBlinkStateSnapshot
 
-            let drawableSizeChanged = backBufferSize != view.drawableSize && backBuffer != nil
+            let drawableSizeChanged = surfaceDrawableSizeChanged(
+                backBufferSize: backBuffer == nil ? nil : backBufferSize,
+                drawableSize: view.drawableSize
+            )
             let hasNewCommit = currentCommitRevision != lastDrawnRevision
             lastDrawnRevision = currentCommitRevision
             // Content questions, asked of content. They used to be gated on
@@ -2934,9 +2949,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     if fixedFloatRectsScratch.count > SurfaceFixedFloatMask.maxRects { break }
                 }
             }
-            // A partial mask is visibly wrong, so an unrepresentable union drops
-            // the whole transform rather than masking part of it — the main
-            // renderer answers an overflow the same way.
+            // An unrepresentable union already dropped the transform in the
+            // committed snapshot above; the mask is emptied to match.
             if !fixedFloatMask.update(fixedFloatRectsScratch) {
                 fixedFloatMask.update([])
             }
