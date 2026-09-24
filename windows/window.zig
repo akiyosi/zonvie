@@ -2945,6 +2945,33 @@ pub export fn WndProc(
                             };
                         }
 
+                        // Track in each grid whether this paint built a present rect.
+                        // The core thread can make a layer dirty after the loop
+                        // below has run; that layer's band is drawn but not
+                        // presented, so only the layers recorded here may have
+                        // their dirty flag consumed.
+
+                        // Layers paint whole; present each one that changed.
+                        // Their rows are not in rows_to_draw, which only
+                        // covers the root grid's own dirty rows. Added before
+                        // the chrome test below, which widens only a list that
+                        // already has content: a paint whose only damage was a
+                        // layer used to present it without the chrome bands.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            app_mod.appendLayerPresentRects(
+                                app,
+                                tbs_snapshot.layers.slice(),
+                                content_x_offset_i32,
+                                content_y_offset_i32,
+                                client.right,
+                                client.bottom,
+                                row_h_px,
+                                present_rects,
+                            );
+                        }
+
                         // The chrome outside the content area — the tabline with
                         // its close and new-tab buttons, the caption buttons, the
                         // sidebar — is redrawn into back_tex on EVERY paint, from
@@ -2992,30 +3019,6 @@ pub export fn WndProc(
                                     };
                                 }
                             }
-                        }
-
-                        // Track in each grid whether this paint built a present rect.
-                        // The core thread can make a layer dirty after the loop
-                        // below has run; that layer's band is drawn but not
-                        // presented, so only the layers recorded here may have
-                        // their dirty flag consumed.
-
-                        // Layers paint whole; present each one that changed.
-                        // Their rows are not in rows_to_draw, which only
-                        // covers the root grid's own dirty rows.
-                        if (tbs_snapshot.layers.len > 1) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            defer app.mu.unlock(core.clock.io());
-                            app_mod.appendLayerPresentRects(
-                                app,
-                                tbs_snapshot.layers.slice(),
-                                content_x_offset_i32,
-                                content_y_offset_i32,
-                                client.right,
-                                client.bottom,
-                                row_h_px,
-                                present_rects,
-                            );
                         }
 
                         // Clamp first, then compact in place with O(n log n)

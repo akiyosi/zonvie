@@ -1846,6 +1846,21 @@ pub export fn zonvie_core_scrollbar_metrics(
     if (out) |o| o.* = scrollbar_metrics.compute(topline, botline, line_count);
 }
 
+pub const zonvie_scrollbar_drag_target = scrollbar_metrics.DragTarget;
+
+/// Where a knob dragged to `ratio` of its travel asks the window to scroll.
+/// The track and knob geometry that produce `ratio` are chrome and stay with
+/// the caller.
+pub export fn zonvie_core_scrollbar_drag_target(
+    ratio: f64,
+    topline: i64,
+    botline: i64,
+    line_count: i64,
+    out: ?*scrollbar_metrics.DragTarget,
+) callconv(.c) void {
+    if (out) |o| o.* = scrollbar_metrics.dragTarget(ratio, topline, botline, line_count);
+}
+
 /// The grid a surface's scrollbar should show. `surface_id` is 1 for the main
 /// window and the grid id of an external window for its own. Returns 1 and
 /// fills `out_grid` on success, 0 when grid_mu was held — on 0 the caller
