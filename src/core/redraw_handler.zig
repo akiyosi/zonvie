@@ -2349,12 +2349,7 @@ pub fn handleRedraw(
                     // Resolved once per grid_line tuple (grid_id is constant within
                     // it); used by the repeat clamp below. A per-cell sub_grids
                     // lookup here would be a hash probe on the grid_line hot path.
-                    const grid_cols: u32 = if (grid_id == 1)
-                        grid.cols
-                    else if (grid.sub_grids.get(grid_id)) |sg|
-                        sg.cols
-                    else
-                        0;
+                    const grid_cols: u32 = if (grid.bufForConst(grid_id)) |buf| buf.cols else 0;
 
                     // "hl" is a state that persists across cell tuples within THIS grid_line event.
                     // - If hl is omitted, keep previous hl value.

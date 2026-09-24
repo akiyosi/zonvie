@@ -3109,6 +3109,30 @@ func surfaceShaderCursorOffsetPx(
     return -offset.offset_y * viewportHeightPx / 2.0
 }
 
+/// Horizontal wheel events owed for a scroll input. The result is signed:
+/// positive sends "left", negative "right". A wheel (non-precise) event is one
+/// event per input; a swipe banks its travel and pays one event per `stepPx`.
+/// A swipe that is mostly vertical carries sideways jitter and pays nothing.
+struct HorizontalScrollAccumulator {
+    private var pendingPx: CGFloat = 0
+
+    mutating func consume(deltaX: CGFloat, deltaY: CGFloat, precise: Bool, scale: CGFloat, stepPx: CGFloat) -> Int {
+        guard deltaX != 0 else { return 0 }
+        guard precise else {
+            pendingPx = 0
+            return deltaX > 0 ? 1 : -1
+        }
+        guard stepPx > 0, abs(deltaX) > abs(deltaY) else {
+            pendingPx = 0
+            return 0
+        }
+        pendingPx += deltaX * scale
+        let steps = Int(pendingPx / stepPx)
+        pendingPx -= CGFloat(steps) * stepPx
+        return steps
+    }
+}
+
 /// The rows of a grid a pixel may be mapped into, and the band of them the
 /// sub-row ease actually moves.
 struct GridRowBand: Equatable {

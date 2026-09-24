@@ -211,7 +211,7 @@ final class SurfaceScrollbarController {
     }
 }
 
-final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
+final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     var renderer: GridSurfaceRenderer!
 
     /// Expose drawable size without requiring MetalKit import at call site.
@@ -231,18 +231,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     private let redrawScheduler = SurfaceRedrawScheduler()
 
     private static var dirtyLogEnabled: Bool { ZonvieCore.appLogEnabled }
-
-    // --- IME / NSTextInputClient support ---
-    // Shared composition handling: inline-extmark preedit with overlay fallback.
-    private lazy var ime = IMEPreeditController(host: self)
-    private var _inputContext: NSTextInputContext?
-
-    override var inputContext: NSTextInputContext? {
-        if _inputContext == nil {
-            _inputContext = NSTextInputContext(client: self)
-        }
-        return _inputContext
-    }
 
     override func viewDidEndLiveResize() {
         super.viewDidEndLiveResize()
@@ -1010,8 +998,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         requestRedraw(vr)
     }
 
-    override var acceptsFirstResponder: Bool { true }
-
     override init(frame frameRect: NSRect, device: MTLDevice?) {
         let dev = device ?? MTLCreateSystemDefaultDevice()
         super.init(frame: frameRect, device: dev)
@@ -1126,11 +1112,6 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             self.layer?.isOpaque = true
             self.layer?.backgroundColor = NSColor.black.cgColor
         }
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
     }
 
     override func viewDidMoveToWindow() {
@@ -1837,6 +1818,28 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// over another grid. Cleared when the gesture and its momentum finish.
     private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
 
+    private var horizontalScroll = HorizontalScrollAccumulator()
+
+    /// Send the horizontal part of a scroll input. Shared with external grid
+    /// views, like handleScrollInput.
+    func handleHorizontalScrollInput(
+        gridId: Int64, row: Int32, col: Int32,
+        deltaX: CGFloat, deltaY: CGFloat, scale: CGFloat,
+        hasPrecise: Bool, modifier: String
+    ) {
+        guard let core else { return }
+        // Neovim's default 'mousescroll' hor:6 moves six columns per event;
+        // paying one event per six cells keeps the text with the finger.
+        let stepPx = CGFloat(renderer.cellWidthPx) * 6
+        let steps = horizontalScroll.consume(
+            deltaX: deltaX, deltaY: deltaY, precise: hasPrecise, scale: scale, stepPx: stepPx)
+        guard steps != 0 else { return }
+        let direction = steps > 0 ? "left" : "right"
+        for _ in 0..<abs(steps) {
+            core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+        }
+    }
+
     override func scrollWheel(with event: NSEvent) {
         noteScrollGesturePhase(event)
         // A gesture's .began carries no delta, so it is dropped by the check
@@ -1894,6 +1897,11 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 requestRedraw()
             }
         }
+
+        handleHorizontalScrollInput(
+            gridId: target.gridId, row: target.row, col: target.col,
+            deltaX: deltaX, deltaY: deltaY, scale: scale,
+            hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
 
         // Release the lock once the gesture and its inertia have finished. The
         // gesture's own .ended is not released here so momentum keeps the same
@@ -3598,7 +3606,37 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 }
 
 // MARK: - NSTextInputClient (IME support)
-extension MetalTerminalView: NSTextInputClient {
+/// The input side the main grid view and every external grid view share: the
+/// NSTextInputClient glue over the shared IME controller, the input context,
+/// and first-responder acceptance. It is a class, not a protocol extension,
+/// because the ObjC runtime never sees a Swift default implementation.
+/// Subclasses supply the view-specific half as an IMEPreeditHost.
+class GridInputView: MTKView, NSTextInputClient {
+    private lazy var ime: IMEPreeditController = {
+        guard let host = self as? IMEPreeditHost else {
+            preconditionFailure("GridInputView subclasses must be IMEPreeditHosts")
+        }
+        return IMEPreeditController(host: host)
+    }()
+    private var _inputContext: NSTextInputContext?
+
+    // Declared so the subclasses' nonisolated deinits have a nonisolated
+    // declaration to override; the implicit one here is main-actor isolated.
+    nonisolated deinit {}
+
+    override var inputContext: NSTextInputContext? {
+        if _inputContext == nil {
+            _inputContext = NSTextInputContext(client: self)
+        }
+        return _inputContext
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
+    }
 
     func insertText(_ string: Any, replacementRange: NSRange) {
         ime.insertText(string)
@@ -3632,11 +3670,9 @@ extension MetalTerminalView: NSTextInputClient {
         return 0
     }
 
-    /// Handle unbound key commands from interpretKeyEvents.
-    override func doCommand(by selector: Selector) {
-        // Some keys (like arrow keys during IME) may come through here.
-        // For most terminal usage, we can ignore these or handle specific selectors.
-    }
+    /// Unbound key commands from interpretKeyEvents are swallowed. Passing
+    /// them up the responder chain beeps.
+    override func doCommand(by selector: Selector) {}
 }
 
 // MARK: - Shared IME preedit handling

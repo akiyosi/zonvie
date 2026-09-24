@@ -105,9 +105,42 @@ private func verifyDisplacedFollowerHit() {
     expect(still == nil ? 1 : 0, 1, "an undisplaced follower leaves the static hit alone")
 }
 
+/// Horizontal input was read only to drop an all-zero event and never sent,
+/// so neither a tilt wheel nor a sideways swipe reached Neovim.
+private func verifyHorizontalScrollEvents() {
+    var acc = HorizontalScrollAccumulator()
+    // A tilt-wheel notch is one event whatever its size; positive is "left".
+    expect(Int32(acc.consume(deltaX: 0.4, deltaY: 0, precise: false, scale: 2, stepPx: 60)), 1,
+           "a wheel notch sends one event")
+    expect(Int32(acc.consume(deltaX: -3, deltaY: 0, precise: false, scale: 2, stepPx: 60)), -1,
+           "a wheel notch the other way sends one event")
+
+    // A swipe banks its travel and pays one event per step.
+    acc = HorizontalScrollAccumulator()
+    expect(Int32(acc.consume(deltaX: 20, deltaY: 0, precise: true, scale: 2, stepPx: 60)), 0,
+           "40px of a 60px step sends nothing yet")
+    expect(Int32(acc.consume(deltaX: 20, deltaY: 0, precise: true, scale: 2, stepPx: 60)), 1,
+           "the step completes on the next input")
+    expect(Int32(acc.consume(deltaX: -70, deltaY: 0, precise: true, scale: 2, stepPx: 60)), -2,
+           "a reversal spends the bank, then pays whole steps the other way")
+
+    // A mostly vertical swipe carries sideways jitter; it must not scroll.
+    acc = HorizontalScrollAccumulator()
+    for _ in 0..<10 {
+        expect(Int32(acc.consume(deltaX: 8, deltaY: 30, precise: true, scale: 2, stepPx: 60)), 0,
+               "vertical-dominant swipe sends no horizontal event")
+    }
+
+    // A zero step cannot divide.
+    expect(Int32(acc.consume(deltaX: 50, deltaY: 0, precise: true, scale: 2, stepPx: 0)), 0,
+           "a zero step sends nothing")
+}
+
 @main
 struct ScrollAdjustedRowTests {
     static func main() {
+        verifyHorizontalScrollEvents()
+
         // A pixel on a CONTENT row, eased: the ease is undone, because the shader
         // really did move that pixel.
         expect(

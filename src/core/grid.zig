@@ -951,10 +951,10 @@ pub const GridBuf = struct {
         return true;
     }
 
-    fn getCellHL(self: *const GridBuf, row: u32, col: u32) u32 {
-        if (row >= self.rows or col >= self.cols) return 0;
+    fn getCell(self: *const GridBuf, row: u32, col: u32) Cell {
+        if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.cells[idx].hl;
+        return self.cells[idx];
     }
 
     /// Implements the "grid_scroll" UI event for a sub-grid.
@@ -1961,37 +1961,22 @@ pub const Grid = struct {
     }
 
     pub fn getCellHL(self: *const Grid, row: u32, col: u32) u32 {
-        if (row >= self.rows or col >= self.cols) return 0;
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.main_buf.cells[idx].hl;
+        return self.main_buf.getCell(row, col).hl;
     }
 
     pub fn getCellHLGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) u32 {
-        if (grid_id == 1) return self.getCellHL(row, col);
-
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            return sg.getCellHL(row, col);
-        }
-        return 0;
+        return self.getCellGrid(grid_id, row, col).hl;
     }
 
     /// Get cell at (row, col) for global grid
     pub fn getCell(self: *const Grid, row: u32, col: u32) Cell {
-        if (row >= self.rows or col >= self.cols) return .{ .cp = 0, .hl = 0 };
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-        return self.main_buf.cells[idx];
+        return self.main_buf.getCell(row, col);
     }
 
     /// Get cell at (row, col) for any grid
     pub fn getCellGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) Cell {
-        if (grid_id == 1) return self.getCell(row, col);
-
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            if (row >= sg.rows or col >= sg.cols) return .{ .cp = 0, .hl = 0 };
-            const idx: usize = @as(usize, row) * @as(usize, sg.cols) + @as(usize, col);
-            return sg.cells[idx];
-        }
-        return .{ .cp = 0, .hl = 0 };
+        const buf = self.bufForConst(grid_id) orelse return .{ .cp = 0, .hl = 0 };
+        return buf.getCell(row, col);
     }
 
     /// Grow `dirty_rows` to cover `rows`, leaving new bits clean. Never index
@@ -2018,6 +2003,13 @@ pub const Grid = struct {
 
     pub fn markAllDirty(self: *Grid) void {
         self.main_buf.markAllDirty();
+    }
+
+    /// Grid 1 and every sub-grid: the whole display is owed again.
+    pub fn markEverySurfaceDirty(self: *Grid) void {
+        self.main_buf.markAllDirty();
+        var sg_it = self.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| sg.markAllDirty();
     }
 
     /// Shift previously-recorded touched rows by a new scroll delta.
@@ -3403,12 +3395,8 @@ pub const Grid = struct {
     }
 
     pub fn setCursor(self: *Grid, grid_id: i64, row: u32, col: u32) void {
-        if (grid_id == 1) {
-            if (row >= self.rows or col >= self.cols) return;
-        } else {
-            const sub_grid = self.sub_grids.get(grid_id) orelse return;
-            if (row >= sub_grid.rows or col >= sub_grid.cols) return;
-        }
+        const buf = self.bufForConst(grid_id) orelse return;
+        if (row >= buf.rows or col >= buf.cols) return;
 
         const changed =
             (!self.cursor_valid) or
