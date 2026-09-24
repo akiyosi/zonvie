@@ -807,20 +807,24 @@ final class ZonvieCore {
                             // callback pointer is valid. Copying the entire row
                             // here allocated on the grid_mu redraw hot path and
                             // retained that allocation in the main queue.
-                            if let background = ZonvieCore.extractExternalGridBackground(
+                            // Configured even when the row carries no
+                            // background quad: under blur the core drops the
+                            // default-background runs of a surface root that
+                            // hosts a float, and skipping the configuration
+                            // then left the window's background unset (black).
+                            let background = ZonvieCore.extractExternalGridBackground(
                                 verts: verts,
                                 vertCount: Int(vertCount)
-                            ) {
-                                DispatchQueue.main.async { [weak core] in
-                                    guard let core = core else { return }
-                                    core.configureExternalGridFromRow(
-                                        gridId: gridId,
-                                        gridView: gridView,
-                                        background: background,
-                                        rows: totalRows,
-                                        cols: totalCols
-                                    )
-                                }
+                            )
+                            DispatchQueue.main.async { [weak core] in
+                                guard let core = core else { return }
+                                core.configureExternalGridFromRow(
+                                    gridId: gridId,
+                                    gridView: gridView,
+                                    background: background,
+                                    rows: totalRows,
+                                    cols: totalCols
+                                )
                             }
                         }
                     } else {
@@ -3133,6 +3137,14 @@ final class ZonvieCore {
             return m
         }
 
+        /// The line a knob dragged to `ratio` of its travel names, and which
+        /// edge to align it with (`zonvie_core_scrollbar_drag_target`).
+        func dragTarget(ratio: Double) -> zonvie_scrollbar_drag_target {
+            var t = zonvie_scrollbar_drag_target()
+            zonvie_core_scrollbar_drag_target(ratio, topline, botline, lineCount, &t)
+            return t
+        }
+
         /// Single mapping point from the C ABI struct, shared by the blocking
         /// and non-blocking queries so field additions cannot drift apart.
         init(_ vp: zonvie_viewport_info) {
@@ -4225,7 +4237,7 @@ final class ZonvieCore {
     }
     private var externalWindowDelegates: [Int64: ExternalWindowDelegate] = [:]
     /// Pending background color configuration (applied when window is created)
-    private var pendingExternalGridConfig: [Int64: (bgColor: NSColor, rows: UInt32, cols: UInt32)] = [:]
+    private var pendingExternalGridConfig: [Int64: (bgColor: NSColor?, rows: UInt32, cols: UInt32)] = [:]
     /// Pending vertices for external grids. Their colors/dimensions configure a
     /// newly-created window, but their atlas-dependent content is not replayed:
     /// window creation drives a bracketed full resend instead.
@@ -5140,7 +5152,7 @@ final class ZonvieCore {
     private func configureExternalGridFromRow(
         gridId: Int64,
         gridView: ExternalGridView,
-        background: ExternalGridBackground,
+        background: ExternalGridBackground?,
         rows: UInt32,
         cols: UInt32
     ) {
@@ -5149,13 +5161,15 @@ final class ZonvieCore {
 
         let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
                              gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-        let bgColor = NSColor(
-            red: CGFloat(background.rgba.x),
-            green: CGFloat(background.rgba.y),
-            blue: CGFloat(background.rgba.z),
-            alpha: CGFloat(background.rgba.w)
-        )
-        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) bgVertexIdx=\(background.vertexIndex) bgColor=\(bgColor)")
+        let bgColor = background.map {
+            NSColor(
+                red: CGFloat($0.rgba.x),
+                green: CGFloat($0.rgba.y),
+                blue: CGFloat($0.rgba.z),
+                alpha: CGFloat($0.rgba.w)
+            )
+        }
+        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) bgVertexIdx=\(background?.vertexIndex ?? -1) bgColor=\(String(describing: bgColor))")
 
         // No nested async hop: the resize must complete before
         // requestRedraw() so the drawable size stays in sync with the NDC viewport.
@@ -5183,7 +5197,7 @@ final class ZonvieCore {
         gridId: Int64,
         window: NSWindow,
         gridView: ExternalGridView,
-        bgColor: NSColor,
+        bgColor: NSColor?,
         rows: UInt32,
         cols: UInt32
     ) {
@@ -6781,12 +6795,25 @@ final class ZonvieCore {
         let name: String?
         switch kind {
         case .normal:
-            // Only use NormalFloat for float-origin externals (nvim_open_win external=true).
-            // Regular splits externalized by --extwindows use default bg.
+            // A float given a window of its own is drawn in NormalFloat. Any
+            // other window — a split externalized with <C-w>ge — is drawn in
+            // the default background: the core's, the value the main window
+            // clears with. It used to be recovered from the first background
+            // quad of row 0, and the core drops exactly those quads from a
+            // surface root that hosts a float (blur_enabled is always on in
+            // the core), so a split holding a float opened black. Not looked
+            // up by the name "Normal": Neovim sends it as the default colours,
+            // not as a named group, and the lookup reports it missing.
             if zonvie_core_is_float_external(corePtr, gridId) != 0 {
                 name = "NormalFloat"
             } else {
-                name = nil
+                bg = zonvie_core_get_default_bg(corePtr)
+                return NSColor(
+                    red: CGFloat((bg >> 16) & 0xFF) / 255.0,
+                    green: CGFloat((bg >> 8) & 0xFF) / 255.0,
+                    blue: CGFloat(bg & 0xFF) / 255.0,
+                    alpha: 1.0
+                )
             }
         case .cmdline, .msgShow, .msgHistory:
             name = "MsgArea"

@@ -75,8 +75,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     private(set) var surfaceClearAlpha: Double = 1.0
 
     func setGridBackground(rgb: UInt32, clearAlpha: Double) {
+        // The colour arrives from the main queue after the commit whose rows
+        // it describes, and those rows paint no default background — the core
+        // leaves that to the clear once the surface hosts a layer. So a change
+        // has to clear the whole surface again, or the first frame's colour
+        // (black, before any was known) stays under every row.
+        lock.lock()
+        let changed = surfaceBgRGB != rgb || surfaceClearAlpha != clearAlpha
         surfaceBgRGB = rgb
         surfaceClearAlpha = clearAlpha
+        if changed { pendingLayoutDamage = true }
+        lock.unlock()
+        if changed { requestRedraw() }
     }
 
     /// Track if we've presented at least once (for loadAction optimization)
@@ -239,13 +249,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         seedingBaseline: Bool = true
     ) -> Float {
         guard cellHeightPx > 0, let main = mainTerminalView else { return 0 }
+        // Taken before `lock`: it takes the main view's own lock, and neither
+        // is held while taking the other.
         let anchorRowsUp = main.anchorLandedRowsUpSnapshot(anchorGridId)
+        // Both ledgers under `lock`: commitFlush prunes them on the core
+        // thread under it, and this runs on the main thread. Unlocked, the two
+        // mutated one Swift dictionary at once.
+        lock.lock()
         let placementRowsUp = placementRowsUpSnapshot[gridId] ?? 0
         guard let baseline = floatDebtBaselineSnapshot[gridId] else {
             if seedingBaseline {
                 floatDebtBaselineSnapshot[gridId] = FloatDebtBaseline(
                     anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
             }
+            lock.unlock()
             return 0
         }
         let rows = floatDebtRowsUp(
@@ -254,15 +271,23 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             baseline: baseline
         )
         // The draw's reading is the surface's state; the hit test only reads it.
-        if seedingBaseline, ZonvieCore.appLogEnabled, hostedDebtLastLogged[gridId] != rows {
-            hostedDebtLastLogged[gridId] = rows
+        let logChanged = seedingBaseline && ZonvieCore.appLogEnabled && hostedDebtLastLogged[gridId] != rows
+        if logChanged { hostedDebtLastLogged[gridId] = rows }
+        lock.unlock()
+        if logChanged {
             ZonvieCore.appLog(
                 "[float_debt] surface=\(self.gridId) gridId=\(gridId) rows=\(rows)"
                     + " anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp)"
                     + " base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))"
             )
         }
-        return Float(rows) * cellHeightPx
+        // The displacement the debt adds to the drawn origin, +y down. A float
+        // whose placement ran `rows` ahead of its anchor (rows < 0 when it
+        // moved up first) is held where it was drawn by moving it back down,
+        // so the sign is the debt's opposite — as on the main surface, where
+        // the same rows are added to an NDC offset that is negated against
+        // pixels. This returned `+rows`, which doubled the step instead.
+        return -Float(rows) * cellHeightPx
     }
 
     /// This surface's fixed-float mask, the same one the main renderer keeps.
@@ -2589,6 +2614,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(layers: committedSurfaceLayers, rootGridId: gridId)
             scrollOffsetSnapshot = scrollOffsetLatch.isActive && !fixedFloatOverflow ? scrollOffsetData : nil
             hostedScrollOffsetSnapshot = fixedFloatOverflow ? [] : hostedScrollOffsetData  // Value-type copy
+            // And no retained rows: they are drawn only beside an offset that
+            // places them, and without one they land unshifted and unclipped.
+            if fixedFloatOverflow { hasScrollOffset = false }
             // What displaces the cursor's own grid, resolved exactly as
             // drawHostedLayers resolves a layer's: its own offset when it is
             // scrolling in its own right, the root's when it merely follows,
@@ -2814,6 +2842,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 hasNewCommit: hasNewCommit,
                 hasCursorUpdate: cursorDirtySnapshot,
                 hasDirtyRows: hasDirtyContent,
+                // Layout damage is the whole surface owing a redraw that no
+                // row expresses. It came only with a commit until a
+                // background change could raise it between commits.
+                hasDirtyRect: layoutDamageSnapshot,
                 hasStagedScroll: hasPendingScroll,
                 scrollOffsetChanged: scrollOffsetChanged,
                 isSmoothScrolling: smoothScrolling,
@@ -4987,25 +5019,26 @@ extension ExternalGridView: NSTextInputClient {
 
     @objc private func scrollerDidScroll(_ sender: NSScroller) {
         guard let main = mainTerminalView, let core = main.core else { return }
-        guard let viewport = core.getViewportNonBlocking(gridId: gridId) else { return }
-
-        let visibleLines = viewport.botline - viewport.topline
+        // Read and act on the same grid: the knob shows `scrollbarInteractionGrid`,
+        // and this read `gridId`'s viewport while scrolling the other.
+        let target = scrollbarInteractionGrid
 
         switch sender.hitPart {
         case .decrementPage:
-            let newTopline = max(1, viewport.topline - (visibleLines - 2) + 1)
-            core.scrollToLine(gridId: scrollbarInteractionGrid, newTopline, useBottom: false)
+            // Neovim's own page step, as the main window and Windows take it;
+            // this surface stepped by its own arithmetic.
+            core.pageScroll(gridId: target, forward: false)
 
         case .incrementPage:
-            let newTopline = min(viewport.lineCount - visibleLines + 1, viewport.topline + (visibleLines - 2) + 1)
-            let targetLine = max(1, newTopline)
-            core.scrollToLine(gridId: scrollbarInteractionGrid, targetLine, useBottom: false)
+            core.pageScroll(gridId: target, forward: true)
 
         case .knob, .knobSlot:
-            let scrollRange = max(1, viewport.lineCount - visibleLines)
-            let targetTopline = Int64(sender.doubleValue * Double(scrollRange)) + 1
-            let clampedTopline = max(1, min(targetTopline, viewport.lineCount - visibleLines + 1))
-            core.scrollToLine(gridId: scrollbarInteractionGrid, clampedTopline, useBottom: false)
+            // The core's rule, shared with the main window and Windows. It
+            // aligns the lower half of the travel to the bottom, which is the
+            // only way the last line can be reached; this surface never did.
+            guard let viewport = core.getViewportNonBlocking(gridId: target) else { return }
+            let drag = viewport.dragTarget(ratio: sender.doubleValue)
+            core.scrollToLine(gridId: target, drag.line, useBottom: drag.use_bottom != 0)
 
         default:
             break

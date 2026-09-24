@@ -1528,6 +1528,29 @@ ZONVIE_API void zonvie_core_scrollbar_metrics(
     int64_t line_count,
     zonvie_scrollbar_metrics *out);
 
+/* Where a knob dragged to `ratio` of its travel (0 top, 1 bottom) asks the
+   window to scroll, filled by zonvie_core_scrollbar_drag_target. */
+typedef struct zonvie_scrollbar_drag_target {
+    /* 1-based buffer line to bring to the edge `use_bottom` names. */
+    int64_t line;
+    /* 1 to align `line` with the window's bottom (zb), 0 with its top (zt).
+       The lower half of the travel aligns to the bottom, the only way the
+       last line of the buffer can be reached. */
+    uint8_t use_bottom;
+} zonvie_scrollbar_drag_target;
+
+/* The line a knob at `ratio` of its travel names, for a viewport reported as
+   (topline, botline exclusive, line_count). `ratio` is clamped to 0..1.
+   Pass the result to zonvie_core_scroll_to_line.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_scrollbar_drag_target(
+    double ratio,
+    int64_t topline,
+    int64_t botline,
+    int64_t line_count,
+    zonvie_scrollbar_drag_target *out);
+
 /* The grid a surface's scrollbar should show: the cursor's grid when this
    surface composites it, and the surface's own root otherwise. `surface_id` is
    1 for the main window and the grid id of an external window for its own.

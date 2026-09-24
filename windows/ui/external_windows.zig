@@ -3662,22 +3662,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 const ext_cursor_verts = tbs_cursor.verts.items;
                 if (ext_cursor_verts.len != 0) {
                     if (app.renderer) |*main_r2| {
-                        var minx_c: f32 = ext_cursor_verts[0].position[0];
-                        var maxx_c: f32 = minx_c;
-                        var miny_c: f32 = ext_cursor_verts[0].position[1];
-                        var maxy_c: f32 = miny_c;
-                        for (ext_cursor_verts) |v| {
-                            if (v.position[0] < minx_c) minx_c = v.position[0];
-                            if (v.position[0] > maxx_c) maxx_c = v.position[0];
-                            if (v.position[1] < miny_c) miny_c = v.position[1];
-                            if (v.position[1] > maxy_c) maxy_c = v.position[1];
-                        }
-                        // Position the cursor at its centre, but size it
-                        // using the main grid's cell metrics. ext cmdline /
-                        // popupmenu drawables are often taller than a single
-                        // cell (multi-row prompt / padding), so sizing from
-                        // the drawable would render the cursor SDF at the
-                        // drawable's height instead of the cell height.
                         // Core vertices are grid-local pixels, y down, and a
                         // decorated surface does not draw them at its client
                         // origin: the cmdline's grid starts past the icon strip
@@ -3700,21 +3684,24 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                                 break;
                             }
                         }
-                        const center_x = off_x + content_origin.x + layer_x + (minx_c + maxx_c) * 0.5;
-                        const center_y = off_y + content_origin.y + layer_y + (miny_c + maxy_c) * 0.5;
-                        const cell_w: f32 = @floatFromInt(app.cell_w_px);
-                        const cell_h: f32 = @floatFromInt(app.rowHeightPx());
-                        const left_main = center_x - cell_w * 0.5;
-                        const right_main = center_x + cell_w * 0.5;
-                        const top_main = center_y - cell_h * 0.5;
-                        const bot_main = center_y + cell_h * 0.5;
-                        // Ghostty's cursor shaders treat iCurrentCursor.y
-                        // as the BOTTOM edge of the cursor rect.
-                        const cv0 = ext_cursor_verts[0];
-                        main_r2.setCursorShaderState(
-                            .{ left_main, bot_main, right_main - left_main, bot_main - top_main },
-                            cv0.color,
-                        );
+                        // The cursor's own box, from the core's cursor_rect as
+                        // the main driver takes it: a bar or underline stays a
+                        // bar or underline. This used to centre a whole-cell
+                        // box on the vertices, so a cursor shader saw a block
+                        // in an external window and a bar in the main one.
+                        // Ghostty's cursor shaders treat iCurrentCursor.y as
+                        // the BOTTOM edge of the cursor rect.
+                        if (core.cursor_rect.bounds(
+                            core.Vertex,
+                            ext_cursor_verts,
+                            off_x + content_origin.x + layer_x,
+                            off_y + content_origin.y + layer_y,
+                        )) |cb| {
+                            main_r2.setCursorShaderState(
+                                .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                                ext_cursor_verts[0].color,
+                            );
+                        }
                     }
                 }
 

@@ -1417,20 +1417,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         case .knob:
             // Dragging knob - jump directly to target line (requires viewport data)
             guard let viewport else { break }
-            let visibleLines = viewport.botline - viewport.topline
-            let scrollRatio = sender.doubleValue
-            let scrollRange = max(1, viewport.lineCount - visibleLines)
-            let targetLine0based = Int64(scrollRatio * Double(scrollRange))
-            let targetLine1based = targetLine0based + 1  // Neovim uses 1-based line numbers
-
-            // Use bottom alignment for second half to allow scrolling to end of file
-            let useBottom = scrollRatio >= 0.5
-            let targetLine: Int64 = if useBottom {
-                // For bottom mode, calculate the bottom line of the viewport
-                min(targetLine1based + visibleLines - 1, viewport.lineCount)
-            } else {
-                targetLine1based
-            }
+            // The core's rule, shared with the external window and Windows.
+            let drag = viewport.dragTarget(ratio: sender.doubleValue)
+            let targetLine = drag.line
+            let useBottom = drag.use_bottom != 0
 
             // Store pending position for throttling
             pendingScrollLine = targetLine

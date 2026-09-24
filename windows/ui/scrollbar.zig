@@ -448,19 +448,11 @@ pub fn scrollbarMouseMoveForExternal(hwnd: c.HWND, app: *App, ext_win: *app_mod.
     const mouse_in_track: f32 = @as(f32, @floatFromInt(mouse_y)) - geom.track_top - knob_height / 2.0;
     const scroll_ratio = @max(0.0, @min(1.0, mouse_in_track / knob_travel));
 
-    // scroll_range is max topline value (0-based: 0 to line_count - visible_lines)
-    const scroll_range = @max(0, vp.line_count - visible_lines);
-    const target_topline_0based: i64 = @intFromFloat(scroll_ratio * @as(f32, @floatFromInt(scroll_range)));
-
-    // 1-based topline for Neovim
-    const target_topline_1based: i64 = target_topline_0based + 1;
-
-    // Determine scroll mode: top half uses zt (top), bottom half uses zb (bottom)
-    const use_bottom = scroll_ratio >= 0.5;
-    const target_line: i64 = if (use_bottom) blk: {
-        const bottom_line = target_topline_1based + visible_lines - 1;
-        break :blk @min(bottom_line, vp.line_count);
-    } else target_topline_1based;
+    // The core's rule, shared with the main window and both macOS surfaces.
+    var drag: app_mod.zonvie_scrollbar_drag_target = undefined;
+    app_mod.zonvie_core_scrollbar_drag_target(scroll_ratio, vp.topline, vp.botline, vp.line_count, &drag);
+    const target_line: i64 = drag.line;
+    const use_bottom = drag.use_bottom != 0;
 
     // Always store pending position
     ext_win.scrollbar_pending_line = target_line;
@@ -658,22 +650,12 @@ pub fn scrollbarMouseMove(hwnd: c.HWND, app: *App, mouse_y: i32) void {
     const mouse_in_track: f32 = @as(f32, @floatFromInt(mouse_y)) - geom.track_top - knob_height / 2.0;
     const scroll_ratio = @max(0.0, @min(1.0, mouse_in_track / knob_travel));
 
-    // scroll_range is max topline value (0-based: 0 to line_count - visible_lines)
-    const scroll_range = @max(0, vp.line_count - visible_lines);
-    const target_topline_0based: i64 = @intFromFloat(scroll_ratio * @as(f32, @floatFromInt(scroll_range)));
-
-    // 1-based topline for Neovim
-    const target_topline_1based: i64 = target_topline_0based + 1;
-
-    // Determine scroll mode: top half uses zt (top), bottom half uses zb (bottom)
-    // This allows scrolling to the very end of the file
-    const use_bottom = scroll_ratio >= 0.5;
-    const target_line: i64 = if (use_bottom) blk: {
-        // For bottom mode, calculate the bottom line of the viewport
-        const bottom_line = target_topline_1based + visible_lines - 1;
-        // Clamp to line_count
-        break :blk @min(bottom_line, vp.line_count);
-    } else target_topline_1based;
+    // The line the ratio names is the core's rule, shared with the external
+    // window and both macOS surfaces.
+    var drag: app_mod.zonvie_scrollbar_drag_target = undefined;
+    app_mod.zonvie_core_scrollbar_drag_target(scroll_ratio, vp.topline, vp.botline, vp.line_count, &drag);
+    const target_line: i64 = drag.line;
+    const use_bottom = drag.use_bottom != 0;
 
     // Always store pending position
     app.scrollbar_pending_line = target_line;

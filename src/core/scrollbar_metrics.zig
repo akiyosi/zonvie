@@ -59,7 +59,64 @@ pub fn compute(topline: i64, botline: i64, line_count: i64) Metrics {
     };
 }
 
+/// Where a knob dragged to `ratio` of its travel asks the window to scroll.
+pub const DragTarget = extern struct {
+    /// 1-based buffer line to bring to the edge `use_bottom` names.
+    line: i64,
+    /// 1 to align `line` with the bottom of the window (`zb`), 0 with its top
+    /// (`zt`). The lower half of the travel aligns to the bottom, which is
+    /// the only way the last line of the buffer can be reached.
+    use_bottom: u8,
+};
+
+/// The line a knob at `ratio` (0 top, 1 bottom) of its travel names. Three
+/// frontends wrote this out and a fourth — the macOS external window — had
+/// none, stepping pages by its own arithmetic instead. macOS divided by
+/// `max(1, line_count - visible)`, so a window showing everything still moved
+/// its top line to 2 at the end of the travel; the range here is `max(0, …)`.
+pub fn dragTarget(ratio: f64, topline: i64, botline: i64, line_count: i64) DragTarget {
+    const visible: i64 = @max(0, botline - topline);
+    const lines: i64 = @max(0, line_count);
+    const r: f64 = if (std.math.isNan(ratio)) 0 else @min(1.0, @max(0.0, ratio));
+    const range: i64 = @max(0, lines - visible);
+    const top_line: i64 = @as(i64, @intFromFloat(r * @as(f64, @floatFromInt(range)))) + 1;
+    const use_bottom = r >= 0.5;
+    const line: i64 = if (use_bottom) @min(top_line + visible - 1, lines) else top_line;
+    return .{ .line = @max(1, line), .use_bottom = @intFromBool(use_bottom) };
+}
+
 // ── tests ────────────────────────────────────────────────────────────────
+
+test "the top half of the travel aligns a top line, the bottom half a bottom line" {
+    // 100 lines, 20 shown: the top line can run from 1 to 81.
+    const top = dragTarget(0.0, 0, 20, 100);
+    try testing.expectEqual(@as(i64, 1), top.line);
+    try testing.expectEqual(@as(u8, 0), top.use_bottom);
+    const quarter = dragTarget(0.25, 0, 20, 100);
+    try testing.expectEqual(@as(i64, 21), quarter.line);
+    try testing.expectEqual(@as(u8, 0), quarter.use_bottom);
+    const bottom = dragTarget(1.0, 0, 20, 100);
+    try testing.expectEqual(@as(i64, 100), bottom.line);
+    try testing.expectEqual(@as(u8, 1), bottom.use_bottom);
+}
+
+test "a window showing everything names its first line wherever the knob is" {
+    // macOS's max(1, …) range sent the top line to 2 at the end of the travel.
+    try testing.expectEqual(@as(i64, 1), dragTarget(0.0, 0, 20, 20).line);
+    const end = dragTarget(1.0, 0, 20, 20);
+    try testing.expectEqual(@as(i64, 20), end.line);
+    try testing.expectEqual(@as(u8, 1), end.use_bottom);
+}
+
+test "a ratio outside the travel, or none at all, is clamped rather than trusted" {
+    try testing.expectEqual(@as(i64, 1), dragTarget(-3.0, 0, 20, 100).line);
+    try testing.expectEqual(@as(i64, 100), dragTarget(7.0, 0, 20, 100).line);
+    try testing.expectEqual(@as(i64, 1), dragTarget(std.math.nan(f64), 0, 20, 100).line);
+}
+
+test "an unreported viewport names line 1" {
+    try testing.expectEqual(@as(i64, 1), dragTarget(0.9, 0, 0, 0).line);
+}
 
 const testing = std.testing;
 

@@ -569,6 +569,17 @@ test "gui:extwin_blink_without_cursor_skips" {
     }
 }
 
+test "gui:visual_extwin_split_with_float_background" {
+    // macOS only: it enumerates the app's OS windows to capture the external
+    // one.
+    if (comptime builtin.os.tag == .macos and driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extwin_split_with_float_background.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_extwin_hosted_layer_glow" {
     // macOS only: it enumerates the app's OS windows and captures a
     // non-main one, and the bloom path under test is macOS frontend code.
