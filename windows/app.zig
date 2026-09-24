@@ -57,6 +57,7 @@ pub const zonvie_scrollbar_metrics = core.zonvie_scrollbar_metrics;
 pub const zonvie_core_scrollbar_drag_target = core.zonvie_core_scrollbar_drag_target;
 pub const zonvie_scrollbar_drag_target = core.zonvie_scrollbar_drag_target;
 pub const zonvie_core_popupmenu_top = core.zonvie_core_popupmenu_top;
+pub const zonvie_core_cmdline_popupmenu_top = core.zonvie_core_cmdline_popupmenu_top;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
@@ -434,6 +435,11 @@ pub const PendingExternalWindow = struct {
     /// the existing entry's seq so the original posted message still
     /// matches.
     seq: u64,
+    /// App.external_session_generation when the core asked for this window.
+    /// Read at request time: a create still queued across on_restart /
+    /// on_connect belongs to the old session, whatever the counter says when
+    /// the UI thread gets to it.
+    session_generation: u64,
     /// Set while the UI thread is attempting the fallible HWND/renderer/map
     /// creation. The request stays queued until every step succeeds so a
     /// transient failure can be retried without allocating another entry.

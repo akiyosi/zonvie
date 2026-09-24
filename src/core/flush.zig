@@ -3216,6 +3216,14 @@ pub const FlushCtx = struct {
         // order is intentional: this defer runs after the two defers below.
         defer {
             ctx.core.ext_float_anchor_index_valid = false;
+            // A reset still pending here was never consumed by a check: an
+            // abort returned first (the cursor glyph lookup's `.aborted`).
+            // Rows committed earlier point into the replaced atlas, so this is
+            // corruption, not a refusal that may keep the committed frame.
+            if (ctx.core.atlas_reset_during_flush) {
+                ctx.core.invalidateMirroredFrameState();
+                ctx.core.flush_atlas_corrupted = true;
+            }
             const vertex_budget_committed = !ctx.core.flush_aborted and !ctx.core.flush_atlas_corrupted;
             traceRender(ctx.core, "event=end outcome={s} retryable={} destroyed_pending={d} metadata_bytes={d} metadata_limit_bytes={d}\n", .{ if (vertex_budget_committed) "commit" else "abort", ctx.core.flush_retryable, ctx.core.grid.destroyed_pending.items.len, ctx.core.layout_budget.live_bytes.load(.monotonic), c_api.render_layout.Budget.limit_bytes });
             // on_flush_begin runs before any core vertex/atlas mutation. Its
@@ -3275,9 +3283,7 @@ pub const FlushCtx = struct {
                     if (dirty_snapshot_valid) {
                         ctx.core.grid.restoreDirty(&ctx.core.flush_dirty_snapshot);
                     } else {
-                        ctx.core.grid.markAllDirty();
-                        var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                        while (sg_it.next()) |sg| sg.markAllDirty();
+                        ctx.core.grid.markEverySurfaceDirty();
                     }
                     ctx.core.last_sent_content_rev = last_sent_content_rev_before;
                     ctx.core.last_sent_cursor_rev = last_sent_cursor_rev_before;
@@ -4018,12 +4024,8 @@ pub const FlushCtx = struct {
                                     );
                                 }
                                 ctx.core.flush_atlas_corrupted = true;
-                                ctx.core.grid.markAllDirty();
+                                ctx.core.grid.markEverySurfaceDirty();
                                 ctx.core.invalidateMirroredFrameState();
-                                var reset_sg_it = ctx.core.grid.sub_grids.valueIterator();
-                                while (reset_sg_it.next()) |sg| {
-                                    sg.markAllDirty();
-                                }
                                 ctx.core.grid.cursor_rev +%= 1;
                                 return;
                             }
@@ -4271,12 +4273,8 @@ pub const FlushCtx = struct {
             // sample unrelated contents for one frame. Preserve dirty state so
             // the next flush regenerates against the fresh atlas.
             if (ctx.core.atlas_reset_during_flush) {
-                ctx.core.grid.markAllDirty();
+                ctx.core.grid.markEverySurfaceDirty();
                 ctx.core.invalidateMirroredFrameState();
-                var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                while (sg_it.next()) |sg| {
-                    sg.markAllDirty();
-                }
                 ctx.core.atlas_reset_during_flush = false;
                 // Dirtying repairs the next flush only; cancel this transaction
                 // so the rows already published against the replaced atlas
@@ -4340,11 +4338,7 @@ pub const FlushCtx = struct {
         // the per-row emit path picks rows from dirty_rows, so with no bits set
         // every row is skipped — markAllDirty() sets both. The cursor is a
         // separate consumer gated on cursor_rev, which no grid dirtying touches.
-        ctx.core.grid.markAllDirty();
-        var sg_it = ctx.core.grid.sub_grids.valueIterator();
-        while (sg_it.next()) |sg| {
-            sg.markAllDirty();
-        }
+        ctx.core.grid.markEverySurfaceDirty();
         ctx.core.grid.cursor_rev +%= 1;
 
         ctx.core.emitGuiFont(font);
@@ -4369,9 +4363,7 @@ pub const FlushCtx = struct {
         // layout/vertex generation.
         ctx.core.reinitHlCache();
         ctx.core.invalidateMirroredFrameState();
-        ctx.core.grid.markAllDirty();
-        var sg_it = ctx.core.grid.sub_grids.valueIterator();
-        while (sg_it.next()) |sg| sg.markAllDirty();
+        ctx.core.grid.markEverySurfaceDirty();
         ctx.core.grid.cursor_rev +%= 1;
         ctx.core.emitDefaultColors(fg, bg);
     }
@@ -5608,83 +5600,80 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             };
             self.row_cells.setLen(sg.cols);
 
-            ext_retry: while (true) {
-                // Only up to viewport_rows, not sg.rows: rows beyond it are not
-                // drawable, so the frontend must not receive vertices for them.
-                for (0..viewport_rows) |row_idx| {
-                    // A prior row_cb in this loop may have called
-                    // zonvie_core_abort_flush (e.g. Windows external row-buffer
-                    // OOM); the frontend cancels the whole bracket, so further
-                    // rows would be discarded work.
-                    if (self.flush_aborted) break;
+            // Only up to viewport_rows, not sg.rows: rows beyond it are not
+            // drawable, so the frontend must not receive vertices for them.
+            for (0..viewport_rows) |row_idx| {
+                // A prior row_cb in this loop may have called
+                // zonvie_core_abort_flush (e.g. Windows external row-buffer
+                // OOM); the frontend cancels the whole bracket, so further
+                // rows would be discarded work.
+                if (self.flush_aborted) break;
 
-                    const row: u32 = @intCast(row_idx);
+                const row: u32 = @intCast(row_idx);
 
-                    // Fast path: compose only the rows in the regen set.
-                    // Otherwise use the dirty_rows bitmap, except after a scroll
-                    // the fast path rejected: the frontend cannot shift rows
-                    // itself, so every row must be regenerated.
-                    if (!need_full_redraw and !ext_scroll_needs_full_regen) {
-                        // dirty_all dominates; otherwise a row the bitset does
-                        // not cover is regenerated, never skipped.
-                        if (!sg.dirty_all and
-                            sg.dirty_rows.bit_length > row and
-                            !sg.dirty_rows.isSet(@as(usize, row)))
-                        {
-                            continue;
-                        }
+                // Fast path: compose only the rows in the regen set.
+                // Otherwise use the dirty_rows bitmap, except after a scroll
+                // the fast path rejected: the frontend cannot shift rows
+                // itself, so every row must be regenerated.
+                if (!need_full_redraw and !ext_scroll_needs_full_regen) {
+                    // dirty_all dominates; otherwise a row the bitset does
+                    // not cover is regenerated, never skipped.
+                    if (!sg.dirty_all and
+                        sg.dirty_rows.bit_length > row and
+                        !sg.dirty_rows.isSet(@as(usize, row)))
+                    {
+                        continue;
                     }
-                    regen_count += 1;
-
-                    ext_verts.clearRetainingCapacity();
-
-                    // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
-                    const row_est = @as(usize, sg.cols) * 24 + 12;
-                    ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
-                        ext_had_row_error = true;
-                        // The frontend must cancel this bracket rather than
-                        // commit it with this row silently missing; the outer
-                        // grid loop's flush_aborted check stops the rest.
-                        self.flush_aborted = true;
-                        break :ext_retry;
-                    };
-
-                    composeGridRow(self, ext_src, row, ext_tables, &cache.perf_hl_cache_hits, &cache.perf_hl_cache_misses);
-                    const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
-                        ext_verts.clearRetainingCapacity();
-                        ext_had_row_error = true;
-                        self.flush_aborted = true;
-                        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-                        break :ext_retry;
-                    };
-                    ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
-                    // An atlas reset during this row leaves the rows already sent with stale UVs.
-                    if (self.atlas_reset_during_flush) {
-                        ext_saw_atlas_reset = true;
-                        ext_saw_atlas_reset_any = true;
-                        self.atlas_reset_during_flush = false;
-                        // A reset here also invalidates glyphs the MAIN grid
-                        // used earlier in this flush (it always renders before
-                        // this deferred external-grid pass), so the end of the
-                        // pass cancels the whole commit. Nothing sent from here
-                        // on would survive it: stop, rather than restart this
-                        // grid's rows or clear them to empty as this did.
-                        self.grid.markAllDirty();
-                        self.invalidateMirroredFrameState();
-                        break :ext_retry;
-                    }
-
-                    // Charged after the reset check, as the root is: a row the
-                    // cancelled commit discards owes the ledger nothing.
-                    chargeGridRow(self, ext_src, row, ext_verts.items) catch |err| {
-                        ext_had_row_error = true;
-                        self.flush_aborted = true;
-                        self.failHardRender(err);
-                        break :ext_retry;
-                    };
-                    sendGridRow(self, row_cb, ext_src, row, ext_verts.items);
                 }
-                break :ext_retry; // Normal exit from retry loop
+                regen_count += 1;
+
+                ext_verts.clearRetainingCapacity();
+
+                // Estimate capacity for this row: 6 bg + 6 glyph + 6 deco + 6 overline + 6 glow per cell + 12 cursor
+                const row_est = @as(usize, sg.cols) * 24 + 12;
+                ext_verts.ensureTotalCapacity(self.alloc, row_est) catch {
+                    ext_had_row_error = true;
+                    // The frontend must cancel this bracket rather than
+                    // commit it with this row silently missing; the outer
+                    // grid loop's flush_aborted check stops the rest.
+                    self.flush_aborted = true;
+                    break;
+                };
+
+                composeGridRow(self, ext_src, row, ext_tables, &cache.perf_hl_cache_hits, &cache.perf_hl_cache_misses);
+                const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
+                    ext_verts.clearRetainingCapacity();
+                    ext_had_row_error = true;
+                    self.flush_aborted = true;
+                    if (Core.isHardRenderFailure(err)) self.failHardRender(err);
+                    break;
+                };
+                ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
+                // An atlas reset during this row leaves the rows already sent with stale UVs.
+                if (self.atlas_reset_during_flush) {
+                    ext_saw_atlas_reset = true;
+                    ext_saw_atlas_reset_any = true;
+                    self.atlas_reset_during_flush = false;
+                    // A reset here also invalidates glyphs the MAIN grid
+                    // used earlier in this flush (it always renders before
+                    // this deferred external-grid pass), so the end of the
+                    // pass cancels the whole commit. Nothing sent from here
+                    // on would survive it: stop, rather than restart this
+                    // grid's rows or clear them to empty as this did.
+                    self.grid.markAllDirty();
+                    self.invalidateMirroredFrameState();
+                    break;
+                }
+
+                // Charged after the reset check, as the root is: a row the
+                // cancelled commit discards owes the ledger nothing.
+                chargeGridRow(self, ext_src, row, ext_verts.items) catch |err| {
+                    ext_had_row_error = true;
+                    self.flush_aborted = true;
+                    self.failHardRender(err);
+                    break;
+                };
+                sendGridRow(self, row_cb, ext_src, row, ext_verts.items);
             }
         }
 
@@ -5829,12 +5818,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // main row loop already dispatched its vertices this same flush, with UVs
     // baked against the pre-reset atlas.
     if (ext_saw_atlas_reset_any) {
-        self.grid.markAllDirty();
+        self.grid.markEverySurfaceDirty();
         self.invalidateMirroredFrameState();
-        var sg_it = self.grid.sub_grids.valueIterator();
-        while (sg_it.next()) |sg_val| {
-            sg_val.markAllDirty();
-        }
         // The cursor is a separate vertex consumer gated on cursor_rev alone,
         // which none of the dirtying above touches.
         self.grid.cursor_rev +%= 1;
@@ -12013,6 +11998,72 @@ test "atlas create abort does not leak reset edge into next flush" {
     try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
     // The aborted flush's one row plus this flush's row and cursor layer.
     try std.testing.expectEqual(@as(u32, 3), state.partial_calls);
+}
+
+test "atlas reset in the cursor glyph lookup followed by an abort is not a frontend refusal" {
+    const State = struct {
+        core: *Core,
+        abort_create: bool = false,
+
+        fn partial(ctx: ?*anyopaque, grid_id: i64, row_start: u32, row_count: u32, main_verts: ?[*]const c_api.Vertex, main_count: usize, flags: u32, total_rows: u32, total_cols: u32) callconv(.c) void {
+            _ = .{ ctx, grid_id, row_start, row_count, main_verts, main_count, flags, total_rows, total_cols };
+        }
+
+        fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = .{ ctx, scalar, style_flags };
+            out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 1, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+            return 1;
+        }
+
+        fn upload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = .{ ctx, dest_x, dest_y, width, height, bitmap };
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = .{ atlas_w, atlas_h };
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (self.abort_create) self.core.flush_aborted = true;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 1, 1);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.cursor_valid = true;
+    core.grid.cursor_visible = true;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 1;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_max;
+    core.atlas_h = config.atlas_size_max;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    core.atlas_initialized = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.partial;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(!core.flush_aborted);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+
+    // Only the cursor is owed, and its glyph is not cached: the lookup
+    // resets the full atlas, and the frontend refuses the new atlas. Every
+    // row committed earlier now points into the replaced atlas.
+    core.grid.main_buf.cells[0].cp = 'B';
+    core.grid.cursor_rev +%= 1;
+    core.atlas_packer.?.next_y = config.atlas_size_max;
+    state.abort_create = true;
+    try flush_ctx.onFlush(1, 1);
+    try std.testing.expect(core.flush_aborted);
+    try std.testing.expect(core.flush_atlas_corrupted);
+    try std.testing.expect(core.grid.main_buf.dirty_all);
 }
 
 fn checkShapingScratchAllocationFailure(alloc: std.mem.Allocator) !void {

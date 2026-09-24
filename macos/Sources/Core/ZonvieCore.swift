@@ -4165,6 +4165,16 @@ final class ZonvieCore {
             // --nofork mode); NSApp.terminate would exit(0) and lose it.
             let isLastSession = SessionManager.shared.sessions.count <= 1
             if let win = self.terminalView?.window, !isLastSession {
+                // The core sends no external-window close on exit, and the
+                // app outlives this session, so its external windows would
+                // stay on screen with a dead core behind them.
+                self.pendingExternalWindowRequests.removeAll()
+                for window in self.externalWindows.values {
+                    window.delegate = nil
+                    window.contentView = nil
+                    window.close()
+                }
+                self.externalWindows.removeAll()
                 win.close()
                 return
             }
@@ -6242,12 +6252,19 @@ final class ZonvieCore {
         let popupmenuPadding: CGFloat = 8.0
         let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
         let gap: CGFloat = 4.0
-        let aboveY = cmdlineFrame.origin.y + cmdlineFrame.height + gap
-        let belowY = cmdlineFrame.origin.y - windowHeight - gap
-        let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-        let y = (aboveY + windowHeight <= screenTop) ? aboveY : belowY
+        let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? CGFloat(Int32.max)
+        // Above or below is the core's rule, shared with Windows. It works
+        // with Y growing downward, which here is the negated screen Y.
+        let popupTopDown = zonvie_core_cmdline_popupmenu_top(
+            Int32((-cmdlineFrame.maxY).rounded()),
+            Int32((-cmdlineFrame.minY).rounded()),
+            Int32(windowHeight.rounded()),
+            Int32(gap),
+            Int32((-screenTop).rounded())
+        )
+        let y = -CGFloat(popupTopDown) - windowHeight
         return (NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
-                y == aboveY ? "above" : "below")
+                y > cmdlineFrame.minY ? "above" : "below")
     }
 
     private func buildInitialDecoratedWindowRect(
@@ -6414,15 +6431,8 @@ final class ZonvieCore {
             )
         }
 
-        if let saved = self.savedExternalWindowPositions[gridId],
-           saved.sessionGeneration == sessionGeneration {
-            ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(saved.origin)")
-            return NSRect(x: saved.origin.x, y: saved.origin.y, width: geometry.windowWidth, height: geometry.windowHeight)
-        }
-        if self.savedExternalWindowPositions[gridId] != nil {
-            self.savedExternalWindowPositions.removeValue(forKey: gridId)
-        }
-
+        // A drag-out drop point is the user's latest word on where this window
+        // goes, so it wins over a position saved from an earlier undock.
         if let pendingPos = self.pendingExternalWindowPosition {
             let titleBarHeight: CGFloat = 28
             let x = pendingPos.x - geometry.windowWidth / 2
@@ -6430,6 +6440,15 @@ final class ZonvieCore {
             self.pendingExternalWindowPosition = nil
             ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
             return NSRect(x: x, y: y, width: geometry.windowWidth, height: geometry.windowHeight)
+        }
+
+        if let saved = self.savedExternalWindowPositions[gridId],
+           saved.sessionGeneration == sessionGeneration {
+            ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(saved.origin)")
+            return NSRect(x: saved.origin.x, y: saved.origin.y, width: geometry.windowWidth, height: geometry.windowHeight)
+        }
+        if self.savedExternalWindowPositions[gridId] != nil {
+            self.savedExternalWindowPositions.removeValue(forKey: gridId)
         }
 
         if startRow >= 0 && startCol >= 0, let tvFrame = self.terminalViewScreenFrame() {

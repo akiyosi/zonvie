@@ -1874,6 +1874,18 @@ pub export fn zonvie_core_popupmenu_top(
     return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
 }
 
+/// The top edge of the cmdline completion popup: `gap` above the cmdline
+/// window while it clears `screen_top`, else `gap` below. Y grows downward.
+pub export fn zonvie_core_cmdline_popupmenu_top(
+    cmdline_top: i32,
+    cmdline_bottom: i32,
+    popup_height: i32,
+    gap: i32,
+    screen_top: i32,
+) callconv(.c) i32 {
+    return popup_placement.cmdlineTop(cmdline_top, cmdline_bottom, popup_height, gap, screen_top);
+}
+
 /// Plan a window-layout operation (win_move / win_exchange / win_rotate /
 /// win_resize_equal) over the frames the frontend collected, in place. Pure --
 /// no core pointer, no lock -- so a frontend may call it from the callback that
@@ -3041,11 +3053,7 @@ fn forceResendAll(cp: *core.Core) void {
     // A newly registered surface needs placement as well as retained rows.
     var layout_it = cp.last_surface_layout.valueIterator();
     while (layout_it.next()) |layout| layout.valid = false;
-    cp.grid.markAllDirty();
-    var sub_it = cp.grid.sub_grids.iterator();
-    while (sub_it.next()) |entry| {
-        entry.value_ptr.markAllDirty();
-    }
+    cp.grid.markEverySurfaceDirty();
     cp.grid.cursor_rev +%= 1;
     // A prior failed flush may have moved the cursor between external
     // grids without the old grid ever actually receiving its empty-cursor

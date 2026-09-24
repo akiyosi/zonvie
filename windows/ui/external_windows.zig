@@ -1077,6 +1077,7 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
                 .start_row = start_row,
                 .start_col = start_col,
                 .seq = item.seq, // preserve so existing in-flight message still matches
+                .session_generation = app.external_session_generation.load(.acquire),
                 .create_in_progress = item.create_in_progress,
                 .update_revision = item.update_revision +% 1,
             };
@@ -1097,6 +1098,7 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
         .start_row = start_row,
         .start_col = start_col,
         .seq = seq,
+        .session_generation = app.external_session_generation.load(.acquire),
     }) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to queue external window request: {any}\n", .{e});
         if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
@@ -1545,7 +1547,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Restore saved position from previous tab switch (only for regular external windows)
     if (!is_special_window) {
         const saved_opt = app.saved_external_window_positions.get(req.grid_id);
-        if (saved_opt != null and saved_opt.?.session_generation == app.external_session_generation.load(.acquire)) {
+        if (saved_opt != null and saved_opt.?.session_generation == req.session_generation) {
             const saved = saved_opt.?;
             pos_x = saved.x;
             pos_y = saved.y;
@@ -1686,12 +1688,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 const cmdline_content_x: c_int =
                     @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
                     @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
-                const popupmenu_padding: c_int = 8;
-                // Position above cmdline window with small gap
+                // Position above cmdline window with small gap. The popupmenu
+                // draws at its client origin (decoratedContentOriginPx), so
+                // its column lines up with no inset to subtract.
                 pos_x = cmdline_rect.left + cmdline_content_x +
-                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)) -
-                    popupmenu_padding;
-                pos_y = cmdline_rect.top - window_h - 4; // 4px gap
+                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
+                // Above or below is the core's rule, shared with macOS.
+                var screen_top: c_int = std.math.minInt(c_int);
+                var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+                const monitor = c.MonitorFromWindow(cw.hwnd, c.MONITOR_DEFAULTTONEAREST);
+                if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
+                pos_y = app_mod.zonvie_core_cmdline_popupmenu_top(cmdline_rect.top, cmdline_rect.bottom, window_h, 4, screen_top);
                 if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
             }
         } else {
@@ -1876,7 +1884,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     };
     ext_window_ptr.* = app_mod.ExternalWindow{
-        .session_generation = app.external_session_generation.load(.acquire),
+        .session_generation = req.session_generation,
         .hwnd = hwnd.?,
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .win_id = req.win,
@@ -2549,46 +2557,23 @@ pub export fn ExternalWndProc(
             }
             return 0;
         },
-        c.WM_MOUSEWHEEL => {
+        c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL => {
             if (app_mod.getApp(hwnd)) |app| {
-                // Find grid_id and ext_window for this hwnd
+                const horizontal = msg == c.WM_MOUSEHWHEEL;
                 app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
+                const hit = findExternalWindowByHwndLocked(app, hwnd);
                 app.mu.unlock(core.clock.io());
 
-                if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, false);
+                if (hit) |h| {
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, h.grid_id, horizontal);
 
-                    // Show scrollbar on scroll if in scroll mode
-                    if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
-                        scrollbar.showScrollbarForExternal(hwnd, ext_window.?);
+                    // Show scrollbar on vertical scroll if in scroll mode
+                    if (!horizontal and app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
+                        scrollbar.showScrollbarForExternal(hwnd, h.win);
                         // Auto-hide after delay
                         const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
                         _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
                     }
-                }
-                return 0;
-            }
-        },
-
-        c.WM_MOUSEHWHEEL => {
-            if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
-
-                if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, true);
                 }
                 return 0;
             }
@@ -2635,20 +2620,7 @@ pub export fn ExternalWndProc(
                     // A float anchored inside this window is one of its layers,
                     // not a window of its own, so the press has to say which
                     // grid it landed on -- Neovim trusts the id it is given.
-                    const target = blk: {
-                        const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
-                        app.mu.lockUncancelable(core.clock.io());
-                        defer app.mu.unlock(core.clock.io());
-                        break :blk input.resolveMouseTarget(
-                            ext_window.?.tbs.committed_layers.slice(),
-                            grids,
-                            grid_id.?,
-                            x,
-                            y,
-                            app.cell_w_px,
-                            app.rowHeightPx(),
-                        );
-                    };
+                    const target = input.resolveSurfaceTarget(app, &ext_window.?.tbs, grid_id.?, false, x, y);
                     // Another button pressed mid left-drag leaves the drag to
                     // the left button: taking over the held state lost the
                     // left release once this button was let go.
@@ -2763,17 +2735,7 @@ pub export fn ExternalWndProc(
                     // The press chose the grid; the release must not re-choose
                     // it, or letting go outside the float ends the selection in
                     // the window behind it.
-                    const up_target = blk: {
-                        app.mu.lockUncancelable(core.clock.io());
-                        defer app.mu.unlock(core.clock.io());
-                        break :blk input.rebaseToGrid(
-                            ext_window.?.tbs.committed_layers.slice(),
-                            grid_id.?,
-                            press_grid,
-                            x,
-                            y,
-                        );
-                    };
+                    const up_target = input.rebaseSurfaceTarget(app, &ext_window.?.tbs, grid_id.?, false, press_grid, x, y);
                     if (msg != c.WM_LBUTTONUP) {
                         if (editor_target) {
                             const button: [*:0]const u8 = switch (msg) {
@@ -2884,17 +2846,7 @@ pub export fn ExternalWndProc(
                     // for the reason the press gate states.
                     if (classifyExternalSurface(grid_id.?) == .normal) {
                         if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
-                            const drag_target = blk: {
-                                app.mu.lockUncancelable(core.clock.io());
-                                defer app.mu.unlock(core.clock.io());
-                                break :blk input.rebaseToGrid(
-                                    ext_win.tbs.committed_layers.slice(),
-                                    grid_id.?,
-                                    app.mouse_press_grid_id,
-                                    x,
-                                    y,
-                                );
-                            };
+                            const drag_target = input.rebaseSurfaceTarget(app, &ext_win.tbs, grid_id.?, false, app.mouse_press_grid_id, x, y);
                             input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
                         }
                     }
