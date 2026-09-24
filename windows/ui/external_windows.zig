@@ -1544,7 +1544,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // Restore saved position from previous tab switch (only for regular external windows)
     if (!is_special_window) {
-        if (app.saved_external_window_positions.get(req.grid_id)) |saved| {
+        const saved_opt = app.saved_external_window_positions.get(req.grid_id);
+        if (saved_opt != null and saved_opt.?.session_generation == app.external_session_generation.load(.acquire)) {
+            const saved = saved_opt.?;
             pos_x = saved.x;
             pos_y = saved.y;
             if (applog.isEnabled()) applog.appLog("[win] restored saved position for grid_id={d}: ({d},{d})\n", .{ req.grid_id, pos_x, pos_y });
@@ -1874,6 +1876,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     };
     ext_window_ptr.* = app_mod.ExternalWindow{
+        .session_generation = app.external_session_generation.load(.acquire),
         .hwnd = hwnd.?,
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .win_id = req.win,
@@ -2141,9 +2144,15 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         }
     }
 
-    // Save window position before removing (for tab switch restoration)
+    // Save window position before removing (for tab switch restoration), for
+    // the session that created the window only. The old server's windows
+    // close after a restart or connect, and saving them then handed their
+    // positions to the new server's windows that reuse the ids.
     if (app.external_windows.get(grid_id)) |ew| {
-        if (ew.hwnd) |hwnd| {
+        const current_generation = app.external_session_generation.load(.acquire);
+        if (ew.session_generation != current_generation) {
+            _ = app.saved_external_window_positions.remove(grid_id);
+        } else if (ew.hwnd) |hwnd| {
             var rect: c.RECT = undefined;
             if (c.GetWindowRect(hwnd, &rect) != 0) {
                 // Evict oldest entry (smallest grid_id) when inserting a new key
@@ -2163,6 +2172,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
                 app.saved_external_window_positions.put(app.alloc, grid_id, .{
                     .x = rect.left,
                     .y = rect.top,
+                    .session_generation = current_generation,
                 }) catch {};
                 if (applog.isEnabled()) applog.appLog("[win] saved position for grid_id={d}: ({d},{d})\n", .{ grid_id, rect.left, rect.top });
             }
@@ -3979,81 +3989,6 @@ fn showingSurfaceIdLocked(app: *App, grid_id: i64) i64 {
     return shown.root_grid_id;
 }
 
-/// Find nearest window in direction. Returns matching WindowInfo or null.
-/// direction: 0=down, 1=up, 2=right, 3=left
-/// Falls back to the nearest window overall when no candidate is found in the strict direction
-/// (e.g. when window centers align on the checked axis).
-fn findInDirection(infos: []const WindowInfo, ref_grid: i64, direction: i32, count: i32) ?WindowInfo {
-    // Find reference
-    var ref_cx: i32 = 0;
-    var ref_cy: i32 = 0;
-    var found_ref = false;
-    for (infos) |info| {
-        if (info.grid_id == ref_grid) {
-            ref_cx = @divTrunc(info.rect.left + info.rect.right, 2);
-            ref_cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-            found_ref = true;
-            break;
-        }
-    }
-    if (!found_ref) return null;
-
-    // Collect directional candidates
-    var candidates: [MAX_WIN_INFOS]WindowInfo = undefined;
-    var distances: [MAX_WIN_INFOS]i32 = undefined;
-    var cand_count: usize = 0;
-
-    for (infos) |info| {
-        if (info.grid_id == ref_grid) continue;
-        const cx = @divTrunc(info.rect.left + info.rect.right, 2);
-        const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-
-        const match = switch (direction) {
-            0 => cy > ref_cy, // down (Win32: higher Y = lower on screen)
-            1 => cy < ref_cy, // up
-            2 => cx > ref_cx, // right
-            3 => cx < ref_cx, // left
-            else => false,
-        };
-        if (match) {
-            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
-            candidates[cand_count] = info;
-            distances[cand_count] = dist;
-            cand_count += 1;
-        }
-    }
-
-    // Fallback: if no directional candidates, collect all other windows
-    if (cand_count == 0) {
-        for (infos) |info| {
-            if (info.grid_id == ref_grid) continue;
-            const cx = @divTrunc(info.rect.left + info.rect.right, 2);
-            const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
-            candidates[cand_count] = info;
-            distances[cand_count] = dist;
-            cand_count += 1;
-        }
-    }
-
-    if (cand_count == 0) return null;
-
-    // Sort by distance (simple selection sort)
-    for (0..cand_count) |i| {
-        var min_idx = i;
-        for (i + 1..cand_count) |j| {
-            if (distances[j] < distances[min_idx]) min_idx = j;
-        }
-        if (min_idx != i) {
-            std.mem.swap(WindowInfo, &candidates[i], &candidates[min_idx]);
-            std.mem.swap(i32, &distances[i], &distances[min_idx]);
-        }
-    }
-
-    const idx: usize = if (count > 0) @intCast(count - 1) else 0;
-    return if (idx < cand_count) candidates[idx] else candidates[0];
-}
-
 /// Calculate popupmenu Y position, preferring below the anchor cell and
 /// flipping above when the popup would run past the bottom of the window the
 /// anchor is in — the core's rule (zonvie_core_popupmenu_top), shared with
@@ -4078,288 +4013,135 @@ fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd
     return app_mod.zonvie_core_popupmenu_top(anchor_top, cell_h, popup_h, ref_bottom, screen_top);
 }
 
-fn absI32(v: i32) i32 {
-    return if (v < 0) -v else v;
+const win_layout = core.win_layout;
+
+/// Rows closer than this in centre height are one row in reading order: the
+/// band macOS uses (20pt), scaled.
+fn layoutRowBandPx(app: *App) f64 {
+    return @floatFromInt(app.scalePx(20));
 }
 
-/// Append a two-window position swap (A moves to B's position keeping A's
-/// size; B moves to A's position keeping B's size) to app.deferred_win_ops.
-/// Appends after any ops a previous call queued whose
-/// WM_APP_DEFERRED_WIN_POS the UI thread has not drained yet — resetting the
-/// count here would silently drop that earlier op set. Returns false (drops
-/// the swap) when fewer than 2 slots remain. Caller MUST hold app.mu while
-/// calling this, and MUST PostMessageW(hwnd, WM_APP_DEFERRED_WIN_POS, 0, 0)
-/// after unlocking -- SetWindowPos on a cross-thread-owned window sends
-/// WM_SIZE synchronously to the UI thread, which calls
-/// updateLayoutToCore -> grid_mu.lock(); calling it directly from the core
-/// thread while grid_mu is held (as this function's callers are) deadlocks.
-/// This mirrors the existing onWinRotate/onWinResizeEqual deferred pattern.
-fn queueSwapWindowPositions(app: *App, hwnd_a: c.HWND, rect_a: c.RECT, hwnd_b: c.HWND, rect_b: c.RECT) bool {
-    const base = app.deferred_win_ops_count;
-    if (base + 2 > App.MAX_DEFERRED_WIN_OPS) {
-        if (applog.isEnabled()) applog.appLog("[win] queueSwapWindowPositions: deferred_win_ops full, dropping swap\n", .{});
-        return false;
+/// `infos` as frames for the core's window-layout plan, each id its index.
+/// Win32 rects are already top-left, y down.
+fn layoutFrames(infos: []const WindowInfo, out: *[MAX_WIN_INFOS]win_layout.Frame) []win_layout.Frame {
+    for (infos, 0..) |info, i| {
+        out[i] = .{
+            .id = @intCast(i),
+            .x = @floatFromInt(info.rect.left),
+            .y = @floatFromInt(info.rect.top),
+            .w = @floatFromInt(info.rect.right - info.rect.left),
+            .h = @floatFromInt(info.rect.bottom - info.rect.top),
+        };
     }
-    const w_a = rect_a.right - rect_a.left;
-    const h_a = rect_a.bottom - rect_a.top;
-    const w_b = rect_b.right - rect_b.left;
-    const h_b = rect_b.bottom - rect_b.top;
-    app.deferred_win_ops[base] = .{ .hwnd = hwnd_a, .x = rect_b.left, .y = rect_b.top, .w = w_a, .h = h_a, .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE };
-    app.deferred_win_ops[base + 1] = .{ .hwnd = hwnd_b, .x = rect_a.left, .y = rect_a.top, .w = w_b, .h = h_b, .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE };
-    app.deferred_win_ops_count = base + 2;
-    return true;
+    return out[0..infos.len];
 }
 
-/// Sort window infos spatially: top-to-bottom, left-to-right. Centres within
-/// `row_band_px` of each other are one row, ordered left to right -- macOS's
-/// rule (20pt). Compared exactly, two side-by-side windows a few pixels apart
-/// in height ordered by Y, so <C-w>x and <C-w>r swapped a different pair.
-fn sortSpatially(infos: []WindowInfo, row_band_px: i32) void {
-    for (0..infos.len) |i| {
-        var min_idx = i;
-        for (i + 1..infos.len) |j| {
-            const a_cy = @divTrunc(infos[min_idx].rect.top + infos[min_idx].rect.bottom, 2);
-            const b_cy = @divTrunc(infos[j].rect.top + infos[j].rect.bottom, 2);
-            const a_cx = @divTrunc(infos[min_idx].rect.left + infos[min_idx].rect.right, 2);
-            const b_cx = @divTrunc(infos[j].rect.left + infos[j].rect.right, 2);
-            const same_row = absI32(b_cy - a_cy) <= row_band_px;
-            if ((!same_row and b_cy < a_cy) or (same_row and b_cx < a_cx)) {
-                min_idx = j;
-            }
+fn infoIndex(infos: []const WindowInfo, surface_id: i64) ?usize {
+    for (infos, 0..) |info, i| if (info.grid_id == surface_id) return i;
+    return null;
+}
+
+fn roundPx(v: f64) c_int {
+    return @intFromFloat(@round(v));
+}
+
+fn frameMoved(rect: c.RECT, frame: win_layout.Frame) bool {
+    return rect.left != roundPx(frame.x) or rect.top != roundPx(frame.y) or
+        rect.right - rect.left != roundPx(frame.w) or rect.bottom - rect.top != roundPx(frame.h);
+}
+
+/// Queue every window the plan moved or resized, after any ops a previous call
+/// queued whose WM_APP_DEFERRED_WIN_POS the UI thread has not drained -- a reset
+/// count would drop them. Returns how many were appended: 0 when nothing
+/// changed, or when they would not all fit (none is queued then, so no window
+/// moves without the one it swaps with). Caller holds app.mu and posts
+/// WM_APP_DEFERRED_WIN_POS after unlocking: SetWindowPos on a window another
+/// thread owns sends WM_SIZE to the UI thread, which takes grid_mu, and these
+/// callbacks run with grid_mu held.
+fn queuePlannedFrames(app: *App, infos: []const WindowInfo, frames: []const win_layout.Frame) usize {
+    const base = app.deferred_win_ops_count;
+    var changed: usize = 0;
+    for (infos, frames) |info, frame| {
+        if (frameMoved(info.rect, frame)) changed += 1;
+    }
+    if (changed == 0) return 0;
+    if (base > App.MAX_DEFERRED_WIN_OPS or changed > App.MAX_DEFERRED_WIN_OPS - base) {
+        if (applog.isEnabled()) applog.appLog("[win] window layout: deferred_win_ops full, dropping\n", .{});
+        return 0;
+    }
+    var i = base;
+    for (infos, frames) |info, frame| {
+        if (!frameMoved(info.rect, frame)) continue;
+        app.deferred_win_ops[i] = .{
+            .hwnd = info.hwnd,
+            .x = roundPx(frame.x),
+            .y = roundPx(frame.y),
+            .w = roundPx(frame.w),
+            .h = roundPx(frame.h),
+            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+        };
+        i += 1;
+    }
+    app.deferred_win_ops_count = i;
+    return changed;
+}
+
+/// Plan `op` over every visible window with the core's window-layout rule and
+/// queue what moved. `source_grid` names the window the event came from, by
+/// grid; it is mapped to the OS window showing that grid. Shared by every
+/// window-layout callback, which each carried its own copy of the geometry.
+fn planAndQueueWindowLayout(app: *App, op: win_layout.Op, arg: i32, count: i32, source_grid: ?i64, name: []const u8) void {
+    if (applog.isEnabled()) applog.appLog("[win] {s}: arg={d} count={d}\n", .{ name, arg, count });
+    app.mu.lockUncancelable(core.clock.io());
+    const coll = collectWindowInfos(app, true);
+    const hwnd = app.hwnd;
+    const infos = coll.infos[0..coll.count];
+    var frame_buf: [MAX_WIN_INFOS]win_layout.Frame = undefined;
+    const frames = layoutFrames(infos, &frame_buf);
+    const source_index: ?usize = if (source_grid) |g| infoIndex(infos, showingSurfaceIdLocked(app, g)) else 0;
+    var queued: usize = 0;
+    if (source_index) |si| {
+        if (win_layout.plan(op, arg, count, @intCast(si), layoutRowBandPx(app), frames)) {
+            queued = queuePlannedFrames(app, infos, frames);
         }
-        if (min_idx != i) std.mem.swap(WindowInfo, &infos[i], &infos[min_idx]);
+    }
+    app.mu.unlock(core.clock.io());
+    if (queued == 0) return;
+
+    const posted = if (hwnd) |h| c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) != 0 else false;
+    if (!posted) {
+        if (applog.isEnabled()) applog.appLog("[win] {s}: PostMessageW failed\n", .{name});
+        // Remove only what this call appended. If a drain already consumed
+        // it, there is nothing to remove.
+        app.mu.lockUncancelable(core.clock.io());
+        if (app.deferred_win_ops_count >= queued) app.deferred_win_ops_count -= queued;
+        app.mu.unlock(core.clock.io());
     }
 }
 
 pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_move: grid={d} flags={d}\n", .{ grid_id, flags });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-    const source_id = showingSurfaceIdLocked(app, grid_id);
-
-    var queued = false;
-    const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, source_id, flags, 1)) |target| {
-        // Find source rect
-        for (infos) |info| {
-            if (info.grid_id == source_id) {
-                queued = queueSwapWindowPositions(app, info.hwnd, info.rect, target.hwnd, target.rect);
-                break;
-            }
-        }
-    }
-    app.mu.unlock(core.clock.io());
-
-    if (queued) {
-        if (hwnd) |h| {
-            if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-                if (applog.isEnabled()) applog.appLog("[win] on_win_move: PostMessageW failed\n", .{});
-                // Remove only the 2 ops this call appended. If a drain already
-                // consumed them (count < 2), there is nothing to remove.
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.deferred_win_ops_count >= 2) app.deferred_win_ops_count -= 2;
-                app.mu.unlock(core.clock.io());
-            }
-        }
-    }
+    planAndQueueWindowLayout(app, .move, flags, 1, grid_id, "on_win_move");
 }
 
 pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: grid={d} count={d}\n", .{ grid_id, count });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count], app.scalePx(20));
-    const source_id = showingSurfaceIdLocked(app, grid_id);
-
-    // Find source index
-    var src_idx: ?usize = null;
-    for (sorted[0..coll.count], 0..) |info, i| {
-        if (info.grid_id == source_id) {
-            src_idx = i;
-            break;
-        }
-    }
-    const si = src_idx orelse {
-        app.mu.unlock(core.clock.io());
-        return;
-    };
-
-    // count=0 means "next window" (default for <C-w>x without count prefix)
-    const effective_count: i32 = if (count == 0) 1 else count;
-    const n: i32 = @intCast(coll.count);
-    var dst: i32 = @as(i32, @intCast(si)) + effective_count;
-    dst = @mod(dst, n);
-    if (dst < 0) dst += n;
-    const di: usize = @intCast(dst);
-    var queued = false;
-    if (di != si) {
-        queued = queueSwapWindowPositions(app, sorted[si].hwnd, sorted[si].rect, sorted[di].hwnd, sorted[di].rect);
-    }
-    app.mu.unlock(core.clock.io());
-
-    if (queued) {
-        if (hwnd) |h| {
-            if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-                if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: PostMessageW failed\n", .{});
-                // Remove only the 2 ops this call appended. If a drain already
-                // consumed them (count < 2), there is nothing to remove.
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.deferred_win_ops_count >= 2) app.deferred_win_ops_count -= 2;
-                app.mu.unlock(core.clock.io());
-            }
-        }
-    }
+    planAndQueueWindowLayout(app, .exchange, 0, count, grid_id, "on_win_exchange");
 }
 
-/// Defers SetWindowPos to UI thread via PostMessage to avoid blocking the core
-/// thread on cross-thread message processing while grid_mu is held.
 pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
     _ = grid_id;
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: direction={d} count={d}\n", .{ direction, count });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd orelse {
-        app.mu.unlock(core.clock.io());
-        return;
-    };
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count], app.scalePx(20));
-
-    // Save original positions (left, top) only — each window keeps its own size
-    var lefts: [MAX_WIN_INFOS]c.LONG = undefined;
-    var tops: [MAX_WIN_INFOS]c.LONG = undefined;
-    for (0..coll.count) |i| {
-        lefts[i] = sorted[i].rect.left;
-        tops[i] = sorted[i].rect.top;
-    }
-
-    // count=0 means "rotate once" (default for <C-w>r without count prefix).
-    // Reject malformed negative counts and reduce huge counts modulo the number
-    // of windows instead of doing attacker-controlled O(count * windows) work.
-    if (count < 0) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    const n = coll.count;
-    const effective_count: usize = @mod(if (count == 0) @as(usize, 1) else @as(usize, @intCast(count)), n);
-    if (effective_count == 0) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-
-    // Append after any ops still awaiting their WM_APP_DEFERRED_WIN_POS drain
-    // (resetting the count here would silently drop that earlier op set).
-    const base = app.deferred_win_ops_count;
-    if (base > App.MAX_DEFERRED_WIN_OPS or n > App.MAX_DEFERRED_WIN_OPS - base) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    for (0..n) |i| {
-        // Compute directly from the immutable position snapshot. This keeps
-        // even attacker-sized counts O(window_count), after the modulo above.
-        const source_index = if (direction == 0)
-            (i + n - effective_count) % n
-        else
-            (i + effective_count) % n;
-        app.deferred_win_ops[base + i] = .{
-            .hwnd = sorted[i].hwnd,
-            .x = lefts[source_index],
-            .y = tops[source_index],
-            .w = sorted[i].rect.right - sorted[i].rect.left,
-            .h = sorted[i].rect.bottom - sorted[i].rect.top,
-            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-        };
-    }
-    app.deferred_win_ops_count = base + n;
-    // Post while app.mu still excludes both the UI drain and other appenders;
-    // a failed post can therefore roll back exactly this transaction.
-    if (c.PostMessageW(hwnd, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-        app.deferred_win_ops_count = base;
-        if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: PostMessageW failed\n", .{});
-    }
-    app.mu.unlock(core.clock.io());
+    planAndQueueWindowLayout(app, .rotate, direction, count, null, "on_win_rotate");
 }
 
-/// Make all windows equal size (including main window).
-/// Defers SetWindowPos to UI thread via PostMessage to avoid deadlock:
-/// SetWindowPos on the main window from core thread sends WM_SIZE → updateLayoutToCore → grid_mu.lock()
-/// while grid_mu is already held by the core thread during this callback.
+/// Make all windows equal size (including main window), top-left corners kept.
 pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    const infos = coll.infos[0..coll.count];
-
-    // Calculate average size
-    var total_w: i32 = 0;
-    var total_h: i32 = 0;
-    for (infos) |info| {
-        total_w += info.rect.right - info.rect.left;
-        total_h += info.rect.bottom - info.rect.top;
-    }
-    const n: i32 = @intCast(coll.count);
-    const avg_w = @divTrunc(total_w, n);
-    const avg_h = @divTrunc(total_h, n);
-
-    // Append after any ops still awaiting their WM_APP_DEFERRED_WIN_POS drain
-    // (resetting the count here would silently drop that earlier op set).
-    const base = app.deferred_win_ops_count;
-    var appended: usize = 0;
-    for (infos, 0..) |info, i| {
-        if (base + i >= App.MAX_DEFERRED_WIN_OPS) break;
-        app.deferred_win_ops[base + i] = .{
-            .hwnd = info.hwnd,
-            .x = info.rect.left,
-            .y = info.rect.top,
-            .w = avg_w,
-            .h = avg_h,
-            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-        };
-        appended = i + 1;
-    }
-    app.deferred_win_ops_count = base + appended;
-    app.mu.unlock(core.clock.io());
-
-    if (hwnd) |h| {
-        if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-            if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal: PostMessageW failed\n", .{});
-            // Remove only what this call appended. If a drain already
-            // consumed it (count < appended), there is nothing to remove.
-            app.mu.lockUncancelable(core.clock.io());
-            if (app.deferred_win_ops_count >= appended) app.deferred_win_ops_count -= appended;
-            app.mu.unlock(core.clock.io());
-        }
-    }
+    planAndQueueWindowLayout(app, .resize_equal, 0, 0, null, "on_win_resize_equal");
 }
 
 pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
@@ -4385,12 +4167,14 @@ pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c
     app.mu.unlock(core.clock.io());
 
     const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, current_id, direction, count)) |target| {
-        // collectWindowInfos leaves the main window's win_id 0: it may run
-        // with grid_mu held. Resolved here, where it is not.
-        const win_id = if (target.grid_id == 1) app_mod.zonvie_core_get_win_id(cp, main_target_grid) else target.win_id;
-        if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
-        return win_id;
-    }
-    return 0;
+    var frame_buf: [MAX_WIN_INFOS]win_layout.Frame = undefined;
+    const frames = layoutFrames(infos, &frame_buf);
+    const current_index = infoIndex(infos, current_id) orelse return 0;
+    const target_index = win_layout.findInDirection(frames, @intCast(current_index), @enumFromInt(direction), count) orelse return 0;
+    const target = infos[target_index];
+    // collectWindowInfos leaves the main window's win_id 0: it may run with
+    // grid_mu held. Resolved here, where it is not.
+    const win_id = if (target.grid_id == 1) app_mod.zonvie_core_get_win_id(cp, main_target_grid) else target.win_id;
+    if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
+    return win_id;
 }
