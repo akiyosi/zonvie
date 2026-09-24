@@ -2599,6 +2599,22 @@ final class ZonvieCore {
         setOptionValue("guifont", "\(name):h\(pointSize)")
     }
 
+    /// Open files with `:drop` (one command for all) or one `:tab drop` per
+    /// file. Paths go unescaped; the server escapes each with fnameescape.
+    func dropPaths(_ paths: [String], tabPerFile: Bool) {
+        guard let core, !paths.isEmpty else { return }
+        let cstrs = paths.map { strdup($0) }
+        defer { cstrs.forEach { free($0) } }
+        let ptrs: [UnsafePointer<UInt8>?] = cstrs.map { $0.map { UnsafeRawPointer($0).assumingMemoryBound(to: UInt8.self) } }
+        let lens = cstrs.map { $0.map { strlen($0) } ?? 0 }
+        ptrs.withUnsafeBufferPointer { p in
+            lens.withUnsafeBufferPointer { l in
+                zonvie_core_drop_paths(core, p.baseAddress, l.baseAddress, paths.count, tabPerFile ? 1 : 0)
+            }
+        }
+        ZonvieCore.appLog("[dropPaths] count=\(paths.count) tabPerFile=\(tabPerFile)")
+    }
+
     func sendCommand(_ cmd: String) {
         guard let core else {
             ZonvieCore.appLog("[sendCommand] core is nil")
@@ -3589,6 +3605,12 @@ final class ZonvieCore {
     func getMouseScrollVer() -> Int {
         guard let core else { return 0 }
         return Int(zonvie_core_get_mousescroll_ver(core))
+    }
+
+    /// The 'hor' component of 'mousescroll', read the same way.
+    func getMouseScrollHor() -> Int {
+        guard let core else { return 0 }
+        return Int(zonvie_core_get_mousescroll_hor(core))
     }
 
     /// Check if cursor is visible (false during busy, true otherwise)
@@ -8971,20 +8993,24 @@ final class ZonvieCore {
         // Pass data as notification.object (reference type) to avoid Obj-C
         // bridging issues with named tuples in NSDictionary-backed userInfo.
         DispatchQueue.main.async { [weak self] in
-            self?.agentTabNames = Dictionary(parsedTabs.map { ($0.handle, $0.name) }, uniquingKeysWith: { a, _ in a })
+            guard let self else { return }
+            self.agentTabNames = Dictionary(parsedTabs.map { ($0.handle, $0.name) }, uniquingKeysWith: { a, _ in a })
+            // Sent by this core, so each session's views observe only their own.
             NotificationCenter.default.post(
                 name: ZonvieCore.tablineUpdateNotification,
-                object: TablineUpdateInfo(tabs: parsedTabs, currentTab: curtab)
+                object: self,
+                userInfo: [ZonvieCore.notificationInfoKey: TablineUpdateInfo(tabs: parsedTabs, currentTab: curtab)]
             )
         }
     }
 
     nonisolated private func onTablineHide() {
         ZonvieCore.appLog("[Tabline] hide")
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
             NotificationCenter.default.post(
                 name: ZonvieCore.tablineHideNotification,
-                object: nil
+                object: self
             )
         }
     }
@@ -9036,7 +9062,8 @@ final class ZonvieCore {
             if ZonvieConfig.shared.tabline.agentIndicator {
                 NotificationCenter.default.post(
                     name: ZonvieCore.agentStatusNotification,
-                    object: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: base)
+                    object: self,
+                    userInfo: [ZonvieCore.notificationInfoKey: ZonvieCore.AgentStatusInfo(tabHandle: tabHandle, state: base)]
                 )
             }
         }
@@ -9118,6 +9145,9 @@ final class ZonvieCore {
     }
 
     static let agentStatusNotification = NSNotification.Name("ZonvieAgentStatus")
+    /// userInfo key carrying the tabline / agent-status payload. The
+    /// notification's object is the posting core, never the payload.
+    static let notificationInfoKey = "info"
 
     static let tablineUpdateNotification = NSNotification.Name("ZonvieTablineUpdate")
 

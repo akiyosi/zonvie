@@ -2902,14 +2902,8 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
     app.mu.lockUncancelable(core.clock.io());
     if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
     if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
-    // Push the bg into the d3d11 renderer so its ClearRenderTargetView
-    // call uses the colorscheme bg instead of the historical hardcoded
-    // black. This is what makes the bottom/right remainder strip
-    // (drawable_px % cell_px) blend with the rest of the grid instead
-    // of showing as a black band.
-    if (bg != 0xFFFFFFFF) {
-        if (app.renderer) |*r| r.setDefaultBgColor(bg);
-    }
+    // The renderers' clear colour (the remainder strip, and what shows under
+    // dropped default-bg runs) is pulled from colorscheme_bg by each paint.
     app.mu.unlock(core.clock.io());
 
     // Invalidate tabline/sidebar to repaint with new colors, and

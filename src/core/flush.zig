@@ -4089,15 +4089,13 @@ pub const FlushCtx = struct {
                         // Not after a retry that survived the reset: it rebuilt
                         // every root row against the new atlas, and marking them
                         // again only regenerated them all a second time.
-                        if (had_glyph_miss or !atlas_retried) ctx.core.grid.markAllDirty();
-                        // A successful retry already regenerated every row with
-                        // the fresh atlas, so its mirrored UVs are valid;
+                        if (had_glyph_miss) ctx.core.grid.markAllDirty();
+                        // A reset always retried (a second one cancels the
+                        // flush above), and the retry regenerated every row
+                        // with the fresh atlas, so its mirrored UVs are valid;
                         // invalidating them would force a full regeneration on
                         // the next scroll flush (~65-80ms for CJK).
                         if (saw_atlas_reset) {
-                            if (!atlas_retried) {
-                                ctx.core.invalidateMirroredFrameState();
-                            }
                             var sg_it = ctx.core.grid.sub_grids.valueIterator();
                             while (sg_it.next()) |sg| {
                                 sg.markAllDirty();
@@ -4278,7 +4276,8 @@ pub const FlushCtx = struct {
                 ctx.core.atlas_reset_during_flush = false;
                 // Dirtying repairs the next flush only; cancel this transaction
                 // so the rows already published against the replaced atlas
-                // generation are never committed.
+                // generation are never committed. Set here, not left to the
+                // outer defer: on_flush_end reads it and runs before that.
                 ctx.core.flush_atlas_corrupted = true;
                 return;
             }

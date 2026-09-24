@@ -328,13 +328,14 @@ final class ViewController: NSViewController {
     // MARK: - Tabline Notification Observers (shared across modes)
 
     private func setupTablineNotificationObservers() {
+        // Only this session's core: every session posts the same names.
         tablineUpdateObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineUpdateNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.TablineUpdateInfo else {
-                ZonvieCore.appLog("[Tabline] WARNING: notification object cast failed: \(String(describing: notification.object))")
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.TablineUpdateInfo else {
+                ZonvieCore.appLog("[Tabline] WARNING: notification payload cast failed: \(String(describing: notification.userInfo))")
                 return
             }
             self?.handleTablineUpdate(tabs: info.tabs, currentTab: info.currentTab)
@@ -342,7 +343,7 @@ final class ViewController: NSViewController {
 
         tablineHideObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineHideNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] _ in
             self?.handleTablineHide()
@@ -350,10 +351,10 @@ final class ViewController: NSViewController {
 
         agentStatusObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.agentStatusNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.AgentStatusInfo else { return }
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.AgentStatusInfo else { return }
             self?.tabBarView?.setAgentState(handle: info.tabHandle, state: info.state)
             self?.sidebarView?.setAgentState(handle: info.tabHandle, state: info.state)
         }

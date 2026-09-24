@@ -1435,7 +1435,8 @@ pub fn setupMouseScrollReporter(self: *Core) void {
         \\local function report()
         \\  local ms = vim.o.mousescroll or ''
         \\  local n = tonumber(ms:match('ver:(%d+)'))
-        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3)
+        \\  local h = tonumber(ms:match('hor:(%d+)'))
+        \\  vim.rpcnotify(0, 'zonvie_mousescroll', n or 3, h or 6)
         \\end
         \\report()
         \\local grp = vim.api.nvim_create_augroup('zonvie_mousescroll', { clear = true })
@@ -1888,6 +1889,11 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             const clamped: u32 = if (v <= 0) 0 else if (v > 32) 32 else @intCast(v);
             self.mousescroll_ver.store(clamped, .release);
             self.log.write("mousescroll ver={d}\n", .{clamped});
+        }
+        if (params.len > 1 and params[1] == .int) {
+            const v = params[1].int;
+            const clamped: u32 = if (v <= 0) 0 else if (v > 256) 256 else @intCast(v);
+            self.mousescroll_hor.store(clamped, .release);
         }
     } else if (std.mem.eql(u8, method, "zonvie_agent_status")) {
         // Custom RPC notification: AI-agent work state for one tabpage.
