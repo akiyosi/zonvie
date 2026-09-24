@@ -1251,6 +1251,60 @@ func clampRowsDelta(_ value: Int) -> Int {
     max(-1_000_000, min(1_000_000, value))
 }
 
+/// A value one surface measured inside its flush bracket, published only by
+/// that surface's own commit. At a flush end every surface commits in turn,
+/// the main one first; a value another surface staged describes vertices that
+/// surface has not committed yet, and publishing it early pairs it with the
+/// rows of the previous flush for any frame drawn in between.
+struct SurfaceCommitStaged<Value> {
+    private var slot: (value: Value, stager: ObjectIdentifier)?
+
+    mutating func stage(_ value: Value, by stager: ObjectIdentifier) {
+        slot = (value, stager)
+    }
+
+    mutating func take(committedBy committer: ObjectIdentifier) -> Value? {
+        guard let s = slot, s.stager == committer else { return nil }
+        slot = nil
+        return s.value
+    }
+
+    mutating func drop() {
+        slot = nil
+    }
+
+    /// Rewrite a staged value in place, keeping its stager.
+    mutating func update(_ body: (inout Value) -> Void) {
+        guard var s = slot else { return }
+        body(&s.value)
+        slot = s
+    }
+}
+
+/// Fold a committed shift into the one no draw has blitted yet. Both surfaces
+/// run this at commit, for a root and for a layer alike. The same region adds;
+/// another region cannot share one blit, so the old shift is dropped and the
+/// rows it would have moved are dirtied — their slots were already remapped,
+/// so the committed vertices are post-scroll and a redraw lands them.
+func mergeCommittedSurfaceScroll(
+    into accum: inout SurfaceRowScroll?,
+    _ ps: SurfaceRowScroll,
+    dirtyRows: inout IndexSet
+) {
+    if let existing = accum, existing.rowStart == ps.rowStart, existing.rowEnd == ps.rowEnd {
+        var merged = ps
+        // &+ mirrors the core's own +%= idiom; the clamp keeps the result away
+        // from Int.min, which abs() downstream traps on.
+        merged.rowsDelta = clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta)
+        accum = merged
+        return
+    }
+    if let existing = accum, existing.rowEnd > existing.rowStart {
+        dirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
+    }
+    accum = ps
+}
+
 // MARK: - Surface Buffer Helpers
 
 /// Maximum vertex buffer capacity (256 MB), bounding a single row's vertex

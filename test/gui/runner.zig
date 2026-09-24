@@ -580,6 +580,17 @@ test "gui:visual_extwin_split_with_float_background" {
     }
 }
 
+test "gui:visual_extwin_winhighlight_hosted_float_colors" {
+    // macOS only: it enumerates the app's OS windows to capture the external
+    // one.
+    if (comptime builtin.os.tag == .macos and driver.capture.supported) {
+        try requirePrereqs();
+        try @import("scenarios/visual/extwin_winhighlight_hosted_float_colors.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:visual_hosted_float_scroll_band" {
     // macOS only: it drives a trackpad gesture and enumerates the app's
     // windows to capture the external one.

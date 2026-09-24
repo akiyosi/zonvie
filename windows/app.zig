@@ -56,6 +56,7 @@ pub const zonvie_core_scrollbar_metrics = core.zonvie_core_scrollbar_metrics;
 pub const zonvie_scrollbar_metrics = core.zonvie_scrollbar_metrics;
 pub const zonvie_core_scrollbar_drag_target = core.zonvie_core_scrollbar_drag_target;
 pub const zonvie_scrollbar_drag_target = core.zonvie_scrollbar_drag_target;
+pub const zonvie_core_popupmenu_top = core.zonvie_core_popupmenu_top;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
 pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
@@ -85,6 +86,7 @@ pub const zonvie_core_request_quit = core.zonvie_core_request_quit;
 pub const zonvie_core_quit_confirmed = core.zonvie_core_quit_confirmed;
 pub const zonvie_core_send_stdin_data = core.zonvie_core_send_stdin_data;
 pub const zonvie_core_send_command = core.zonvie_core_send_command;
+pub const zonvie_core_request_win_close = core.zonvie_core_request_win_close;
 pub const zonvie_core_set_preedit = core.zonvie_core_set_preedit;
 pub const zonvie_core_clear_preedit = core.zonvie_core_clear_preedit;
 pub const zonvie_core_set_option_value = core.zonvie_core_set_option_value;
@@ -2426,6 +2428,11 @@ pub const ExternalWindow = struct {
     scrollbar_pending_use_bottom: bool = false,
     scrollbar_hover: bool = false,
     scrollbar_last_update: i64 = 0, // Timestamp for throttling
+    // Last viewport this window's scrollbar was updated for, as App keeps
+    // for the main window (-1 = never).
+    last_viewport_topline: i64 = -1,
+    last_viewport_line_count: i64 = -1,
+    last_viewport_botline: i64 = -1,
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
     // A copy just succeeded, so the button shows a checkmark instead of the
@@ -4914,6 +4921,196 @@ pub fn drawSurfaceRowFrame(
     return out;
 }
 
+/// What a surface owns across paints for its row pass: the row-frame state
+/// plus the growable row VB list and the scratch the scroll shift uses.
+pub const RowPassSurface = struct {
+    tbs: *TripleBufferedSurface,
+    row_vbs: *std.ArrayListUnmanaged(RowVB),
+    row_vbs_shift_scratch: *std.ArrayListUnmanaged(RowVB),
+    scroll_rows_merge_scratch: *std.ArrayListUnmanaged(u32),
+    row_vb_retained_bytes: *usize,
+    cursor_vb: *?*c.ID3D11Buffer,
+    cursor_vb_bytes: *usize,
+    last_painted_cursor_row: *?u32,
+    last_painted_cursor_grid: *i64,
+};
+
+/// Layer rectangles appended under the lock the layer plan runs in, so a store
+/// landing between plan and draw cannot have its flag dropped. Reserved by the
+/// caller.
+pub const RowPassLayerPresent = struct {
+    rects: *std.ArrayListUnmanaged(c.RECT),
+    right: i32,
+    bottom: i32,
+};
+
+pub const RowPassInput = struct {
+    snapshot: PaintSnapshot,
+    rows_to_draw: *std.ArrayListUnmanaged(u32),
+    /// Row VB slots the committed set needs.
+    row_vb_len: usize,
+    /// The root's row count the scroll shift and its layer reach clamp to.
+    total_rows: u32,
+    preserve_back: bool,
+    /// What the layer plan counts as the root repainting whole.
+    layer_paint_full: bool,
+    cell_w_px: i32,
+    layer_present: ?RowPassLayerPresent = null,
+    /// The frame, minus what this pass settles: the redraw set, the layers
+    /// and their staleness verdict.
+    frame: RowFrameInput,
+};
+
+pub const RowPassOutcome = struct {
+    frame: RowFrameOutcome,
+    /// The rectangle the root's GPU scroll copied, or null.
+    scroll_damage: ?c.RECT,
+};
+
+/// The row pass both paint drivers run, in one order: size the row VBs, shift
+/// the root's retained pixels for a committed scroll, plan the layers under
+/// `app.mu`, then draw the row frame. Prologue, redraw set, present rects and
+/// Present stay with the driver. OutOfMemory means nothing may be presented
+/// and the driver requeues a full paint.
+pub fn drawSurfaceRowPass(
+    g: *d3d11.Renderer,
+    app: *App,
+    surface: RowPassSurface,
+    in_: RowPassInput,
+) error{OutOfMemory}!RowPassOutcome {
+    var in = in_;
+    const p = in.frame.draw_params;
+    const rows_to_draw = in.rows_to_draw;
+    const layers = in.snapshot.layers.slice();
+    const has_layers = layers.len > 1;
+
+    if (!resizeRowVBsForPaint(app.alloc, surface.row_vbs, &app.row_vb_budget, surface.row_vb_retained_bytes, in.row_vb_len))
+        return error.OutOfMemory;
+
+    var scroll_damage: ?c.RECT = null;
+    if (in.preserve_back) {
+        if (in.snapshot.scroll_rect) |sr| {
+            const shift = applyScrollShift(
+                g,
+                app.alloc,
+                surface.row_vbs.items,
+                surface.row_vbs_shift_scratch,
+                rows_to_draw,
+                surface.scroll_rows_merge_scratch,
+                sr,
+                in.snapshot.scroll_dy_px,
+                in.snapshot.vb_shift,
+                in.snapshot.scroll_row_start,
+                in.snapshot.scroll_row_end,
+                surface.last_painted_cursor_row,
+                p.row_h_px,
+                in.total_rows,
+                p.y_offset,
+            );
+            if (!shift.rows_complete) return error.OutOfMemory;
+            scroll_damage = shift.scroll_rect;
+
+            // The copy moved every pixel of the region, a layer composited
+            // into it included. The plan repaints each layer where it IS, but
+            // the root rows its pixels were dragged ONTO belong to the root,
+            // which only redraws the band the scroll vacated. Both directions,
+            // at one band's cost, so a wrong sign cannot leave the ghost. A
+            // root that never scrolls under its layers (the main surface's)
+            // never reaches this.
+            if (has_layers and p.row_h_px > 0 and in.snapshot.scroll_dy_px != 0) {
+                const shift_rows: u32 = @intCast(@abs(@divTrunc(in.snapshot.scroll_dy_px, p.row_h_px)));
+                for (layers[1..]) |layer| {
+                    const span = render_pipeline_helpers.rootRowsLayerScrollReached(
+                        layer.y_px,
+                        layer.rows,
+                        shift_rows,
+                        p.row_h_px,
+                        in.total_rows,
+                    ) orelse continue;
+                    if (!render_pipeline_helpers.mergeSortedRowsWithRange(
+                        app.alloc,
+                        rows_to_draw,
+                        surface.scroll_rows_merge_scratch,
+                        span[0],
+                        span[1],
+                    )) return error.OutOfMemory;
+                }
+            }
+        }
+    } else {
+        consumePendingVbShift(
+            app.alloc,
+            surface.row_vbs.items,
+            surface.row_vbs_shift_scratch,
+            in.snapshot.vb_shift,
+            in.snapshot.scroll_row_start,
+            in.snapshot.scroll_row_end,
+        );
+    }
+
+    // The copy has to land before the rows below paint over the band it
+    // moves, and the plan before the draw. app.mu after the renderer context,
+    // the order the layer draw takes them in.
+    var layout_stale = false;
+    var commit_stale = false;
+    if (has_layers) {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        const staleness = layerFrameStaleness(surface.tbs, in.snapshot);
+        layout_stale = staleness.layout;
+        commit_stale = staleness.commit;
+        if (staleness.any()) {
+            // Nothing is planned at a placement the core already replaced, or
+            // beside root rows it already replaced. The frame is refused, and
+            // the commit that replaced them owes the repaint that draws them.
+            if (in.frame.log_enabled) applog.appLog(
+                "[layer_draw] stale_layout={d} stale_commit={d} root={d} gen={d} rev={d}\n",
+                .{ @intFromBool(layout_stale), @intFromBool(commit_stale), in.frame.root_grid_id, in.snapshot.layout_gen, in.snapshot.commit_rev },
+            );
+            rearmLayerDraw(app, layers);
+        } else planLayerFrame(g, app, layers, .{
+            .x_offset = p.x_offset,
+            .y_offset = p.y_offset,
+            .content_right = p.content_right,
+            .content_height = @intCast(p.content_height),
+            .row_h_px = p.row_h_px,
+            .cell_w_px = in.cell_w_px,
+            .preserve_back = in.preserve_back,
+            .paint_full = in.layer_paint_full,
+            .cursor_grid = in.snapshot.cursor_layer_grid_id,
+            .last_cursor_row = surface.last_painted_cursor_row.*,
+            .rows_to_draw = rows_to_draw.items,
+            .root_scroll_rect = scroll_damage,
+            .log_enabled = in.frame.log_enabled,
+        });
+        if (in.layer_present) |lp| appendLayerPresentRects(
+            app,
+            layers,
+            p.x_offset,
+            p.y_offset,
+            lp.right,
+            lp.bottom,
+            p.row_h_px,
+            lp.rects,
+        );
+    }
+
+    in.frame.layers = layers;
+    in.frame.rows_to_draw = rows_to_draw.items;
+    in.frame.layer_layout_stale = layout_stale;
+    in.frame.layer_commit_stale = commit_stale;
+    const frame = drawSurfaceRowFrame(g, app, .{
+        .row_vbs = surface.row_vbs.items,
+        .row_vb_retained_bytes = surface.row_vb_retained_bytes,
+        .pool = &surface.tbs.pool,
+        .cursor_vb = surface.cursor_vb,
+        .cursor_vb_bytes = surface.cursor_vb_bytes,
+        .last_painted_cursor_row = surface.last_painted_cursor_row,
+        .last_painted_cursor_grid = surface.last_painted_cursor_grid,
+    }, in.frame);
+    return .{ .frame = frame, .scroll_damage = scroll_damage };
+}
+
 /// Row-mode bloom path that reuses the already-uploaded row VBs. This keeps
 /// glow out of the per-paint heap and avoids copying every grid vertex.
 pub fn drawBloomRowsOverlay(
@@ -5423,7 +5620,6 @@ pub const App = struct {
     // Cached highlight group bg colors for external window clear color.
     // Updated in updateExternalWindowColors (UI thread) to avoid grid_mu during WM_PAINT.
     // 0xFFFFFFFF = not set (fall back to colorscheme_bg).
-    cached_normal_float_bg: u32 = 0xFFFFFFFF,
     cached_msg_area_bg: u32 = 0xFFFFFFFF,
     cached_pmenu_bg: u32 = 0xFFFFFFFF,
 
@@ -7091,4 +7287,9 @@ test "a layer frame is refused once the core republishes the root rows beside it
         try std.testing.expectEqual(@as(f32, 3.0), Probe.layerMarker(&state));
         try std.testing.expect(!layerFrameStaleness(&tbs, fresh).commit);
     }
+}
+
+test {
+    // input.zig's pure helpers (the colon/semicolon swap) run with this suite.
+    _ = @import("input.zig");
 }

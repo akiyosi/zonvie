@@ -2975,6 +2975,8 @@ pub const FlushCtx = struct {
         const n_cells: usize = @as(usize, rows) * @as(usize, cols);
         ctx.core.flush_retryable = true;
         try beginVertexBudgetTransaction(ctx.core);
+        // Before the dirty snapshot, so an aborted attempt still owes them.
+        regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
         const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
         const last_sent_cursor_rev_before = ctx.core.last_sent_cursor_rev;
         // Remember what this attempt is about to consume. A frontend that
@@ -4137,17 +4139,10 @@ pub const FlushCtx = struct {
                         const x0 = @as(f32, @floatFromInt(cur_col)) * cellW;
                         const y0 = @as(f32, @floatFromInt(cur_row)) * cellH;
 
-                        const pct_u32 = @max(@as(u32, 1), @min(cursor_out.cell_percentage, 100));
-                        const pct: f32 = @floatFromInt(pct_u32);
-
-                        const tW = cellW * pct / 100.0;
-                        const tH = cellH * pct / 100.0;
-
                         const cursor_grid_id = ctx.core.grid.cursor_grid;
                         const grid_cursor_row = ctx.core.grid.cursor_row;
                         const grid_cursor_col = ctx.core.grid.cursor_col;
                         const cursor_cell = ctx.core.grid.getCellGrid(cursor_grid_id, grid_cursor_row, grid_cursor_col);
-                        const cursor_cp = cursor_cell.cp;
 
                         // A next cell with cp == 0 is a wide char's continuation cell.
                         var is_double_width = false;
@@ -4171,132 +4166,28 @@ pub const FlushCtx = struct {
 
                         const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
 
-                        const rx0: f32 = x0;
-                        var ry0: f32 = y0;
-                        var rx1: f32 = x0 + cursor_width;
-                        const ry1: f32 = y0 + cellH;
-
-                        switch (@intFromEnum(cursor_out.shape)) {
-                            1 => { // vertical
-                                rx1 = x0 + tW;
-                            },
-                            2 => { // horizontal
-                                ry0 = y0 + (cellH - tH);
-                            },
-                            else => { // block
-                                // full cell (or double-width)
-                            },
-                        }
-
-                        // DECO_CURSOR so the shader treats it as decoration, not
-                        // a background subject to transparency.
-                        {
-                            const col = Helpers.rgb(cursor_out.bgRGB);
-                            try Helpers.pushSolidQuad(cursor, ctx.core.alloc, rx0, ry0, rx1, ry1, col, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
-                        }
-
-                        // The character under the cursor, in inverted colour.
-                        if (@intFromEnum(cursor_out.shape) == 0 and cursor_cp != 0 and cursor_cp != ' ') {
-                            if (block_elements.isBlockElement(cursor_cp)) {
-                                const blk_geo = block_elements.getBlockGeometry(cursor_cp);
-                                if (blk_geo.count > 0) {
-                                    try cursor.ensureUnusedCapacity(ctx.core.alloc, @as(usize, blk_geo.count) * 6);
-                                    const cursor_fg_col = Helpers.rgb(cursor_out.fgRGB);
-                                    for (blk_geo.rects[0..blk_geo.count]) |rect| {
-                                        // DECO_CURSOR for the same reason the cursor
-                                        // background quad carries it: the shader fades
-                                        // plain solids to `backgroundAlpha` once blur is
-                                        // on, so the box behind the glyph would stay
-                                        // opaque while the glyph itself went translucent.
-                                        Helpers.pushSolidQuadAssumeCapacity(cursor, x0 + rect.x0 * cursor_width, y0 + rect.y0 * cellH, x0 + rect.x1 * cursor_width, y0 + rect.y1 * cellH, cursor_fg_col, cursor_grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
-                                    }
-                                }
-                            } else {
-                                const ensure_base = ctx.core.cb.on_atlas_ensure_glyph;
-                                const ensure_styled = ctx.core.cb.on_atlas_ensure_glyph_styled;
-
-                                if (ctx.core.isPhase2Atlas() or ensure_base != null or ensure_styled != null) {
-                                    var ge: c_api.GlyphEntry = undefined;
-                                    var glyph_ok = false;
-
-                                    const cursor_style: u8 = ctx.core.hl.getWithStyles(cursor_cell.hl).style_flags;
-                                    const cursor_style_mask = cursor_style & (STYLE_BOLD | STYLE_ITALIC);
-                                    const cursor_c_style: u32 =
-                                        @as(u32, if (cursor_style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                        @as(u32, if (cursor_style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-
-                                    // Set emoji cluster context for cursor cell if its overflow
-                                    // contains emoji-significant codepoints (VS16, ZWJ, skin tone).
-                                    if (ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col)) |extras| {
-                                        const is_emoji = isEmojiPresentation(cursor_cp) or for (extras) |e| {
-                                            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
-                                        } else false;
-                                        if (is_emoji) {
-                                            ctx.core.emoji_cluster_buf[0] = cursor_cp;
-                                            const elen = @min(extras.len, ctx.core.emoji_cluster_buf.len - 1);
-                                            for (0..elen) |ei| {
-                                                ctx.core.emoji_cluster_buf[1 + ei] = extras[ei];
-                                            }
-                                            ctx.core.emoji_cluster_len = @intCast(1 + elen);
-                                        }
-                                    }
-                                    defer ctx.core.emoji_cluster_len = 0;
-
-                                    if (ctx.core.isPhase2Atlas()) {
-                                        const overflow = ctx.core.grid.getOverflow(cursor_grid_id, grid_cursor_row, grid_cursor_col);
-                                        if (try ensureCachedPhase2Glyph(ctx.core, cursor_cp, cursor_c_style, overflow)) |entry| {
-                                            ge = entry;
-                                            glyph_ok = true;
-                                        } else if (ctx.core.flush_aborted) {
-                                            return;
-                                        } else {
-                                            // Do not consume cursor_rev on a transient
-                                            // rasterizer miss: the next flush retries the
-                                            // same cursor without cancelling this transaction.
-                                            cursor_retry_required = true;
-                                        }
-                                    } else if (cursor_style_mask != 0 and ensure_styled != null) {
-                                        if (ensure_styled) |styled_fn| {
-                                            glyph_ok = styled_fn(ctx.core.ctx, cursor_cp, cursor_c_style, &ge) != 0;
-                                        }
-                                    } else if (ensure_base) |base_fn| {
-                                        glyph_ok = base_fn(ctx.core.ctx, cursor_cp, &ge) != 0;
-                                    }
-
-                                    if (glyph_ok and ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
-                                        const cursorBaseY: f32 = y0 + topPad;
-                                        const baselineY: f32 = cursorBaseY + ge.ascent_px;
-
-                                        const gx0: f32 = x0 + ge.bbox_origin_px[0];
-                                        const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                                        const gy0: f32 = baselineY - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
-
-                                        const uv0 = [2]f32{ ge.uv_min[0], ge.uv_min[1] };
-                                        const uv1 = [2]f32{ ge.uv_max[0], ge.uv_min[1] };
-                                        const uv2 = [2]f32{ ge.uv_min[0], ge.uv_max[1] };
-                                        const uv3 = [2]f32{ ge.uv_max[0], ge.uv_max[1] };
-
-                                        const fg = Helpers.rgb(cursor_out.fgRGB);
-
-                                        try Helpers.pushGlyphQuad(
-                                            cursor,
-                                            ctx.core.alloc,
-                                            gx0,
-                                            gy0,
-                                            gx1,
-                                            gy1,
-                                            uv0,
-                                            uv1,
-                                            uv2,
-                                            uv3,
-                                            fg,
-                                            cursor_grid_id, // cursor belongs to its actual grid
-                                            cursorGlyphDecoFlags(ge.bytes_per_pixel), // cursor is always in content area
-                                        );
-                                    }
-                                }
-                            } // end else (non-block-element cursor glyph)
+                        switch (try emitCursorQuads(ctx.core, cursor, .{
+                            .grid_id = cursor_grid_id,
+                            .row = grid_cursor_row,
+                            .col = grid_cursor_col,
+                            .x0 = x0,
+                            .y0 = y0,
+                            .cell_w = cellW,
+                            .cell_h = cellH,
+                            .top_pad = topPad,
+                            .width = cursor_width,
+                            .shape = @intCast(@intFromEnum(cursor_out.shape)),
+                            .pct = cursor_out.cell_percentage,
+                            .bg_rgb = cursor_out.bgRGB,
+                            .fg_rgb = cursor_out.fgRGB,
+                            .cell = cursor_cell,
+                        })) {
+                            .ok => {},
+                            // Do not consume cursor_rev on a transient
+                            // rasterizer miss: the next flush retries the
+                            // same cursor without cancelling this transaction.
+                            .retry => cursor_retry_required = true,
+                            .aborted => return,
                         }
                     }
                 }
@@ -4610,6 +4501,34 @@ fn surfaceHasLayers(self: *Core, surface_id: i64) bool {
     return false;
 }
 
+/// Under blur a surface root drops its default-background runs while it
+/// hosts a layer (the `skip_default_bg` row parameter), so the surface gaining
+/// its first layer or losing its last one changes every root row, not only
+/// the band a layer covers. Answered here, once per flush for every surface
+/// root, by comparing with what the root's rows were last generated under.
+/// It was hand-written in three grid mutators for the main surface only, and
+/// an external window never regenerated: rows generated before and after the
+/// flip disagreed about the default-background quads.
+fn regenerateRootsWhoseDefaultBgRuleFlipped(self: *Core) void {
+    const main_skip = self.blur_enabled and surfaceHasLayers(self, 1);
+    if (main_skip != self.grid.main_buf.skip_default_bg_last) {
+        self.grid.main_buf.skip_default_bg_last = main_skip;
+        self.grid.markAllDirty();
+        // The main pass is gated on content_rev; a flip nothing else bumped
+        // it for (blur switched on) would otherwise leave the rows unsent.
+        self.grid.content_rev +%= 1;
+    }
+    var it = self.grid.external_grids.keyIterator();
+    while (it.next()) |id| {
+        const sg = self.grid.sub_grids.getPtr(id.*) orelse continue;
+        const skip = self.blur_enabled and surfaceHasLayers(self, id.*);
+        if (skip != sg.skip_default_bg_last) {
+            sg.skip_default_bg_last = skip;
+            sg.markAllDirty();
+        }
+    }
+}
+
 fn mainSurfaceHasLayers(self: *Core) bool {
     return surfaceHasLayers(self, 1);
 }
@@ -4872,6 +4791,149 @@ fn rowTopPadPx(linespace_px: i32) i32 {
 /// Deco flags for a cursor glyph. The same set on every surface: the emoji test
 /// is `>= 4` as it is at every other row-path site (`== 4` here was the only
 /// exception, and `bytes_per_pixel` is documented as 1, 3 or 4).
+/// One cursor cell to emit: where it is, what shape and colours it takes, and
+/// the cell under it. Grid-local pixels.
+pub const CursorCellQuads = struct {
+    grid_id: i64,
+    row: u32,
+    col: u32,
+    x0: f32,
+    y0: f32,
+    cell_w: f32,
+    cell_h: f32,
+    top_pad: f32,
+    /// One cell, or two for a double-width character.
+    width: f32,
+    /// 0 block, 1 vertical, 2 horizontal (grid.CursorShape and c_api order).
+    shape: u8,
+    /// cell_percentage, clamped to 1..100 here.
+    pct: u32,
+    bg_rgb: u32,
+    fg_rgb: u32,
+    cell: grid_mod.Cell,
+};
+
+pub const CursorEmitResult = enum {
+    ok,
+    /// A transient glyph miss: do not consume the cursor revision, retry.
+    retry,
+    /// The core aborted the flush while ensuring the glyph.
+    aborted,
+};
+
+/// The cursor's box and, for a block cursor, the inverted character under
+/// it. The main surface and the external pass each carried a copy of this;
+/// they differed only in where the colours and shape were read from and in
+/// how an error is reported, which stay with the callers. A box-drawing
+/// character is trimmed to the cell exactly as row generation trims it.
+pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), q: CursorCellQuads) !CursorEmitResult {
+    const pct: f32 = @floatFromInt(@max(@as(u32, 1), @min(q.pct, 100)));
+    var rx1: f32 = q.x0 + q.width;
+    var ry0: f32 = q.y0;
+    const ry1: f32 = q.y0 + q.cell_h;
+    switch (q.shape) {
+        // A bar is a fraction of ONE cell's width, double-width or not.
+        1 => rx1 = q.x0 + q.cell_w * pct / 100.0,
+        2 => ry0 = q.y0 + (q.cell_h - q.cell_h * pct / 100.0),
+        else => {},
+    }
+
+    // DECO_CURSOR so the shader treats it as decoration, not a background
+    // subject to transparency.
+    try out.ensureUnusedCapacity(core.alloc, 6);
+    Helpers.pushSolidQuadAssumeCapacity(out, q.x0, ry0, rx1, ry1, Helpers.rgb(q.bg_rgb), q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
+
+    // The character under a block cursor, in inverted colour.
+    const cp = q.cell.cp;
+    if (q.shape != 0 or cp == 0 or cp == ' ') return .ok;
+
+    if (block_elements.isBlockElement(cp)) {
+        const blk_geo = block_elements.getBlockGeometry(cp);
+        if (blk_geo.count == 0) return .ok;
+        try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
+        const fg_col = Helpers.rgb(q.fg_rgb);
+        for (blk_geo.rects[0..blk_geo.count]) |rect| {
+            // DECO_CURSOR for the same reason the box carries it: the shader
+            // fades plain solids to `backgroundAlpha` once blur is on, so the
+            // box behind the glyph would stay opaque while the glyph itself
+            // went translucent.
+            Helpers.pushSolidQuadAssumeCapacity(out, q.x0 + rect.x0 * q.width, q.y0 + rect.y0 * q.cell_h, q.x0 + rect.x1 * q.width, q.y0 + rect.y1 * q.cell_h, fg_col, q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
+        }
+        return .ok;
+    }
+
+    const ensure_base = core.cb.on_atlas_ensure_glyph;
+    const ensure_styled = core.cb.on_atlas_ensure_glyph_styled;
+    if (!core.isPhase2Atlas() and ensure_base == null and ensure_styled == null) return .ok;
+
+    const style: u8 = core.hl.getWithStyles(q.cell.hl).style_flags;
+    const style_mask = style & (STYLE_BOLD | STYLE_ITALIC);
+    const c_style: u32 =
+        @as(u32, if (style & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
+        @as(u32, if (style & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
+
+    // Emoji cluster context when the cell's overflow carries emoji-significant
+    // codepoints (VS16, ZWJ, skin tone).
+    const overflow = core.grid.getOverflow(q.grid_id, q.row, q.col);
+    if (overflow) |extras| {
+        const is_emoji = isEmojiPresentation(cp) or for (extras) |e| {
+            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
+        } else false;
+        if (is_emoji) {
+            core.emoji_cluster_buf[0] = cp;
+            const elen = @min(extras.len, core.emoji_cluster_buf.len - 1);
+            for (0..elen) |ei| core.emoji_cluster_buf[1 + ei] = extras[ei];
+            core.emoji_cluster_len = @intCast(1 + elen);
+        }
+    }
+    defer core.emoji_cluster_len = 0;
+
+    var ge: c_api.GlyphEntry = undefined;
+    var glyph_ok = false;
+    if (core.isPhase2Atlas()) {
+        if (try ensureCachedPhase2Glyph(core, cp, c_style, overflow)) |entry| {
+            ge = entry;
+            glyph_ok = true;
+        } else if (core.flush_aborted) {
+            return .aborted;
+        } else {
+            return .retry;
+        }
+    } else if (style_mask != 0 and ensure_styled != null) {
+        glyph_ok = ensure_styled.?(core.ctx, cp, c_style, &ge) != 0;
+    } else if (ensure_base) |base_fn| {
+        glyph_ok = base_fn(core.ctx, cp, &ge) != 0;
+    }
+    if (!glyph_ok or ge.bbox_size_px[0] <= 0 or ge.bbox_size_px[1] <= 0) return .ok;
+
+    const baseline_y: f32 = q.y0 + q.top_pad + ge.ascent_px;
+    const gx0: f32 = q.x0 + ge.bbox_origin_px[0];
+    const gx1: f32 = gx0 + ge.bbox_size_px[0];
+    const raw_gy0: f32 = baseline_y - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+    const span = vertexgen.trimBoxDrawingSpanY(
+        cp,
+        .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
+        q.y0,
+        q.y0 + q.cell_h,
+    );
+    try out.ensureUnusedCapacity(core.alloc, 6);
+    VH.pushGlyphQuadAssumeCapacity(
+        out,
+        gx0,
+        span.y0,
+        gx1,
+        span.y1,
+        .{ ge.uv_min[0], span.v0 },
+        .{ ge.uv_max[0], span.v0 },
+        .{ ge.uv_min[0], span.v1 },
+        .{ ge.uv_max[0], span.v1 },
+        Helpers.rgb(q.fg_rgb),
+        q.grid_id,
+        cursorGlyphDecoFlags(ge.bytes_per_pixel),
+    );
+    return .ok;
+}
+
 fn cursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
     return c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE |
         (if (bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
@@ -5704,9 +5766,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         return;
                     };
 
-                    const cx0 = @as(f32, @floatFromInt(cursor_col)) * cellW;
-                    const cy0 = @as(f32, @floatFromInt(cur_row)) * cellH;
-
                     var is_double_width = false;
                     if (cursor_col + 1 < sg.cols) {
                         const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
@@ -5714,156 +5773,48 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             is_double_width = true;
                         }
                     }
-                    const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
-
-                    const pct_u32 = @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100));
-                    const pct: f32 = @floatFromInt(pct_u32);
-                    const tW = cellW * pct / 100.0;
-                    const tH = cellH * pct / 100.0;
-
-                    const crx0: f32 = cx0;
-                    var cry0: f32 = cy0;
-                    var crx1: f32 = cx0 + cursor_width;
-                    const cry1: f32 = cy0 + cellH;
+                    const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
+                    const cursor_cell: grid_mod.Cell = if (cell_idx < sg.cells.len) sg.cells[cell_idx] else .{ .cp = 0, .hl = 0 };
+                    const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
 
                     self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
-                        @tagName(self.grid.cursor_shape), pct_u32, self.grid.cursor_style_enabled,
+                        @tagName(self.grid.cursor_shape), @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100)), self.grid.cursor_style_enabled,
                     });
 
-                    switch (self.grid.cursor_shape) {
-                        .vertical => crx1 = cx0 + tW,
-                        .horizontal => cry0 = cy0 + (cellH - tH),
-                        .block => {},
+                    const emitted = emitCursorQuads(self, ext_verts, .{
+                        .grid_id = grid_id,
+                        .row = cur_row,
+                        .col = cursor_col,
+                        .x0 = @as(f32, @floatFromInt(cursor_col)) * cellW,
+                        .y0 = @as(f32, @floatFromInt(cur_row)) * cellH,
+                        .cell_w = cellW,
+                        .cell_h = cellH,
+                        .top_pad = topPad,
+                        .width = if (is_double_width) cellW * 2 else cellW,
+                        .shape = @intFromEnum(self.grid.cursor_shape),
+                        .pct = self.grid.cursor_cell_percentage,
+                        .bg_rgb = if (attr) |a| a.bg else self.hl.default_fg,
+                        .fg_rgb = if (attr) |a| a.fg else self.hl.default_bg,
+                        .cell = cursor_cell,
+                    }) catch blk: {
+                        self.flush_aborted = true;
+                        break :blk CursorEmitResult.aborted;
+                    };
+                    switch (emitted) {
+                        .ok => {},
+                        .retry => ext_cursor_retry_required = true,
+                        .aborted => return,
                     }
 
-                    const cursor_bg: u32 = if (self.grid.cursor_attr_id != 0)
-                        self.hl.get(self.grid.cursor_attr_id).bg
-                    else
-                        self.hl.default_fg;
-                    const cursor_color = Helpers.rgb(cursor_bg);
-
-                    Helpers.pushSolidQuadAssumeCapacity(ext_verts, crx0, cry0, crx1, cry1, cursor_color, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
-
-                    if (self.grid.cursor_shape == .block) {
-                        const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
-                        if (cell_idx < sg.cells.len) {
-                            const cursor_cell = sg.cells[cell_idx];
-                            if (cursor_cell.cp != 0 and cursor_cell.cp != ' ') {
-                                if (block_elements.isBlockElement(cursor_cell.cp)) {
-                                    const eblk_geo = block_elements.getBlockGeometry(cursor_cell.cp);
-                                    if (eblk_geo.count > 0) {
-                                        const ext_cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
-                                            self.hl.get(self.grid.cursor_attr_id).fg
-                                        else
-                                            self.hl.default_bg;
-                                        const eblk_fg_col = Helpers.rgb(ext_cursor_fg);
-                                        ext_verts.ensureUnusedCapacity(self.alloc, @as(usize, eblk_geo.count) * 6) catch {
-                                            self.flush_aborted = true;
-                                            return;
-                                        };
-                                        for (eblk_geo.rects[0..eblk_geo.count]) |rect| {
-                                            Helpers.pushSolidQuadAssumeCapacity(ext_verts, cx0 + rect.x0 * cursor_width, cy0 + rect.y0 * cellH, cx0 + rect.x1 * cursor_width, cy0 + rect.y1 * cellH, eblk_fg_col, grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
-                                        }
-                                    }
-                                } else {
-                                    var glyph_entry: c_api.GlyphEntry = undefined;
-                                    var glyph_ok: c_int = 0;
-
-                                    const ext_cursor_resolved = self.hl.getWithStyles(cursor_cell.hl);
-                                    const ext_cursor_c_style: u32 =
-                                        @as(u32, if (ext_cursor_resolved.style_flags & STYLE_BOLD != 0) c_api.STYLE_BOLD else 0) |
-                                        @as(u32, if (ext_cursor_resolved.style_flags & STYLE_ITALIC != 0) c_api.STYLE_ITALIC else 0);
-
-                                    // Set emoji cluster context for ext grid cursor if emoji-significant
-                                    if (self.grid.getOverflow(grid_id, cur_row, cursor_col)) |extras| {
-                                        const is_emoji = isEmojiPresentation(cursor_cell.cp) or for (extras) |e| {
-                                            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
-                                        } else false;
-                                        if (is_emoji) {
-                                            self.emoji_cluster_buf[0] = cursor_cell.cp;
-                                            const elen = @min(extras.len, self.emoji_cluster_buf.len - 1);
-                                            for (0..elen) |ei| {
-                                                self.emoji_cluster_buf[1 + ei] = extras[ei];
-                                            }
-                                            self.emoji_cluster_len = @intCast(1 + elen);
-                                        }
-                                    }
-                                    defer self.emoji_cluster_len = 0;
-
-                                    if (self.isPhase2Atlas()) {
-                                        const overflow = self.grid.getOverflow(grid_id, cur_row, cursor_col);
-                                        const cached_entry = ensureCachedPhase2Glyph(self, cursor_cell.cp, ext_cursor_c_style, overflow) catch blk: {
-                                            self.flush_aborted = true;
-                                            break :blk null;
-                                        };
-                                        if (cached_entry) |entry| {
-                                            glyph_entry = entry;
-                                            glyph_ok = 1;
-                                        } else if (self.flush_aborted) {
-                                            return;
-                                        } else {
-                                            ext_cursor_retry_required = true;
-                                        }
-                                    } else if (self.cb.on_atlas_ensure_glyph_styled) |styled_fn| {
-                                        const ext_cursor_style = ext_cursor_resolved.style_flags & (STYLE_BOLD | STYLE_ITALIC);
-                                        if (ext_cursor_style != 0) {
-                                            glyph_ok = styled_fn(self.ctx, cursor_cell.cp, ext_cursor_c_style, &glyph_entry);
-                                        } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
-                                            glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
-                                        }
-                                    } else if (self.cb.on_atlas_ensure_glyph) |fn_ptr| {
-                                        glyph_ok = fn_ptr(self.ctx, cursor_cell.cp, &glyph_entry);
-                                    }
-
-                                    // The cursor glyph ensure above can trigger an
-                                    // atlas reset no later code re-checks; handle it
-                                    // here rather than leak the flag to the next grid.
-                                    if (self.atlas_reset_during_flush) {
-                                        ext_saw_atlas_reset = true;
-                                        ext_saw_atlas_reset_any = true;
-                                        self.atlas_reset_during_flush = false;
-                                        self.grid.markAllDirty();
-                                        self.invalidateMirroredFrameState();
-                                    }
-
-                                    if (glyph_ok != 0 and glyph_entry.bbox_size_px[0] > 0 and glyph_entry.bbox_size_px[1] > 0) {
-                                        const cursorBaseY: f32 = cy0 + topPad;
-                                        const baselineY: f32 = cursorBaseY + glyph_entry.ascent_px;
-                                        const gx0: f32 = cx0 + glyph_entry.bbox_origin_px[0];
-                                        const gx1: f32 = gx0 + glyph_entry.bbox_size_px[0];
-                                        const gy0: f32 = baselineY - (glyph_entry.bbox_origin_px[1] + glyph_entry.bbox_size_px[1]);
-                                        const gy1: f32 = gy0 + glyph_entry.bbox_size_px[1];
-
-                                        const uv_x0 = glyph_entry.uv_min[0];
-                                        const uv_y0 = glyph_entry.uv_min[1];
-                                        const uv_x1 = glyph_entry.uv_max[0];
-                                        const uv_y1 = glyph_entry.uv_max[1];
-
-                                        const cursor_fg: u32 = if (self.grid.cursor_attr_id != 0)
-                                            self.hl.get(self.grid.cursor_attr_id).fg
-                                        else
-                                            self.hl.default_bg;
-                                        const text_col = Helpers.rgb(cursor_fg);
-
-                                        const cursor_glyph_flags = cursorGlyphDecoFlags(glyph_entry.bytes_per_pixel);
-                                        VH.pushGlyphQuadAssumeCapacity(
-                                            ext_verts,
-                                            gx0,
-                                            gy0,
-                                            gx1,
-                                            gy1,
-                                            .{ uv_x0, uv_y0 },
-                                            .{ uv_x1, uv_y0 },
-                                            .{ uv_x0, uv_y1 },
-                                            .{ uv_x1, uv_y1 },
-                                            text_col,
-                                            grid_id,
-                                            cursor_glyph_flags,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                    // The cursor glyph ensure above can trigger an atlas reset
+                    // no later code re-checks; handle it here rather than leak
+                    // the flag to the next grid.
+                    if (self.atlas_reset_during_flush) {
+                        ext_saw_atlas_reset = true;
+                        ext_saw_atlas_reset_any = true;
+                        self.atlas_reset_during_flush = false;
+                        self.grid.markAllDirty();
+                        self.invalidateMirroredFrameState();
                     }
 
                     if (self.flush_aborted) return;
@@ -6766,6 +6717,39 @@ pub fn notifyTablineChanges(self: *Core) void {
 /// Grid content is rendered from the structured Neovim data (word, kind, menu).
 /// The on_popupmenu_show callback delivers resolved Pmenu/PmenuSel colors so
 /// the frontend can style the container background without inspecting vertices.
+pub const PopupmenuAnchorPlacement = struct { win: i64, row: i32, col: i32 };
+
+/// Where to publish a buffer-completion popup's anchor: `win` is the window
+/// the frontends position from, and (row, col) the anchor cell inside it.
+/// Both frontends read (row, col) against the external window `win` names
+/// when there is one, and against the main window's grid otherwise.
+///
+/// So an anchor an external window shows — its root, or a float it hosts —
+/// is published local to that window, with the window's root id. A detached
+/// split (<C-w>ge) keeps its old main-grid position as its origin, and adding
+/// that origin put the popup that far away from the cell; a float the window
+/// hosts was published under its own id, found no window, and was placed
+/// against the main window. win_pos holds floats anchored into an external
+/// window in global units, the same space externalCompositeOriginRow undoes
+/// for damage.
+pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, anchor_row: i32, anchor_col: i32) PopupmenuAnchorPlacement {
+    if (anchor_grid == 1 or g.external_grids.contains(anchor_grid)) {
+        return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
+    }
+    const pos = g.win_pos.get(anchor_grid) orelse return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
+    const row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row);
+    const col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col);
+    const surface = g.surfaceForGrid(anchor_grid) orelse return .{ .win = anchor_grid, .row = row, .col = col };
+    if (g.external_grids.get(surface)) |ext| {
+        return .{
+            .win = surface,
+            .row = row -| grid_mod.externalCompositeOriginRow(ext),
+            .col = col -| grid_mod.externalCompositeOriginCol(ext),
+        };
+    }
+    return .{ .win = anchor_grid, .row = row, .col = col };
+}
+
 pub fn sendPopupmenuShow(self: *Core) bool {
     const pum_grid_id = grid_mod.POPUPMENU_GRID_ID;
     const items = self.grid.popupmenu.items.items;
@@ -6882,46 +6866,19 @@ pub fn sendPopupmenuShow(self: *Core) bool {
         }
     }
 
-    // Register as external grid with position.
-    // anchor_row/col are local to anchor_grid. Convert to global (grid 1)
-    // coordinates using win_pos so the frontend can position the popup
-    // relative to the terminal view without knowing about sub-grid offsets.
+    // Register as external grid with position: in the coordinates of the
+    // window that shows the anchor (see popupmenuAnchorPlacement). Cmdline
+    // completion is placed by the frontend from the cmdline window instead.
     const is_cmdline_completion = anchor_grid < 0;
-    var start_row: i32 = undefined;
-    var start_col: i32 = undefined;
-    if (is_cmdline_completion) {
-        start_row = -1;
-        start_col = anchor_col;
-    } else if (anchor_grid != 1) {
-        if (self.grid.win_pos.get(anchor_grid)) |pos| {
-            start_row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row);
-            start_col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col);
-        } else if (self.grid.external_grids.get(anchor_grid)) |ext| {
-            // An external grid is never in win_pos — setWinExternalPos drops it
-            // — so without this the completion popup anchored to a window that
-            // lives in an external window was published with that window's
-            // LOCAL row and column treated as global coordinates. The sibling
-            // conversion in redraw_handler.zig has always had this branch.
-            if (ext.start_row >= 0 and ext.start_col >= 0) {
-                start_row = anchor_row +| ext.start_row;
-                start_col = anchor_col +| ext.start_col;
-            } else {
-                start_row = anchor_row;
-                start_col = anchor_col;
-            }
-        } else {
-            start_row = anchor_row;
-            start_col = anchor_col;
-        }
-    } else {
-        start_row = anchor_row;
-        start_col = anchor_col;
-    }
+    const placement: PopupmenuAnchorPlacement = if (is_cmdline_completion)
+        .{ .win = anchor_grid, .row = -1, .col = anchor_col }
+    else
+        popupmenuAnchorPlacement(&self.grid, anchor_grid, anchor_row, anchor_col);
 
     self.grid.putSyntheticExternal(pum_grid_id, .{
-        .win = anchor_grid,
-        .start_row = start_row,
-        .start_col = start_col,
+        .win = placement.win,
+        .start_row = placement.row,
+        .start_col = placement.col,
     }) catch |e| {
         self.log.write("[popupmenu] external_grids.put failed: {any}\n", .{e});
         return false;
@@ -16450,4 +16407,231 @@ test "composeRowRuns composes any grid's cells, and blanks a short row's tail" {
         try std.testing.expectEqual(a0.bg, dst.bg_rgbs.items[c]);
         try std.testing.expectEqual(@as(i64, 2), dst.grid_ids.items[c]);
     }
+}
+
+test "popupmenu anchor is published in the coordinates of the window that shows it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    const g = &core.grid;
+
+    // A split detached with <C-w>ge keeps its old main-grid position as its
+    // origin (10, 20). Both frontends place the popup from the external
+    // window's own top-left, so the anchor must stay local to it.
+    try g.external_grids.put(g.alloc, 5, .{ .win = 1005, .start_row = 10, .start_col = 20 });
+    var p = popupmenuAnchorPlacement(g, 5, 3, 4);
+    try std.testing.expectEqual(@as(i64, 5), p.win);
+    try std.testing.expectEqual(@as(i32, 3), p.row);
+    try std.testing.expectEqual(@as(i32, 4), p.col);
+
+    // Born external (no position): local as well.
+    try g.external_grids.put(g.alloc, 6, .{ .win = 1006, .start_row = -1, .start_col = -1 });
+    p = popupmenuAnchorPlacement(g, 6, 3, 4);
+    try std.testing.expectEqual(@as(i64, 6), p.win);
+    try std.testing.expectEqual(@as(i32, 3), p.row);
+
+    // A float the detached window hosts: win_pos holds it in global units
+    // (origin + local 6, 8). The popup goes to the HOST window, at the
+    // float's place inside it.
+    try g.win_pos.put(g.alloc, 7, .{ .row = 16, .col = 28, .anchor_grid = 5 });
+    p = popupmenuAnchorPlacement(g, 7, 1, 2);
+    try std.testing.expectEqual(@as(i64, 5), p.win);
+    try std.testing.expectEqual(@as(i32, 7), p.row);
+    try std.testing.expectEqual(@as(i32, 10), p.col);
+
+    // A split on the main window: global coordinates, as before.
+    try g.win_pos.put(g.alloc, 2, .{ .row = 2, .col = 0, .anchor_grid = 1 });
+    p = popupmenuAnchorPlacement(g, 2, 3, 4);
+    try std.testing.expectEqual(@as(i64, 2), p.win);
+    try std.testing.expectEqual(@as(i32, 5), p.row);
+    try std.testing.expectEqual(@as(i32, 4), p.col);
+}
+
+test "a surface root regenerates every row when it gains or loses its layers under blur" {
+    const State = struct {
+        seen_rows: [4]bool = .{false} ** 4,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    // Under blur a surface root drops its default-background runs while it
+    // hosts a layer, so that answer changing changes every root row, not just
+    // the band the layer covers.
+    core.blur_enabled = true;
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 4, 4);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 4);
+    try flush_ctx.onFlush(4, 4);
+
+    // The external window's first float: one row, on row 0.
+    try core.grid.resizeGrid(3, 1, 2);
+    try core.grid.setWinFloatPos(3, 43, 0, 0, 50, 1, 2, true);
+    state = .{};
+    try flush_ctx.onFlush(4, 4);
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
+
+    // And back: hiding the last float flips it again.
+    state = .{};
+    try flush_ctx.onFlush(4, 4);
+    try core.grid.hideWin(3);
+    state = .{};
+    try flush_ctx.onFlush(4, 4);
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
+}
+
+test "the main surface regenerates every row when its last layer is hidden under blur" {
+    const State = struct {
+        seen_rows: [4]bool = .{false} ** 4,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = verts;
+            _ = vert_count;
+            _ = total_rows;
+            _ = total_cols;
+            if (grid_id != 1 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var row = row_start;
+            while (row < row_start + row_count and row < self.seen_rows.len) : (row += 1) {
+                self.seen_rows[row] = true;
+            }
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.blur_enabled = true;
+    try core.grid.resizeGrid(1, 4, 4);
+    try core.grid.resizeGrid(2, 1, 4);
+    try core.grid.setWinPos(2, 42, 0, 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 4;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(4, 4);
+    try flush_ctx.onFlush(4, 4);
+
+    // hideWin only marks the band the window covered (row 0); the rule for
+    // the other rows flips with it.
+    try core.grid.hideWin(2);
+    state = .{};
+    try flush_ctx.onFlush(4, 4);
+    try std.testing.expectEqual([4]bool{ true, true, true, true }, state.seen_rows);
+}
+
+test "the cursor's glyph quads come from one emitter and trim box drawing to the cell" {
+    const State = struct {
+        entry: c_api.GlyphEntry,
+        fn ensure(ctx: ?*anyopaque, scalar: u32, out_entry: *c_api.GlyphEntry) callconv(.c) c_int {
+            _ = scalar;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            out_entry.* = self.entry;
+            return 1;
+        }
+    };
+    // Same overshooting glyph as the row test: 9..22 against a 10..20 cell.
+    var entry = std.mem.zeroes(c_api.GlyphEntry);
+    entry.uv_min = .{ 0, 0 };
+    entry.uv_max = .{ 0.1, 1.3 };
+    entry.bbox_origin_px = .{ 4, -4 };
+    entry.bbox_size_px = .{ 2, 13 };
+    entry.ascent_px = 8;
+    var state = State{ .entry = entry };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ctx = &state;
+    core.cb.on_atlas_ensure_glyph = State.ensure;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+
+    const Span = struct {
+        fn ofGlyph(verts: []const c_api.Vertex) [2]f32 {
+            // The glyph quad is the last six vertices (after the cursor box).
+            var lo: f32 = std.math.inf(f32);
+            var hi: f32 = -std.math.inf(f32);
+            for (verts[verts.len - 6 ..]) |v| {
+                lo = @min(lo, v.position[1]);
+                hi = @max(hi, v.position[1]);
+            }
+            return .{ lo, hi };
+        }
+    };
+
+    var q = CursorCellQuads{
+        .grid_id = 2,
+        .row = 1,
+        .col = 0,
+        .x0 = 0,
+        .y0 = 10,
+        .cell_w = 10,
+        .cell_h = 10,
+        .top_pad = 0,
+        .width = 10,
+        .shape = 0,
+        .pct = 100,
+        .bg_rgb = 0xFFFFFF,
+        .fg_rgb = 0x000000,
+        .cell = .{ .cp = 0x2502, .hl = 0 },
+    };
+    try std.testing.expectEqual(CursorEmitResult.ok, try emitCursorQuads(&core, &out, q));
+    // Cursor box, then the inverted glyph.
+    try std.testing.expectEqual(@as(usize, 12), out.items.len);
+    var span = Span.ofGlyph(out.items);
+    try std.testing.expectApproxEqAbs(@as(f32, 10), span[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 20), span[1], 0.001);
+
+    out.clearRetainingCapacity();
+    q.cell.cp = 0x2190;
+    try std.testing.expectEqual(CursorEmitResult.ok, try emitCursorQuads(&core, &out, q));
+    span = Span.ofGlyph(out.items);
+    try std.testing.expectApproxEqAbs(@as(f32, 9), span[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 22), span[1], 0.001);
 }

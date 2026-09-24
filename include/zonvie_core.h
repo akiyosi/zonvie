@@ -1353,6 +1353,13 @@ ZONVIE_API void zonvie_core_set_option_value(
    len: length of command string */
 ZONVIE_API void zonvie_core_send_command(zonvie_core *core, const unsigned char *cmd, size_t len);
 
+/* Ask Neovim to close the window shown in grid_id, as a user closing an
+   external OS window does (nvim_win_close under pcall, so a window that is
+   already gone or is the last one raises nothing). The OS window itself is
+   torn down when Neovim confirms, through on_external_window_close.
+   Returns 1 when a request was sent, 0 when the grid has no Neovim window. */
+ZONVIE_API int zonvie_core_request_win_close(zonvie_core *core, int64_t grid_id);
+
 /* Set/update IME preedit (composition) text.
    text: UTF-8 preedit string; len: its byte length.
    target_start/target_end: UTF-8 byte offsets into text marking the clause
@@ -1550,6 +1557,21 @@ ZONVIE_API void zonvie_core_scrollbar_drag_target(
     int64_t botline,
     int64_t line_count,
     zonvie_scrollbar_drag_target *out);
+
+/* The top edge of an external popupmenu window, Y growing downward: below
+   the anchor cell (anchor_top + anchor_height) when the popup ends at or
+   above ref_bottom — the bottom of the window the anchor is in — else above
+   the anchor (anchor_top - popup_height) when that starts at or below
+   screen_top, else below. Neovim's own popupmenu flips on the editor's room,
+   not the screen's.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API int32_t zonvie_core_popupmenu_top(
+    int32_t anchor_top,
+    int32_t anchor_height,
+    int32_t popup_height,
+    int32_t ref_bottom,
+    int32_t screen_top);
 
 /* The grid a surface's scrollbar should show: the cursor's grid when this
    surface composites it, and the surface's own root otherwise. `surface_id` is

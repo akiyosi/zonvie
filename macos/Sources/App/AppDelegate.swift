@@ -385,13 +385,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidChangeOcclusionState(_ notification: Notification) {
         let win = notification.object as? NSWindow ?? window
         guard let vc = win?.contentViewController as? ViewController else { return }
-        // Pause blinking when the window is fully occluded; resume only when it
-        // is visible and the app is frontmost (focus gating handled separately).
-        if win?.occlusionState.contains(.visible) == true && NSApp.isActive {
-            vc.core?.resetCursorBlink()
-        } else {
-            vc.core?.stopCursorBlinking()
-        }
+        // Pause blinking when the window showing the cursor is occluded; the
+        // core's gate decides, since the cursor may be in an external window
+        // this one's occlusion says nothing about.
+        vc.core?.refreshCursorBlinkGate()
 
         // Repaint on the way back, for the same reason windowDidDeminiaturize
         // does: GridSurfaceRenderer.draw skips every frame while the window

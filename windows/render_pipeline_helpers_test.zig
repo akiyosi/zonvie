@@ -670,6 +670,156 @@ test "paint policy forces a full redraw on each of its four terms" {
     }
 }
 
+/// The main driver's present decision as window.zig wrote it before
+/// `presentGate`, kept verbatim as the oracle.
+fn mainPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
+    const s = in.seed.?;
+    const effective_rows = in.rows;
+    const allow_present = blk: {
+        if (!in.layout_ok) break :blk false;
+        if (!in.metrics_ok) break :blk false;
+        if (in.frame_incomplete) break :blk false;
+        if (s.clear) break :blk true;
+        if (s.pending and !in.preserve_back) break :blk true;
+        if (effective_rows == 0) break :blk false;
+        if (s.pending) {
+            if (s.back_tex_valid) {
+                if (s.rows_mismatch) {
+                    if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
+                    break :blk false;
+                }
+                break :blk true;
+            }
+            if (s.rows_mismatch) {
+                if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
+                break :blk false;
+            }
+            if (s.row_valid_count == effective_rows) {
+                if (in.skipped_empty != 0) break :blk false;
+                if (in.rows_to_draw != effective_rows) break :blk false;
+                break :blk true;
+            }
+            break :blk false;
+        }
+        if (in.force_full_rows and in.skipped_empty != 0) break :blk false;
+        if (in.force_full_rows and in.rows_to_draw != effective_rows) break :blk false;
+        break :blk true;
+    };
+    const full = in.force_full_rows or
+        (s.pending and !s.back_tex_valid and !s.rows_mismatch) or
+        s.clear or
+        in.present_rects_overflowed or
+        in.custom_shader;
+    const rendered_complete_frame = effective_rows != 0 and
+        in.skipped_empty == 0 and
+        in.rows_to_draw == effective_rows;
+    return .{
+        .verdict = if (allow_present) .present else .refuse,
+        .full = full,
+        .back_tex_valid = (s.back_tex_valid and in.preserve_back) or rendered_complete_frame,
+    };
+}
+
+/// The external driver's, from external_windows.zig: an incomplete frame and
+/// stale metrics requeue, no damage skips, and back_tex is always valid.
+fn externalPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
+    const full = in.force_full_rows or in.custom_shader;
+    const verdict: helpers.PresentVerdict = if (in.frame_incomplete or !in.metrics_ok)
+        .refuse
+    else if (!full and in.present_rects == 0)
+        .skip
+    else
+        .present;
+    return .{ .verdict = verdict, .full = full, .back_tex_valid = true };
+}
+
+fn expectSameGate(want: helpers.PresentGate, got: helpers.PresentGate) !void {
+    try std.testing.expectEqual(want.verdict, got.verdict);
+    // Fullness and validity only mean anything for a frame that presents.
+    if (want.verdict != .present) return;
+    try std.testing.expectEqual(want.full, got.full);
+    try std.testing.expectEqual(want.back_tex_valid, got.back_tex_valid);
+}
+
+test "the present gate answers what the main driver answered, for every input" {
+    var n: u32 = 0;
+    var bits: u32 = 0;
+    while (bits < (1 << 12)) : (bits += 1) {
+        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
+            for ([_]u32{ 0, 1 }) |skipped_empty| {
+                for ([_]usize{ 0, 4 }) |rows| {
+                    for ([_]usize{ 0, 4 }) |row_valid_count| {
+                        const bit = struct {
+                            fn at(v: u32, i: u5) bool {
+                                return (v >> i) & 1 != 0;
+                            }
+                        }.at;
+                        const in = helpers.PresentGateInputs{
+                            .layout_ok = bit(bits, 0),
+                            .metrics_ok = bit(bits, 1),
+                            .frame_incomplete = bit(bits, 2),
+                            .force_full_rows = bit(bits, 3),
+                            .preserve_back = bit(bits, 4),
+                            .custom_shader = bit(bits, 5),
+                            .present_rects_overflowed = bit(bits, 6),
+                            .present_rects = if (bit(bits, 7)) 2 else 0,
+                            .rows = rows,
+                            .rows_to_draw = rows_to_draw,
+                            .skipped_empty = skipped_empty,
+                            .empty_damage_presents_all = true,
+                            .seed = .{
+                                .pending = bit(bits, 8),
+                                .clear = bit(bits, 9),
+                                .back_tex_valid = bit(bits, 10),
+                                .rows_mismatch = bit(bits, 11),
+                                .row_valid_count = row_valid_count,
+                            },
+                        };
+                        try expectSameGate(mainPresentOracle(in), helpers.presentGate(in));
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(n > 10_000);
+}
+
+test "the present gate answers what the external driver answered, for every input" {
+    var bits: u32 = 0;
+    while (bits < (1 << 6)) : (bits += 1) {
+        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
+            for ([_]u32{ 0, 1 }) |skipped_empty| {
+                const in = helpers.PresentGateInputs{
+                    .metrics_ok = bits & 1 != 0,
+                    .frame_incomplete = bits & 2 != 0,
+                    .force_full_rows = bits & 4 != 0,
+                    .preserve_back = bits & 8 != 0,
+                    .custom_shader = bits & 16 != 0,
+                    .present_rects = if (bits & 32 != 0) 2 else 0,
+                    .rows = 4,
+                    .rows_to_draw = rows_to_draw,
+                    .skipped_empty = skipped_empty,
+                };
+                try expectSameGate(externalPresentOracle(in), helpers.presentGate(in));
+            }
+        }
+    }
+}
+
+test "a surface whose chrome draws without damage never skips an empty present" {
+    const in = helpers.PresentGateInputs{
+        .force_full_rows = false,
+        .preserve_back = true,
+        .rows = 4,
+        .rows_to_draw = 0,
+        .skipped_empty = 0,
+        .present_rects = 0,
+        .empty_damage_presents_all = true,
+    };
+    try std.testing.expectEqual(helpers.PresentVerdict.present, helpers.presentGate(in).verdict);
+}
+
 test "paint policy refuses to preserve a back buffer that is not valid" {
     const in = helpers.PaintPolicyInputs{
         .force_full = false,
@@ -711,6 +861,17 @@ test "present rect clamping trims a rect that overhangs the target" {
     const len = helpers.clampPresentRects(Rect, &rects, 100, 100);
     try std.testing.expectEqual(@as(usize, 1), len);
     try std.testing.expectEqual(Rect{ .left = 80, .top = 80, .right = 100, .bottom = 100 }, rects[0]);
+}
+
+test "dirty rows become one full-width rect per run of adjacent rows" {
+    var out: [6]Rect = undefined;
+    const rows = [_]u32{ 1, 2, 3, 7, 9, 10 };
+    const n = helpers.rowSpanRects(Rect, &rows, 24, 640, 10, &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 34, .right = 640, .bottom = 64 }, out[0]);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 94, .right = 640, .bottom = 104 }, out[1]);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 114, .right = 640, .bottom = 134 }, out[2]);
+    try std.testing.expectEqual(@as(usize, 0), helpers.rowSpanRects(Rect, &.{}, 0, 640, 10, &out));
 }
 
 test "damage compaction merges row spans and contained cursor damage" {
