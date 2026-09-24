@@ -585,6 +585,57 @@ func captureSurfaceLayerScrollStep(
     return stepped
 }
 
+/// Begin one retention step for a grid_scroll the row-shift fast path does not
+/// see, and capture the rows it pushes out of `bounds` — the grid's scrollable
+/// span, margins excluded. A bordered float or a vertical split scrolls less
+/// than its full width, so the core repaints it instead of shifting it, and
+/// this is the only capture it gets.
+///
+/// The main renderer runs it from the grid_scroll callback; an external
+/// surface runs it when its bracket opens, for every grid it draws, root or
+/// hosted layer. Claiming the grid in `bracketStagedGrids` is what makes the
+/// fast path stand down if it does fire for the same step. No ease seed: the
+/// gesture that drives these scrolls holds its own compensation.
+///
+/// `sourceShift` is how far the source set lags the content this step
+/// describes (see the main renderer's replay). `captureRow` is the caller's,
+/// for the reason `captureSurfaceLayerScrollStep` gives.
+///
+/// Returns false when nothing could be planned.
+@discardableResult
+func captureSurfaceGridScrollStep(
+    gridId: Int64,
+    cs: SurfaceBufferSet,
+    bounds: (top: Int, bottomEx: Int),
+    rowsDelta: Int,
+    sourceShift: Int,
+    retention: ScrollRetention,
+    lock: NSLock,
+    bracketStagedGrids: inout Set<Int64>,
+    captureRow: (SurfaceBufferSet, Int, Int) -> Void
+) -> Bool {
+    guard cs.rowState.usingRowBuffers else { return false }
+    // Clamped to the rows the grid actually has: spans are armed per gesture
+    // and never disarmed, so a grid that has shrunk since would plan rows past
+    // its end, open the band empty, and let `beginStep` prune the previous
+    // step's good rows against a pivot derived from the stale span.
+    guard let plan = ScrollRetention.plan(
+        rowStart: bounds.top,
+        rowEnd: min(bounds.bottomEx, cs.rowState.counts.count),
+        rowsDelta: rowsDelta,
+        depth: retention.depthRows
+    ) else { return false }
+    retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
+    lock.lock()
+    bracketStagedGrids.insert(gridId)
+    lock.unlock()
+    for i in 0..<plan.count {
+        let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
+        captureRow(cs, row + sourceShift, row - rowsDelta)
+    }
+    return true
+}
+
 func encodeSurfaceCustomShaderChain(
     cmd: MTLCommandBuffer,
     pipelines: [CustomShaderPipeline],
@@ -2676,22 +2727,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // again on the frames this function does not run at all — which is
         // every frame once nothing is easing.
         retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
+        retention.releaseCoveredPins(&scrollOffsetData, cellHeightNDC: cellHeightNDC)
         for i in scrollOffsetData.indices {
             let gid = Int64(scrollOffsetData[i].grid_id)
-            let retained = retention.publishedCount(gridId: gid)
-            if retained > 0, cellHeightNDC > 0, ScrollRetention.coversBand(
-                retainedRows: retained,
-                offsetNDC: scrollOffsetData[i].offset_y,
-                cellHeightNDC: cellHeightNDC
-            ) {
-                scrollOffsetData[i].pin_edges = 0
-            }
             // Logged AFTER the pin decision so pin/retained carry the values
             // a frame actually renders with — the GUI harness derives the
             // margin band and asserts retained-row band coverage from these
             // fields, mirroring the [ExternalGridView] scroll offset line.
             let info = offsets.first { $0.gridId == gid }
-            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(gid) offsetYPx=\(info?.offsetYPx ?? 0) marginTop=\(info?.marginTop ?? 0) marginBottom=\(info?.marginBottom ?? 0) ndc=\(scrollOffsetData[i].offset_y) top=\(scrollOffsetData[i].content_top_y) bot=\(scrollOffsetData[i].content_bottom_y) pin=\(scrollOffsetData[i].pin_edges) retained=\(retained) gridTop=\(info?.gridTopYNDC ?? 0) cellNDC=\(cellHeightNDC) vpH=\(drawableHeight)")
+            ZonvieCore.appLog("[renderer] scroll offset: gridId=\(gid) offsetYPx=\(info?.offsetYPx ?? 0) marginTop=\(info?.marginTop ?? 0) marginBottom=\(info?.marginBottom ?? 0) ndc=\(scrollOffsetData[i].offset_y) top=\(scrollOffsetData[i].content_top_y) bot=\(scrollOffsetData[i].content_bottom_y) pin=\(scrollOffsetData[i].pin_edges) retained=\(retention.publishedCount(gridId: gid)) gridTop=\(info?.gridTopYNDC ?? 0) cellNDC=\(cellHeightNDC) vpH=\(drawableHeight)")
         }
 
         // Store as value-type array; draw() will snapshot and pass via setVertexBytes.
@@ -5173,47 +5217,26 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Read the scrolling grid's OWN rows: every grid keeps its own buffers
         // and its own row space now, so the bounds above are grid-local.
         let cs = (gridBuffers.existingSets(for: gridId) ?? bufferSets)[flushSourceSetIndex]
-        guard cs.rowState.usingRowBuffers else {
-            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no row buffers")
-            return
-        }
-
         // A step is routinely more than one row (a whole wheel event's
         // 'mousescroll' worth, coalesced), but the retention holds only
-        // `depthRows` — the offset is clamped to the same reach — so keep the
-        // rows adjacent to the edge the block left through.
-        let depth = retention.depthRows
-        // Clamp to the rows the grid actually has, as the external surface
-        // does. The bounds are armed per gesture and never disarmed, so a grid
-        // that has shrunk since plans rows past its end: every one of them
-        // fails `captureOneRetainedRow`'s vertex-count test, the band opens
-        // empty, and `beginStep` has already pruned the previous step's good
-        // rows against a pivot derived from the stale span.
-        let capturableRowEnd = min(bounds.bottomEx, cs.rowState.counts.count)
-        guard let plan = ScrollRetention.plan(
-            rowStart: bounds.top,
-            rowEnd: capturableRowEnd,
+        // `depthRows` — the offset is clamped to the same reach — so the
+        // shared step keeps the rows adjacent to the edge the block left
+        // through.
+        let captured = captureSurfaceGridScrollStep(
+            gridId: gridId,
+            cs: cs,
+            bounds: bounds,
             rowsDelta: rowsDelta,
-            depth: depth
-        ) else {
-            ZonvieCore.appLog(
-                "[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no plan (top=\(bounds.top) bottomEx=\(bounds.bottomEx) depth=\(depth))"
-            )
-            return
+            sourceShift: sourceShift,
+            retention: retention,
+            lock: lock,
+            bracketStagedGrids: &bracketStagedGrids
+        ) { cs, readRow, targetRow in
+            captureOneRetainedRow(cs: cs, gridId: gridId, readRow: readRow, targetRow: targetRow)
         }
-
-        retention.beginStep(gridId: gridId, rowsDelta: rowsDelta, pivotTargetRow: plan.pivotTargetRow)
-        lock.lock()
-        bracketStagedGrids.insert(gridId)
-        lock.unlock()
-
-        for i in 0..<plan.count {
-            let row = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-            captureOneRetainedRow(
-                cs: cs,
-                gridId: gridId,
-                readRow: row + sourceShift,
-                targetRow: row - rowsDelta
+        if !captured {
+            ZonvieCore.appLog(
+                "[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no row buffers or no plan (top=\(bounds.top) bottomEx=\(bounds.bottomEx) depth=\(retention.depthRows))"
             )
         }
     }
