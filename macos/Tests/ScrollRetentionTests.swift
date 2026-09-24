@@ -831,7 +831,22 @@ private enum ScrollRetentionTests {
         require(stale[0].rows.isEmpty && stale[2].rows.isEmpty, "and clears their row lists")
     }
 
+    /// A layer ledger never holds the root, and every staged layout does, so a
+    /// count comparison left a single closed float's entry behind.
+    private static func verifyLedgerForgetsALoneClosedLayer() {
+        func layer(_ id: Int64) -> SurfaceLayer {
+            SurfaceLayer(gridId: id, anchorGrid: 1, originPx: .zero, rows: 1, cols: 1, z: 0, followsScroll: true)
+        }
+        var ledger: [Int64: Int] = [7: 3]
+        pruneSurfaceLayerLedger(&ledger, to: [layer(1)])
+        require(ledger.isEmpty, "a closed float's entry is dropped even when it is the only one")
+        ledger = [7: 3, 9: 1]
+        pruneSurfaceLayerLedger(&ledger, to: [layer(1), layer(9), layer(12)])
+        requireEqual(ledger, [9: 1], "a closed float's entry is dropped while another float opens")
+    }
+
     static func main() {
+        verifyLedgerForgetsALoneClosedLayer()
         verifyCommittedRowMutationLedger()
         verifyStagedValueIsPublishedByItsOwnCommit()
         verifyCommittedScrollMerge()

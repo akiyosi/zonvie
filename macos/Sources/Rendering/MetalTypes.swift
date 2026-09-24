@@ -3841,12 +3841,13 @@ func accumulateSurfaceLayerPlacementTravel(
 /// places. A destroyed grid's entry describes a layer that no longer exists,
 /// and its id is reused by the next float a scroll makes — which would
 /// otherwise inherit the last one's travel, baseline or last-logged value.
-/// Only rebuilds the dictionary when something can have gone.
+/// Only rebuilds the dictionary when an entry has gone. A count comparison
+/// could not say so: the ledgers never hold the root, every layout does.
 func pruneSurfaceLayerLedger<Key: BinaryInteger, Value>(
     _ ledger: inout [Key: Value],
     to staged: [SurfaceLayer]
 ) {
-    guard ledger.count > staged.count else { return }
+    guard ledger.keys.contains(where: { key in !staged.contains { $0.gridId == Int64(key) } }) else { return }
     ledger = ledger.filter { entry in
         staged.contains { $0.gridId == Int64(entry.key) }
     }

@@ -2491,7 +2491,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // an external-only flush between a cursor move and the draw turned the
         // cursor-only frame into a full main pass. A background change repaints
         // every edge the main pass clears.
-        if bracketLanded {
+        if bracketLanded || retentionLanded {
             pendingCursorOnlyCommit = didCursorWrite
                 && !didMainWrite
                 && !flushHadLayerWork
