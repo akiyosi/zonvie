@@ -804,9 +804,9 @@ fn applyGlowConfigLocked(self: *Core, result: mp.Value) bool {
         } else if (std.mem.eql(u8, key, "radius")) {
             if (entry.val == .int) {
                 const r: f32 = @floatFromInt(entry.val.int);
-                self.glow_radius_px = std.math.clamp(r, 2.0, 16.0);
+                self.setGlowRadiusPx(std.math.clamp(r, 2.0, 16.0));
             } else if (entry.val == .float) {
-                self.glow_radius_px = std.math.clamp(@as(f32, @floatCast(entry.val.float)), 2.0, 16.0);
+                self.setGlowRadiusPx(std.math.clamp(@as(f32, @floatCast(entry.val.float)), 2.0, 16.0));
             }
         } else if (std.mem.eql(u8, key, "intensity")) {
             if (entry.val == .int) {
@@ -822,7 +822,7 @@ fn applyGlowConfigLocked(self: *Core, result: mp.Value) bool {
         self.resolveGlowGroups();
         self.glow_startup_retries = 0;
         self.log.write("glow config: enabled, {d} groups, radius={d:.1}, intensity={d:.1}\n", .{
-            self.glow_group_names.items.len, self.glow_radius_px, self.getGlowIntensity(),
+            self.glow_group_names.items.len, self.getGlowRadiusPx(), self.getGlowIntensity(),
         });
         return true;
     }

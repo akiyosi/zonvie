@@ -31,18 +31,28 @@ extension SurfaceDrawLoopHost {
     /// commits pile up into a multi-row jump on the first frame of a held-key
     /// scroll; calling it for every already-active commit would only enqueue
     /// redundant AppKit invalidations.
+    ///
+    /// Called from draw() on every animated frame, so a main-thread caller is
+    /// served in place: the hop allocated a closure per call, up to three per
+    /// frame. The core thread's calls still hop.
     func activateSurfaceDrawLoop() {
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.window != nil else { return }
-            self.drawLoopIdleCounter.noteActive()
-            guard self.isPaused else { return }
-            ZonvieCore.appLogScrollMode(
-                "[drawloop] activate: \(self.drawLoopTraceName) switching to continuous rendering"
-            )
-            self.isPaused = false
-            self.enableSetNeedsDisplay = false
-            self.setNeedsDisplay(self.bounds)
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.activateSurfaceDrawLoopOnMain() }
+            return
         }
+        activateSurfaceDrawLoopOnMain()
+    }
+
+    private func activateSurfaceDrawLoopOnMain() {
+        guard window != nil else { return }
+        drawLoopIdleCounter.noteActive()
+        guard isPaused else { return }
+        ZonvieCore.appLogScrollMode(
+            "[drawloop] activate: \(drawLoopTraceName) switching to continuous rendering"
+        )
+        isPaused = false
+        enableSetNeedsDisplay = false
+        setNeedsDisplay(bounds)
     }
 
     /// Switch back to on-demand rendering (setNeedsDisplay-driven).

@@ -831,6 +831,23 @@ private enum ScrollRetentionTests {
         require(stale[0].rows.isEmpty && stale[2].rows.isEmpty, "and clears their row lists")
     }
 
+    /// An editor-anchored float follows whichever window it overlaps most this
+    /// frame. Two windows' landed-row counters share no zero, so a baseline
+    /// seeded against one and read against the other made the debt jump by
+    /// their difference.
+    private static func verifyFloatDebtBaselineFollowsOneGrid() {
+        let first = floatDebtBaselineFollowing(anchorGridId: 2, stored: nil, anchorRowsUp: 0, placementRowsUp: 0)
+        require(first.seeded, "a float seen following for the first time is seeded")
+        let same = floatDebtBaselineFollowing(anchorGridId: 2, stored: first.baseline, anchorRowsUp: 3, placementRowsUp: 0)
+        require(!same.seeded, "following the same window keeps its baseline")
+        requireEqual(floatDebtRowsUp(anchorRowsUp: 3, placementRowsUp: 0, baseline: same.baseline),
+                     3, "and accrues that window's steps")
+        let switched = floatDebtBaselineFollowing(anchorGridId: 5, stored: same.baseline, anchorRowsUp: 50, placementRowsUp: 0)
+        require(switched.seeded, "a switch to another window re-seeds")
+        requireEqual(floatDebtRowsUp(anchorRowsUp: 50, placementRowsUp: 0, baseline: switched.baseline),
+                     0, "so the other window's history is not carried as debt")
+    }
+
     /// A layer ledger never holds the root, and every staged layout does, so a
     /// count comparison left a single closed float's entry behind.
     private static func verifyLedgerForgetsALoneClosedLayer() {
@@ -847,6 +864,7 @@ private enum ScrollRetentionTests {
 
     static func main() {
         verifyLedgerForgetsALoneClosedLayer()
+        verifyFloatDebtBaselineFollowsOneGrid()
         verifyCommittedRowMutationLedger()
         verifyStagedValueIsPublishedByItsOwnCommit()
         verifyCommittedScrollMerge()

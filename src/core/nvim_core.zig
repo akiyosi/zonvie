@@ -1101,10 +1101,10 @@ pub const Core = struct {
     clipboard_setup_done: bool = false,
 
     // Neon glow configuration (read from vim.g.zonvie_glow)
-    // glow_enabled and glow_intensity are atomic: written by RPC thread, read by frontend draw thread.
+    // glow_enabled, glow_intensity and glow_radius are atomic: written by RPC thread, read by frontend draw thread.
     glow_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     glow_all: bool = false, // true = apply glow to all cells (groups = "all")
-    glow_radius_px: f32 = 6.0,
+    glow_radius_px_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 6.0))),
     glow_intensity_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
     glow_hl_ids: ?std.AutoHashMap(u32, void) = null,
     /// Attribute ids already reported by `noteGlowMiss`, so a refusal is said
@@ -1122,6 +1122,10 @@ pub const Core = struct {
         return @bitCast(self.glow_intensity_bits.load(.acquire));
     }
 
+    pub fn getGlowRadiusPx(self: *const Core) f32 {
+        return @bitCast(self.glow_radius_px_bits.load(.acquire));
+    }
+
     /// `radius` as a multiplier on the blur's tap offsets, which is the only
     /// form a Dual Kawase chain can take it in: the chain's depth is fixed, so
     /// what a radius buys is how far each tap reaches.
@@ -1133,7 +1137,7 @@ pub const Core = struct {
     /// the chain still reads as a blur rather than as rings.
     pub fn getGlowRadiusScale(self: *const Core) f32 {
         const default_radius_px: f32 = 6.0;
-        return std.math.clamp(self.glow_radius_px / default_radius_px, 0.33, 2.0);
+        return std.math.clamp(self.getGlowRadiusPx() / default_radius_px, 0.33, 2.0);
     }
 
     pub fn isHardRenderFailure(reason: anyerror) bool {
@@ -1188,6 +1192,10 @@ pub const Core = struct {
 
     pub fn setGlowIntensity(self: *Core, val: f32) void {
         self.glow_intensity_bits.store(@bitCast(val), .release);
+    }
+
+    pub fn setGlowRadiusPx(self: *Core, val: f32) void {
+        self.glow_radius_px_bits.store(@bitCast(val), .release);
     }
 
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
@@ -2746,8 +2754,8 @@ pub const Core = struct {
         if (packer.shelfIndexForYOrdered(order, y)) |idx| live[idx] = true;
     }
 
-    /// True when grid 1 and every visible sub-grid is accounted for; see
-    /// gridAccountedForCollect.
+    /// True when grid 1, every visible sub-grid and every surface the frontend
+    /// owns is accounted for; see gridAccountedForCollect.
     fn mainRowsAccountedForCollect(self: *Core) bool {
         if (!self.gridAccountedForCollect(1, &self.grid.main_buf)) return false;
         var it = self.grid.sub_grids.iterator();
@@ -2759,6 +2767,18 @@ pub const Core = struct {
                 self.grid.external_grids.contains(grid_id);
             if (!visible) continue;
             if (!self.gridAccountedForCollect(grid_id, sg)) return false;
+        }
+        // A surface the frontend still shows without a visible buffer here
+        // (destroyed, or a hidden synthetic grid) is read from its mirror
+        // alone: every row it holds must be valid, or it could keep a glyph
+        // this collection recycles.
+        var known_it = self.known_external_grids.keyIterator();
+        while (known_it.next()) |key| {
+            const grid_id = key.*;
+            if (self.grid.sub_grids.contains(grid_id) and self.grid.external_grids.contains(grid_id)) continue;
+            const m = self.glyph_mirror.getPtr(grid_id) orelse return false;
+            if (m.valid.bit_length < m.rows.items.len) return false;
+            if (m.valid.count() != m.rows.items.len) return false;
         }
         return true;
     }
@@ -2872,18 +2892,6 @@ pub const Core = struct {
         const log_on = self.log.cb != null;
         if (!self.isPhase2Atlas()) return false;
         if (self.atlas_packer == null) return false;
-        // A grid the frontend owns a surface for (external window, float,
-        // popupmenu) retains its own rows. Keyed on the ownership map itself
-        // rather than on its intersection with sub_grids: a grid can lose its
-        // GridBuf while the surface is still on screen, and intersecting missed
-        // exactly that window.
-        if (self.known_external_grids.count() > 0) {
-            if (log_on) self.log.write(
-                "[perf] atlas_gc skip=external_grid count={d}\n",
-                .{self.known_external_grids.count()},
-            );
-            return false;
-        }
         if (self.display_mirror_stale) {
             if (log_on) self.log.write("[perf] atlas_gc skip=display_mirror_stale\n", .{});
             return false;
@@ -7586,16 +7594,58 @@ test "atlas reclamation runs when the frontend owns no surface" {
     try std.testing.expect(recycledShelfCount(&core) > 0);
 }
 
-test "atlas reclamation stands down for a frontend-owned surface" {
+/// The UV of a glyph on closed shelf `index` of initCoreForAtlasGcTest's
+/// packer.
+fn shelfUvY(core: *Core, index: u32) f32 {
+    const packer = &(core.atlas_packer.?);
+    const y: f32 = @floatFromInt(packer.shelves[index].y);
+    return (y + 0.5) / @as(f32, @floatFromInt(packer.height));
+}
+
+/// A clean 2x2 external window whose two rows are mirrored, both on the
+/// packer's first closed shelf.
+fn addMirroredExternalSurface(core: *Core, grid_id: i64, with_buffer: bool) !void {
+    if (with_buffer) {
+        try core.grid.resizeGrid(grid_id, 2, 2);
+        try core.grid.external_grids.put(core.alloc, grid_id, .{ .win = grid_id, .start_row = 0, .start_col = 0 });
+        const sg = core.grid.sub_grids.getPtr(grid_id).?;
+        sg.dirty_all = false;
+        if (sg.dirty_rows.bit_length != 0) sg.dirty_rows.unsetAll();
+    }
+    try core.known_external_grids.put(core.alloc, grid_id, .{ .win = grid_id, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    const v = [_]c_api.Vertex{mirrorGlyphVert(grid_id, shelfUvY(core, 0))};
+    core.recordGlyphMirrorRow(grid_id, 0, 2, &v);
+    core.recordGlyphMirrorRow(grid_id, 1, 2, &v);
+}
+
+test "atlas reclamation counts a frontend-owned surface like any other grid" {
+    // Every surface's rows are mirrored now, so a float or external window is
+    // read the way the main grid is. Refusing whenever one existed turned
+    // reclamation off for the session under ext_windows, and whenever the
+    // cmdline, popupmenu or a message was up, leaving only full resets.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, true);
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    // The shelf the surface draws from survives; the other goes.
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+    try std.testing.expect(core.atlas_packer.?.shelves[1].recycled);
+}
+
+test "atlas reclamation stands down for a surface row it cannot read" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try initCoreForAtlasGcTest(&core, 4);
 
-    // The ordinary shape of a float: cell storage, placement, and a frontend
-    // surface the core was told about.
+    // Clean, so not regenerated this flush, and never mirrored.
     try core.grid.resizeGrid(7, 2, 2);
     try core.grid.external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0 });
     try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    const sg = core.grid.sub_grids.getPtr(7).?;
+    sg.dirty_all = false;
+    if (sg.dirty_rows.bit_length != 0) sg.dirty_rows.unsetAll();
 
     try std.testing.expect(!core.collectAtlasGarbage());
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
@@ -7603,8 +7653,7 @@ test "atlas reclamation stands down for a frontend-owned surface" {
 
 test "atlas reclamation stands down for a surface that outlived its grid buffer" {
     // grid_destroy can drop the GridBuf while the frontend surface is still on
-    // screen. Deriving eligibility from sub_grids missed exactly that window
-    // and reclaimed shelves the surface was still drawing from.
+    // screen. With no mirror either, nothing says what it still draws.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try initCoreForAtlasGcTest(&core, 4);
@@ -7614,6 +7663,26 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
 
     try std.testing.expect(!core.collectAtlasGarbage());
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}
+
+test "a surface that outlived its grid buffer is read from its mirror" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, false);
+    try std.testing.expect(!core.grid.sub_grids.contains(7));
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+    try std.testing.expect(core.atlas_packer.?.shelves[1].recycled);
+
+    // Once its mirror cannot be trusted, the collector stands down again.
+    var fresh = Core.initForTest(std.testing.allocator);
+    defer fresh.deinitForTest();
+    try initCoreForAtlasGcTest(&fresh, 4);
+    try addMirroredExternalSurface(&fresh, 7, false);
+    fresh.glyph_mirror.getPtr(7).?.valid.unset(1);
+    try std.testing.expect(!fresh.collectAtlasGarbage());
 }
 
 

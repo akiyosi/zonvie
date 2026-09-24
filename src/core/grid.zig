@@ -2420,6 +2420,18 @@ pub const Grid = struct {
         self.recordScrollTouchedRow(tr);
     }
 
+    /// A layer's cell changed. A main-surface layer repaints its own band on
+    /// both frontends and grid 1 holds none of its cells, so the root row under
+    /// it owes nothing: dirtying it regenerated that row, and every layer
+    /// crossing it, on each keystroke in any split. Shrink, clear and close
+    /// dirty the band themselves. A float an external window hosts still
+    /// dirties its host's row.
+    fn dirtyHostRowForCellChange(self: *Grid, p: GridPos, row: u32) void {
+        const surface = self.surfaceForGrid(p.anchor_grid) orelse return;
+        if (surface == 1) return;
+        self.dirtyCompositedRow(p, row);
+    }
+
     /// Force-mark a cell's row dirty (for overflow-only changes where putCellGrid
     /// would no-op because cp+hl are unchanged).
     /// Also advances cursor_rev when the cursor is on this cell.
@@ -2443,7 +2455,7 @@ pub const Grid = struct {
                 sg.dirty_rows.set(row);
             }
             if (self.win_pos.get(grid_id)) |p| {
-                self.dirtyCompositedRow(p, row);
+                self.dirtyHostRowForCellChange(p, row);
             }
             if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
                 self.cursor_rev +%= 1;
@@ -2469,9 +2481,7 @@ pub const Grid = struct {
                 self.glyph_working_set_rev +%= 1;
             }
             if (self.win_pos.get(grid_id)) |p| {
-                // Composited grid: dirty the main grid, or the anchor
-                // external grid for ext-anchored floats.
-                self.dirtyCompositedRow(p, row);
+                self.dirtyHostRowForCellChange(p, row);
             }
             // External grids (not in win_pos) do not affect global grid
             // content_rev or dirty state.
@@ -5236,6 +5246,31 @@ test "destroying an external grid owes the main viewport no repaint" {
     grid.main_buf.dirty_all = false;
     try grid.destroyGrid(3);
     try std.testing.expect(!grid.main_buf.dirty_all);
+}
+
+test "typing in a main-surface split leaves the root rows alone" {
+    // A split is its own layer and repaints its own band on both frontends;
+    // grid 1 holds none of its cells. Dirtying the root row under every
+    // changed cell regenerated that row, and every layer crossing it, on each
+    // keystroke. Shrink, clear and close still dirty the band themselves.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(2, 10, 40);
+    try grid.setWinPos(2, 102, 0, 0);
+    grid.main_buf.dirty_all = false;
+    grid.main_buf.dirty_rows.unsetAll();
+    const rev_before = grid.content_rev;
+
+    grid.putCellGrid(2, 3, 5, 'x', 0);
+    grid.markDirtyCellGrid(2, 4, 5);
+
+    try std.testing.expect(!grid.main_buf.isRowDirty(3));
+    try std.testing.expect(!grid.main_buf.isRowDirty(4));
+    try std.testing.expectEqual(rev_before, grid.content_rev);
+    const sg = grid.sub_grids.get(2).?;
+    try std.testing.expect(sg.isRowDirty(3));
+    try std.testing.expect(sg.isRowDirty(4));
 }
 
 test "closing or resizing a main-surface layer repaints its band, not the viewport" {

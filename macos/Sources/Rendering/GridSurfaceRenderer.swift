@@ -1742,9 +1742,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private var pendingDirtyRectPx: NSRect? = nil
     private var pendingDirtyRows: IndexSet = IndexSet()
     /// The last commit carried a cursor and nothing else, and left no earlier
-    /// damage undrawn. `ExternalGridView` calls the same thing `cursorOnlyCommit`
-    /// and uses it to reuse the surface instead of clearing it; this is that
-    /// state on the main surface, so neither surface has to spend a dirty row to
+    /// damage undrawn. `ExternalGridView` reuses its surface for the same state
+    /// (`reuseRootContents`) instead of clearing it; this is that state on the
+    /// main surface, so neither surface has to spend a dirty row to
     /// say "the cursor moved". Cleared by any commit that writes content, and by
     /// a cursor commit that finds rows a draw has not consumed yet — those rows
     /// are the frame's real work and must not be reused over.
@@ -1769,6 +1769,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// belongs to, and the zero the two halves are compared against. Both are
     /// protected by `lock` and consumed in `applyFloatScrollDebt`.
     private var scrollDebtAnchorRowsUp: [Int32: Int32] = [:]
+    private var scrollDebtAnchorGridId: [Int32: Int64] = [:]
     private var scrollDebtBaseline: [Int32: FloatDebtBaseline] = [:]
     /// A cell's height in the NDC the offsets above were built in, so the
     /// debt, which is counted in rows, can be paid in them.
@@ -1816,30 +1817,61 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     private func applyFloatScrollDebt(to snapshot: inout [ScrollOffset]) {
         guard !scrollDebtAnchorRowsUp.isEmpty, scrollDebtCellHeightNDC > 0 else { return }
         for i in snapshot.indices {
-            let gid = snapshot[i].grid_id
-            guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { continue }
-            let placementRowsUp = layerPlacementRowsUp[Int64(gid)] ?? 0
-            guard let baseline = scrollDebtBaseline[gid] else {
-                scrollDebtBaseline[gid] = FloatDebtBaseline(
-                    anchorRowsUp: Int(anchorRowsUp), placementRowsUp: placementRowsUp)
-                continue
-            }
-            // The one definition of this subtraction, the one ScrollRetentionTests
-            // pins. Two more had grown beside it.
-            let debtRows = Int32(clamping: floatDebtRowsUp(
-                anchorRowsUp: Int(anchorRowsUp),
-                placementRowsUp: placementRowsUp,
-                baseline: baseline
-            ))
-            if ZonvieCore.appLogEnabled, scrollDebtLastLogged[gid] != debtRows {
-                scrollDebtLastLogged[gid] = debtRows
-                ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))")
-            }
+            let debtRows = floatDebtRows(for: snapshot[i].grid_id, seeding: true)
             guard debtRows != 0 else { continue }
             // offset_y is NDC and negated against the pixel offset the view
             // built (see computeScrollOffset), so withholding pixels adds here.
             snapshot[i].offset_y += Float(debtRows) * scrollDebtCellHeightNDC
         }
+    }
+
+    /// The float debt of `gid` in rows. Caller holds `lock`. Only the draw
+    /// seeds a baseline: the frame that first shows a float following defines
+    /// its zero, and a reader arriving before it must not.
+    private func floatDebtRows(for gid: Int32, seeding: Bool) -> Int32 {
+        guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { return 0 }
+        let placementRowsUp = layerPlacementRowsUp[Int64(gid)] ?? 0
+        let resolved = floatDebtBaselineFollowing(
+            anchorGridId: scrollDebtAnchorGridId[gid] ?? 0,
+            stored: scrollDebtBaseline[gid],
+            anchorRowsUp: Int(anchorRowsUp),
+            placementRowsUp: placementRowsUp
+        )
+        if resolved.seeded {
+            if seeding { scrollDebtBaseline[gid] = resolved.baseline }
+            return 0
+        }
+        let baseline = resolved.baseline
+        // The one definition of this subtraction, the one ScrollRetentionTests
+        // pins. Two more had grown beside it.
+        let debtRows = Int32(clamping: floatDebtRowsUp(
+            anchorRowsUp: Int(anchorRowsUp),
+            placementRowsUp: placementRowsUp,
+            baseline: baseline
+        ))
+        if seeding, ZonvieCore.appLogEnabled, scrollDebtLastLogged[gid] != debtRows {
+            scrollDebtLastLogged[gid] = debtRows
+            ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))")
+        }
+        return debtRows
+    }
+
+    /// How far each float that moves bodily with a scroll is drawn from its
+    /// placement, in pixels, +y down: the followed offset plus its debt, the
+    /// same two terms the draw applies. The pointer reads this so a press lands
+    /// where the float is drawn; `hitTestGrid` knew only a grid's own offset,
+    /// which a follower does not have. Not per frame: allocated per call.
+    func drawnFollowerOffsetsPx() -> [Int64: CGFloat] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard scrollOffsetViewportHeight > 0 else { return [:] }
+        var result: [Int64: CGFloat] = [:]
+        for entry in scrollOffsetData where entry.move_all != 0 {
+            let debtNDC = Float(floatDebtRows(for: entry.grid_id, seeding: false)) * scrollDebtCellHeightNDC
+            let px = -(entry.offset_y + debtNDC) * scrollOffsetViewportHeight / 2
+            if px.isFinite { result[Int64(entry.grid_id)] = CGFloat(px) }
+        }
+        return result
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -2058,8 +2090,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// |---|---|---|
     /// | begin | drop while row capacity provisions; `retention.beginFlush`; drop the staged shader cursor; reseed the cursor owner | same drop; `carriedDirtyRows`; font generation; `bracketStagedGrids` |
     /// | first row write | `prepareMainWriteState`: pick set, sync rows, `prepareLayerGridsForWrite` | `prepareRowWriteState`: pick set, copy each layer grid's row state, `retention.beginFlush`, capture retained rows, sync rows |
-    /// | abort | `endBracketWithoutPublishing`, from all three exits | `cancelFlush` |
-    /// | commit | retained rows published; `pendingCursorOnlyCommit` | font generation verdict; `cursorOnlyCommit`; `layoutContracted` |
+    /// | abort | `endBracketWithoutPublishing`, from `abortFlush` | `cancelFlush` |
+    /// | commit | retained rows published; `pendingCursorOnlyCommit` | font generation verdict; `layoutContracted` |
     ///
     /// `retention.beginFlush` sits at begin here and at the first row write
     /// there because of where each surface CAPTURES: this surface captures on
@@ -2098,12 +2130,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         layerGridsPreparedThisFlush = false
-        // Begin owns this, not the terminators. A bracket has three exits —
-        // abortFlush and commitFlush's two deferred returns — and only the
-        // first cleared it, so a deferred commit leaked a stale `true` into the
-        // next bracket and gave it a `lastCommitTime` it had not earned.
-        // ExternalGridView clears its `flushHadContent` at begin for the same
-        // reason.
+        // Begin owns this, not the terminators: a bracket that ended without
+        // publishing once leaked a stale `true` into the next one and gave it
+        // a `lastCommitTime` it had not earned. ExternalGridView clears its
+        // `flushHadContent` at begin for the same reason.
         flushHadLayerWork = false
         let perfEnabled = ZonvieCore.appLogEnabled
         if perfEnabled {
@@ -2127,9 +2157,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         flushDirtyRectPx = nil
         flushSourceSetIndex = committedSetIndex
         // Re-seed the pending cursor owner from the committed one, as
-        // ExternalGridView.beginFlush does. abortFlush restores it too, but the
-        // two deferred returns in commitFlush do not, and the caller does not
-        // call abortFlush for them — so a deferred commit carried a stale owner
+        // ExternalGridView.beginFlush does. abortFlush restores it too; this
+        // keeps any bracket that did not publish from carrying a stale owner
         // into the retry, where the `count != 0 || pending == id` guards would
         // drop the true owner's cursor clear and leave a cursor drawn where it
         // no longer is.
@@ -2282,15 +2311,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         endBracketWithoutPublishing()
     }
 
-    /// Put the surface back as an unpublished bracket found it.
-    ///
-    /// Three exits need this, not one: `abortFlush`, and commitFlush's two
-    /// deferred returns for an atlas transaction that could not close. Those
-    /// two used to reset a subset — leaving `pendingSurfaceLayers`, the layers'
-    /// staged dirty marks, and (before begin took them) the pending cursor
-    /// owner and `flushHadLayerWork` — and the caller does not call
-    /// `abortFlush` for them either (`ZonvieCore`'s `!mainCommitted` branch
-    /// cancels the external views and retries the core, nothing more).
+    /// Put the surface back as an unpublished bracket found it. Reached only
+    /// through `abortFlush`, which is also how `ZonvieCore` ends a bracket
+    /// whose atlas transaction could not close.
     private func endBracketWithoutPublishing() {
         if mainWritePrepared {
             // The scratch set may contain any prefix of this flush. It cannot
@@ -2691,6 +2714,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // only readable under this renderer's lock, so the subtraction itself
         // has to happen there.
         var debtAnchorRowsUp: Int32? = nil
+        // The grid those rows were counted on, which can change from frame to
+        // frame for an editor-anchored float (see floatDebtBaselineFollowing).
+        var debtAnchorGridId: Int64 = 0
     }
 
     /// - Parameters:
@@ -2719,11 +2745,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         scrollOffsetData.removeAll(keepingCapacity: true)
         scrollOffsetData.reserveCapacity(offsets.count)
         scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
+        scrollDebtAnchorGridId.removeAll(keepingCapacity: true)
         scrollDebtCellHeightNDC = cellHeightNDC
         scrollOffsetViewportHeight = drawableHeight
         for info in offsets {
             if let anchorRowsUp = info.debtAnchorRowsUp {
                 scrollDebtAnchorRowsUp[Int32(clamping: info.gridId)] = anchorRowsUp
+                scrollDebtAnchorGridId[Int32(clamping: info.gridId)] = info.debtAnchorGridId
             }
             scrollOffsetData.append(Self.computeScrollOffset(
                 info: info,
@@ -2867,6 +2895,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             ZonvieCore.appLog("[main_visibility] hidden=\(windowIsHidden) miniaturized=\(view.window?.isMiniaturized ?? false)")
         }
         if windowIsHidden {
+            ZonvieCore.drawTrace("surface=1 gate=hidden")
             // Drain the scroll clears anyway: they are appended from the core
             // thread and drained ONLY inside draw(), so a window left covered
             // for an hour with a background :terminal scrolling would leave an
@@ -2874,6 +2903,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // back. Lock and dictionary work, not GPU work.
             (view as? MetalTerminalView)?.processPendingScrollClears()
             (view as? MetalTerminalView)?.didDrawFrame()
+            // Park the loop, as the external surface does: this path skips the
+            // idle count, and every flush from any surface re-activates it, so
+            // a hidden main woke at vsync until it was shown again. Not while a
+            // synthesized key repeat is armed: its safety tick is the top of
+            // this function. Showing the window repaints it (occlusion and
+            // deminiaturize handlers), which re-activates the loop as needed.
+            if let terminalView = view as? MetalTerminalView, !terminalView.synthRepeatActive {
+                terminalView.deactivateSurfaceDrawLoop()
+            }
             return
         }
 
