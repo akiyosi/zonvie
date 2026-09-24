@@ -87,6 +87,7 @@ pub const zonvie_core_request_quit = core.zonvie_core_request_quit;
 pub const zonvie_core_quit_confirmed = core.zonvie_core_quit_confirmed;
 pub const zonvie_core_send_stdin_data = core.zonvie_core_send_stdin_data;
 pub const zonvie_core_send_command = core.zonvie_core_send_command;
+pub const zonvie_core_drop_paths = core.zonvie_core_drop_paths;
 pub const zonvie_core_request_win_close = core.zonvie_core_request_win_close;
 pub const zonvie_core_set_preedit = core.zonvie_core_set_preedit;
 pub const zonvie_core_clear_preedit = core.zonvie_core_clear_preedit;

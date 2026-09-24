@@ -122,10 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var deferredTabMenu: NSMenu?
 
     private func finalizeTabMenuSetup() {
-        guard let vc = window?.contentViewController as? ViewController else { return }
+        guard window?.contentViewController is ViewController else { return }
 
         guard let tabMenu = deferredTabMenu else { return }
-        tabMenuManager = TabMenuManager(menu: tabMenu, viewController: vc)
+        tabMenuManager = TabMenuManager(menu: tabMenu) { [weak self] in
+            self?.window?.contentViewController as? ViewController
+        }
         deferredTabMenu = nil
     }
 
@@ -318,7 +320,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Track the frontmost session window so single-window-oriented code
         // (and the menu bar's active marking) follows focus across sessions.
         if let win = notification.object as? NSWindow, win.contentViewController is ViewController {
+            let previous = self.window
             self.window = win
+            // App activation reports focus to the key session only, so a
+            // switch between sessions has to hand it over itself: without
+            // this neither nvim saw FocusLost/FocusGained (no checktime).
+            if previous !== win, NSApp.isActive {
+                (previous?.contentViewController as? ViewController)?.core?.setFocus(false)
+                (win.contentViewController as? ViewController)?.core?.setFocus(true)
+            }
+            tabMenuManager?.activeSessionChanged()
         }
     }
 
@@ -463,15 +474,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // tab via `:tab drop`). Multiple files always open as new tabs. Using
         // `:drop`/`:tab drop` (rather than `:edit`/`:tabe`) jumps to a window
         // already showing the file instead of opening a duplicate.
+        // Through the core, not typed keys: `<Esc>:` typed into a terminal
+        // buffer went to the job, and a remapped `:` broke it.
         let useCurrent = pendingFilesToOpen.count == 1
             && ZonvieConfig.shared.server.openMode == "current"
-        let cmd = useCurrent ? "drop" : "tab drop"
-        for filename in pendingFilesToOpen {
-            let escapedPath = escapePathForNeovim(filename)
-            let input = "\u{1b}:\(cmd) \(escapedPath)\r"
-            core.sendInput(input)
-            ZonvieCore.appLog("zonvie: sent :\(cmd) \(escapedPath)")
-        }
+        core.dropPaths(pendingFilesToOpen, tabPerFile: !useCurrent)
 
         pendingFilesToOpen = []
 

@@ -1704,12 +1704,6 @@ pub const Grid = struct {
         self.scrolled_grid_overflow = false;
         self.main_scroll_notify_pending = false;
         self.main_scroll_notify_rows = 0;
-        var scroll_it = self.sub_grids.valueIterator();
-        while (scroll_it.next()) |sg| {
-            sg.scroll_notify_pending = false;
-            sg.scroll_notify_rows = 0;
-            sg.row_scroll_notify_pending = false;
-        }
         self.scroll_touched_count = 0;
 
         // Bump revs so any rev-equality short-circuit (e.g. last_sent_*
@@ -2376,6 +2370,26 @@ pub const Grid = struct {
         return null;
     }
 
+    /// Rows a placed grid covers: its buffer's, or one for a grid with none.
+    fn layerRows(self: *const Grid, grid_id: i64) u32 {
+        return if (self.sub_grids.getPtr(grid_id)) |sg| sg.rows else 1;
+    }
+
+    /// Dirty the band a layer at `p`, `h` rows tall, covers on the surface
+    /// that composites it: grid 1's rows plus content_rev (which gates the
+    /// grid-1 rebuild), or the external root's own rows. Returns whether
+    /// grid 1 was touched.
+    fn dirtyLayerBand(self: *Grid, p: GridPos, h: u32) bool {
+        if (self.surfaceForGrid(p.anchor_grid) == 1) {
+            self.markDirtyRect(p.row, p.row +| h);
+            self.content_rev +%= 1;
+            return true;
+        }
+        var r: u32 = 0;
+        while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
+        return false;
+    }
+
     /// Dirty the owning root's old pixel coverage, not an intermediate float
     /// or an unrelated main-surface row. Grid-local contents remain separate.
     fn dirtyCompositedRow(self: *Grid, p: GridPos, row: u32) void {
@@ -3010,11 +3024,11 @@ pub const Grid = struct {
             if (old_pos.row == row and old_pos.col == col and !was_float) return;
         }
 
-        // First dirty the old range (position changed, so exposed area needs recomposition)
-        if (old_pos_opt) |old_pos| {
-            const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-            self.markDirtyRect(old_pos.row, old_pos.row +| h_old);
-        }
+        // First dirty the old range (position changed, so exposed area needs
+        // recomposition) -- on the surface it was on: a float leaving an
+        // external window left its pixels there, not on grid 1.
+        const h = self.layerRows(grid_id);
+        if (old_pos_opt) |old_pos| _ = self.dirtyLayerBand(old_pos, h);
 
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
@@ -3023,8 +3037,7 @@ pub const Grid = struct {
         }
 
         // Dirty the new range
-        const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-        self.markDirtyRect(row, row +| h_new);
+        self.markDirtyRect(row, row +| h);
 
         // Bump content_rev so the next flush's need_main is true and actually
         // recomposes the window at its new position. markDirtyRect alone is
@@ -3144,33 +3157,17 @@ pub const Grid = struct {
         self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
 
-        // Mark old position dirty if this float is moving
-        var affects_main = false;
         // Sticky "buffer-tracking" flag: a float that is repositioned to a new
         // row after creation (e.g. to track a buffer line as the window scrolls)
         // may pixel-follow smooth scroll. A truly fixed float never changes row
         // and so must not pixel-shift. Only set on an actual reposition (old_pos
         // exists), never on the initial placement.
-        const old_pos_opt = self.win_pos.get(grid_id);
-        if (old_pos_opt) |old_pos| {
-            const h_old: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-            // Affects the main composite unless anchored to an external grid
-            // (those float over a separate top-level window, not the main grid).
-            if (self.surfaceForGrid(old_pos.anchor_grid) == 1) {
-                self.markDirtyRect(old_pos.row, old_pos.row +| h_old);
-                affects_main = true;
-            } else {
-                // Dirty the OLD coverage on the anchor's own sub_grid — a
-                // move/hide-then-show with no accompanying cell change would
-                // otherwise leave the vacated overlay area on that external
-                // window showing stale float pixels forever (only cell
-                // updates dirty the anchor today, via dirtyCompositedRow).
-                var r: u32 = 0;
-                while (r < h_old) : (r += 1) {
-                    self.dirtyCompositedRow(old_pos, r);
-                }
-            }
-        }
+        // Dirty the old coverage and the new one, each on the surface that
+        // composites it. A move/hide-then-show with no cell change would
+        // otherwise leave the vacated area stale -- on an external window
+        // forever, since only cell updates dirty the anchor there.
+        const h = self.layerRows(grid_id);
+        if (self.win_pos.get(grid_id)) |old_pos| _ = self.dirtyLayerBand(old_pos, h);
 
         const new_pos = prospective_pos;
         if (win_pos_is_new) {
@@ -3178,30 +3175,7 @@ pub const Grid = struct {
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
-
-        // Mark new position dirty so row-mode recomposes with float overlay.
-        // Covers editor-anchored (anchor_grid==1) and window-anchored floats
-        // (e.g. bufpos, anchor_grid>1) alike — both are composited into the main
-        // grid, so creating/moving them must trigger a recompose.
-        const h_new: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-        if (self.surfaceForGrid(anchor_grid) == 1) {
-            self.markDirtyRect(row, row +| h_new);
-            affects_main = true;
-        } else {
-            // Same reasoning as the old-position branch above, for the NEW
-            // coverage on an external anchor.
-            var r: u32 = 0;
-            while (r < h_new) : (r += 1) {
-                self.dirtyCompositedRow(new_pos, r);
-            }
-        }
-
-        // Bump content_rev so the next flush's need_main is true and actually
-        // recomposes the float overlay at its new position. markDirtyRect alone
-        // is insufficient: need_main gates the whole main rebuild on content_rev,
-        // so a win_float_pos arriving without any accompanying content change
-        // would otherwise leave the float composited at its stale row.
-        if (affects_main) self.content_rev +%= 1;
+        _ = self.dirtyLayerBand(new_pos, h);
 
         // Preserve existing order if present.
         const new_layer = WinLayer{
@@ -3234,27 +3208,7 @@ pub const Grid = struct {
         // (e.g., window separators that were previously overlaid).
         // Only bump content_rev when win_pos existed (grid was composited);
         // external-only grids don't affect global grid composition.
-        if (self.win_pos.get(grid_id)) |pos| {
-            if (self.surfaceForGrid(pos.anchor_grid) != 1) {
-                // Float anchored to an external grid: it composites into
-                // that grid's own window, not the main grid (same reasoning
-                // as dirtyCompositedRow/setWinFloatPos). Dirtying the main
-                // grid here would rebuild it spuriously at the wrong rows
-                // while leaving the anchor's real overlay stale.
-                const h: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-                var r: u32 = 0;
-                while (r < h) : (r += 1) {
-                    self.dirtyCompositedRow(pos, r);
-                }
-            } else {
-                if (self.sub_grids.get(grid_id)) |sg| {
-                    self.markDirtyRect(pos.row, pos.row +| sg.rows);
-                } else {
-                    self.markAllDirty();
-                }
-                self.content_rev +%= 1;
-            }
-        }
+        if (self.win_pos.get(grid_id)) |pos| _ = self.dirtyLayerBand(pos, self.layerRows(grid_id));
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
@@ -3311,12 +3265,7 @@ pub const Grid = struct {
         if (self.win_pos.get(grid_id)) |pos| {
             start_row = saturatingI32FromU32(pos.row);
             start_col = saturatingI32FromU32(pos.col);
-            if (self.sub_grids.get(grid_id)) |sg| {
-                self.markDirtyRect(pos.row, pos.row +| sg.rows);
-            } else {
-                self.markAllDirty();
-            }
-            self.content_rev +%= 1;
+            _ = self.dirtyLayerBand(pos, self.layerRows(grid_id));
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)
@@ -5234,6 +5183,32 @@ test "destroying an external grid owes the main viewport no repaint" {
     grid.main_buf.dirty_all = false;
     try grid.destroyGrid(3);
     try std.testing.expect(!grid.main_buf.dirty_all);
+}
+
+test "a float in an external window turned split dirties that window's band, not grid 1" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    // External window 3 (never placed, origin row 0) hosting float 4 on rows 2..4.
+    try grid.resizeGrid(3, 10, 40);
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    try grid.resizeGrid(4, 3, 10);
+    try grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
+
+    grid.main_buf.dirty_all = false;
+    grid.main_buf.dirty_rows.unsetAll();
+    const ext = grid.sub_grids.getPtr(3).?;
+    ext.dirty_all = false;
+    ext.dirty_rows.unsetAll();
+
+    // `:wincmd J` on the float: Neovim sends win_pos for it with no close.
+    try grid.setWinPos(4, 44, 12, 0);
+
+    // The pixels it left are on window 3, rows 2..4.
+    try std.testing.expect(ext.isRowDirty(2));
+    try std.testing.expect(ext.isRowDirty(4));
+    // Grid 1's rows 2..4 never held it.
+    try std.testing.expect(!grid.main_buf.isRowDirty(2));
 }
 
 test "typing in a main-surface split leaves the root rows alone" {

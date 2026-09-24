@@ -822,27 +822,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
     }
 
     // --- Scrollbar ---
-    private lazy var verticalScroller: NSScroller = {
-        let scroller = NSScroller()
-        scroller.scrollerStyle = .legacy
-        scroller.controlSize = .regular
-        scroller.knobProportion = 0.2
-        scroller.isEnabled = true
-        scroller.alphaValue = 0.0
-        scroller.target = self
-        scroller.action = #selector(scrollerDidScroll(_:))
-        return scroller
-    }()
-    // Created on first use, never from deinit: forming `[weak self]` while
-    // self is deallocating traps.
-    private var createdScrollbarController: SurfaceScrollbarController?
-    private var scrollbarController: SurfaceScrollbarController {
-        if let controller = createdScrollbarController { return controller }
-        let controller = SurfaceScrollbarController(
-            scroller: verticalScroller, surfaceId: gridId, core: { [weak self] in self?.mainTerminalView?.core })
-        createdScrollbarController = controller
-        return controller
-    }
+    override var scrollbarSurfaceId: Int64 { gridId }
+    override var scrollbarCore: ZonvieCore? { mainTerminalView?.core }
     private var scrollbarTrackingArea: NSTrackingArea?
     private var urlTrackingArea: NSTrackingArea?
     private var lastUrlCursorIsHand = false
@@ -1026,9 +1007,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
 
     deinit {
         ZonvieCore.appLog("[ExternalGridView] deinit: gridId=\(gridId)")
-
-        // Invalidate scrollbar hide timer to break its run-loop retain.
-        createdScrollbarController?.invalidate()
 
         // viewDidMoveToWindow(nil) normally removes this on teardown, since
         // every current close path clears contentView first. Dropping it here
@@ -4528,18 +4506,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
 
     // MARK: - Scroll Event Handling
 
-    /// The grid a trackpad gesture claimed at its start, held through momentum.
-    private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
+    private var scrollTargetLock = ScrollTargetLock()
 
     override func scrollWheel(with event: NSEvent) {
         guard let main = mainTerminalView else { return }
         main.noteScrollGesturePhase(event)
-
-        // A gesture's .began carries no delta, so it is dropped by the check
-        // below before the lock is consulted. Retire the previous gesture's
-        // target here or the first .changed event finds a stale lock and the
-        // whole new gesture drives the grid the last one did.
-        if event.phase.contains(.began) { lockedScrollTarget = nil }
+        scrollTargetLock.noteBegan(event)
 
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
@@ -4552,20 +4524,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
         let pointPx = CGPoint(x: location.x * scale,
                               y: bounds.height * scale - location.y * scale)
 
-        // Resolve which grid this scroll drives. A trackpad gesture resolves
-        // once at its start and keeps that target through its momentum, so a
-        // pointer drifting across a float's edge mid-gesture cannot hand the
-        // rest of the scroll to another grid; a wheel resolves per event.
-        let target: (gridId: Int64, row: Int32, col: Int32)
-        let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
-        if event.hasPreciseScrollingDeltas && isGesture {
-            if lockedScrollTarget == nil {
-                lockedScrollTarget = resolveInputTarget(pointPx: pointPx, requireScrollable: true)
-            }
-            target = lockedScrollTarget ?? resolveInputTarget(pointPx: pointPx, requireScrollable: true)
-        } else {
-            lockedScrollTarget = nil
-            target = resolveInputTarget(pointPx: pointPx, requireScrollable: true)
+        let target = scrollTargetLock.target(for: event) {
+            resolveInputTarget(pointPx: pointPx, requireScrollable: $0)
         }
 
         let modifier = main.buildModifierString(from: event.modifierFlags)
@@ -4602,13 +4562,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
             deltaX: deltaX, deltaY: deltaY, scale: scale,
             hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
 
-        // Release the lock once the gesture and its inertia are done. The
-        // gesture's own .ended is not released here so momentum keeps the same
-        // target; a fresh gesture re-locks on its .began.
-        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
-            || event.phase.contains(.cancelled) {
-            lockedScrollTarget = nil
-        }
+        scrollTargetLock.noteFinished(event)
     }
 
 }
@@ -4791,32 +4745,13 @@ extension ExternalGridView {
     private func layoutScrollbar() {
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
         guard scrollbarConfig.enabled && !isDecoratedSurface else { return }
-
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        verticalScroller.frame = NSRect(
-            x: bounds.width - scrollerWidth,
-            y: 0,
-            width: scrollerWidth,
-            height: bounds.height
-        )
+        layoutScrollbarFrame()
     }
 
     /// Move the knob after a drawn frame (shared controller).
     func updateScrollbarIfNeeded() {
         guard !isDecoratedSurface else { return }
         scrollbarController.update()
-    }
-
-    private func showScrollbar() {
-        scrollbarController.show()
-    }
-
-    private func hideScrollbar() {
-        scrollbarController.hide()
-    }
-
-    @objc private func scrollerDidScroll(_ sender: NSScroller) {
-        scrollbarController.scrollerDidScroll(sender)
     }
 
     private func setupScrollbarHoverTracking() {
@@ -4956,11 +4891,10 @@ extension ExternalGridView {
 
         // Dropping on the command line means "put this path here", regardless
         // of what mode the editor thinks it is in.
-        let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
         if dropInsertsPath {
-            core.sendInput(paths)
+            core.sendInput(urls.map { escapePathForNeovim($0.path) }.joined(separator: " "))
         } else {
-            core.sendCommand("drop \(paths)")
+            core.dropPaths(urls.map { $0.path }, tabPerFile: false)
         }
         return true
     }

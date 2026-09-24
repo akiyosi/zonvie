@@ -112,18 +112,19 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
     const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
     if (file_count == 0) return;
 
-    // Build a single command buffer: "drop path1 path2 ..."
-    // or just "path1 path2 ..." for cmdline insertion.
+    // Cmdline insertion types "path1 path2 ..." escaped here. Opening goes
+    // through the core with the paths as they are: the server escapes them
+    // with its own fnameescape (this table missed `*`, and a `\` in a
+    // Windows path is a separator to a Windows server, not an escape).
     var cmd_buf: [32768]u8 = undefined;
     var pos: usize = 0;
+    var open_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (open_paths.items) |p| app.alloc.free(p);
+        open_paths.deinit(app.alloc);
+    }
 
     const is_cmdline = dropInsertsPath(app, force_cmdline);
-
-    if (!is_cmdline) {
-        const prefix = "drop ";
-        @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
-        pos += prefix.len;
-    }
 
     var i: c.UINT = 0;
     while (i < file_count) : (i += 1) {
@@ -156,8 +157,17 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
         const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
         const utf8_path = utf8_dest[0..utf8_len];
 
+        if (!is_cmdline) {
+            const owned = app.alloc.dupe(u8, utf8_path) catch continue;
+            open_paths.append(app.alloc, owned) catch {
+                app.alloc.free(owned);
+                continue;
+            };
+            continue;
+        }
+
         // Add space separator between paths
-        if (i > 0 or (!is_cmdline and pos > 5)) {
+        if (pos > 0) {
             if (pos < cmd_buf.len) {
                 cmd_buf[pos] = ' ';
                 pos += 1;
@@ -179,14 +189,23 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
         }
     }
 
-    if (pos == 0) return;
-    if (is_cmdline) {
-        // Insert paths at the cursor position.
-        app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
-    } else {
-        // Normal/insert/visual mode: execute :drop immediately.
-        app_mod.zonvie_core_send_command(corep, &cmd_buf, pos);
+    if (!is_cmdline) {
+        // Normal/insert/visual mode: `:drop` them all.
+        if (open_paths.items.len == 0) return;
+        const ptrs = app.alloc.alloc([*]const u8, open_paths.items.len) catch return;
+        defer app.alloc.free(ptrs);
+        const lens = app.alloc.alloc(usize, open_paths.items.len) catch return;
+        defer app.alloc.free(lens);
+        for (open_paths.items, 0..) |p, k| {
+            ptrs[k] = p.ptr;
+            lens[k] = p.len;
+        }
+        app_mod.zonvie_core_drop_paths(corep, ptrs.ptr, lens.ptr, open_paths.items.len, 0);
+        return;
     }
+    if (pos == 0) return;
+    // Insert paths at the cursor position.
+    app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
 }
 
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
@@ -2227,6 +2246,12 @@ pub export fn WndProc(
                 var gpu_ptr: ?*d3d11.Renderer = null;
                 if (app.atlas) |*a| atlas_ptr = a;
                 if (app.renderer) |*g| gpu_ptr = g;
+                // Pulled every paint, as the external driver does: a push from
+                // default_colors_set missed a renderer created later (deferred
+                // init, device-lost recovery), which then cleared black.
+                if (gpu_ptr) |g| {
+                    if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
+                }
                 var atlas_recreate_needed = false;
                 var atlas_recreate_w: u32 = 0;
                 var atlas_recreate_h: u32 = 0;
@@ -6204,10 +6229,14 @@ pub export fn WndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                // Handle tabline/sidebar drag or hover (when ext_tabline enabled)
+                // Handle tabline/sidebar drag or hover (when ext_tabline enabled).
+                // An editor drag keeps going over the chrome, as its release
+                // does (press_reached_editor): the chrome neither consumes the
+                // move nor lights a hover under it.
+                const editor_drag = app.mouse_button_held != 0 and app.mouse_press_grid_id != 0;
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
-                        if (app.tabline_state.dragging_tab != null or y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                        if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
                             tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
                             if (app.tabline_state.dragging_tab != null) return 0;
                         } else {
@@ -6238,7 +6267,7 @@ pub export fn WndProc(
                         else
                             x < @as(i16, @intCast(sb_w3));
 
-                        if (app.tabline_state.dragging_tab != null or in_sb3) {
+                        if (app.tabline_state.dragging_tab != null or (!editor_drag and in_sb3)) {
                             tabline_mod.handleSidebarMouseMove(app, hwnd, @as(c_int, x), @as(c_int, y));
                             // Consume event: sidebar area is UI, not Neovim editor input
                             return 0;

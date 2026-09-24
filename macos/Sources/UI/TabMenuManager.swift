@@ -4,20 +4,25 @@ import AppKit
 /// Observes tabline notifications and updates menu items dynamically.
 final class TabMenuManager {
     private let menu: NSMenu
-    private weak var viewController: ViewController?
+    /// The key session's view controller. Every session posts tabline
+    /// notifications; the menu shows and drives the one in front.
+    private let activeViewController: () -> ViewController?
+    private var viewController: ViewController? { activeViewController() }
 
     private var tablineUpdateObserver: Any?
     private var tablineHideObserver: Any?
 
     private var currentTabs: [(handle: Int64, name: String)] = []
     private var currentTabHandle: Int64 = 0
+    /// Last tabline each session sent, so a session switch can redraw the menu.
+    private var tablinesByCore: [ObjectIdentifier: (tabs: [(handle: Int64, name: String)], current: Int64)] = [:]
 
     // Fixed menu item count before dynamic tab list (New Tab, Close Tab, separator)
     private let fixedItemCount = 3
 
-    init(menu: NSMenu, viewController: ViewController) {
+    init(menu: NSMenu, activeViewController: @escaping () -> ViewController?) {
         self.menu = menu
-        self.viewController = viewController
+        self.activeViewController = activeViewController
 
         // Build initial fixed items
         let newTabItem = NSMenuItem(title: "New Tab", action: #selector(handleNewTab(_:)), keyEquivalent: "t")
@@ -37,20 +42,38 @@ final class TabMenuManager {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.TablineUpdateInfo else {
-                ZonvieCore.appLog("[Tabline] WARNING: menu notification object cast failed: \(String(describing: notification.object))")
+            guard let self, let sender = notification.object as? ZonvieCore,
+                  let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.TablineUpdateInfo else {
+                ZonvieCore.appLog("[Tabline] WARNING: menu notification payload cast failed: \(String(describing: notification.userInfo))")
                 return
             }
-            self?.updateMenu(tabs: info.tabs, currentTab: info.currentTab)
+            self.tablinesByCore[ObjectIdentifier(sender)] = (info.tabs, info.currentTab)
+            if sender === self.viewController?.core {
+                self.updateMenu(tabs: info.tabs, currentTab: info.currentTab)
+            }
         }
 
         tablineHideObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineHideNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
-            self?.clearTabItems()
+        ) { [weak self] notification in
+            guard let self, let sender = notification.object as? ZonvieCore else { return }
+            self.tablinesByCore.removeValue(forKey: ObjectIdentifier(sender))
+            if sender === self.viewController?.core {
+                self.clearTabItems()
+            }
         }
+    }
+
+    /// The key session changed: show its tabs.
+    func activeSessionChanged() {
+        guard let core = viewController?.core,
+              let tabline = tablinesByCore[ObjectIdentifier(core)] else {
+            clearTabItems()
+            return
+        }
+        updateMenu(tabs: tabline.tabs, currentTab: tabline.current)
     }
 
     deinit {

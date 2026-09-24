@@ -58,9 +58,10 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
     ext_win.msg_hover = hovered;
 }
 
-/// Client-pixel padding a decorated external surface adds around its grid:
-/// the cmdline's icon strip and padding, a message surface's padding, and the
-/// copy-content button's trailing reservation.
+/// Client-pixel padding an external surface adds around its grid: the
+/// cmdline's icon strip and padding, a message surface's padding, the
+/// copy-content button's trailing reservation, and a normal window's
+/// "always" scrollbar strip.
 ///
 /// Every site that sizes an external window must go through this. The two
 /// resize paths in callbacks.zig used to re-derive the first two terms and
@@ -77,9 +78,17 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
         app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
     const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
     const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
+    // WM_SIZE reads a normal window's columns back through
+    // effectiveContentWidthAt, which takes the "always" scrollbar strip off;
+    // sizing without it lost columns under the strip and shrank the grid on
+    // the next user resize.
+    const scrollbar_strip: c_int = if (kind == .normal and app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+        @intFromFloat(app_mod.scrollbarReservedWidth(app.dpi_scale))
+    else
+        0;
 
     return .{
-        .w = cmdline_icon_w + cmdline_padding + msg_padding + copyButtonReservedPx(app, kind),
+        .w = cmdline_icon_w + cmdline_padding + msg_padding + scrollbar_strip + copyButtonReservedPx(app, kind),
         .h = cmdline_padding + msg_padding,
     };
 }
@@ -1950,8 +1959,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
-    // Set last_cursor_grid to this grid
-    app.last_cursor_grid = req.grid_id;
+    // Only a window the cursor enters, as on macOS: a popupmenu or message
+    // window gets no cursor report to correct it, so recording it named a
+    // grid the cursor never moved to (the blink gate and msg_pos asked it).
+    const cursor_may_enter = !is_special_window or is_cmdline;
+    if (cursor_may_enter) app.last_cursor_grid = req.grid_id;
 
     // Set App pointer as user data for WndProc access
     app_mod.setApp(hwnd.?, app);
@@ -2024,8 +2036,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
-    // Activate this external window
-    _ = c.SetForegroundWindow(hwnd);
+    // Activate a window the cursor enters. A popupmenu or message window is
+    // shown SW_SHOWNA; taking the foreground took it from the window the
+    // cursor is in, with no cursor report to give it back.
+    if (cursor_may_enter) _ = c.SetForegroundWindow(hwnd);
     return .published;
 }
 
@@ -3413,6 +3427,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     };
     const tbs_committed = &ext_win.tbs.sets[tbs_snapshot.committed_index];
     const tbs_cursor = &ext_win.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
+    // For the blink timer, on every kind: the normal row path re-records it
+    // below, but a decorated surface kept the initial `true` and repainted
+    // on every blink tick with no cursor to toggle.
+    ext_win.has_committed_cursor = tbs_cursor.verts.items.len > 0;
     // Shared font/cell/linespace metrics are protected by app.mu. Pair the
     // snapshot with the generation stored alongside the committed row
     // vertices so an old vertex set is never drawn using new scissor/row

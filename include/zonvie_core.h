@@ -1353,6 +1353,16 @@ ZONVIE_API void zonvie_core_set_option_value(
    len: length of command string */
 ZONVIE_API void zonvie_core_send_command(zonvie_core *core, const unsigned char *cmd, size_t len);
 
+/* Open files: `:drop` with every path in one command, or with tab_per_file
+   one `:tab drop` per path. `paths[i]` is `lens[i]` bytes of UTF-8, not
+   escaped: the server escapes each with its own fnameescape(), so the rules
+   are the server OS's (a remote or Windows nvim included). */
+ZONVIE_API void zonvie_core_drop_paths(zonvie_core *core,
+                                       const unsigned char *const *paths,
+                                       const size_t *lens,
+                                       size_t count,
+                                       int tab_per_file);
+
 /* Ask Neovim to close the window shown in grid_id, as a user closing an
    external OS window does (nvim_win_close under pcall, so a window that is
    already gone or is the last one raises nothing). The OS window itself is
@@ -1785,6 +1795,11 @@ ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value)
    The reporter is installed on macOS only; elsewhere this returns Neovim's
    default (3) and should not be relied on. */
 ZONVIE_API uint32_t zonvie_core_get_mousescroll_ver(zonvie_core *core);
+
+/* Columns one horizontal wheel event scrolls: the 'hor' component of
+   'mousescroll', from the same reporter (macOS only; elsewhere Neovim's
+   default, 6). 'hor:0' reports 0, as does a null core. */
+ZONVIE_API uint32_t zonvie_core_get_mousescroll_hor(zonvie_core *core);
 
 /* Check if cursor is visible.
    Returns false during busy_start, true after busy_stop. */

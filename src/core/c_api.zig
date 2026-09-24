@@ -1361,6 +1361,23 @@ pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: 
     box.core.requestCommand(cmd[0..len]) catch {};
 }
 
+/// Open `count` UTF-8 paths with `:drop` (all in one command) or, with
+/// `tab_per_file`, one `:tab drop` each. Escaped server-side by fnameescape.
+pub export fn zonvie_core_drop_paths(
+    p: ?*zonvie_core,
+    paths: [*]const [*]const u8,
+    lens: [*]const usize,
+    count: usize,
+    tab_per_file: c_int,
+) callconv(.c) void {
+    if (p == null or count == 0) return;
+    const box = asBox(p.?);
+    const slices = box.core.alloc.alloc([]const u8, count) catch return;
+    defer box.core.alloc.free(slices);
+    for (slices, 0..) |*s, i| s.* = paths[i][0..lens[i]];
+    box.core.requestDropPaths(slices, tab_per_file != 0) catch {};
+}
+
 /// Set/update IME preedit (composition) text.
 /// target_start/target_end are UTF-8 byte offsets into `text` marking the
 /// clause being converted (highlighted distinctly); pass target_start >=
@@ -2140,6 +2157,14 @@ pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32
     if (p == null) return 0;
     const box = asBox(p.?);
     return box.core.mousescroll_ver.load(.acquire);
+}
+
+/// Columns one horizontal wheel event scrolls: the 'hor' component of
+/// 'mousescroll', from the same reporter. Lock-free atomic read.
+pub export fn zonvie_core_get_mousescroll_hor(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.mousescroll_hor.load(.acquire);
 }
 
 /// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).
