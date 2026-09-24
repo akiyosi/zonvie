@@ -1499,6 +1499,100 @@ fn shapeClustersValid(clusters: []const u32, glyph_count: usize, scalar_count: u
     return true;
 }
 
+/// One grid's rows as a row pass reads them. The root grid and every other
+/// grid composed, generated, charged and sent each row through two copies of
+/// the same steps; the helpers below are the one copy. What differs between the
+/// two passes stays with each caller: which rows are owed, the atlas-reset
+/// policy (the root retries once, the rest cancel), and the per-step timing
+/// the root reports.
+const GridRowSource = struct {
+    grid_id: i64,
+    buf: *grid_mod.GridBuf,
+    /// The rows the frontend is told the grid has.
+    rows: u32,
+    cols: u32,
+    margins: grid_mod.ViewportMargins,
+    is_cmdline: bool,
+    /// See RowGenParams.skip_default_bg.
+    skip_default_bg: bool,
+};
+
+const RowComposeTables = struct {
+    hl_cache: []highlight.ResolvedAttrWithStyles,
+    hl_valid: []bool,
+    glow_enabled: bool,
+    glow_all: bool,
+    glow_hl_ids: ?*std.AutoHashMap(u32, void),
+};
+
+/// Compose `row` of `src` into core.row_cells, viewport margin flags included.
+/// core.row_cells must already hold `src.cols` cells.
+inline fn composeGridRow(
+    core: *Core,
+    src: GridRowSource,
+    row: u32,
+    tables: RowComposeTables,
+    hl_hits: *u32,
+    hl_misses: *u32,
+) void {
+    setViewportRowDecoFlags(core.row_cells.deco_base_flags.items[0..src.cols], row, src.rows, src.cols, src.margins);
+    composeRowRuns(
+        core,
+        &core.row_cells,
+        src.buf.cells,
+        src.grid_id,
+        @as(usize, row) * @as(usize, src.cols),
+        src.cols,
+        tables.hl_cache,
+        tables.hl_valid,
+        @intCast(tables.hl_valid.len),
+        tables.glow_enabled,
+        tables.glow_all,
+        tables.glow_hl_ids,
+        true,
+        hl_hits,
+        hl_misses,
+    );
+}
+
+/// Generate the vertices of the row composeGridRow left in core.row_cells.
+fn generateGridRow(
+    core: *Core,
+    src: GridRowSource,
+    row: u32,
+    glow_enabled: bool,
+    out: *std.ArrayListUnmanaged(c_api.Vertex),
+) !RowGenStats {
+    return generateRowVertices(core, .{
+        .row = row,
+        .cols = src.cols,
+        .cell_w = @floatFromInt(core.cell_w_px),
+        .cell_h = @floatFromInt(core.cell_h_px),
+        .top_pad = @floatFromInt(rowTopPadPx(core.linespace_px)),
+        .default_bg = core.hl.default_bg,
+        .blur_enabled = core.blur_enabled,
+        .background_opacity = core.background_opacity,
+        .is_cmdline = src.is_cmdline,
+        .glow_enabled = glow_enabled,
+        .skip_default_bg = src.skip_default_bg,
+    }, out);
+}
+
+/// Charge a generated row to its surface's vertex ledger and mirror its glyph
+/// UVs for atlas reclamation, before the frontend sees it.
+fn chargeGridRow(core: *Core, src: GridRowSource, row: u32, verts: []const c_api.Vertex) !void {
+    try replaceGridSurfaceRowVertexCount(core, src.grid_id, src.buf, row, verts.len);
+    core.recordGlyphMirrorRow(src.grid_id, row, src.rows, verts);
+}
+
+/// Send a charged row as the grid's main content (ZONVIE_VERT_UPDATE_MAIN).
+/// The pointer is never NULL, even for an empty row: NULL with row_count 0 is
+/// the layout-only signal, and the Windows root path unwraps it.
+fn sendGridRow(core: *Core, row_cb: anytype, src: GridRowSource, row: u32, verts: []const c_api.Vertex) void {
+    traceRender(core, "event=row_send grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ src.grid_id, row, verts.len, src.rows, src.cols });
+    row_cb(core.ctx, src.grid_id, row, 1, verts.ptr, verts.len, c_api.VERT_UPDATE_MAIN, src.rows, src.cols);
+}
+
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
@@ -3703,7 +3797,6 @@ pub const FlushCtx = struct {
                     // (sized by the hl_cache_size config).
                     const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
                     const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
-                    const hl_cache_limit: u32 = @intCast(hl_valid.len);
                     @memset(hl_valid, false);
                     // The glyph cache is persistent across flushes and reset only
                     // on font change (onGuifont). Do NOT call
@@ -3713,6 +3806,33 @@ pub const FlushCtx = struct {
 
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
+                    const main_src = GridRowSource{
+                        .grid_id = 1,
+                        .buf = ctx.core.grid.bufFor(1).?,
+                        .rows = rows,
+                        .cols = cols,
+                        .margins = main_margins,
+                        .is_cmdline = false,
+                        // The root grid is a container once its windows draw as
+                        // layers: every layer paints the same default
+                        // background, and a second premultiplied `over`
+                        // compounds alpha (0.5 -> 0.75 -> 0.875), which stopped
+                        // the Windows main window being translucent enough for
+                        // blur to show. BLUR ONLY: without blur the frontends
+                        // force backgrounds opaque and apply window opacity at
+                        // the layer level, so nothing compounds and dropping the
+                        // run only thins the surface and leaves the gaps between
+                        // layers unpainted. Settled once this flush, before any
+                        // row, by regenerateRootsWhoseDefaultBgRuleFlipped.
+                        .skip_default_bg = ctx.core.grid.main_buf.skip_default_bg_last,
+                    };
+                    const main_tables = RowComposeTables{
+                        .hl_cache = hl_cache,
+                        .hl_valid = hl_valid,
+                        .glow_enabled = glow_enabled,
+                        .glow_all = glow_all,
+                        .glow_hl_ids = glow_hl_ids,
+                    };
 
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
@@ -3793,34 +3913,7 @@ pub const FlushCtx = struct {
                                 t_row_compose_start = clock.nowNs();
                             }
 
-                            // SIMD-optimized: batch consecutive cells with the same hl_id.
-                            {
-                                const row_start: usize = @as(usize, r) * @as(usize, cols);
-                                setViewportRowDecoFlags(
-                                    row_cells.deco_base_flags.items[0..cols],
-                                    r,
-                                    rows,
-                                    cols,
-                                    main_margins,
-                                );
-                                composeRowRuns(
-                                    ctx.core,
-                                    row_cells,
-                                    ctx.core.grid.main_buf.cells,
-                                    1,
-                                    row_start,
-                                    cols,
-                                    hl_cache,
-                                    hl_valid,
-                                    hl_cache_limit,
-                                    glow_enabled,
-                                    glow_all,
-                                    glow_hl_ids,
-                                    true,
-                                    &perf_hl_cache_hits,
-                                    &perf_hl_cache_misses,
-                                );
-                            }
+                            composeGridRow(ctx.core, main_src, r, main_tables, &perf_hl_cache_hits, &perf_hl_cache_misses);
 
                             var t_row_compose_end: i128 = 0;
                             var t_row_gen_start: i128 = 0;
@@ -3836,32 +3929,7 @@ pub const FlushCtx = struct {
                             // write-set, with this row missing, from committing as
                             // a successful frame. flush_aborted is what makes both
                             // frontends cancel the bracket instead.
-                            const row_gen_stats = generateRowVertices(ctx.core, .{
-                                .row = r,
-                                .cols = cols,
-                                .cell_w = cellW,
-                                .cell_h = cellH,
-                                .top_pad = topPad,
-                                .default_bg = ctx.core.hl.default_bg,
-                                .blur_enabled = ctx.core.blur_enabled,
-                                .background_opacity = ctx.core.background_opacity,
-                                .is_cmdline = false,
-                                .glow_enabled = glow_enabled,
-                                // The root grid is a container once its windows
-                                // draw as layers: every layer paints the same
-                                // default background, and a second premultiplied
-                                // `over` compounds alpha (0.5 -> 0.75 -> 0.875),
-                                // which stopped the Windows main window being
-                                // translucent enough for blur to show.
-                                // BLUR ONLY: without blur the frontends force
-                                // backgrounds opaque and apply window opacity at
-                                // the layer level, so nothing compounds and
-                                // dropping the run only thins the surface and
-                                // leaves the gaps between layers unpainted.
-                                // Settled once this flush, before any row, by
-                                // regenerateRootsWhoseDefaultBgRuleFlipped.
-                                .skip_default_bg = ctx.core.grid.main_buf.skip_default_bg_last,
-                            }, out) catch |err| {
+                            const row_gen_stats = generateGridRow(ctx.core, main_src, r, glow_enabled, out) catch |err| {
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
                                 ctx.core.flush_aborted = true;
@@ -3969,10 +4037,7 @@ pub const FlushCtx = struct {
                             // Charge the exact generated row before invoking the
                             // frontend: overflow clusters then count all emitted
                             // glyphs, and blank cells are charged nothing.
-                            try replaceGridSurfaceRowVertexCount(ctx.core, 1, ctx.core.grid.bufFor(1).?, r, out.items.len);
-
-                            // Mirror this row's glyph UVs for atlas reclamation.
-                            ctx.core.recordGlyphMirrorRow(1, r, rows, out.items);
+                            try chargeGridRow(ctx.core, main_src, r, out.items);
 
                             var t_row_before_cb: i128 = 0;
                             if (log_enabled) {
@@ -3980,7 +4045,7 @@ pub const FlushCtx = struct {
                                 t_row_before_cb = t_row_cache_store_end;
                             }
 
-                            row_cb(ctx.core.ctx, 1, r, 1, out.items.ptr, out.items.len, 1, rows, cols); // grid_id=1 (main), flags=1 (ZONVIE_VERT_UPDATE_MAIN)
+                            sendGridRow(ctx.core, row_cb, main_src, r, out.items);
 
                             if (log_enabled) {
                                 const t_row_after_cb = clock.nowNs();
@@ -4257,9 +4322,9 @@ pub const FlushCtx = struct {
             return;
         }
 
-        // Invalidate caches BEFORE emitting the callback: it may trigger vertex
-        // generation (Windows' updateLayoutToCore calls sendExternalGridVertices
-        // when cell dimensions change), which must use fresh cache lookups.
+        // Invalidate caches BEFORE emitting the callback: a frontend may answer
+        // it with a layout update that generates vertices, which must use
+        // fresh cache lookups.
         ctx.core.resetAtlasMaintenanceBackoff();
         ctx.core.resetGlyphCacheFlags();
         ctx.core.resetShapeCache();
@@ -5399,7 +5464,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
 
 
-    const default_bg = self.hl.default_bg;
 
     self.initHlCache() catch {
         self.log.write("[ext_grid] Failed to initialize hl cache\n", .{});
@@ -5518,6 +5582,32 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // inline in row vertices, which is what stops it ghosting across a
             // scroll copy.
 
+            // Viewport dimensions, not sg's, so the frontend's scroll offset
+            // calculation matches the rows emitted here.
+            const ext_src = GridRowSource{
+                .grid_id = grid_id,
+                .buf = sg,
+                .rows = viewport_rows,
+                .cols = viewport_cols,
+                .margins = ext_margins,
+                .is_cmdline = is_cmdline,
+                .skip_default_bg = surface_skips_default_bg,
+            };
+            const ext_tables = RowComposeTables{
+                .hl_cache = cache.hl_cache_buf,
+                .hl_valid = cache.hl_valid_buf,
+                .glow_enabled = ext_glow_enabled,
+                .glow_all = ext_glow_all,
+                .glow_hl_ids = ext_glow_hl_ids,
+            };
+            // Row scratch for this grid, once: its width is the grid's.
+            self.row_cells.clearRetainingCapacity();
+            self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
+                self.flush_aborted = true;
+                break;
+            };
+            self.row_cells.setLen(sg.cols);
+
             ext_retry: while (true) {
                 // Only up to viewport_rows, not sg.rows: rows beyond it are not
                 // drawable, so the frontend must not receive vertices for them.
@@ -5559,81 +5649,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         break :ext_retry;
                     };
 
-                    // Compose RenderCells for this row (resolve hl -> fg/bg/sp/style_flags)
-                    self.row_cells.clearRetainingCapacity();
-                    self.row_cells.ensureTotalCapacity(self.alloc, sg.cols) catch {
+                    composeGridRow(self, ext_src, row, ext_tables, &cache.perf_hl_cache_hits, &cache.perf_hl_cache_misses);
+                    const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
+                        ext_verts.clearRetainingCapacity();
                         ext_had_row_error = true;
                         self.flush_aborted = true;
+                        if (Core.isHardRenderFailure(err)) self.failHardRender(err);
                         break :ext_retry;
-                    };
-                    self.row_cells.setLen(sg.cols);
-
-                    // Resolve the base external-grid row directly into the row
-                    // scratch; clean rows never copy or scan their cells. Same
-                    // run-batched composer the main grid uses — it was written
-                    // against main_buf, so under ext_multigrid the SIMD path ran
-                    // over the empty container and every real window went cell
-                    // by cell.
-                    const row_start: usize = @as(usize, row) * @as(usize, sg.cols);
-                    composeRowRuns(
-                        self,
-                        &self.row_cells,
-                        sg.cells,
-                        grid_id,
-                        row_start,
-                        sg.cols,
-                        cache.hl_cache_buf,
-                        cache.hl_valid_buf,
-                        @intCast(cache.hl_valid_buf.len),
-                        ext_glow_enabled,
-                        ext_glow_all,
-                        ext_glow_hl_ids,
-                        true,
-                        &cache.perf_hl_cache_hits,
-                        &cache.perf_hl_cache_misses,
-                    );
-                    setViewportRowDecoFlags(
-                        self.row_cells.deco_base_flags.items[0..sg.cols],
-                        row,
-                        sg.rows,
-                        sg.cols,
-                        ext_margins,
-                    );
-
-                    const row_gen_stats = row_gen: {
-                        break :row_gen generateRowVertices(self, .{
-                            .row = row,
-                            .cols = sg.cols,
-                            .cell_w = cellW,
-                            .cell_h = cellH,
-                            .top_pad = topPad,
-                            .default_bg = default_bg,
-                            .blur_enabled = self.blur_enabled,
-                            .background_opacity = self.background_opacity,
-                            .is_cmdline = is_cmdline,
-                            .glow_enabled = ext_glow_enabled,
-                            .skip_default_bg = surface_skips_default_bg,
-                        }, ext_verts) catch |err| {
-                            ext_verts.clearRetainingCapacity();
-                            ext_had_row_error = true;
-                            self.flush_aborted = true;
-                            if (Core.isHardRenderFailure(err)) self.failHardRender(err);
-                            break :ext_retry;
-                        };
                     };
                     ext_had_glyph_miss = ext_had_glyph_miss or row_gen_stats.had_glyph_miss;
-                    replaceGridSurfaceRowVertexCount(
-                        self,
-                        grid_id,
-                        sg,
-                        @intCast(row),
-                        ext_verts.items.len,
-                    ) catch |err| {
-                        ext_had_row_error = true;
-                        self.flush_aborted = true;
-                        self.failHardRender(err);
-                        break :ext_retry;
-                    };
                     // An atlas reset during this row leaves the rows already sent with stale UVs.
                     if (self.atlas_reset_during_flush) {
                         ext_saw_atlas_reset = true;
@@ -5650,13 +5674,15 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                         break :ext_retry;
                     }
 
-                    // Pass viewport dimensions, not sg's, so the frontend's
-                    // scroll offset calculation matches the rows emitted here.
-                    const row_ptr = if (ext_verts.items.len == 0) null else ext_verts.items.ptr;
-                    // Mirror this row's glyph UVs for atlas reclamation.
-                    self.recordGlyphMirrorRow(grid_id, row, viewport_rows, ext_verts.items);
-                    traceRender(self, "event=row_send grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ grid_id, row, ext_verts.items.len, viewport_rows, viewport_cols });
-                    row_cb(self.ctx, grid_id, row, 1, row_ptr, ext_verts.items.len, 1, viewport_rows, viewport_cols);
+                    // Charged after the reset check, as the root is: a row the
+                    // cancelled commit discards owes the ledger nothing.
+                    chargeGridRow(self, ext_src, row, ext_verts.items) catch |err| {
+                        ext_had_row_error = true;
+                        self.flush_aborted = true;
+                        self.failHardRender(err);
+                        break :ext_retry;
+                    };
+                    sendGridRow(self, row_cb, ext_src, row, ext_verts.items);
                 }
                 break :ext_retry; // Normal exit from retry loop
             }
