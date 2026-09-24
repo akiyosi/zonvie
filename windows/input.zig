@@ -410,14 +410,20 @@ pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
 /// the way ExternalWndProc has resolved its own since 5e7e9cb. Takes app.mu,
 /// which is what the committed layer list is protected by.
 pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
+    return resolveSurfaceTarget(app, &app.tbs, 1, true, x, y);
+}
+
+/// resolveMainWindowTarget for any surface: `tbs` and `root_grid_id` name the
+/// surface, and `is_main_window` picks its origin (an external window's is 0).
+pub fn resolveSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root_grid_id: i64, is_main_window: bool, x: i32, y: i32) MouseTarget {
     const grids: []const app_mod.GridInfo = if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{};
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
-    const origin = surfaceOriginPx(app, true);
+    const origin = surfaceOriginPx(app, is_main_window);
     return resolveMouseTarget(
-        app.tbs.committed_layers.slice(),
+        tbs.committed_layers.slice(),
         grids,
-        1,
+        root_grid_id,
         x - origin.x,
         y - origin.y,
         app.cell_w_px,
@@ -429,10 +435,14 @@ pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
 /// hit-testing again, so a selection dragged out of a float does not retarget
 /// the moment the pointer leaves it.
 pub fn rebaseMainWindowTarget(app: *App, grid_id: i64, x: i32, y: i32) MouseTarget {
+    return rebaseSurfaceTarget(app, &app.tbs, 1, true, grid_id, x, y);
+}
+
+pub fn rebaseSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root_grid_id: i64, is_main_window: bool, grid_id: i64, x: i32, y: i32) MouseTarget {
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
-    const origin = surfaceOriginPx(app, true);
-    return rebaseToGrid(app.tbs.committed_layers.slice(), 1, grid_id, x - origin.x, y - origin.y);
+    const origin = surfaceOriginPx(app, is_main_window);
+    return rebaseToGrid(tbs.committed_layers.slice(), root_grid_id, grid_id, x - origin.x, y - origin.y);
 }
 
 fn cellAt(content_x: i32, content_y: i32, cell_w: u32, row_h: u32, allow_negative: bool) CellPos {

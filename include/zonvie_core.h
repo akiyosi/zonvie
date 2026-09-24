@@ -1620,6 +1620,18 @@ ZONVIE_API int32_t zonvie_core_popupmenu_top(
     int32_t ref_bottom,
     int32_t screen_top);
 
+/* The top edge of the cmdline completion popup, Y growing downward: `gap`
+   above the cmdline window (cmdline_top - gap - popup_height) when that starts
+   at or below screen_top, else `gap` below it (cmdline_bottom + gap).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API int32_t zonvie_core_cmdline_popupmenu_top(
+    int32_t cmdline_top,
+    int32_t cmdline_bottom,
+    int32_t popup_height,
+    int32_t gap,
+    int32_t screen_top);
+
 /* The grid a surface's scrollbar should show: the cursor's grid when this
    surface composites it, and the surface's own root otherwise. `surface_id` is
    1 for the main window and the grid id of an external window for its own.

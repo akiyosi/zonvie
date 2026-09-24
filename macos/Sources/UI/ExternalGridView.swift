@@ -50,7 +50,7 @@ fileprivate func screenSpaceParameters(
 /// A Metal view for rendering external Neovim grids (from win_external_pos).
 /// Shares the glyph atlas with the main renderer for consistent text rendering.
 /// Forwards key events to the main terminal view so keyboard input still works.
-final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
+final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHost {
     private let mtlDevice: MTLDevice
     private let queue: MTLCommandQueue
 
@@ -101,18 +101,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// window it holds back has just lost focus.
     private static let occlusionSuspectSeconds: CFTimeInterval = 0.1
     private let redrawScheduler = SurfaceRedrawScheduler()
-
-    // --- IME / NSTextInputClient support ---
-    // Shared composition handling: inline-extmark preedit with overlay fallback.
-    private lazy var ime = IMEPreeditController(host: self)
-    private var _inputContext: NSTextInputContext?
-
-    override var inputContext: NSTextInputContext? {
-        if _inputContext == nil {
-            _inputContext = NSTextInputContext(client: self)
-        }
-        return _inputContext
-    }
 
     /// The GPU objects every surface shares, handed in at construction. Before
     /// this, these were copied in one by one and the rest were reached through
@@ -4520,8 +4508,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
     // MARK: - Key Event Handling with IME Support
 
-    override var acceptsFirstResponder: Bool { true }
-
     override func keyDown(with event: NSEvent) {
         // The main view's keyDown: this view's keys reach Neovim through the
         // main view's core and its repeat synthesis; this view supplies itself
@@ -4610,6 +4596,11 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 }
             }
         }
+
+        main.handleHorizontalScrollInput(
+            gridId: target.gridId, row: target.row, col: target.col,
+            deltaX: deltaX, deltaY: deltaY, scale: scale,
+            hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
 
         // Release the lock once the gesture and its inertia are done. The
         // gesture's own .ended is not released here so momentum keeps the same
@@ -4720,51 +4711,9 @@ extension ExternalGridView: IMEPreeditHost {
 }
 
 // MARK: - NSTextInputClient (IME support)
-extension ExternalGridView: NSTextInputClient {
-
-    func insertText(_ string: Any, replacementRange: NSRange) {
-        ime.insertText(string)
-    }
-
-    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        ime.setMarkedText(string, selectedRange: selectedRange)
-    }
-
-    func unmarkText() {
-        ime.unmarkText()
-    }
-
-    func markedRange() -> NSRange { ime.markedRange }
-
-    func selectedRange() -> NSRange { ime.selectedRange }
-
-    func hasMarkedText() -> Bool { ime.hasMarkedText }
-
-    func validAttributesForMarkedText() -> [NSAttributedString.Key] { ime.validAttributes }
-
-    func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        return nil
-    }
-
-    func firstRect(forCharacterRange range: NSRange, actualRange: NSRangePointer?) -> NSRect {
-        return ime.firstRect()
-    }
-
-    func characterIndex(for point: NSPoint) -> Int {
-        return 0
-    }
-
-    /// Unbound key commands from interpretKeyEvents, swallowed as the main
-    /// view swallows them. Without this override NSResponder passes them up
-    /// the chain, which beeps.
-    override func doCommand(by selector: Selector) {}
+extension ExternalGridView {
 
     // MARK: - Scrollbar
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
-    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()

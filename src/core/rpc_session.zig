@@ -720,9 +720,7 @@ fn forceGlowFlush(self: *Core) void {
     self.grid_mu.lockUncancelable(clock.io());
     self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
     self.grid.content_rev +%= 1;
-    self.grid.markAllDirty();
-    var sg_it = self.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| sg.markAllDirty();
+    self.grid.markEverySurfaceDirty();
     self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
@@ -1549,9 +1547,7 @@ fn prepareRenderStateForFlush(ctx: *flush.FlushCtx) !void {
         self.hl.groups_changed = false;
         self.resolveGlowGroups();
         if (self.glow_enabled.load(.acquire)) {
-            self.grid.markAllDirty();
-            var sg_it = self.grid.sub_grids.valueIterator();
-            while (sg_it.next()) |sg| sg.markAllDirty();
+            self.grid.markEverySurfaceDirty();
             self.force_ext_cursor_recheck = true;
         }
     }
