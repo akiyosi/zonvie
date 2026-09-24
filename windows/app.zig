@@ -2395,6 +2395,10 @@ pub const ExternalWindow = struct {
     // Close state - set when window is scheduled for closing (don't paint or access renderer)
     is_pending_close: bool = false,
 
+    /// App.external_session_generation when this window was created. Its
+    /// position is saved on close only while that is still the current one.
+    session_generation: u64 = 0,
+
     // Paint reference count - prevents freeing while paint is in progress
     // DXGI operations can pump Win32 messages, so close could be triggered during paint.
     // This counter ensures ext_win isn't freed until all paint operations complete.
@@ -5292,7 +5296,11 @@ pub const App = struct {
     pending_external_window_position_time: i64 = 0, // Timestamp when position was set (for timeout)
 
     // Saved positions for external windows (restored on tab switch back)
-    saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int }) = .{},
+    saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int, session_generation: u64 }) = .{},
+    /// Bumped on `restart` and `connect`: Neovim restarts grid ids per
+    /// server, so a position saved under the previous one would move an
+    /// unrelated window that reuses its id. macOS keeps the same generation.
+    external_session_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     // Pending vertices for external windows that haven't been created yet
     pending_external_verts: std.ArrayListUnmanaged(PendingExternalVertices) = .empty,

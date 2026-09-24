@@ -2838,7 +2838,8 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 // =========================================================================
 
 pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
+    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+    _ = app.external_session_generation.fetchAdd(1, .acq_rel);
     if (!applog.isEnabled()) return;
     if (addr_ptr) |p| {
         applog.appLog("[win] on_restart: reconnecting to listen_addr={s}\n", .{p[0..addr_len]});
@@ -2852,7 +2853,8 @@ pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) call
 /// keeps running headless instead of dying. The core handles the actual
 /// hot-swap; this callback is informational only.
 pub fn onConnect(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
-    _ = ctx;
+    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+    _ = app.external_session_generation.fetchAdd(1, .acq_rel);
     if (!applog.isEnabled()) return;
     if (addr_ptr) |p| {
         applog.appLog("[win] on_connect: hot-swap to server_addr={s}\n", .{p[0..addr_len]});

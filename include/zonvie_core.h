@@ -1559,6 +1559,52 @@ ZONVIE_API void zonvie_core_scrollbar_drag_target(
     int64_t line_count,
     zonvie_scrollbar_drag_target *out);
 
+/* One OS window for the window-layout plan: top-left origin, Y growing down,
+   in whatever unit the frontend uses (only comparisons and top-left positions
+   matter, so a Y-up frontend passes y = -maxY). `id` is the frontend's own. */
+typedef struct zonvie_win_frame {
+    int64_t id;
+    double x;
+    double y;
+    double w;
+    double h;
+} zonvie_win_frame;
+
+enum {
+    ZONVIE_WIN_LAYOUT_MOVE = 0,         /* arg: direction 0=down 1=up 2=right 3=left */
+    ZONVIE_WIN_LAYOUT_EXCHANGE = 1,     /* count: steps in reading order, 0 = 1 */
+    ZONVIE_WIN_LAYOUT_ROTATE = 2,       /* arg: 0 = forward; count < 0 refused, reduced mod n */
+    ZONVIE_WIN_LAYOUT_RESIZE_EQUAL = 3, /* average sizes, top-left corners kept */
+};
+
+/* Plan a window-layout operation (win_move / win_exchange / win_rotate /
+   win_resize_equal) over `frames` IN PLACE: each frame keeps its id and gets
+   the position and size it should take. Returns true when the frontend should
+   apply them. `row_band` is how far apart two centres may be and still read as
+   one row in reading order (macOS uses 20pt; Windows the same scaled).
+   At most 64 frames; more is refused.
+
+   Pure — no core pointer, no lock — so it may be called from the callback that
+   delivered the event, grid_mu held or not. */
+ZONVIE_API bool zonvie_core_win_layout_plan(
+    int32_t op,
+    int32_t arg,
+    int32_t count,
+    int64_t source_id,
+    double row_band,
+    zonvie_win_frame *frames,
+    size_t frame_count);
+
+/* The index into `frames` of the window win_move_cursor lands on from
+   `source_id`: the count-th nearest in `direction` (count 0 = 1; past the last
+   candidate, the nearest), else the nearest overall. -1 when none. Pure. */
+ZONVIE_API int64_t zonvie_core_win_layout_find(
+    int64_t source_id,
+    int32_t direction,
+    int32_t count,
+    const zonvie_win_frame *frames,
+    size_t frame_count);
+
 /* The top edge of an external popupmenu window, Y growing downward: below
    the anchor cell (anchor_top + anchor_height) when the popup ends at or
    above ref_bottom — the bottom of the window the anchor is in — else above

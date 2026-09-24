@@ -21,6 +21,7 @@ pub const flush_mod = @import("flush.zig");
 pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
+pub const win_layout = @import("win_layout.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
@@ -1186,6 +1187,7 @@ comptime {
 comptime {
     if (@sizeOf(cursor_rect.Rect) != 4 * 4) @compileError("zonvie_cursor_rect layout drifted from the header");
     if (@sizeOf(cursor_rect.IntRect) != 4 * 4) @compileError("zonvie_cursor_irect layout drifted from the header");
+    if (@sizeOf(win_layout.Frame) != 8 + 4 * 8) @compileError("zonvie_win_frame layout drifted from the header");
 }
 
 /// The cursor's bounds on a surface: the vertex box moved to the origin that
@@ -1870,6 +1872,36 @@ pub export fn zonvie_core_popupmenu_top(
     screen_top: i32,
 ) callconv(.c) i32 {
     return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
+}
+
+/// Plan a window-layout operation (win_move / win_exchange / win_rotate /
+/// win_resize_equal) over the frames the frontend collected, in place. Pure --
+/// no core pointer, no lock -- so a frontend may call it from the callback that
+/// delivered the event, grid_mu held or not. See win_layout.zig.
+pub export fn zonvie_core_win_layout_plan(
+    op: i32,
+    arg: i32,
+    count: i32,
+    source_id: i64,
+    row_band: f64,
+    frames: ?[*]win_layout.Frame,
+    frame_count: usize,
+) callconv(.c) bool {
+    const ptr = frames orelse return false;
+    return win_layout.plan(@enumFromInt(op), arg, count, source_id, row_band, ptr[0..frame_count]);
+}
+
+/// The index of the window `win_move_cursor` lands on, or -1. Pure.
+pub export fn zonvie_core_win_layout_find(
+    source_id: i64,
+    direction: i32,
+    count: i32,
+    frames: ?[*]const win_layout.Frame,
+    frame_count: usize,
+) callconv(.c) i64 {
+    const ptr = frames orelse return -1;
+    const index = win_layout.findInDirection(ptr[0..frame_count], source_id, @enumFromInt(direction), count) orelse return -1;
+    return @intCast(index);
 }
 
 /// Where a knob dragged to `ratio` of its travel asks the window to scroll.

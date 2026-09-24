@@ -5996,6 +5996,16 @@ pub export fn WndProc(
                 const x_up = pos_x_up.x;
                 const y_up = pos_x_up.y;
 
+                // The scrollbar first: its press never reached the editor, so a
+                // knob dragged up past the tab bar or across a sidebar was
+                // released into the chrome branches below, which returned
+                // before ending the drag -- capture stayed, and every later
+                // move scrolled the buffer.
+                if (msg == c.WM_LBUTTONUP and (app.scrollbar_dragging or app.scrollbar_repeat_timer != 0)) {
+                    scrollbar.scrollbarMouseUp(hwnd, app);
+                    return 0;
+                }
+
                 // Check tabline/sidebar drag end or area click
                 if (app.ext_tabline_enabled and !press_reached_editor) {
                     if (app.tabline_style == .titlebar) {
@@ -6028,12 +6038,6 @@ pub export fn WndProc(
                             return 0;
                         }
                     }
-                }
-
-                // Check if we were interacting with scrollbar (left button only)
-                if (msg == c.WM_LBUTTONUP and (app.scrollbar_dragging or app.scrollbar_repeat_timer != 0)) {
-                    scrollbar.scrollbarMouseUp(hwnd, app);
-                    return 0;
                 }
 
                 // Release mouse capture
