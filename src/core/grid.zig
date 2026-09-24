@@ -1529,6 +1529,12 @@ pub const Grid = struct {
         self.subgrid_surface_vertex_count -|= sg.surface_vertex_count;
         sg.surface_vertex_count = 0;
         sg.vertex_row_ledger_valid = false;
+        // The rows go to another surface now, generated afresh. A grid that
+        // leaves an external root keeps its GridBuf, and the row loops read
+        // this as the rule: left set, a former root drew as a layer with the
+        // default background dropped. One that becomes a root starts from
+        // false, so the flush-start check sees the flip and regenerates.
+        sg.skip_default_bg_last = false;
     }
 
     fn checkedAggregateCellCount(self: *const Grid, old_len: usize, new_len: usize) !usize {
@@ -4261,6 +4267,27 @@ fn checkExternalPromotionAllocationFailure(alloc: std.mem.Allocator) !void {
         try std.testing.expectEqual(old_rev, grid.glyph_working_set_rev);
         return err;
     };
+}
+
+test "a grid that stops being an external root forgets its default-background rule" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(8, 16);
+    try grid.resizeGrid(2, 3, 5);
+    try grid.resizeGrid(3, 2, 4);
+
+    // Under blur, an external root hosting a float had its rows generated
+    // with the default background dropped. As a layer on the main surface it
+    // must paint it again; the row loop reads this flag as the rule.
+    try std.testing.expect(try grid.setWinExternalPos(2, 42));
+    grid.sub_grids.getPtr(2).?.skip_default_bg_last = true;
+    try grid.promoteExternalToWinPos(2, 42, 1, 2);
+    try std.testing.expect(!grid.sub_grids.get(2).?.skip_default_bg_last);
+
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    grid.sub_grids.getPtr(3).?.skip_default_bg_last = true;
+    try grid.setWinFloatPos(3, 43, 0, 0, 50, 0, 1, true);
+    try std.testing.expect(!grid.sub_grids.get(3).?.skip_default_bg_last);
 }
 
 test "external promotion OOM preserves external state" {

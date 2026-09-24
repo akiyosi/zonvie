@@ -19,6 +19,12 @@
 // Measured on the idle gate's trace: a main frame drawn for a new commit with
 // nothing else in it is the exposure, counted directly.
 //
+// Then the cursor does move, each time in the same call as an external update,
+// so the main surface gets a cursor-only commit followed by a contentless one
+// before it draws. The contentless bracket used to overwrite the cursor-only
+// verdict, and the frame ran the whole main pass. Counted as cursor-only
+// frames drawn less the main passes they logged skipping.
+//
 // macOS-only: GridSurfaceRenderer is macOS frontend code.
 
 const std = @import("std");
@@ -54,6 +60,30 @@ fn emptyCommitFrames(alloc: std.mem.Allocator, since_ms: f64) !usize {
         if (empty) n += 1;
     }
     return n;
+}
+
+/// Cursor-only main frames that still ran the main pass: every one that drew,
+/// less the ones that logged skipping it.
+fn cursorOnlyMainPasses(alloc: std.mem.Allocator, since_ms: f64) !usize {
+    const frames = try app_log.linesSince(alloc, log_path, "[dtrace] surface=1 gate=idle", since_ms);
+    defer alloc.free(frames);
+    var drawn: usize = 0;
+    var it = std.mem.splitScalar(u8, frames, '\n');
+    while (it.next()) |line| {
+        const cursor_only = std.mem.indexOf(u8, line, "newCommit=1") != null and
+            std.mem.indexOf(u8, line, "dirty=0 rect=0 layerWork=0 scroll=0 scrollOff=0 smooth=0 shaderCur=1 blink=0 sizeChg=0 anim=0 -> draw") != null;
+        if (cursor_only) drawn += 1;
+    }
+    const skips = try app_log.linesSince(alloc, log_path, "[draw] skipMainPass=true", since_ms);
+    defer alloc.free(skips);
+    var skipped: usize = 0;
+    var sit = std.mem.splitScalar(u8, skips, '\n');
+    while (sit.next()) |line| {
+        if (line.len != 0) skipped += 1;
+    }
+    std.debug.print("[gui] cursor-only main frames: {d}; main passes skipped: {d}\n", .{ drawn, skipped });
+    if (drawn == 0) return error.NoCursorOnlyFrame;
+    return drawn -| skipped;
 }
 
 /// Frames any external surface drew.
@@ -119,4 +149,25 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // exercised.
     if (ext_draws == 0) return error.ExternalWindowDidNotDraw;
     if (empty != 0) return error.MainDrewForExternalOnlyFlush;
+
+    try g.exec("setline(1, 'ab')");
+    gui_io.sleepNs(400 * std.time.ns_per_ms);
+    const t1 = try app_log.nowMs(alloc, log_path);
+    i = 0;
+    while (i < updates) : (i += 1) {
+        var buf: [300]u8 = undefined;
+        const cmd = try std.fmt.bufPrint(
+            &buf,
+            "luaeval('(function() vim.api.nvim_win_set_cursor(0, {{1, {d}}}) vim.api.nvim__redraw({{cursor=true, flush=true}}) " ++
+                "vim.api.nvim_buf_set_lines(_G.z_buf, 0, 1, false, {{\"moved {d}\"}}) return 1 end)()')",
+            .{ i % 2, i },
+        );
+        try g.exec(cmd);
+        gui_io.sleepNs(120 * std.time.ns_per_ms);
+    }
+    gui_io.sleepNs(400 * std.time.ns_per_ms);
+
+    const passes = try cursorOnlyMainPasses(alloc, t1);
+    std.debug.print("[gui] cursor-only main frames that ran the main pass: {d}\n", .{passes});
+    if (passes != 0) return error.MainPassForCursorOnlyFrame;
 }
