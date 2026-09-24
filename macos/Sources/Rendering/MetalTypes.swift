@@ -335,6 +335,23 @@ final class ScrollRetention {
         }
     }
 
+    /// Turn off the edge stretch of every grid in `offsets` whose band its
+    /// published rows cover (see `coversBand`). One rule for every grid a
+    /// surface displaces: an external surface asked it of its root only, so a
+    /// float it hosts stretched its edge row over the rows it had retained.
+    func releaseCoveredPins(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], cellHeightNDC: Float) {
+        for i in offsets.indices {
+            let retained = publishedCount(gridId: Int64(offsets[i].grid_id))
+            if retained > 0, Self.coversBand(
+                retainedRows: retained,
+                offsetNDC: offsets[i].offset_y,
+                cellHeightNDC: cellHeightNDC
+            ) {
+                offsets[i].pin_edges = 0
+            }
+        }
+    }
+
     func publishedCount(gridId: Int64) -> Int {
         lock.lock()
         defer { lock.unlock() }

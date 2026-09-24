@@ -251,6 +251,18 @@ final class ZonvieCore {
 
     func resolveGridRoute(gridId: Int64) -> GridRoute {
         if gridId == 1 { return .mainRoot }
+        if let route = resolveExternalGridRoute(gridId: gridId) { return route }
+        // Read outside the map lock, as the callers that consulted the renderer
+        // directly did: `ownsGrid` reads layer state the core thread owns.
+        if terminalView?.renderer?.ownsGrid(gridId) == true { return .mainLayer }
+        return .unplaced
+    }
+
+    /// The part of `resolveGridRoute` that reads only the owner map: an
+    /// external surface's root or layer, a deferred host, or nil for a grid the
+    /// main surface would own. Safe on any thread, which the rest of the rule
+    /// is not.
+    func resolveExternalGridRoute(gridId: Int64) -> GridRoute? {
         externalGridViewsLock.lock()
         let ownerId = (pendingGridSurfaceOwners ?? gridSurfaceOwners)[gridId]
         let ownView = (ownerId == nil || ownerId == gridId) ? externalGridViews[gridId] : nil
@@ -259,10 +271,7 @@ final class ZonvieCore {
         if let ownView { return .externalRoot(ownView) }
         if let hostView { return .externalLayer(host: hostView) }
         if let ownerId, ownerId != 1, ownerId != gridId { return .deferred(surfaceId: ownerId) }
-        // Read outside the map lock, as the callers that consulted the renderer
-        // directly did: `ownsGrid` reads layer state the core thread owns.
-        if terminalView?.renderer?.ownsGrid(gridId) == true { return .mainLayer }
-        return .unplaced
+        return nil
     }
 
     /// Snapshot buffer for the seed drain below. Its own, not shared with
