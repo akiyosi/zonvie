@@ -5,6 +5,7 @@ const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const input = @import("../input.zig");
+const callbacks = @import("../callbacks.zig");
 
 pub const ViewportRead = enum { fresh, cached, none };
 
@@ -721,16 +722,25 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     const corep = app.corep;
     if (corep == null) return;
 
-    // Skip main window scrollbar update when cursor is on an external grid.
-    // External windows have their own scrollbar; the main window scrollbar
-    // should only reflect viewports of grids composited on the main window.
+    // When the cursor is in a grid an external window shows (its root or a
+    // float it hosts), that window's scrollbar is the one this update is
+    // for; the main window scrollbar only reflects grids composited on the
+    // main window. The external one used to be skipped outright, so a
+    // keyboard or programmatic scroll there never showed its bar — only the
+    // wheel handler did. macOS updates both views after every flush.
     // Non-blocking: on lock contention this serves the cached position; a
     // cold cache (-1) simply falls through to the main-window update below.
     var cur_row: i32 = 0;
     var cur_col: i32 = 0;
     var cursor_stale = false;
     const cursor_grid = input.getCursorPositionNonBlocking(app, corep.?, &cur_row, &cur_col, &cursor_stale);
-    if (cursor_grid > 1 and app.external_windows.contains(cursor_grid)) {
+    const cursor_ext = blk: {
+        if (cursor_grid <= 1) break :blk null;
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        break :blk callbacks.externalWindowShowingGridLocked(app, cursor_grid);
+    };
+    if (cursor_ext) |shown| {
         if (cursor_stale) {
             // The cached "on an external grid" position may predate the
             // flush that posted this one-shot WM_APP_UPDATE_SCROLLBAR; the
@@ -743,7 +753,9 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
             // message loop ahead of WM_PAINT. Losing one cosmetic scrollbar
             // update is the milder failure.
             _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
+            return;
         }
+        updateScrollbarForExternal(hwnd, app, shown.win, shown.root_grid_id);
         return;
     }
 
@@ -790,6 +802,49 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
 
     // Request repaint for scrollbar area
     invalidateScrollbarTrack(hwnd, app);
+}
+
+/// updateScrollbar for an external window: the same viewport comparison
+/// and show/hide rule as the main window, against this window's own
+/// last-seen viewport. `main_hwnd` receives the lock-busy retry, which
+/// re-enters updateScrollbar and routes here again.
+fn updateScrollbarForExternal(main_hwnd: c.HWND, app: *App, ext_win: *app_mod.ExternalWindow, root_grid_id: i64) void {
+    var vp: app_mod.ViewportInfo = undefined;
+    switch (getViewportNonBlocking(app, scrollbarGrid(app, root_grid_id), &vp)) {
+        .fresh => {},
+        .none => return,
+        .cached => {
+            _ = c.SetTimer(main_hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
+            return;
+        },
+    }
+
+    const viewport_changed = vp.topline != ext_win.last_viewport_topline or
+        vp.line_count != ext_win.last_viewport_line_count or
+        vp.botline != ext_win.last_viewport_botline or
+        ext_win.last_viewport_topline == -1;
+    if (!viewport_changed) return;
+
+    ext_win.last_viewport_topline = vp.topline;
+    ext_win.last_viewport_line_count = vp.line_count;
+    ext_win.last_viewport_botline = vp.botline;
+
+    var metrics: app_mod.zonvie_scrollbar_metrics = undefined;
+    app_mod.zonvie_core_scrollbar_metrics(vp.topline, vp.botline, vp.line_count, &metrics);
+
+    if (metrics.is_scrollable == 0 and !app.config.scrollbar.isAlways()) {
+        hideScrollbarForExternal(ext_win.hwnd, app, ext_win);
+        return;
+    }
+    if (app.config.scrollbar.isScroll() or app.config.scrollbar.isAlways()) {
+        showScrollbarForExternal(ext_win.hwnd, ext_win);
+        // Auto-hide after the delay, as the wheel handler arms it.
+        if (app.config.scrollbar.isScroll() and !app.config.scrollbar.isAlways()) {
+            const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
+            _ = c.SetTimer(ext_win.hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+        }
+    }
+    invalidateScrollbarTrackForExternal(ext_win.hwnd, ext_win.dpi_scale);
 }
 
 /// Show scrollbar with fade-in animation

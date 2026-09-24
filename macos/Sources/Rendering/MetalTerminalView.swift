@@ -21,6 +21,196 @@ func surfaceOtherMouseButtonName(_ buttonNumber: Int) -> String? {
     }
 }
 
+/// One surface's scrollbar: which grid its knob shows, when the knob moves,
+/// shows and hides, and what a click or drag on it asks the core for.
+///
+/// The main window and every external window carried a copy of this, about
+/// 150 lines each, and they had drifted: the external one had no retry for a
+/// busy core lock (so its knob stayed stale after the last flush of a scroll
+/// burst), no first-show, no estimated knob after a page click, ignored the
+/// knob slot's part on one side and not the other, and showed only in "scroll"
+/// mode. The views keep only what differs — their hover tracking areas.
+///
+/// A knob drag is throttled to one scroll per interval with a trailing send
+/// for the last position. The main window used to flush that last position
+/// from its own mouseUp, which the scroller's tracking loop consumes, so the
+/// final position of a quick drag could be sent on the next unrelated click.
+final class SurfaceScrollbarController {
+    private weak var scroller: NSScroller?
+    private let surfaceId: Int64
+    private let core: () -> ZonvieCore?
+
+    private var hideTimer: Timer?
+    private var lastViewportTopline: Int64 = -1
+    private var lastViewportLineCount: Int64 = -1
+    private var lastViewportBotline: Int64 = -1
+    /// The grid the knob is showing, kept across a busy lock.
+    private var lastGrid: Int64
+    /// Last grid `[scrollbar]` named, so the line is a transition.
+    private var lastGridLogged: Int64 = 0
+    private var retryScheduled = false
+    private static let dragThrottleInterval: TimeInterval = 0.016
+    private var lastDragSendTime: CFAbsoluteTime = 0
+    private var pendingDrag: (line: Int64, useBottom: Bool)?
+    private var trailingDragScheduled = false
+
+    /// `surfaceId` is 1 for the main window, an external window's root grid
+    /// id for its own.
+    init(scroller: NSScroller, surfaceId: Int64, core: @escaping () -> ZonvieCore?) {
+        self.scroller = scroller
+        self.surfaceId = surfaceId
+        self.lastGrid = surfaceId
+        self.core = core
+    }
+
+    func invalidate() {
+        hideTimer?.invalidate()
+        hideTimer = nil
+    }
+
+    /// The grid this surface's scrollbar ACTS on, which has to be the one it
+    /// shows — a float an external window hosts included.
+    private var interactionGrid: Int64 {
+        let g = core()?.scrollbarGridNonBlocking(surfaceId: surfaceId) ?? lastGrid
+        // Rare — a page or a drag, not a frame — and the only trace of which
+        // window a scrollbar acts on.
+        ZonvieCore.appLog("[scrollbar_action] surface=\(surfaceId) grid=\(g)")
+        return g
+    }
+
+    /// Move the knob to the viewport of the grid this surface shows, once per
+    /// change. Called after each flush or drawn frame.
+    func update() {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled, let core = core() else { return }
+        // On a busy lock keep the grid the knob is already showing, so the
+        // stale-viewport retry below still runs — returning here would skip it.
+        let grid = core.scrollbarGridNonBlocking(surfaceId: surfaceId) ?? lastGrid
+        lastGrid = grid
+        var lockBusy = false
+        let viewportOrStale = core.getViewportNonBlocking(gridId: grid, lockBusy: &lockBusy)
+        if lockBusy, !retryScheduled {
+            // grid_mu was held (core thread mid-handleRedraw): the value above
+            // is the one-flush-stale cache, and the FINAL flush of a scroll
+            // burst has no later flush to heal it. One-shot retry, as
+            // windows/ui/scrollbar.zig's TIMER_SCROLLBAR_RETRY (16ms).
+            retryScheduled = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
+                self?.retryScheduled = false
+                self?.update()
+            }
+        }
+        guard let viewport = viewportOrStale else { return }
+
+        let changed = viewport.topline != lastViewportTopline ||
+                      viewport.lineCount != lastViewportLineCount ||
+                      viewport.botline != lastViewportBotline ||
+                      lastViewportTopline == -1
+        // A page click's estimated knob stands until this reports a change:
+        // an unchanged viewport moves nothing.
+        if !changed { return }
+        // One line per change, not per flush: which grid a knob follows has
+        // no other trace.
+        if ZonvieCore.appLogEnabled, grid != lastGridLogged || viewport.topline != lastViewportTopline {
+            lastGridLogged = grid
+            ZonvieCore.appLog("[scrollbar] surface=\(surfaceId) grid=\(grid) topline=\(viewport.topline) lineCount=\(viewport.lineCount)")
+        }
+        lastViewportTopline = viewport.topline
+        lastViewportLineCount = viewport.lineCount
+        lastViewportBotline = viewport.botline
+        scroller?.apply(viewport.scrollbarMetrics, alwaysVisible: config.isAlways)
+        if config.isScroll || config.isAlways {
+            show()
+        }
+    }
+
+    func show() {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled, let scroller else { return }
+        hideTimer?.invalidate()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            scroller.animator().alphaValue = CGFloat(config.opacity)
+        }
+        // Auto-hide after the delay, only in "scroll" mode.
+        if config.isScroll && !config.isAlways {
+            hideTimer = Timer.scheduledTimer(withTimeInterval: config.delay, repeats: false) { [weak self] _ in
+                self?.hide()
+            }
+        }
+    }
+
+    func hide() {
+        let config = ZonvieConfig.shared.scrollbar
+        if config.isAlways { return }
+        guard let scroller else { return }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.3
+            scroller.animator().alphaValue = 0.0
+        }
+    }
+
+    /// The scroller's action: a page click or a knob drag.
+    func scrollerDidScroll(_ sender: NSScroller) {
+        guard let core = core() else { return }
+        // Read and act on the same grid: the one the knob shows. Viewport may
+        // be nil before Neovim reports one; paging does not need it.
+        let target = interactionGrid
+        let viewport = core.getViewportNonBlocking(gridId: target)
+
+        switch sender.hitPart {
+        case .decrementPage, .incrementPage:
+            let forward = sender.hitPart == .incrementPage
+            // Neovim's own page step (<C-f>/<C-b>), one RPC.
+            core.pageScroll(gridId: target, forward: forward)
+            // Move the knob to an estimate now; update() leaves it until the
+            // viewport actually moves.
+            if let viewport {
+                let visible = viewport.botline - viewport.topline
+                let range = max(1, viewport.lineCount - visible)
+                let step = max(1, visible - 2)
+                let newTopline = forward
+                    ? min(viewport.lineCount - visible + 1, viewport.topline + step)
+                    : max(1, viewport.topline - step)
+                sender.doubleValue = min(1.0, max(0, Double(newTopline - 1) / Double(range)))
+            }
+
+        case .knob, .knobSlot:
+            guard let viewport else { break }
+            // The core's rule, shared with Windows: the lower half of the
+            // travel aligns to the bottom, the only way to reach the last line.
+            let drag = viewport.dragTarget(ratio: sender.doubleValue)
+            sendDrag(line: drag.line, useBottom: drag.use_bottom != 0, target: target)
+
+        default:
+            break
+        }
+        // Keep the scrollbar visible while interacting.
+        show()
+    }
+
+    private func sendDrag(line: Int64, useBottom: Bool, target: Int64) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastDragSendTime >= Self.dragThrottleInterval {
+            core()?.scrollToLine(gridId: target, line, useBottom: useBottom)
+            lastDragSendTime = now
+            pendingDrag = nil
+            return
+        }
+        pendingDrag = (line, useBottom)
+        guard !trailingDragScheduled else { return }
+        trailingDragScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.dragThrottleInterval) { [weak self] in
+            guard let self else { return }
+            self.trailingDragScheduled = false
+            guard let pending = self.pendingDrag else { return }
+            self.pendingDrag = nil
+            self.lastDragSendTime = CFAbsoluteTimeGetCurrent()
+            self.core()?.scrollToLine(gridId: self.interactionGrid, pending.line, useBottom: pending.useBottom)
+        }
+    }
+}
+
 final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     var renderer: GridSurfaceRenderer!
 
@@ -199,19 +389,16 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         scroller.action = #selector(scrollerDidScroll(_:))
         return scroller
     }()
-    private var scrollbarHideTimer: Timer?
-    private var lastViewportTopline: Int64 = -1
-    private var lastViewportLineCount: Int64 = -1
-    private var lastViewportBotline: Int64 = -1
-    // Scrollbar drag throttling (16ms = ~60fps)
-    private static let scrollbarThrottleInterval: TimeInterval = 0.016
-    private var lastScrollbarDragTime: CFAbsoluteTime = 0
-    private var pendingScrollLine: Int64 = -1
-    private var pendingScrollUseBottom: Bool = false
-    // Page scroll knob guard: prevent updateScrollbarIfNeeded from reverting
-    // the estimated knob position before viewport actually updates
-    private var pageScrollTime: CFAbsoluteTime = 0
-    private static let pageScrollGuardInterval: TimeInterval = 0.5
+    // Created on first use, never from deinit: forming `[weak self]` while
+    // self is deallocating traps.
+    private var createdScrollbarController: SurfaceScrollbarController?
+    private var scrollbarController: SurfaceScrollbarController {
+        if let controller = createdScrollbarController { return controller }
+        let controller = SurfaceScrollbarController(
+            scroller: verticalScroller, surfaceId: 1, core: { [weak self] in self?.core })
+        createdScrollbarController = controller
+        return controller
+    }
 
     /// Scroll offset below this threshold (in pixels) is treated as zero and removed.
     /// Used consistently in processPendingScrollClears, updateScrollShaderOffset,
@@ -984,8 +1171,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     }
 
     deinit {
-        scrollbarHideTimer?.invalidate()
-        scrollbarHideTimer = nil
+        createdScrollbarController?.invalidate()
         msgTimer?.invalidate()
         msgTimer = nil
         // Belt-and-suspenders: viewDidMoveToWindow(nil) already disarms (and
@@ -1017,31 +1203,12 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         super.mouseDown(with: event)
         window?.makeFirstResponder(self)
         heldMouseButton = "left"
-
-        let location = convert(event.locationInWindow, from: nil)
-        let (gridId, _, _) = hitTestGrid(at: location)
-        if let grid = core?.getVisibleGridsCached().first(where: { $0.gridId == gridId }) {
-            dragGridCache = DragGridCache(
-                gridId: grid.gridId,
-                startCol: grid.startCol,
-                band: GridRowBand(of: grid)
-            )
-        }
-
         sendMouseEvent(button: "left", action: "press", event: event)
     }
 
     override func mouseUp(with event: NSEvent) {
         super.mouseUp(with: event)
         heldMouseButton = nil
-        dragGridCache = nil  // Clear drag cache on mouse up
-
-        // Send any pending scrollbar position
-        if pendingScrollLine > 0 {
-            core?.scrollToLine(gridId: scrollbarInteractionGrid, pendingScrollLine, useBottom: pendingScrollUseBottom)
-            pendingScrollLine = -1
-        }
-
         sendMouseEvent(button: "left", action: "release", event: event)
     }
 
@@ -1110,8 +1277,20 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         let location = convert(event.locationInWindow, from: nil)
         let modifier = buildModifierString(from: event.modifierFlags)
 
-        // For drag events, use cached grid info to prevent oscillation during separator dragging
-        if action == "drag", let cache = dragGridCache {
+        // The press claims its grid for every button, and the drag and release
+        // that follow stay on it: Neovim keeps a drag on the window the press
+        // chose, and a release re-resolved under the pointer ended a selection
+        // dragged out of a float in the window behind it. The external surface
+        // and Windows pin the same way. The cache also keeps separator drags
+        // from oscillating as the grids resize.
+        if action == "press" {
+            let (gridId, _, _) = hitTestGrid(at: location)
+            dragGridCache = core.getVisibleGridsCached().first(where: { $0.gridId == gridId }).map {
+                DragGridCache(gridId: $0.gridId, startCol: $0.startCol, band: GridRowBand(of: $0))
+            }
+        }
+        if action != "press", let cache = dragGridCache {
+            if action == "release" { dragGridCache = nil }
             // The cached grid, but the CURRENT geometry: dragging a separator
             // resizes the grids, and the cache exists so the coordinates stay
             // in the grid the press chose, not so they freeze.
@@ -1259,187 +1438,20 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
     // MARK: - Scrollbar
 
-    /// One-shot retry pending for updateScrollbarIfNeeded (main thread only).
-    private var scrollbarRetryScheduled = false
-
-    /// The grid this surface's knob is showing, kept across a busy lock.
-    private var lastScrollbarGrid: Int64 = 1
-    /// Last grid `[scrollbar]` named, so the line is a transition.
-    private var lastScrollbarGridLogged: Int64 = 0
-
     func updateScrollbarIfNeeded() {
-        let config = ZonvieConfig.shared.scrollbar
-        guard config.enabled else { return }
-        guard let core else { return }
-        // The grid THIS surface draws, not the cursor's wherever it is: asking
-        // for -1 made the main window's knob follow a scroll in an external
-        // window, which draws none of that content.
-        // On a busy lock keep the grid the knob is already showing, so the
-        // stale-viewport retry below still runs — returning here would skip it.
-        let scrollbarGrid = core.scrollbarGridNonBlocking(surfaceId: 1) ?? lastScrollbarGrid
-        lastScrollbarGrid = scrollbarGrid
-        var lockBusy = false
-        let viewportOrStale = core.getViewportNonBlocking(gridId: scrollbarGrid, lockBusy: &lockBusy)
-        if lockBusy, !scrollbarRetryScheduled {
-            // grid_mu was held (core thread mid-handleRedraw): the value above
-            // is the one-flush-stale cache. This update runs once per flush, so
-            // a busy read on the FINAL flush of a scroll burst has no later
-            // flush to heal it — the knob would stay at the pre-scroll position.
-            // One-shot main-thread retry, mirroring windows/ui/scrollbar.zig's
-            // TIMER_SCROLLBAR_RETRY (16ms ≈ one frame).
-            scrollbarRetryScheduled = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.016) { [weak self] in
-                self?.scrollbarRetryScheduled = false
-                self?.updateScrollbarIfNeeded()
-            }
-        }
-        guard let viewport = viewportOrStale else { return }
-
-        let viewportChanged = viewport.topline != lastViewportTopline ||
-                              viewport.lineCount != lastViewportLineCount ||
-                              viewport.botline != lastViewportBotline ||
-                              lastViewportTopline == -1
-
-        // After page scroll, skip knob updates until viewport actually changes.
-        // This prevents the display link from reverting the estimated knob position
-        // before Neovim sends updated viewport data.
-        if !viewportChanged {
-            let elapsed = CFAbsoluteTimeGetCurrent() - pageScrollTime
-            if elapsed < Self.pageScrollGuardInterval {
-                return
-            }
-        }
-
-        if viewportChanged {
-            pageScrollTime = 0  // Clear guard on real viewport update
-            // One line per change, not per flush. Which grid a surface's knob
-            // follows had no trace at all, and "the main window's scrollbar
-            // moved when an external window scrolled" was reported from the
-            // screen because there was nothing else to read.
-            if ZonvieCore.appLogEnabled, scrollbarGrid != lastScrollbarGridLogged || viewport.topline != lastViewportTopline {
-                lastScrollbarGridLogged = scrollbarGrid
-                ZonvieCore.appLog("[scrollbar] surface=1 grid=\(scrollbarGrid) topline=\(viewport.topline) lineCount=\(viewport.lineCount)")
-            }
-            lastViewportTopline = viewport.topline
-            lastViewportLineCount = viewport.lineCount
-            lastViewportBotline = viewport.botline
-            updateScrollbar(viewport: viewport)
-            // Show scrollbar on scroll only if "scroll" or "always" mode
-            if config.isScroll || config.isAlways {
-                showScrollbar()
-            }
-        }
-    }
-
-    private func updateScrollbar(viewport: ZonvieCore.ViewportInfo) {
-        let config = ZonvieConfig.shared.scrollbar
-        guard config.enabled else { return }
-
-        verticalScroller.apply(viewport.scrollbarMetrics, alwaysVisible: config.isAlways)
+        scrollbarController.update()
     }
 
     private func showScrollbar() {
-        let config = ZonvieConfig.shared.scrollbar
-        guard config.enabled else { return }
-
-        scrollbarHideTimer?.invalidate()
-
-        let targetAlpha = CGFloat(config.opacity)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            verticalScroller.animator().alphaValue = targetAlpha
-        }
-
-        // Auto-hide after delay (only if "scroll" mode and not "always")
-        if config.isScroll && !config.isAlways {
-            scrollbarHideTimer = Timer.scheduledTimer(withTimeInterval: config.delay, repeats: false) { [weak self] _ in
-                self?.hideScrollbar()
-            }
-        }
+        scrollbarController.show()
     }
 
     private func hideScrollbar() {
-        let config = ZonvieConfig.shared.scrollbar
-        // Don't hide if "always" mode is enabled
-        if config.isAlways { return }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.3
-            verticalScroller.animator().alphaValue = 0.0
-        }
-    }
-
-    /// The grid this surface's scrollbar ACTS on, which has to be the one it
-    /// shows. Page and drag both ran against grid -1 — the cursor's window —
-    /// so the main window's knob paged an external window whenever the cursor
-    /// was in it, while displaying its own content.
-    private var scrollbarInteractionGrid: Int64 {
-        let g = core?.scrollbarGridNonBlocking(surfaceId: 1) ?? lastScrollbarGrid
-        // Rare — a page or a drag, not a frame — and it is the only trace of
-        // which window a scrollbar acts on.
-        ZonvieCore.appLog("[scrollbar_action] surface=1 grid=\(g)")
-        return g
+        scrollbarController.hide()
     }
 
     @objc private func scrollerDidScroll(_ sender: NSScroller) {
-        guard let core else { return }
-
-        // Viewport may be nil if Neovim hasn't sent win_viewport for the cursor grid yet
-        // (e.g., after window split with no content change). pageScroll doesn't need viewport.
-        let target = scrollbarInteractionGrid
-        let viewport = core.getViewportNonBlocking(gridId: target)
-
-        switch sender.hitPart {
-        case .decrementPage:
-            // Click above knob - page up (single RPC, Neovim-native <C-b>)
-            core.pageScroll(gridId: target, forward: false)
-            // Update knob position immediately (estimated) and guard against revert
-            if let viewport {
-                let visibleLines = viewport.botline - viewport.topline
-                let upScrollRange = max(1, viewport.lineCount - visibleLines)
-                let upNewTopline = max(1, viewport.topline - max(1, visibleLines - 2))
-                verticalScroller.doubleValue = max(0, Double(upNewTopline - 1) / Double(upScrollRange))
-            }
-            pageScrollTime = CFAbsoluteTimeGetCurrent()
-
-        case .incrementPage:
-            // Click below knob - page down (single RPC, Neovim-native <C-f>)
-            core.pageScroll(gridId: target, forward: true)
-            // Update knob position immediately (estimated) and guard against revert
-            if let viewport {
-                let visibleLines = viewport.botline - viewport.topline
-                let downScrollRange = max(1, viewport.lineCount - visibleLines)
-                let downNewTopline = min(viewport.lineCount - visibleLines + 1, viewport.topline + max(1, visibleLines - 2))
-                verticalScroller.doubleValue = min(1.0, max(0, Double(downNewTopline - 1) / Double(downScrollRange)))
-            }
-            pageScrollTime = CFAbsoluteTimeGetCurrent()
-
-        case .knob:
-            // Dragging knob - jump directly to target line (requires viewport data)
-            guard let viewport else { break }
-            // The core's rule, shared with the external window and Windows.
-            let drag = viewport.dragTarget(ratio: sender.doubleValue)
-            let targetLine = drag.line
-            let useBottom = drag.use_bottom != 0
-
-            // Store pending position for throttling
-            pendingScrollLine = targetLine
-            pendingScrollUseBottom = useBottom
-
-            // Throttle: only send if enough time has passed
-            let now = CFAbsoluteTimeGetCurrent()
-            if now - lastScrollbarDragTime >= Self.scrollbarThrottleInterval {
-                core.scrollToLine(gridId: scrollbarInteractionGrid, targetLine, useBottom: useBottom)
-                lastScrollbarDragTime = now
-                pendingScrollLine = -1
-            }
-
-        default:
-            break
-        }
-
-        // Keep scrollbar visible while interacting
-        showScrollbar()
+        scrollbarController.scrollerDidScroll(sender)
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -3229,7 +3241,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         scrollOffsetLock.lock()
         let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(cellHeightPx))
         scrollOffsetLock.unlock()
-        if abs(offsetPx) < 0.001 { return nil }
+        // The main surface's threshold (updateScrollShaderOffset): below it an
+        // offset is settled, and drawing it here kept an external surface in a
+        // smooth scroll the main surface had already ended.
+        if abs(offsetPx) < Self.scrollOffsetEpsilon { return nil }
 
         // Get grid info for margins (non-blocking)
         let grids = core.getVisibleGridsCached()

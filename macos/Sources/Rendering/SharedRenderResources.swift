@@ -575,8 +575,11 @@ final class SurfaceShaderCursor {
     /// and those only reach the screen at commit. Publishing at submit put the
     /// NEXT flush's cursor position into the uniforms while the screen still
     /// showed the previous one — a row apart mid-scroll, which is a cursor
-    /// shader firing off the cursor for that frame.
-    private var staged: (rect: Rect, color: Color, gridId: Int64)?
+    /// shader firing off the cursor for that frame. Only the staging surface's
+    /// own commit publishes it: the main surface commits first at every flush
+    /// end, and publishing an external window's cursor there paired it with
+    /// that window's previous rows for any frame drawn before its commit.
+    private var staged = SurfaceCommitStaged<(rect: Rect, color: Color, gridId: Int64)>()
 
     init(timeBase: SurfaceShaderTiming) {
         self.timeBase = timeBase
@@ -601,9 +604,9 @@ final class SurfaceShaderCursor {
     /// when that flush commits — see `staged` for why it cannot go straight
     /// out. Called from the vertex-submit path (core/RPC thread) while a draw
     /// reads the published fields on the main thread.
-    func stage(rect: Rect, color: Color, gridId grid: Int64) {
+    func stage(rect: Rect, color: Color, gridId grid: Int64, by surface: AnyObject) {
         lock.lock()
-        staged = (rect: rect, color: color, gridId: grid)
+        staged.stage((rect: rect, color: color, gridId: grid), by: ObjectIdentifier(surface))
         lock.unlock()
     }
 
@@ -614,8 +617,8 @@ final class SurfaceShaderCursor {
     /// generation. The main surface used to release its compensation after
     /// its lock, and the external surface's was released by the main
     /// surface's commit.
-    func publishCommitTail(publishScrollClears: () -> Void, commitRevision: inout UInt64) {
-        publish()
+    func publishCommitTail(committedBy surface: AnyObject, publishScrollClears: () -> Void, commitRevision: inout UInt64) {
+        publish(committedBy: surface)
         publishScrollClears()
         commitRevision &+= 1
     }
@@ -623,17 +626,16 @@ final class SurfaceShaderCursor {
     /// Drop a measurement whose flush never committed.
     func dropStaged() {
         lock.lock()
-        staged = nil
+        staged.drop()
         lock.unlock()
     }
 
     /// Hand the staged state to the shader uniforms, together with the vertices
     /// it describes. Called from every surface's commit.
-    func publish() {
+    func publish(committedBy surface: AnyObject) {
         lock.lock()
         defer { lock.unlock() }
-        guard let s = staged else { return }
-        staged = nil
+        guard let s = staged.take(committedBy: ObjectIdentifier(surface)) else { return }
         rawRect = s.rect
         rawColor = s.color
         gridId = s.gridId
@@ -664,8 +666,8 @@ final class SurfaceShaderCursor {
         previous = (previous.0 + dx, previous.1 + dy, previous.2, previous.3)
         // A cursor update that arrived during the drag is still waiting for a
         // commit; move it too, or the commit would undo this re-anchor.
-        if let s = staged, s.gridId == grid {
-            staged = (rect: rect, color: s.color, gridId: s.gridId)
+        staged.update { s in
+            if s.gridId == grid { s.rect = rect }
         }
     }
 

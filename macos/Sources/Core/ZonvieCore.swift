@@ -187,14 +187,6 @@ final class ZonvieCore {
     /// still owns while this runs.
     private var pendingCapacityScratch: [ExternalGridView] = []
 
-    /// The window owning a grid, if that grid is rendered as its own surface.
-    /// Callers must not hold a surface lock (see the note below).
-    func externalGridView(for gridId: Int64) -> ExternalGridView? {
-        externalGridViewsLock.lock()
-        defer { externalGridViewsLock.unlock() }
-        return externalGridViews[gridId]
-    }
-
     /// Tell every external surface which font generation its rows must match.
     ///
     /// Any bump of the atlas's font generation owes this: the external views
@@ -3245,13 +3237,29 @@ final class ZonvieCore {
     private var lastBlinkOffMs: UInt32 = 0
 
     /// Single gate for whether the cursor blink timer may run: only while the
-    /// main window is frontmost and visible. Centralizes the focus/occlusion
-    /// check so that background flushes (e.g. a mode change in an unfocused
-    /// nvim, routed through updateCursorBlinking) cannot revive a timer that
-    /// the resign-active / occlusion handlers intentionally stopped.
+    /// app is frontmost and the window showing the cursor is visible.
+    /// Centralizes the focus/occlusion check so that background flushes (e.g.
+    /// a mode change in an unfocused nvim, routed through updateCursorBlinking)
+    /// cannot revive a timer that the resign-active / occlusion handlers
+    /// intentionally stopped. It asked the MAIN window whatever surface held
+    /// the cursor, so editing in an external window with the main window
+    /// minimized or covered left the cursor solid.
     private var cursorBlinkAllowed: Bool {
-        guard let window = terminalView?.window else { return false }
+        let surfaceId = layoutSurfaceId(for: lastCursorGrid)
+        guard let window = surfaceId == 1 ? terminalView?.window : externalWindows[surfaceId] else { return false }
         return NSApp.isActive && window.occlusionState.contains(.visible) && !window.isMiniaturized
+    }
+
+    /// Arm or stop the blink timer to match `cursorBlinkAllowed` now. For the
+    /// events that change the answer without a blink setting changing: the
+    /// main window being covered or uncovered, and the cursor moving to a
+    /// window whose visibility differs.
+    func refreshCursorBlinkGate() {
+        if cursorBlinkAllowed {
+            if cursorBlinkTimer == nil { resetCursorBlink() }
+        } else if cursorBlinkTimer != nil {
+            stopCursorBlinking()
+        }
     }
 
     /// Get current cursor blink parameters from core (non-blocking).
@@ -5285,12 +5293,10 @@ final class ZonvieCore {
     /// Called when an external grid is closed.
     private func requestExternalWindowCloseFromUser(gridId: Int64) {
         precondition(Thread.isMainThread, "external window close requests must originate on the main thread")
-        guard let winId = externalWindowWinIds[gridId] else {
-            ZonvieCore.appLog("[external_window] user close ignored: no Neovim win id for gridId=\(gridId)")
-            return
-        }
-        ZonvieCore.appLog("[external_window] requesting Neovim close gridId=\(gridId) win=\(winId)")
-        sendCommand("lua pcall(vim.api.nvim_win_close, \(winId), false)")
+        guard let core else { return }
+        // The command is the core's, shared with Windows.
+        let sent = zonvie_core_request_win_close(core, gridId) != 0
+        ZonvieCore.appLog("[external_window] user close gridId=\(gridId) requested=\(sent)")
     }
 
     /// Remove only the installed incarnation identified by both object identity
@@ -5467,14 +5473,16 @@ final class ZonvieCore {
 
     /// Collect layout info for all visible windows. Must be called on main thread.
     /// `includeMainWindow`: all ext_windows operations pass true. Parameter retained for future use.
-    /// Main window is registered as grid 2 (Neovim's default editor grid).
+    /// Entries are OS windows, keyed by the surface id: the main window is 1
+    /// whatever grids it holds, an external window its own root grid. It used
+    /// to be registered as grid 2, which is only the main window's grid until
+    /// that window is externalized — then two entries shared the id and a
+    /// direction search from either one skipped both.
     private func allWindowLayoutInfos(includeMainWindow: Bool = true) -> [WindowLayoutInfo] {
         var result: [WindowLayoutInfo] = []
 
-        // Main window uses grid 2 (the default editor grid), not grid 1 (Neovim's global grid)
         if includeMainWindow, let mainWindow = terminalView?.window {
-            let mainWinId: Int64 = (core != nil) ? zonvie_core_get_win_id(core, 2) : 0
-            result.append(WindowLayoutInfo(gridId: 2, winId: mainWinId, frame: mainWindow.frame, window: mainWindow))
+            result.append(WindowLayoutInfo(gridId: 1, winId: mainWindowTargetWinId(), frame: mainWindow.frame, window: mainWindow))
         }
 
         // External windows (skip special windows like cmdline/popupmenu/msg and hidden windows)
@@ -5486,6 +5494,29 @@ final class ZonvieCore {
         }
 
         return result
+    }
+
+    /// The OS window that shows `gridId`, as a WindowLayoutInfo key: the
+    /// external window that is the grid or hosts it, otherwise the main
+    /// window (1). Owner map only, so it is safe on the main thread.
+    private func layoutSurfaceId(for gridId: Int64) -> Int64 {
+        switch resolveExternalGridRoute(gridId: gridId) {
+        case .externalRoot(let view), .externalLayer(let view):
+            return view.gridId
+        default:
+            return 1
+        }
+    }
+
+    /// The Neovim window a move INTO the main window lands on: the top-left
+    /// split the main window still shows. Grid 2 is only that window until it
+    /// is externalized.
+    private func mainWindowTargetWinId() -> Int64 {
+        guard let core else { return 0 }
+        let mainSplit = getVisibleGridsCached()
+            .filter { $0.gridId > 1 && $0.zindex <= 0 && layoutSurfaceId(for: $0.gridId) == 1 }
+            .min { ($0.startRow, $0.startCol) < ($1.startRow, $1.startCol) }
+        return zonvie_core_get_win_id(core, mainSplit?.gridId ?? 2)
     }
 
     /// Find the nearest window in the given direction from a reference frame.
@@ -5537,11 +5568,12 @@ final class ZonvieCore {
     private func handleWinMove(gridId: Int64, flags: Int32) {
         let infos = allWindowLayoutInfos(includeMainWindow: true)
         ZonvieCore.appLog("[ext_win] handleWinMove: grid=\(gridId) flags=\(flags) infos=\(infos.map { "grid=\($0.gridId) frame=\($0.frame)" })")
-        guard let source = infos.first(where: { $0.gridId == gridId }) else {
+        let sourceId = layoutSurfaceId(for: gridId)
+        guard let source = infos.first(where: { $0.gridId == sourceId }) else {
             ZonvieCore.appLog("[ext_win] handleWinMove: source grid=\(gridId) not found in \(infos.count) windows")
             return
         }
-        guard let target = findWindowInDirection(from: source.frame, refGridId: gridId, direction: flags, count: 1, infos: infos) else {
+        guard let target = findWindowInDirection(from: source.frame, refGridId: sourceId, direction: flags, count: 1, infos: infos) else {
             ZonvieCore.appLog("[ext_win] handleWinMove: no target found for grid=\(gridId) direction=\(flags)")
             return
         }
@@ -5575,7 +5607,8 @@ final class ZonvieCore {
             return a.frame.midX < b.frame.midX
         }
 
-        guard let srcIdx = sorted.firstIndex(where: { $0.gridId == gridId }) else {
+        let sourceId = layoutSurfaceId(for: gridId)
+        guard let srcIdx = sorted.firstIndex(where: { $0.gridId == sourceId }) else {
             ZonvieCore.appLog("[ext_win] handleWinExchange: source grid=\(gridId) not found")
             return
         }
@@ -5731,18 +5764,16 @@ final class ZonvieCore {
 
             ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) direction=\(direction) count=\(count) infos=\(infos.map { "grid=\($0.gridId) win=\($0.winId) frame=\($0.frame)" })")
 
-            guard let current = infos.first(where: { $0.gridId == cursorGrid }) else {
-                ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) not found in infos, fallback to main")
-                // Fallback: use main window (grid 2)
-                if let main = infos.first(where: { $0.gridId == 2 }) {
-                    if let target = findWindowInDirection(from: main.frame, refGridId: 2, direction: direction, count: count, infos: infos) {
-                        targetWin = target.winId
-                    }
-                }
+            // The window the cursor's grid is shown in — a float an external
+            // window hosts is found through its host, which a lookup by grid
+            // id missed and sent back to the main window.
+            let currentId = layoutSurfaceId(for: cursorGrid)
+            guard let current = infos.first(where: { $0.gridId == currentId }) else {
+                ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) not found in infos")
                 return targetWin
             }
 
-            if let target = findWindowInDirection(from: current.frame, refGridId: cursorGrid, direction: direction, count: count, infos: infos) {
+            if let target = findWindowInDirection(from: current.frame, refGridId: currentId, direction: direction, count: count, infos: infos) {
                 targetWin = target.winId
                 ZonvieCore.appLog("[ext_win] handleWinMoveCursor: found target grid=\(target.gridId) win=\(target.winId) frame=\(target.frame)")
             } else {
@@ -6553,19 +6584,17 @@ final class ZonvieCore {
 
         let x = referenceFrame.origin.x + anchorX
 
-        // Below: popup window top edge at anchor row bottom edge
-        let belowY = refTop - anchorY - cellHeight - windowHeight
-        // Above: popup window bottom edge at anchor row top edge
-        let aboveY = refTop - anchorY
-
-        let y: CGFloat
-        if belowY >= referenceFrame.origin.y {
-            y = belowY
-        } else if (aboveY + windowHeight) <= screenTop {
-            y = aboveY
-        } else {
-            y = belowY
-        }
+        // Below or above is the core's rule, shared with Windows. It works
+        // with Y growing downward, which here is the negated screen Y.
+        let popupTopDown = zonvie_core_popupmenu_top(
+            Int32((anchorY - refTop).rounded()),
+            Int32(cellHeight.rounded()),
+            Int32(windowHeight.rounded()),
+            Int32((-referenceFrame.origin.y).rounded()),
+            Int32((-screenTop).rounded())
+        )
+        // Back to AppKit's bottom-left origin.
+        let y = -CGFloat(popupTopDown) - windowHeight
 
         return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
     }
@@ -6804,26 +6833,27 @@ final class ZonvieCore {
         let name: String?
         switch kind {
         case .normal:
-            // A float given a window of its own is drawn in NormalFloat. Any
-            // other window — a split externalized with <C-w>ge — is drawn in
-            // the default background: the core's, the value the main window
-            // clears with. It used to be recovered from the first background
-            // quad of row 0, and the core drops exactly those quads from a
-            // surface root that hosts a float (blur_enabled is always on in
-            // the core), so a split holding a float opened black. Not looked
-            // up by the name "Normal": Neovim sends it as the default colours,
-            // not as a named group, and the lookup reports it missing.
-            if zonvie_core_is_float_external(corePtr, gridId) != 0 {
-                name = "NormalFloat"
-            } else {
-                bg = zonvie_core_get_default_bg(corePtr)
-                return NSColor(
-                    red: CGFloat((bg >> 16) & 0xFF) / 255.0,
-                    green: CGFloat((bg >> 8) & 0xFF) / 255.0,
-                    blue: CGFloat(bg & 0xFF) / 255.0,
-                    alpha: 1.0
-                )
-            }
+            // The default background: the core's, the value the main window
+            // clears with. The core drops a surface root's default-background
+            // runs while it hosts a layer (blur_enabled is always on in the
+            // core), and this fill is what shows under them, so it has to be
+            // that colour whatever the window is. A float given a window of
+            // its own used to be filled with NormalFloat, which painted its
+            // Normal cells — `winhighlight=NormalFloat:Normal` — pink under
+            // a hosted float; its NormalFloat cells arrive as explicit quads
+            // anyway. It was also once recovered from the first background
+            // quad of row 0, exactly the quads the core drops, so a split
+            // holding a float opened black. Not looked up by the name
+            // "Normal": Neovim sends it as the default colours, not as a
+            // named group, and the lookup reports it missing.
+            _ = gridId
+            bg = zonvie_core_get_default_bg(corePtr)
+            return NSColor(
+                red: CGFloat((bg >> 16) & 0xFF) / 255.0,
+                green: CGFloat((bg >> 8) & 0xFF) / 255.0,
+                blue: CGFloat(bg & 0xFF) / 255.0,
+                alpha: 1.0
+            )
         case .cmdline, .msgShow, .msgHistory:
             name = "MsgArea"
         case .popupmenu:
@@ -7191,6 +7221,8 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[cursor_grid_changed] cursor stayed on same gridId=\(gridId), no activation change")
                 return
             }
+            // The blink gate follows the window showing the cursor.
+            self.refreshCursorBlinkGate()
 
             self.externalGridViewsLock.lock()
             // The staged map first, the way resolveGridRoute reads it. A float
