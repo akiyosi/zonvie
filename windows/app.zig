@@ -88,6 +88,12 @@ pub const zonvie_core_quit_confirmed = core.zonvie_core_quit_confirmed;
 pub const zonvie_core_send_stdin_data = core.zonvie_core_send_stdin_data;
 pub const zonvie_core_send_command = core.zonvie_core_send_command;
 pub const zonvie_core_drop_paths = core.zonvie_core_drop_paths;
+pub const zonvie_core_msg_stack_plan = core.zonvie_core_msg_stack_plan;
+pub const zonvie_core_popupmenu_left = core.zonvie_core_popupmenu_left;
+pub const zonvie_core_clamp_window_origin = core.zonvie_core_clamp_window_origin;
+// The values zonvie_core_msg_stack_plan returns (ZONVIE_MSG_STACK_* in the header).
+pub const ZONVIE_MSG_STACK_REPLACE_LAST: c_int = 1;
+pub const ZONVIE_MSG_STACK_APPEND_TO_LAST: c_int = 2;
 pub const zonvie_core_request_win_close = core.zonvie_core_request_win_close;
 pub const zonvie_core_set_preedit = core.zonvie_core_set_preedit;
 pub const zonvie_core_clear_preedit = core.zonvie_core_clear_preedit;
@@ -1557,6 +1563,10 @@ pub const MiniWindowId = enum(u2) {
     showmode = 0,
     showcmd = 1,
     ruler = 2,
+    /// A msg_show routed to the mini view. It had borrowed `showmode`, so it
+    /// overwrote "-- INSERT --" and a later showmode erased it; macOS keeps
+    /// the same separate slot.
+    custom = 3,
 };
 
 /// Mini window state (one per type)
@@ -5321,7 +5331,7 @@ pub const App = struct {
     tabline_state: TablineState = .{},
 
     // Mini view state (showmode/showcmd/ruler)
-    mini_windows: [3]MiniWindowState = .{ .{}, .{}, .{} },
+    mini_windows: [4]MiniWindowState = .{ .{}, .{}, .{}, .{} },
     last_mouse_grid_id: i64 = 1,
 
     owned_by_hwnd: bool = false, //

@@ -1024,11 +1024,6 @@ final class SurfaceCursorSlot {
     var vertexBuffer: MTLBuffer? = nil
     var vertexBufferCap: Int = 0
     var vertexCount: Int = 0
-    /// Fallback scratch for the cursor pass's scroll offsets, used only when
-    /// they exceed setVertexBytes' 4096-byte limit. Stays nil on a surface that
-    /// binds one offset rather than an array.
-    var scrollOffsetBuffer: MTLBuffer? = nil
-    var scrollOffsetBufferCap: Int = 0
 }
 
 /// Where the grid that owns the cursor sits on a surface, and how it moves.
@@ -1155,15 +1150,6 @@ final class SurfaceBufferSet {
     // commit installed in between. Published in ExternalGridView.commitFlush()
     // with committedSetIndex, under the same tripleBufferLock.
     var atlasTextureSnapshot: MTLTexture? = nil
-    // Scroll-offset scratch for bindSurfaceScrollOffsets' fallback path (only
-    // when offsets exceed the 4096-byte setVertexBytes limit — rare). Per-set
-    // because gpuInFlightCount guarantees the previous frame's read of this
-    // slot completed before it is reused. The cursor pass has its own, on the
-    // cursor slot, because the two passes can bind different offsets within
-    // one frame.
-    var scrollOffsetBuffer: MTLBuffer? = nil
-    var scrollOffsetBufferCap: Int = 0
-
     // Detach pool: buffers saved from this set before beginFlush overwrites them.
     // On COW detach, reuse a pool buffer instead of calling device.makeBuffer().
     var detachPoolRowBuffers: [MTLBuffer?] = []
@@ -3449,38 +3435,23 @@ private func dedupSortedSurfaceEdges(_ values: inout [Float]) {
 
 /// Bind scroll offset data to a render encoder, with a dummy entry standing in
 /// for an empty array.
+///
+/// setVertexBytes takes at most 4096 bytes. The offsets are capped upstream
+/// (MetalTerminalView.maxScrollOffsets, 128 × 28 B = 3584 B), so they always
+/// fit; a larger array is a broken cap, asserted in debug and truncated in
+/// release rather than bound past the limit.
 func bindSurfaceScrollOffsets(
     encoder: MTLRenderCommandEncoder,
-    offsets: [GridSurfaceRenderer.ScrollOffset],
-    device: MTLDevice,
-    scratchBuffer: inout MTLBuffer?,
-    scratchCapacity: inout Int
+    offsets: [GridSurfaceRenderer.ScrollOffset]
 ) {
     let maxSetVertexBytesSize = 4096
-    var effectiveCount = UInt32(offsets.count)
-    if !offsets.isEmpty {
+    let stride = MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride
+    let count = min(offsets.count, maxSetVertexBytesSize / stride)
+    assert(count == offsets.count, "scroll offsets exceed setVertexBytes' 4096-byte limit")
+    var effectiveCount = UInt32(count)
+    if count > 0 {
         offsets.withUnsafeBytes { ptr in
-            if ptr.count <= maxSetVertexBytesSize {
-                encoder.setVertexBytes(ptr.baseAddress!, length: ptr.count, index: 1)
-            } else {
-                // Rare path (256+ simultaneous scroll offsets). Reuse the
-                // caller's persistent per-set scratch buffer instead of
-                // calling device.makeBuffer() fresh every time this
-                // triggers — see the SurfaceBufferSet field comments for
-                // why overwriting it here is safe.
-                if scratchBuffer == nil || scratchCapacity < ptr.count {
-                    scratchBuffer = device.makeBuffer(length: ptr.count, options: .storageModeShared)
-                    scratchCapacity = scratchBuffer != nil ? ptr.count : 0
-                }
-                if let buf = scratchBuffer {
-                    memcpy(buf.contents(), ptr.baseAddress!, ptr.count)
-                    encoder.setVertexBuffer(buf, offset: 0, index: 1)
-                } else {
-                    var dummy = GridSurfaceRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
-                    encoder.setVertexBytes(&dummy, length: MemoryLayout<GridSurfaceRenderer.ScrollOffset>.stride, index: 1)
-                    effectiveCount = 0
-                }
-            }
+            encoder.setVertexBytes(ptr.baseAddress!, length: count * stride, index: 1)
         }
     } else {
         var dummy = GridSurfaceRenderer.ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
@@ -3592,7 +3563,6 @@ func bindSurfaceFragmentState(
     viewportMetrics: SurfaceViewportMetrics,
     backgroundAlphaBuffer: MTLBuffer?,
     cursorBlinkBuffer: MTLBuffer?,
-    cursorBlinkVisible: Bool,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand] = [],
     fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval] = []
 ) {
@@ -3603,9 +3573,12 @@ func bindSurfaceFragmentState(
         encoder.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
     }
 
+    // Holds 1 from creation and is never rewritten. The shader reads it only
+    // for DECO_CURSOR fragments, which only the cursor overlay draws, and the
+    // overlay is skipped on the CPU while blink is off. Writing the blink
+    // phase here per pass changed nothing visible, and with two frames in
+    // flight a 0 could reach a frame still drawing its cursor.
     if let blinkBuf = cursorBlinkBuffer {
-        var visible: UInt32 = cursorBlinkVisible ? 1 : 0
-        memcpy(blinkBuf.contents(), &visible, MemoryLayout<UInt32>.size)
         encoder.setFragmentBuffer(blinkBuf, offset: 0, index: 2)
     }
 
@@ -4067,7 +4040,6 @@ func encodeSurfaceCursorOverlay(
         viewportMetrics: viewportMetrics,
         backgroundAlphaBuffer: backgroundAlphaBuffer,
         cursorBlinkBuffer: cursorBlinkBuffer,
-        cursorBlinkVisible: true,
         fixedFloatBands: fixedFloatBands,
         fixedFloatIntervals: fixedFloatIntervals
     )

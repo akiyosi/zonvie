@@ -722,7 +722,7 @@ final class ZonvieCore {
                     core.hasNotifiedReady = true
                     ZonvieCore.appLog("zonvie: posting neovimReadyNotification")
                     DispatchQueue.main.async {
-                        NotificationCenter.default.post(name: ZonvieCore.neovimReadyNotification, object: nil)
+                        NotificationCenter.default.post(name: ZonvieCore.neovimReadyNotification, object: core)
                         // Close devcontainer progress dialog if shown
                         core.hideDevcontainerProgress()
                     }
@@ -1412,7 +1412,7 @@ final class ZonvieCore {
                 DispatchQueue.main.async {
                     NotificationCenter.default.post(
                         name: ZonvieCore.colorschemeDidChangeNotification,
-                        object: nil,
+                        object: me,
                         userInfo: ["bgRGB": bg, "fgRGB": fg]
                     )
                 }
@@ -6020,7 +6020,7 @@ final class ZonvieCore {
         let contentHeight = CGFloat(rows) * cellH / scale
 
         let cmdlinePadding: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlinePadding : 0.0
-        let popupmenuPadding: CGFloat = kind == .popupmenu ? 8.0 : 0.0
+        let popupmenuPadding: CGFloat = kind == .popupmenu ? Self.popupmenuTextInsetPt : 0.0
         let msgPadding: CGFloat = (kind == .msgShow || kind == .msgHistory) ? 8.0 : 0.0
         let shadowMargin: CGFloat = kind == .cmdline ? 150.0 : 0.0
         let cmdlineIconTotalWidth: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
@@ -6259,6 +6259,22 @@ final class ZonvieCore {
     ///
     /// `direction` is returned rather than logged here so that only the
     /// create path logs, as before; the update path runs per geometry update.
+    /// Points the popupmenu draws its grid in from its frame's edges.
+    static let popupmenuTextInsetPt: CGFloat = 8.0
+
+    /// A popupmenu window's left edge: the core's rule, shared with Windows --
+    /// the anchor column less the text inset, shifted left to stay on
+    /// `screen`'s visible frame.
+    static func popupmenuLeft(anchorX: CGFloat, windowWidth: CGFloat, screen: NSScreen?) -> CGFloat {
+        let visible = screen?.visibleFrame
+        return CGFloat(zonvie_core_popupmenu_left(
+            Int32(anchorX.rounded()),
+            Int32(windowWidth.rounded()),
+            Int32(popupmenuTextInsetPt),
+            visible.map { Int32($0.minX.rounded()) } ?? Int32.min,
+            visible.map { Int32($0.maxX.rounded()) } ?? Int32.max))
+    }
+
     private func cmdlinePopupmenuPlacement(
         startCol: Int32,
         cellW: CGFloat,
@@ -6271,8 +6287,10 @@ final class ZonvieCore {
         }
         let cmdlineFrame = cmdlineWindow.frame
         let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
-        let popupmenuPadding: CGFloat = 8.0
-        let x = cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale - popupmenuPadding
+        let x = Self.popupmenuLeft(
+            anchorX: cmdlineFrame.origin.x + cmdlineContentX + CGFloat(startCol) * cellW / scale,
+            windowWidth: windowWidth,
+            screen: cmdlineWindow.screen)
         let gap: CGFloat = 4.0
         let screenTop = (cmdlineWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? CGFloat(Int32.max)
         // Above or below is the core's rule, shared with Windows. It works
@@ -6317,10 +6335,22 @@ final class ZonvieCore {
                 return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
             }
 
-            if let savedOrigin = CmdlineWindow.savedOrigin, let screen = NSScreen.main {
+            // Kept on the screen the saved origin is on (the core's rule,
+            // shared with Windows), not NSScreen.main, which pulled a cmdline
+            // dragged to another screen back to the key window's.
+            if let savedOrigin = CmdlineWindow.savedOrigin,
+               let screen = NSScreen.screens.first(where: { $0.frame.contains(savedOrigin) }) ?? NSScreen.main {
                 let screenFrame = screen.visibleFrame
-                let x = max(screenFrame.minX, min(savedOrigin.x, screenFrame.maxX - containerWidth))
-                let y = max(screenFrame.minY, min(savedOrigin.y, screenFrame.maxY - containerHeight))
+                var cx: Int32 = 0
+                var cy: Int32 = 0
+                zonvie_core_clamp_window_origin(
+                    Int32(savedOrigin.x.rounded()), Int32(savedOrigin.y.rounded()),
+                    Int32(containerWidth.rounded()), Int32(containerHeight.rounded()),
+                    Int32(screenFrame.minX.rounded()), Int32(screenFrame.minY.rounded()),
+                    Int32(screenFrame.maxX.rounded()), Int32(screenFrame.maxY.rounded()),
+                    &cx, &cy)
+                let x = CGFloat(cx)
+                let y = CGFloat(cy)
                 ZonvieCore.appLog("[external_window] cmdline using saved position: (\(x), \(y))")
                 return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
             }
@@ -6516,7 +6546,16 @@ final class ZonvieCore {
         // macOS screen coords (origin = bottom-left, y increases upward)
         let refTop = referenceFrame.origin.y + referenceFrame.height
 
-        let x = referenceFrame.origin.x + anchorX
+        // The popup's text inset is taken off here too: it was only on the
+        // cmdline path, so an anchored popup's text sat one inset right of the
+        // column it completes.
+        let referenceScreen = NSScreen.screens.first {
+            $0.frame.contains(NSPoint(x: referenceFrame.midX, y: referenceFrame.midY))
+        }
+        let x = Self.popupmenuLeft(
+            anchorX: referenceFrame.origin.x + anchorX,
+            windowWidth: windowWidth,
+            screen: referenceScreen ?? NSScreen.main)
 
         // Below or above is the core's rule, shared with Windows. It works
         // with Y growing downward, which here is the negated screen Y.
@@ -7014,7 +7053,7 @@ final class ZonvieCore {
         let cellW = CGFloat(context.renderer.cellWidthPx)
         let cellH = CGFloat(context.renderer.cellHeightPx)
         let oldFrame = context.window.frame
-        let popupmenuPadding: CGFloat = 8.0
+        let popupmenuPadding = Self.popupmenuTextInsetPt
         let contentWidth = CGFloat(cols) * cellW / context.scale
         let contentHeight = CGFloat(rows) * cellH / context.scale
         let containerWidth = contentWidth + (popupmenuPadding * 2)
@@ -7745,21 +7784,19 @@ final class ZonvieCore {
             } else if isMini {
                 self.updateMini(.custom, content: contentStr, timeout: timeoutSec)
             } else {
-                let shouldReplace = replaceLast != 0
-                let shouldAppend = append != 0
-
-                if shouldReplace {
-                    self.pendingMessages.removeAll()
-                    self.pendingMessages.append((kind: kindStr, content: contentStr, hlId: primaryHlId))
-                } else if shouldAppend && !self.pendingMessages.isEmpty {
+                // The stack rule is the core's, shared with Windows.
+                var evict = 0
+                let action = zonvie_core_msg_stack_plan(self.pendingMessages.count, replaceLast, append, &evict)
+                switch Int(action) {
+                case Int(ZONVIE_MSG_STACK_REPLACE_LAST):
+                    self.pendingMessages[self.pendingMessages.count - 1] = (kind: kindStr, content: contentStr, hlId: primaryHlId)
+                case Int(ZONVIE_MSG_STACK_APPEND_TO_LAST):
                     let last = self.pendingMessages.removeLast()
                     self.pendingMessages.append((kind: last.kind, content: last.content + contentStr, hlId: last.hlId))
-                } else {
+                default:
                     self.pendingMessages.append((kind: kindStr, content: contentStr, hlId: primaryHlId))
-                    if self.pendingMessages.count > 5 {
-                        self.pendingMessages.removeFirst()
-                    }
                 }
+                self.pendingMessages.removeFirst(min(evict, self.pendingMessages.count))
 
                 let displayContent = self.pendingMessages.map { $0.content }.joined(separator: "\n")
                 let displayKind = self.pendingMessages.last?.kind ?? kindStr
@@ -8465,6 +8502,10 @@ final class ZonvieCore {
         messageAutoHideWorkItem = nil
         if !isPrompt && timeoutMs > 0 {
             let workItem = DispatchWorkItem { [weak self] in
+                // The messages the user watched go are gone from the stack
+                // too, as on Windows: a later replace_last or push shows only
+                // what is new, not these again.
+                self?.pendingMessages.removeAll()
                 self?.hideMessageWindow()
             }
             messageAutoHideWorkItem = workItem
@@ -8954,9 +8995,12 @@ final class ZonvieCore {
     nonisolated private func onSSHAuthPrompt(prompt: String) {
         ZonvieCore.appLog("[SSH] Password prompt received: \(prompt)")
 
+        // Sent by and observed for this core only: every session registers the
+        // same name, and one prompt used to show an alert in each, cancelling
+        // (stop()) or writing the password into sessions that never asked.
         NotificationCenter.default.post(
             name: ZonvieCore.sshAuthNotification,
-            object: nil,
+            object: self,
             userInfo: ["prompt": prompt]
         )
 
@@ -9160,7 +9204,7 @@ final class ZonvieCore {
     func setupSSHNotificationObserver() {
         sshNotificationObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.sshAuthNotification,
-            object: nil,
+            object: self,
             queue: .main
         ) { [weak self] notification in
             ZonvieCore.appLog("[SSH] Notification received on main thread")

@@ -915,7 +915,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
             decoratedSurface: isDecoratedSurface
         )
 
-        setupScrollbar()
+        installScrollbar()
     }
 
     /// The custom-shader chain this surface draws with. The opaque variant
@@ -1054,22 +1054,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
         return surfaceHadRecentCommit(lastCommitTime: t, withinNs: withinNs)
     }
 
-    private func setupScrollbar() {
-        let scrollbarConfig = ZonvieConfig.shared.scrollbar
-        guard scrollbarConfig.enabled else { return }
-
-        if isDecoratedSurface { return }
-
-        addSubview(verticalScroller)
-
-        if scrollbarConfig.isAlways {
-            verticalScroller.isHidden = false
-            verticalScroller.alphaValue = CGFloat(scrollbarConfig.opacity)
-        } else {
-            verticalScroller.isHidden = true
-            verticalScroller.alphaValue = 0.0
-        }
-    }
+    /// A decorated surface (cmdline, popupmenu, messages) has no scrollbar.
+    override var hostsScrollbar: Bool { !isDecoratedSurface }
 
     private func buildShaderBuffers() {
         // (scroll offset / drawable size buffers removed: now passed via setVertexBytes/setFragmentBytes)
@@ -1864,12 +1850,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
     /// A cursor slot that is neither published nor being read by the GPU.
     /// -1 when nothing is free. Caller holds `lock`.
     private func pickCursorSlotLocked() -> Int {
-        for index in 0..<cursorSlots.count
-        where index != committedCursorSetIndex
-            && cursorGpuInFlightCount[index] == 0 {
-            return index
-        }
-        return -1
+        pickFreeBufferSetIndex(
+            count: cursorSlots.count,
+            committedIndex: committedCursorSetIndex,
+            gpuInFlightCount: cursorGpuInFlightCount)
     }
 
     /// Release one protected GPU read of a cursor slot. Caller holds
@@ -3453,7 +3437,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
                     viewportMetrics: viewportMetrics,
                     backgroundAlphaBuffer: backgroundAlphaBuffer,
                     cursorBlinkBuffer: cursorBlinkBuffer,
-                    cursorBlinkVisible: cursorBlinkStateSnapshot,
                     fixedFloatBands: fixedFloatMask.bands,
                     fixedFloatIntervals: fixedFloatMask.intervals
                 )
@@ -4510,41 +4493,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
 
     override func scrollWheel(with event: NSEvent) {
         guard let main = mainTerminalView else { return }
-        main.noteScrollGesturePhase(event)
-        scrollTargetLock.noteBegan(event)
-
-        let deltaY = event.scrollingDeltaY
-        let deltaX = event.scrollingDeltaX
-        if deltaY == 0 && deltaX == 0 { return }
-
         let location = convert(event.locationInWindow, from: nil)
         let scale = backingScale
-
         // Flip Y coordinate (view origin is bottom-left, grid origin is top-left)
         let pointPx = CGPoint(x: location.x * scale,
                               y: bounds.height * scale - location.y * scale)
-
-        let target = scrollTargetLock.target(for: event) {
-            resolveInputTarget(pointPx: pointPx, requireScrollable: $0)
-        }
-
-        let modifier = main.buildModifierString(from: event.modifierFlags)
-
-        if deltaY != 0 {
-            ZonvieCore.appLog("[ExternalGridView scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
-
-            let newOffset = main.handleScrollInput(
-                gridId: target.gridId,
-                row: target.row,
-                col: target.col,
-                deltaY: deltaY,
-                scale: scale,
-                hasPrecise: event.hasPreciseScrollingDeltas,
-                modifier: modifier
-            )
-
-            if event.hasPreciseScrollingDeltas {
-                ZonvieCore.appLog("[ExternalGridView scroll] offset=\(newOffset)")
+        main.handleGridScrollWheel(
+            event, lock: &scrollTargetLock, scale: scale, logTag: "ExternalGridView scroll",
+            resolve: { resolveInputTarget(pointPx: pointPx, requireScrollable: $0) },
+            afterPrecise: { newOffset in
                 main.serviceSharedScrollStateForExternalView()
                 updateScrollShaderOffset()
                 requestRedraw()
@@ -4554,15 +4511,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
                 if isPaused && newOffset != 0 {
                     activateSurfaceDrawLoop()
                 }
-            }
-        }
-
-        main.handleHorizontalScrollInput(
-            gridId: target.gridId, row: target.row, col: target.col,
-            deltaX: deltaX, deltaY: deltaY, scale: scale,
-            hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
-
-        scrollTargetLock.noteFinished(event)
+            })
     }
 
 }
@@ -4599,7 +4548,7 @@ extension ExternalGridView: IMEPreeditHost {
         let layer = committedSurfaceLayers.first { $0.gridId == cursorGrid }
         lock.unlock()
         guard let layer else { return nil }
-        let scale = window?.backingScaleFactor ?? 1
+        let scale = backingScale
         return CGPoint(x: CGFloat(layer.originPx.x) / scale, y: CGFloat(layer.originPx.y) / scale)
     }
 
@@ -4610,54 +4559,59 @@ extension ExternalGridView: IMEPreeditHost {
     /// count mid-resize; the view's height is its top, as the mouse and the
     /// main window's IME measure it.
     private func imeContentTopPt(rowHeightPt: CGFloat) -> CGFloat {
-        isDecoratedSurface ? viewportOriginPx.y + CGFloat(gridRows) * rowHeightPt : bounds.height
+        guard isDecoratedSurface else { return bounds.height }
+        // The committed row count, under the lock the draw reads it with:
+        // `gridRows` is the core thread's in-flight bracket value, unpublished
+        // and not restored when that bracket is cancelled.
+        lock.lock()
+        let extent = committedExtent
+        lock.unlock()
+        let rows = extent.resolved(liveWidth: gridCols, liveHeight: gridRows).height
+        return viewportOriginPx.y + CGFloat(rows) * rowHeightPt
+    }
+
+    /// The cursor's cell in view points, or nil when the cursor is on another
+    /// surface. Cursor is grid-local; viewportOriginPx adds a decorated
+    /// surface's inset (e.g. the cmdline icon/padding). The overlay and the
+    /// candidate window both come from here.
+    private func imeCursorRectInView() -> NSRect? {
+        guard let core = mainTerminalView?.core else { return nil }
+        let cursor = core.getCursorPositionNonBlocking()
+        guard cursor.row >= 0, cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) else { return nil }
+        let cell = imePreeditCellSize
+        return NSRect(x: viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width,
+                      y: imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height,
+                      width: cell.width, height: cell.height)
     }
 
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
+        if let rect = imeCursorRectInView() { return rect.origin }
         let cell = imePreeditCellSize
-        if let core = mainTerminalView?.core {
-            let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) {
-                // Cursor is grid-local; add viewportOriginPx for decorated
-                // surfaces (e.g. the cmdline icon/padding).
-                let x = viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width
-                let y = imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height
-                return CGPoint(x: x, y: y)
-            }
-        }
         return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
     }
 
     func imeFirstRect() -> NSRect {
         guard let win = window, let main = mainTerminalView else { return .zero }
-        let scale = win.backingScaleFactor
-        let cellW = CGFloat(shared.cellWidthPx) / scale
-        let rowH = CGFloat(shared.cellHeightPx) / scale
-        var screenRow = 0
-        var screenCol = 0
-        var origin = CGPoint.zero
+        if let rect = imeCursorRectInView() {
+            return win.convertToScreen(convert(rect, to: nil))
+        }
         if let core = main.core {
             let cursor = core.getCursorPositionNonBlocking()
             if cursor.row >= 0 && cursor.col >= 0 {
-                if let o = imeCursorGridOriginPt(cursor.gridId) {
-                    screenRow = Int(cursor.row)
-                    screenCol = Int(cursor.col)
-                    origin = o
-                } else {
-                    // The cursor is on another surface -- this window became
-                    // key by Cmd-` or its title bar, which does not move
-                    // Neovim's cursor. Ask the surface showing it, as the main
-                    // window asks an external one. Not this view again: the
-                    // owner map can name it before its layout commits.
-                    let showing = core.externalViewShowing(gridId: cursor.gridId)
-                    if let showing, showing !== self { return showing.imeFirstRect() }
-                    if showing == nil { return main.imeFirstRect() }
-                }
+                // The cursor is on another surface -- this window became key
+                // by Cmd-` or its title bar, which does not move Neovim's
+                // cursor. Ask the surface showing it, as the main window asks
+                // an external one. Not this view again: the owner map can
+                // name it before its layout commits.
+                let showing = core.externalViewShowing(gridId: cursor.gridId)
+                if let showing, showing !== self { return showing.imeFirstRect() }
+                if showing == nil { return main.imeFirstRect() }
             }
         }
-        let cursorXPt = viewportOriginPx.x + origin.x + CGFloat(screenCol) * cellW
-        let cursorYPt = imeContentTopPt(rowHeightPt: rowH) - origin.y - CGFloat(screenRow + 1) * rowH
-        let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
+        let cell = imePreeditCellSize
+        let rectInView = NSRect(x: viewportOriginPx.x,
+                                y: imeContentTopPt(rowHeightPt: cell.height) - cell.height,
+                                width: cell.width, height: cell.height)
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 
@@ -4724,13 +4678,9 @@ extension ExternalGridView {
             }
         }
 
+        applyAlwaysScrollbarVisibility()
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
-        guard scrollbarConfig.enabled && !isDecoratedSurface else { return }
-
-        if scrollbarConfig.isAlways {
-            verticalScroller.isHidden = false
-            verticalScroller.alphaValue = CGFloat(scrollbarConfig.opacity)
-        }
+        guard scrollbarConfig.enabled && hostsScrollbar else { return }
 
         if scrollbarConfig.isHover {
             setupScrollbarHoverTracking()

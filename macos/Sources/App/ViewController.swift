@@ -74,8 +74,8 @@ final class ViewController: NSViewController {
 
         case .menu:
             // Menu mode: no tab UI in the window, full-size terminal.
-            // Notification observers are set up for currentTabs tracking.
-            setupTablineNotificationObservers()
+            // Notification observers (set up below, once the core exists)
+            // keep currentTabs tracking.
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -95,6 +95,14 @@ final class ViewController: NSViewController {
 
         // Create core (init takes no args)
         core = ZonvieCore()
+
+        // Observers filter on this session's core, so they register only
+        // once it exists: registered earlier, `object: core` was nil and
+        // every session's tabline reached this window.
+        if tablineStyle != nil {
+            setupTablineNotificationObservers()
+        }
+        sidebarView?.observeColorschemeChanges(of: core)
 
         // Wire both directions
         core.terminalView = terminalView
@@ -309,12 +317,18 @@ final class ViewController: NSViewController {
             NotificationCenter.default.removeObserver(observer)
             tablineHideObserver = nil
         }
+        // Registered with the other two and re-registered with them, so it
+        // is removed with them too; it used to stack one per restore.
+        if let observer = agentStatusObserver {
+            NotificationCenter.default.removeObserver(observer)
+            agentStatusObserver = nil
+        }
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
         // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
-        if tablineUpdateObserver == nil {
+        if tablineUpdateObserver == nil && ZonvieConfig.shared.effectiveTablineStyle != nil {
             setupTablineNotificationObservers()
         }
         // Present the `--dialog` dialog once, after the window exists so it can
@@ -409,8 +423,6 @@ final class ViewController: NSViewController {
         }
 
         self.tabBarView = tabBar
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Sidebar (sidebar mode)
@@ -466,8 +478,6 @@ final class ViewController: NSViewController {
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Public Tab Bar Control

@@ -4066,7 +4066,7 @@ pub export fn WndProc(
                         .mini => {
                             // Show in mini window
                             const text = dm.text[0..dm.text_len];
-                            messages.updateMiniText(app, .showmode, text);
+                            messages.updateMiniText(app, .custom, text);
                             messages.updateMiniWindows(app);
 
                             // Set auto-hide timer based on timeout (use separate timer for mini)
@@ -4090,26 +4090,38 @@ pub export fn WndProc(
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
                         .ext_float => {
-                            // Floating window: add to display stack
-                            if (req.replace_last != 0) {
-                                app.display_messages.clearRetainingCapacity();
-                            }
-                            if (req.append != 0 and app.display_messages.items.len > 0) {
-                                var last = &app.display_messages.items[app.display_messages.items.len - 1];
-                                const append_len = @min(req.text_len, last.text.len - last.text_len);
-                                @memcpy(last.text[last.text_len..][0..append_len], req.text[0..append_len]);
-                                last.text_len += append_len;
-                                messages.showMessageWindowOnUIThread(app, dm, false);
-                            } else {
-                                var append_failed = false;
-                                app.display_messages.append(app.alloc, dm) catch {
+                            // Floating window: the display stack. The rule is
+                            // the core's, shared with macOS; replace_last
+                            // replaces only the last message, as the UI spec
+                            // says, where this cleared the whole stack.
+                            var evict: usize = 0;
+                            const stack_len = app.display_messages.items.len;
+                            const action = app_mod.zonvie_core_msg_stack_plan(
+                                stack_len,
+                                @intCast(req.replace_last),
+                                @intCast(req.append),
+                                &evict,
+                            );
+                            var append_failed = false;
+                            switch (action) {
+                                app_mod.ZONVIE_MSG_STACK_REPLACE_LAST => app.display_messages.items[stack_len - 1] = dm,
+                                app_mod.ZONVIE_MSG_STACK_APPEND_TO_LAST => {
+                                    var last = &app.display_messages.items[stack_len - 1];
+                                    const append_len = @min(req.text_len, last.text.len - last.text_len);
+                                    @memcpy(last.text[last.text_len..][0..append_len], req.text[0..append_len]);
+                                    last.text_len += append_len;
+                                },
+                                else => app.display_messages.append(app.alloc, dm) catch {
                                     append_failed = true;
-                                };
-                                if (app.display_messages.items.len > 5) {
-                                    _ = app.display_messages.orderedRemove(0);
-                                }
-                                messages.showMessageWindowOnUIThread(app, dm, append_failed);
+                                },
                             }
+                            // The eviction counted the push; a push that failed
+                            // made no room to take back.
+                            const drop = if (append_failed) 0 else evict;
+                            for (0..@min(drop, app.display_messages.items.len)) |_| {
+                                _ = app.display_messages.orderedRemove(0);
+                            }
+                            messages.showMessageWindowOnUIThread(app, dm, append_failed);
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                             const timeout_ms = messageTimerMilliseconds(dm.timeout);
                             if (timeout_ms > 0) {
@@ -4546,7 +4558,7 @@ pub export fn WndProc(
                 // Kill the timer and hide mini window (showmode slot)
                 _ = c.KillTimer(hwnd, TIMER_MINI_AUTOHIDE);
                 if (getApp(hwnd)) |app| {
-                    messages.updateMiniText(app, .showmode, "");
+                    messages.updateMiniText(app, .custom, "");
                     messages.updateMiniWindows(app);
                 }
             } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE) {
@@ -6230,10 +6242,12 @@ pub export fn WndProc(
                 const y = pos.y;
 
                 // Handle tabline/sidebar drag or hover (when ext_tabline enabled).
-                // An editor drag keeps going over the chrome, as its release
-                // does (press_reached_editor): the chrome neither consumes the
-                // move nor lights a hover under it.
-                const editor_drag = app.mouse_button_held != 0 and app.mouse_press_grid_id != 0;
+                // An editor or scrollbar-knob drag keeps going over the chrome,
+                // as its release does (press_reached_editor, and the scrollbar
+                // release ahead of the chrome branches): the chrome neither
+                // consumes the move nor lights a hover under it.
+                const editor_drag = app.scrollbar_dragging or
+                    (app.mouse_button_held != 0 and app.mouse_press_grid_id != 0);
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
                         if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
@@ -6267,7 +6281,14 @@ pub export fn WndProc(
                         else
                             x < @as(i16, @intCast(sb_w3));
 
-                        if (app.tabline_state.dragging_tab != null or (!editor_drag and in_sb3)) {
+                        // A pressed close/new-tab button keeps getting moves
+                        // wherever the pointer goes: its "left the button,
+                        // cancel" check lives there, and the release fires
+                        // the button unconditionally. Gated on the sidebar,
+                        // a press dragged into the editor still ran tabnew.
+                        const sidebar_button_pressed = app.tabline_state.close_button_pressed != null or
+                            app.tabline_state.new_tab_button_pressed;
+                        if (app.tabline_state.dragging_tab != null or sidebar_button_pressed or (!editor_drag and in_sb3)) {
                             tabline_mod.handleSidebarMouseMove(app, hwnd, @as(c_int, x), @as(c_int, y));
                             // Consume event: sidebar area is UI, not Neovim editor input
                             return 0;
@@ -6520,7 +6541,7 @@ pub export fn WndProc(
                     // The blink timer stops with the app, as on macOS.
                     input.pauseCursorBlinking(hwnd, app);
                     // App is being deactivated - hide mini and message windows
-                    inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+                    inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
                         const idx = @intFromEnum(id);
                         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
                             _ = c.ShowWindow(mini_hwnd, c.SW_HIDE);

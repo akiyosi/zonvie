@@ -556,23 +556,6 @@ pub const Core = struct {
     // Reusable scratch buffers (zero-allocation hot path)
     row_cells: RenderCells = .{},
     grid_entries: c_api.render_layout.List(GridEntry) = .{},
-    // Sort scratch for float overlays anchored to an external grid — same
-    // (zindex, compindex, order, grid_id) ordering as grid_entries, but kept
-    // separate since it's populated by a different function
-    // (sendExternalGridVerticesFiltered) that can run within the same flush
-    // cycle as the main composite path that owns grid_entries.
-    ext_float_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
-    // One win_pos scan per flush, grouped by external anchor and layer order.
-    ext_float_anchor_entries: std.ArrayListUnmanaged(flush.ExternalFloatAnchorEntry) = .empty,
-    ext_float_anchor_index_valid: bool = false,
-    // Flush-local row index for floats composited into an external grid.
-    // Entries are built once per anchor grid, sorted once, then referenced by
-    // per-row buckets so dirty rows never rescan/sort the full win_pos map.
-    ext_float_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_entry_indices: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_index_valid: bool = false,
-    ext_float_index_generation: u64 = 0,
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
@@ -997,14 +980,6 @@ pub const Core = struct {
     /// Maps each shaping_scalars entry back to its composited column index.
     shaping_src_cols: std.ArrayListUnmanaged(u32) = .empty,
 
-    /// Pointer to the float overlay overflow map for the current ext grid.
-    /// Set during ext grid composition, null during main grid / non-ext-grid paths.
-    flush_float_overlay: ?*const flush.FloatOverlayMap = null,
-
-    /// Persistent float overlay map reused across flushes (avoids per-flush allocation).
-    /// Cleared and repopulated for each ext grid that has float overlays.
-    flush_float_overlay_buf: flush.FloatOverlayMap = .{},
-
     /// Per-instance emoji cluster context for the current rasterize callback.
     /// Set during flush vertex generation, read by on_rasterize_glyph callbacks.
     emoji_cluster_buf: [16]u32 = undefined,
@@ -1260,11 +1235,6 @@ pub const Core = struct {
         for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
         self.grid_entries.deinit();
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_entry_indices.deinit(self.alloc);
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
@@ -1289,7 +1259,6 @@ pub const Core = struct {
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
         self.shaping_src_cols.deinit(self.alloc);
-        self.flush_float_overlay_buf.deinit(self.alloc);
 
         // Glow state.
         self.freeGlowGroupNames();
@@ -1663,23 +1632,6 @@ pub const Core = struct {
         self.last_cmd_len = 0;
         self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
-
-        // External-float scratch is bounded during a session, but a hostile
-        // previous peer may have driven it to that high-water mark. Session
-        // changes are cold paths, so release rather than retain these buffers.
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries = .empty;
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_entries = .empty;
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_offsets = .empty;
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets = .empty;
-        self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.ext_float_row_entry_indices = .empty;
-        self.ext_float_anchor_index_valid = false;
-        self.ext_float_row_index_valid = false;
-        self.ext_float_index_generation +%= 1;
 
         self.log.write("resetProtocolState: cleared UI protocol state (transport_reset={any})\n", .{reset_transport});
     }
@@ -4912,7 +4864,8 @@ pub const Core = struct {
     /// Open files with `:drop` -- all in one command -- or `:tab drop`, one
     /// per file. The paths go as arguments and the server escapes them with
     /// its own fnameescape, so the rules are the server OS's, not a table
-    /// each frontend kept.
+    /// each frontend kept. A file that fails (a swap-file prompt, say) is
+    /// reported and the rest still open, as separate typed commands did.
     pub fn requestDropPaths(self: *Core, paths: []const []const u8, tab_per_file: bool) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
@@ -4926,10 +4879,14 @@ pub const Core = struct {
         const lua_code =
             \\local tab_per_file, paths = ...
             \\local esc = vim.tbl_map(vim.fn.fnameescape, paths)
+            \\local function run(cmd)
+            \\  local ok, err = pcall(vim.cmd, cmd)
+            \\  if not ok then vim.notify(tostring(err), vim.log.levels.ERROR) end
+            \\end
             \\if tab_per_file then
-            \\  for _, p in ipairs(esc) do vim.cmd('tab drop ' .. p) end
+            \\  for _, p in ipairs(esc) do run('tab drop ' .. p) end
             \\elseif #esc > 0 then
-            \\  vim.cmd('drop ' .. table.concat(esc, ' '))
+            \\  run('drop ' .. table.concat(esc, ' '))
             \\end
         ;
         try self.sendRequestHeader(buf, id, "nvim_exec_lua");
@@ -7006,9 +6963,6 @@ test "session reset republishes the latest desired resize" {
     // cleared, but the queue can still be discarded by reconnect cleanup.
     core.pending_resize_valid = false;
     core.ui_attached.store(true, .release);
-    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, 32);
-    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 32);
-    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, 32);
     try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
     try core.hl.setGroup("SessionOnly", 9);
 
@@ -7017,9 +6971,6 @@ test "session reset republishes the latest desired resize" {
     try std.testing.expect(core.pending_resize_valid);
     try std.testing.expectEqual(@as(u32, 47), core.pending_resize_rows);
     try std.testing.expectEqual(@as(u32, 113), core.pending_resize_cols);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
     try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
     try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
 }

@@ -3207,7 +3207,7 @@ pub fn queueExternalWindowResizes(
 
         if (ext_win.is_pending_close) continue;
 
-        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id);
+        const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
         var content_w: c_int = @as(c_int, @intCast(ext_win.surface.cols * cell_w)) + insets.w;
         const content_h: c_int = @as(c_int, @intCast(ext_win.surface.rows * cell_h)) + insets.h;
         content_w = external_windows.clampCmdlineWidthToWorkArea(app, grid_id, content_w);

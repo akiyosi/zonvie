@@ -4010,13 +4010,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             enc.setFragmentSamplerState(shared.sampler!, index: 0)
 
             // Bind scroll offsets, fragment state (drawable size, alpha, blink) via shared helpers
-            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot, device: shared.device, scratchBuffer: &committed.scrollOffsetBuffer, scratchCapacity: &committed.scrollOffsetBufferCap)
+            bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot)
             bindSurfaceFragmentState(
                 encoder: enc,
                 viewportMetrics: viewportMetrics,
                 backgroundAlphaBuffer: backgroundAlphaBuffer,
                 cursorBlinkBuffer: cursorBlinkBuffer,
-                cursorBlinkVisible: true,  // always visible; cursor drawn as separate overlay pass
                 fixedFloatBands: fixedFloatBandsSnapshot,
                 fixedFloatIntervals: fixedFloatIntervalsSnapshot
             )
@@ -4436,13 +4435,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // for the cursor pass: the loop above narrowed both to whatever
                 // the last layer needed.
                 bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
-                bindSurfaceScrollOffsets(
-                    encoder: enc,
-                    offsets: scrollSnapshot,
-                    device: shared.device,
-                    scratchBuffer: &committed.scrollOffsetBuffer,
-                    scratchCapacity: &committed.scrollOffsetBufferCap
-                )
+                bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot)
             }
 
             // === PERF LOG: encode_rows → encode_finalize boundary ===
@@ -4498,17 +4491,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         enc.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
                     }
 
-                    var extractScrollCount = UInt32(scrollSnapshot.count)
-                    if !scrollSnapshot.isEmpty {
-                        scrollSnapshot.withUnsafeBytes { ptr in
-                            enc.setVertexBytes(ptr.baseAddress!, length: ptr.count, index: 1)
-                        }
-                    } else {
-                        var dummy = ScrollOffset(grid_id: 0, offset_y: 0, content_top_y: 0, content_bottom_y: 0)
-                        enc.setVertexBytes(&dummy, length: MemoryLayout<ScrollOffset>.stride, index: 1)
-                        extractScrollCount = 0
-                    }
-                    enc.setVertexBytes(&extractScrollCount, length: MemoryLayout<UInt32>.size, index: 2)
+                    bindSurfaceScrollOffsets(encoder: enc, offsets: scrollSnapshot)
                     var zeroTrans: Float = 0
                     enc.setVertexBytes(&zeroTrans, length: MemoryLayout<Float>.size, index: 3)
 
@@ -4561,18 +4544,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                     enc.setRenderPipelineState(extractPipe)
                                 }
                                 for row in 0..<rowCount {
-                                    let slot = set.rowLogicalToSlot[row]
-                                    guard slot >= 0, slot < set.rowState.buffers.count,
-                                          let vb = set.rowState.buffers[slot],
-                                          set.rowState.counts[slot] > 0
-                                    else { continue }
-                                    let sourceRow = slot < set.rowSlotSourceRows.count
-                                        ? set.rowSlotSourceRows[slot]
-                                        : row
-                                    var rt = Float(row - sourceRow) * Float(cellHi)
+                                    // The shared lookup, which also bounds
+                                    // the slot against `counts`.
+                                    guard let resolved = resolveSurfaceGridRow(set, row: row, cellHeightPx: Float(cellHi)) else { continue }
+                                    var rt = resolved.translationY
                                     enc.setVertexBytes(&rt, length: MemoryLayout<Float>.size, index: 3)
-                                    enc.setVertexBuffer(vb, offset: 0, index: 0)
-                                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: set.rowState.counts[slot])
+                                    enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+                                    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
                                 }
                                 for i in 0..<retainedForGlowCount {
                                     let r = retainedSnapshot[retainedIndexScratch[i]]
@@ -4802,13 +4780,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         gpuSampler.attachStats(to: cursorRPD, label: "cursor")
                     },
                     bindScrollOffsets: { cursorEnc in
-                        bindSurfaceScrollOffsets(
-                            encoder: cursorEnc,
-                            offsets: scrollSnapshot,
-                            device: shared.device,
-                            scratchBuffer: &committedCursor.scrollOffsetBuffer,
-                            scratchCapacity: &committedCursor.scrollOffsetBufferCap
-                        )
+                        bindSurfaceScrollOffsets(encoder: cursorEnc, offsets: scrollSnapshot)
                     }
                 )
                 if !cursorEncoded {

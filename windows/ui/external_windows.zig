@@ -69,7 +69,7 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
 /// message window was open sent it back one copy-button width too narrow.
 pub const ExternalSurfaceInsets = struct { w: c_int, h: c_int };
 
-pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
+pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64, dpi_scale: f32) ExternalSurfaceInsets {
     const kind = classifyExternalSurface(grid_id);
     const is_cmdline = kind == .cmdline;
     const is_msg = kind == .msg_show or kind == .msg_history;
@@ -83,7 +83,7 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
     // sizing without it lost columns under the strip and shrank the grid on
     // the next user resize.
     const scrollbar_strip: c_int = if (kind == .normal and app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
-        @intFromFloat(app_mod.scrollbarReservedWidth(app.dpi_scale))
+        @intFromFloat(app_mod.scrollbarReservedWidth(dpi_scale))
     else
         0;
 
@@ -1433,7 +1433,12 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
 
-    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    const surface_dpi_scale: f32 = blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        break :blk if (app.external_windows.get(req.grid_id)) |w| w.dpi_scale else app.dpi_scale;
+    };
+    const insets = externalSurfaceInsetsPx(app, req.grid_id, surface_dpi_scale);
     var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
     const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
     client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
@@ -1524,7 +1529,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const is_msg_show = (req.grid_id == app_mod.MESSAGE_GRID_ID);
     const is_msg_history = (req.grid_id == app_mod.MSG_HISTORY_GRID_ID);
 
-    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    const insets = externalSurfaceInsetsPx(app, req.grid_id, app.dpi_scale);
     var client_w: c_int = content_w + insets.w;
     const client_h: c_int = content_h + insets.h;
     client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
@@ -1608,6 +1613,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
                 pos_x = client_pt.x + px_x;
                 if (is_popupmenu) {
+                    pos_x = popupmenuPositionX(pos_x, window_w, ahwnd);
                     pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, ahwnd);
                 } else {
                     pos_y = client_pt.y + px_y;
@@ -1632,6 +1638,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
                 pos_x = client_pt.x + px_x;
                 if (is_popupmenu) {
+                    pos_x = popupmenuPositionX(pos_x, window_w, main_hwnd);
                     pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, main_hwnd);
                 } else {
                     pos_y = client_pt.y + px_y;
@@ -1670,11 +1677,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             app.mu.unlock(core.clock.io());
 
             if (saved_x != null and saved_y != null) {
-                // Use saved position, but ensure window stays on screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @max(0, @min(saved_x.?, screen_w - window_w));
-                pos_y = @max(0, @min(saved_y.?, screen_h - window_h));
+                // Use saved position, kept inside the work area of the
+                // monitor it is on. SM_CXSCREEN/SM_CYSCREEN are the primary
+                // monitor: a cmdline dragged to another monitor was pulled
+                // back to it, and one left of it (negative x) to x=0.
+                var work: c.RECT = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+                var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+                const saved_pt: c.POINT = .{ .x = saved_x.?, .y = saved_y.? };
+                const monitor = c.MonitorFromPoint(saved_pt, c.MONITOR_DEFAULTTONEAREST);
+                if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) work = monitor_info.rcWork;
+                // The core's rule, shared with macOS.
+                app_mod.zonvie_core_clamp_window_origin(saved_x.?, saved_y.?, window_w, window_h, work.left, work.top, work.right, work.bottom, &pos_x, &pos_y);
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window using saved position: ({d},{d})\n", .{ pos_x, pos_y });
             } else {
                 // Default: center on screen
@@ -1700,8 +1714,8 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 // Position above cmdline window with small gap. The popupmenu
                 // draws at its client origin (decoratedContentOriginPx), so
                 // its column lines up with no inset to subtract.
-                pos_x = cmdline_rect.left + cmdline_content_x +
-                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
+                pos_x = popupmenuPositionX(cmdline_rect.left + cmdline_content_x +
+                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)), window_w, cw.hwnd);
                 // Above or below is the core's rule, shared with macOS.
                 var screen_top: c_int = std.math.minInt(c_int);
                 var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
@@ -2426,7 +2440,7 @@ pub export fn ExternalWndProc(
                     }
                 }
                 // Check if this is a mini window
-                inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+                inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
                     const idx = @intFromEnum(id);
                     if (app.mini_windows[idx].hwnd) |mini_hwnd| {
                         if (mini_hwnd == hwnd) {
@@ -3361,6 +3375,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // avoids needless non-blocking atlas-reset abort/retry cycles.
     const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
     const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
+    const glow_radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else @as(f32, 1.0);
 
     app.mu.lockUncancelable(core.clock.io());
 
@@ -3783,6 +3798,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                     return;
                 }
             }
+            // The blur reads the radius from the renderer, and only the shared
+            // row pass set it: a decorated surface never runs that pass, so
+            // its glow stayed at the default radius.
+            g.glow_radius_scale = glow_radius_scale;
             drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.flat_draw_scratch, glow_enabled, glow_intensity) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow decorated draw failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
@@ -3965,6 +3984,22 @@ fn showingSurfaceIdLocked(app: *App, grid_id: i64) i64 {
 /// macOS. It used to flip only at the monitor work area, so near the bottom
 /// of a window that was not at the bottom of the screen the popup hung below
 /// the window here and flipped up on macOS.
+/// Popupmenu X: the anchor column (the Windows popupmenu draws at its client
+/// origin, so no text inset), shifted left to stay inside the work area of the
+/// monitor holding the reference window -- the core's rule, shared with macOS.
+fn popupmenuPositionX(anchor_left: c_int, popup_w: c_int, ref_hwnd: c.HWND) c_int {
+    var screen_left: c_int = std.math.minInt(c_int);
+    var screen_right: c_int = std.math.maxInt(c_int);
+    var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+    const monitor = c.MonitorFromWindow(ref_hwnd, c.MONITOR_DEFAULTTONEAREST);
+    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) {
+        screen_left = monitor_info.rcWork.left;
+        screen_right = monitor_info.rcWork.right;
+    }
+    return app_mod.zonvie_core_popupmenu_left(anchor_left, popup_w, 0, screen_left, screen_right);
+}
+
 fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd: c.HWND) c_int {
     // The reference window's client bottom, in screen coordinates.
     var ref_bottom: c_int = std.math.maxInt(c_int);
