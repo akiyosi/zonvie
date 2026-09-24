@@ -365,28 +365,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     // and scales the bounce decay by actual elapsed time.
     private var lastScrollEdgeTickTime: CFAbsoluteTime = 0
 
-    // --- Scrollbar ---
-    private lazy var verticalScroller: NSScroller = {
-        let scroller = NSScroller()
-        scroller.scrollerStyle = .legacy
-        scroller.controlSize = .regular
-        scroller.knobProportion = 0.2  // Initial value
-        scroller.isEnabled = true
-        scroller.alphaValue = 0.0  // Hidden initially
-        scroller.target = self
-        scroller.action = #selector(scrollerDidScroll(_:))
-        return scroller
-    }()
-    // Created on first use, never from deinit: forming `[weak self]` while
-    // self is deallocating traps.
-    private var createdScrollbarController: SurfaceScrollbarController?
-    private var scrollbarController: SurfaceScrollbarController {
-        if let controller = createdScrollbarController { return controller }
-        let controller = SurfaceScrollbarController(
-            scroller: verticalScroller, surfaceId: 1, core: { [weak self] in self?.core })
-        createdScrollbarController = controller
-        return controller
-    }
+    override var scrollbarCore: ZonvieCore? { core }
 
     /// Scroll offset below this threshold (in pixels) is treated as zero and removed.
     /// Used consistently in processPendingScrollClears, updateScrollShaderOffset,
@@ -1152,7 +1131,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     deinit {
-        createdScrollbarController?.invalidate()
         msgTimer?.invalidate()
         msgTimer = nil
         // Belt-and-suspenders: viewDidMoveToWindow(nil) already disarms (and
@@ -1333,13 +1311,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     private func layoutScrollbar() {
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        verticalScroller.frame = NSRect(
-            x: bounds.width - scrollerWidth,
-            y: 0,
-            width: scrollerWidth,
-            height: bounds.height
-        )
+        layoutScrollbarFrame()
 
         // Update hover tracking area if hover mode is enabled
         let config = ZonvieConfig.shared.scrollbar
@@ -1440,18 +1412,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
     func updateScrollbarIfNeeded() {
         scrollbarController.update()
-    }
-
-    private func showScrollbar() {
-        scrollbarController.show()
-    }
-
-    private func hideScrollbar() {
-        scrollbarController.hide()
-    }
-
-    @objc private func scrollerDidScroll(_ sender: NSScroller) {
-        scrollbarController.scrollerDidScroll(sender)
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -1813,12 +1773,12 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
     // MARK: - Smooth Scrolling
 
-    /// Scroll target locked at the start of a trackpad gesture. Subsequent
-    /// events (including momentum) scroll this grid even if the pointer drifts
-    /// over another grid. Cleared when the gesture and its momentum finish.
-    private var lockedScrollTarget: (gridId: Int64, row: Int32, col: Int32)?
+    private var scrollTargetLock = ScrollTargetLock()
 
+    /// Shared by this view and every external grid view, like the vertical
+    /// scroll state; a new gesture or a new target grid starts it empty.
     private var horizontalScroll = HorizontalScrollAccumulator()
+    private var horizontalScrollGridId: Int64 = 0
 
     /// Send the horizontal part of a scroll input. Shared with external grid
     /// views, like handleScrollInput.
@@ -1828,48 +1788,39 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         hasPrecise: Bool, modifier: String
     ) {
         guard let core else { return }
-        // Neovim's default 'mousescroll' hor:6 moves six columns per event;
-        // paying one event per six cells keeps the text with the finger.
-        let stepPx = CGFloat(renderer.cellWidthPx) * 6
+        if gridId != horizontalScrollGridId {
+            horizontalScroll = HorizontalScrollAccumulator()
+            horizontalScrollGridId = gridId
+        }
+        // 'mousescroll' hor: columns one event moves. Paying one event per
+        // that many cells keeps the text with the finger; 0 disables it.
+        let colsPerEvent = core.getMouseScrollHor()
+        guard colsPerEvent > 0 else { return }
+        let stepPx = CGFloat(renderer.cellWidthPx) * CGFloat(colsPerEvent)
         let steps = horizontalScroll.consume(
             deltaX: deltaX, deltaY: deltaY, precise: hasPrecise, scale: scale, stepPx: stepPx)
         guard steps != 0 else { return }
+        // AppKit turns Shift + a vertical mouse wheel into horizontal deltas.
+        // That Shift chose the axis; passed on, it would make every notch
+        // <S-ScrollWheelLeft>, a whole page.
+        let axisSwapped = !hasPrecise && deltaY == 0 && modifier.contains("S")
+        let sentModifier = axisSwapped ? modifier.replacingOccurrences(of: "S", with: "") : modifier
         let direction = steps > 0 ? "left" : "right"
         for _ in 0..<abs(steps) {
-            core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
+            core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: sentModifier)
         }
     }
 
     override func scrollWheel(with event: NSEvent) {
         noteScrollGesturePhase(event)
-        // A gesture's .began carries no delta, so it is dropped by the check
-        // below before the lock is consulted. Retire the previous gesture's
-        // target here or the first .changed event finds a stale lock and the
-        // whole new gesture drives the grid the last one did.
-        if event.phase.contains(.began) { lockedScrollTarget = nil }
+        scrollTargetLock.noteBegan(event)
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
         if deltaY == 0 && deltaX == 0 { return }
 
         let location = convert(event.locationInWindow, from: nil)
-
-        // Determine the grid to scroll. For trackpad (precise) gestures the
-        // target is resolved once at gesture start and held for the whole
-        // gesture + momentum, so the scroll stays on the grid the gesture began
-        // over even if the pointer later drifts over a scrollable float (req #2).
-        // Mouse-wheel events resolve per event.
-        let target: (gridId: Int64, row: Int32, col: Int32)
-        let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
-        if event.hasPreciseScrollingDeltas && isGesture {
-            if event.phase.contains(.began) || lockedScrollTarget == nil {
-                lockedScrollTarget = resolveScrollTarget(at: location)
-            }
-            target = lockedScrollTarget ?? resolveScrollTarget(at: location)
-        } else {
-            // Mouse wheel, or a phase-less precise event with no gesture lifecycle:
-            // resolve per event and drop any stale lock so it is never reused.
-            lockedScrollTarget = nil
-            target = resolveScrollTarget(at: location)
+        let target = scrollTargetLock.target(for: event) {
+            resolveScrollTarget(at: location, requireScrollable: $0)
         }
 
         let scale = window?.backingScaleFactor ?? 2.0
@@ -1903,13 +1854,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             deltaX: deltaX, deltaY: deltaY, scale: scale,
             hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
 
-        // Release the lock once the gesture and its inertia have finished. The
-        // gesture's own .ended is not released here so momentum keeps the same
-        // target; a fresh gesture re-locks on its .began.
-        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
-            || event.phase.contains(.cancelled) {
-            lockedScrollTarget = nil
-        }
+        scrollTargetLock.noteFinished(event)
     }
 
     /// Track the trackpad gesture lifecycle for the edge bounce. A held
@@ -1917,6 +1862,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     /// soon as they lift. Called from scrollWheel of this view and of external
     /// grid views (shared scroll state).
     func noteScrollGesturePhase(_ event: NSEvent) {
+        if event.phase.contains(.began) { horizontalScroll = HorizontalScrollAccumulator() }
         // Written on the main thread, read on the core thread by
         // processPendingScrollClears when it decides who owns a scroll — so
         // the writes take the same lock that read is already holding.
@@ -3452,7 +3398,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     /// Resolve which grid a scroll at `point` should target. A non-scrollable
     /// float overlay is transparent to scrolling, so the scroll falls through to
     /// the topmost window beneath it (req #1). Returns grid-local row/col.
-    private func resolveScrollTarget(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
+    private func resolveScrollTarget(at point: CGPoint, requireScrollable: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core, let geo = pointerGeometry(at: point) else { return (1, 0, 0) }
         let globalRow = geo.globalRow
         let globalCol = geo.globalCol
@@ -3460,7 +3406,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // grid directly beneath one — another float or the base window — shows
         // through (req #1).
         _ = core.getVisibleGridsCached()
-        let target = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: true)
+        let target = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: requireScrollable)
         guard let t = target else { return (1, globalRow, globalCol) }
         return (t.gridId, t.row, t.col)
     }
@@ -3606,6 +3552,47 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 }
 
 // MARK: - NSTextInputClient (IME support)
+/// The grid a scroll event drives. A trackpad gesture resolves once at its
+/// start and keeps that target through its momentum, so a pointer drifting
+/// across a float's edge mid-gesture cannot hand the rest of the scroll to
+/// another grid; a wheel resolves per event. One per view.
+struct ScrollTargetLock {
+    typealias Target = (gridId: Int64, row: Int32, col: Int32)
+    private var locked: Target?
+
+    /// Call first for every event, delta or not: a gesture's .began carries
+    /// no delta, and the previous gesture's target must not survive into it.
+    mutating func noteBegan(_ event: NSEvent) {
+        if event.phase.contains(.began) { locked = nil }
+    }
+
+    /// `resolve` takes whether the grid must be able to scroll: "can scroll"
+    /// is a line-count test, a vertical rule, so a sideways scroll does not
+    /// ask it.
+    mutating func target(for event: NSEvent, resolve: (_ requireScrollable: Bool) -> Target) -> Target {
+        let requireScrollable = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
+        let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
+        guard event.hasPreciseScrollingDeltas && isGesture else {
+            // A wheel, or a phase-less precise event: never reuse a stale lock.
+            locked = nil
+            return resolve(requireScrollable)
+        }
+        if let locked { return locked }
+        let resolved = resolve(requireScrollable)
+        locked = resolved
+        return resolved
+    }
+
+    /// Release once the gesture and its inertia are done. The gesture's own
+    /// .ended keeps the lock so momentum stays on the same grid.
+    mutating func noteFinished(_ event: NSEvent) {
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
+            || event.phase.contains(.cancelled) {
+            locked = nil
+        }
+    }
+}
+
 /// The input side the main grid view and every external grid view share: the
 /// NSTextInputClient glue over the shared IME controller, the input context,
 /// and first-responder acceptance. It is a class, not a protocol extension,
@@ -3620,9 +3607,12 @@ class GridInputView: MTKView, NSTextInputClient {
     }()
     private var _inputContext: NSTextInputContext?
 
-    // Declared so the subclasses' nonisolated deinits have a nonisolated
-    // declaration to override; the implicit one here is main-actor isolated.
-    nonisolated deinit {}
+    // Nonisolated so the subclasses' nonisolated deinits have one to
+    // override; the implicit one here would be main-actor isolated. The
+    // scrollbar's hide timer is invalidated to break its run-loop retain.
+    nonisolated deinit {
+        createdScrollbarController?.invalidate()
+    }
 
     override var inputContext: NSTextInputContext? {
         if _inputContext == nil {
@@ -3673,6 +3663,58 @@ class GridInputView: MTKView, NSTextInputClient {
     /// Unbound key commands from interpretKeyEvents are swallowed. Passing
     /// them up the responder chain beeps.
     override func doCommand(by selector: Selector) {}
+
+    // --- Scrollbar ---
+
+    /// The surface the scrollbar reads and acts on: 1 for the main window,
+    /// an external window's root grid for its own.
+    var scrollbarSurfaceId: Int64 { 1 }
+    var scrollbarCore: ZonvieCore? { nil }
+
+    lazy var verticalScroller: NSScroller = {
+        let scroller = NSScroller()
+        scroller.scrollerStyle = .legacy
+        scroller.controlSize = .regular
+        scroller.knobProportion = 0.2  // Initial value
+        scroller.isEnabled = true
+        scroller.alphaValue = 0.0  // Hidden initially
+        scroller.target = self
+        scroller.action = #selector(scrollerDidScroll(_:))
+        return scroller
+    }()
+    // Created on first use, never from deinit: forming `[weak self]` while
+    // self is deallocating traps.
+    private var createdScrollbarController: SurfaceScrollbarController?
+    var scrollbarController: SurfaceScrollbarController {
+        if let controller = createdScrollbarController { return controller }
+        let controller = SurfaceScrollbarController(
+            scroller: verticalScroller, surfaceId: scrollbarSurfaceId, core: { [weak self] in self?.scrollbarCore })
+        createdScrollbarController = controller
+        return controller
+    }
+
+    /// Pin the scroller to the right edge, full height.
+    func layoutScrollbarFrame() {
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        verticalScroller.frame = NSRect(
+            x: bounds.width - scrollerWidth,
+            y: 0,
+            width: scrollerWidth,
+            height: bounds.height
+        )
+    }
+
+    func showScrollbar() {
+        scrollbarController.show()
+    }
+
+    func hideScrollbar() {
+        scrollbarController.hide()
+    }
+
+    @objc func scrollerDidScroll(_ sender: NSScroller) {
+        scrollbarController.scrollerDidScroll(sender)
+    }
 }
 
 // MARK: - Shared IME preedit handling
@@ -4113,14 +4155,12 @@ extension MetalTerminalView {
 
         guard !urls.isEmpty, let core = core else { return false }
 
-        let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
-
         if dropInsertsPath {
             // Built-in command line is up: insert paths at the cursor.
-            core.sendInput(paths)
+            core.sendInput(urls.map { escapePathForNeovim($0.path) }.joined(separator: " "))
         } else {
             // Buffer drop: open the files.
-            core.sendCommand("drop \(paths)")
+            core.dropPaths(urls.map { $0.path }, tabPerFile: false)
         }
         return true
     }

@@ -1086,6 +1086,9 @@ pub const Core = struct {
     // 'ver:0' disables mouse scrolling in Neovim and reports 0, which the
     // frontend treats as "no row count to reason with".
     mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
+    // Columns one horizontal wheel event scrolls: the 'hor' component, from
+    // the same reporter. Neovim's default is 6.
+    mousescroll_hor: std.atomic.Value(u32) = std.atomic.Value(u32).init(6),
 
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
@@ -4906,6 +4909,38 @@ pub const Core = struct {
         self.log.write("rpc send: nvim_command (id={d}) {s}\n", .{ id, cmd });
     }
 
+    /// Open files with `:drop` -- all in one command -- or `:tab drop`, one
+    /// per file. The paths go as arguments and the server escapes them with
+    /// its own fnameescape, so the rules are the server OS's, not a table
+    /// each frontend kept.
+    pub fn requestDropPaths(self: *Core, paths: []const []const u8, tab_per_file: bool) !void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        try self.packDropPathsRequest(&buf, id, paths, tab_per_file);
+        try self.sendRaw(buf.items);
+        self.log.write("rpc send: drop paths (id={d}) count={d} tab={}\n", .{ id, paths.len, tab_per_file });
+    }
+
+    fn packDropPathsRequest(self: *Core, buf: *rpc.Buf, id: i64, paths: []const []const u8, tab_per_file: bool) !void {
+        const lua_code =
+            \\local tab_per_file, paths = ...
+            \\local esc = vim.tbl_map(vim.fn.fnameescape, paths)
+            \\if tab_per_file then
+            \\  for _, p in ipairs(esc) do vim.cmd('tab drop ' .. p) end
+            \\elseif #esc > 0 then
+            \\  vim.cmd('drop ' .. table.concat(esc, ' '))
+            \\end
+        ;
+        try self.sendRequestHeader(buf, id, "nvim_exec_lua");
+        try rpc.packArray(buf, self.alloc, 2);
+        try rpc.packStr(buf, self.alloc, lua_code);
+        try rpc.packArray(buf, self.alloc, 2);
+        try rpc.packBool(buf, self.alloc, tab_per_file);
+        try rpc.packArray(buf, self.alloc, paths.len);
+        for (paths) |p| try rpc.packStr(buf, self.alloc, p);
+    }
+
     /// Request graceful quit (called by frontend on window close button).
     /// Checks for unsaved buffers and calls on_quit_requested callback with result.
     pub fn requestQuit(self: *Core) void {
@@ -7105,6 +7140,42 @@ test "redraw recovery rejects old epoch and admits fresh attach replay" {
     rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
     try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
     try std.testing.expectEqual(@as(u8, 1), core.redraw_recovery_attempts);
+}
+
+test "dropped paths reach the server unescaped, for its own fnameescape" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const paths = [_][]const u8{ "/tmp/a b*.txt", "C:\\x\\[y].md" };
+    try core.packDropPathsRequest(&buf, 7, &paths, true);
+
+    // Each path travels as its own msgpack string, byte for byte: the
+    // frontends' escape tables (which missed `*` and turned `\` into `\\` for
+    // a Windows server) are out of the loop.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "/tmp/a b*.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "C:\\x\\[y].md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\\ ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "fnameescape") != null);
+}
+
+test "mousescroll report carries both the ver and hor components" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var params = [_]mp.Value{ .{ .int = 5 }, .{ .int = 1 } };
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "zonvie_mousescroll" }, .{ .arr = &params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, 5), core.mousescroll_ver.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), core.mousescroll_hor.load(.acquire));
+
+    // An older reporter sends ver alone; hor keeps its last value.
+    var ver_only = [_]mp.Value{.{ .int = 2 }};
+    var top_ver_only = [_]mp.Value{ .{ .int = 2 }, .{ .str = "zonvie_mousescroll" }, .{ .arr = &ver_only } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top_ver_only);
+    try std.testing.expectEqual(@as(u32, 2), core.mousescroll_ver.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), core.mousescroll_hor.load(.acquire));
 }
 
 test "redraw recovery retains resize that cannot queue after fresh attach" {
