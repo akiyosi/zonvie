@@ -842,6 +842,9 @@ pub const GridBuf = struct {
     scroll_notify_rows: i32 = 0, // Signed rows accumulated for the pending notification; one event can cover several scrolls
     row_scroll_notify_pending: bool = false, // Consumed separately from on_grid_scroll notification delivery
     scroll_fast_path_blocked: bool = false, // True when multiple scrolls in same batch
+    /// The frontend was sent this scroll's row shift (dispatchGridRowScroll),
+    /// so it holds the surviving rows and needs only the vacated ones.
+    row_shift_sent: bool = false,
     prev_cursor_row: ?u32 = null, // Previous cursor row (grid-relative) for erasing old cursor
     // Last submitted main-layer vertex count per row. Rendering uses this to
     // enforce actual-output budgets without rescanning every retained row.
@@ -1082,6 +1085,7 @@ pub const GridBuf = struct {
         self.last_scroll_op = null;
         self.row_scroll_notify_pending = false;
         self.scroll_fast_path_blocked = false;
+        self.row_shift_sent = false;
         self.prev_cursor_row = null;
     }
 

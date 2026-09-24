@@ -2713,17 +2713,16 @@ pub export fn WndProc(
                         // any other grid the surface draws as a layer needs
                         // that layer's origin added before its position means
                         // anything in screen space.
-                        var cursor_layer_x_px: f32 = 0;
-                        var cursor_layer_y_px: f32 = 0;
-                        if (cursor_verts_snapshot.len != 0 and cursor_verts_snapshot[0].grid_id != 1) {
-                            for (tbs_snapshot.layers.slice()) |layer| {
-                                if (layer.grid_id == cursor_verts_snapshot[0].grid_id) {
-                                    cursor_layer_x_px = @floatFromInt(layer.x_px);
-                                    cursor_layer_y_px = @floatFromInt(layer.y_px);
-                                    break;
-                                }
-                            }
-                        }
+                        // Keyed on the grid the snapshot says holds the cursor,
+                        // the same transaction as the vertices.
+                        const cursor_layer_origin_px = render_helpers.layerOriginPx(
+                            app_mod.SurfaceLayer,
+                            tbs_snapshot.layers.slice(),
+                            tbs_snapshot.cursor_layer_grid_id,
+                            1,
+                        );
+                        const cursor_layer_x_px: f32 = @floatFromInt(cursor_layer_origin_px[0]);
+                        const cursor_layer_y_px: f32 = @floatFromInt(cursor_layer_origin_px[1]);
 
                         // Where the cursor's grid sits on the surface: its
                         // layer's origin plus the content viewport's, the same
@@ -2771,15 +2770,7 @@ pub export fn WndProc(
                         // root grid's. The grid id comes from the same
                         // transaction as the cursor vertices.
                         const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
-                        const cursor_layer_origin: [2]f32 = blk: {
-                            if (cursor_grid == 1) break :blk .{ 0, 0 };
-                            for (tbs_snapshot.layers.slice()) |l| {
-                                if (l.grid_id == cursor_grid) {
-                                    break :blk .{ @floatFromInt(l.x_px), @floatFromInt(l.y_px) };
-                                }
-                            }
-                            break :blk .{ 0, 0 };
-                        };
+                        const cursor_layer_origin: [2]f32 = .{ cursor_layer_x_px, cursor_layer_y_px };
 
                         // The rows the cursor overlay would otherwise erase:
                         // where the previous cursor was baked into back_tex,
@@ -3287,7 +3278,12 @@ pub export fn WndProc(
                         // region changed in back_tex. Add it to present_rects so the
                         // CopySubresourceRegion in present copies the shifted pixels
                         // to all swapchain buffers.
-                        if (pass.scroll_damage) |sr| {
+                        // Only into a list that already names rects: an empty
+                        // one means "present everything" (chrome included),
+                        // which covers this region, and adding the region
+                        // would narrow it to a partial present without the
+                        // chrome bands.
+                        if (pass.scroll_damage) |sr| if (present_rects.items.len != 0) {
                             present_rects.append(app.alloc, sr) catch {
                                 present_rects_fallback_full = true;
                             };
@@ -3304,7 +3300,7 @@ pub export fn WndProc(
                                 @intCast(g.width),
                                 @intCast(g.height),
                             );
-                        }
+                        };
 
                         if (log_enabled) applog.appLog(
                             "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
@@ -3346,11 +3342,13 @@ pub export fn WndProc(
                                                 if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
                                                 break :present_frame;
                                             };
-                                            if (captured_scrollbar_rect) |captured_rect| {
+                                            // Same rule as the scroll rect: an
+                                            // empty list already presents it.
+                                            if (captured_scrollbar_rect) |captured_rect| if (present_rects.items.len != 0) {
                                                 present_rects.append(app.alloc, captured_rect) catch {
                                                     present_rects_fallback_full = true;
                                                 };
-                                            }
+                                            };
                                         }
                                     }
                                 }
@@ -5812,59 +5810,7 @@ pub export fn WndProc(
 
         c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
             if (getApp(hwnd)) |app| {
-                const vk: u32 = @intCast(wParam);
-                const mods = input.queryMods();
-
-                // Windows keycode is passed as 0x10000|VK so Zig core can distinguish.
-                const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
-
-                // scancode is in bits 16..23 of lParam
-                const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
-
-                const has_ctrl_alt = (mods & (input.MOD_CTRL | input.MOD_ALT)) != 0;
-
-                // Check if IME is composing
-                app.mu.lockUncancelable(core.clock.io());
-                const ime_composing = app.ime_composing;
-                app.mu.unlock(core.clock.io());
-
-                // 1) Special keys always go through send_key_event (chars=nil)
-                //    BUT skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
-                if (input.isSpecialVk(vk)) {
-                    if (ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK)) {
-                        // Let IME handle Enter/Backspace - committed text comes via WM_IME_CHAR,
-                        // then the key comes via WM_CHAR after WM_IME_ENDCOMPOSITION.
-                        // Return 0 to prevent DefWindowProcW from also translating.
-                        return 0;
-                    } else {
-                        input.sendKeyEventToCore(app, keycode, mods, null, null);
-                        return 0;
-                    }
-                }
-
-                // 2) Ctrl/Alt combos: also go through send_key_event, and try to provide chars/ign.
-                //    (Let Zig decide <C-x> etc.)
-                if (has_ctrl_alt) {
-                    var tmp_chars: [16]u16 = undefined;
-                    var tmp_ign: [16]u16 = undefined;
-                    var out_chars: [8]u8 = undefined;
-                    var out_ign: [8]u8 = undefined;
-
-                    const pair = input.toUnicodePairUtf8(
-                        vk,
-                        scancode,
-                        &tmp_chars,
-                        &tmp_ign,
-                        &out_chars,
-                        &out_ign,
-                    );
-
-                    input.sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
-                    return 0;
-                }
-
-                // 3) Otherwise (normal text, Shift-only, IME): let WM_CHAR handle.
-                // Do not consume here.
+                if (input.handleKeyDownMessage(app, wParam, lParam)) return 0;
             }
         },
 
@@ -6127,6 +6073,10 @@ pub export fn WndProc(
 
         c.WM_XBUTTONUP => {
             if (getApp(hwnd)) |app| {
+                // ReleaseCapture sends WM_CAPTURECHANGED synchronously, which
+                // zeroes the press grid; read it first, as the other buttons
+                // and the external window do.
+                const press_grid = app.mouse_press_grid_id;
                 _ = c.ReleaseCapture();
 
                 const pos = input.mousePosFromLParam(lParam);
@@ -6138,7 +6088,7 @@ pub export fn WndProc(
 
                 app.mouse_button_held = 0;
 
-                const x_up = input.rebaseMainWindowTarget(app, app.mouse_press_grid_id, @as(i32, x), @as(i32, y));
+                const x_up = input.rebaseMainWindowTarget(app, press_grid, @as(i32, x), @as(i32, y));
                 app.mouse_press_grid_id = 0;
                 input.sendMouseButton(app, x_up.grid_id, button, .release, x_up.x, x_up.y, wParam);
 

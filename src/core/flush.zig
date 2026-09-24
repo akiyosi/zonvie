@@ -2965,6 +2965,7 @@ fn dispatchGridRowScroll(
     core.shiftGlyphMirror(grid_id, region.row_start, region.row_end, op.rows);
     traceRender(core, "event=row_shift_send grid={d} start={d} end={d} delta={d}\n", .{ grid_id, region.row_start, region.row_end, op.rows });
     scroll_cb(core.ctx, grid_id, region.row_start, region.row_end, region.col_start, region.col_end, op.rows, sg.rows, sg.cols);
+    sg.row_shift_sent = true;
     return true;
 }
 
@@ -3702,14 +3703,6 @@ pub const FlushCtx = struct {
                     // Get viewport margins for scrollable row detection
                     const main_margins = ctx.core.grid.getViewportMargins(1);
 
-                    // Hoisted out of the row loop: placement cannot change
-                    // mid-flush.
-                    // Behind the blur test its only consumer already applies, as
-                    // the external root's copy of this does: with blur off the
-                    // scan's answer cannot change anything, and it walks the
-                    // whole win_pos map once per flush.
-                    const main_has_layers = ctx.core.blur_enabled and mainSurfaceHasLayers(ctx.core);
-
                     var saw_atlas_reset: bool = false;
                     var atlas_retried: bool = false;
 
@@ -3854,7 +3847,9 @@ pub const FlushCtx = struct {
                                 // the layer level, so nothing compounds and
                                 // dropping the run only thins the surface and
                                 // leaves the gaps between layers unpainted.
-                                .skip_default_bg = main_has_layers and ctx.core.blur_enabled,
+                                // Settled once this flush, before any row, by
+                                // regenerateRootsWhoseDefaultBgRuleFlipped.
+                                .skip_default_bg = ctx.core.grid.main_buf.skip_default_bg_last,
                             }, out) catch |err| {
                                 out.clearRetainingCapacity();
                                 had_glyph_miss = true;
@@ -4365,7 +4360,7 @@ pub fn surfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
 }
 
 /// Resolving an anchor id does not imply that its surface has a root layout.
-fn placedSurfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
+pub fn placedSurfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
     const surface = surfaceForGrid(grid, grid_id) orelse return null;
     _ = grid.bufForConst(surface) orelse return null;
     return surface;
@@ -4477,9 +4472,6 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
     return self.layout_scratch.items;
 }
 
-/// Whether the main surface draws any window grid as its own layer. Mirrors the
-/// acceptance test in `collectSurfaceLayerEntries`, so the root grid's cells
-/// beneath such a layer are never what the user sees.
 /// Whether `surface_id` places any grid as a layer on top of its own root.
 ///
 /// The surface is an argument because an external grid is a surface root too,
@@ -4527,10 +4519,6 @@ fn regenerateRootsWhoseDefaultBgRuleFlipped(self: *Core) void {
             sg.markAllDirty();
         }
     }
-}
-
-fn mainSurfaceHasLayers(self: *Core) bool {
-    return surfaceHasLayers(self, 1);
 }
 
 /// Fill `core.emit_grid_ids` with every grid that emits its own rows: the
@@ -5465,7 +5453,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         cache.resetCounters();
 
         // Full redraw only for forced operations, not cursor-only changes.
-        // Cursor rows are handled via regen_rows (fast path) or dirty_rows marking below.
+        // Cursor rows are handled via dirty_rows marking below.
         const need_full_redraw = force_render or force_redraw_this;
 
         const viewport_cols = sg.cols;
@@ -5478,8 +5466,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         var ext_saw_atlas_reset: bool = false;
         var ext_had_row_error: bool = false;
         var ext_had_glyph_miss: bool = false;
+        // Rows this pass regenerated, for the [ext_grid_row] report.
         var regen_count: u32 = 0;
-        var use_ext_scroll_fast_path = false;
 
         ext_verts.clearRetainingCapacity();
 
@@ -5496,96 +5484,27 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             // An external grid is a surface root and can host floats, so it owes
             // the same rule the main root does: once a layer paints the default
             // background over it, painting it here too compounds the alpha under
-            // blur. Only asked under blur, and only of a root, so the win_pos
-            // scan costs nothing in the common case.
-            const surface_skips_default_bg = self.blur_enabled and
-                self.grid.external_grids.contains(grid_id) and
-                surfaceHasLayers(self, grid_id);
+            // blur. Settled for every root at the start of the flush
+            // (regenerateRootsWhoseDefaultBgRuleFlipped); a layer's own flag
+            // is never set, which is its answer.
+            const surface_skips_default_bg = sg.skip_default_bg_last;
 
-            var ext_retried: bool = false;
-
-            // When eligible, non-dirty rows are skipped even with sg.dirty set,
-            // because scroll() only marks the vacated rows dirty.
-            const ext_scroll_fast_path: bool = blk: {
-                if (force_render or need_full_redraw) break :blk false;
-                // Without this callback the consumer cannot shift its retained
-                // row slots, so regenerate the whole viewport.
-                if (self.cb.on_grid_row_scroll == null) break :blk false;
-                // A newly/re-opened external grid has no frontend seed until its
-                // lifecycle callback is committed; nothing exists to shift yet.
-                if (self.grid.external_grids.contains(grid_id) and
-                    !self.known_external_grids.contains(grid_id)) break :blk false;
-                // The same clause dispatchGridRowScroll applies to the HOST.
-                // These two gates decide one thing — "did the frontend get a
-                // shift, so may I send only the vacated rows?" — and must agree.
-                // A layer placed on an external root whose open is still
-                // withheld gets no shift dispatched, so assuming one here sent
-                // a partial row set the frontend cannot place.
-                const placed_surface = placedSurfaceForGrid(&self.grid, grid_id) orelse break :blk false;
-                if (placed_surface != 1 and
-                    !self.known_external_grids.contains(placed_surface)) break :blk false;
-                const op = sg.last_scroll_op orelse break :blk false;
-                if (sg.scroll_fast_path_blocked) break :blk false;
-                _ = gridScrollFastPathRegion(
-                    op,
-                    sg.rows,
-                    sg.cols,
-                    viewport_rows,
-                    viewport_cols,
-                ) orelse break :blk false;
-                break :blk true;
-            };
-
-            // When a scroll happened but the fast path is not usable (multiple
-            // scrolls in one batch, a delta past half the region, or a
-            // partial-width region), the frontend receives no on_grid_row_scroll
-            // and cannot shift its row slots, so every shifted row needs full
-            // regeneration — dirty_rows only covers the vacated band. Any
-            // last_scroll_op the fast path rejected falls into this same bucket
-            // — e.g. a partial-width, abs(rows)==1 scroll, which this condition
-            // used to miss, leaving the moved region's stale pre-scroll content
-            // on the GPU forever.
+            // A scroll the frontend was sent a row shift for (see
+            // dispatchGridRowScroll) needs only the rows it vacated; scroll()
+            // marks exactly those dirty. Any other scroll left the frontend's
+            // rows where they were, so every row is regenerated — a rejected
+            // fast path (several scrolls in a batch, a delta past half the
+            // region, a partial width) and a shift never dispatched alike.
+            // This pass used to re-derive the dispatch's conditions instead of
+            // asking whether it ran, and the two could disagree.
             const ext_scroll_needs_full_regen: bool =
-                !ext_scroll_fast_path and sg.last_scroll_op != null;
+                sg.last_scroll_op != null and !sg.row_shift_sent;
 
             // The cursor is a separate layer emitted after the row loop, never
             // inline in row vertices, which is what stops it ghosting across a
             // scroll copy.
 
-            // Rows to regenerate under the fast path: dirty rows only.
-            var regen_rows: [12]u32 = undefined;
-            use_ext_scroll_fast_path = ext_scroll_fast_path;
-
-            if (ext_scroll_fast_path) {
-                // Rows beyond viewport_rows are invisible and must not be in the
-                // regen set.
-                for (0..viewport_rows) |ri| {
-                    const r: u32 = @intCast(ri);
-                    if (sg.isRowDirty(r)) {
-                        if (regen_count < regen_rows.len) {
-                            regen_rows[regen_count] = r;
-                            regen_count += 1;
-                        } else {
-                            // Too many dirty rows for the fast path — fall back
-                            // to the dirty-row check below, which regenerates
-                            // every row this set would have held.
-                            use_ext_scroll_fast_path = false;
-                            break;
-                        }
-                    }
-                }
-            }
-
             ext_retry: while (true) {
-                if (ext_retried) {
-                    // Reset per-pass state for clean retry
-                    // An atlas reset invalidates glyph UVs, not hl resolution.
-                    cache.resetCounters();
-                    ext_had_row_error = false;
-                    ext_had_glyph_miss = false;
-                }
-                const ext_effective_rebuild = ext_retried;
-
                 // Only up to viewport_rows, not sg.rows: rows beyond it are not
                 // drawable, so the frontend must not receive vertices for them.
                 for (0..viewport_rows) |row_idx| {
@@ -5601,16 +5520,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     // Otherwise use the dirty_rows bitmap, except after a scroll
                     // the fast path rejected: the frontend cannot shift rows
                     // itself, so every row must be regenerated.
-                    if (use_ext_scroll_fast_path and !ext_retried) {
-                        var in_regen = false;
-                        for (regen_rows[0..regen_count]) |rr| {
-                            if (rr == row) {
-                                in_regen = true;
-                                break;
-                            }
-                        }
-                        if (!in_regen) continue;
-                    } else if (!need_full_redraw and !ext_effective_rebuild and !ext_scroll_needs_full_regen) {
+                    if (!need_full_redraw and !ext_scroll_needs_full_regen) {
                         // dirty_all dominates; otherwise a row the bitset does
                         // not cover is regenerated, never skipped.
                         if (!sg.dirty_all and
@@ -5620,6 +5530,7 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                             continue;
                         }
                     }
+                    regen_count += 1;
 
                     ext_verts.clearRetainingCapacity();
 
@@ -5713,31 +5624,16 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     if (self.atlas_reset_during_flush) {
                         ext_saw_atlas_reset = true;
                         ext_saw_atlas_reset_any = true;
-                        self.atlas_reset_during_flush = false; // Clear for retry
-                        // A reset here can also invalidate glyphs the MAIN grid
+                        self.atlas_reset_during_flush = false;
+                        // A reset here also invalidates glyphs the MAIN grid
                         // used earlier in this flush (it always renders before
-                        // this deferred external-grid pass).
+                        // this deferred external-grid pass), so the end of the
+                        // pass cancels the whole commit. Nothing sent from here
+                        // on would survive it: stop, rather than restart this
+                        // grid's rows or clear them to empty as this did.
                         self.grid.markAllDirty();
                         self.invalidateMirroredFrameState();
-                        if (!ext_retried) {
-                            ext_retried = true;
-                            use_ext_scroll_fast_path = false; // Retry needs full redraw
-                            continue :ext_retry; // Restart this grid's row loop from row 0
-                        }
-                        // 2nd reset: clear all sent rows (match global grid behavior)
-                        for (0..viewport_rows) |clear_ri| {
-                            // A clear callback can itself call
-                            // zonvie_core_abort_flush (e.g. Windows COW detach failure).
-                            if (self.flush_aborted) break;
-                            replaceGridSurfaceRowVertexCount(self, grid_id, sg, clear_ri, 0) catch |err| {
-                                self.flush_aborted = true;
-                                self.failHardRender(err);
-                                break;
-                            };
-                            self.recordGlyphMirrorRow(grid_id, @intCast(clear_ri), viewport_rows, &.{});
-                            row_cb(self.ctx, grid_id, @intCast(clear_ri), 1, null, 0, 1, viewport_rows, viewport_cols);
-                        }
-                        break; // Abort remaining rows
+                        break :ext_retry;
                     }
 
                     // Pass viewport dimensions, not sg's, so the frontend's
@@ -5754,9 +5650,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         // Cursor layer: a separate on_vertices_row with the CURSOR flag, which
         // keeps the cursor out of the row buffers so a GPU scroll copy cannot
-        // ghost it. Skipped on abort — the frontend cancels this grid's whole
-        // bracket, so a cursor layer would be discarded work.
-        if (!self.flush_aborted) {
+        // ghost it. Skipped on abort, and after an atlas reset that cancels
+        // the commit — either way it would be discarded work.
+        if (!self.flush_aborted and !ext_saw_atlas_reset_any) {
             if (cursor_row) |cur_row| {
                 if (cur_row < sg.rows and cursor_col < sg.cols) {
                     ext_verts.clearRetainingCapacity();
@@ -5849,8 +5745,10 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             }
         }
 
+        // scroll_fast_path: the frontend got this scroll as a row shift and
+        // was sent only the rows below, instead of the whole viewport.
         self.log.write("[ext_grid_row] grid_id={d} rows={d} cols={d} scroll_fast_path={} regen_count={d}\n", .{
-            grid_id, sg.rows, sg.cols, use_ext_scroll_fast_path, regen_count,
+            grid_id, sg.rows, sg.cols, sg.last_scroll_op != null and sg.row_shift_sent, regen_count,
         });
 
         self.log.write("[ext_grid_perf] grid_id={d} hl_cache hits={d} misses={d}\n", .{
@@ -5876,6 +5774,8 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
         if (ext_had_glyph_miss) {
             sg.markAllDirty();
         }
+        // The commit is cancelled below; the remaining grids stay dirty.
+        if (ext_saw_atlas_reset_any) break;
     }
 
     // If any atlas reset occurred, every already-sent grid has stale UVs. The
@@ -10299,6 +10199,83 @@ test "external scroll without row-shift callback regenerates every retained row"
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
 }
 
+test "an external scroll whose shift was never sent regenerates every row" {
+    const State = struct {
+        row_calls: u32 = 0,
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.row_calls += 1;
+        }
+        fn onRowScroll(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_end: u32,
+            col_start: u32,
+            col_end: u32,
+            rows_delta: i32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = grid_id;
+            _ = row_start;
+            _ = row_end;
+            _ = col_start;
+            _ = col_end;
+            _ = rows_delta;
+            _ = total_rows;
+            _ = total_cols;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 4, 2);
+    try core.grid.resizeGrid(2, 4, 2);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{ .win = 42, .start_row = 0, .start_col = 0, .rows = 4, .cols = 2 });
+    for (0..4) |row| core.grid.putCellGrid(2, @intCast(row), 0, @intCast('A' + row), 0);
+    core.drawable_w_px = 2;
+    core.drawable_h_px = 4;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.grid.cursor_visible = false;
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_grid_row_scroll = State.onRowScroll;
+    core.sendExternalGridVertices(true);
+    state = .{};
+
+    // A scroll the frontend was never told about (no dispatchGridRowScroll):
+    // its retained rows are where they were, so sending only the vacated row
+    // would leave the rest a row out. The pass decided eligibility by
+    // re-deriving the dispatch's conditions, not by whether it ran.
+    core.grid.scrollGrid(2, 0, 4, 0, 2, 1, 0);
+    core.sendExternalGridVertices(false);
+    try std.testing.expectEqual(@as(u32, 4), state.row_calls);
+}
+
 test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
     const State = struct {
         raster_calls: u32 = 0,
@@ -11450,6 +11427,104 @@ test "second row-mode atlas reset cancels instead of committing empty rows" {
     try std.testing.expectEqual(@as(u32, 1), state.row_calls);
     try std.testing.expectEqual(@as(u32, 2), state.create_calls);
     try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
+}
+
+test "an atlas reset in the external pass stops sending rows the cancelled commit discards" {
+    const State = struct {
+        core: *Core,
+        ext_rows: u32 = 0,
+        ext_empty_rows: u32 = 0,
+        upload_calls: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id != 2 or flags & c_api.VERT_UPDATE_MAIN == 0) return;
+            self.ext_rows += 1;
+            if (vert_count == 0) self.ext_empty_rows += 1;
+        }
+
+        fn rasterize(ctx: ?*anyopaque, scalar: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{ .pixels = null, .width = 1, .height = 1, .pitch = 1, .bearing_x = 0, .bearing_y = 1, .advance_26_6 = 64, .ascent_px = 1, .descent_px = 0, .bytes_per_pixel = 1 };
+            return 1;
+        }
+
+        fn upload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.upload_calls += 1;
+            // Full again after the first glyph, so a retry would reset twice.
+            if (self.upload_calls == 1) {
+                self.core.atlas_packer.?.next_x = self.core.atlas_w;
+                self.core.atlas_packer.?.next_y = self.core.atlas_h;
+                self.core.atlas_packer.?.row_h = 0;
+            }
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 1);
+    try core.grid.resizeGrid(2, 2, 1);
+    try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
+    try core.known_external_grids.put(core.alloc, 2, .{ .win = 42, .start_row = 0, .start_col = 0, .rows = 2, .cols = 1 });
+    core.grid.putCellGrid(2, 0, 0, 'A', 0);
+    core.grid.putCellGrid(2, 1, 0, 'B', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    // Full from the start: the external grid's first glyph resets the atlas.
+    core.atlas_packer.?.next_x = core.atlas_w;
+    core.atlas_packer.?.next_y = core.atlas_h;
+    core.atlas_initialized = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    core.sendExternalGridVertices(true);
+
+    // The commit is cancelled either way; everything the grid sends after the
+    // reset — a restarted row loop, rows cleared to empty — is discarded.
+    try std.testing.expect(core.flush_atlas_corrupted);
+    try std.testing.expectEqual(@as(u32, 0), state.ext_empty_rows);
+    try std.testing.expectEqual(@as(u32, 0), state.ext_rows);
+    try std.testing.expect(core.grid.sub_grids.get(2).?.dirty_all);
 }
 
 test "atlas reset on a scroll fast path flush still resends every row" {

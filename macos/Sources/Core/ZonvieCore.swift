@@ -244,10 +244,14 @@ final class ZonvieCore {
     func resolveGridRoute(gridId: Int64) -> GridRoute {
         if gridId == 1 { return .mainRoot }
         if let route = resolveExternalGridRoute(gridId: gridId) { return route }
-        // Read outside the map lock, as the callers that consulted the renderer
-        // directly did: `ownsGrid` reads layer state the core thread owns.
-        if terminalView?.renderer?.ownsGrid(gridId) == true { return .mainLayer }
-        return .unplaced
+        // The owner map names the main surface for exactly the grids the main
+        // renderer's staged-else-committed layer list holds: both are written
+        // by the same onSurfaceLayout. Asking the renderer too was a third copy
+        // of ownership, and a linear scan per row.
+        externalGridViewsLock.lock()
+        let owner = (pendingGridSurfaceOwners ?? gridSurfaceOwners)[gridId]
+        externalGridViewsLock.unlock()
+        return owner == 1 ? .mainLayer : .unplaced
     }
 
     /// The part of `resolveGridRoute` that reads only the owner map: an
@@ -1316,9 +1320,13 @@ final class ZonvieCore {
                     publishedAtlasTexture = texture
                 }
 
+                // Neovim's default background, for the viewport-edge clear
+                // colour, published by the commit it came with.
+                let defaultBg = me.core.map { zonvie_core_get_default_bg($0) } ?? 0
                 let mainCommitted = me.terminalView?.renderer.commitFlush(
                     drawableW: dw, drawableH: dh,
-                    publishedAtlasTexture: publishedAtlasTexture
+                    publishedAtlasTexture: publishedAtlasTexture,
+                    defaultBgRGB: defaultBg
                 ) ?? false
                 if !mainCommitted {
                     // The main surface's own bracket was not open (dropped or
@@ -1333,11 +1341,6 @@ final class ZonvieCore {
                     }
                     me.scheduleFlushRetry()
                     return
-                }
-                // Pass Neovim default background to renderer for viewport-edge clear color
-                if let corePtr = me.core {
-                    let bg = zonvie_core_get_default_bg(corePtr)
-                    me.terminalView?.renderer.updateDefaultBgColor(bg)
                 }
                 if ZonvieCore.appLogEnabled {
                     let snap = me.currentInputTraceSnapshot()
@@ -3245,7 +3248,7 @@ final class ZonvieCore {
     /// the cursor, so editing in an external window with the main window
     /// minimized or covered left the cursor solid.
     private var cursorBlinkAllowed: Bool {
-        let surfaceId = layoutSurfaceId(for: lastCursorGrid)
+        let surfaceId = showingSurfaceId(for: lastCursorGrid)
         guard let window = surfaceId == 1 ? terminalView?.window : externalWindows[surfaceId] else { return false }
         return NSApp.isActive && window.occlusionState.contains(.visible) && !window.isMiniaturized
     }
@@ -4785,12 +4788,6 @@ final class ZonvieCore {
     /// Updated on every popupmenu_show (including re-shows without hide).
     private var popupmenuBgColor: NSColor? = nil
 
-    /// Pending main window activation work item (can be cancelled by popupmenu_show)
-    private var mainWindowActivationWorkItem: DispatchWorkItem? = nil
-
-    /// Flag to cancel main window activation (checked inside workItem)
-    private var cancelMainWindowActivation: Bool = false
-
     /// Track last cursor grid to detect transitions from external windows
     private var lastCursorGrid: Int64 = 1
 
@@ -5496,16 +5493,23 @@ final class ZonvieCore {
         return result
     }
 
-    /// The OS window that shows `gridId`, as a WindowLayoutInfo key: the
-    /// external window that is the grid or hosts it, otherwise the main
-    /// window (1). Owner map only, so it is safe on the main thread.
-    private func layoutSurfaceId(for gridId: Int64) -> Int64 {
-        switch resolveExternalGridRoute(gridId: gridId) {
-        case .externalRoot(let view), .externalLayer(let view):
-            return view.gridId
-        default:
-            return 1
-        }
+    /// The surface that shows `gridId`: the external window that is the grid
+    /// or hosts it, otherwise the main window (1) — including a grid whose
+    /// host has no window yet. The one answer to "which window shows this
+    /// grid" on the main thread; six places used to ask it five ways (the view
+    /// registry, the owner map with two fallbacks, the core's
+    /// `placed_by_surface`, "is it a window of its own"). The owner map is the
+    /// one routing reads, staged first the way routing reads it.
+    func showingSurfaceId(for gridId: Int64) -> Int64 {
+        externalViewShowing(gridId: gridId)?.gridId ?? 1
+    }
+
+    /// The external view that shows `gridId`, or nil for the main window.
+    func externalViewShowing(gridId: Int64) -> ExternalGridView? {
+        externalGridViewsLock.lock()
+        defer { externalGridViewsLock.unlock() }
+        let owner = (pendingGridSurfaceOwners ?? gridSurfaceOwners)[gridId] ?? gridId
+        return externalGridViews[owner]
     }
 
     /// The Neovim window a move INTO the main window lands on: the top-left
@@ -5514,7 +5518,7 @@ final class ZonvieCore {
     private func mainWindowTargetWinId() -> Int64 {
         guard let core else { return 0 }
         let mainSplit = getVisibleGridsCached()
-            .filter { $0.gridId > 1 && $0.zindex <= 0 && layoutSurfaceId(for: $0.gridId) == 1 }
+            .filter { $0.gridId > 1 && $0.zindex <= 0 && showingSurfaceId(for: $0.gridId) == 1 }
             .min { ($0.startRow, $0.startCol) < ($1.startRow, $1.startCol) }
         return zonvie_core_get_win_id(core, mainSplit?.gridId ?? 2)
     }
@@ -5568,7 +5572,7 @@ final class ZonvieCore {
     private func handleWinMove(gridId: Int64, flags: Int32) {
         let infos = allWindowLayoutInfos(includeMainWindow: true)
         ZonvieCore.appLog("[ext_win] handleWinMove: grid=\(gridId) flags=\(flags) infos=\(infos.map { "grid=\($0.gridId) frame=\($0.frame)" })")
-        let sourceId = layoutSurfaceId(for: gridId)
+        let sourceId = showingSurfaceId(for: gridId)
         guard let source = infos.first(where: { $0.gridId == sourceId }) else {
             ZonvieCore.appLog("[ext_win] handleWinMove: source grid=\(gridId) not found in \(infos.count) windows")
             return
@@ -5607,7 +5611,7 @@ final class ZonvieCore {
             return a.frame.midX < b.frame.midX
         }
 
-        let sourceId = layoutSurfaceId(for: gridId)
+        let sourceId = showingSurfaceId(for: gridId)
         guard let srcIdx = sorted.firstIndex(where: { $0.gridId == sourceId }) else {
             ZonvieCore.appLog("[ext_win] handleWinExchange: source grid=\(gridId) not found")
             return
@@ -5767,7 +5771,7 @@ final class ZonvieCore {
             // The window the cursor's grid is shown in — a float an external
             // window hosts is found through its host, which a lookup by grid
             // id missed and sent back to the main window.
-            let currentId = layoutSurfaceId(for: cursorGrid)
+            let currentId = showingSurfaceId(for: cursorGrid)
             guard let current = infos.first(where: { $0.gridId == currentId }) else {
                 ZonvieCore.appLog("[ext_win] handleWinMoveCursor: cursorGrid=\(cursorGrid) not found in infos")
                 return targetWin
@@ -7209,9 +7213,6 @@ final class ZonvieCore {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
-            self.mainWindowActivationWorkItem?.cancel()
-            self.mainWindowActivationWorkItem = nil
-
             let lastGrid = self.lastCursorGrid
             let isGridChange = (lastGrid != gridId)
 
@@ -7224,16 +7225,14 @@ final class ZonvieCore {
             // The blink gate follows the window showing the cursor.
             self.refreshCursorBlinkGate()
 
+            // Staged first (showingSurfaceId). A float opened on an external
+            // surface is placed by the layout of the flush that creates it,
+            // and the cursor moves onto it in that same flush — so the
+            // committed map does not name its host yet. Measured: gridId=5
+            // resolved committed=nil, pending=4; the committed read ordered
+            // the MAIN window in front of the external one.
+            let surfaceId = self.showingSurfaceId(for: gridId)
             self.externalGridViewsLock.lock()
-            // The staged map first, the way resolveGridRoute reads it. A float
-            // opened on an external surface is placed by the layout of the
-            // flush that creates it, and the cursor moves onto it in that same
-            // flush — so the committed map does not name its host yet.
-            // Measured: gridId=5 resolved committed=nil, pending=4. Reading
-            // only the committed one made this fall through to `?? gridId`,
-            // find no window under that id, and order the MAIN window in front
-            // of the external one the cursor had just moved into.
-            let surfaceId = (self.pendingGridSurfaceOwners ?? self.gridSurfaceOwners)[gridId] ?? gridId
             // Whichever window is ordered in front below, every OTHER external
             // surface may end up behind it, and the window server will not say
             // so for another frame or two. Told here because this is the only
@@ -7683,14 +7682,6 @@ final class ZonvieCore {
             self.popupmenuAnchorGrid = gridId
             self.popupmenuAnchorRow = row
             self.popupmenuAnchorCol = col
-
-            // Cancel any pending main window activation if popupmenu is anchored to external window
-            if self.externalWindows[gridId] != nil {
-                self.cancelMainWindowActivation = true
-                self.mainWindowActivationWorkItem?.cancel()
-                self.mainWindowActivationWorkItem = nil
-                ZonvieCore.appLog("[popupmenu] cancelled main window activation (anchor on ext grid \(gridId))")
-            }
         }
     }
 
@@ -8377,10 +8368,8 @@ final class ZonvieCore {
     /// reachable state was measured where the answers differ: this is one
     /// question in one place, not a behaviour change.
     private func windowCompositing(_ grid: GridInfo?) -> NSWindow? {
-        guard let grid,
-              let raw = cachedVisibleGridsRaw.first(where: { $0.grid_id == grid.gridId })
-        else { return nil }
-        return externalWindows[raw.placed_by_surface]
+        guard let grid else { return nil }
+        return externalWindows[showingSurfaceId(for: grid.gridId)]
     }
 
     /// The window that actually composites the grid the cursor is on.
@@ -8388,19 +8377,11 @@ final class ZonvieCore {
     /// "Is this a float" is not that question, and answering it instead put an
     /// ext-message on the MAIN window whenever the cursor was in a float an
     /// EXTERNAL window hosts — the one surface that float is certainly not
-    /// drawn in. The core knows which surface places a grid
-    /// (`zonvie_grid_info.placed_by_surface`); that is the answer, and it
-    /// covers a grid an external window merely contains as well as one it is.
-    ///
-    /// Reads the snapshot getVisibleGridsCached() last took, so it refreshes
-    /// it first: this runs when a message is placed, not per frame.
+    /// drawn in. `showingSurfaceId` answers who draws it, and covers a grid an
+    /// external window merely contains as well as one it is.
     private func windowCompositingCursorGrid(_ mainWindow: NSWindow) -> NSWindow {
         let cursorGrid = getCursorPositionNonBlocking().gridId
-        _ = getVisibleGridsCached()
-        guard let g = cachedVisibleGridsRaw.first(where: { $0.grid_id == cursorGrid }),
-              let external = externalWindows[g.placed_by_surface]
-        else { return mainWindow }
-        return external
+        return externalWindows[showingSurfaceId(for: cursorGrid)] ?? mainWindow
     }
 
 

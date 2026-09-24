@@ -814,7 +814,25 @@ private enum ScrollRetentionTests {
         requireEqual(slot.take(committedBy: main), 2, "the latest measurement wins, published by its stager")
     }
 
+    private static func verifyCommittedRowMutationLedger() {
+        let stale = (0..<3).map { _ in SparseRowSet(rowLimit: 16, preparedRows: 16) }
+        var needsFullSync = [false, true, false]
+        stale[0].insert(9)
+        recordCommittedRowMutation(stale: stale, needsFullSync: &needsFullSync,
+                                   committedIndex: 0, rows: [2, 5], structural: false)
+        require(stale[0].rows.isEmpty, "the committed set owes nothing")
+        requireEqual(needsFullSync[0], false, "and is in sync")
+        requireEqual(stale[2].rows, [2, 5], "another set owes the changed rows")
+        require(stale[1].rows.isEmpty, "a set owing a full sync records no rows")
+
+        recordCommittedRowMutation(stale: stale, needsFullSync: &needsFullSync,
+                                   committedIndex: 2, rows: [1], structural: true)
+        requireEqual(needsFullSync, [true, true, false], "a structural change owes every other set a full sync")
+        require(stale[0].rows.isEmpty && stale[2].rows.isEmpty, "and clears their row lists")
+    }
+
     static func main() {
+        verifyCommittedRowMutationLedger()
         verifyStagedValueIsPublishedByItsOwnCommit()
         verifyCommittedScrollMerge()
         verifyPlan()
