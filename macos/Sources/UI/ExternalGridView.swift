@@ -1324,8 +1324,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // row, fails its cursor-only test and clears the whole surface to
             // redraw content that did not change.
             let publishedRows = rowWritePrepared
-            let publishedLayers = pendingSurfaceLayers != nil
-            let cursorOnlyCommit = !publishedRows && !publishedLayers
             let layoutContracted = publishedRows
                 && (bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[writeSetIndex].knownTotalRows
                     || bufferSets[flushSourceSetIndex].knownTotalCols > bufferSets[writeSetIndex].knownTotalCols)
@@ -3186,9 +3184,15 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // Blur can still redraw dirty-only with .load because the 2-pass
             // background pass overwrites, so alpha does not accumulate — that
             // avoids a full redraw on every content update under blur.
-            let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
-                && hasPresentedOnce && !smoothScrolling && !drawableSizeChanged && !glowEnabled
-                && !isDecoratedSurface && committedFontIsCurrent && !layoutDamageSnapshot
+            let canDirtyOnlyWithBlur = SurfaceLoadActionTerms.dirtyOnlyWithBlur(
+                rowMode: rowMode,
+                useTwoPass: use2Pass,
+                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
+                hasPresentedOnce: hasPresentedOnce,
+                isSmoothScrolling: smoothScrolling,
+                drawableSizeChanged: drawableSizeChanged,
+                glowEnabled: glowEnabled
+            )
             // Decorated surfaces (ext-cmdline) always clear: their viewport origin offset
             // means scissor rects for partial redraw don't align correctly.
             // Shared with GridSurfaceRenderer: SurfaceLoadActionTerms holds
@@ -3552,11 +3556,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     ).plan
 
                     switch rowPassPlan {
-                    case .blinkFastPathRow:
-                        // Not planned here: a blink-only frame reuses the
-                        // retained texture (reuseRootContents) and encodes no
-                        // surface pass, as the main surface's skipMainPass does.
-                        break
                     case .dirtyRowsAfterScrollBlit where use2Pass:
                         // The back texture is loaded after the pixel shift, so all
                         // clears must overwrite it. The regular blur pipeline uses

@@ -624,6 +624,16 @@ test "gui:main_float_mouse_disabled_scroll" {
     }
 }
 
+test "gui:blink_survives_popupmenu" {
+    // macOS only: the blink gate is ZonvieCore's.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/blink_survives_popupmenu.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:extwin_animated_shader_reuses_rows" {
     // macOS only: ExternalGridView is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {

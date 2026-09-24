@@ -3928,50 +3928,6 @@ func drawSurfaceBackgroundClearBand(
 /// `.notEncoded` means nothing could be encoded. Both callers read that as
 /// "submit what is already encoded, present nothing, and do not consume this
 /// frame's state" — the drawable would otherwise be presented untouched.
-/// The blink fast path: one row, scissored, redrawn in place so the old cursor
-/// is erased and the new one drawn without touching any other pixel.
-///
-/// Single pass through the unified blur pipeline when one exists; the two-pass
-/// background-then-glyph fallback otherwise, which is the rule every other
-/// `use2Pass` branch follows — the background pass overwrites, which is what
-/// erases the old cursor, and the glyph pass blends the text back over it.
-///
-/// Both surfaces had this written out, identical apart from where each keeps
-/// the cursor's row. A row whose scissor cannot be formed encodes nothing: the
-/// row is outside the render target, and drawing it unscissored would repaint
-/// the wrong band.
-func encodeSurfaceBlinkFastPathRow(
-    encoder: MTLRenderCommandEncoder,
-    row: Int,
-    resolved: (vc: Int, vb: MTLBuffer, translationY: Float),
-    geometry: SurfaceRowGeometry,
-    backgroundPipeline: MTLRenderPipelineState?,
-    glyphPipeline: MTLRenderPipelineState?,
-    unifiedBlurPipeline: MTLRenderPipelineState?
-) {
-    guard let scissor = makeRowScissorRect(
-        row: row,
-        cellHeight_px: geometry.cellHeightPx,
-        drawableWidth_px: geometry.drawableWidthPx,
-        renderTargetWidth_px: geometry.renderTargetWidthPx,
-        renderTargetHeight_px: geometry.renderTargetHeightPx
-    ) else { return }
-    encoder.setScissorRect(scissor)
-    var rowTranslation = resolved.translationY
-    func draw(_ pipeline: MTLRenderPipelineState) {
-        encoder.setRenderPipelineState(pipeline)
-        encoder.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
-        encoder.setVertexBuffer(resolved.vb, offset: 0, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
-    }
-    if let unified = unifiedBlurPipeline {
-        draw(unified)
-        return
-    }
-    if let bg = backgroundPipeline { draw(bg) }
-    if let glyph = glyphPipeline { draw(glyph) }
-}
-
 /// The cursor, composited onto the drawable after the copy.
 ///
 /// It goes on the drawable and never into the back buffer, so a GPU scroll copy

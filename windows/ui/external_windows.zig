@@ -12,6 +12,7 @@ const dialogs = @import("dialogs.zig");
 const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
+const callbacks = @import("../callbacks.zig");
 const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
 
@@ -2635,17 +2636,21 @@ pub export fn ExternalWndProc(
                             app.rowHeightPx(),
                         );
                     };
-                    app.mouse_press_grid_id = target.grid_id;
+                    // Another button pressed mid left-drag leaves the drag to
+                    // the left button: taking over the held state lost the
+                    // left release once this button was let go.
+                    const left_drag = app.mouse_button_held == 1;
+                    if (!left_drag) app.mouse_press_grid_id = target.grid_id;
 
                     // Capture so a drag that leaves the window keeps arriving.
                     _ = c.SetCapture(hwnd);
                     const button: [*:0]const u8 = switch (msg) {
                         c.WM_RBUTTONDOWN => blk: {
-                            app.mouse_button_held = 2;
+                            if (!left_drag) app.mouse_button_held = 2;
                             break :blk "right";
                         },
                         c.WM_MBUTTONDOWN => blk: {
-                            app.mouse_button_held = 3;
+                            if (!left_drag) app.mouse_button_held = 3;
                             break :blk "middle";
                         },
                         // HIWORD(wParam) is XBUTTON1 (1) or XBUTTON2 (2), and
@@ -2653,7 +2658,7 @@ pub export fn ExternalWndProc(
                         // <X1Mouse>/<X2Mouse> did nothing here.
                         c.WM_XBUTTONDOWN => blk: {
                             const x1 = @as(u16, @truncate(wParam >> 16)) == 1;
-                            app.mouse_button_held = if (x1) 4 else 5;
+                            if (!left_drag) app.mouse_button_held = if (x1) 4 else 5;
                             break :blk if (x1) "x1" else "x2";
                         },
                         else => blk: {
@@ -2710,8 +2715,13 @@ pub export fn ExternalWndProc(
 
                 const held = app.mouse_button_held;
                 const press_grid = app.mouse_press_grid_id;
-                app.mouse_button_held = 0;
-                app.mouse_press_grid_id = 0;
+                // Another button let go mid left-drag: the drag, its capture
+                // and its release still belong to the left button.
+                const left_drag_continues = held == 1 and msg != c.WM_LBUTTONUP;
+                if (!left_drag_continues) {
+                    app.mouse_button_held = 0;
+                    app.mouse_press_grid_id = 0;
+                }
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2727,7 +2737,9 @@ pub export fn ExternalWndProc(
                 // the pending line with it. Release only after the scrollbar
                 // has committed its final position below, or a drag ends where
                 // it started.
-                defer _ = c.ReleaseCapture();
+                defer if (!left_drag_continues) {
+                    _ = c.ReleaseCapture();
+                };
 
                 if (grid_id != null and ext_window != null) {
                     // Mirrors the press gate: a sentinel-grid surface never
@@ -3900,14 +3912,17 @@ const MAX_WIN_INFOS = 32;
 
 /// Collect layout info for all visible windows. Caller must hold app.mu.
 /// `include_main`: all ext_windows operations pass true. Parameter retained for future use.
-/// Main window is registered as grid 2 (Neovim's default editor grid).
+/// Entries are OS windows keyed by surface id: the main window is 1 whatever
+/// grids it holds, an external window its own root grid. The main window used
+/// to be grid 2, which is only its grid until that window is externalized --
+/// then two entries shared the id. Same keys as macOS `allWindowLayoutInfos`.
 /// Called from the core thread; GetWindowRect/SetWindowPos are thread-safe Win32 APIs,
 /// and app.mu serializes access against concurrent window operations.
 fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_INFOS]WindowInfo, count: usize } {
     var result: [MAX_WIN_INFOS]WindowInfo = undefined;
     var count: usize = 0;
 
-    // Main window (grid 2)
+    // Main window (surface 1)
     if (include_main) {
         if (app.hwnd) |main_hwnd| {
             var rect: c.RECT = std.mem.zeroes(c.RECT);
@@ -3917,7 +3932,7 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
             // zonvie_core_get_win_id would re-acquire grid_mu causing deadlock.
             // Callers that need win_id must resolve it separately.
             const main_win_id: i64 = 0;
-            result[count] = .{ .grid_id = 2, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
+            result[count] = .{ .grid_id = 1, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
             count += 1;
         }
     }
@@ -3941,6 +3956,16 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
     }
 
     return .{ .infos = result, .count = count };
+}
+
+/// The surface id of the OS window showing `grid_id`: the external window
+/// that is the grid or hosts it, otherwise the main window (1). The window
+/// ops were handed raw grid ids, so a split of the main window other than
+/// grid 2, or a float an external window hosts, found no window to start
+/// from. Caller must hold app.mu.
+fn showingSurfaceIdLocked(app: *App, grid_id: i64) i64 {
+    const shown = callbacks.externalWindowShowingGridLocked(app, grid_id) orelse return 1;
+    return shown.root_grid_id;
 }
 
 /// Find nearest window in direction. Returns matching WindowInfo or null.
@@ -4099,13 +4124,14 @@ pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(
     app.mu.lockUncancelable(core.clock.io());
     const coll = collectWindowInfos(app, true);
     const hwnd = app.hwnd;
+    const source_id = showingSurfaceIdLocked(app, grid_id);
 
     var queued = false;
     const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, grid_id, flags, 1)) |target| {
+    if (findInDirection(infos, source_id, flags, 1)) |target| {
         // Find source rect
         for (infos) |info| {
-            if (info.grid_id == grid_id) {
+            if (info.grid_id == source_id) {
                 queued = queueSwapWindowPositions(app, info.hwnd, info.rect, target.hwnd, target.rect);
                 break;
             }
@@ -4142,11 +4168,12 @@ pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callc
     }
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
     sortSpatially(sorted[0..coll.count]);
+    const source_id = showingSurfaceIdLocked(app, grid_id);
 
     // Find source index
     var src_idx: ?usize = null;
     for (sorted[0..coll.count], 0..) |info, i| {
-        if (info.grid_id == grid_id) {
+        if (info.grid_id == source_id) {
             src_idx = i;
             break;
         }
@@ -4325,22 +4352,28 @@ pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c
     if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: direction={d} count={d}\n", .{ direction, count });
 
     app.mu.lockUncancelable(core.clock.io());
-    const cursor_grid = app.last_cursor_grid;
-    const coll = collectWindowInfos(app, true);
     const corep = app.corep;
+    app.mu.unlock(core.clock.io());
+    const cp = corep orelse return 0;
+
+    // Outside app.mu: these take grid_mu, which the core takes before app.mu.
+    // The cursor's grid is the core's; app.last_cursor_grid also records
+    // special windows the cursor never enters.
+    const cursor_grid = app_mod.zonvie_core_get_cursor_position(cp, null, null);
+    var grids: [64]app_mod.GridInfo = undefined;
+    const grid_count = app_mod.zonvie_core_get_visible_grids(cp, &grids, grids.len);
+    const main_target_grid = render_pipeline_helpers.mainMoveTargetGrid(app_mod.GridInfo, grids[0..grid_count]);
+
+    app.mu.lockUncancelable(core.clock.io());
+    const current_id = showingSurfaceIdLocked(app, cursor_grid);
+    const coll = collectWindowInfos(app, true);
     app.mu.unlock(core.clock.io());
 
     const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, cursor_grid, direction, count)) |target| {
-        // collectWindowInfos sets win_id=0 for grid 2 (main window) to avoid
-        // calling zonvie_core_get_win_id while grid_mu might be held.
-        // Resolve it here where app.mu is released and grid_mu is not held.
-        var win_id = target.win_id;
-        if (win_id == 0 and target.grid_id == 2) {
-            if (corep) |cp| {
-                win_id = app_mod.zonvie_core_get_win_id(cp, 2);
-            }
-        }
+    if (findInDirection(infos, current_id, direction, count)) |target| {
+        // collectWindowInfos leaves the main window's win_id 0: it may run
+        // with grid_mu held. Resolved here, where it is not.
+        const win_id = if (target.grid_id == 1) app_mod.zonvie_core_get_win_id(cp, main_target_grid) else target.win_id;
         if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
         return win_id;
     }

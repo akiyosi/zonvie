@@ -2487,11 +2487,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Read the pending sets AFTER this bracket folded into them: a cursor
         // commit that arrives while a content commit still waits for a draw is
         // not a cursor-only frame, and treating it as one loses those rows.
-        pendingCursorOnlyCommit = didCursorWrite
-            && !didMainWrite
-            && !flushHadLayerWork
-            && pendingDirtyRows.isEmpty
-            && pendingDirtyRectPx == nil
+        // A bracket that landed nothing leaves the verdict to the one that did:
+        // an external-only flush between a cursor move and the draw turned the
+        // cursor-only frame into a full main pass. A background change repaints
+        // every edge the main pass clears.
+        if bracketLanded {
+            pendingCursorOnlyCommit = didCursorWrite
+                && !didMainWrite
+                && !flushHadLayerWork
+                && !bgChanged
+                && pendingDirtyRows.isEmpty
+                && pendingDirtyRectPx == nil
+        }
         // Only update lastCommitTime when there are pending visual changes
         // (dirty rows, dirty rect, or a layer's rows/shift). Empty flushes
         // should not prevent the draw loop from deactivating.
@@ -3016,8 +3023,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Taken under `lock` with the layer list and per-layer buffer sets:
             // the core thread replaces both while this frame is being encoded.
             let cursorLayerOriginSnapshot: simd_float2
-            let cursorOwnerGridSnapshot: Int64
-            let lastKnownCursorRowSnapshot: Int
             /// The committed state carries a cursor move and nothing else.
             let cursorOnlyCommitSnapshot: Bool
 
@@ -3128,8 +3133,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 ))
             }
             cursorLayerOriginSnapshot = committedCursorPlacement.originPx
-            cursorOwnerGridSnapshot = cursorOwner.committed ?? 1
-            lastKnownCursorRowSnapshot = cursorOwner.committedRootRow
             snappedBgRGB = surfaceBgRGB
             snappedCommittedExtent = committedExtent
             lock.unlock()
@@ -3430,35 +3433,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     resolveRow: resolvedRowState
                 )
             }
-
-            // --- Step 3: the row the core named for the cursor ---
-            // This used to be rediscovered every frame by scanning the
-            // committed cursor vertices for their topmost y and dividing by the
-            // cell height — an inference from pixels back to the row the core
-            // had already named. ExternalGridView records the callback's row
-            // instead; a full suite with the two compared under a precondition
-            // never disagreed.
-            let cursorGridRow = lastKnownCursorRowSnapshot
-
-            // --- Step 4: Gate for blink fast path ---
-            let canBlinkFastPath: Bool = {
-                guard isBlinkOnlyFrame && blurEnabled && rowMode && use2Pass && !glowEnabled else { return false }
-                // `cursorGridRow` came from vertices in the CURSOR GRID's own
-                // pixels, but everything below it here — the range check, the
-                // row resolve, the scissor — is the ROOT's row space. They only
-                // coincide while the cursor is on the root. Under ext_multigrid
-                // every editor window is a layer, so without this the fast path
-                // scissored and redrew a root row that was not the cursor's,
-                // and could overwrite a hosted layer's pixels in that band on a
-                // frame where no layer was being redrawn. The external surface
-                // avoids it by refusing the fast path whenever it hosts a layer
-                // at all; naming the cursor's owner is the same rule, stated
-                // precisely enough to keep the fast path on a root cursor.
-                guard cursorOwnerGridSnapshot == 1 else { return false }
-                guard cursorGridRow >= 0 && cursorGridRow < safeRowCount else { return false }
-                guard resolvedRowState(cursorGridRow) != nil else { return false }
-                return true
-            }()
 
             // Skip the main render pass for a frame that changes no backTex
             // pixel — blink-only or noop. The cursor lives on the drawable, not
@@ -3890,8 +3864,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Blur can still redraw dirty-only with .load because the 2-pass
             // background pass overwrites, so alpha does not accumulate — that
             // avoids a full clear between scroll flushes (e.g. statusline).
-            let canDirtyOnlyWithBlur = rowMode && use2Pass && hasAnyDirtyInRowMode
-                && hasPresentedOnceSnapshot && !smoothScrolling && !drawableSizeChanged && !glowEnabled
+            let canDirtyOnlyWithBlur = SurfaceLoadActionTerms.dirtyOnlyWithBlur(
+                rowMode: rowMode,
+                useTwoPass: use2Pass,
+                hasDirtyRowsInRowMode: hasAnyDirtyInRowMode,
+                hasPresentedOnce: hasPresentedOnceSnapshot,
+                isSmoothScrolling: smoothScrolling,
+                drawableSizeChanged: drawableSizeChanged,
+                glowEnabled: glowEnabled
+            )
             // Shared with ExternalGridView: SurfaceLoadActionTerms holds every
             // guard and arm either surface has. This surface has no font gate,
             // no separate layout-damage flag and is never decorated, so those
@@ -3900,7 +3881,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // `hasAnyDirtyInRowMode`, via `anyLayerWork`.
             let loadTerms = SurfaceLoadActionTerms(
                 glowEnabled: glowEnabled,
-                canBlinkFastPath: canBlinkFastPath,
                 useGpuScrollCopy: useGpuScrollCopy,
                 canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
                 hasDirtyRect: dirtyRectPxOpt != nil,
@@ -3918,9 +3898,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             )
 
             if rpd.colorAttachments[0].loadAction == .load {
-                if canBlinkFastPath {
-                    ZonvieCore.appLog("[draw] loadAction=.load (blinkFastPath cursorRow=\(cursorGridRow))")
-                } else if useGpuScrollCopy {
+                if useGpuScrollCopy {
                     ZonvieCore.appLog("[draw] loadAction=.load (layerScrollCopy)")
                 } else {
                     ZonvieCore.appLog("[draw] loadAction=.load (blur=\(blurEnabled) hasPresentedOnce=\(hasPresentedOnce))")
@@ -4047,7 +4025,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // drawn from this same pass.
             let rowPassPlan = SurfaceRowPassTerms(
                 useTwoPass: use2Pass,
-                canBlinkFastPath: canBlinkFastPath,
                 isSmoothScrolling: smoothScrolling,
                 canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
                 loadedPreviousContents: rpd.colorAttachments[0].loadAction == .load,
@@ -4058,23 +4035,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             if rowMode {
                 switch rowPassPlan {
-                case .blinkFastPathRow:
-                    // FAST PATH: blink-only — redraw only cursor row.
-                    // Single-pass via unified blur pipeline when available;
-                    // 2-pass fallback otherwise (matches the global rule
-                    // for use2Pass branches).
-                    let resolved = resolvedRowState(cursorGridRow)!  // guaranteed non-nil by canBlinkFastPath
-                    // Shared with ExternalGridView; only the row differs.
-                    encodeSurfaceBlinkFastPathRow(
-                        encoder: enc,
-                        row: cursorGridRow,
-                        resolved: resolved,
-                        geometry: rowGeometry,
-                        backgroundPipeline: shared.backgroundPipeline,
-                        glyphPipeline: shared.glyphPipeline,
-                        unifiedBlurPipeline: shared.unifiedBlurPipeline
-                    )
-                    ZonvieCore.appLog("[draw] blinkFastPath: cursorRow=\(cursorGridRow) vc=\(resolved.vc) unified=\(shared.unifiedBlurPipeline != nil)")
                 case .dirtyRowsOnly where use2Pass:
                     // Partial redraw with .load for blur: only dirty rows are
                     // redrawn 2-pass (overwrite bg + alpha glyph) with
@@ -4453,8 +4413,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
             // Reset scissor before cursor pass.
             // In rowMode we scissor per row; leaving it as-is will clip the cursor.
-            // canBlinkFastPath also sets a scissor that must be reset.
-            if (rowMode && !use2Pass) || canBlinkFastPath {
+            if rowMode && !use2Pass {
                 let fullW = max(0, Int(view.drawableSize.width.rounded(.down)))
                 let fullH = max(0, Int(view.drawableSize.height.rounded(.down)))
                 if fullW > 0 && fullH > 0 {

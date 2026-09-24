@@ -878,6 +878,22 @@ test "a grid's layer origin: zero for the root, the layer's for a hosted grid, z
     try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &moved_root, 1, 1));
 }
 
+test "a move into the main window lands on the top-left split it still shows" {
+    const G = struct { grid_id: i64, zindex: i64, start_row: i32, start_col: i32, placed_by_surface: i64 };
+    // Grid 2 is externalized (placed by itself); the main window keeps 5 and
+    // 6 side by side, with a float over them and the global grid behind.
+    const grids = [_]G{
+        .{ .grid_id = 1, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+        .{ .grid_id = 2, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 2 },
+        .{ .grid_id = 6, .zindex = 0, .start_row = 0, .start_col = 40, .placed_by_surface = 1 },
+        .{ .grid_id = 5, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+        .{ .grid_id = 9, .zindex = 50, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+    };
+    try std.testing.expectEqual(@as(i64, 5), helpers.mainMoveTargetGrid(G, &grids));
+    // Nothing split in the main window: grid 2, as before.
+    try std.testing.expectEqual(@as(i64, 2), helpers.mainMoveTargetGrid(G, grids[0..2]));
+}
+
 test "dirty rows become one full-width rect per run of adjacent rows" {
     var out: [6]Rect = undefined;
     const rows = [_]u32{ 1, 2, 3, 7, 9, 10 };

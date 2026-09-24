@@ -941,6 +941,21 @@ pub fn layerOriginPx(comptime Layer: type, layers: []const Layer, grid_id: i64, 
     return .{ 0, 0 };
 }
 
+/// The grid whose Neovim window a move INTO the main window lands on: the
+/// top-left split the main window still shows. Grid 2 is only that window
+/// until it is externalized. Same rule as macOS `mainWindowTargetWinId`.
+pub fn mainMoveTargetGrid(comptime Grid: type, grids: []const Grid) i64 {
+    var best: ?Grid = null;
+    for (grids) |g| {
+        if (g.grid_id <= 1 or g.zindex > 0 or g.placed_by_surface != 1) continue;
+        if (best) |b| {
+            if (g.start_row > b.start_row or (g.start_row == b.start_row and g.start_col >= b.start_col)) continue;
+        }
+        best = g;
+    }
+    return if (best) |b| b.grid_id else 2;
+}
+
 /// One full-width rect per run of adjacent dirty rows, written into `out` and
 /// counted. `rows` is sorted and deduplicated, so there are never more runs
 /// than rows: a caller that reserved `rows.len` slots cannot run short, which

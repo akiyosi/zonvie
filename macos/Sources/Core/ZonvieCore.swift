@@ -3246,9 +3246,12 @@ final class ZonvieCore {
     /// cannot revive a timer that the resign-active / occlusion handlers
     /// intentionally stopped. It asked the MAIN window whatever surface held
     /// the cursor, so editing in an external window with the main window
-    /// minimized or covered left the cursor solid.
+    /// minimized or covered left the cursor solid. The cursor's grid is the
+    /// core's, not `lastCursorGrid`: opening any external window, a popupmenu
+    /// included, records that window's grid there, and the core never reports
+    /// the cursor staying where it was.
     private var cursorBlinkAllowed: Bool {
-        let surfaceId = showingSurfaceId(for: lastCursorGrid)
+        let surfaceId = showingSurfaceId(for: getCursorPositionNonBlocking().gridId)
         guard let window = surfaceId == 1 ? terminalView?.window : externalWindows[surfaceId] else { return false }
         return NSApp.isActive && window.occlusionState.contains(.visible) && !window.isMiniaturized
     }

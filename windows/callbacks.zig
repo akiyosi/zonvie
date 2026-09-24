@@ -17,6 +17,7 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("ui/external_windows.zig");
+const render_helpers = @import("render_pipeline_helpers.zig");
 
 // ---- Logging globals for row vertex callbacks ----
 var log_row_no_glyphs_count: u32 = 0;
@@ -721,12 +722,9 @@ pub fn onVerticesPartial(
                         staged
                     else
                         app.tbs.committed_layers;
-                    for (layers.slice()) |l| {
-                        if (l.grid_id != cursor_layer_grid) continue;
-                        if (l.x_px > 0) cur_vp_x +|= @intCast(l.x_px);
-                        if (l.y_px > 0) cur_vp_y +|= @intCast(l.y_px);
-                        break;
-                    }
+                    const origin = render_helpers.layerOriginPx(app_mod.SurfaceLayer, layers.slice(), cursor_layer_grid, 1);
+                    cur_vp_x = @intCast(@max(0, @as(i64, vp_x) + origin[0]));
+                    cur_vp_y = @intCast(@max(0, @as(i64, vp_y) + origin[1]));
                 }
 
                 const new_rc = cursorRectInViewport(slice, cur_vp_x, cur_vp_y, vp_w, vp_h, rect_client.right, rect_client.bottom);

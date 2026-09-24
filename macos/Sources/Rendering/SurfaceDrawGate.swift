@@ -139,6 +139,23 @@ struct SurfaceIdleTerms {
 /// One term needs its role spelled out, because its name would otherwise lie.
 /// See `layersOutsideDirtySet`.
 struct SurfaceLoadActionTerms {
+    /// `canDirtyOnlyWithBlur` for either surface. The external surface also
+    /// tested its font, layout-damage and decoration guards here; the guards
+    /// below refuse reuse on those already, and without reuse the row pass
+    /// cannot choose dirty rows, so the answer was the same.
+    static func dirtyOnlyWithBlur(
+        rowMode: Bool,
+        useTwoPass: Bool,
+        hasDirtyRowsInRowMode: Bool,
+        hasPresentedOnce: Bool,
+        isSmoothScrolling: Bool,
+        drawableSizeChanged: Bool,
+        glowEnabled: Bool
+    ) -> Bool {
+        rowMode && useTwoPass && hasDirtyRowsInRowMode
+            && hasPresentedOnce && !isSmoothScrolling && !drawableSizeChanged && !glowEnabled
+    }
+
     // MARK: guards — any one of these refuses reuse outright
 
     /// Additive bloom accumulates brightness over a loaded texture.
@@ -171,10 +188,6 @@ struct SurfaceLoadActionTerms {
     var layersOutsideDirtySet = false
 
     // MARK: arms — any one of these permits reuse
-
-    /// Only the cursor's blink phase changed, and the cursor is composited
-    /// after the retained texture.
-    var canBlinkFastPath = false
 
     /// The scroll is being served by a GPU blit of the texture being loaded.
     var useGpuScrollCopy = false
@@ -215,7 +228,7 @@ struct SurfaceLoadActionTerms {
             + " glow=\(glowEnabled ? 1 : 0) fontCurrent=\(fontIsCurrent ? 1 : 0)"
             + " layout=\(hasLayoutDamage ? 1 : 0) decorated=\(isDecoratedSurface ? 1 : 0)"
             + " layersOutside=\(layersOutsideDirtySet ? 1 : 0)"
-            + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
+            + " gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
             + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0)"
             + " reuseHosted=\(reuseHostedContents ? 1 : 0) reuseRoot=\(reuseRootContents ? 1 : 0)"
             + " partialHosted=\(partialHostedContents ? 1 : 0)"
@@ -229,8 +242,7 @@ struct SurfaceLoadActionTerms {
     var reusesPreviousContents: Bool {
         guardsAllow
             && (!layersOutsideDirtySet || reuseHostedContents || partialHostedContents)
-            && (canBlinkFastPath
-                || useGpuScrollCopy
+            && (useGpuScrollCopy
                 || canDirtyOnlyWithBlur
                 || reuseHostedContents
                 || reuseRootContents
@@ -243,8 +255,7 @@ struct SurfaceLoadActionTerms {
     /// all, may say this.
     var forcesReusePreviousContents: Bool {
         guardsAllow
-            && (canBlinkFastPath
-                || useGpuScrollCopy
+            && (useGpuScrollCopy
                 || canDirtyOnlyWithBlur
                 || reuseHostedContents
                 || reuseRootContents)
@@ -308,10 +319,6 @@ struct DrawLoopIdleCounter {
 /// the other. This is the decision alone; the encoding stays where each surface
 /// keeps its row resolution.
 enum SurfaceRowPassPlan: Equatable {
-    /// One row, scissored: the blink fast path erases and redraws the cursor's
-    /// row and nothing else.
-    case blinkFastPathRow
-
     /// The rows the frame marked dirty, each scissored to its own band.
     case dirtyRowsOnly
 
@@ -335,12 +342,6 @@ enum SurfaceRowPassPlan: Equatable {
 struct SurfaceRowPassTerms {
     /// Blur's two-pass background/glyph path is in use.
     var useTwoPass = false
-
-    /// Only the cursor's blink phase changed and its row can be resolved.
-    /// Both surfaces require `use2Pass` to set it, so it is only consulted
-    /// inside that branch below — the non-blur ladder never had a blink arm on
-    /// either side, and giving it one here would be unreachable code.
-    var canBlinkFastPath = false
 
     /// A GPU blit already shifted **this pass's own target** for a scroll, so
     /// the band it vacated holds no valid pixels and must be repainted while
@@ -390,7 +391,6 @@ struct SurfaceRowPassTerms {
 
     var plan: SurfaceRowPassPlan {
         if useTwoPass {
-            if canBlinkFastPath { return .blinkFastPathRow }
             if rootScrollBlitVacatedBand { return .dirtyRowsAfterScrollBlit }
             if canDirtyOnlyWithBlur && loadedPreviousContents { return .dirtyRowsOnly }
             return .allRowsWithRetained
