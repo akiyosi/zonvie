@@ -16,7 +16,7 @@ const callbacks = @import("../callbacks.zig");
 const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
 
-const ExternalSurfaceKind = enum {
+pub const ExternalSurfaceKind = enum {
     normal,
     cmdline,
     popupmenu,
@@ -32,7 +32,7 @@ fn externalWakeCookie(hwnd: c.HWND) usize {
     return window_mod.windowWakeCookie(hwnd);
 }
 
-fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
+pub fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
     return switch (grid_id) {
         app_mod.CMDLINE_GRID_ID => .cmdline,
         app_mod.POPUPMENU_GRID_ID => .popupmenu,
@@ -792,6 +792,11 @@ fn drawNormalExternalSurfaceRowMode(
     // unchanged. This used to be claimed only when layers were present, and the
     // no-layer case was covered by the overlay's erase branch instead — a
     // full-content-width clear that the layer case already had to forbid.
+    //
+    // Whether content rows were drawn is read before the erase rows join them,
+    // as the main driver reads it: a frame that only redraws the cursor's two
+    // rows leaves the rest sampling the atlas as it was before the upload.
+    ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0;
     render_pipeline_helpers.insertCursorEraseRows(
         app.alloc,
         rows_to_draw,
@@ -821,7 +826,6 @@ fn drawNormalExternalSurfaceRowMode(
         }
         break :blk_dirty false;
     };
-    ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0 or force_full_rows;
     // A committed scroll is work too: acquireForPaint has already consumed
     // it, so returning here would lose the back_tex and row-VB shift for good.
     const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
@@ -3274,8 +3278,11 @@ fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
     var main_hwnd: ?c.HWND = null;
     app.mu.lockUncancelable(core.clock.io());
     const ext_win = app.external_windows.get(grid_id);
+    // No needs_redraw here: onFlushEnd reads it on every flush and nothing
+    // but a paint clears it, so the failing window was invalidated at flush
+    // rate and never waited for the retry below. The retry timer, or device
+    // recovery, is what wakes it -- as it is for the main window.
     if (ext_win) |ew| {
-        ew.needs_redraw = true;
         device_lost = ew.renderer.device_lost;
         main_hwnd = app.hwnd;
     }

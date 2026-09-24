@@ -72,6 +72,39 @@ private let decorated = GridRowBand(startRow: 0, rows: 10, marginTop: 1, marginB
 /// A plain window: every row scrolls.
 private let plain = GridRowBand(startRow: 0, rows: 10, marginTop: 0, marginBottom: 0)
 
+/// A float that follows its anchor is drawn displaced bodily and has no
+/// offset of its own. The hit test has to find it where it is drawn — through
+/// the core, at the cell the drawn pixel came from — and must not keep naming
+/// it where it no longer is.
+private func verifyDisplacedFollowerHit() {
+    // Float 7 (z 50) placed on rows 4..6, drawn two rows lower (40px) mid-ease.
+    // The core resolver, as the stub answers it: rows 4..6 are the float,
+    // everything else window 2.
+    let resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)? = { row, col in
+        (4...6).contains(row) ? (7, row - 4, col) : (2, row, col)
+    }
+    let zindexOf: (Int64) -> Int64? = { $0 == 7 ? 50 : 0 }
+
+    // Row 7 on screen is where float row 1 is drawn now.
+    let drawn = resolveDisplacedFollowerHit(
+        pointPxY: 150, cellHeightPx: cell, globalCol: 3,
+        staticGridId: 2, followers: [7: 40], zindexOf: zindexOf, resolve: resolve)
+    expect(Int32(drawn?.gridId ?? -1), 7, "a press where the follower is drawn names it")
+    expect(drawn?.row ?? -1, 1, "at the row that pixel came from")
+
+    // Row 4 on screen: the float's placement, which it has moved off.
+    let vacated = resolveDisplacedFollowerHit(
+        pointPxY: 90, cellHeightPx: cell, globalCol: 3,
+        staticGridId: 7, followers: [7: 40], zindexOf: zindexOf, resolve: resolve)
+    expect(Int32(vacated?.gridId ?? -1), 1, "the vacated placement goes to grid 1, the window behind")
+
+    // Not displaced: the static answer stands.
+    let still = resolveDisplacedFollowerHit(
+        pointPxY: 90, cellHeightPx: cell, globalCol: 3,
+        staticGridId: 7, followers: [7: 0.1], zindexOf: zindexOf, resolve: resolve)
+    expect(still == nil ? 1 : 0, 1, "an undisplaced follower leaves the static hit alone")
+}
+
 @main
 struct ScrollAdjustedRowTests {
     static func main() {
@@ -152,6 +185,8 @@ struct ScrollAdjustedRowTests {
             0,
             "a zero cell height returns zero"
         )
+
+        verifyDisplacedFollowerHit()
 
         if failures == 0 {
             print("ScrollAdjustedRowTests: all checks passed")

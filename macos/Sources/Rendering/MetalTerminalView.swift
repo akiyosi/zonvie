@@ -634,7 +634,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     /// window holds focus this one is not, and checking itself would disarm
     /// every repeat the external window starts.
     private weak var heldKeyOwner: KeyRepeatOwner? = nil
-    private var synthRepeatActive = false
+    private(set) var synthRepeatActive = false
     /// Bumped by disarmKeyRepeatSynthesis. The display-link tick snapshots it
     /// under the lock and replayHeldKeyOffMain re-validates it immediately
     /// before the send, narrowing (not closing) the window in which a keyUp
@@ -1303,13 +1303,19 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
             // The band the press cached, not the grid as it stands now: a drag
             // that resizes the grids would otherwise answer a different
-            // question part-way through, which is why the cache exists.
-            let localRow = scrollAdjustedLocalRow(
-                pointPxY: g.pointPx.y,
-                cellHeightPx: g.cellH,
-                band: cache.band,
-                scrollOffsetPx: dragOffsetPx
-            )
+            // question part-way through, which is why the cache exists. A
+            // follower moves bodily, band and all, so it is read where drawn.
+            let localRow: Int32
+            if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[cache.gridId], g.cellH > 0 {
+                localRow = Int32((g.pointPx.y - followerOffsetPx) / g.cellH) - cache.band.startRow
+            } else {
+                localRow = scrollAdjustedLocalRow(
+                    pointPxY: g.pointPx.y,
+                    cellHeightPx: g.cellH,
+                    band: cache.band,
+                    scrollOffsetPx: dragOffsetPx
+                )
+            }
             let localCol = globalCol - cache.startCol
 
             core.sendMouseInput(
@@ -1366,9 +1372,11 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         if let existing = urlTrackingArea {
             removeTrackingArea(existing)
         }
+        // Entered/exited too: a hand set over a URL stayed when the pointer
+        // left for an external window, which sets no cursor of its own there.
         let area = NSTrackingArea(
             rect: bounds,
-            options: [.mouseMoved, .activeInKeyWindow],
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
             owner: self,
             userInfo: nil
         )
@@ -1379,7 +1387,9 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
         let location = convert(event.locationInWindow, from: nil)
-        let (gridId, row, col) = hitTestGrid(at: location, adjustForSmoothScroll: false)
+        // The cell a click here would name, ease undone: hovering read the
+        // drawn row, so mid-ease the hand showed over a row a click missed.
+        let (gridId, row, col) = hitTestGrid(at: location)
         let hasUrl = core?.cellHasURL(gridId: gridId, row: row, col: col) ?? false
         if hasUrl != lastUrlCursorIsHand {
             lastUrlCursorIsHand = hasUrl
@@ -1426,6 +1436,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     }
 
     override func mouseExited(with event: NSEvent) {
+        if event.trackingArea === urlTrackingArea, lastUrlCursorIsHand {
+            lastUrlCursorIsHand = false
+            NSCursor.arrow.set()
+        }
         if let userInfo = event.trackingArea?.userInfo as? [String: Bool],
            userInfo["scrollbar"] == true {
             let config = ZonvieConfig.shared.scrollbar
@@ -3363,6 +3377,23 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             localCol = hit.col
         }
 
+        // A float that follows its anchor is drawn displaced bodily and has no
+        // offset of its own for the correction below: during an ease or a held
+        // bounce a press landed rows from where it is drawn, or in the window
+        // behind. See resolveDisplacedFollowerHit.
+        if let displaced = resolveDisplacedFollowerHit(
+            pointPxY: pointPx.y,
+            cellHeightPx: cellH,
+            globalCol: globalCol,
+            staticGridId: bestGridId,
+            followers: renderer?.drawnFollowerOffsetsPx() ?? [:],
+            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
+            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: false) }
+        ) {
+            ZonvieCore.appLog("[hitTest] result: displaced follower gridId=\(displaced.gridId) row=\(displaced.row) col=\(displaced.col)")
+            return displaced
+        }
+
         // Adjust for smooth scroll offset: during scrolling, content rows are
         // visually shifted by scrollOffsetPx. Without this adjustment, clicking
         // on visually-shifted content selects the wrong row.
@@ -3524,7 +3555,8 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 marginBottom: 0,
                 clipToContent: false,
                 zindex: Int32(clamping: floatGrid.zindex),
-                debtAnchorRowsUp: debtAnchorRowsUp
+                debtAnchorRowsUp: debtAnchorRowsUp,
+                debtAnchorGridId: followedGridId
             ))
         }
         return true

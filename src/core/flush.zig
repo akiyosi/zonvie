@@ -3137,11 +3137,15 @@ pub const FlushCtx = struct {
                 !ctx.core.flush_atlas_corrupted and
                 ctx.core.flush_retryable and
                 dirty_snapshot_valid;
+            // A begin rejection keeps the budget (nothing was consumed) but
+            // publishes nothing, so the mirrors are as stale as they were.
+            const mirror_stale_before = ctx.core.display_mirror_stale;
             finishVertexBudgetTransactionRestoring(
                 ctx.core,
                 vertex_budget_committed or aborted_at_flush_begin,
                 frontend_refused_publication,
             );
+            if (aborted_at_flush_begin) ctx.core.display_mirror_stale = mirror_stale_before;
             if (vertex_budget_committed) {
                 for (ctx.core.grid.destroyed_pending.items) |grid_id| {
                     traceRender(ctx.core, "event=destroy_release grid={d}\n", .{grid_id});
@@ -4015,7 +4019,10 @@ pub const FlushCtx = struct {
                     if (!ctx.core.flush_aborted) ctx.core.grid.clearDirty();
                     if (had_glyph_miss or saw_atlas_reset) {
                         main_retry_required = true;
-                        ctx.core.grid.markAllDirty();
+                        // Not after a retry that survived the reset: it rebuilt
+                        // every root row against the new atlas, and marking them
+                        // again only regenerated them all a second time.
+                        if (had_glyph_miss or !atlas_retried) ctx.core.grid.markAllDirty();
                         // A successful retry already regenerated every row with
                         // the fresh atlas, so its mirrored UVs are valid;
                         // invalidating them would force a full regeneration on
@@ -5739,6 +5746,12 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
                     traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, ext_verts.items.len });
                     row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                     self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
+                } else {
+                    // Outside a grid that shrank under it: Neovim moves the
+                    // cursor in a later batch, and until then the one this grid
+                    // drew must go, as the main surface's does.
+                    traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
+                    row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
                 }
             } else if ((cursor_was_on_this_grid or self.force_ext_cursor_recheck) and !cursor_on_this_grid) {
                 // Cursor left this grid: send an empty cursor to clear the
@@ -11436,6 +11449,121 @@ test "second row-mode atlas reset cancels instead of committing empty rows" {
     try std.testing.expectEqual(@as(u32, 2), state.upload_calls);
 }
 
+test "a row-mode atlas reset the retry survives leaves the root clean" {
+    // The retry regenerates every root row against the new atlas, so the root
+    // owes nothing afterwards. It was still marked all-dirty, which made the
+    // next flush regenerate every root row a second time.
+    const State = struct {
+        core: *Core,
+        committed_flushes: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = grid_id;
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = vert_count;
+            _ = flags;
+            _ = total_rows;
+            _ = total_cols;
+        }
+
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (!self.core.flush_aborted and !self.core.flush_atlas_corrupted) self.committed_flushes += 1;
+        }
+
+        fn rasterize(
+            ctx: ?*anyopaque,
+            scalar: u32,
+            style_flags: u32,
+            out_bitmap: *c_api.GlyphBitmap,
+        ) callconv(.c) c_int {
+            _ = ctx;
+            _ = scalar;
+            _ = style_flags;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(
+            ctx: ?*anyopaque,
+            dest_x: u32,
+            dest_y: u32,
+            width: u32,
+            height: u32,
+            bitmap: *const c_api.GlyphBitmap,
+        ) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resizeGrid(1, 2, 1);
+    core.grid.putCell(0, 0, 'A', 0);
+    core.grid.putCell(1, 0, 'B', 0);
+    core.grid.cursor_visible = false;
+    core.drawable_w_px = 1;
+    core.drawable_h_px = 2;
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.atlas_w = config.atlas_size_default;
+    core.atlas_h = config.atlas_size_default;
+    core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
+    // Full: the first glyph grows the atlas, which resets it mid-loop once.
+    core.atlas_packer.?.next_x = core.atlas_w;
+    core.atlas_packer.?.next_y = core.atlas_h;
+    core.atlas_initialized = true;
+
+    var state = State{ .core = &core };
+    core.ctx = &state;
+    core.cb.on_flush_end = State.onEnd;
+    core.cb.on_vertices_row = State.onRow;
+    core.cb.on_rasterize_glyph = State.rasterize;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(2, 1);
+
+    try std.testing.expectEqual(@as(u32, 1), state.committed_flushes);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+}
+
 test "an atlas reset in the external pass stops sending rows the cancelled commit discards" {
     const State = struct {
         core: *Core,
@@ -15834,6 +15962,113 @@ test "a publication refused after a row shift was sent regenerates the whole gri
     const resent_shift = state.scroll_calls == 1 and state.rows_emitted == 1;
     const regenerated = state.scroll_calls == 0 and state.rows_emitted == 10;
     try std.testing.expect(resent_shift or regenerated);
+}
+
+test "a cursor left outside a shrunk layer clears the one it drew" {
+    // Shrinking a grid does not move Neovim's cursor or bump its revision.
+    // The main surface sends an empty cursor set for an out-of-bounds cursor;
+    // the layer path sent nothing, and the frontend kept the old block.
+    const State = struct {
+        empty_cursor_sends: u32 = 0,
+        drawn_cursor_sends: u32 = 0,
+
+        fn onRow(
+            ctx: ?*anyopaque,
+            grid_id: i64,
+            row_start: u32,
+            row_count: u32,
+            verts: ?[*]const c_api.Vertex,
+            vert_count: usize,
+            flags: u32,
+            total_rows: u32,
+            total_cols: u32,
+        ) callconv(.c) void {
+            _ = row_start;
+            _ = row_count;
+            _ = verts;
+            _ = total_rows;
+            _ = total_cols;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id != 2 or (flags & c_api.VERT_UPDATE_CURSOR) == 0) return;
+            if (vert_count == 0) self.empty_cursor_sends += 1 else self.drawn_cursor_sends += 1;
+        }
+    };
+
+    var state = State{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    core.drawable_w_px = 20;
+    core.drawable_h_px = 10;
+    try core.grid.resize(10, 20);
+    try core.grid.resizeGrid(2, 10, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    core.grid.cursor_visible = true;
+    core.grid.cursor_valid = true;
+    core.grid.cursor_shape = .block;
+    core.grid.cursor_grid = 2;
+    core.grid.cursor_row = 8;
+    core.grid.cursor_col = 0;
+    core.grid.cursor_rev +%= 1;
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expect(state.drawn_cursor_sends > 0);
+
+    state = .{};
+    try core.grid.resizeGrid(2, 4, 20);
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 1), state.empty_cursor_sends);
+    try std.testing.expectEqual(@as(u32, 0), state.drawn_cursor_sends);
+}
+
+test "a flush rejected at begin keeps the mirrors marked stale" {
+    // A late refusal leaves the glyph mirrors describing a frame that never
+    // reached the screen. A begin rejection publishes nothing either, so it
+    // must not declare them current: the next collector would free glyphs
+    // only the frame still on screen draws.
+    const Refuse = struct {
+        var core: ?*Core = null;
+        var at_end = false;
+        var at_begin = false;
+        fn onBegin(ctx: ?*anyopaque) callconv(.c) void {
+            _ = ctx;
+            if (at_begin) if (core) |c| {
+                c.flush_aborted = true;
+            };
+        }
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            _ = ctx;
+            if (at_end) if (core) |c| {
+                c.flush_aborted = true;
+            };
+        }
+    };
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+    core.cb.on_flush_begin = Refuse.onBegin;
+    core.cb.on_flush_end = Refuse.onEnd;
+    Refuse.core = &core;
+    defer Refuse.core = null;
+    var flush_ctx = FlushCtx{ .core = &core };
+
+    core.grid.putCellGrid(2, 0, 1, 'x', 0);
+    Refuse.at_end = true;
+    try flush_ctx.onFlush(10, 20);
+    Refuse.at_end = false;
+    try std.testing.expect(core.display_mirror_stale);
+
+    Refuse.at_begin = true;
+    try flush_ctx.onFlush(10, 20);
+    Refuse.at_begin = false;
+    try std.testing.expect(core.display_mirror_stale);
+
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expect(!core.display_mirror_stale);
 }
 
 test "same-region scrolls in a batch reach on_grid_scroll as one signed summed delta" {

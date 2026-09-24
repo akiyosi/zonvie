@@ -253,14 +253,18 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // mutated one Swift dictionary at once.
         lock.lock()
         let placementRowsUp = placementRowsUpSnapshot[gridId] ?? 0
-        guard let baseline = floatDebtBaselineSnapshot[gridId] else {
-            if seedingBaseline {
-                floatDebtBaselineSnapshot[gridId] = FloatDebtBaseline(
-                    anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp)
-            }
+        let resolved = floatDebtBaselineFollowing(
+            anchorGridId: anchorGridId,
+            stored: floatDebtBaselineSnapshot[gridId],
+            anchorRowsUp: anchorRowsUp,
+            placementRowsUp: placementRowsUp
+        )
+        if resolved.seeded {
+            if seedingBaseline { floatDebtBaselineSnapshot[gridId] = resolved.baseline }
             lock.unlock()
             return 0
         }
+        let baseline = resolved.baseline
         let rows = floatDebtRowsUp(
             anchorRowsUp: anchorRowsUp,
             placementRowsUp: placementRowsUp,
@@ -284,6 +288,27 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         // the same rows are added to an NDC offset that is negated against
         // pixels. This returned `+rows`, which doubled the step instead.
         return -Float(rows) * cellHeightPx
+    }
+
+    /// The same debt, read with `lock` already held and the anchor's count
+    /// taken before it. Never seeds: the draw's body call defines the zero.
+    private func hostedFloatDebtPxLocked(gridId: Int64, anchorRowsUp: Int, cellHeightPx: Float) -> Float {
+        guard cellHeightPx > 0, let baseline = floatDebtBaselineSnapshot[gridId],
+              baseline.anchorGridId == self.gridId else { return 0 }
+        let rows = floatDebtRowsUp(
+            anchorRowsUp: anchorRowsUp,
+            placementRowsUp: placementRowsUpSnapshot[gridId] ?? 0,
+            baseline: baseline
+        )
+        return -Float(rows) * cellHeightPx
+    }
+
+    /// Whether a hosted layer moves bodily with this window's root scroll.
+    /// Only a float anchored to the root: one anchored to another float would
+    /// take the root's offset while its debt was kept against a grid that
+    /// never scrolls, and drift. The main surface refuses the same case.
+    private func followsRootScroll(anchorGrid: Int64, followsScroll: Bool) -> Bool {
+        followsScroll && anchorGrid == gridId
     }
 
     /// This surface's fixed-float mask, the same one the main renderer keeps.
@@ -831,6 +856,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         return controller
     }
     private var scrollbarTrackingArea: NSTrackingArea?
+    private var urlTrackingArea: NSTrackingArea?
+    private var lastUrlCursorIsHand = false
 
 
     // Use GridSurfaceRenderer.ScrollOffset for shader data (shared with main window)
@@ -1319,10 +1346,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         let tracedWriteSet = rowWritePrepared ? writeSetIndex : -1
         if hadContent {
             // What this bracket actually published. A flush that only moved the
-            // cursor took no row set and rotates none: it must not bump the
-            // commit revision either, or draw() reads a new commit with no dirty
-            // row, fails its cursor-only test and clears the whole surface to
-            // redraw content that did not change.
+            // cursor took no row set and rotates none.
             let publishedRows = rowWritePrepared
             let layoutContracted = publishedRows
                 && (bufferSets[flushSourceSetIndex].knownTotalRows > bufferSets[writeSetIndex].knownTotalRows
@@ -1342,8 +1366,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 // frame would otherwise never be drawn: a draw() that
                 // interleaved between the submit and this commit already
                 // consumed the flag the submit set, and submitLayerCursor never
-                // sets one at all. Neither is covered by the commit revision
-                // any more — a cursor-only commit deliberately leaves it alone.
+                // sets one at all.
                 cursorDirty = true
             }
             committedExtent.commit(width: gridCols, height: gridRows)
@@ -1412,11 +1435,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // before calling this function, both on the core/RPC thread.
             //
             // A cursor-only commit rotates no set, so it refreshes the standing
-            // one — and only while no frame is reading it, because draw() takes
-            // this reference outside the lock. A cursor glyph that missed the
-            // refresh still draws: within one atlas generation the texture
-            // object does not change, and a generation change is caught by
-            // committedFontIsCurrent instead.
+            // one. Always: it waited for no frame to be in flight, and a cursor
+            // glyph new to this flush (one half of a ligature) then addressed a
+            // texture the swap had made the back one. draw() takes the
+            // reference under the lock with the set index.
             // The texture this flush published, taken from the transaction
             // that published it. This asked the MAIN renderer for its copy,
             // which is the same object only because external surfaces commit
@@ -1425,7 +1447,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             let committedAtlas = shared.committedAtlasTexture
             if publishedRows {
                 bufferSets[writeSetIndex].atlasTextureSnapshot = committedAtlas
-            } else if gpuInFlightCount[committedSetIndex] == 0 {
+            } else {
                 bufferSets[committedSetIndex].atlasTextureSnapshot = committedAtlas
             }
             // Merge the write set's staged scroll into the global accumulator.
@@ -2409,6 +2431,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // --- Snapshot committed state under lock (same pattern as GridSurfaceRenderer) ---
             let csi: Int
             let cci: Int
+            // Read with `csi`, under the lock: a cursor-only commit refreshes
+            // the committed set's reference while a frame may be encoding it.
+            let atlasTextureSnapshot: MTLTexture?
             let currentCommitRevision: UInt64
             let pendingScroll: SurfaceRowScroll?
             var submittedDirtyRows: [Int] = []
@@ -2465,6 +2490,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // Settled against THIS surface's commit, the way the main renderer
             // settles against its own; shared with it. Returns with `lock` held.
             var hasScrollOffset = false
+            // Before `lock`, for the shader cursor's debt below: a follower
+            // follows only the root (followsRootScroll).
+            let rootAnchorRowsUp = mainTerminalView?.anchorLandedRowsUpSnapshot(gridId) ?? 0
             settleSurfaceAgainstOwnCommit(
                 lock: lock,
                 commitRevision: { self.commitRevision },
@@ -2490,6 +2518,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 return
             }
             csi = committedSetIndex
+            atlasTextureSnapshot = bufferSets[csi].atlasTextureSnapshot
             retainedSnapshot = retention.snapshotPublished()
             currentCommitRevision = commitRevision
             snappedCommittedExtent = committedExtent
@@ -2570,17 +2599,31 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // scrolling in its own right, the root's when it merely follows,
             // and nothing at all when it stands still. The body and the cursor
             // have to answer the same offset or they are drawn a row apart.
+            let cursorOwnOffset = surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
+            let cursorFollowsRoot = cursorOwnerSnapshot != gridId && cursorOwnOffset == nil
+                && followsRootScroll(anchorGrid: cursorLayerAnchorGridSnapshot, followsScroll: cursorLayerFollowsScrollSnapshot)
             cursorOwnerOffset = cursorOwnerSnapshot == gridId
                 ? scrollOffsetSnapshot
-                : (surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot)
-                    ?? (cursorLayerFollowsScrollSnapshot ? scrollOffsetSnapshot : nil))
+                : (cursorOwnOffset ?? (cursorFollowsRoot ? scrollOffsetSnapshot : nil))
             // Shared with GridSurfaceRenderer. The height is the one every
             // NDC above was built against, latched beside them rather than
-            // recomputed on a cell size the core may have moved since.
+            // recomputed on a cell size the core may have moved since. A
+            // follower's effect carries its debt, as its body does and as the
+            // main surface folds it into offset_y.
+            var cursorShaderOffset = cursorOwnerOffset
+            if cursorFollowsRoot, var followed = cursorShaderOffset, scrollOffsetViewportHeight > 0 {
+                let debtPx = hostedFloatDebtPxLocked(
+                    gridId: cursorOwnerSnapshot,
+                    anchorRowsUp: rootAnchorRowsUp,
+                    cellHeightPx: Float(shared.cellHeightPx ?? 0)
+                )
+                followed.offset_y -= debtPx * 2 / scrollOffsetViewportHeight
+                cursorShaderOffset = followed
+            }
             cursorShaderOffsetPx = surfaceShaderCursorOffsetPx(
                 rawGridId: cursorShaderRawSnapshot.gridId,
                 ownerGridId: cursorOwnerSnapshot,
-                offset: cursorOwnerOffset,
+                offset: cursorShaderOffset,
                 viewportHeightPx: scrollOffsetViewportHeight
             )
             shaderCursorMoved = shared.shaderCursor.evaluate(
@@ -3033,7 +3076,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // registered, so the downstream `if let tex = atlasTex` gates become
             // compile errors rather than dead conditionals that would
             // over-release the DispatchGroup.
-            guard let atlasTex = atlasReader.beginExternalRead(commandBuffer: cmd, snapshot: { committed.atlasTextureSnapshot }) else {
+            guard let atlasTex = atlasReader.beginExternalRead(commandBuffer: cmd, snapshot: { atlasTextureSnapshot }) else {
                 // A pending writer intentionally rejects new reader admission
                 // until already-in-flight readers drain. Commit the otherwise
                 // empty command buffer for prompt driver resource release, then
@@ -3233,7 +3276,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             var cursorDrawOrigin = cursorLayerOriginSnapshot
             // A layer with an offset of its own keeps its origin: the shader
             // displaces its rows inside it. Only a follower is moved bodily.
-            if cursorLayerFollowsScrollSnapshot,
+            if followsRootScroll(anchorGrid: cursorLayerAnchorGridSnapshot, followsScroll: cursorLayerFollowsScrollSnapshot),
                surfaceScrollOffset(gridId: cursorOwnerSnapshot, offsets: hostedScrollOffsetSnapshot) == nil,
                let offset = scrollOffsetSnapshot {
                 // The shared helper the main renderer uses, rather than the same
@@ -3278,7 +3321,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     // up in one coordinate space.
                     let layerOffset = surfaceScrollOffset(
                         gridId: layer.gridId, offsets: hostedScrollOffsetSnapshot)
-                    if layerOffset == nil, layer.followsScroll, let offset = scrollOffsetSnapshot {
+                    if layerOffset == nil, followsRootScroll(anchorGrid: layer.anchorGrid, followsScroll: layer.followsScroll),
+                       let offset = scrollOffsetSnapshot {
                         origin = displacedLayerOriginPx(
                             originPx: origin,
                             offset: offset,
@@ -3375,11 +3419,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     // Attenuate what this surface already extracted under the
                     // layer before adding the layer's own light, so a glyph
                     // hidden behind a float here does not bloom through it --
-                    // the same two-pass order the main surface uses.
+                    // the same two-pass order the main surface uses, over the
+                    // same rows the extract draws, retained ones included.
                     if glow, let occludePipe = shared.glowOccludePipeline {
                         _ = encodeSurfaceRowDraws(
-                            encoder: encoder, rows: 0..<rows,
-                            resolve: { resolveSurfaceGridRow(set, row: $0, cellHeightPx: Float(cellHi)) },
+                            encoder: encoder, rows: 0..<(rows + retainedForLayerCount),
+                            resolve: resolveLayerRow,
                             pipeline: occludePipe,
                             backgroundPipeline: nil, glyphPipeline: nil, useTwoPass: false
                         )
@@ -3926,8 +3971,12 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             redrawScheduler.didDrawFrame()
             finishedRedraw = true
 
-            DispatchQueue.main.async { [weak self] in
-                self?.updateScrollbarIfNeeded()
+            // Only when there is a scrollbar, as the main surface's flush path
+            // does: this hop ran on every presented frame of an animation.
+            if ZonvieConfig.shared.scrollbar.enabled {
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateScrollbarIfNeeded()
+                }
             }
         }
     }
@@ -4340,7 +4389,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         rootOffsetPx: CGFloat,
         cellH: CGFloat
     ) -> CGFloat {
-        guard ownOffsetPx == 0, layer.followsScroll else { return CGFloat(layer.originPx.y) }
+        guard ownOffsetPx == 0, followsRootScroll(anchorGrid: layer.anchorGrid, followsScroll: layer.followsScroll) else {
+            return CGFloat(layer.originPx.y)
+        }
         let debtPx = hostedFloatDebtPx(
             gridId: layer.gridId,
             anchorGridId: layer.anchorGrid,
@@ -4607,6 +4658,16 @@ extension ExternalGridView: IMEPreeditHost {
         return CGPoint(x: CGFloat(layer.originPx.x) / scale, y: CGFloat(layer.originPx.y) / scale)
     }
 
+    /// The y, in view points from the bottom, of the top of the grid content.
+    /// A decorated surface's frame is sized to its content, so the grid's own
+    /// height plus the viewport offset is exact there. A normal window draws
+    /// from the top and may carry leftover pixels (zoom, tiling) or a stale row
+    /// count mid-resize; the view's height is its top, as the mouse and the
+    /// main window's IME measure it.
+    private func imeContentTopPt(rowHeightPt: CGFloat) -> CGFloat {
+        isDecoratedSurface ? viewportOriginPx.y + CGFloat(gridRows) * rowHeightPt : bounds.height
+    }
+
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
         let cell = imePreeditCellSize
         if let core = mainTerminalView?.core {
@@ -4614,9 +4675,8 @@ extension ExternalGridView: IMEPreeditHost {
             if cursor.row >= 0 && cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) {
                 // Cursor is grid-local; add viewportOriginPx for decorated
                 // surfaces (e.g. the cmdline icon/padding).
-                let gridContentHeight = CGFloat(gridRows) * cell.height
                 let x = viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width
-                let y = viewportOriginPx.y + gridContentHeight - origin.y - CGFloat(cursor.row + 1) * cell.height
+                let y = imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height
                 return CGPoint(x: x, y: y)
             }
         }
@@ -4633,15 +4693,25 @@ extension ExternalGridView: IMEPreeditHost {
         var origin = CGPoint.zero
         if let core = main.core {
             let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0, let o = imeCursorGridOriginPt(cursor.gridId) {
-                screenRow = Int(cursor.row)
-                screenCol = Int(cursor.col)
-                origin = o
+            if cursor.row >= 0 && cursor.col >= 0 {
+                if let o = imeCursorGridOriginPt(cursor.gridId) {
+                    screenRow = Int(cursor.row)
+                    screenCol = Int(cursor.col)
+                    origin = o
+                } else {
+                    // The cursor is on another surface -- this window became
+                    // key by Cmd-` or its title bar, which does not move
+                    // Neovim's cursor. Ask the surface showing it, as the main
+                    // window asks an external one. Not this view again: the
+                    // owner map can name it before its layout commits.
+                    let showing = core.externalViewShowing(gridId: cursor.gridId)
+                    if let showing, showing !== self { return showing.imeFirstRect() }
+                    if showing == nil { return main.imeFirstRect() }
+                }
             }
         }
-        let gridContentHeight = CGFloat(gridRows) * rowH
         let cursorXPt = viewportOriginPx.x + origin.x + CGFloat(screenCol) * cellW
-        let cursorYPt = viewportOriginPx.y + gridContentHeight - origin.y - CGFloat(screenRow + 1) * rowH
+        let cursorYPt = imeContentTopPt(rowHeightPt: rowH) - origin.y - CGFloat(screenRow + 1) * rowH
         let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
         return win.convertToScreen(convert(rectInView, to: nil))
     }
@@ -4843,6 +4913,10 @@ extension ExternalGridView: NSTextInputClient {
         if hoverScrollbarEnabled {
             hideScrollbar()
         }
+        if event.trackingArea === urlTrackingArea, lastUrlCursorIsHand {
+            lastUrlCursorIsHand = false
+            NSCursor.arrow.set()
+        }
         super.mouseExited(with: event)
     }
 
@@ -4854,7 +4928,38 @@ extension ExternalGridView: NSTextInputClient {
                 hideScrollbar()
             }
         }
+        updateURLCursor(event)
         super.mouseMoved(with: event)
+    }
+
+    /// The hand over a URL, as the main window shows it, for the cell a click
+    /// here would name. External windows had no hover tracking outside the
+    /// scrollbar's, so a URL in one never showed it.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = urlTrackingArea { removeTrackingArea(existing) }
+        urlTrackingArea = nil
+        guard !isDecoratedSurface else { return }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        urlTrackingArea = area
+    }
+
+    private func updateURLCursor(_ event: NSEvent) {
+        guard !isDecoratedSurface, let core = mainTerminalView?.core else { return }
+        let scale = backingScale
+        let location = convert(event.locationInWindow, from: nil)
+        let pointPx = CGPoint(x: location.x * scale, y: bounds.height * scale - location.y * scale)
+        let target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
+        let hasUrl = core.cellHasURL(gridId: target.gridId, row: target.row, col: target.col)
+        guard hasUrl != lastUrlCursorIsHand else { return }
+        lastUrlCursorIsHand = hasUrl
+        (hasUrl ? NSCursor.pointingHand : NSCursor.arrow).set()
     }
 }
 

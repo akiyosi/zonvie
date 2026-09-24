@@ -5707,7 +5707,11 @@ final class ZonvieCore {
         let avgHeight = totalHeight / CGFloat(infos.count)
 
         for info in infos {
+            // Keep the top-left corner, as move, exchange and rotate do and as
+            // Windows does; AppKit's origin is the bottom-left, so resizing in
+            // place moved every window's top edge.
             var newFrame = info.frame
+            newFrame.origin.y = info.frame.maxY - avgHeight
             newFrame.size = NSSize(width: avgWidth, height: avgHeight)
             info.window.setFrame(newFrame, display: true)
         }

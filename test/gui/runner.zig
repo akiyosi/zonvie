@@ -624,6 +624,16 @@ test "gui:main_float_mouse_disabled_scroll" {
     }
 }
 
+test "gui:hidden_main_parks_draw_loop" {
+    // macOS only: GridSurfaceRenderer is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/hidden_main_parks_draw_loop.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:blink_survives_popupmenu" {
     // macOS only: the blink gate is ZonvieCore's.
     if (comptime builtin.os.tag == .macos) {
