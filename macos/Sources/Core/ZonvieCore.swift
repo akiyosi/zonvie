@@ -3246,12 +3246,9 @@ final class ZonvieCore {
     /// cannot revive a timer that the resign-active / occlusion handlers
     /// intentionally stopped. It asked the MAIN window whatever surface held
     /// the cursor, so editing in an external window with the main window
-    /// minimized or covered left the cursor solid. The cursor's grid is the
-    /// core's, not `lastCursorGrid`: opening any external window, a popupmenu
-    /// included, records that window's grid there, and the core never reports
-    /// the cursor staying where it was.
+    /// minimized or covered left the cursor solid.
     private var cursorBlinkAllowed: Bool {
-        let surfaceId = showingSurfaceId(for: getCursorPositionNonBlocking().gridId)
+        let surfaceId = showingSurfaceId(for: lastCursorGrid)
         guard let window = surfaceId == 1 ? terminalView?.window : externalWindows[surfaceId] else { return false }
         return NSApp.isActive && window.occlusionState.contains(.visible) && !window.isMiniaturized
     }
@@ -6224,7 +6221,15 @@ final class ZonvieCore {
         window: NSWindow,
         gridView: ExternalGridView
     ) {
-        self.lastCursorGrid = gridId
+        // Only a window the cursor enters. The core reports the cursor moving
+        // onto it once the window is registered, and this makes that report a
+        // no-op; a popupmenu or message window gets no such report, so
+        // recording it named a grid the cursor never left for, and the blink
+        // gate asked a window that had since closed. The gate cannot read the
+        // core instead: the change arrives mid-flush, while grid_mu is held.
+        if kind == .normal || kind == .cmdline {
+            self.lastCursorGrid = gridId
+        }
         window.makeKeyAndOrderFront(nil)
         window.makeFirstResponder(gridView)
         let windowType = self.externalGridKindLogLabel(kind)
@@ -7198,13 +7203,13 @@ final class ZonvieCore {
         terminalView?.renderer?.releaseLayerDrawState(gridId: gridId)
         externalGridViewsLock.lock()
         gridSurfaceOwners.removeValue(forKey: gridId)
-        let isOwnSurface = externalGridViews[gridId] != nil
-        let hosts = isOwnSurface ? [] : Array(externalGridViews.values)
+        let hosts = externalGridViews.filter { $0.key != gridId }.map { $0.value }
         externalGridViewsLock.unlock()
         // An external view's OWN grid is released by its teardown, which the
         // close dispatches asynchronously AFTER this callback: releasing it
-        // here blanks a window that is still installed and drawing. Only
-        // grids a view hosts as a non-root layer are released on destroy.
+        // here blanks a window that is still installed and drawing. Every
+        // other view releases its copy: a float hosted in one window and later
+        // given its own kept that copy until the host closed.
         for host in hosts { host.releaseGridBuffers(gridId: gridId) }
     }
 

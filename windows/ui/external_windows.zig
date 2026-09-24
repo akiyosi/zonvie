@@ -1605,14 +1605,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 var client_pt: c.POINT = .{ .x = 0, .y = 0 };
                 _ = c.ClientToScreen(main_hwnd, &client_pt);
 
-                // Calculate position in pixels from cell coordinates
-                const px_x: c_int = @intCast(@as(i32, @intCast(req.start_col)) * @as(i32, @intCast(cell_w)));
-                var px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)));
-
-                // When ext_tabline is enabled, grid coordinates start below the tabbar
-                if (app.ext_tabline_enabled and app.content_hwnd == null) {
-                    px_y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-                }
+                // Cell coordinates start at the main surface's origin: below a
+                // titlebar tabline, right of a left sidebar. The rule the mouse
+                // and IME use; this added the tab bar for every style and never
+                // the sidebar.
+                const origin = input.surfaceOriginPx(app, true);
+                const px_x: c_int = @intCast(@as(i32, @intCast(req.start_col)) * @as(i32, @intCast(cell_w)) + origin.x);
+                const px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)) + origin.y);
 
                 pos_x = client_pt.x + px_x;
                 if (is_popupmenu) {
@@ -2643,7 +2642,9 @@ pub export fn ExternalWndProc(
                     if (!left_drag) app.mouse_press_grid_id = target.grid_id;
 
                     // Capture so a drag that leaves the window keeps arriving.
-                    _ = c.SetCapture(hwnd);
+                    // Not again mid left-drag: whether re-capturing notifies
+                    // WM_CAPTURECHANGED is not worth depending on.
+                    if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
                     const button: [*:0]const u8 = switch (msg) {
                         c.WM_RBUTTONDOWN => blk: {
                             if (!left_drag) app.mouse_button_held = 2;
@@ -3948,7 +3949,10 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
         if (grid_id < 0) continue; // Skip special windows (cmdline, popupmenu, etc.)
         const ext = entry.value_ptr.*;
         if (ext.is_pending_close) continue;
-        if (c.IsWindowVisible(ext.hwnd) == 0) continue; // Skip hidden windows
+        // Skip hidden and minimized windows. IsWindowVisible is still true for
+        // an iconic one, whose rect is the off-screen minimized position; macOS
+        // leaves those out through `isVisible`.
+        if (c.IsWindowVisible(ext.hwnd) == 0 or c.IsIconic(ext.hwnd) != 0) continue;
         var rect: c.RECT = std.mem.zeroes(c.RECT);
         _ = c.GetWindowRect(ext.hwnd, &rect);
         result[count] = .{ .grid_id = grid_id, .win_id = ext.win_id, .rect = rect, .hwnd = ext.hwnd };
@@ -4099,8 +4103,11 @@ fn queueSwapWindowPositions(app: *App, hwnd_a: c.HWND, rect_a: c.RECT, hwnd_b: c
     return true;
 }
 
-/// Sort window infos spatially: top-to-bottom, left-to-right.
-fn sortSpatially(infos: []WindowInfo) void {
+/// Sort window infos spatially: top-to-bottom, left-to-right. Centres within
+/// `row_band_px` of each other are one row, ordered left to right -- macOS's
+/// rule (20pt). Compared exactly, two side-by-side windows a few pixels apart
+/// in height ordered by Y, so <C-w>x and <C-w>r swapped a different pair.
+fn sortSpatially(infos: []WindowInfo, row_band_px: i32) void {
     for (0..infos.len) |i| {
         var min_idx = i;
         for (i + 1..infos.len) |j| {
@@ -4108,7 +4115,8 @@ fn sortSpatially(infos: []WindowInfo) void {
             const b_cy = @divTrunc(infos[j].rect.top + infos[j].rect.bottom, 2);
             const a_cx = @divTrunc(infos[min_idx].rect.left + infos[min_idx].rect.right, 2);
             const b_cx = @divTrunc(infos[j].rect.left + infos[j].rect.right, 2);
-            if (b_cy < a_cy or (b_cy == a_cy and b_cx < a_cx)) {
+            const same_row = absI32(b_cy - a_cy) <= row_band_px;
+            if ((!same_row and b_cy < a_cy) or (same_row and b_cx < a_cx)) {
                 min_idx = j;
             }
         }
@@ -4167,7 +4175,7 @@ pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callc
         return;
     }
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count]);
+    sortSpatially(sorted[0..coll.count], app.scalePx(20));
     const source_id = showingSurfaceIdLocked(app, grid_id);
 
     // Find source index
@@ -4230,7 +4238,7 @@ pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, cou
         return;
     }
     var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count]);
+    sortSpatially(sorted[0..coll.count], app.scalePx(20));
 
     // Save original positions (left, top) only — each window keeps its own size
     var lefts: [MAX_WIN_INFOS]c.LONG = undefined;

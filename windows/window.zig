@@ -5897,8 +5897,12 @@ pub export fn WndProc(
                 // Check tabline/sidebar area first (when ext_tabline enabled)
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
-                        if (msg == c.WM_LBUTTONDOWN and y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                            tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                        // Every button, as the sidebar does: a right press on
+                        // a tab reached Neovim as a click on row 0.
+                        if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            if (msg == c.WM_LBUTTONDOWN) {
+                                tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            }
                             return 0;
                         }
                     } else if (app.tabline_style == .sidebar) {
@@ -5927,8 +5931,13 @@ pub export fn WndProc(
                     }
                 }
 
+                // Another button pressed mid left-drag leaves the drag, its
+                // capture and its release to the left button, as the external
+                // window does.
+                const left_drag = app.mouse_button_held == 1;
+
                 // Capture mouse to receive WM_MOUSEMOVE outside window
-                _ = c.SetCapture(hwnd);
+                if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
 
                 // Determine button name
                 const button: [*:0]const u8 = switch (msg) {
@@ -5937,11 +5946,11 @@ pub export fn WndProc(
                         break :blk "left";
                     },
                     c.WM_RBUTTONDOWN => blk: {
-                        app.mouse_button_held = 2;
+                        if (!left_drag) app.mouse_button_held = 2;
                         break :blk "right";
                     },
                     c.WM_MBUTTONDOWN => blk: {
-                        app.mouse_button_held = 3;
+                        if (!left_drag) app.mouse_button_held = 3;
                         break :blk "middle";
                     },
                     else => "left",
@@ -5955,7 +5964,7 @@ pub export fn WndProc(
                 // path -- and it measured the cost on 0.12.2, a middle press
                 // over a float pasting destructively into the buffer behind it.
                 const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
-                app.mouse_press_grid_id = target.grid_id;
+                if (!left_drag) app.mouse_press_grid_id = target.grid_id;
                 input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
 
                 return 0;
@@ -5971,8 +5980,16 @@ pub export fn WndProc(
                 // later WM_MOUSEMOVE then passed the drag gate and Neovim saw a
                 // selection following a pointer with no button down.
                 const press_grid = app.mouse_press_grid_id;
-                app.mouse_button_held = 0;
-                app.mouse_press_grid_id = 0;
+                const left_drag_continues = app.mouse_button_held == 1 and msg != c.WM_LBUTTONUP;
+                if (!left_drag_continues) {
+                    app.mouse_button_held = 0;
+                    app.mouse_press_grid_id = 0;
+                }
+                // A press the editor received is released to it, wherever the
+                // pointer is now: the chrome branches below kept the release
+                // (and, for right and middle, the capture) from a drag that
+                // ended over the tab bar or sidebar.
+                const press_reached_editor = press_grid != 0;
 
                 // Extract position from lParam (needed for tabline check)
                 const pos_x_up = input.mousePosFromLParam(lParam);
@@ -5980,10 +5997,12 @@ pub export fn WndProc(
                 const y_up = pos_x_up.y;
 
                 // Check tabline/sidebar drag end or area click
-                if (app.ext_tabline_enabled) {
+                if (app.ext_tabline_enabled and !press_reached_editor) {
                     if (app.tabline_style == .titlebar) {
-                        if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
-                            tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                        if (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            if (msg == c.WM_LBUTTONUP) {
+                                tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                            }
                             return 0;
                         }
                     } else if (app.tabline_style == .sidebar) {
@@ -6018,7 +6037,7 @@ pub export fn WndProc(
                 }
 
                 // Release mouse capture
-                _ = c.ReleaseCapture();
+                if (!left_drag_continues) _ = c.ReleaseCapture();
 
                 // Determine button name
                 const button: [*:0]const u8 = switch (msg) {
@@ -6046,7 +6065,8 @@ pub export fn WndProc(
 
         c.WM_XBUTTONDOWN => {
             if (getApp(hwnd)) |app| {
-                _ = c.SetCapture(hwnd);
+                const left_drag = app.mouse_button_held == 1;
+                if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
 
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
@@ -6054,16 +6074,11 @@ pub export fn WndProc(
 
                 // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
                 const x_button: u16 = @truncate(wParam >> 16);
-                const button: [*:0]const u8 = if (x_button == 1) blk: {
-                    app.mouse_button_held = 4;
-                    break :blk "x1";
-                } else blk: {
-                    app.mouse_button_held = 5;
-                    break :blk "x2";
-                };
+                const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
+                if (!left_drag) app.mouse_button_held = if (x_button == 1) 4 else 5;
 
                 const x_target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
-                app.mouse_press_grid_id = x_target.grid_id;
+                if (!left_drag) app.mouse_press_grid_id = x_target.grid_id;
                 input.sendMouseButton(app, x_target.grid_id, button, .press, x_target.x, x_target.y, wParam);
 
                 // WM_XBUTTONDOWN requires returning TRUE
@@ -6077,7 +6092,8 @@ pub export fn WndProc(
                 // zeroes the press grid; read it first, as the other buttons
                 // and the external window do.
                 const press_grid = app.mouse_press_grid_id;
-                _ = c.ReleaseCapture();
+                const left_drag_continues = app.mouse_button_held == 1;
+                if (!left_drag_continues) _ = c.ReleaseCapture();
 
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
@@ -6086,10 +6102,10 @@ pub export fn WndProc(
                 const x_button: u16 = @truncate(wParam >> 16);
                 const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
 
-                app.mouse_button_held = 0;
+                if (!left_drag_continues) app.mouse_button_held = 0;
 
                 const x_up = input.rebaseMainWindowTarget(app, press_grid, @as(i32, x), @as(i32, y));
-                app.mouse_press_grid_id = 0;
+                if (!left_drag_continues) app.mouse_press_grid_id = 0;
                 input.sendMouseButton(app, x_up.grid_id, button, .release, x_up.x, x_up.y, wParam);
 
                 // WM_XBUTTONUP requires returning TRUE
