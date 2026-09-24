@@ -4875,9 +4875,12 @@ extension ExternalGridView: NSTextInputClient {
             removeTrackingArea(existingArea)
         }
 
+        // No .mouseMoved: the URL area covers the same bounds on every surface
+        // that can hover its scrollbar, and mouseMoved serves both. Two areas
+        // asking for it ran the handler twice per move.
         let trackingArea = NSTrackingArea(
             rect: bounds,
-            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
