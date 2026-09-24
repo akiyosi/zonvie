@@ -2177,15 +2177,21 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
     /// The rows one grid's smooth scroll may retain an outgoing row from.
     private func armScrollRetentionSpan(for info: ZonvieCore.GridInfo, grids: [ZonvieCore.GridInfo]) {
-        // An external window renders its own surface, so its rows are its own
-        // and the full-width test below does not apply. The core reports it at
-        // (0,0), which is already this window's row space.
-        if let external = core?.externalGridView(for: info.gridId) {
-            external.setScrollCaptureBounds(
+        // A grid an external window draws, as its root or as a layer, keeps its
+        // rows in that window's surface, so the span is armed there. Spans are
+        // grid-local either way.
+        switch core?.resolveExternalGridRoute(gridId: info.gridId) {
+        case .externalRoot(let view), .externalLayer(let view):
+            view.setScrollCaptureBounds(
+                gridId: info.gridId,
                 top: Int(info.marginTop),
                 bottomEx: Int(info.rows - info.marginBottom)
             )
             return
+        case .deferred:
+            return
+        default:
+            break
         }
 
         // Armed for full-width windows too, which used to be left to the
@@ -2608,7 +2614,13 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                     || scrollMomentumRunning
                     || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
             if sent > 0 || lookahead || padIsDriving || abs(offset) >= Self.scrollOffsetEpsilon {
-                if let external = core?.externalGridView(for: gridId) {
+                // The route publishStagedScrollClears takes: the surface
+                // that draws the grid owns its rows. Asking only whether the
+                // grid IS an external window sent a float one hosts to the main
+                // renderer, which does not draw it — the band that float's
+                // offset opened was left to the edge stretch.
+                switch core?.resolveGridRoute(gridId: gridId) {
+                case .externalRoot(let view), .externalLayer(let view):
                     // An external window's rows live in its own surface, not
                     // the main composite, so the capture belongs to it. It
                     // cannot happen here: its flush bracket opens lazily on
@@ -2617,8 +2629,10 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                     // distance instead and let it capture when the bracket
                     // opens — the committed set still holds the on-screen rows
                     // at that point.
-                    external.noteGridScroll(rowsDelta: rowsDelta)
-                } else {
+                    view.noteGridScroll(gridId: gridId, rowsDelta: rowsDelta)
+                case .deferred:
+                    break
+                default:
                     renderer.captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta)
                 }
             }

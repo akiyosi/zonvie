@@ -140,6 +140,37 @@ private enum ScrollRetentionTests {
         )
     }
 
+    /// The pin is released per grid, for every grid a surface displaces. An
+    /// external window used to ask only about its root, so a float it hosts
+    /// kept stretching its edge row over the rows it had retained.
+    private static func verifyReleaseCoveredPins(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(3)
+        retention.beginFlush()
+        retention.beginStep(gridId: 5, rowsDelta: 3, pivotTargetRow: 0)
+        for row in 0..<3 { retention.stage(makeRow(retention, gridId: 5, targetRow: row - 3)) }
+        _ = retention.commit()
+
+        let cell: Float = 0.04
+        var offsets = [
+            // The root: displaced, nothing retained, so it keeps the stretch.
+            GridSurfaceRenderer.ScrollOffset(
+                grid_id: 4, offset_y: 0.10, content_top_y: 1, content_bottom_y: -1),
+            // A hosted float, three rows retained for a band under three rows.
+            GridSurfaceRenderer.ScrollOffset(
+                grid_id: 5, offset_y: -0.10, content_top_y: 0.2, content_bottom_y: -0.2),
+        ]
+        retention.releaseCoveredPins(&offsets, cellHeightNDC: cell)
+        requireEqual(offsets[0].pin_edges, 1, "a grid with nothing retained keeps its stretch")
+        requireEqual(offsets[1].pin_edges, 0, "a hosted grid whose band is covered drops its stretch")
+
+        // Wider than the retention: the uncovered part needs the stretch.
+        var wide = [GridSurfaceRenderer.ScrollOffset(
+            grid_id: 5, offset_y: 0.13, content_top_y: 0.2, content_bottom_y: -0.2)]
+        retention.releaseCoveredPins(&wide, cellHeightNDC: cell)
+        requireEqual(wide[0].pin_edges, 1, "a band wider than the retained rows keeps its stretch")
+    }
+
     /// staged -> published only ever happens through a bracket's own commit.
     private static func verifyStagingLifecycle(device: MTLDevice) {
         let retention = ScrollRetention(device: device)
@@ -770,6 +801,7 @@ private enum ScrollRetentionTests {
         verifyPrune(device: device)
         verifyUndisplacedPrune(device: device)
         verifyDepthClamp(device: device)
+        verifyReleaseCoveredPins(device: device)
         print("ScrollRetentionTests: OK")
     }
 }
