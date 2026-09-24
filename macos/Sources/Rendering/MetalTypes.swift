@@ -3153,10 +3153,71 @@ func scrollAdjustedLocalRow(
     return adjustedLocal
 }
 
-/// A float's two running counters as they stood when its debt was last zero.
+/// Where a press lands among floats that follow their anchor, which are drawn
+/// displaced bodily (the anchor's offset plus their debt) and have no offset
+/// of their own for `scrollAdjustedLocalRow` to undo.
+///
+/// Each follower is tested where it is drawn: the pixel is moved back by its
+/// displacement and `resolve` — the core's resolver — is asked about the cell
+/// it came from, so the core's rules (mouse_enabled, order) still decide. The
+/// highest such follower wins over the static hit if it is above it. A static
+/// hit that names a follower which has moved off the cell names what is drawn
+/// there now instead: the window behind, which Neovim resolves from grid 1.
+///
+/// Returns nil when the static hit stands.
+func resolveDisplacedFollowerHit(
+    pointPxY: CGFloat,
+    cellHeightPx: CGFloat,
+    globalCol: Int32,
+    staticGridId: Int64,
+    followers: [Int64: CGFloat],
+    zindexOf: (Int64) -> Int64?,
+    resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)?
+) -> (gridId: Int64, row: Int32, col: Int32)? {
+    guard cellHeightPx > 0, !followers.isEmpty else { return nil }
+    let minDisplacementPx: CGFloat = 0.5
+    var best: (gridId: Int64, row: Int32, col: Int32, zindex: Int64)?
+    for (followerId, offsetPx) in followers where abs(offsetPx) >= minDisplacementPx {
+        guard let zindex = zindexOf(followerId) else { continue }
+        let sourceRow = Int32(((pointPxY - offsetPx) / cellHeightPx).rounded(.down))
+        guard let hit = resolve(sourceRow, globalCol), hit.gridId == followerId else { continue }
+        if best == nil || zindex > best!.zindex {
+            best = (followerId, hit.row, hit.col, zindex)
+        }
+    }
+    let staticMoved = abs(followers[staticGridId] ?? 0) >= minDisplacementPx
+    if let best, staticMoved || best.zindex > (zindexOf(staticGridId) ?? 0) {
+        return (best.gridId, best.row, best.col)
+    }
+    if staticMoved {
+        return (1, Int32((pointPxY / cellHeightPx).rounded(.down)), globalCol)
+    }
+    return nil
+}
+
+/// A float's two running counters as they stood when its debt was last zero,
+/// and the grid whose landed rows the first one counts.
 struct FloatDebtBaseline: Equatable {
     var anchorRowsUp: Int
     var placementRowsUp: Int
+    var anchorGridId: Int64 = 0
+}
+
+/// The baseline a float's debt is read against this frame: the stored one
+/// while it follows the same grid, one fixed now when it follows another or
+/// none is stored. An editor-anchored float follows whichever window it
+/// overlaps most, and two windows' counters share no zero; reading one's
+/// baseline against the other's count made the debt jump by the difference.
+/// A seeded baseline owes nothing this frame.
+func floatDebtBaselineFollowing(
+    anchorGridId: Int64,
+    stored: FloatDebtBaseline?,
+    anchorRowsUp: Int,
+    placementRowsUp: Int
+) -> (baseline: FloatDebtBaseline, seeded: Bool) {
+    if let stored, stored.anchorGridId == anchorGridId { return (stored, false) }
+    return (FloatDebtBaseline(anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp,
+                              anchorGridId: anchorGridId), true)
 }
 
 /// Rows of scroll compensation a float is carrying that its own placement has

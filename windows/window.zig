@@ -6157,38 +6157,18 @@ pub export fn WndProc(
                     const sc_row_h = app.rowHeightPx();
                     app.mu.unlock(core.clock.io());
 
-                    const sc_cx: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                        @as(i32, mx) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                    else
-                        @as(i32, mx);
-                    const sc_cy: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                        @as(i32, my) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                    else
-                        @as(i32, my);
-
-                    if (sc_cx < 0 or sc_cy < 0) {
+                    // The grid a click here would name: the core's resolver
+                    // through the same layer walk the buttons use. This kept
+                    // a grid only if its zindex beat the best so far, from -1,
+                    // so grid 1 (z 0) won over every split (z 0) and the hand
+                    // showed only over floats; it also ignored mouse_enabled.
+                    if (input.pointInMainChrome(app, hwnd, mx, my)) {
                         app.cursor_is_hand = false;
                     } else if (app.corep) |corep| {
-                        const global_col: i32 = if (sc_cell_w > 0) @divTrunc(sc_cx, @as(i32, @intCast(sc_cell_w))) else 0;
-                        const global_row: i32 = if (sc_row_h > 0) @divTrunc(sc_cy, @as(i32, @intCast(sc_row_h))) else 0;
-
-                        // Hit-test visible grids to find the correct grid and local coordinates
-                        const vg = app.getVisibleGridsCached(corep);
-                        var best_grid_id: i64 = 1;
-                        var local_row: i32 = global_row;
-                        var local_col: i32 = global_col;
-                        var best_zindex: i64 = -1;
-                        for (vg) |g| {
-                            if (global_row >= g.start_row and global_row < g.start_row + g.rows and
-                                global_col >= g.start_col and global_col < g.start_col + g.cols and
-                                g.zindex > best_zindex)
-                            {
-                                best_zindex = g.zindex;
-                                best_grid_id = g.grid_id;
-                                local_row = global_row - g.start_row;
-                                local_col = global_col - g.start_col;
-                            }
-                        }
+                        const target = input.resolveMainWindowTarget(app, mx, my);
+                        const best_grid_id = target.grid_id;
+                        const local_col: i32 = if (sc_cell_w > 0) @divFloor(target.x, @as(i32, @intCast(sc_cell_w))) else 0;
+                        const local_row: i32 = if (sc_row_h > 0) @divFloor(target.y, @as(i32, @intCast(sc_row_h))) else 0;
 
                         const result = core.zonvie_core_try_cell_has_url(corep, best_grid_id, local_row, local_col);
                         if (result >= 0) {
@@ -6288,6 +6268,16 @@ pub export fn WndProc(
                     if (in_scrollbar and !app.scrollbar_hover) {
                         app.scrollbar_hover = true;
                         scrollbar.showScrollbar(hwnd, app);
+                        // A pointer leaving through the right edge sends no
+                        // further WM_MOUSEMOVE: ask for WM_MOUSELEAVE, as the
+                        // external window does, or the bar stays up.
+                        var tme: c.TRACKMOUSEEVENT = .{
+                            .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+                            .dwFlags = c.TME_LEAVE,
+                            .hwndTrack = hwnd,
+                            .dwHoverTime = 0,
+                        };
+                        _ = c.TrackMouseEvent(&tme);
                     } else if (!in_scrollbar and app.scrollbar_hover) {
                         app.scrollbar_hover = false;
                         if (!app.config.scrollbar.isAlways() and !app.config.scrollbar.isScroll()) {
@@ -6494,6 +6484,8 @@ pub export fn WndProc(
                     core.zonvie_core_set_focus(corep, is_activating);
                 }
                 if (!is_activating) {
+                    // The blink timer stops with the app, as on macOS.
+                    input.pauseCursorBlinking(hwnd, app);
                     // App is being deactivated - hide mini and message windows
                     inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
                         const idx = @intFromEnum(id);
@@ -6526,6 +6518,8 @@ pub export fn WndProc(
                         }
                     }
                 } else {
+                    // Re-arm through the gate; a stopped timer restarts there.
+                    _ = c.PostMessageW(hwnd, WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
                     // App is being activated - disable IME if configured
                     if (app.config.input.ime_disable_on_activate) {
                         input.setIMEOff(hwnd);
@@ -6554,6 +6548,12 @@ pub export fn WndProc(
         c.WM_MOUSELEAVE => {
             // Mouse left the client area - clear sidebar hover states
             if (getApp(hwnd)) |app| {
+                if (app.scrollbar_hover) {
+                    app.scrollbar_hover = false;
+                    if (!app.config.scrollbar.isAlways() and !app.config.scrollbar.isScroll()) {
+                        scrollbar.hideScrollbar(hwnd, app);
+                    }
+                }
                 if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
                     if (app.tabline_state.hovered_tab != null or
                         app.tabline_state.hovered_close != null or

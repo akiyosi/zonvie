@@ -7,6 +7,7 @@ const core = @import("zonvie_core");
 const dwrite_d2d = app_mod.dwrite_d2d;
 const render_helpers = @import("render_pipeline_helpers.zig");
 const callbacks = @import("callbacks.zig");
+const external_windows = @import("ui/external_windows.zig");
 
 /// The external window that shows the cursor's grid, and where that grid
 /// sits inside it: zero for the window's own root, the layer's origin for a
@@ -15,6 +16,15 @@ const callbacks = @import("callbacks.zig");
 /// grid up by exact id, so a hosted float fell through to main-window
 /// coordinates. Caller holds `app.mu`.
 const ImeExternalSurface = struct { hwnd: c.HWND, root_grid_id: i64, x_px: c.LONG, y_px: c.LONG };
+
+/// Where core content starts inside a decorated external surface: the
+/// cmdline's icon strip and padding, a message window's padding. The IME wrote
+/// the cmdline's out by hand, twice, and gave a message window none.
+fn imeDecoratedOrigin(app: *App, surface: ?ImeExternalSurface) [2]c.LONG {
+    const s = surface orelse return .{ 0, 0 };
+    const o = external_windows.decoratedContentOriginPx(app, external_windows.classifyExternalSurface(s.root_grid_id));
+    return .{ @intFromFloat(o.x), @intFromFloat(o.y) };
+}
 
 fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
     const shown = callbacks.externalWindowShowingGridLocked(app, grid_id) orelse return null;
@@ -378,6 +388,22 @@ pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOr
         .sidebar_width_px = @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))),
         .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
     });
+}
+
+/// Whether a MAIN-window client point is on the chrome -- a titlebar tabline or
+/// a sidebar -- rather than the grid. The origin rule is `surfaceOriginPx`'s; a
+/// sidebar on the right takes no leading columns, so it is tested at the edge.
+pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
+    if (!app.ext_tabline_enabled) return false;
+    const origin = surfaceOriginPx(app, true);
+    if (px < origin.x or py < origin.y) return true;
+    if (app.tabline_style == .sidebar and app.sidebar_position_right) {
+        var client: c.RECT = undefined;
+        if (c.GetClientRect(hwnd, &client) == 0) return false;
+        const sidebar_w: i32 = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+        return px >= client.right - sidebar_w;
+    }
+    return false;
 }
 
 /// Resolve a MAIN-window client point to the grid the pointer is actually over,
@@ -812,6 +838,9 @@ pub fn handleMouseWheel(
     const is_main_window = if (app.hwnd) |main_hwnd| hwnd == main_hwnd else false;
     const px: i32 = @intCast(pt.x);
     const py: i32 = @intCast(pt.y);
+    // Clicks there are the chrome's; a wheel clamped its negative cell to 0
+    // and scrolled whatever window sat at row 0 or column 0.
+    if (is_main_window and pointInMainChrome(app, hwnd, px, py)) return;
     const cell = clientPxToCell(app, is_main_window, px, py, cell_w, row_h, false);
     const col = cell.col;
     const row = cell.row;
@@ -969,12 +998,9 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     if (ext_surface) |es| {
         const ehwnd = es.hwnd;
         // Cursor is on an external grid — position via that window's client area.
-        const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-        const cmdline_x_offset: c.LONG = if (is_cmdline)
-            @intCast(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT)
-        else
-            0;
-        const cmdline_y_offset: c.LONG = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING) else 0;
+        const decorated_origin = imeDecoratedOrigin(app, es);
+        const cmdline_x_offset: c.LONG = decorated_origin[0];
+        const cmdline_y_offset: c.LONG = decorated_origin[1];
 
         // Grid-local pixel position within the external window's client
         // area, plus where a hosted float sits in it.
@@ -1231,17 +1257,11 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const overlay_width: i32 = text_size.cx + 4; // Add small padding
     const overlay_height: i32 = @intCast(atlas_cell_h);
 
-    // Convert client position to screen position (use row_h for Y position)
-    // For ext-cmdline, add offset for icon area and padding
-    const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
-    const cmdline_x_offset: c.LONG = if (is_external_window and is_cmdline)
-        @intCast(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT)
-    else
-        0;
-    const cmdline_y_offset: c.LONG = if (is_external_window and is_cmdline)
-        @intCast(app_mod.CMDLINE_PADDING)
-    else
-        0;
+    // Convert client position to screen position (use row_h for Y position),
+    // past a decorated surface's icon strip and padding.
+    const decorated_origin = imeDecoratedOrigin(app, ext_surface);
+    const cmdline_x_offset: c.LONG = decorated_origin[0];
+    const cmdline_y_offset: c.LONG = decorated_origin[1];
 
     var pt: c.POINT = .{
         .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
@@ -1478,6 +1498,12 @@ pub fn scheduleNextBlink(hwnd: c.HWND, app: *App, is_currently_on: bool) void {
 pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
     _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
     app.cursor_blink_timer = 0;
+    // Minimized or covered since the last tick: stop here, within one
+    // interval, rather than hooking every way a window can stop showing.
+    if (!cursorBlinkAllowed(app)) {
+        pauseCursorBlinking(hwnd, app);
+        return;
+    }
 
     if (app.cursor_blink_phase == 0) {
         // Wait phase complete, enter blink cycle
@@ -1503,6 +1529,37 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
         // Schedule next blink
         scheduleNextBlink(hwnd, app, app.cursor_blink_state);
     }
+}
+
+/// Whether the blink timer may run: this process is in front and the window
+/// showing the cursor is visible and not minimized -- macOS's
+/// `cursorBlinkAllowed`. The timer used to run regardless, repainting a
+/// window in the background or in the taskbar twice a second.
+fn cursorBlinkAllowed(app: *App) bool {
+    const foreground = c.GetForegroundWindow() orelse return false;
+    var foreground_pid: c.DWORD = 0;
+    _ = c.GetWindowThreadProcessId(foreground, &foreground_pid);
+    if (foreground_pid != c.GetCurrentProcessId()) return false;
+    app.mu.lockUncancelable(core.clock.io());
+    const holder: ?c.HWND = if (callbacks.externalWindowShowingGridLocked(app, app.last_cursor_grid)) |shown|
+        shown.win.hwnd
+    else
+        app.hwnd;
+    app.mu.unlock(core.clock.io());
+    const h = holder orelse return false;
+    return c.IsWindowVisible(h) != 0 and c.IsIconic(h) == 0;
+}
+
+/// Stop the timer and leave the cursor drawn. Stopping in the off phase left
+/// the main window's cursor hidden until something else repainted it.
+pub fn pauseCursorBlinking(hwnd: c.HWND, app: *App) void {
+    const was_off = !app.cursor_blink_state;
+    stopCursorBlinking(hwnd, app);
+    if (!was_off) return;
+    app.mu.lockUncancelable(core.clock.io());
+    const cursor_rect = app.last_cursor_rect_px;
+    app.mu.unlock(core.clock.io());
+    if (cursor_rect) |rect| _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
 }
 
 /// Stop cursor blinking
@@ -1555,7 +1612,13 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[blink] settings_changed={}, on_ms>0={}, off_ms>0={}, timer_stopped={}\n", .{ settings_changed, on_ms > 0, off_ms > 0, timer_stopped });
 
     if (on_ms > 0 and off_ms > 0) {
-        // Blink should be enabled
+        // Blink should be enabled -- where it can be seen. Gated here as well
+        // as in the tick: a stopped timer reads as "restart" below, and every
+        // cursor callback lands here.
+        if (!cursorBlinkAllowed(app)) {
+            if (!timer_stopped) pauseCursorBlinking(hwnd, app);
+            return;
+        }
         if (settings_changed or timer_stopped) {
             // Start/restart if settings changed OR timer was stopped (e.g., after mode change to non-blinking mode)
             if (applog.isEnabled()) applog.appLog("[blink] calling startCursorBlinking\n", .{});
