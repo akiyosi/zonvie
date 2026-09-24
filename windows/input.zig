@@ -6,6 +6,27 @@ const applog = app_mod.applog;
 const core = @import("zonvie_core");
 const dwrite_d2d = app_mod.dwrite_d2d;
 const render_helpers = @import("render_pipeline_helpers.zig");
+const callbacks = @import("callbacks.zig");
+
+/// The external window that shows the cursor's grid, and where that grid
+/// sits inside it: zero for the window's own root, the layer's origin for a
+/// float it hosts. Null when the main window shows the grid. The IME
+/// candidate and the preedit overlay both place against this; they looked the
+/// grid up by exact id, so a hosted float fell through to main-window
+/// coordinates. Caller holds `app.mu`.
+const ImeExternalSurface = struct { hwnd: c.HWND, root_grid_id: i64, x_px: c.LONG, y_px: c.LONG };
+
+fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
+    const shown = callbacks.externalWindowShowingGridLocked(app, grid_id) orelse return null;
+    const hwnd = shown.win.hwnd orelse return null;
+    const origin = render_helpers.layerOriginPx(
+        app_mod.SurfaceLayer,
+        shown.win.tbs.committed_layers.slice(),
+        grid_id,
+        shown.root_grid_id,
+    );
+    return .{ .hwnd = hwnd, .root_grid_id = shown.root_grid_id, .x_px = origin[0], .y_px = origin[1] };
+}
 
 // =========================================================================
 // Keyboard constants and input helpers
@@ -93,6 +114,45 @@ test "colon and semicolon swap only when enabled" {
     try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(';', true));
     try std.testing.expectEqual(@as(u16, 'a'), swapColonSemicolon('a', true));
     try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(':', false));
+}
+
+/// WM_KEYDOWN / WM_SYSKEYDOWN for any surface, main or external. True when
+/// the key was consumed; false leaves it to WM_CHAR (plain text, Shift-only,
+/// IME). The two WndProcs carried copies of this body.
+pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool {
+    const vk: u32 = @intCast(wParam);
+    const mods = queryMods();
+    // Passed as 0x10000|VK so the core can tell a Windows keycode apart.
+    const keycode: u32 = KEYCODE_WINVK_FLAG | vk;
+    const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
+
+    app.mu.lockUncancelable(core.clock.io());
+    const ime_composing = app.ime_composing;
+    app.mu.unlock(core.clock.io());
+
+    // Special keys always go through send_key_event, except Enter and
+    // Backspace while IME composes: the committed text comes via WM_IME_CHAR
+    // and the key via WM_CHAR after WM_IME_ENDCOMPOSITION, so sending it here
+    // too would input it twice.
+    if (isSpecialVk(vk)) {
+        if (!(ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK))) {
+            sendKeyEventToCore(app, keycode, mods, null, null);
+        }
+        return true;
+    }
+
+    // Ctrl/Alt combos go through send_key_event with the characters the core
+    // needs to decide <C-x> and the like.
+    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
+        var tmp_chars: [16]u16 = undefined;
+        var tmp_ign: [16]u16 = undefined;
+        var out_chars: [8]u8 = undefined;
+        var out_ign: [8]u8 = undefined;
+        const pair = toUnicodePairUtf8(vk, scancode, &tmp_chars, &tmp_ign, &out_chars, &out_ign);
+        sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
+        return true;
+    }
+    return false;
 }
 
 /// WM_CHAR / WM_SYSCHAR for any surface, main or external. The two WndProcs
@@ -879,7 +939,6 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const cell_w = app.cell_w_px;
     const cell_h = app.cell_h_px;
     const row_h_px = app.rowHeightPx();
-    const ext_tabline_enabled = app.ext_tabline_enabled;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
@@ -901,16 +960,14 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     // If so, we need to calculate screen coordinates via that window, then convert
     // back to the IME hwnd's client coordinates. Otherwise the candidate window
     // appears behind the topmost external window and is invisible.
-    var ext_hwnd: ?c.HWND = null;
-    {
+    const ext_surface = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        if (app.external_windows.get(grid_id)) |ew| {
-            ext_hwnd = ew.hwnd;
-        }
-    }
+        break :blk imeExternalSurfaceLocked(app, grid_id);
+    };
 
-    if (ext_hwnd) |ehwnd| {
+    if (ext_surface) |es| {
+        const ehwnd = es.hwnd;
         // Cursor is on an external grid — position via that window's client area.
         const is_cmdline = (grid_id == app_mod.CMDLINE_GRID_ID);
         const cmdline_x_offset: c.LONG = if (is_cmdline)
@@ -919,9 +976,10 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
             0;
         const cmdline_y_offset: c.LONG = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING) else 0;
 
-        // Grid-local pixel position within the external window's client area
-        const local_x: c.LONG = col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset;
-        const local_cursor_y: c.LONG = row * row_h + cmdline_y_offset;
+        // Grid-local pixel position within the external window's client
+        // area, plus where a hosted float sits in it.
+        const local_x: c.LONG = es.x_px + col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset;
+        const local_cursor_y: c.LONG = es.y_px + row * row_h + cmdline_y_offset;
         const local_below_y: c.LONG = local_cursor_y + @as(c.LONG, @intCast(cell_h));
 
         // Convert external window client coords → screen → IME hwnd client coords
@@ -957,29 +1015,36 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
             }
         }
 
-        const x: c.LONG = @intCast(screen_col * @as(i32, @intCast(cell_w)));
-        const cursor_y: c.LONG = @intCast(screen_row * row_h);
-        const below_overlay_y: c.LONG = cursor_y + @as(c.LONG, @intCast(cell_h));
-
-        // When ext_tabline is enabled on main window, content is rendered below the tabbar.
-        var adjusted_cursor_y = cursor_y;
-        var adjusted_below_overlay_y = below_overlay_y;
-        const is_main_window = if (main_hwnd) |mh| hwnd == mh else false;
-        if (ext_tabline_enabled and is_main_window) {
-            const tab_h = app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-            adjusted_cursor_y += tab_h;
-            adjusted_below_overlay_y += tab_h;
+        // In the MAIN window's client area: the surface starts below a
+        // titlebar tab bar and right of a left sidebar — the rule the paint
+        // and the mouse use. Adding the tab bar for every tabline style put
+        // the candidate a bar too low under a sidebar and never moved it right.
+        const origin = surfaceOriginPx(app, true);
+        const x: c.LONG = origin.x + @as(c.LONG, @intCast(screen_col * @as(i32, @intCast(cell_w))));
+        const cursor_y: c.LONG = origin.y + @as(c.LONG, @intCast(screen_row * row_h));
+        var pt_cursor: c.POINT = .{ .x = x, .y = cursor_y };
+        var pt_below: c.POINT = .{ .x = x, .y = cursor_y + @as(c.LONG, @intCast(cell_h)) };
+        // Then into the client area of the window IME is attached to, which
+        // is another window when focus sits in an external one: the preedit
+        // overlay converts through the main window too.
+        if (main_hwnd) |mh| {
+            if (mh != hwnd) {
+                _ = c.ClientToScreen(mh, &pt_cursor);
+                _ = c.ClientToScreen(mh, &pt_below);
+                _ = c.ScreenToClient(hwnd, &pt_cursor);
+                _ = c.ScreenToClient(hwnd, &pt_below);
+            }
         }
 
         var cf: c.COMPOSITIONFORM = undefined;
         cf.dwStyle = c.CFS_POINT;
-        cf.ptCurrentPos = .{ .x = x, .y = adjusted_cursor_y };
+        cf.ptCurrentPos = pt_cursor;
         _ = c.ImmSetCompositionWindow(himc, &cf);
 
         var candidate_form: c.CANDIDATEFORM = undefined;
         candidate_form.dwIndex = 0;
         candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-        candidate_form.ptCurrentPos = .{ .x = x, .y = adjusted_below_overlay_y };
+        candidate_form.ptCurrentPos = pt_below;
         _ = c.ImmSetCandidateWindow(himc, &candidate_form);
     }
 }
@@ -1045,8 +1110,8 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     atlas_ptr = if (app.atlas) |*a| a else null;
     atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
-    const ext_tabline_enabled = app.ext_tabline_enabled;
     const content_hwnd = app.content_hwnd;
+    const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
     // Access atlas without holding app.mu to avoid nested locking
@@ -1077,19 +1142,15 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     var col: i32 = 0;
     const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
 
-    // Check if hwnd is an external window (use grid-local coords) or main window (use screen coords)
-    var is_external_window = false;
-    {
+    // The window that shows the cursor's grid, as the candidate window finds
+    // it. This asked whether the window with focus was an external one, so a
+    // float an external window hosts was placed at its grid-local position.
+    const ext_surface = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        var ext_it = app.external_windows.iterator();
-        while (ext_it.next()) |entry| {
-            if (entry.value_ptr.*.hwnd == hwnd) {
-                is_external_window = true;
-                break;
-            }
-        }
-    }
+        break :blk imeExternalSurfaceLocked(app, grid_id);
+    };
+    const is_external_window = ext_surface != null;
 
     var screen_row: i32 = row;
     var screen_col: i32 = col;
@@ -1186,13 +1247,22 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
         .y = screen_row * @as(c.LONG, @intCast(row_h)) + cmdline_y_offset,
     };
-    // For external windows, always use their own hwnd for coordinate conversion
-    // (grid-local coords are relative to the external window's client area).
-    // For main window, use content_hwnd when it exists (positioned below tabline),
-    // or add tabline height manually if content_hwnd is null.
-    const coord_hwnd = if (is_external_window) hwnd else if (content_hwnd) |ch| ch else hwnd;
-    if (!is_external_window and content_hwnd == null and ext_tabline_enabled) {
-        pt.y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
+    // An external window's coordinates are relative to its own client area,
+    // plus where a hosted float sits in it. The main window's start at the
+    // surface origin (below a titlebar tab bar, right of a left sidebar),
+    // or in content_hwnd when a child window hosts the content.
+    var coord_hwnd: c.HWND = hwnd;
+    if (ext_surface) |es| {
+        coord_hwnd = es.hwnd;
+        pt.x += es.x_px;
+        pt.y += es.y_px;
+    } else if (content_hwnd) |ch| {
+        coord_hwnd = ch;
+    } else {
+        if (main_hwnd) |mh| coord_hwnd = mh;
+        const origin = surfaceOriginPx(app, true);
+        pt.x += origin.x;
+        pt.y += origin.y;
     }
     _ = c.ClientToScreen(coord_hwnd, &pt);
 

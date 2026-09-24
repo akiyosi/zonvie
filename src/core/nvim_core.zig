@@ -3528,8 +3528,11 @@ pub const Core = struct {
                     .is_external = 0,
                     .mouse_enabled = if (pos.mouse_enabled) 1 else 0,
                     // The same answer flush.collectSurfaceLayerEntries uses to
-                    // decide whose layer list this grid belongs in.
-                    .placed_by_surface = self.grid.surfaceForGrid(gid) orelse 1,
+                    // decide whose layer list this grid belongs in; 0 when no
+                    // surface draws it (broken or cyclic anchor chain, or a
+                    // surface with no buffer yet). `orelse 1` named the main
+                    // surface for a grid the flush drew nowhere.
+                    .placed_by_surface = flush.placedSurfaceForGrid(&self.grid, gid) orelse 0,
                     .compindex = layer.compindex,
                     .draw_order = layer.order,
                 };
@@ -7450,6 +7453,25 @@ test "complete visible-grid snapshot reports truncation from one lock state" {
     core.grid_mu.lockUncancelable(clock.io());
     defer core.grid_mu.unlock(clock.io());
     try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
+}
+
+test "a grid no surface places reports no placing surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 8);
+    // A float whose anchor chain ends at a grid that does not exist: the
+    // flush draws it on no surface. The snapshot said the main surface did,
+    // so the pointer resolver and the macOS offset builder counted a grid
+    // nobody draws.
+    try core.grid.resizeGrid(4, 2, 3);
+    try core.grid.win_pos.put(core.grid.alloc, 4, .{ .row = 1, .col = 1, .anchor_grid = 99 });
+
+    var out: [2]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(i64, 4), out[1].grid_id);
+    try std.testing.expectEqual(@as(i64, 0), out[1].placed_by_surface);
 }
 
 test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {

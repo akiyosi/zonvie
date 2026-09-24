@@ -183,15 +183,6 @@ struct SurfaceLoadActionTerms {
     /// background pass overwrites rather than blends, so alpha cannot build up.
     var canDirtyOnlyWithBlur = false
 
-    /// The frame carries a cursor move and nothing else.
-    ///
-    /// Left false by a surface that says the same thing by refusing to encode
-    /// the surface pass at all — GridSurfaceRenderer's `skipMainPass`, whose
-    /// `noMainWorkFrame` is this condition plus the layer work only it has.
-    /// Both reach the same load action; they differ in whether the frame still
-    /// runs a pass that would overwrite what it loads.
-    var isCursorOnlyFrame = false
-
     /// Hosted layers are unchanged and nothing else moved.
     var reuseHostedContents = false
 
@@ -225,7 +216,7 @@ struct SurfaceLoadActionTerms {
             + " layout=\(hasLayoutDamage ? 1 : 0) decorated=\(isDecoratedSurface ? 1 : 0)"
             + " layersOutside=\(layersOutsideDirtySet ? 1 : 0)"
             + " blinkFast=\(canBlinkFastPath ? 1 : 0) gpuScroll=\(useGpuScrollCopy ? 1 : 0)"
-            + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0) cursorOnly=\(isCursorOnlyFrame ? 1 : 0)"
+            + " dirtyBlur=\(canDirtyOnlyWithBlur ? 1 : 0)"
             + " reuseHosted=\(reuseHostedContents ? 1 : 0) reuseRoot=\(reuseRootContents ? 1 : 0)"
             + " partialHosted=\(partialHostedContents ? 1 : 0)"
             + " rect=\(hasDirtyRect ? 1 : 0) rowDirty=\(hasDirtyRowsInRowMode ? 1 : 0)"
@@ -241,7 +232,6 @@ struct SurfaceLoadActionTerms {
             && (canBlinkFastPath
                 || useGpuScrollCopy
                 || canDirtyOnlyWithBlur
-                || isCursorOnlyFrame
                 || reuseHostedContents
                 || reuseRootContents
                 || partialHostedContents

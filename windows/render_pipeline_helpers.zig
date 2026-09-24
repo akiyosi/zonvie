@@ -928,6 +928,19 @@ fn seedAllowsPresent(in: PresentGateInputs, s: SeedPresentFacts) bool {
     return !in.force_full_rows or drew_every_row;
 }
 
+/// Where `grid_id`'s layer sits in its surface, in surface pixels: zero for
+/// the surface's root, the layer's origin for a grid it hosts, zero when the
+/// grid is not placed there. The cursor overlay, its damage rect and the IME
+/// all place against this; they carried five copies of the loop with two
+/// different keys.
+pub fn layerOriginPx(comptime Layer: type, layers: []const Layer, grid_id: i64, root_grid_id: i64) [2]i32 {
+    if (grid_id == root_grid_id) return .{ 0, 0 };
+    for (layers) |l| {
+        if (l.grid_id == grid_id) return .{ l.x_px, l.y_px };
+    }
+    return .{ 0, 0 };
+}
+
 /// One full-width rect per run of adjacent dirty rows, written into `out` and
 /// counted. `rows` is sorted and deduplicated, so there are never more runs
 /// than rows: a caller that reserved `rows.len` slots cannot run short, which

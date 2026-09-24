@@ -777,16 +777,14 @@ fn drawNormalExternalSurfaceRowMode(
     // Where the cursor's own grid sits inside this surface. Its rows are that
     // grid's local rows, so everything that turns one into a surface rectangle
     // — the overlay draw and the present damage alike — has to add this.
-    var cursor_layer_x_px: i32 = 0;
-    var cursor_layer_y_px: i32 = 0;
-    if (!cursor_on_root) {
-        for (tbs_snap.layers.slice()) |layer| {
-            if (layer.grid_id != tbs_snap.cursor_layer_grid_id) continue;
-            cursor_layer_x_px = layer.x_px;
-            cursor_layer_y_px = layer.y_px;
-            break;
-        }
-    }
+    const cursor_layer_origin_px = render_pipeline_helpers.layerOriginPx(
+        app_mod.SurfaceLayer,
+        tbs_snap.layers.slice(),
+        tbs_snap.cursor_layer_grid_id,
+        grid_id,
+    );
+    const cursor_layer_x_px: i32 = cursor_layer_origin_px[0];
+    const cursor_layer_y_px: i32 = cursor_layer_origin_px[1];
     // Unconditionally, as the main driver does for `cursor_grid == 1`. Claiming
     // both rows from their own grid's vertices is what removes the previous
     // cursor, including an in-place shape change that leaves the row otherwise
@@ -1309,6 +1307,9 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     ext_win.surface.cols = pv.surface.cols;
     ext_win.surface.metrics_gen = pv.metrics_gen;
     ext_win.needs_redraw = true;
+    // Joined the open flush above: onFlushEnd owes this window the
+    // invalidate, and the paint that follows clears needs_redraw.
+    if (ext_win.tbs.is_in_flush) ext_win.flush_needs_invalidate = true;
 
     if (pv.surface.row_mode) {
         ext_win.surface.verts.clearRetainingCapacity();
@@ -1362,6 +1363,10 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
         pv.surface.cursor_verts.items,
         pv.surface.last_cursor_row,
     )) return false;
+    // The seed's cursor is this root's, as the cursor callback would have
+    // staged it. The TBS starts with grid 1 as owner, which made a root
+    // scroll keep a stale cursor and a later empty cursor look foreign.
+    if (pv.surface.cursor_verts.items.len != 0) ext_win.tbs.stageCursorLayerGrid(grid_id);
     ext_win.tbs.markFlushPaintFull();
     if (!ext_win.tbs.is_in_flush) ext_win.tbs.commitFlush(app.alloc);
 
@@ -2451,48 +2456,7 @@ pub export fn ExternalWndProc(
         // Forward keyboard input to core (same as main window)
         c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
-                const vk: u32 = @intCast(wParam);
-                const mods = input.queryMods();
-                const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
-                const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
-
-                // Check if IME is composing
-                app.mu.lockUncancelable(core.clock.io());
-                const ime_composing = app.ime_composing;
-                app.mu.unlock(core.clock.io());
-
-                // Skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
-                if (ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK)) {
-                    // Let IME handle Enter/Backspace
-                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-                }
-
-                // Special keys (arrows, function keys, etc.) go through send_key_event
-                if (input.isSpecialVk(vk)) {
-                    input.sendKeyEventToCore(app, keycode, mods, null, null);
-                    return 0;
-                }
-
-                // Ctrl/Alt combos: use toUnicodePairUtf8 to get character for <C-x> etc.
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    var tmp_chars: [16]u16 = undefined;
-                    var tmp_ign: [16]u16 = undefined;
-                    var out_chars: [8]u8 = undefined;
-                    var out_ign: [8]u8 = undefined;
-
-                    const pair = input.toUnicodePairUtf8(
-                        vk,
-                        scancode,
-                        &tmp_chars,
-                        &tmp_ign,
-                        &out_chars,
-                        &out_ign,
-                    );
-
-                    input.sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
-                    return 0;
-                }
-                // Otherwise let WM_CHAR handle normal text
+                if (input.handleKeyDownMessage(app, wParam, lParam)) return 0;
             }
         },
         c.WM_CHAR, c.WM_SYSCHAR => {
@@ -2617,7 +2581,7 @@ pub export fn ExternalWndProc(
         },
 
         // --- Scrollbar and grid mouse handling for external windows ---
-        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_XBUTTONDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
@@ -2684,13 +2648,22 @@ pub export fn ExternalWndProc(
                             app.mouse_button_held = 3;
                             break :blk "middle";
                         },
+                        // HIWORD(wParam) is XBUTTON1 (1) or XBUTTON2 (2), and
+                        // the ids are the main window's. It had no X handler, so
+                        // <X1Mouse>/<X2Mouse> did nothing here.
+                        c.WM_XBUTTONDOWN => blk: {
+                            const x1 = @as(u16, @truncate(wParam >> 16)) == 1;
+                            app.mouse_button_held = if (x1) 4 else 5;
+                            break :blk if (x1) "x1" else "x2";
+                        },
                         else => blk: {
                             app.mouse_button_held = 1;
                             break :blk "left";
                         },
                     };
                     input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
-                    return 0;
+                    // An X button message wants TRUE back.
+                    return if (msg == c.WM_XBUTTONDOWN) 1 else 0;
                 }
             }
         },
@@ -2729,7 +2702,7 @@ pub export fn ExternalWndProc(
             return 0;
         },
 
-        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP, c.WM_XBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
@@ -2776,10 +2749,14 @@ pub export fn ExternalWndProc(
                     };
                     if (msg != c.WM_LBUTTONUP) {
                         if (editor_target) {
-                            const button: [*:0]const u8 = if (msg == c.WM_RBUTTONUP) "right" else "middle";
+                            const button: [*:0]const u8 = switch (msg) {
+                                c.WM_RBUTTONUP => "right",
+                                c.WM_XBUTTONUP => if (@as(u16, @truncate(wParam >> 16)) == 1) "x1" else "x2",
+                                else => "middle",
+                            };
                             input.sendMouseButton(app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
                         }
-                        return 0;
+                        return if (msg == c.WM_XBUTTONUP) 1 else 0;
                     }
                     if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
                         if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
@@ -3520,16 +3497,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                         // already adds it; without the same term here the
                         // shader burned at the window's top-left corner
                         // whenever the cursor was inside a hosted float.
-                        var layer_x: f32 = 0;
-                        var layer_y: f32 = 0;
-                        if (tbs_snapshot.cursor_layer_grid_id != grid_id) {
-                            for (tbs_snapshot.layers.slice()) |layer| {
-                                if (layer.grid_id != tbs_snapshot.cursor_layer_grid_id) continue;
-                                layer_x = @floatFromInt(layer.x_px);
-                                layer_y = @floatFromInt(layer.y_px);
-                                break;
-                            }
-                        }
+                        const layer_origin = render_pipeline_helpers.layerOriginPx(
+                            app_mod.SurfaceLayer,
+                            tbs_snapshot.layers.slice(),
+                            tbs_snapshot.cursor_layer_grid_id,
+                            grid_id,
+                        );
+                        const layer_x: f32 = @floatFromInt(layer_origin[0]);
+                        const layer_y: f32 = @floatFromInt(layer_origin[1]);
                         // The cursor's own box, from the core's cursor_rect as
                         // the main driver takes it: a bar or underline stays a
                         // bar or underline. This used to centre a whole-cell

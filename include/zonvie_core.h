@@ -1441,8 +1441,9 @@ typedef struct zonvie_grid_info {
     int32_t mouse_enabled;
     /* Which surface composites this grid: 1 for the main window, its own id
      * for an external window, and the HOST's id for a float anchored inside
-     * one. A grid placed by another surface reports start_row/start_col in
-     * that surface's space, so a frontend must not hit-test it as its own. */
+     * one; 0 when no surface draws it (a broken anchor chain). A grid placed
+     * by another surface reports start_row/start_col in that surface's space,
+     * so a frontend must not hit-test it as its own. */
     int64_t placed_by_surface;
     /* Neovim's composition index, and the core's tie-breaker after it. With
      * zindex and grid_id these are the order a surface's layers are drawn in,

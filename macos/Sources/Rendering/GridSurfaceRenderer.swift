@@ -1031,16 +1031,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// True when `gridId` is one of this surface's layers. The pending list is
-    /// consulted too, because the layout for a newly placed grid arrives in the
-    /// same bracket as that grid's first rows.
-    func ownsGrid(_ gridId: Int64) -> Bool {
-        if gridId == 1 { return true }
-        if let pending = pendingSurfaceLayers {
-            return pending.contains { $0.gridId == gridId }
-        }
-        return committedSurfaceLayers.contains { $0.gridId == gridId }
-    }
 
     private var layerGridsPreparedThisFlush = false
 
@@ -2339,7 +2329,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// before calling this, for every surface at once, because a surface that
     /// published UVs against an unswapped texture would sample the wrong
     /// glyphs.
-    func commitFlush(drawableW: UInt32, drawableH: UInt32, publishedAtlasTexture: MTLTexture?) -> Bool {
+    func commitFlush(
+        drawableW: UInt32,
+        drawableH: UInt32,
+        publishedAtlasTexture: MTLTexture?,
+        defaultBgRGB: UInt32
+    ) -> Bool {
         guard isInFlush else { return false }  // Flush was dropped or aborted
         FrameTracer.trace(.commitFlush)
 
@@ -2364,6 +2359,21 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         let mainLayoutChanged = didMainWrite
             && (mainRowStateDrawableW != drawableW || mainRowStateDrawableH != drawableH)
+        // The background the viewport edges and scroll gaps clear to lands
+        // with the rows it belongs to. Set after the commit, a draw in between
+        // took the new rows with the old colour and kept it, the commit's
+        // revision already spent.
+        let bgChanged = surfaceBgRGB != defaultBgRGB
+        surfaceBgRGB = defaultBgRGB
+        // The core opens this bracket on every flush, including one that only
+        // changed an external window. Nothing landed here then, and a new
+        // revision would still be a frame this surface cannot skip. An atlas
+        // swap is not a landing either: the new texture keeps every glyph the
+        // committed UVs name, and the next frame that has work reads it.
+        let bracketLanded = didMainWrite || didCursorWrite || flushHadLayerWork
+            || pendingSurfaceLayers != nil
+            || !flushDirtyRows.isEmpty || flushDirtyRectPx != nil
+            || bgChanged
         if didMainWrite {
             committedSetIndex = writeSetIndex
         }
@@ -2408,7 +2418,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Publish this bracket's smooth-scroll retention together with the
         // vertices it belongs to: a retained row shown against pre-scroll
         // content would draw the same line twice.
-        if retention.commit() {
+        let retentionLanded = retention.commit()
+        if retentionLanded {
             smoothScrollSeeds.append(contentsOf: stagedSmoothScrollSeeds)
             stagedSmoothScrollSeeds.removeAll(keepingCapacity: true)
         }
@@ -2417,7 +2428,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         shared.shaderCursor.publishCommitTail(
             committedBy: self,
             publishScrollClears: { onCommitPublished?() },
-            commitRevision: &commitRevision
+            commitRevision: &commitRevision,
+            bumpRevision: bracketLanded || retentionLanded
         )
         let rev = commitRevision
         serviceSurfaceRowStorageRetirement(
@@ -2493,22 +2505,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Only a successful publication advances other sets' sparse
             // history. Aborted scratch mutations are handled by abortFlush's
             // full-sync barrier instead.
-            staleMainRowsBySet[ws].removeAll()
-            mainRowStateNeedsFullSync[ws] = false
-            if flushHasStructuralMainChange || mainLayoutChanged {
-                for i in bufferSets.indices where i != ws {
-                    staleMainRowsBySet[i].removeAll()
-                    mainRowStateNeedsFullSync[i] = true
-                }
-            } else {
-                for storedRow in flushChangedMainRows.rows {
-                    let row = Int(storedRow)
-                    for i in bufferSets.indices
-                    where i != ws && !mainRowStateNeedsFullSync[i] {
-                        staleMainRowsBySet[i].insert(row)
-                    }
-                }
-            }
+            recordCommittedRowMutation(
+                stale: staleMainRowsBySet,
+                needsFullSync: &mainRowStateNeedsFullSync,
+                committedIndex: ws,
+                rows: flushChangedMainRows.rows.lazy.map(Int.init),
+                structural: flushHasStructuralMainChange || mainLayoutChanged
+            )
             mainRowStateDrawableW = drawableW
             mainRowStateDrawableH = drawableH
         }
@@ -2545,12 +2548,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     /// Update the default Neovim background color (for clear color in viewport edges).
     /// Called from core thread during flush.
-    func updateDefaultBgColor(_ rgb: UInt32) {
-        lock.lock()
-        surfaceBgRGB = rgb
-        lock.unlock()
-    }
-
 
     func submitVerticesPartialRaw(
         mainPtr: UnsafeRawPointer?, mainCount: Int,
