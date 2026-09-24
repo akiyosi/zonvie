@@ -1688,6 +1688,16 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
     }
 
     override func keyDown(with event: NSEvent) {
+        handleGridKeyDown(event, owner: self, traceSurface: 1)
+    }
+
+    /// One keyDown for every grid view. `owner` is the view the event reached:
+    /// its marked text, input context and window decide composition and when a
+    /// repeat must stop. This view supplies the core and the repeat synthesis,
+    /// whose pacing every surface shares — an external view's keys left on the
+    /// OS repeat timer beat against the display and stalled a frame at a time.
+    /// The two views spelled this body out separately.
+    func handleGridKeyDown(_ event: NSEvent, owner: KeyRepeatOwner, traceSurface: Int64) {
         guard let core else { return }
 
         let m = event.modifierFlags
@@ -1704,14 +1714,26 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // evt_ts: NSEvent.timestamp (kernel event time, seconds since boot) in ms.
         // Comparing evt_ts deltas against handler-entry deltas separates the
         // repeat generator's cadence from main-runloop delivery quantization.
-        ZonvieCore.appLogScrollMode("[keyDown] keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
+        ZonvieCore.appLogScrollMode("[keyDown] surface=\(traceSurface) keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(owner.hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
 
         // --- Key repeat synthesis (see MARK above) ---
-        if keyRepeatSwallowsOSRepeat(event, owner: self) { return }
+        let swallowed = keyRepeatSwallowsOSRepeat(event, owner: owner)
+        // External views only: this surface records its sends where the
+        // synthesis sends them, and test/perf/analyze.py counts every tag-12
+        // row as a send.
+        if FrameTracer.enabled, owner !== self {
+            FrameTracer.trace(
+                .inputSend,
+                a: UInt64(event.keyCode),
+                b: (event.isARepeat ? 1 : 0) | (swallowed ? 2 : 0),
+                seq: UInt32(truncatingIfNeeded: traceSurface)
+            )
+        }
+        if swallowed { return }
 
         // If IME is composing (has marked text), let IME handle all keys
         // except Escape which cancels composition.
-        if consumeKeyDuringComposition(event) { return }
+        if owner.consumeKeyDuringComposition(event) { return }
 
         // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
         let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
@@ -1745,7 +1767,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
             if !event.isARepeat && !m.contains(.command) {
                 armHeldKeyEvent(
-                    owner: self,
+                    owner: owner,
                     code: event.keyCode,
                     mods: mods,
                     characters: chars,
@@ -1761,34 +1783,32 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
         // containing `:`/`;`. These two ASCII chars never start IME
         // composition, so bypassing IME for them is safe. The held action
         // stores the swapped char so synthesized repeats replay it verbatim.
-        if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
+        // `endHeldKeyCapture` also refuses to arm while text is marked, which
+        // cannot happen here: the guard already required none.
+        if ZonvieConfig.shared.input.swapColonSemicolon, !owner.hasMarkedText(),
            let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
         {
-            // The same three calls an external grid view makes.
-            // `endHeldKeyCapture` also refuses to arm while text is marked,
-            // which cannot happen here: the guard above already required none.
             beginHeldKeyCapture(isRepeat: event.isARepeat)
-            sendInputNow(swapped)
-            endHeldKeyCapture(owner: self, code: event.keyCode)
+            // Only this surface's own draw loop is kept awake for the reply.
+            if owner === self { sendInputNow(swapped) } else { sendInputForHeldKey(swapped) }
+            endHeldKeyCapture(owner: owner, code: event.keyCode)
             return
         }
 
-        // Plain key: capture what this keyDown sends (via IME insertText ->
-        // sendInputNow) so repeats can replay it. Only a clean single-send
-        // keyDown is a synthesis candidate.
-        // Shared with ExternalGridView, which has called these two since it
-        // was written; this surface open-coded the same window.
+        // Plain key: capture what this keyDown sends (via IME insertText) so
+        // repeats can replay it. Only a clean single-send keyDown is a
+        // synthesis candidate.
         beginHeldKeyCapture(isRepeat: event.isARepeat)
-        defer { endHeldKeyCapture(owner: self, code: event.keyCode) }
+        defer { endHeldKeyCapture(owner: owner, code: event.keyCode) }
 
         // Let the system handle IME input.
-        if let ctx = inputContext, ctx.handleEvent(event) {
+        if let ctx = owner.inputContext, ctx.handleEvent(event) {
             ZonvieCore.appLogScrollMode("[keyDown] -> inputContext.handleEvent returned true")
             return
         }
         ZonvieCore.appLogScrollMode("[keyDown] -> interpretKeyEvents fallback")
         // Fallback: interpret key events directly.
-        interpretKeyEvents([event])
+        owner.interpretKeyEvents([event])
     }
 
     // MARK: - Smooth Scrolling
@@ -2393,6 +2413,7 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
 
             var newOffset: CGFloat
             var scrollCount = 0
+            var sendUp = false
             if pushingIntoEdge {
                 // Pushing into a blocked edge: apply rubber-band resistance
                 // (response fades quadratically toward the visual clamp) and
@@ -2448,17 +2469,14 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
                 let sendDirection: CGFloat = deltaYPx > 0 ? 1 : -1
                 // A row already asked for but not yet landed is already ahead.
                 var lookaheadPx = newOffset - sendDirection * rowHeightPx * CGFloat(alreadyPending)
+                // Counted here, sent after the lock: the send is an RPC
+                // write the core treats as potentially blocking, and the core
+                // thread takes this lock under grid_mu.
                 while lookaheadPx * sendDirection > 0 && canSendNow && scrollCount < Self.maxLookaheadEventsPerInput {
-                    core.sendMouseScroll(
-                        gridId: gridId,
-                        row: row,
-                        col: col,
-                        direction: sendDirection > 0 ? "up" : "down",
-                        modifier: modifier
-                    )
                     scrollCount += 1
                     lookaheadPx -= sendDirection * stepPx
                 }
+                if scrollCount > 0 { sendUp = sendDirection > 0 }
             }
 
             // Clamp stored offset to the same visual range the renderer can display.
@@ -2508,6 +2526,16 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             // incoming grid_scroll is decided against it.
             gestureScrollGridId = gridId
             scrollOffsetLock.unlock()
+
+            for _ in 0..<scrollCount {
+                core.sendMouseScroll(
+                    gridId: gridId,
+                    row: row,
+                    col: col,
+                    direction: sendUp ? "up" : "down",
+                    modifier: modifier
+                )
+            }
 
             if FrameTracer.enabled {
                 var packed = UInt64(min(scrollCount, 255))
@@ -3720,7 +3748,10 @@ extension MetalTerminalView: IMEPreeditHost {
         let cell = imePreeditCellSize
         if let core = core {
             let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0 {
+            // Only a grid this window draws: another surface's start_row and
+            // start_col are in that surface's space. The external view makes
+            // the same refusal for a cursor that is not on it.
+            if cursor.row >= 0 && cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 {
                 // Cursor is grid-local; add the grid's screen offset.
                 var screenRow = Int(cursor.row)
                 var screenCol = Int(cursor.col)
@@ -3746,6 +3777,12 @@ extension MetalTerminalView: IMEPreeditHost {
         var screenCol = 0
         if let core = core {
             let cursor = core.getCursorPositionNonBlocking()
+            // A grid an external window shows is placed by that window, in its
+            // own coordinates, hosted float included: ask it.
+            if cursor.row >= 0 && cursor.col >= 0,
+               let showing = core.externalViewShowing(gridId: cursor.gridId) {
+                return showing.imeFirstRect()
+            }
             if cursor.row >= 0 && cursor.col >= 0 {
                 screenRow = Int(cursor.row)
                 screenCol = Int(cursor.col)

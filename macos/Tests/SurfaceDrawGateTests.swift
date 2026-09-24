@@ -198,14 +198,18 @@ private enum SurfaceDrawGateTests {
             let smooth = bit(mask, 12)
             let rowDirty = bit(mask, 13)
 
+            // No cursor-only arm: a cursor-only frame is reuseRoot or
+            // reuseHosted now, and the arm that stood alone granted reuse
+            // during a smooth scroll, which the main surface never does.
             let originalReuse = fontCurrent
                 && !layoutDamage
                 && (!hasLayers || reuseHosted || partialHosted)
                 && !decorated
                 && !glow
                 && (partialHosted || reuseHosted || reuseRoot
-                    || blinkFast || gpuScroll || cursorOnly
+                    || blinkFast || gpuScroll
                     || dirtyBlur || (!smooth && rowDirty))
+            _ = cursorOnly
             let originalForce = fontCurrent && !layoutDamage
                 && !decorated && !glow
                 && (reuseHosted || reuseRoot || blinkFast || gpuScroll || dirtyBlur)
@@ -219,7 +223,6 @@ private enum SurfaceDrawGateTests {
                 canBlinkFastPath: blinkFast,
                 useGpuScrollCopy: gpuScroll,
                 canDirtyOnlyWithBlur: dirtyBlur,
-                isCursorOnlyFrame: cursorOnly,
                 reuseHostedContents: reuseHosted,
                 reuseRootContents: reuseRoot,
                 partialHostedContents: partialHosted,

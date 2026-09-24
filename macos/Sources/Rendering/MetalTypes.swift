@@ -60,6 +60,34 @@ final class SparseRowSet {
     }
 }
 
+/// After a commit published `committedIndex`, what every other buffer set owes
+/// the next write that picks it up: the rows this commit changed, or a full
+/// sync after a structural change. A set already owing a full sync records no
+/// rows. Both surfaces keep this ledger for their root; it was written out in
+/// each.
+func recordCommittedRowMutation(
+    stale: [SparseRowSet],
+    needsFullSync: inout [Bool],
+    committedIndex: Int,
+    rows: some Sequence<Int>,
+    structural: Bool
+) {
+    stale[committedIndex].removeAll()
+    needsFullSync[committedIndex] = false
+    if structural {
+        for i in stale.indices where i != committedIndex {
+            stale[i].removeAll()
+            needsFullSync[i] = true
+        }
+        return
+    }
+    for row in rows {
+        for i in stale.indices where i != committedIndex && !needsFullSync[i] {
+            stale[i].insert(row)
+        }
+    }
+}
+
 /// The drawable no longer matches the back buffer this surface keeps across
 /// frames, so the frame it holds would be stretched. Nil when no back buffer
 /// exists yet: the first frame is forced whole by `hasPresentedOnce` instead,

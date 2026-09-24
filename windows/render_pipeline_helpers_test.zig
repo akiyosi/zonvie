@@ -863,6 +863,21 @@ test "present rect clamping trims a rect that overhangs the target" {
     try std.testing.expectEqual(Rect{ .left = 80, .top = 80, .right = 100, .bottom = 100 }, rects[0]);
 }
 
+test "a grid's layer origin: zero for the root, the layer's for a hosted grid, zero when missing" {
+    const L = struct { grid_id: i64, x_px: i32, y_px: i32 };
+    const layers = [_]L{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0 },
+        .{ .grid_id = 7, .x_px = 30, .y_px = 60 },
+    };
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &layers, 4, 4));
+    try std.testing.expectEqual([2]i32{ 30, 60 }, helpers.layerOriginPx(L, &layers, 7, 4));
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &layers, 9, 4));
+    // The root answers zero even if the list carried an offset for it: its
+    // layer IS the surface.
+    const moved_root = [_]L{.{ .grid_id = 1, .x_px = 5, .y_px = 5 }};
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &moved_root, 1, 1));
+}
+
 test "dirty rows become one full-width rect per run of adjacent rows" {
     var out: [6]Rect = undefined;
     const rows = [_]u32{ 1, 2, 3, 7, 9, 10 };

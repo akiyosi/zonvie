@@ -617,10 +617,17 @@ final class SurfaceShaderCursor {
     /// generation. The main surface used to release its compensation after
     /// its lock, and the external surface's was released by the main
     /// surface's commit.
-    func publishCommitTail(committedBy surface: AnyObject, publishScrollClears: () -> Void, commitRevision: inout UInt64) {
+    /// `bumpRevision` is false for a bracket that landed nothing: a new
+    /// revision is a frame the surface cannot skip.
+    func publishCommitTail(
+        committedBy surface: AnyObject,
+        publishScrollClears: () -> Void,
+        commitRevision: inout UInt64,
+        bumpRevision: Bool = true
+    ) {
         publish(committedBy: surface)
         publishScrollClears()
-        commitRevision &+= 1
+        if bumpRevision { commitRevision &+= 1 }
     }
 
     /// Drop a measurement whose flush never committed.

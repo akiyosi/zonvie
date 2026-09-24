@@ -624,6 +624,26 @@ test "gui:main_float_mouse_disabled_scroll" {
     }
 }
 
+test "gui:extwin_animated_shader_reuses_rows" {
+    // macOS only: ExternalGridView is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/extwin_animated_shader_reuses_rows.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
+test "gui:main_idle_while_extwin_updates" {
+    // macOS only: GridSurfaceRenderer is macOS frontend code.
+    if (comptime builtin.os.tag == .macos) {
+        try requirePrereqs();
+        try @import("scenarios/macos/main_idle_while_extwin_updates.zig").run(testing.allocator);
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "gui:main_cursor_move_reuses_rows" {
     // macOS only: GridSurfaceRenderer is macOS frontend code.
     if (comptime builtin.os.tag == .macos) {

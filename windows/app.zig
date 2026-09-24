@@ -2348,6 +2348,13 @@ pub const ExternalWindow = struct {
     vb_bytes: usize = 0,
     vert_count: usize = 0,
     needs_redraw: bool = false,
+    /// This flush owes the window an invalidate. Set under `app.mu` by work
+    /// that joins the open flush (core callbacks, and a window seeding its
+    /// write set mid-flush), cleared only by onFlushEnd or a failed flush —
+    /// never by paint: `needs_redraw` is also cleared by paint, and a paint
+    /// landing mid-flush erased the request before onFlushEnd read it,
+    /// leaving the window a flush behind.
+    flush_needs_invalidate: bool = false,
     paint_retry: PaintRetryState = .{},
     paint_retry_deadline_ms: u64 = 0,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
@@ -2831,6 +2838,7 @@ pub const ScrollShiftResult = struct {
 ///   scroll_dy_px:        Pixel shift amount (negative = content moves up, positive = down)
 ///   vb_shift_rows:       Row-unit shift for row_vbs (same sign convention as grid_scroll rows_delta)
 ///   last_cursor_row_ptr: Pointer to last painted cursor row tracker (read + cleared)
+///   last_cursor_on_root: That row is the root's; false leaves it untouched
 ///   row_h_px:            Row height in pixels
 ///   effective_rows:      Total valid row count
 ///   y_offset:            Content Y offset in back_tex pixels (e.g. tabbar height). 0 for ext windows.
@@ -2847,6 +2855,7 @@ pub fn applyScrollShift(
     scroll_row_start: u32,
     scroll_row_end: u32,
     last_cursor_row_ptr: *?u32,
+    last_cursor_on_root: bool,
     row_h_px: i32,
     effective_rows: u32,
     y_offset: i32,
@@ -2867,8 +2876,13 @@ pub fn applyScrollShift(
         shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end, shift_scratch.items);
     }
 
-    // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to rows_to_draw.
-    if (last_cursor_row_ptr.*) |prev_cr| {
+    // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to
+    //    rows_to_draw. Only a row of the root is one: a cursor last painted in
+    //    a hosted float names that float's row, which the root's shift did not
+    //    move, and the layer plan still needs it to repaint the float.
+    if (!last_cursor_on_root) {
+        // Leave it for the layer plan.
+    } else if (last_cursor_row_ptr.*) |prev_cr| {
         if (row_h_px > 0) {
             const scroll_rows: i32 = @divTrunc(scroll_dy_px, row_h_px);
             const shifted_row: i32 = @as(i32, @intCast(prev_cr)) + scroll_rows;
@@ -2885,7 +2899,7 @@ pub fn applyScrollShift(
             }
         }
     }
-    last_cursor_row_ptr.* = null;
+    if (last_cursor_on_root) last_cursor_row_ptr.* = null;
 
     // 3. Fill in scroll rect and apply pixel shift on back_tex.
     var filled = scroll_rect;
@@ -5003,6 +5017,7 @@ pub fn drawSurfaceRowPass(
                 in.snapshot.scroll_row_start,
                 in.snapshot.scroll_row_end,
                 surface.last_painted_cursor_row,
+                surface.last_painted_cursor_grid.* == in.frame.root_grid_id,
                 p.row_h_px,
                 in.total_rows,
                 p.y_offset,

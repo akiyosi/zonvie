@@ -799,21 +799,13 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         rows: some Sequence<Int>,
         structural: Bool
     ) {
-        staleRowsBySet[committedIndex].removeAll()
-        rowStateNeedsFullSync[committedIndex] = false
-        if structural {
-            for i in bufferSets.indices where i != committedIndex {
-                staleRowsBySet[i].removeAll()
-                rowStateNeedsFullSync[i] = true
-            }
-        } else {
-            for row in rows {
-                for i in bufferSets.indices
-                where i != committedIndex && !rowStateNeedsFullSync[i] {
-                    staleRowsBySet[i].insert(row)
-                }
-            }
-        }
+        recordCommittedRowMutation(
+            stale: staleRowsBySet,
+            needsFullSync: &rowStateNeedsFullSync,
+            committedIndex: committedIndex,
+            rows: rows,
+            structural: structural
+        )
     }
 
     // --- Scrollbar ---
@@ -904,7 +896,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
         buildShaderBuffers()
 
-        if gridId == ZonvieCore.cmdlineGridId {
+        if acceptsFileDrops {
             registerForDraggedTypes([.fileURL])
         }
 
@@ -2823,9 +2815,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 return
             }
             drawLoopIdleCounter.noteActive()
-            if gridId == 4 {
-                ZonvieCore.appLog("[ext_draw_why] gridId=4 rowMode=\(rowMode) presented=\(hasPresentedOnce) blink=\(blinkStateChanged) dirty=\(hasDirtyContent) scroll=\(hasPendingScroll) sizeChg=\(drawableSizeChanged) scrollOff=\(scrollOffsetChanged) cursor=\(hasCursorUpdate) hasNewCommit=\(hasNewCommit)")
-            }
 
             let isBlinkOnlyFrame = blinkStateChanged
                 && !layoutDamageSnapshot
@@ -2966,7 +2955,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 // overwrite/glyph pipelines could not be created.
                 && (!blurEnabled || use2Pass)
 
-            // Row state resolution — compute early so canBlinkFastPath can use it.
+            // Row state resolution.
             // A stale set may stay GPU in-flight and must remain immutable.
             // Suppress it logically instead of clearing its row counts.
             let safeRowCount = rowMode && committedFontIsCurrent
@@ -3011,18 +3000,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     resolveRow: resolvedRowState
                 )
             }
-
-            let canBlinkFastPath: Bool = {
-                // Decorated surfaces use loadAction=.clear because their
-                // viewport origin makes partial preservation invalid. Drawing
-                // only the cursor row after that clear would blank every other
-                // row, so they must take the full-row path below.
-                guard !isDecoratedSurface,
-                      isBlinkOnlyFrame && blurEnabled && rowMode && use2Pass && !glowEnabled else { return false }
-                guard lastKnownCursorRowSnapshot >= 0 && lastKnownCursorRowSnapshot < safeRowCount else { return false }
-                guard resolvedRowState(lastKnownCursorRowSnapshot) != nil else { return false }
-                return true
-            }()
 
             // --- Ensure back buffer ---
             ensureBackBuffer(drawableSize: view.drawableSize, pixelFormat: view.colorPixelFormat)
@@ -3164,41 +3141,39 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             rpd.colorAttachments[0].texture = backTex
             rpd.colorAttachments[0].storeAction = .store
 
-            // loadAction logic — match GridSurfaceRenderer, plus cursor-only preservation.
-            // GridSurfaceRenderer marks cursor rows in pendingDirtyRows via markDirtyRect,
-            // so hasAnyDirtyInRowMode is true during cursor-only frames. ExternalGridView
-            // uses a dedicated cursor buffer instead, so dirtyRows may be empty. In that
-            // case, preserve the back buffer to avoid clearing valid content.
+            // loadAction logic — match GridSurfaceRenderer. A cursor-only frame
+            // keeps the back buffer through reuseRootContents/reuseHostedContents,
+            // which, like the main surface's skipMainPass, refuse while an ease
+            // holds an offset.
             let hasAnyDirtyInRowMode = rowMode && !dirtyRows.isEmpty
-            let cursorOnlyFrame = (hasCursorUpdate || isBlinkOnlyFrame) && dirtyRows.isEmpty
-                && !hasDirtyContent && !hasPendingScroll && !layoutDamageSnapshot
             // The cursor is composited after the retained texture. A pure
             // blink needs no root or hosted-row draw, including under blur.
+            // An animating shader is no reason to redraw either: its chain
+            // only reads the retained texture, which is what the main surface
+            // hands it on a frame with no main work.
             let reuseHostedContents = rowMode && !layerSnapshot.isEmpty
                 && committedFontIsCurrent && hasPresentedOnce
                 && !layoutDamageSnapshot && !hasDirtyContent
                 && !hasPendingScroll && !drawableSizeChanged && !scrollOffsetChanged
-                && !smoothScrolling && !shaderAnimates && !glowEnabled
+                && !smoothScrolling && !glowEnabled
                 && !isDecoratedSurface
-            if reuseHostedContents {
-                ZonvieCore.renderTrace("side=macos event=retained_content_reuse surface=\(gridId) root_row_draws=0 hosted_row_draws=0")
-            }
             // Same deal without hosted layers: the cursor lives on the
-            // drawable, not the back texture, so a cursor move or a blink
-            // toggle needs no root row redrawn. Without this the branch
-            // ladder below falls through to the full-redraw arm and
-            // re-encodes every row per keystroke, where the main surface
-            // skips its whole pass (GridSurfaceRenderer's skipMainPass).
+            // drawable, not the back texture, so a frame with no root row to
+            // draw — a cursor move, a blink toggle, an animating shader's
+            // next frame — keeps every row. Without this the branch ladder
+            // below falls through to the full-redraw arm, where the main
+            // surface skips its whole pass (GridSurfaceRenderer's
+            // noMainWorkFrame asks the same question).
             let reuseRootContents = rowMode && layerSnapshot.isEmpty
-                && cursorOnlyFrame && committedFontIsCurrent && hasPresentedOnce
+                && dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
                 && !layoutDamageSnapshot && !hasDirtyContent && !hasPendingScroll
                 && !drawableSizeChanged && !scrollOffsetChanged
-                && !smoothScrolling && !shaderAnimates && !glowEnabled
+                && !smoothScrolling && !glowEnabled
                 && !isDecoratedSurface
             let partialHostedContents = rowMode && !layerSnapshot.isEmpty
                 && !dirtyRows.isEmpty && committedFontIsCurrent && hasPresentedOnce
                 && !layoutDamageSnapshot && !hasPendingScroll && !drawableSizeChanged
-                && !scrollOffsetChanged && !smoothScrolling && !shaderAnimates
+                && !scrollOffsetChanged && !smoothScrolling
                 && !glowEnabled && !isDecoratedSurface
                 // Under blur the recompose is only safe as the two passes the
                 // root uses: the background pass overwrites, so a band redrawn
@@ -3225,10 +3200,8 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 hasLayoutDamage: layoutDamageSnapshot,
                 isDecoratedSurface: isDecoratedSurface,
                 layersOutsideDirtySet: !layerSnapshot.isEmpty,
-                canBlinkFastPath: canBlinkFastPath,
                 useGpuScrollCopy: useGpuScrollCopy,
                 canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
-                isCursorOnlyFrame: cursorOnlyFrame,
                 reuseHostedContents: reuseHostedContents,
                 reuseRootContents: reuseRootContents,
                 partialHostedContents: partialHostedContents,
@@ -3490,7 +3463,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                         if !nonZeroTranslations.isEmpty {
                             ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) nonZeroTranslationY rows: \(nonZeroTranslations.map { "r\($0.0):ty=\($0.1):slot=\($0.2):src=\($0.3)" }.joined(separator: " "))")
                         }
-                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=\(canBlinkFastPath) loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPx.y)")
+                        ZonvieCore.appLog("[ext_draw_debug] gridId=\(gridId) safeRowCount=\(safeRowCount) dirtyRows=\(dirtyRows.count) useGpuScrollCopy=\(useGpuScrollCopy) use2Pass=\(use2Pass) canBlink=false loadAction=\(rpd.colorAttachments[0].loadAction.rawValue) vpH=\(vpHeight) snapRows=\(snapGridRows) drawableH=\(view.drawableSize.height) vpOriginY=\(viewportOriginPx.y)")
                     }
 
                     let drawableW = max(0, Int(view.drawableSize.width.rounded(.down)))
@@ -3568,7 +3541,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     // which is why four cases below still split on it.
                     let rowPassPlan = SurfaceRowPassTerms(
                         useTwoPass: use2Pass,
-                        canBlinkFastPath: canBlinkFastPath,
                         rootScrollBlitVacatedBand: useGpuScrollCopy,
                         isSmoothScrolling: smoothScrolling,
                         canDirtyOnlyWithBlur: canDirtyOnlyWithBlur,
@@ -3581,18 +3553,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
                     switch rowPassPlan {
                     case .blinkFastPathRow:
-                        let cursorRow = lastKnownCursorRowSnapshot
-                        let resolved = resolvedRowState(cursorRow)!
-                        // Shared with GridSurfaceRenderer; only the row differs.
-                        encodeSurfaceBlinkFastPathRow(
-                            encoder: enc,
-                            row: cursorRow,
-                            resolved: resolved,
-                            geometry: rowGeometry,
-                            backgroundPipeline: shared.backgroundPipeline,
-                            glyphPipeline: shared.glyphPipeline,
-                            unifiedBlurPipeline: shared.unifiedBlurPipeline
-                        )
+                        // Not planned here: a blink-only frame reuses the
+                        // retained texture (reuseRootContents) and encodes no
+                        // surface pass, as the main surface's skipMainPass does.
+                        break
                     case .dirtyRowsAfterScrollBlit where use2Pass:
                         // The back texture is loaded after the pixel shift, so all
                         // clears must overwrite it. The regular blur pipeline uses
@@ -4509,106 +4473,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     override var acceptsFirstResponder: Bool { true }
 
     override func keyDown(with event: NSEvent) {
-        guard let main = mainTerminalView, let core = main.core else {
-            return
-        }
-        let m = event.modifierFlags
-
-        // Check if Option key should be treated as Meta (Alt) based on config.
-        // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
-        let optionIsMeta = KeyCharacterSelection.optionActsAsMeta(
-            hasOption: m.contains(.option),
-            modifierRawValue: m.rawValue,
-            optionAsMeta: core.getOptionAsMeta()
-        )
-        let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
-
-        // Key repeat synthesis. This view's keys reach Neovim through the main
-        // view's core, so they have to run on the same paced cadence: left on
-        // the OS repeat timer they beat against the display and the picture
-        // stalls a frame at a time. State and pacing live in MetalTerminalView
-        // (see its Key Repeat Synthesis mark); this view only supplies itself
-        // as the owner, being the one whose window and IME state decide when a
-        // repeat must stop.
-        let swallowed = main.keyRepeatSwallowsOSRepeat(event, owner: self)
-        if FrameTracer.enabled {
-            FrameTracer.trace(
-                .inputSend,
-                a: UInt64(event.keyCode),
-                b: (event.isARepeat ? 1 : 0) | (swallowed ? 2 : 0),
-                seq: UInt32(truncatingIfNeeded: gridId)
-            )
-        }
-        if swallowed { return }
-
-        // If IME is composing (has marked text), let IME handle all keys
-        // except Escape which cancels composition.
-        if consumeKeyDuringComposition(event) { return }
-
-        // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
-
-        if hasControlOrCommand || isSpecialKey {
-            // Use sendKeyEvent (same as MetalTerminalView) instead of sendInput
-            let mods = KeyCharacterSelection.modifierMask(
-                control: m.contains(.control),
-                optionIsMeta: optionIsMeta,
-                shift: m.contains(.shift),
-                command: m.contains(.command),
-                ctrlBit: UInt32(ZONVIE_MOD_CTRL),
-                altBit: UInt32(ZONVIE_MOD_ALT),
-                shiftBit: UInt32(ZONVIE_MOD_SHIFT),
-                superBit: UInt32(ZONVIE_MOD_SUPER)
-            )
-
-            let chars = KeyCharacterSelection.primaryCharacters(
-                optionIsMeta: optionIsMeta,
-                characters: event.characters,
-                charactersIgnoringModifiers: event.charactersIgnoringModifiers
-            )
-
-            core.sendKeyEvent(
-                keyCode: UInt32(event.keyCode),
-                mods: mods,
-                characters: chars,
-                charactersIgnoringModifiers: event.charactersIgnoringModifiers
-            )
-            // Cmd shortcuts must not synthesize repeats; everything else
-            // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
-            if !event.isARepeat && !m.contains(.command) {
-                main.armHeldKeyEvent(
-                    owner: self,
-                    code: event.keyCode,
-                    mods: mods,
-                    characters: chars,
-                    charactersIgnoringModifiers: event.charactersIgnoringModifiers
-                )
-            }
-            return
-        }
-
-        // `:` <-> `;` swap (config-gated). Handle single keypresses here,
-        // bypassing IME; paste flows through a separate path and is unaffected.
-        if ZonvieConfig.shared.input.swapColonSemicolon, !hasMarkedText(),
-           let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
-        {
-            main.beginHeldKeyCapture(isRepeat: event.isARepeat)
-            main.sendInputForHeldKey(swapped)
-            main.endHeldKeyCapture(owner: self, code: event.keyCode)
-            return
-        }
-
-        // Plain key: capture what this keyDown sends (via IME insertText ->
-        // imeSendCommitted -> sendInputForHeldKey) so repeats can replay it.
-        main.beginHeldKeyCapture(isRepeat: event.isARepeat)
-        defer { main.endHeldKeyCapture(owner: self, code: event.keyCode) }
-
-        // Let the system handle IME input.
-        if let ctx = inputContext, ctx.handleEvent(event) {
-            return
-        }
-        // Fallback: interpret key events directly.
-        interpretKeyEvents([event])
+        // The main view's keyDown: this view's keys reach Neovim through the
+        // main view's core and its repeat synthesis; this view supplies itself
+        // as the owner, whose window and IME state decide when a repeat stops.
+        mainTerminalView?.handleGridKeyDown(event, owner: self, traceSurface: gridId)
     }
 
     override func keyUp(with event: NSEvent) {
@@ -4726,16 +4594,30 @@ extension ExternalGridView: IMEPreeditHost {
 
     var imePreeditContainer: NSView { self }
 
+    /// Where the cursor's grid sits in this view, in points from the top-left:
+    /// zero for this window's root, the layer origin for a float it hosts,
+    /// nil when the cursor is on another surface. The IME answered only for
+    /// the root, so a hosted float's candidate window fell to the corner.
+    private func imeCursorGridOriginPt(_ cursorGrid: Int64) -> CGPoint? {
+        if cursorGrid == gridId { return .zero }
+        lock.lock()
+        let layer = committedSurfaceLayers.first { $0.gridId == cursorGrid }
+        lock.unlock()
+        guard let layer else { return nil }
+        let scale = window?.backingScaleFactor ?? 1
+        return CGPoint(x: CGFloat(layer.originPx.x) / scale, y: CGFloat(layer.originPx.y) / scale)
+    }
+
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
         let cell = imePreeditCellSize
         if let core = mainTerminalView?.core {
             let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0 && cursor.gridId == gridId {
+            if cursor.row >= 0 && cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) {
                 // Cursor is grid-local; add viewportOriginPx for decorated
                 // surfaces (e.g. the cmdline icon/padding).
                 let gridContentHeight = CGFloat(gridRows) * cell.height
-                let x = viewportOriginPx.x + CGFloat(cursor.col) * cell.width
-                let y = viewportOriginPx.y + gridContentHeight - CGFloat(cursor.row + 1) * cell.height
+                let x = viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width
+                let y = viewportOriginPx.y + gridContentHeight - origin.y - CGFloat(cursor.row + 1) * cell.height
                 return CGPoint(x: x, y: y)
             }
         }
@@ -4749,16 +4631,18 @@ extension ExternalGridView: IMEPreeditHost {
         let rowH = CGFloat(shared.cellHeightPx) / scale
         var screenRow = 0
         var screenCol = 0
+        var origin = CGPoint.zero
         if let core = main.core {
             let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0 && cursor.gridId == gridId {
+            if cursor.row >= 0 && cursor.col >= 0, let o = imeCursorGridOriginPt(cursor.gridId) {
                 screenRow = Int(cursor.row)
                 screenCol = Int(cursor.col)
+                origin = o
             }
         }
         let gridContentHeight = CGFloat(gridRows) * rowH
-        let cursorXPt = viewportOriginPx.x + CGFloat(screenCol) * cellW
-        let cursorYPt = viewportOriginPx.y + gridContentHeight - CGFloat(screenRow + 1) * rowH
+        let cursorXPt = viewportOriginPx.x + origin.x + CGFloat(screenCol) * cellW
+        let cursorYPt = viewportOriginPx.y + gridContentHeight - origin.y - CGFloat(screenRow + 1) * rowH
         let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
         return win.convertToScreen(convert(rectInView, to: nil))
     }
@@ -4801,6 +4685,11 @@ extension ExternalGridView: NSTextInputClient {
         return 0
     }
 
+    /// Unbound key commands from interpretKeyEvents, swallowed as the main
+    /// view swallows them. Without this override NSResponder passes them up
+    /// the chain, which beeps.
+    override func doCommand(by selector: Selector) {}
+
     // MARK: - Scrollbar
 
     override func viewDidChangeEffectiveAppearance() {
@@ -4833,7 +4722,12 @@ extension ExternalGridView: NSTextInputClient {
                 object: win,
                 queue: .main
             ) { [weak self] _ in
-                guard let self, self.window?.occlusionState.contains(.visible) == true else { return }
+                guard let self else { return }
+                // The blink follows the window showing the cursor, which can
+                // be this one; minimizing it also lands here. The main
+                // window's delegate does the same for the main window.
+                self.mainTerminalView?.core?.refreshCursorBlinkGate()
+                guard self.window?.occlusionState.contains(.visible) == true else { return }
                 self.activateSurfaceDrawLoop()
                 self.setNeedsDisplay(self.bounds)
             }
@@ -4965,14 +4859,16 @@ extension ExternalGridView: NSTextInputClient {
     }
 }
 
-// MARK: - Drag & Drop (path expansion on the external cmdline)
+// MARK: - Drag & Drop
 extension ExternalGridView {
 
-    /// Only the external cmdline accepts file drops; a drop there inserts the
-    /// path as text instead of opening the file. The other decorated surfaces
+    /// A buffer window opens a dropped file, as the main window does; the
+    /// external cmdline inserts the path instead. The other decorated surfaces
     /// (popupmenu, messages) have nothing to insert into, so they decline and
-    /// the drag falls through.
-    var acceptsFileDrops: Bool { gridId == ZonvieCore.cmdlineGridId }
+    /// the drag falls through. Buffer windows used to decline too.
+    var acceptsFileDrops: Bool { dropInsertsPath || !isDecoratedSurface }
+
+    private var dropInsertsPath: Bool { gridId == ZonvieCore.cmdlineGridId }
 
     private func hasFileURLs(_ sender: NSDraggingInfo) -> Bool {
         sender.draggingPasteboard.canReadObject(
@@ -4983,7 +4879,11 @@ extension ExternalGridView {
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         guard acceptsFileDrops, hasFileURLs(sender) else { return [] }
-        FileDragFeedback.showPathText(sender, in: self)
+        if dropInsertsPath {
+            FileDragFeedback.showPathText(sender, in: self)
+        } else {
+            FileDragFeedback.showFileIcon(sender, in: self)
+        }
         return .copy
     }
 
@@ -5001,7 +4901,11 @@ extension ExternalGridView {
         // Dropping on the command line means "put this path here", regardless
         // of what mode the editor thinks it is in.
         let paths = urls.map { escapePathForNeovim($0.path) }.joined(separator: " ")
-        core.sendInput(paths)
+        if dropInsertsPath {
+            core.sendInput(paths)
+        } else {
+            core.sendCommand("drop \(paths)")
+        }
         return true
     }
 }

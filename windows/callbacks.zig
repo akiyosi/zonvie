@@ -1167,6 +1167,7 @@ pub fn onVerticesRow(
                     ext_win.surface.last_cursor_row = null;
                 }
                 ext_win.needs_redraw = true;
+                ext_win.flush_needs_invalidate = true;
                 // InvalidateRect deferred to onFlushEnd.
                 return;
             }
@@ -1213,6 +1214,7 @@ pub fn onVerticesRow(
             ext_win.surface.cols = total_cols;
             ext_win.surface.metrics_gen = app.shared_metrics_gen;
             ext_win.needs_redraw = true;
+            ext_win.flush_needs_invalidate = true;
             if (size_changed) {
                 ext_win.surface.paint_full = true;
                 if (ext_win.tbs.is_in_flush) {
@@ -1772,7 +1774,10 @@ pub fn onGridRowScroll(
                 // the main window, whose flag drives a whole-window
                 // InvalidateRect.
                 switch (row_route) {
-                    .external_layer => |host| host.needs_redraw = true,
+                    .external_layer => |host| {
+                        host.needs_redraw = true;
+                        host.flush_needs_invalidate = true;
+                    },
                     .main_root, .main_layer, .unplaced => app.flush_needs_invalidate = true,
                     .external_root => {},
                 }
@@ -1929,8 +1934,13 @@ pub fn onGridRowScroll(
         return;
     }
 
+    // `last_cursor_row` is a row of the grid the cursor is ON. A cursor in a
+    // float this window hosts names that float's row, which says nothing
+    // about the root's scroll region, and the core does not resend a cursor
+    // that did not move: clearing it there erased it for good.
+    const cursor_on_root = ext_win.tbs.cursorLayerGridIdInFlush() == grid_id;
     const clear_committed_cursor = if (ext_win.surface.last_cursor_row) |cr|
-        cr >= row_start and cr < row_end
+        cursor_on_root and cr >= row_start and cr < row_end
     else
         false;
     if (clear_committed_cursor and !ext_win.tbs.storeMainCursor(app.alloc, &.{}, null)) {
@@ -1944,11 +1954,9 @@ pub fn onGridRowScroll(
     // Update last_cursor_row to follow the scroll shift.
     // If the cursor row moved into the vacated region, it was cleared.
     // Cursor verts are stored separately, so just clear them (core will re-send).
-    if (ext_win.surface.last_cursor_row) |cr| {
-        if (cr >= row_start and cr < row_end) {
-            ext_win.surface.cursor_verts.clearRetainingCapacity();
-            ext_win.surface.last_cursor_row = null;
-        }
+    if (clear_committed_cursor) {
+        ext_win.surface.cursor_verts.clearRetainingCapacity();
+        ext_win.surface.last_cursor_row = null;
     }
 
     // TBS: remap slot indices in write set (no physical data move).
@@ -2018,6 +2026,7 @@ pub fn onGridRowScroll(
 
     ext_win.recomputeVertCount();
     ext_win.needs_redraw = true;
+    ext_win.flush_needs_invalidate = true;
     // InvalidateRect deferred to onFlushEnd for coalescing.
 }
 
@@ -2091,6 +2100,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
         while (ext_cancel_it.next()) |entry| {
             traceRender(app, "event=surface_abort surface={d}\n", .{entry.key_ptr.*});
             entry.value_ptr.*.tbs.cancelFlush();
+            entry.value_ptr.*.flush_needs_invalidate = false;
         }
         // Layers publish nothing until applyStaged, so dropping their staged
         // ops leaves WM_PAINT on the previous committed frame.
@@ -2269,7 +2279,9 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     var ext_hwnd_count: usize = 0;
     var it = app.external_windows.iterator();
     while (it.next()) |entry| {
-        if (entry.value_ptr.*.needs_redraw or atlas_reset_committed) {
+        const ext_dirty = entry.value_ptr.*.flush_needs_invalidate or entry.value_ptr.*.needs_redraw;
+        entry.value_ptr.*.flush_needs_invalidate = false;
+        if (ext_dirty or atlas_reset_committed) {
             if (entry.value_ptr.*.hwnd) |ext_hwnd| {
                 if (ext_hwnd_count < ext_hwnds.len) {
                     ext_hwnds[ext_hwnd_count] = ext_hwnd;
@@ -3303,6 +3315,7 @@ pub fn onSurfaceLayout(
     // same reason. Grid 1 has no needs_redraw of its own, so it uses the flag.
     if (app.external_windows.get(surface_id)) |ext_win| {
         ext_win.needs_redraw = true;
+        ext_win.flush_needs_invalidate = true;
     } else {
         app.flush_needs_invalidate = true;
     }
@@ -3459,7 +3472,10 @@ fn storeMainSurfaceLayerRowLocked(
         .external_root, .unplaced => return false,
     };
     traceRender(app, "event=row_route surface={d} grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ if (ext) |host| traceExternalSurfaceId(host, grid_id) else @as(i64, 1), grid_id, row, verts.len, total_rows, total_cols });
-    if (ext) |host| host.needs_redraw = true;
+    if (ext) |host| {
+        host.needs_redraw = true;
+        host.flush_needs_invalidate = true;
+    }
 
     // The row belongs to this path, so an allocation failure must not fall
     // through to the external-window path. Abort the flush and have the core
