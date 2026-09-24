@@ -1630,6 +1630,49 @@ ZONVIE_API int32_t zonvie_core_popupmenu_top(
     int32_t ref_bottom,
     int32_t screen_top);
 
+/* A saved window origin kept inside an area (the work area of the monitor
+   holding it): each axis clamped to [area_min, area_max - size]. The axes
+   carry no direction, so Y may grow up or down.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_clamp_window_origin(
+    int32_t x, int32_t y, int32_t w, int32_t h,
+    int32_t area_min_x, int32_t area_min_y,
+    int32_t area_max_x, int32_t area_max_y,
+    int32_t *out_x, int32_t *out_y);
+
+/* The left edge of an external popupmenu window: anchor_left - text_inset
+   (so the popup's text lines up with the anchor column), shifted left to end
+   at screen_right when it would run past it -- as Neovim's own popupmenu
+   does -- and never left of screen_left. Any unit, X growing rightward.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API int32_t zonvie_core_popupmenu_left(
+    int32_t anchor_left,
+    int32_t popup_width,
+    int32_t text_inset,
+    int32_t screen_left,
+    int32_t screen_right);
+
+/* How one msg_show changes a frontend's stack of `stack_len` messages shown
+   together: returns ZONVIE_MSG_STACK_PUSH (add at the end),
+   ZONVIE_MSG_STACK_REPLACE_LAST (put it in place of the last entry; the other
+   visible messages stay, per the UI spec's replace_last) or
+   ZONVIE_MSG_STACK_APPEND_TO_LAST (append its text to the last entry), and
+   writes how many oldest entries to drop afterwards (the stack holds 5).
+
+   Pure — no core pointer, no lock. */
+enum {
+    ZONVIE_MSG_STACK_PUSH = 0,
+    ZONVIE_MSG_STACK_REPLACE_LAST = 1,
+    ZONVIE_MSG_STACK_APPEND_TO_LAST = 2,
+};
+ZONVIE_API int zonvie_core_msg_stack_plan(
+    size_t stack_len,
+    int replace_last,
+    int append,
+    size_t *out_evict_oldest);
+
 /* The top edge of the cmdline completion popup, Y growing downward: `gap`
    above the cmdline window (cmdline_top - gap - popup_height) when that starts
    at or below screen_top, else `gap` below it (cmdline_bottom + gap).

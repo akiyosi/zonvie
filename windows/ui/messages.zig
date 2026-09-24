@@ -919,7 +919,7 @@ pub fn updateMiniWindows(app: *App) void {
 
     // Count visible minis and build stack order
     var stacked_height_px: c_int = 0;
-    for (0..3) |idx| {
+    for (0..app.mini_windows.len) |idx| {
         app.mu.lockUncancelable(core.clock.io());
         const text_len = app.mini_windows[idx].text_len;
         var text_buf: [256]u8 = undefined;
@@ -1135,7 +1135,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     app.mu.lockUncancelable(core.clock.io());
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
-    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
         const idx = @intFromEnum(id);
         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
             if (mini_hwnd == hwnd) {

@@ -22,6 +22,7 @@ pub const render_layout = @import("render_layout.zig");
 pub const row_scroll = @import("row_scroll.zig");
 pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
+const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
@@ -1891,6 +1892,53 @@ pub export fn zonvie_core_popupmenu_top(
     return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
 }
 
+/// A saved window origin clamped into an area: each axis to [min, max - size].
+/// Direction-free, so the same call serves Y-up and Y-down. Pure.
+pub export fn zonvie_core_clamp_window_origin(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    area_min_x: i32,
+    area_min_y: i32,
+    area_max_x: i32,
+    area_max_y: i32,
+    out_x: ?*i32,
+    out_y: ?*i32,
+) callconv(.c) void {
+    const o = popup_placement.clampOrigin(x, y, w, h, area_min_x, area_min_y, area_max_x, area_max_y);
+    if (out_x) |p| p.* = o[0];
+    if (out_y) |p| p.* = o[1];
+}
+
+/// The left edge of an external popupmenu window: `anchor_left - text_inset`,
+/// shifted left to end at `screen_right` if it would run past it, never left
+/// of `screen_left`. Pure.
+pub export fn zonvie_core_popupmenu_left(
+    anchor_left: i32,
+    popup_width: i32,
+    text_inset: i32,
+    screen_left: i32,
+    screen_right: i32,
+) callconv(.c) i32 {
+    return popup_placement.left(anchor_left, popup_width, text_inset, screen_left, screen_right);
+}
+
+/// How one msg_show changes the frontend's message stack of `stack_len`
+/// entries: returns 0 push, 1 replace the last entry, 2 append to the last
+/// entry, and writes the count of oldest entries to drop afterwards. Pure.
+/// See msg_stack.zig.
+pub export fn zonvie_core_msg_stack_plan(
+    stack_len: usize,
+    replace_last: c_int,
+    append: c_int,
+    out_evict_oldest: ?*usize,
+) callconv(.c) c_int {
+    const p = msg_stack.plan(stack_len, replace_last != 0, append != 0);
+    if (out_evict_oldest) |out| out.* = p.evict_oldest;
+    return @intFromEnum(p.action);
+}
+
 /// The top edge of the cmdline completion popup: `gap` above the cmdline
 /// window while it clears `screen_top`, else `gap` below. Y grows downward.
 pub export fn zonvie_core_cmdline_popupmenu_top(
@@ -3023,19 +3071,13 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     }
     // The mirrored frame holds atlas UVs; invalidate after atlas reset.
     box.core.invalidateMirroredFrameState();
-    box.core.grid.markAllDirty();
+    // Every grid's cached row vertices hold stale atlas UVs / font metrics.
+    // dirty alone is not enough: the per-row emit path checks dirty_rows,
+    // and markAllDirty sets both.
+    box.core.grid.markEverySurfaceDirty();
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).
     box.core.grid.content_rev +%= 1;
-    // Every sub_grid's cached row vertices hold stale atlas UVs / font
-    // metrics too. sg.dirty alone is not enough: the per-row emit path
-    // checks dirty_rows to decide which rows to regenerate, so with no
-    // bits set every row is skipped and dirty gets cleared at flush end
-    // with nothing ever actually resent — markAllDirty() sets both.
-    var sg_it = box.core.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| {
-        sg.markAllDirty();
-    }
     // The main cursor's own regen check is gated on cursor_rev alone (not
     // content_rev/dirty_all), and an external grid's cursor is a separate
     // vertex consumer again — neither is covered by the dirtying above, so
