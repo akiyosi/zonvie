@@ -774,7 +774,49 @@ private enum ScrollRetentionTests {
         require(both.contains(7), "and this bracket's own mark still names the row it drew")
     }
 
+    private static func verifyCommittedScrollMerge() {
+        func scroll(_ start: Int, _ end: Int, _ delta: Int) -> SurfaceRowScroll {
+            SurfaceRowScroll(rowStart: start, rowEnd: end, colStart: 0, colEnd: 80,
+                             rowsDelta: delta, totalRows: 24, totalCols: 80)
+        }
+        var accum: SurfaceRowScroll? = nil
+        var dirty = IndexSet()
+        mergeCommittedSurfaceScroll(into: &accum, scroll(0, 20, 1), dirtyRows: &dirty)
+        requireEqual(accum?.rowsDelta, 1, "the first shift becomes the accumulator")
+        mergeCommittedSurfaceScroll(into: &accum, scroll(0, 20, 2), dirtyRows: &dirty)
+        requireEqual(accum?.rowsDelta, 3, "a shift of the same region adds, so no draw loses one")
+        require(dirty.isEmpty, "and dirties nothing")
+
+        // A different region cannot be one blit: the old one is dropped, and
+        // the rows it would have moved are repainted from their remapped slots.
+        mergeCommittedSurfaceScroll(into: &accum, scroll(2, 10, -1), dirtyRows: &dirty)
+        requireEqual(accum?.rowStart, 2, "a new region replaces the accumulator")
+        requireEqual(accum?.rowsDelta, -1, "with its own distance")
+        requireEqual(dirty, IndexSet(integersIn: 0..<20), "the dropped region is dirtied whole")
+    }
+
+    private static func verifyStagedValueIsPublishedByItsOwnCommit() {
+        final class Surface {}
+        let main = ObjectIdentifier(Surface.self)
+        let external = Surface()
+        let ext = ObjectIdentifier(external)
+        var slot = SurfaceCommitStaged<Int>()
+        slot.stage(7, by: ext)
+        // The main surface commits first at every flush end. Handing it the
+        // external window's measurement paired that rect with rows the
+        // external window had not committed yet.
+        requireEqual(slot.take(committedBy: main), nil, "another surface's commit leaves it staged")
+        requireEqual(slot.take(committedBy: ext), 7, "the stager's own commit publishes it")
+        requireEqual(slot.take(committedBy: ext), nil, "once")
+
+        slot.stage(1, by: ext)
+        slot.stage(2, by: main)
+        requireEqual(slot.take(committedBy: main), 2, "the latest measurement wins, published by its stager")
+    }
+
     static func main() {
+        verifyStagedValueIsPublishedByItsOwnCommit()
+        verifyCommittedScrollMerge()
         verifyPlan()
         verifyCoversBand()
         verifyRingOutlivesTheLiveSet()

@@ -823,15 +823,16 @@ fn drawNormalExternalSurfaceRowMode(
         break :blk_dirty false;
     };
     ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0 or force_full_rows;
+    // A committed scroll is work too: acquireForPaint has already consumed
+    // it, so returning here would lose the back_tex and row-VB shift for good.
+    const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
     if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
-        !has_scrollbar_work and !any_layer_dirty)
+        !has_scrollbar_work and !any_layer_dirty and !has_scroll_work)
     {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
         ext_win.paint_present_rects.clearRetainingCapacity();
         return false;
     }
-
-    var scroll_damage: ?c.RECT = null;
 
     const draw_params = app_mod.RowModeDrawParams{
         .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
@@ -845,182 +846,67 @@ fn drawNormalExternalSurfaceRowMode(
         .bloom_layers = if (has_layers) .{ .app = app, .layers = tbs_snap.layers.slice() } else null,
     };
 
-    // Ensure row_vbs array covers committed set's row count.
-    {
-        const need_len: usize = @intCast(tbs_committed.rows);
-        if (!app_mod.resizeRowVBsForPaint(
-            app.alloc,
-            &ext_win.row_vbs,
-            &app.row_vb_budget,
-            &ext_win.row_vb_retained_bytes,
-            need_len,
-        ))
-            return error.OutOfMemory;
-    }
-
-    // Apply scroll pixel shift (shared with main window).
-    // Scroll state is bundled in tbs_snap, atomically consistent with committed set.
-    if (!force_full_rows) {
-        if (tbs_snap.scroll_rect) |sr| {
-            const shift_result = app_mod.applyScrollShift(
-                g,
-                app.alloc,
-                ext_win.row_vbs.items,
-                &ext_win.row_vbs_shift_scratch,
-                rows_to_draw,
-                &ext_win.scroll_rows_merge_scratch,
-                sr,
-                tbs_snap.scroll_dy_px,
-                tbs_snap.vb_shift,
-                tbs_snap.scroll_row_start,
-                tbs_snap.scroll_row_end,
-                &ext_win.last_painted_cursor_row,
-                row_h_px,
-                ext_rows,
-                0, // no content_y_offset for external windows
-            );
-            if (!shift_result.rows_complete) return error.OutOfMemory;
-            scroll_damage = shift_result.scroll_rect;
-
-            // scrollBackTex moved every pixel of the region, a layer composited
-            // into it included. planLayerFrame repaints each layer at its own
-            // placement, which restores where the layer IS — but the rows its
-            // pixels were dragged ONTO belong to the root, and the root only
-            // redraws the band the scroll vacated. A fixed float at rows 10-14
-            // scrolled up one leaves a strip of itself on row 9 that nobody
-            // owns.
-            //
-            // Mark the root rows each layer's pixels can have reached. The span
-            // is taken in both directions rather than from the sign of the
-            // shift: it costs one extra band height, and getting the direction
-            // wrong would leave exactly the ghost this is here to remove. The
-            // rows are marked before planLayerFrame, so its own step 2 also
-            // repaints the layers sitting over them.
-            //
-            // The main window never needs this: under ext_multigrid its root
-            // grid holds no cells and does not scroll, and without multigrid it
-            // has no layers.
-            if (has_layers and row_h_px > 0 and tbs_snap.scroll_dy_px != 0) {
-                const shift_rows: u32 = @intCast(@abs(@divTrunc(tbs_snap.scroll_dy_px, row_h_px)));
-                for (tbs_snap.layers.slice()[1..]) |layer| {
-                    const span = render_pipeline_helpers.rootRowsLayerScrollReached(
-                        layer.y_px,
-                        layer.rows,
-                        shift_rows,
-                        row_h_px,
-                        ext_rows,
-                    ) orelse continue;
-                    if (!render_pipeline_helpers.mergeSortedRowsWithRange(
-                        app.alloc,
-                        rows_to_draw,
-                        &ext_win.scroll_rows_merge_scratch,
-                        span[0],
-                        span[1],
-                    )) return error.OutOfMemory;
-                }
-            }
-        }
-    } else {
-        app_mod.consumePendingVbShift(
-            app.alloc,
-            ext_win.row_vbs.items,
-            &ext_win.row_vbs_shift_scratch,
-            tbs_snap.vb_shift,
-            tbs_snap.scroll_row_start,
-            tbs_snap.scroll_row_end,
-        );
-    }
-
-    // Damage for this frame. Reserved for every row span plus one rectangle
-    // per layer; the layer rectangles are appended under the same lock as the
-    // plan below, and the row spans after the draws.
+    // Damage for this frame: every row span plus one rectangle per layer. The
+    // layer rectangles are appended by the row pass under the lock its plan
+    // runs in, the spans after the draws. The pass can grow the redraw set
+    // (scroll ghosts, rows a layer was dragged onto), never past the row count.
     const present_rects = &ext_win.paint_present_rects;
     present_rects.clearRetainingCapacity();
     present_rects.ensureTotalCapacity(
         app.alloc,
-        rows_to_draw.items.len + 5 + tbs_snap.layers.len,
+        @as(usize, @max(rows_to_draw.items.len, ext_rows)) + 5 + tbs_snap.layers.len,
     ) catch return error.OutOfMemory;
 
-    var layer_layout_stale = false;
-    var layer_commit_stale = false;
-    if (has_layers) {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        const staleness = app_mod.layerFrameStaleness(&ext_win.tbs, tbs_snap);
-        layer_layout_stale = staleness.layout;
-        layer_commit_stale = staleness.commit;
-        if (staleness.any()) {
-            // The placement this paint pinned, or the root rows it drew beside
-            // these layers, is no longer the published one. Re-arm and let the
-            // repaint the commit already owes draw it.
-            if (log_enabled) applog.appLog(
-                "[layer_draw] stale_layout={d} stale_commit={d} grid_id={d} gen={d} rev={d}\n",
-                .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), grid_id, tbs_snap.layout_gen, tbs_snap.commit_rev },
-            );
-            app_mod.rearmLayerDraw(app, tbs_snap.layers.slice());
-        } else app_mod.planLayerFrame(g, app, tbs_snap.layers.slice(), .{
-            .x_offset = 0,
-            .y_offset = 0,
-            .content_right = content_right,
-            .content_height = @intCast(draw_params.content_height),
-            .row_h_px = row_h_px,
-            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
-            .preserve_back = paint_policy.preserve_back,
-            .paint_full = force_full_rows,
-            .cursor_grid = tbs_snap.cursor_layer_grid_id,
-            .last_cursor_row = ext_win.last_painted_cursor_row,
-            .rows_to_draw = rows_to_draw.items,
-            // The blit moved every layer inside the region, not only the rows
-            // it vacated; the plan repaints those. Without this a scrolled
-            // surface dragged its floats with the copied pixels.
-            .root_scroll_rect = scroll_damage,
-            .log_enabled = log_enabled,
-        });
-
-        // Under the same lock as the plan and the draw, so a store landing
-        // between them cannot have its flag dropped below. Reserved above.
-        app_mod.appendLayerPresentRects(
-            app,
-            tbs_snap.layers.slice(),
-            0,
-            0,
-            @intCast(g.width),
-            @intCast(draw_params.content_height),
-            row_h_px,
-            present_rects,
-        );
-    }
-
-    const row_frame = app_mod.drawSurfaceRowFrame(g, app, .{
-        .row_vbs = ext_win.row_vbs.items,
+    // Shared with the main window. An external window's back_tex is always
+    // valid, so preserving it is exactly "not a full redraw".
+    const pass = try app_mod.drawSurfaceRowPass(g, app, .{
+        .tbs = &ext_win.tbs,
+        .row_vbs = &ext_win.row_vbs,
+        .row_vbs_shift_scratch = &ext_win.row_vbs_shift_scratch,
+        .scroll_rows_merge_scratch = &ext_win.scroll_rows_merge_scratch,
         .row_vb_retained_bytes = &ext_win.row_vb_retained_bytes,
-        .pool = &ext_win.tbs.pool,
         .cursor_vb = &ext_win.cursor_vb,
         .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
         .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
         .last_painted_cursor_grid = &ext_win.last_painted_cursor_grid,
     }, .{
-        .root_grid_id = grid_id,
-        .layers = tbs_snap.layers.slice(),
-        .row_map = tbs_committed.row_map.items,
-        .rows_to_draw = rows_to_draw.items,
-        .cursor_verts = tbs_cursor.verts.items,
-        .cursor_row = tbs_cursor.last_cursor_row,
-        .cursor_grid = tbs_snap.cursor_layer_grid_id,
-        .cursor_erase_rows = cursor_erase_rows,
-        .cursor_layer_origin = .{ @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px) },
-        .blink_visible = cursor_blink_visible,
-        .force_full_rows = force_full_rows,
-        .layer_layout_stale = layer_layout_stale,
-        .layer_commit_stale = layer_commit_stale,
-        .glow = if (glow_enabled) app_mod.RowFrameGlow{
-            .intensity = glow_intensity,
-            .radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else 1.0,
-            .cursor_visible = cursor_blink_visible,
-        } else null,
-        .draw_params = draw_params,
-        .log_enabled = log_enabled,
+        .snapshot = tbs_snap,
+        .rows_to_draw = rows_to_draw,
+        .row_vb_len = @intCast(tbs_committed.rows),
+        .total_rows = ext_rows,
+        .preserve_back = paint_policy.preserve_back,
+        .layer_paint_full = force_full_rows,
+        .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+        .layer_present = .{
+            .rects = present_rects,
+            .right = @intCast(g.width),
+            .bottom = @intCast(draw_params.content_height),
+        },
+        .frame = .{
+            .root_grid_id = grid_id,
+            .layers = &.{},
+            .row_map = tbs_committed.row_map.items,
+            .rows_to_draw = &.{},
+            .cursor_verts = tbs_cursor.verts.items,
+            .cursor_row = tbs_cursor.last_cursor_row,
+            .cursor_grid = tbs_snap.cursor_layer_grid_id,
+            .cursor_erase_rows = cursor_erase_rows,
+            .cursor_layer_origin = .{ @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px) },
+            .blink_visible = cursor_blink_visible,
+            .force_full_rows = force_full_rows,
+            .layer_layout_stale = false,
+            .layer_commit_stale = false,
+            .glow = if (glow_enabled) app_mod.RowFrameGlow{
+                .intensity = glow_intensity,
+                .radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else 1.0,
+                .cursor_visible = cursor_blink_visible,
+            } else null,
+            .draw_params = draw_params,
+            .log_enabled = log_enabled,
+        },
     });
+    const row_frame = pass.frame;
+    const scroll_damage = pass.scroll_damage;
 
     if (log_enabled) {
         applog.appLog(
@@ -1037,44 +923,17 @@ fn drawNormalExternalSurfaceRowMode(
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
     // buffer, so a buffer not current this frame catches up when it rotates in.
-    // The main window builds the same row-run spans in window.zig. The two are
-    // NOT shared: this path reserves exactly rows + 5 up front and appends with
-    // appendAssumeCapacity, while the main path appends fallibly and swallows
-    // the error, backed by its force-full-present fallback. A shared helper
-    // returning Allocator.Error would force a `catch unreachable` here; one
-    // taking pre-reserved capacity would turn the main path's tolerant catch
-    // into a panic on a short reservation. Reviewed under the 2026-08-25 audit,
-    // observation 1, finding 332; left duplicated on purpose. The tail is
-    // already shared through compactDamageRects. Cleared and reserved before
-    // the layer plan above, which publishes each drawn layer's rectangle into
-    // it; only the row spans are appended here.
-    var span_start: ?u32 = null;
-    var span_end: u32 = 0;
-    for (rows_to_draw.items) |row| {
-        if (span_start == null) {
-            span_start = row;
-            span_end = row + 1;
-        } else if (row == span_end) {
-            span_end += 1;
-        } else {
-            present_rects.appendAssumeCapacity(.{
-                .left = 0,
-                .top = @as(i32, @intCast(span_start.?)) * row_h_px,
-                .right = @intCast(g.width),
-                .bottom = @as(i32, @intCast(span_end)) * row_h_px,
-            });
-            span_start = row;
-            span_end = row + 1;
-        }
-    }
-    if (span_start) |start_row| {
-        present_rects.appendAssumeCapacity(.{
-            .left = 0,
-            .top = @as(i32, @intCast(start_row)) * row_h_px,
-            .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(span_end)) * row_h_px,
-        });
-    }
+    // The row-run spans the main driver builds too (rowSpanRects), written
+    // into the rows + 5 slots reserved before the layer plan above, which
+    // publishes each drawn layer's rectangle into the same list.
+    present_rects.items.len += render_pipeline_helpers.rowSpanRects(
+        c.RECT,
+        rows_to_draw.items,
+        0,
+        @intCast(g.width),
+        row_h_px,
+        present_rects.unusedCapacitySlice(),
+    );
     if (scroll_damage) |rect| present_rects.appendAssumeCapacity(rect);
     if (restored_scrollbar_rect) |rect| present_rects.appendAssumeCapacity(rect);
 
@@ -2548,7 +2407,24 @@ pub export fn ExternalWndProc(
             return 0;
         },
         c.WM_CLOSE => {
-            // Don't destroy - just hide or let the core handle it
+            // Closing an external window closes the Neovim window it shows,
+            // as on macOS; the HWND is torn down when Neovim confirms through
+            // on_external_window_close. Hiding it instead left the Neovim
+            // window alive, still receiving rows, with nothing to bring it
+            // back. Decorated windows (cmdline, popupmenu, messages) and a
+            // grid with no Neovim window keep the old hide.
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                const grid_id: ?i64 = if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.grid_id else null;
+                app.mu.unlock(core.clock.io());
+                if (grid_id) |gid| {
+                    if (gid >= 0) {
+                        if (app.corep) |corep| {
+                            if (app_mod.zonvie_core_request_win_close(corep, gid) != 0) return 0;
+                        }
+                    }
+                }
+            }
             _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
         },
@@ -2621,40 +2497,7 @@ pub export fn ExternalWndProc(
         },
         c.WM_CHAR, c.WM_SYSCHAR => {
             if (app_mod.getApp(hwnd)) |app| {
-                const mods = input.queryMods();
-
-                // Skip if Ctrl/Alt (handled in WM_KEYDOWN)
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    return 0;
-                }
-
-                const ch0: u16 = @as(u16, @intCast(wParam));
-
-                // Skip control characters handled by WM_KEYDOWN
-                if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
-                    app.pending_high_surrogate_char = 0;
-                    return 0;
-                }
-
-                // Pair surrogate halves for non-BMP characters (emoji etc).
-                var tmp: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
-                    app.pending_high_surrogate_char = ch0;
-                    return 0;
-                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_char;
-                    app.pending_high_surrogate_char = 0;
-                    if (hi == 0) return 0;
-                    s = input.utf16UnitsToUtf8(&tmp, hi, ch0);
-                } else {
-                    app.pending_high_surrogate_char = 0;
-                    s = input.utf16UnitsToUtf8(&tmp, ch0, null);
-                }
-
-                if (s) |text| {
-                    input.sendKeyEventToCore(app, 0, mods, text, null);
-                }
+                input.handleCharMessage(app, wParam);
                 return 0;
             }
         },
@@ -3306,11 +3149,17 @@ pub export fn ExternalWndProc(
 /// Set the clear color for an external window from cached highlight group bg colors.
 /// Uses values pre-resolved in updateExternalWindowColors (UI thread, safe context).
 /// Does NOT call core APIs that acquire grid_mu — safe for WM_PAINT context.
-/// Float-origin normal windows use NormalFloat; ext_windows splits use default bg.
+/// A normal window clears with the default background whether or not it was
+/// born a float: under blur the core drops a surface root's default-background
+/// runs while it hosts a layer, and the clear is what shows under them. A
+/// float-origin window used to clear with NormalFloat, which painted its
+/// Normal cells (`winhighlight=NormalFloat:Normal`) in the wrong colour; its
+/// NormalFloat cells arrive as explicit quads anyway. Same rule as macOS.
 fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind, ext_win: *const app_mod.ExternalWindow) void {
+    _ = ext_win;
     app.mu.lockUncancelable(core.clock.io());
     const cached_bg: u32 = switch (kind) {
-        .normal => if (ext_win.is_float_external) app.cached_normal_float_bg else 0xFFFFFFFF,
+        .normal => 0xFFFFFFFF,
         .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
         .popupmenu => app.cached_pmenu_bg,
     };
@@ -3480,18 +3329,17 @@ pub fn updateExternalWindowColors(app: *App) void {
 
     // Resolve highlight group bg colors for external window clear color cache.
     // Read during WM_PAINT (setExternalWindowClearColor) where grid_mu is unsafe.
-    var normal_float_bg: u32 = 0xFFFFFFFF;
     var msg_area_bg: u32 = 0xFFFFFFFF;
     var pmenu_bg: u32 = 0xFFFFFFFF;
 
-    // All 5 highlight groups in one grid_mu acquisition instead of 5
+    // All 4 highlight groups in one grid_mu acquisition instead of 4
     // separate lock round-trips (was: Search, Comment each own call, then
-    // NormalFloat/MsgArea/Pmenu each own call).
+    // MsgArea/Pmenu each own call).
     if (app.corep) |corep| {
-        const names = [_]?[*:0]const u8{ "Search", "Comment", "NormalFloat", "MsgArea", "Pmenu" };
-        var fg: [5]u32 = undefined;
-        var bg: [5]u32 = undefined;
-        var found: [5]i32 = undefined;
+        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu" };
+        var fg: [4]u32 = undefined;
+        var bg: [4]u32 = undefined;
+        var found: [4]i32 = undefined;
         _ = app_mod.zonvie_core_get_hl_by_names_batch(corep, &names, &fg, &bg, &found, names.len);
 
         if (found[0] != 0) {
@@ -3504,15 +3352,13 @@ pub fn updateExternalWindowColors(app: *App) void {
             icon_g = @as(f32, @floatFromInt((fg[1] >> 8) & 0xFF)) / 255.0;
             icon_b = @as(f32, @floatFromInt(fg[1] & 0xFF)) / 255.0;
         }
-        if (found[2] != 0) normal_float_bg = bg[2];
-        if (found[3] != 0) msg_area_bg = bg[3];
-        if (found[4] != 0) pmenu_bg = bg[4];
+        if (found[2] != 0) msg_area_bg = bg[2];
+        if (found[3] != 0) pmenu_bg = bg[3];
     }
 
     app.mu.lockUncancelable(core.clock.io());
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
-    app.cached_normal_float_bg = normal_float_bg;
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
     app.mu.unlock(core.clock.io());
@@ -4029,7 +3875,17 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             ext_win.tbs.requestFullPaint();
             _ = c.InvalidateRect(hwnd, null, 0);
         }
-        if (!force_full_present and ext_win.paint_present_rects.items.len == 0) {
+        // The main driver's gate (render_pipeline_helpers.presentGate) with no
+        // seed: an incomplete frame and stale metrics were refused above.
+        const present_gate = render_pipeline_helpers.presentGate(.{
+            .force_full_rows = force_full_present,
+            .preserve_back = true,
+            .rows = 0,
+            .rows_to_draw = 0,
+            .skipped_empty = 0,
+            .present_rects = ext_win.paint_present_rects.items.len,
+        });
+        if (present_gate.verdict == .skip) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
             completeExternalPaintRetry(ext_win);
             return;
@@ -4187,31 +4043,28 @@ fn findInDirection(infos: []const WindowInfo, ref_grid: i64, direction: i32, cou
     return if (idx < cand_count) candidates[idx] else candidates[0];
 }
 
-/// Calculate popupmenu Y position, preferring below the anchor cell.
-/// Falls back to above if below would go off-screen.
-/// Mirrors macOS popupmenuWindowRect() logic adapted to Windows coords (Y-down).
+/// Calculate popupmenu Y position, preferring below the anchor cell and
+/// flipping above when the popup would run past the bottom of the window the
+/// anchor is in — the core's rule (zonvie_core_popupmenu_top), shared with
+/// macOS. It used to flip only at the monitor work area, so near the bottom
+/// of a window that was not at the bottom of the screen the popup hung below
+/// the window here and flipped up on macOS.
 fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd: c.HWND) c_int {
-    const below_y = anchor_top + cell_h;
-    const above_y = anchor_top - popup_h;
-
-    // Get work area (screen minus taskbar) for the monitor containing ref_hwnd
+    // The reference window's client bottom, in screen coordinates.
+    var ref_bottom: c_int = std.math.maxInt(c_int);
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(ref_hwnd, &client) != 0) {
+        var pt: c.POINT = .{ .x = 0, .y = client.bottom };
+        if (c.ClientToScreen(ref_hwnd, &pt) != 0) ref_bottom = pt.y;
+    }
+    // The usable screen top for the monitor holding the reference window.
+    var screen_top: c_int = std.math.minInt(c_int);
     var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
     monitor_info.cbSize = @sizeOf(c.MONITORINFO);
     const monitor = c.MonitorFromWindow(ref_hwnd, c.MONITOR_DEFAULTTONEAREST);
-    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) {
-        const screen_bottom = monitor_info.rcWork.bottom;
-        const screen_top = monitor_info.rcWork.top;
+    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
 
-        // Prefer below; if it overflows screen bottom, try above
-        if (below_y + popup_h <= screen_bottom) {
-            return below_y;
-        } else if (above_y >= screen_top) {
-            return above_y;
-        }
-    }
-
-    // Fallback: below
-    return below_y;
+    return app_mod.zonvie_core_popupmenu_top(anchor_top, cell_h, popup_h, ref_bottom, screen_top);
 }
 
 fn absI32(v: i32) i32 {

@@ -453,6 +453,14 @@ pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
     return if (h == 0) 1 else h;
 }
 
+/// The command that closes Neovim window `win_id` on a user's request.
+/// pcall: the window may already be gone, or be the last one (E444), and
+/// neither should surface as an error. Null when there is no window.
+pub fn formatWinCloseCommand(buf: []u8, win_id: i64) ?[]const u8 {
+    if (win_id <= 0) return null;
+    return std.fmt.bufPrint(buf, "lua pcall(vim.api.nvim_win_close, {d}, false)", .{win_id}) catch null;
+}
+
 /// Cumulative attempt/busy counters for a single grid_mu tryLock call site.
 /// See the perf_lock_* fields on Core for why these must be atomic.
 pub const LockContentionStat = struct {
@@ -4856,6 +4864,22 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
     }
 
+    /// Ask Neovim to close the window shown in `grid_id`, the way a user
+    /// closing an external OS window asks for it. Returns false when the grid
+    /// has no Neovim window. Both frontends call this, so the command lives
+    /// in one place.
+    pub fn requestWinClose(self: *Core, grid_id: i64) !bool {
+        const win_id = blk: {
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
+            break :blk self.grid.getWinId(grid_id) orelse 0;
+        };
+        var buf: [64]u8 = undefined;
+        const cmd = formatWinCloseCommand(&buf, win_id) orelse return false;
+        try self.requestCommand(cmd);
+        return true;
+    }
+
     pub fn requestCommand(self: *Core, cmd: []const u8) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
@@ -7671,4 +7695,17 @@ test "a drawable-only resize regenerates nothing" {
     try std.testing.expect(core.grid.main_buf.dirty_all);
     try std.testing.expect(core.grid.sub_grids.getPtr(2).?.dirty_all);
     try std.testing.expect(core.grid.cursor_rev != cursor_rev_before);
+}
+
+test "a window close asked by the frontend names that window and tolerates it being gone" {
+    var buf: [96]u8 = undefined;
+    // pcall: the window may already be closed, or be the last one (E444);
+    // either way the request must not surface an error to the user.
+    try std.testing.expectEqualStrings(
+        "lua pcall(vim.api.nvim_win_close, 1002, false)",
+        formatWinCloseCommand(&buf, 1002).?,
+    );
+    // No Neovim window behind the grid: nothing to ask.
+    try std.testing.expect(formatWinCloseCommand(&buf, 0) == null);
+    try std.testing.expect(formatWinCloseCommand(&buf, -3) == null);
 }

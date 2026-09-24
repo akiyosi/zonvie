@@ -570,19 +570,32 @@ func captureSurfaceLayerScrollStep(
         stepped = true
     }
 
-    // Only a single-row step can be eased; anything larger lands whole.
-    guard stepped, abs(rowsDelta) == 1 else { return stepped }
+    if stepped {
+        stageSurfaceEaseSeed(gridId: gridId, rowsDelta: rowsDelta, lock: lock,
+                             stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
+    }
+    return stepped
+}
+
+/// Stage the sub-row ease seed for a retention step that was taken. Only a
+/// single-row step can be eased; anything larger lands whole. Every surface
+/// that seeds goes through here.
+func stageSurfaceEaseSeed(
+    gridId: Int64,
+    rowsDelta: Int,
+    lock: NSLock,
+    stagedSmoothScrollSeeds: inout [(gridId: Int64, rowsDelta: Int)]
+) {
+    guard abs(rowsDelta) == 1 else { return }
     lock.lock()
     stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
     lock.unlock()
     // `continuous_j_scroll_matches_jump` counts these to tell an eased scroll
-    // from one that jumped, so the marker is part of the contract. It used to
-    // be emitted by the main surface only; an external one seeds the same way
-    // and now says so too.
+    // from one that jumped, so the marker is part of the contract. An external
+    // root used to seed through its own copy without it.
     if ZonvieCore.appLogEnabled {
         ZonvieCore.appLog("[smooth_scroll_seed] gridId=\(gridId) rowsDelta=\(rowsDelta)")
     }
-    return stepped
 }
 
 /// Begin one retention step for a grid_scroll the row-shift fast path does not
@@ -634,6 +647,26 @@ func captureSurfaceGridScrollStep(
         captureRow(cs, row + sourceShift, row - rowsDelta)
     }
     return true
+}
+
+/// Force the window's shadow to be recalculated after a surface's first
+/// present when blur is enabled. Transparent windows (isOpaque=false,
+/// backgroundColor=.clear) need this to show a shadow once the first frame is
+/// rendered. Every surface owes it; only the main one used to do it.
+func recalculateSurfaceShadowAfterFirstPresent(_ view: NSView?) {
+    guard ZonvieConfig.shared.blurEnabled else { return }
+    // Delay so the window is fully rendered first.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak view] in
+        guard let window = view?.window else {
+            ZonvieCore.appLog("[Shadow] window is nil, skipping shadow recalculation")
+            return
+        }
+        ZonvieCore.appLog("[Shadow] Recalculating shadow for window \(window.windowNumber)")
+        window.display()
+        window.hasShadow = false
+        window.hasShadow = true
+        window.invalidateShadow()
+    }
 }
 
 func encodeSurfaceCustomShaderChain(
@@ -2382,6 +2415,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // These steps reached the screen, so there is nothing left to replay.
         pendingRetentionReplay.removeAll(keepingCapacity: true)
         shared.shaderCursor.publishCommitTail(
+            committedBy: self,
             publishScrollClears: { onCommitPublished?() },
             commitRevision: &commitRevision
         )
@@ -2416,33 +2450,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     rowEnd: ps.rowEnd,
                     rowsDelta: ps.rowsDelta
                 )
-                if let existing = state.pendingScrollAccum,
-                   existing.rowStart == ps.rowStart,
-                   existing.rowEnd == ps.rowEnd {
-                    state.pendingScrollAccum = SurfaceRowScroll(
-                        rowStart: ps.rowStart,
-                        rowEnd: ps.rowEnd,
-                        colStart: ps.colStart,
-                        colEnd: ps.colEnd,
-                        // &+ mirrors the core's own +%= idiom; the clamp keeps
-                        // the result away from Int.min, which the abs() calls
-                        // downstream trap on. The bound is far above any real
-                        // row count.
-                        rowsDelta: clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta),
-                        totalRows: ps.totalRows,
-                        totalCols: ps.totalCols
-                    )
-                } else {
-                    // Region mismatch: the old accumulator's blit is dropped, but
-                    // its row slots were already remapped, so the committed
-                    // vertices are post-scroll. Dirty the dropped region rather
-                    // than leave pre-scroll pixels on the rows it did not vacate.
-                    if let existing = state.pendingScrollAccum,
-                       existing.rowEnd > existing.rowStart {
-                        state.pendingDirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
-                    }
-                    state.pendingScrollAccum = ps
-                }
+                mergeCommittedSurfaceScroll(into: &state.pendingScrollAccum, ps,
+                                            dirtyRows: &state.pendingDirtyRows)
                 // A committed set must not keep the staged shift, or a later
                 // frame would apply it a second time.
                 sets[ws].pendingScroll = nil
@@ -2642,7 +2651,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         shared.shaderCursor.stage(
             rect: (rect.left, rect.bottom, rect.right - rect.left, rect.bottom - rect.top),
             color: (c0.x, c0.y, c0.z, c0.w),
-            gridId: verts[0].grid_id
+            gridId: verts[0].grid_id,
+            by: self
         )
     }
 
@@ -5024,23 +5034,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     }
                 }
 
-                // Force shadow recalculation on first present when blur is enabled
-                // Transparent windows (isOpaque=false, backgroundColor=.clear) need this
-                // to properly display shadows after the first frame is rendered
-                if wasFirstPresent && ZonvieConfig.shared.blurEnabled {
-                    // Delay shadow recalculation to ensure window is fully rendered
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        guard let window = view?.window else {
-                            ZonvieCore.appLog("[Shadow] window is nil, skipping shadow recalculation")
-                            return
-                        }
-                        ZonvieCore.appLog("[Shadow] Recalculating shadow for window \(window.windowNumber)")
-                        window.display()
-                        window.hasShadow = false
-                        window.hasShadow = true
-                        window.invalidateShadow()
-                    }
-                }
+                if wasFirstPresent { recalculateSurfaceShadowAfterFirstPresent(view) }
             }
             cmd.commit()
             if ZonvieCore.appLogEnabled {

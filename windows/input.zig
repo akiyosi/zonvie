@@ -77,6 +77,62 @@ pub fn sendKeyEventToCore(
     app_mod.zonvie_core_send_key_event(app.corep, keycode, mods, cptr, clen, iptr, ilen);
 }
 
+/// The `:` <-> `;` swap (config input.swap_colon_semicolon) for one typed
+/// character. Paste arrives through the clipboard path and is unaffected.
+pub fn swapColonSemicolon(ch: u16, enabled: bool) u16 {
+    if (!enabled) return ch;
+    return switch (ch) {
+        0x3A => 0x3B,
+        0x3B => 0x3A,
+        else => ch,
+    };
+}
+
+test "colon and semicolon swap only when enabled" {
+    try std.testing.expectEqual(@as(u16, ';'), swapColonSemicolon(':', true));
+    try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(';', true));
+    try std.testing.expectEqual(@as(u16, 'a'), swapColonSemicolon('a', true));
+    try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(':', false));
+}
+
+/// WM_CHAR / WM_SYSCHAR for any surface, main or external. The two WndProcs
+/// carried copies of this body and one had lost the colon/semicolon swap.
+pub fn handleCharMessage(app: *App, wParam: c.WPARAM) void {
+    const mods = queryMods();
+    // If Ctrl/Alt are down, WM_CHAR often becomes an ASCII control character;
+    // the WM_KEYDOWN path handled those combos.
+    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) return;
+
+    const ch0 = swapColonSemicolon(@as(u16, @intCast(wParam)), app.config.input.swap_colon_semicolon);
+
+    // Enter, Backspace, Tab and Escape are sent by WM_KEYDOWN as special keys.
+    if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
+        app.pending_high_surrogate_char = 0;
+        return;
+    }
+
+    // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high surrogate
+    // first, then low. Buffer the high one and combine it with the next.
+    var out: [8]u8 = undefined;
+    var s: ?[]const u8 = null;
+    if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
+        app.pending_high_surrogate_char = ch0;
+        return;
+    } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
+        const hi = app.pending_high_surrogate_char;
+        app.pending_high_surrogate_char = 0;
+        if (hi == 0) return; // stray low surrogate
+        s = utf16UnitsToUtf8(&out, hi, ch0);
+    } else {
+        app.pending_high_surrogate_char = 0;
+        s = utf16UnitsToUtf8(&out, ch0, null);
+    }
+
+    const text = s orelse return;
+    // keycode=0 means "text input" (the core takes the chars path).
+    sendKeyEventToCore(app, 0, mods, text, text);
+}
+
 /// Convert a UTF-16 (1 or 2 units) sequence to UTF-8 in a small stack buffer.
 pub fn utf16UnitsToUtf8(tmp: *[8]u8, unit0: u16, unit1_opt: ?u16) ?[]const u8 {
     // Handle surrogate pair if present.

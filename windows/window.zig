@@ -1124,11 +1124,6 @@ fn scheduleMainSizeReplay(hwnd: c.HWND, app: *App) void {
     }
 }
 
-fn scheduleMainPaintRetry(hwnd: c.HWND, app: *App) void {
-    const ticket = app.paint_retry.fail() orelse return;
-    armMainPaintRetry(hwnd, app, ticket);
-}
-
 fn armMainPaintRetry(hwnd: c.HWND, app: *App, ticket: app_mod.PaintRetryState.Ticket) void {
     app.main_paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
     if (!scheduleReliableWindowMessage(
@@ -2321,15 +2316,13 @@ pub export fn WndProc(
                             a.mu.unlock(core.clock.io());
                         }
                         app.atlas_upload.forceFull();
-                        app.tbs.requestFullPaint();
-                        scheduleMainPaintRetry(hwnd, app);
+                        recoverMainPaintFailure(hwnd, app);
                         return 0;
                     }
                 }
 
                 if (!paint_snapshot_ok) {
-                    app.tbs.requestFullPaint();
-                    scheduleMainPaintRetry(hwnd, app);
+                    recoverMainPaintFailure(hwnd, app);
                     return 0;
                 }
 
@@ -2392,8 +2385,7 @@ pub export fn WndProc(
                             // retry. Do not draw this frame against a texture
                             // missing pixels referenced by committed UVs.
                             app.atlas_upload.forceFull();
-                            app.tbs.requestFullPaint();
-                            scheduleMainPaintRetry(hwnd, app);
+                            recoverMainPaintFailure(hwnd, app);
                             if (log_enabled) applog.appLog("[win] atlas upload failed; requeued full paint\n", .{});
                             return 0;
                         }
@@ -2657,8 +2649,7 @@ pub export fn WndProc(
                             total_rows_for_enum,
                             max_valid_row,
                         )) {
-                            app.tbs.requestFullPaint();
-                            scheduleMainPaintRetry(hwnd, app);
+                            recoverMainPaintFailure(hwnd, app);
                             return 0;
                         }
 
@@ -2849,59 +2840,18 @@ pub export fn WndProc(
                         // Add content_y_offset for ext_tabline (present_rects are in screen coords)
                         const present_y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
                         if (rows_to_draw.items.len != 0) {
-                            // Build full-width row rects.
-                            // rows_to_draw is already sorted+deduplicated from the normalize step above.
-                            // The external windows build the same spans in
-                            // external_windows.zig and are NOT shared with this:
-                            // they reserve exactly rows + 5 and append
-                            // infallibly, while this path appends fallibly and
-                            // swallows the error, covered by the force-full-
-                            // present fallback above. It also adds
-                            // present_y_offset for the ext_tabline strip, which
-                            // external windows have no equivalent of. Reviewed
-                            // under the 2026-08-25 audit, observation 1,
-                            // finding 332; left duplicated on purpose.
-                            var span_start: u32 = rows_to_draw.items[0];
-                            var span_end: u32 = span_start + 1;
-
-                            var ispan: usize = 1;
-                            while (ispan < rows_to_draw.items.len) : (ispan += 1) {
-                                const r = rows_to_draw.items[ispan];
-                                if (r == span_end) {
-                                    span_end += 1;
-                                } else {
-                                    const top0: i32 = present_y_offset + @as(i32, @intCast(span_start)) * row_h_px;
-                                    const bot0: i32 = present_y_offset + @as(i32, @intCast(span_end)) * row_h_px;
-
-                                    const rc0: c.RECT = .{
-                                        .left = 0,
-                                        .top = top0,
-                                        .right = client.right,
-                                        .bottom = bot0,
-                                    };
-                                    present_rects.append(app.alloc, rc0) catch {
-                                        present_rects_fallback_full = true;
-                                    };
-
-                                    span_start = r;
-                                    span_end = r + 1;
-                                }
-                            }
-
-                            // last span
-                            {
-                                const top0: i32 = present_y_offset + @as(i32, @intCast(span_start)) * row_h_px;
-                                const bot0: i32 = present_y_offset + @as(i32, @intCast(span_end)) * row_h_px;
-
-                                const rc0: c.RECT = .{
-                                    .left = 0,
-                                    .top = top0,
-                                    .right = client.right,
-                                    .bottom = bot0,
-                                };
-                                present_rects.append(app.alloc, rc0) catch {
-                                    present_rects_fallback_full = true;
-                                };
+                            // Shared with the external driver. The reservation
+                            // above covers one slot per row; when it failed the
+                            // present is already full, so the spans are moot.
+                            if (!present_rects_fallback_full) {
+                                present_rects.items.len += render_helpers.rowSpanRects(
+                                    c.RECT,
+                                    rows_to_draw.items,
+                                    present_y_offset,
+                                    client.right,
+                                    row_h_px,
+                                    present_rects.unusedCapacitySlice(),
+                                );
                             }
                         } else if (dirty != null) {
                             present_rects.append(app.alloc, dirty.?) catch {
@@ -2912,17 +2862,16 @@ pub export fn WndProc(
                         // Add bottom gutter rect if client area extends beyond the grid area.
                         // This ensures the gutter is properly cleared in all swapchain buffers
                         // during partial present, preventing ghost artifacts from stale content.
-                        // Use the actual maximum y coordinate from present_rects to handle cases
-                        // where app.surface.rows is stale (e.g., after font/linespace changes).
+                        // The gutter starts at the snapped grid bottom (content_height, derived
+                        // from the client and row height, so never stale). It used to start at the
+                        // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
+                        // present of rows 5 to the bottom of the window.
                         if (present_rects.items.len != 0) {
-                            var max_y: i32 = 0;
-                            for (present_rects.items) |r| {
-                                if (r.bottom > max_y) max_y = r.bottom;
-                            }
-                            if (max_y > 0 and max_y < client.bottom) {
+                            const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
+                            if (grid_bottom > 0 and grid_bottom < client.bottom) {
                                 const gutter_rc: c.RECT = .{
                                     .left = 0,
-                                    .top = max_y,
+                                    .top = grid_bottom,
                                     .right = client.right,
                                     .bottom = client.bottom,
                                 };
@@ -3174,140 +3123,55 @@ pub export fn WndProc(
                                 null,
                         };
 
-                        // Ensure row_vbs array covers committed set's row count.
-                        {
-                            const need_len = committed.row_map.items.len;
-                            if (!app_mod.resizeRowVBsForPaint(
-                                app.alloc,
-                                &app.row_vbs,
-                                &app.row_vb_budget,
-                                &app.row_vb_retained_bytes,
-                                need_len,
-                            )) {
-                                app.tbs.requestFullPaint();
-                                scheduleMainPaintRetry(hwnd, app);
-                                return 0;
-                            }
-                        }
-
-                        // Apply scroll pixel shift (row_vbs shift + cursor ghost + back_tex shift).
-                        // Scroll state is bundled in PaintSnapshot, atomically consistent with committed set.
-                        var scroll_shift_result = app_mod.ScrollShiftResult{};
-                        if (preserve_back) {
-                            if (tbs_snapshot.scroll_rect) |sr| {
-                                scroll_shift_result = app_mod.applyScrollShift(
-                                    g,
-                                    app.alloc,
-                                    app.row_vbs.items,
-                                    &app.row_vbs_shift_scratch,
-                                    rows_to_draw,
-                                    &app.scroll_rows_merge_scratch,
-                                    sr,
-                                    tbs_snapshot.scroll_dy_px,
-                                    tbs_snapshot.vb_shift,
-                                    tbs_snapshot.scroll_row_start,
-                                    tbs_snapshot.scroll_row_end,
-                                    &app.last_painted_cursor_row,
-                                    row_h_px,
-                                    effective_rows,
-                                    content_y_offset_i32,
-                                );
-                                if (!scroll_shift_result.rows_complete) {
-                                    app.tbs.requestFullPaint();
-                                    scheduleMainPaintRetry(hwnd, app);
-                                    return 0;
-                                }
-                            }
-                        } else {
-                            app_mod.consumePendingVbShift(
-                                app.alloc,
-                                app.row_vbs.items,
-                                &app.row_vbs_shift_scratch,
-                                tbs_snapshot.vb_shift,
-                                tbs_snapshot.scroll_row_start,
-                                tbs_snapshot.scroll_row_end,
-                            );
-                        }
-
-                        // Per-layer dirty gating and GPU row scroll, in the
-                        // same slot as the root's applyScrollShift above and
-                        // for the same reason: the copy has to land before the
-                        // rows below paint over the band it moves. The
-                        // renderer context is held by the enclosing defer;
-                        // app.mu was released above, so take it here, in the
-                        // lockContext -> app.mu order the layer draw uses.
-                        var layer_layout_stale = false;
-                        var layer_commit_stale = false;
-                        // Gated on the layer count alone, which is what the
-                        // draw below gates on: planLayerFrame refuses a
-                        // non-positive row height itself, and a frame drawn
-                        // without a staleness verdict is the one outcome
-                        // neither gate may produce.
-                        if (tbs_snapshot.layers.len > 1) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            const staleness = app_mod.layerFrameStaleness(&app.tbs, tbs_snapshot);
-                            layer_layout_stale = staleness.layout;
-                            layer_commit_stale = staleness.commit;
-                            if (staleness.any()) {
-                                // Nothing is planned or drawn at a placement the
-                                // core has already replaced, or beside root rows
-                                // it has already replaced. The frame is refused
-                                // below, which re-arms every layer; the commit
-                                // that replaced them already owes the repaint
-                                // that draws them.
-                                if (log_enabled) applog.appLog(
-                                    "[layer_draw] stale_layout={d} stale_commit={d} gen={d} rev={d}\n",
-                                    .{ @intFromBool(layer_layout_stale), @intFromBool(layer_commit_stale), tbs_snapshot.layout_gen, tbs_snapshot.commit_rev },
-                                );
-                            } else {
-                                app_mod.planLayerFrame(g, app, tbs_snapshot.layers.slice(), .{
-                                    .x_offset = content_x_offset_i32,
-                                    .y_offset = content_y_offset_i32,
-                                    .content_right = content_right_i32,
-                                    .content_height = @intCast(content_height),
-                                    .row_h_px = row_h_px,
-                                    .cell_w_px = @intCast(@max(1, app.cell_w_px)),
-                                    .preserve_back = preserve_back,
-                                    .paint_full = paint_full_snapshot,
-                                    .cursor_grid = tbs_snapshot.cursor_layer_grid_id,
-                                    .last_cursor_row = app.last_painted_cursor_row,
-                                    .rows_to_draw = rows_to_draw.items,
-                                    .root_scroll_rect = scroll_shift_result.scroll_rect,
-                                    .log_enabled = log_enabled,
-                                });
-                            }
-                            app.mu.unlock(core.clock.io());
-                        }
-                        const row_frame = app_mod.drawSurfaceRowFrame(g, app, .{
-                            .row_vbs = app.row_vbs.items,
+                        // Shared with the external driver: row VBs, the scroll
+                        // pixel shift, the layer plan under app.mu (after the
+                        // renderer context, the order the layer draw uses), then
+                        // the row frame. Layer present rects were added above.
+                        const pass = app_mod.drawSurfaceRowPass(g, app, .{
+                            .tbs = &app.tbs,
+                            .row_vbs = &app.row_vbs,
+                            .row_vbs_shift_scratch = &app.row_vbs_shift_scratch,
+                            .scroll_rows_merge_scratch = &app.scroll_rows_merge_scratch,
                             .row_vb_retained_bytes = &app.row_vb_retained_bytes,
-                            .pool = &app.tbs.pool,
                             .cursor_vb = &app.cursor_vb,
                             .cursor_vb_bytes = &app.cursor_vb_bytes,
                             .last_painted_cursor_row = &app.last_painted_cursor_row,
                             .last_painted_cursor_grid = &app.last_painted_cursor_grid,
                         }, .{
-                            .root_grid_id = 1,
-                            .layers = tbs_snapshot.layers.slice(),
-                            .row_map = committed.row_map.items,
-                            .rows_to_draw = rows_to_draw.items,
-                            .cursor_verts = cursor_verts_snapshot,
-                            .cursor_row = committed_cursor.last_cursor_row,
-                            .cursor_grid = cursor_grid,
-                            .cursor_erase_rows = cursor_erase_rows,
-                            .cursor_layer_origin = cursor_layer_origin,
-                            .blink_visible = app.cursor_blink_state,
-                            .force_full_rows = force_full_rows,
-                            .layer_layout_stale = layer_layout_stale,
-                            .layer_commit_stale = layer_commit_stale,
-                            .glow = if (glow_enabled) app_mod.RowFrameGlow{
-                                .intensity = glow_intensity,
-                                .radius_scale = glow_radius_scale,
-                                .cursor_visible = app.cursor_blink_state,
-                            } else null,
-                            .draw_params = row_draw_params,
-                            .log_enabled = log_enabled,
-                        });
+                            .snapshot = tbs_snapshot,
+                            .rows_to_draw = rows_to_draw,
+                            .row_vb_len = committed.row_map.items.len,
+                            .total_rows = effective_rows,
+                            .preserve_back = preserve_back,
+                            .layer_paint_full = paint_full_snapshot,
+                            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                            .frame = .{
+                                .root_grid_id = 1,
+                                .layers = &.{},
+                                .row_map = committed.row_map.items,
+                                .rows_to_draw = &.{},
+                                .cursor_verts = cursor_verts_snapshot,
+                                .cursor_row = committed_cursor.last_cursor_row,
+                                .cursor_grid = cursor_grid,
+                                .cursor_erase_rows = cursor_erase_rows,
+                                .cursor_layer_origin = cursor_layer_origin,
+                                .blink_visible = app.cursor_blink_state,
+                                .force_full_rows = force_full_rows,
+                                .layer_layout_stale = false,
+                                .layer_commit_stale = false,
+                                .glow = if (glow_enabled) app_mod.RowFrameGlow{
+                                    .intensity = glow_intensity,
+                                    .radius_scale = glow_radius_scale,
+                                    .cursor_visible = app.cursor_blink_state,
+                                } else null,
+                                .draw_params = row_draw_params,
+                                .log_enabled = log_enabled,
+                            },
+                        }) catch {
+                            recoverMainPaintFailure(hwnd, app);
+                            return 0;
+                        };
+                        const row_frame = pass.frame;
                         if (row_frame.row_vb_budget_exceeded) {
                             app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
                             return 0;
@@ -3327,8 +3191,6 @@ pub export fn WndProc(
                         const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
                         const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
                         const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
-                        const layer_outcome = row_frame.layers;
-                        const cursor_overlay_failed = row_frame.cursor_overlay_failed;
 
                         if (log_enabled) {
                             applog.appLog(
@@ -3387,92 +3249,45 @@ pub export fn WndProc(
                         }
 
                         var layout_ok: bool = true;
-                        var rows_current: u32 = 0;
                         var metrics_ok: bool = true;
                         app.mu.lockUncancelable(core.clock.io());
                         layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
                         metrics_ok = row_mode and committed_metrics_gen == app.shared_metrics_gen;
-                        rows_current = committed.rows;
                         app.mu.unlock(core.clock.io());
 
-                        const allow_present = blk: {
-                            // Never publish vertices against a newer layout,
-                            // even for a seed-clear frame. A metric change can
-                            // keep rows/cols unchanged while invalidating the
-                            // NDC and row-height snapshot used above. The
-                            // render-failure path requeues a full paint at the
-                            // new generation.
-                            if (!layout_ok) break :blk false;
-                            // Same rule from the set's own side: these vertices
-                            // were generated against the metrics named above.
-                            if (row_mode and !metrics_ok) break :blk false;
-                            if (rows_current != rows_snapshot) break :blk false;
-                            // A failed VB create/upload/draw means one or more
-                            // rows from this paint snapshot never reached
-                            // back_tex. Treat the whole paint as failed so the
-                            // common recovery path requeues a full redraw.
-                            if (failed_rows != 0) break :blk false;
-                            if (layer_outcome.incomplete()) break :blk false;
-                            if (cursor_overlay_failed) break :blk false;
-
-                            // When seed_clear is true, we must present to sync the cleared back buffer
-                            // to all swapchain buffers. Skip other checks - the cleared state must be
-                            // presented to prevent ghost artifacts in gutter areas.
-                            if (seed_clear) break :blk true;
-
-                            // During seed mode with preserve_back=false, we MUST present to ensure
-                            // all swapchain buffers get the cleared state. Without this, some buffers
-                            // may retain stale gutter content causing ghost artifacts.
-                            if (seed_pending_snapshot and !preserve_back) break :blk true;
-
-                            // Never present until core has provided a stable row count.
-                            if (effective_rows == 0) break :blk false;
-
-                            if (seed_pending_snapshot) {
-                                // back_tex_valid_snapshot is the source-of-truth gate
-                                // (same flag preserve_back uses). When it is true,
-                                // back_tex already holds a fully-painted frame at the
-                                // current dimensions/metrics, so an incomplete row_valid
-                                // bitset does not block presenting scroll/dirty updates
-                                // — the rows we have not yet re-validated stay sourced
-                                // from the preserved back_tex content. Without this,
-                                // a WM_SIZE on minimize/restore that resets row_valid,
-                                // combined with grid_scroll propagating zero validity
-                                // bits via swapAndShiftRows, would freeze present while
-                                // preserve_back=true masked the gray-rectangle symptom.
-                                if (back_tex_valid_snapshot) {
-                                    if (rows_mismatch) {
-                                        if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
-                                        break :blk false;
-                                    }
-                                    break :blk true;
-                                }
-
-                                if (rows_mismatch) {
-                                    if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
-                                    break :blk false;
-                                }
-                                // No back_tex yet: require a complete seed so the first
-                                // present covers every row.
-                                if (effective_row_valid_count == effective_rows) {
-                                    if (skipped_empty != 0) break :blk false;
-                                    if (rows_to_draw.items.len != effective_rows) break :blk false;
-                                    break :blk true;
-                                }
-
-                                break :blk false;
-                            }
-
-                            if (force_full_rows and skipped_empty != 0) break :blk false;
-                            if (force_full_rows and rows_to_draw.items.len != effective_rows) break :blk false;
-                            break :blk true;
+                        // Shared with the external driver (render_helpers.presentGate);
+                        // the seed and chrome terms are this surface's own.
+                        // A paint against a newer layout or metrics, or with
+                        // rows that never reached back_tex, is refused and the
+                        // common recovery path requeues a full redraw.
+                        var present_in = render_helpers.PresentGateInputs{
+                            .layout_ok = layout_ok,
+                            .metrics_ok = !row_mode or metrics_ok,
+                            .frame_incomplete = row_frame.incomplete(),
+                            .force_full_rows = force_full_rows,
+                            .preserve_back = preserve_back,
+                            .rows = effective_rows,
+                            .rows_to_draw = rows_to_draw.items.len,
+                            .skipped_empty = skipped_empty,
+                            .custom_shader = g.custom_shader_pipelines.items.len != 0,
+                            .present_rects = present_rects.items.len,
+                            .present_rects_overflowed = present_rects_fallback_full,
+                            .seed = .{
+                                .pending = seed_pending_snapshot,
+                                .clear = seed_clear,
+                                .back_tex_valid = back_tex_valid_snapshot,
+                                .rows_mismatch = rows_mismatch,
+                                .row_valid_count = effective_row_valid_count,
+                            },
+                            .empty_damage_presents_all = true,
                         };
+                        const allow_present = render_helpers.presentGate(present_in).verdict == .present;
 
                         // When scrollBackTex shifted back_tex content, the entire scroll
                         // region changed in back_tex. Add it to present_rects so the
                         // CopySubresourceRegion in present copies the shifted pixels
                         // to all swapchain buffers.
-                        if (scroll_shift_result.scroll_rect) |sr| {
+                        if (pass.scroll_damage) |sr| {
                             present_rects.append(app.alloc, sr) catch {
                                 present_rects_fallback_full = true;
                             };
@@ -3556,11 +3371,11 @@ pub export fn WndProc(
                                 // shader pixels outside the dirty rectangles.
                                 // The external driver has carried this term
                                 // since its present grew the shader pass.
-                                const force_full_present = force_full_rows or
-                                    (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
-                                    seed_clear or
-                                    present_rects_fallback_full or
-                                    g.custom_shader_pipelines.items.len != 0;
+                                // Re-asked: the scrollbar overlay above can have
+                                // overflowed the rect list since the gate ran.
+                                present_in.present_rects_overflowed = present_rects_fallback_full;
+                                const present_gate = render_helpers.presentGate(present_in);
+                                const force_full_present = present_gate.full;
                                 const present_rects_slice: []const c.RECT =
                                     if (force_full_present) &[_]c.RECT{} else present_rects.items;
 
@@ -3613,15 +3428,8 @@ pub export fn WndProc(
                                     // allow_present and presents anyway, so without an explicit
                                     // false-assignment a stale snapshot value would survive a
                                     // paint that wiped back_tex.
-                                    const rendered_complete_frame =
-                                        effective_rows != 0 and
-                                        skipped_empty == 0 and
-                                        rows_to_draw.items.len == effective_rows;
-                                    const new_back_tex_valid =
-                                        (back_tex_valid_snapshot and preserve_back) or
-                                        rendered_complete_frame;
                                     app.mu.lockUncancelable(core.clock.io());
-                                    app.back_tex_valid = new_back_tex_valid;
+                                    app.back_tex_valid = present_gate.back_tex_valid;
                                     app.mu.unlock(core.clock.io());
                                     // last_painted_cursor_row is tracked by drawCursorOverlay above.
                                 } else |e| {
@@ -3661,7 +3469,7 @@ pub export fn WndProc(
                                 .{
                                     @as(u32, @intFromBool(seed_pending_snapshot)),
                                     effective_rows,
-                                    rows_current,
+                                    rows_snapshot,
                                     effective_row_valid_count,
                                     rows_to_draw.items.len,
                                     skipped_empty,
@@ -4157,19 +3965,13 @@ pub export fn WndProc(
                 // ext_hwnd here. The core fires this callback only when the
                 // cursor grid actually changes, so no is_grid_change guard
                 // is needed in the UI handler.
+                // The flush routing's answer, staged layout included: the core
+                // fires this mid-flush, before the layout that places a newly
+                // opened float commits, and a committed-only scan found no host,
+                // brought the MAIN window in front of the external one the cursor
+                // had just entered. macOS reads its staged map for the same case.
                 app.mu.lockUncancelable(core.clock.io());
-                const ext_hwnd = blk: {
-                    if (app.external_windows.get(grid_id)) |ext_win| break :blk ext_win.hwnd;
-                    var ext_it = app.external_windows.valueIterator();
-                    while (ext_it.next()) |entry| {
-                        const ext = entry.*;
-                        if (ext.is_pending_close) continue;
-                        for (ext.tbs.committed_layers.slice()) |layer| {
-                            if (layer.grid_id == grid_id) break :blk ext.hwnd;
-                        }
-                    }
-                    break :blk null;
-                };
+                const ext_hwnd = if (callbacks.externalWindowShowingGridLocked(app, grid_id)) |shown| shown.win.hwnd else null;
                 app.mu.unlock(core.clock.io());
 
                 if (ext_hwnd) |eh| {
@@ -6068,55 +5870,7 @@ pub export fn WndProc(
 
         c.WM_CHAR, c.WM_SYSCHAR => {
             if (getApp(hwnd)) |app| {
-                const mods = input.queryMods();
-
-                // If Ctrl/Alt are down, WM_CHAR often becomes ASCII control => ignore
-                // (WM_KEYDOWN path handled Ctrl/Alt combos).
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    return 0;
-                }
-
-                var ch0: u16 = @as(u16, @intCast(wParam));
-
-                // Skip control characters that are already handled by WM_KEYDOWN as special keys.
-                // This prevents double-input of Enter, Backspace, Tab, Escape.
-                // 0x08 = Backspace, 0x09 = Tab, 0x0D = Enter (CR), 0x1B = Escape
-                if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
-                    app.pending_high_surrogate_char = 0;
-                    return 0;
-                }
-
-                // `:` <-> `;` swap (config-gated) for single keypresses. Paste
-                // arrives via a separate clipboard path, so it is unaffected.
-                if (app.config.input.swap_colon_semicolon) {
-                    if (ch0 == 0x3A) {
-                        ch0 = 0x3B; // ':' -> ';'
-                    } else if (ch0 == 0x3B) {
-                        ch0 = 0x3A; // ';' -> ':'
-                    }
-                }
-
-                // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high
-                // surrogate first, then low surrogate. Buffer the high one and
-                // combine it with the next low one before sending to core.
-                var out: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
-                    app.pending_high_surrogate_char = ch0;
-                    return 0;
-                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_char;
-                    app.pending_high_surrogate_char = 0;
-                    if (hi == 0) return 0; // stray low surrogate
-                    s = input.utf16UnitsToUtf8(&out, hi, ch0);
-                } else {
-                    app.pending_high_surrogate_char = 0;
-                    s = input.utf16UnitsToUtf8(&out, ch0, null);
-                }
-
-                const text = s orelse return 0;
-                // keycode=0 means "text input" (Zig will take chars path).
-                input.sendKeyEventToCore(app, 0, mods, text, text);
+                input.handleCharMessage(app, wParam);
                 return 0;
             }
         },

@@ -94,10 +94,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Until this moment, `occlusionState` may still describe this window as it
     /// stood BEFORE the app itself ordered another window in front of it. See
     /// markOcclusionSuspect.
-    /// The grid this surface's knob is showing, kept across a busy lock.
-    private lazy var lastScrollbarGrid: Int64 = gridId
-    /// Last grid `[scrollbar]` named, so the line is a transition.
-    private var lastScrollbarGridLogged: Int64 = 0
     private var occlusionSuspectUntil: CFAbsoluteTime = 0
     /// Measured at 25-36ms — about two vsyncs — between the app ordering a
     /// window in front and the server publishing the occlusion that follows
@@ -619,7 +615,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
     /// Rows scrolled off this window's edge, kept alive so the band the
     /// smooth-scroll offset opens shows them instead of the edge row's
     /// background stretched over it. Same mechanism the main surface uses;
-    /// only the copying differs (see captureRetainedRows).
+    /// only the copying differs (see captureOneLayerRetainedRow).
     private var retention: ScrollRetention!
     /// Distance each grid this surface draws — its root and every hosted
     /// layer — has moved since the last capture, handed over by the
@@ -832,10 +828,16 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         scroller.action = #selector(scrollerDidScroll(_:))
         return scroller
     }()
-    private var scrollbarHideTimer: Timer?
-    private var lastViewportTopline: Int64 = -1
-    private var lastViewportLineCount: Int64 = -1
-    private var lastViewportBotline: Int64 = -1
+    // Created on first use, never from deinit: forming `[weak self]` while
+    // self is deallocating traps.
+    private var createdScrollbarController: SurfaceScrollbarController?
+    private var scrollbarController: SurfaceScrollbarController {
+        if let controller = createdScrollbarController { return controller }
+        let controller = SurfaceScrollbarController(
+            scroller: verticalScroller, surfaceId: gridId, core: { [weak self] in self?.mainTerminalView?.core })
+        createdScrollbarController = controller
+        return controller
+    }
     private var scrollbarTrackingArea: NSTrackingArea?
 
 
@@ -1019,8 +1021,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         ZonvieCore.appLog("[ExternalGridView] deinit: gridId=\(gridId)")
 
         // Invalidate scrollbar hide timer to break its run-loop retain.
-        scrollbarHideTimer?.invalidate()
-        scrollbarHideTimer = nil
+        createdScrollbarController?.invalidate()
 
         // viewDidMoveToWindow(nil) normally removes this on teardown, since
         // every current close path clears contentView first. Dropping it here
@@ -1399,6 +1400,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // this commit landed is released here too, under `lock`, not at
             // the main surface's commit.
             shared.shaderCursor.publishCommitTail(
+                committedBy: self,
                 publishScrollClears: { mainTerminalView?.publishStagedScrollClears(ownedBy: self) },
                 commitRevision: &commitRevision
             )
@@ -1454,29 +1456,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     rowEnd: ps.rowEnd,
                     rowsDelta: ps.rowsDelta
                 )
-                if let existing = pendingScrollAccum,
-                   existing.rowStart == ps.rowStart,
-                   existing.rowEnd == ps.rowEnd {
-                    pendingScrollAccum = SurfaceRowScroll(
-                        rowStart: ps.rowStart, rowEnd: ps.rowEnd,
-                        colStart: ps.colStart, colEnd: ps.colEnd,
-                        // Wrapping add: matches GridSurfaceRenderer.commitFlush's
-                        // &+ for the same accumulator (core-sourced i32 deltas
-                        // can't realistically overflow 64-bit Int, but avoid a
-                        // hard trap/crash on a corrupted extreme value).
-                        rowsDelta: clampRowsDelta(existing.rowsDelta &+ ps.rowsDelta),
-                        totalRows: ps.totalRows, totalCols: ps.totalCols
-                    )
-                } else {
-                    // Region mismatch: the old accumulator's blit is dropped,
-                    // but its row slots were already remapped — dirty its rows
-                    // so they redraw from the committed post-scroll vertices.
-                    if let existing = pendingScrollAccum,
-                       existing.rowEnd > existing.rowStart {
-                        pendingDirtyRows.insert(integersIn: existing.rowStart..<existing.rowEnd)
-                    }
-                    pendingScrollAccum = ps
-                }
+                mergeCommittedSurfaceScroll(into: &pendingScrollAccum, ps,
+                                            dirtyRows: &pendingDirtyRows)
+                ZonvieCore.appLog("[ext_scroll_commit] gridId=\(gridId) delta=\(ps.rowsDelta) accum=\(pendingScrollAccum?.rowsDelta ?? 0) rev=\(commitRevision)")
                 // Committed sets must not retain the staged scroll: draw()'s
                 // `pendingScrollAccum ?? committed.pendingScroll` fallback
                 // would re-apply it on a later frame.
@@ -1595,29 +1577,24 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         lock.unlock()
         let capturedCellHeightPx = Float(shared.cellHeightPx)
         for pending in pendingGridScrollScratch {
-            guard pending.gridId != gridId else {
-                let rows = Int(committedExtent.resolved(liveWidth: gridCols, liveHeight: gridRows).height)
-                // Seeding is decided by who compensates the scroll, not by
-                // which path captured the rows: this same capture serves a
-                // trackpad gesture (which compensates through the finger and
-                // owes no seed) and a keyboard scroll that only reached here
-                // because an ease was already holding an offset — that one
-                // owes one.
-                captureRetainedRows(
-                    ws: bufferSets[flushSourceSetIndex],
-                    rowStart: pending.bounds.top,
-                    rowEnd: min(pending.bounds.bottomEx, rows),
-                    rowsDelta: pending.rowsDelta,
-                    seedsEase: true
-                )
-                continue
-            }
-            guard let sets = gridBuffers.existingSets(for: pending.gridId) else { continue }
             let id = pending.gridId
-            captureSurfaceGridScrollStep(
+            // The root is a grid of this surface like any other, read from
+            // the surface's own sets and clamped to the committed extent.
+            let isRoot = id == gridId
+            let cs: SurfaceBufferSet
+            var bounds = pending.bounds
+            if isRoot {
+                cs = bufferSets[flushSourceSetIndex]
+                let rows = Int(committedExtent.resolved(liveWidth: gridCols, liveHeight: gridRows).height)
+                bounds.bottomEx = min(bounds.bottomEx, rows)
+            } else {
+                guard let sets = gridBuffers.existingSets(for: id) else { continue }
+                cs = sets[flushSourceSetIndex]
+            }
+            let captured = captureSurfaceGridScrollStep(
                 gridId: id,
-                cs: sets[flushSourceSetIndex],
-                bounds: pending.bounds,
+                cs: cs,
+                bounds: bounds,
                 rowsDelta: pending.rowsDelta,
                 sourceShift: 0,
                 retention: retention,
@@ -1632,33 +1609,20 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                     cellHeightPx: capturedCellHeightPx
                 )
             }
+            // Seeding is decided by who compensates the scroll, not by which
+            // path captured the rows: the root's capture here serves a
+            // trackpad gesture (which compensates through the finger and owes
+            // no seed) and a keyboard scroll that only reached here because an
+            // ease was already holding an offset — that one owes one. The
+            // tick drops a seed for a grid a gesture owns.
+            if isRoot, captured {
+                stageSurfaceEaseSeed(gridId: id, rowsDelta: pending.rowsDelta, lock: lock,
+                                     stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds)
+            }
         }
     }
 
 
-    /// Copy the rows about to leave this window's scroll region into the
-    /// retention, so the band the smooth-scroll offset opens shows them
-    /// instead of the edge row's background stretched across it.
-    ///
-    /// Only the row's DECO_SCROLLABLE vertices are copied (shared filter with
-    /// the main renderer's grid_scroll capture — see
-    /// copyRetainedScrollableRow). An external window owns its surface
-    /// outright, so no OTHER grid mixes in, but its own rows still hold
-    /// non-scrollable cells: a float border's "│" columns. A whole-row copy
-    /// let those escape the offset shift and the content clip, landing them
-    /// on the margin rows. Called from inside the flush bracket, before the
-    /// slot remap.
-    /// `seedsEase` mirrors the main renderer's split: the row-shift fast path
-    /// owes a seed, the grid_scroll hand-over does not.
-    ///
-    /// It deliberately does NOT ask whether a gesture owns the grid. That is
-    /// the tick's decision, on the main thread, where the gesture state lives:
-    /// these seeds join the main surface's in the same `tickSmoothScroll`,
-    /// which tells a gesture-owned grid from a decayed one below. Answering it
-    /// here, on the core thread, dropped the seed outright — and a single-row
-    /// step arriving while `pendingSentScroll` is non-zero is exactly the held
-    /// key that needs one, so the picture snapped a whole cell. The main
-    /// renderer's `captureLayerScrollStep` documents the same rule.
     /// Retain the rows a hosted layer's scroll is about to displace, so its own
     /// pass can ease them the way the root's are eased. The main surface does
     /// this for every layer it places; an external surface used to stage
@@ -1699,7 +1663,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
         }
     }
 
-    /// One row of `captureLayerScrollStep`, read out of the layer's own set.
+    /// One retained row, read out of a grid's own set — the root's or a hosted
+    /// layer's. Only its DECO_SCROLLABLE vertices are copied (the filter the
+    /// main renderer shares, copyRetainedScrollableRow): a float border's "│"
+    /// columns must not ride the offset onto the margin rows.
     private func captureOneLayerRetainedRow(
         cs: SurfaceBufferSet,
         gridId id: Int64,
@@ -1728,65 +1695,6 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             targetRow: targetRow,
             cellHeightPx: cellHeightPx
         ))
-    }
-
-    private func captureRetainedRows(ws: SurfaceBufferSet, rowStart: Int, rowEnd: Int, rowsDelta: Int, seedsEase: Bool) {
-        guard GridSurfaceRenderer.smoothScrollEnabled else { return }
-        guard ws.rowState.usingRowBuffers else { return }
-        guard let plan = ScrollRetention.plan(
-            rowStart: rowStart,
-            rowEnd: rowEnd,
-            rowsDelta: rowsDelta,
-            depth: retention.depthRows
-        ) else { return }
-
-        let capturedCellHeightPx = Float(shared.cellHeightPx ?? 0)
-        guard capturedCellHeightPx > 0 else { return }
-        var stepOpened = false
-        defer {
-            if seedsEase, stepOpened, abs(rowsDelta) == 1 {
-                lock.lock()
-                stagedSmoothScrollSeeds.append((gridId: gridId, rowsDelta: rowsDelta))
-                lock.unlock()
-            }
-        }
-        for i in 0..<plan.count {
-            let outgoingRow = ScrollRetention.planRow(plan, i, rowsDelta: rowsDelta)
-            guard outgoingRow >= 0, outgoingRow < ws.rowLogicalToSlot.count else { continue }
-            let slot = ws.rowLogicalToSlot[outgoingRow]
-            guard slot >= 0, slot < ws.rowState.counts.count, slot < ws.rowState.buffers.count else { continue }
-            let vc = ws.rowState.counts[slot]
-            guard vc > 0, let srcBuf = ws.rowState.buffers[slot] else { continue }
-            // Where these vertices actually sit: the slot remap leaves them at
-            // their original row and lets draw() fix the position through
-            // rowSlotSourceRows, so under a continuous scroll this drifts away
-            // from the logical row.
-            let sourceRow = slot < ws.rowSlotSourceRows.count ? ws.rowSlotSourceRows[slot] : outgoingRow
-
-            if !stepOpened {
-                retention.beginStep(
-                    gridId: gridId,
-                    rowsDelta: rowsDelta,
-                    pivotTargetRow: plan.pivotTargetRow
-                )
-                stepOpened = true
-            }
-            guard let copied = copyRetainedScrollableRow(
-                retention: retention,
-                srcBuf: srcBuf,
-                vertexCount: vc,
-                gridId: gridId,
-                scrollableMask: ZONVIE_DECO_SCROLLABLE
-            ) else { continue }
-            retention.stage(RetainedScrollRow(
-                buffer: copied.buffer,
-                count: copied.count,
-                gridId: gridId,
-                sourceRow: sourceRow,
-                targetRow: outgoingRow - rowsDelta,
-                cellHeightPx: capturedCellHeightPx
-            ))
-        }
     }
 
     /// Remap this surface's row slots for a core row-scroll and stage the
@@ -1823,33 +1731,46 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
 
         guard prepareRowWriteState() else { return }
         let ws = bufferSets[writeSetIndex]
-        // Capture the outgoing rows when the grid_scroll callback handed over
-        // no distance of its own. That hand-over is gated to gesture-owned
-        // scrolls, so a keyboard or Neovim-initiated scroll arrives here with
-        // nothing retained and no ease seed — the main surface takes both from
-        // captureLayerScrollStep on this same fast path, which is what gives it
-        // the animation an external window was missing. Guarded on the pending
-        // distance, because capturing what the bracket-open capture already
-        // staged would shift the same rows a second time.
-        // Only a hand-over the bracket-open capture can actually USE counts as
-        // one. It needs the scrollable span, and that is armed by the trackpad
-        // input path alone — so a keyboard scroll arriving while an ease is
-        // still running hands over a distance nothing can capture: the
-        // grid_scroll gate fires on the offset that ease is holding, this guard
-        // saw the distance and stood down, and the row went uncompensated.
-        lock.lock()
-        let handedOverByGridScroll = (pendingGridScrollRows[gridId] ?? 0) != 0 && scrollCaptureBounds[gridId] != nil
-        lock.unlock()
-        if !handedOverByGridScroll {
-            // The source set still holds the on-screen rows: this runs before
-            // the remap below, the same ordering captureLayerScrollStep keeps.
-            captureRetainedRows(
-                ws: bufferSets[flushSourceSetIndex],
-                rowStart: rowStart,
-                rowEnd: rowEnd,
-                rowsDelta: rowsDelta,
-                seedsEase: true
-            )
+        // Capture the outgoing rows, and stage the ease seed, when the
+        // grid_scroll hand-over did not already: that hand-over is gated to
+        // gesture-owned scrolls, so a keyboard or Neovim-initiated scroll
+        // arrives here with nothing retained and no seed — the main surface
+        // takes both from the same shared step on this fast path. Stood down
+        // on whether the bracket-open capture actually took a step for the
+        // root (prepareRowWriteState ran it just above), because capturing
+        // again would shift the same rows a second time and seed twice. A
+        // hand-over it could not use (no span armed: keyboard scroll during an
+        // ease) took no step, so this one does.
+        if GridSurfaceRenderer.smoothScrollEnabled {
+            lock.lock()
+            let steppedAtBracketOpen = bracketStagedGrids.contains(gridId)
+            lock.unlock()
+            if !steppedAtBracketOpen {
+                let rootId = gridId
+                let capturedCellHeightPx = Float(shared.cellHeightPx)
+                // The source set still holds the on-screen rows: this runs
+                // before the remap below.
+                captureSurfaceLayerScrollStep(
+                    gridId: rootId,
+                    sets: bufferSets,
+                    flushSourceSetIndex: flushSourceSetIndex,
+                    rowStart: rowStart,
+                    rowEnd: rowEnd,
+                    rowsDelta: rowsDelta,
+                    retention: retention,
+                    lock: lock,
+                    bracketStagedGrids: &bracketStagedGrids,
+                    stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds
+                ) { cs, readRow, targetRow in
+                    captureOneLayerRetainedRow(
+                        cs: cs,
+                        gridId: rootId,
+                        readRow: readRow,
+                        targetRow: targetRow,
+                        cellHeightPx: capturedCellHeightPx
+                    )
+                }
+            }
         }
         flushHasStructuralRowChange = true
         // The marks have to travel with the rows they describe. The remap below
@@ -2298,7 +2219,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // the cursor has not moved relative to its text.
             shared.shaderCursor.reanchor(rect: rect, gridId: owner)
         } else {
-            shared.shaderCursor.stage(rect: rect, color: color, gridId: owner)
+            shared.shaderCursor.stage(rect: rect, color: color, gridId: owner, by: self)
         }
     }
 
@@ -3053,18 +2974,10 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
                 : 0
 
             func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-                guard logicalRow >= 0, logicalRow < safeRowCount else { return nil }
-                guard logicalRow < committed.rowLogicalToSlot.count else { return nil }
-                let slot = committed.rowLogicalToSlot[logicalRow]
-                guard slot >= 0, slot < committed.rowState.counts.count else { return nil }
-                let vc = committed.rowState.counts[slot]
-                guard vc > 0, slot < committed.rowState.buffers.count,
-                      let vb = committed.rowState.buffers[slot] else { return nil }
-                let sourceRow = slot < committed.rowSlotSourceRows.count ? committed.rowSlotSourceRows[slot] : logicalRow
-                // Pixels, y down: vertices live at sourceRow and must appear
-                // at logicalRow.
-                let translationY = Float(Int(logicalRow) - Int(sourceRow)) * Float(cellHi)
-                return (vc, vb, translationY)
+                guard logicalRow < safeRowCount else { return nil }
+                // The resolver this surface's hosted layers use: the root is a
+                // grid of this surface like they are.
+                return resolveSurfaceGridRow(committed, row: logicalRow, cellHeightPx: Float(cellHi))
             }
 
             // Rows retained across a smooth-scroll step are drawn as virtual
@@ -3242,6 +3155,9 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             // compaction only shortens the array in place, so this adds no
             // heap work to the frame.
             surfaceSortAndDeduplicateRows(&dirtyRows)
+            if let scroll = pendingScroll {
+                ZonvieCore.appLog("[ext_scroll_draw] gridId=\(gridId) delta=\(scroll.rowsDelta) rows=\(scroll.rowStart)..<\(scroll.rowEnd) may=\(mayGpuScrollCopy) used=\(useGpuScrollCopy) newCommit=\(hasNewCommit) layout=\(layoutDamageSnapshot) font=\(committedFontIsCurrent) presented=\(hasPresentedOnce) smooth=\(smoothScrolling) size=\(drawableSizeChanged) submitted=\(submittedDirtyRows.count) dirty=\(dirtyRows.count) rev=\(currentCommitRevision)")
+            }
 
             // --- Render into back buffer ---
             let rpd = MTLRenderPassDescriptor()
@@ -4042,6 +3958,7 @@ final class ExternalGridView: MTKView, MTKViewDelegate, SurfaceDrawLoopHost {
             gpuSubmitted = true
 
             markScrollOffsetStatePresented()
+            if !hasPresentedOnce { recalculateSurfaceShadowAfterFirstPresent(self) }
             hasPresentedOnce = true
             redrawScheduler.didDrawFrame()
             finishedRedraw = true
@@ -4972,111 +4889,22 @@ extension ExternalGridView: NSTextInputClient {
         )
     }
 
-    /// Update scrollbar if viewport has changed (called after rendering)
-    /// The grid this surface's scrollbar ACTS on, which has to be the one it
-    /// shows — a float this window hosts included. Dragging ran against the
-    /// cursor's window, so this knob scrolled whatever held the cursor.
-    private var scrollbarInteractionGrid: Int64 {
-        let g = mainTerminalView?.core?.scrollbarGridNonBlocking(surfaceId: gridId) ?? lastScrollbarGrid
-        ZonvieCore.appLog("[scrollbar_action] surface=\(gridId) grid=\(g)")
-        return g
-    }
-
+    /// Move the knob after a drawn frame (shared controller).
     func updateScrollbarIfNeeded() {
-        let scrollbarConfig = ZonvieConfig.shared.scrollbar
-        guard scrollbarConfig.enabled && !isDecoratedSurface else { return }
-        guard let main = mainTerminalView, let core = main.core else { return }
-        // The cursor's grid when this surface composites it — a float this
-        // window hosts is this window's content — and this window's own root
-        // otherwise. Asking only for the root left the knob still while a
-        // hosted float scrolled.
-        // On a busy lock keep the grid the knob is already showing.
-        let scrollbarGrid = core.scrollbarGridNonBlocking(surfaceId: gridId) ?? lastScrollbarGrid
-        lastScrollbarGrid = scrollbarGrid
-        guard let viewport = core.getViewportNonBlocking(gridId: scrollbarGrid) else { return }
-
-        let viewportChanged = viewport.topline != lastViewportTopline ||
-                              viewport.lineCount != lastViewportLineCount ||
-                              viewport.botline != lastViewportBotline
-
-        if viewportChanged {
-            if ZonvieCore.appLogEnabled, scrollbarGrid != lastScrollbarGridLogged || viewport.topline != lastViewportTopline {
-                lastScrollbarGridLogged = scrollbarGrid
-                ZonvieCore.appLog("[scrollbar] surface=\(gridId) grid=\(scrollbarGrid) topline=\(viewport.topline) lineCount=\(viewport.lineCount)")
-            }
-            lastViewportTopline = viewport.topline
-            lastViewportLineCount = viewport.lineCount
-            lastViewportBotline = viewport.botline
-            updateScrollbar(viewport: viewport)
-
-            if scrollbarConfig.isScroll {
-                showScrollbar()
-            }
-        }
-    }
-
-    private func updateScrollbar(viewport: ZonvieCore.ViewportInfo) {
-        let config = ZonvieConfig.shared.scrollbar
-        guard config.enabled else { return }
-
-        verticalScroller.apply(viewport.scrollbarMetrics, alwaysVisible: config.isAlways)
+        guard !isDecoratedSurface else { return }
+        scrollbarController.update()
     }
 
     private func showScrollbar() {
-        let config = ZonvieConfig.shared.scrollbar
-        guard config.enabled else { return }
-
-        scrollbarHideTimer?.invalidate()
-
-        let targetAlpha = CGFloat(config.opacity)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.15
-            verticalScroller.animator().alphaValue = targetAlpha
-        }
-
-        if config.isScroll && !config.isAlways {
-            scrollbarHideTimer = Timer.scheduledTimer(withTimeInterval: config.delay, repeats: false) { [weak self] _ in
-                self?.hideScrollbar()
-            }
-        }
+        scrollbarController.show()
     }
 
     private func hideScrollbar() {
-        let config = ZonvieConfig.shared.scrollbar
-        if config.isAlways { return }
-
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.3
-            verticalScroller.animator().alphaValue = 0.0
-        }
+        scrollbarController.hide()
     }
 
     @objc private func scrollerDidScroll(_ sender: NSScroller) {
-        guard let main = mainTerminalView, let core = main.core else { return }
-        // Read and act on the same grid: the knob shows `scrollbarInteractionGrid`,
-        // and this read `gridId`'s viewport while scrolling the other.
-        let target = scrollbarInteractionGrid
-
-        switch sender.hitPart {
-        case .decrementPage:
-            // Neovim's own page step, as the main window and Windows take it;
-            // this surface stepped by its own arithmetic.
-            core.pageScroll(gridId: target, forward: false)
-
-        case .incrementPage:
-            core.pageScroll(gridId: target, forward: true)
-
-        case .knob, .knobSlot:
-            // The core's rule, shared with the main window and Windows. It
-            // aligns the lower half of the travel to the bottom, which is the
-            // only way the last line can be reached; this surface never did.
-            guard let viewport = core.getViewportNonBlocking(gridId: target) else { return }
-            let drag = viewport.dragTarget(ratio: sender.doubleValue)
-            core.scrollToLine(gridId: target, drag.line, useBottom: drag.use_bottom != 0)
-
-        default:
-            break
-        }
+        scrollbarController.scrollerDidScroll(sender)
     }
 
     private func setupScrollbarHoverTracking() {

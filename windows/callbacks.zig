@@ -1049,7 +1049,14 @@ pub fn onVerticesRow(
                 // loop would draw its empty-row background fill over the whole
                 // window every frame — which is opaque and destroys blur.
                 // The layer's own dirty flag and present rect carry the frame.
-                app.flush_needs_invalidate = true;
+                // Only for a main-window layer: a float an external window
+                // hosts already asked its host (storeMainSurfaceLayerRowLocked
+                // sets needs_redraw), and the main flag drives a whole-window
+                // InvalidateRect — the row-scroll path makes the same split.
+                switch (row_route) {
+                    .main_root, .main_layer, .unplaced => app.flush_needs_invalidate = true,
+                    .external_layer, .external_root => {},
+                }
                 return;
             }
         }
@@ -3409,6 +3416,26 @@ fn resolveGridRouteLocked(app: *App, grid_id: i64) GridRoute {
     if (mainSurfaceOwnsGridLocked(app, grid_id)) return .main_layer;
     if (externalSurfaceForGridLocked(app, grid_id)) |host| return .{ .external_layer = host };
     return .unplaced;
+}
+
+/// The external window that shows `grid_id` — as its own root or as a layer
+/// it hosts — with that window's root grid id, or null when the main window
+/// shows it. The flush routing's rule, so UI-thread decisions (which window
+/// to activate, whose scrollbar to update) answer the same way; the staged
+/// layout counts, because the cursor can enter a float in the flush that
+/// places it. Caller must hold `app.mu`.
+pub fn externalWindowShowingGridLocked(app: *App, grid_id: i64) ?struct { win: *app_mod.ExternalWindow, root_grid_id: i64 } {
+    return switch (resolveGridRouteLocked(app, grid_id)) {
+        .external_root => |w| .{ .win = w, .root_grid_id = grid_id },
+        .external_layer => |host| {
+            var it = app.external_windows.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* == host) return .{ .win = host, .root_grid_id = entry.key_ptr.* };
+            }
+            return null;
+        },
+        .main_root, .main_layer, .unplaced => null,
+    };
 }
 
 /// Store one row for a grid the main surface draws as a non-root layer.

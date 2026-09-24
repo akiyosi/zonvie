@@ -515,6 +515,16 @@ pub fn build(b: *std.Build) !void {
     const cursor_rect_tests = b.addTest(.{ .root_module = cursor_rect_test_mod });
     test_step.dependOn(&b.addRunArtifact(cursor_rect_tests).step);
 
+    // Whether an external popupmenu opens below or above its anchor. Same
+    // shape: the two frontends flipped against different edges.
+    const popup_placement_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/popup_placement.zig"),
+    });
+    const popup_placement_tests = b.addTest(.{ .root_module = popup_placement_test_mod });
+    test_step.dependOn(&b.addRunArtifact(popup_placement_tests).step);
+
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,

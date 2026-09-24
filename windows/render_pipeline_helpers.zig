@@ -837,6 +837,137 @@ pub fn paintPolicy(in: PaintPolicyInputs) PaintPolicy {
     };
 }
 
+/// The main driver's seed state. Only the main surface has one (the core seeds
+/// grid 1 alone), so an external window passes none.
+pub const SeedPresentFacts = struct {
+    pending: bool,
+    clear: bool,
+    back_tex_valid: bool,
+    rows_mismatch: bool,
+    row_valid_count: usize,
+};
+
+pub const PresentGateInputs = struct {
+    /// The row layout this paint snapshotted is still current.
+    layout_ok: bool = true,
+    /// The committed set's metrics generation is still current.
+    metrics_ok: bool = true,
+    /// Rows, layers or the cursor overlay never reached back_tex.
+    frame_incomplete: bool = false,
+    force_full_rows: bool,
+    preserve_back: bool,
+    rows: usize,
+    rows_to_draw: usize,
+    skipped_empty: u32,
+    custom_shader: bool = false,
+    present_rects: usize,
+    present_rects_overflowed: bool = false,
+    seed: ?SeedPresentFacts = null,
+    /// Main's chrome is redrawn from hover state that yields no damage rect,
+    /// so an empty damage list there still presents the whole surface.
+    empty_damage_presents_all: bool = false,
+};
+
+pub const PresentVerdict = enum {
+    /// Must not present; the caller's failure path requeues a full paint.
+    refuse,
+    /// Nothing changed on screen; not a failure.
+    skip,
+    present,
+};
+
+pub const PresentGate = struct {
+    verdict: PresentVerdict,
+    /// Mark every rotating swapchain buffer damaged.
+    full: bool,
+    /// back_tex after a successful present.
+    back_tex_valid: bool,
+};
+
+/// Whether and how a paint presents, for both paint drivers. The seed and
+/// row-count rules are the main surface's; with no seed this is the external
+/// driver's gate.
+pub fn presentGate(in: PresentGateInputs) PresentGate {
+    const full = in.force_full_rows or
+        in.present_rects_overflowed or
+        in.custom_shader or
+        if (in.seed) |s| s.clear or (s.pending and !s.back_tex_valid and !s.rows_mismatch) else false;
+    const rendered_complete_frame = in.rows != 0 and
+        in.skipped_empty == 0 and
+        in.rows_to_draw == in.rows;
+    const back_tex_valid = if (in.seed) |s|
+        (s.back_tex_valid and in.preserve_back) or rendered_complete_frame
+    else
+        true;
+    const verdict: PresentVerdict = if (!in.layout_ok or !in.metrics_ok or in.frame_incomplete)
+        .refuse
+    else if (in.seed) |s|
+        (if (seedAllowsPresent(in, s)) .present else .refuse)
+    else if (!full and in.present_rects == 0 and !in.empty_damage_presents_all)
+        .skip
+    else
+        .present;
+    return .{ .verdict = verdict, .full = full, .back_tex_valid = back_tex_valid };
+}
+
+fn seedAllowsPresent(in: PresentGateInputs, s: SeedPresentFacts) bool {
+    // A cleared back buffer must reach every swapchain buffer, or the gutter
+    // keeps stale pixels.
+    if (s.clear) return true;
+    if (s.pending and !in.preserve_back) return true;
+    // Never present until the core has provided a stable row count.
+    if (in.rows == 0) return false;
+    const drew_every_row = in.skipped_empty == 0 and in.rows_to_draw == in.rows;
+    if (s.pending) {
+        if (s.rows_mismatch) return in.rows_to_draw != 0 and in.skipped_empty == 0;
+        // A valid back_tex sources the rows not yet re-validated.
+        if (s.back_tex_valid) return true;
+        // No back_tex yet: the first present must cover every row.
+        return s.row_valid_count == in.rows and drew_every_row;
+    }
+    return !in.force_full_rows or drew_every_row;
+}
+
+/// One full-width rect per run of adjacent dirty rows, written into `out` and
+/// counted. `rows` is sorted and deduplicated, so there are never more runs
+/// than rows: a caller that reserved `rows.len` slots cannot run short, which
+/// is what lets both paint drivers share this without a fallible append.
+pub fn rowSpanRects(
+    comptime Rect: type,
+    rows: []const u32,
+    y_offset: i32,
+    right: i32,
+    row_h: i32,
+    out: []Rect,
+) usize {
+    if (rows.len == 0) return 0;
+    std.debug.assert(out.len >= rows.len);
+    var n: usize = 0;
+    var start = rows[0];
+    var end = start + 1;
+    for (rows[1..]) |r| {
+        if (r == end) {
+            end += 1;
+            continue;
+        }
+        out[n] = spanRect(Rect, start, end, y_offset, right, row_h);
+        n += 1;
+        start = r;
+        end = r + 1;
+    }
+    out[n] = spanRect(Rect, start, end, y_offset, right, row_h);
+    return n + 1;
+}
+
+fn spanRect(comptime Rect: type, start: u32, end: u32, y_offset: i32, right: i32, row_h: i32) Rect {
+    return .{
+        .left = 0,
+        .top = y_offset + @as(i32, @intCast(start)) * row_h,
+        .right = right,
+        .bottom = y_offset + @as(i32, @intCast(end)) * row_h,
+    };
+}
+
 /// Clamp present rectangles to the render target and drop the ones that clamp
 /// away to nothing, returning the surviving length.
 ///

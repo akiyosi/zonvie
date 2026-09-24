@@ -1,6 +1,7 @@
 const std = @import("std");
 const pointer_target = @import("pointer_target.zig");
 const scrollbar_metrics = @import("scrollbar_metrics.zig");
+const popup_placement = @import("popup_placement.zig");
 const build_options = @import("build_options");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
@@ -1342,6 +1343,16 @@ pub export fn zonvie_core_set_option_value(
 }
 
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
+/// Ask Neovim to close the window shown in `grid_id` (a user closing an
+/// external OS window). Returns 1 when a request was sent, 0 when the grid
+/// has no Neovim window or the request could not be queued.
+pub export fn zonvie_core_request_win_close(p: ?*zonvie_core, grid_id: i64) callconv(.c) c_int {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    const sent = box.core.requestWinClose(grid_id) catch return 0;
+    return @intFromBool(sent);
+}
+
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
@@ -1847,6 +1858,19 @@ pub export fn zonvie_core_scrollbar_metrics(
 }
 
 pub const zonvie_scrollbar_drag_target = scrollbar_metrics.DragTarget;
+
+/// The top edge of an external popupmenu window: below the anchor cell when
+/// it fits above the reference window's bottom, else above when it fits
+/// under the screen top, else below. Y grows downward.
+pub export fn zonvie_core_popupmenu_top(
+    anchor_top: i32,
+    anchor_height: i32,
+    popup_height: i32,
+    ref_bottom: i32,
+    screen_top: i32,
+) callconv(.c) i32 {
+    return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
+}
 
 /// Where a knob dragged to `ratio` of its travel asks the window to scroll.
 /// The track and knob geometry that produce `ratio` are chrome and stay with
