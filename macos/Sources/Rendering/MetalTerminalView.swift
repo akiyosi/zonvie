@@ -1307,7 +1307,12 @@ final class MetalTerminalView: MTKView, SurfaceDrawLoopHost {
             // follower moves bodily, band and all, so it is read where drawn.
             let localRow: Int32
             if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[cache.gridId], g.cellH > 0 {
-                localRow = Int32((g.pointPx.y - followerOffsetPx) / g.cellH) - cache.band.startRow
+                // Against the float's placement NOW, not the press's: a
+                // follower is re-placed by Neovim as it scrolls, and the
+                // displacement is measured from the current placement.
+                let startRow = core.getVisibleGridsCached().first { $0.gridId == cache.gridId }?.startRow
+                    ?? cache.band.startRow
+                localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - startRow
             } else {
                 localRow = scrollAdjustedLocalRow(
                     pointPxY: g.pointPx.y,
