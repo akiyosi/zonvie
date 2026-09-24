@@ -33,6 +33,54 @@ pub fn cmdlineTop(cmdline_top: i32, cmdline_bottom: i32, popup_height: i32, gap:
     return cmdline_bottom +| gap;
 }
 
+/// The popup's left edge: the anchor column less the popup's own text inset,
+/// so its text lines up with the anchor, shifted left when the popup would run
+/// past `screen_right` -- as Neovim's own popupmenu does -- but never past
+/// `screen_left`. Neither frontend clamped X, so a completion near the right
+/// edge ran off the screen.
+pub fn left(anchor_left: i32, popup_width: i32, text_inset: i32, screen_left: i32, screen_right: i32) i32 {
+    var x = anchor_left -| text_inset;
+    if (x +| popup_width > screen_right) x = screen_right -| popup_width;
+    return @max(x, screen_left);
+}
+
+/// A saved window origin kept inside an area (a monitor's work area): each
+/// axis clamped to [min, max - size]. The axes need no direction, so it is
+/// the same call for Y growing up or down. The area is the monitor holding
+/// the saved point: both frontends clamped to the primary one, pulling a
+/// window left on another monitor back to it.
+pub fn clampOrigin(x: i32, y: i32, w: i32, h: i32, area_min_x: i32, area_min_y: i32, area_max_x: i32, area_max_y: i32) [2]i32 {
+    return .{
+        @max(area_min_x, @min(x, area_max_x -| w)),
+        @max(area_min_y, @min(y, area_max_y -| h)),
+    };
+}
+
+test "a saved origin inside the area is kept" {
+    try std.testing.expectEqual([2]i32{ 100, 50 }, clampOrigin(100, 50, 200, 40, 0, 0, 1920, 1080));
+}
+
+test "a saved origin on a left monitor keeps its negative x" {
+    try std.testing.expectEqual([2]i32{ -1500, 30 }, clampOrigin(-1500, 30, 200, 40, -1920, 0, 0, 1080));
+}
+
+test "a saved origin past the area's far edges is pulled back inside" {
+    try std.testing.expectEqual([2]i32{ -200, 1040 }, clampOrigin(50, 2000, 200, 40, -1920, 0, 0, 1080));
+}
+
+test "the popup starts at the anchor column less its text inset" {
+    try std.testing.expectEqual(@as(i32, 92), left(100, 200, 8, 0, 1000));
+}
+
+test "a popup that would run past the right edge shifts left to fit" {
+    // 900 - 0 + 200 = 1100 > 1000: shifted to 800.
+    try std.testing.expectEqual(@as(i32, 800), left(900, 200, 0, 0, 1000));
+}
+
+test "a popup wider than the screen keeps its left edge on screen" {
+    try std.testing.expectEqual(@as(i32, 0), left(500, 1200, 0, 0, 1000));
+}
+
 test "cmdline completion sits above the cmdline, flipping below with no room" {
     // Cmdline at 500..540, popup 200 tall, 4px gap, screen from 0.
     try std.testing.expectEqual(@as(i32, 296), cmdlineTop(500, 540, 200, 4, 0));

@@ -2261,7 +2261,6 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             const old_rows = sg.rows;
-            const old_cols = sg.cols;
             const shape_changed = sg.rows != rows or sg.cols != cols;
             const new_len = try checkedGridCellCount(rows, cols);
             const new_total = try self.checkedAggregateCellCount(sg.cells.len, new_len);
@@ -2274,26 +2273,11 @@ pub const Grid = struct {
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
 
-            // Only affect global grid state for composited grids (in win_pos).
-            // External grids (not in win_pos) are rendered independently.
-            if (self.win_pos.get(grid_id)) |p| {
-                if (self.surfaceForGrid(p.anchor_grid) != 1) {
-                    const h = @max(old_rows, rows);
-                    var r: u32 = 0;
-                    while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
-                } else {
-                    self.content_rev +%= 1;
-                    // A resize to or from a zero dimension changes whether this
-                    // grid counts as a layer at all, and with it every main
-                    // row's `skip_default_bg`; anything else only repaints the
-                    // band the layer covered, at its larger extent.
-                    if (rows == 0 or cols == 0 or old_rows == 0 or old_cols == 0) {
-                        self.markAllDirty();
-                    } else {
-                        self.markDirtyRect(p.row, p.row +| @max(old_rows, rows));
-                    }
-                }
-            }
+            // The band the layer covered, at its larger extent. A resize to or
+            // from a zero dimension also changes whether the grid counts as a
+            // layer, and with it every root row's `skip_default_bg`; the flush
+            // regenerates those (regenerateRootsWhoseDefaultBgRuleFlipped).
+            if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, @max(old_rows, rows));
             return;
         }
 
@@ -2313,18 +2297,10 @@ pub const Grid = struct {
             self.glyph_working_set_rev +%= 1;
         }
         self.trimOverflowForGrid(grid_id, rows, cols);
-        if (self.win_pos.get(grid_id)) |p| {
-            if (self.surfaceForGrid(p.anchor_grid) != 1) {
-                var r: u32 = 0;
-                while (r < rows) : (r += 1) self.dirtyCompositedRow(p, r);
-            } else {
-                self.content_rev +%= 1;
-                // The layer's band. A grid appearing as this surface's FIRST
-                // layer also flips `skip_default_bg` for every main row; the
-                // flush regenerates those (regenerateRootsWhoseDefaultBgRuleFlipped).
-                self.markDirtyRect(p.row, p.row +| rows);
-            }
-        }
+        // The layer's band. A grid appearing as grid 1's FIRST layer also
+        // flips `skip_default_bg` for every root row; the flush regenerates
+        // those (regenerateRootsWhoseDefaultBgRuleFlipped).
+        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, rows);
     }
 
     pub fn clearGrid(self: *Grid, grid_id: i64) void {
@@ -2344,17 +2320,8 @@ pub const Grid = struct {
         }
         self.clearOverflowForGrid(grid_id);
 
-        // Only affect global grid state for composited grids. A float anchored
-        // to an external grid composites into that grid's window instead: dirty
-        // the anchor's rows covered by the float (anchor-local translation is
-        // handled by dirtyCompositedRow), not the main grid.
-        if (self.win_pos.get(grid_id)) |p| {
-            const h: u32 = if (self.sub_grids.get(grid_id)) |fsg| fsg.rows else 1;
-            var r: u32 = 0;
-            while (r < h) : (r += 1) {
-                self.dirtyCompositedRow(p, r);
-            }
-        }
+        // Only a placed grid has a band, on the surface that composites it.
+        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, self.layerRows(grid_id));
     }
 
     /// Resolve the owning surface through the complete anchor chain without
@@ -2377,17 +2344,17 @@ pub const Grid = struct {
 
     /// Dirty the band a layer at `p`, `h` rows tall, covers on the surface
     /// that composites it: grid 1's rows plus content_rev (which gates the
-    /// grid-1 rebuild), or the external root's own rows. Returns whether
-    /// grid 1 was touched.
-    fn dirtyLayerBand(self: *Grid, p: GridPos, h: u32) bool {
+    /// grid-1 rebuild), or the external root's own rows. An anchor chain that
+    /// does not resolve dirties nothing: the layer is on no surface, and
+    /// dirtying grid 1 for it rebuilt a surface that never held it.
+    fn dirtyLayerBand(self: *Grid, p: GridPos, h: u32) void {
         if (self.surfaceForGrid(p.anchor_grid) == 1) {
             self.markDirtyRect(p.row, p.row +| h);
             self.content_rev +%= 1;
-            return true;
+            return;
         }
         var r: u32 = 0;
         while (r < h) : (r += 1) self.dirtyCompositedRow(p, r);
-        return false;
     }
 
     /// Dirty the owning root's old pixel coverage, not an intermediate float
@@ -2875,17 +2842,7 @@ pub const Grid = struct {
             // the float's entire coverage, not only the grid_line row that
             // triggered this update. Recompose every covered row in the
             // actual target surface (main or an external anchor).
-            if (self.win_pos.get(grid_id)) |p| {
-                const h: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
-                if (self.surfaceForGrid(p.anchor_grid) != 1) {
-                    var r: u32 = 0;
-                    while (r < h) : (r += 1) {
-                        self.dirtyCompositedRow(p, r);
-                    }
-                } else {
-                    self.markDirtyRect(p.row, p.row +| h);
-                }
-            }
+            if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, self.layerRows(grid_id));
         }
     }
 
@@ -2914,7 +2871,7 @@ pub const Grid = struct {
         // Capture before removal below: needed to dirty the right target
         // (main grid vs. an external anchor) once grid_id's own state is gone.
         const old_pos = self.win_pos.get(grid_id);
-        const old_rows: u32 = if (self.sub_grids.get(grid_id)) |sg| sg.rows else 1;
+        const old_rows = self.layerRows(grid_id);
 
         if (self.sub_grids.fetchRemove(grid_id)) |kv| {
             var buf = kv.value;
@@ -2936,34 +2893,14 @@ pub const Grid = struct {
         _ = self.pending_ext_window_grids.remove(grid_id);
         _ = self.ext_windows_grids.remove(grid_id);
 
-        if (old_pos) |p| {
-            if (self.surfaceForGrid(p.anchor_grid) != 1) {
-                // Float anchored to an external grid: composites into that
-                // grid's own window (same reasoning as clearGrid/hideWin/
-                // resizeGrid above). markAllDirty() only touches the MAIN
-                // grid and would do nothing for this float's actual
-                // container, leaving its last-drawn pixels on screen forever.
-                var r: u32 = 0;
-                while (r < old_rows) : (r += 1) {
-                    self.dirtyCompositedRow(p, r);
-                }
-            } else {
-                // Repaint only what this layer covered. The rows underneath are
-                // grid 1's own and were never overwritten by it. The last layer
-                // going away also flips every main row's `skip_default_bg`; the
-                // flush regenerates those (regenerateRootsWhoseDefaultBgRuleFlipped).
-                self.markDirtyRect(p.row, p.row +| old_rows);
-                self.content_rev +%= 1;
-            }
-        } else if (!was_external) {
-            self.markAllDirty();
-        }
-        // An external grid is its own surface and is never placed in the main
-        // viewport (setWinExternalPos drops its win_pos), so the main grid holds
-        // none of its pixels and owes no repaint when it goes away. Dirtying
-        // everything here made `:q` on an external window regenerate the whole
-        // main viewport, which under ext_multigrid is every split it contains.
-        // The window's own teardown releases its surface.
+        // Repaint only the band this layer covered, on the surface that
+        // composited it. The last layer going away also flips every root
+        // row's `skip_default_bg`; the flush regenerates those
+        // (regenerateRootsWhoseDefaultBgRuleFlipped). A grid with no
+        // placement owes nothing: a hidden one had its band dirtied by
+        // hideWin, and an external one is its own surface, whose window's
+        // teardown releases it.
+        if (old_pos) |p| self.dirtyLayerBand(p, old_rows);
 
         if (self.cursor_grid == grid_id) {
             self.cursor_valid = false;
@@ -3028,7 +2965,7 @@ pub const Grid = struct {
         // recomposition) -- on the surface it was on: a float leaving an
         // external window left its pixels there, not on grid 1.
         const h = self.layerRows(grid_id);
-        if (old_pos_opt) |old_pos| _ = self.dirtyLayerBand(old_pos, h);
+        if (old_pos_opt) |old_pos| self.dirtyLayerBand(old_pos, h);
 
         if (win_pos_is_new) {
             self.win_pos.putAssumeCapacityNoClobber(grid_id, new_pos);
@@ -3036,16 +2973,11 @@ pub const Grid = struct {
             pos_ptr.* = new_pos;
         }
 
-        // Dirty the new range
-        self.markDirtyRect(row, row +| h);
-
-        // Bump content_rev so the next flush's need_main is true and actually
-        // recomposes the window at its new position. markDirtyRect alone is
-        // insufficient: need_main gates the whole main rebuild on content_rev,
-        // so a win_pos-only batch (layout reshuffle with unchanged content)
-        // would otherwise be dropped by the flush, which also clears the dirty
-        // rows just marked above. Mirrors the setWinFloatPos fix below.
-        self.content_rev +%= 1;
+        // Dirty the new range. A win_pos places on grid 1 (anchor_grid
+        // defaults to it), and the band carries the content_rev bump that
+        // need_main gates the rebuild on: a win_pos-only batch would otherwise
+        // be dropped by the flush along with the rows just marked.
+        self.dirtyLayerBand(new_pos, h);
         self.glyph_working_set_rev +%= 1;
 
         // Only advance cursor_rev if cursor is on this grid
@@ -3167,7 +3099,7 @@ pub const Grid = struct {
         // otherwise leave the vacated area stale -- on an external window
         // forever, since only cell updates dirty the anchor there.
         const h = self.layerRows(grid_id);
-        if (self.win_pos.get(grid_id)) |old_pos| _ = self.dirtyLayerBand(old_pos, h);
+        if (self.win_pos.get(grid_id)) |old_pos| self.dirtyLayerBand(old_pos, h);
 
         const new_pos = prospective_pos;
         if (win_pos_is_new) {
@@ -3175,7 +3107,7 @@ pub const Grid = struct {
         } else if (self.win_pos.getPtr(grid_id)) |pos_ptr| {
             pos_ptr.* = new_pos;
         }
-        _ = self.dirtyLayerBand(new_pos, h);
+        self.dirtyLayerBand(new_pos, h);
 
         // Preserve existing order if present.
         const new_layer = WinLayer{
@@ -3208,7 +3140,7 @@ pub const Grid = struct {
         // (e.g., window separators that were previously overlaid).
         // Only bump content_rev when win_pos existed (grid was composited);
         // external-only grids don't affect global grid composition.
-        if (self.win_pos.get(grid_id)) |pos| _ = self.dirtyLayerBand(pos, self.layerRows(grid_id));
+        if (self.win_pos.get(grid_id)) |pos| self.dirtyLayerBand(pos, self.layerRows(grid_id));
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
         _ = self.win_layer.remove(grid_id);
@@ -3265,7 +3197,7 @@ pub const Grid = struct {
         if (self.win_pos.get(grid_id)) |pos| {
             start_row = saturatingI32FromU32(pos.row);
             start_col = saturatingI32FromU32(pos.col);
-            _ = self.dirtyLayerBand(pos, self.layerRows(grid_id));
+            self.dirtyLayerBand(pos, self.layerRows(grid_id));
         }
 
         // Remove from regular win_pos/win_layer (external grids are not composited)

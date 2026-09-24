@@ -39,10 +39,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forName: ZonvieCore.neovimReadyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             ZonvieCore.appLog("zonvie: received neovimReadyNotification")
-            // Show window if it was hidden (SSH/devcontainer mode)
-            if let win = self?.window, !win.isVisible {
+            // Show the window of the session that became ready if it was hidden
+            // (SSH/devcontainer mode). `window` is whichever session was key
+            // last, which a New Session opened meanwhile has taken over.
+            let sender = notification.object as? ZonvieCore
+            let readyWindow = SessionManager.shared.sessions
+                .first { sender != nil && $0.viewController?.core === sender }?.window ?? self?.window
+            if let win = readyWindow, !win.isVisible {
                 win.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 ZonvieCore.appLog("zonvie: window shown after auth")
@@ -314,20 +319,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow else { return }
         SessionManager.shared.unregister(window: win)
+        // A closed session must not stay the one menus, activation and file
+        // opens act on.
+        if window === win { window = nil }
+        if focusedSessionWindow === win { focusedSessionWindow = nil }
     }
+
+    /// The session window whose nvim was last told FocusGained. Tracked apart
+    /// from `window`, which a new session sets before it becomes key.
+    private weak var focusedSessionWindow: NSWindow?
 
     func windowDidBecomeKey(_ notification: Notification) {
         // Track the frontmost session window so single-window-oriented code
         // (and the menu bar's active marking) follows focus across sessions.
         if let win = notification.object as? NSWindow, win.contentViewController is ViewController {
-            let previous = self.window
             self.window = win
             // App activation reports focus to the key session only, so a
             // switch between sessions has to hand it over itself: without
             // this neither nvim saw FocusLost/FocusGained (no checktime).
-            if previous !== win, NSApp.isActive {
-                (previous?.contentViewController as? ViewController)?.core?.setFocus(false)
+            if focusedSessionWindow !== win, NSApp.isActive {
+                (focusedSessionWindow?.contentViewController as? ViewController)?.core?.setFocus(false)
                 (win.contentViewController as? ViewController)?.core?.setFocus(true)
+                focusedSessionWindow = win
             }
             tabMenuManager?.activeSessionChanged()
         }
@@ -366,8 +379,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(true)
+            focusedSessionWindow = window
             // Resume cursor blinking now that we are frontmost.
             vc.core?.resetCursorBlink()
+        }
+        // Every visible session blinks while the app is frontmost, as every
+        // session's timer is stopped when it is not.
+        for session in SessionManager.shared.sessions where session.window !== window {
+            session.viewController?.core?.refreshCursorBlinkGate()
         }
         setCmdlineWindowActiveForAllSessions(true)
     }
@@ -384,11 +403,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillResignActive(_ notification: Notification) {
+        focusedSessionWindow = nil
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(false)
-            // Stop the recursive blink timer while in the background so it does
-            // not wake the CPU to redraw a window the user isn't looking at.
-            vc.core?.stopCursorBlinking()
+        }
+        // Stop every session's recursive blink timer while in the background
+        // so none wakes the CPU to redraw a window the user isn't looking at;
+        // stopping only the key session's left the others blinking.
+        for session in SessionManager.shared.sessions {
+            session.viewController?.core?.stopCursorBlinking()
         }
         setCmdlineWindowActiveForAllSessions(false)
     }

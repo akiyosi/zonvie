@@ -1072,8 +1072,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
         // The IME preedit overlay is added to this view lazily by IMEPreeditController.
 
-        // Add vertical scrollbar
-        addSubview(verticalScroller)
+        installScrollbar()
 
         // Accept file drops via drag & drop
         registerForDraggedTypes([.fileURL])
@@ -1098,15 +1097,8 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         window?.makeFirstResponder(self)
         needsLayout = true
 
-        // Setup scrollbar based on config
+        applyAlwaysScrollbarVisibility()
         let scrollbarConfig = ZonvieConfig.shared.scrollbar
-        if !scrollbarConfig.enabled {
-            verticalScroller.isHidden = true
-        } else if scrollbarConfig.isAlways {
-            // For "always" mode, show scrollbar immediately
-            verticalScroller.isHidden = false
-            verticalScroller.alphaValue = CGFloat(scrollbarConfig.opacity)
-        }
 
         // Setup hover tracking for scrollbar (if "hover" mode is enabled)
         if scrollbarConfig.enabled && scrollbarConfig.isHover {
@@ -1812,23 +1804,40 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     override func scrollWheel(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        handleGridScrollWheel(
+            event, lock: &scrollTargetLock, scale: window?.backingScaleFactor ?? 2.0, logTag: "scroll",
+            resolve: { resolveScrollTarget(at: location, requireScrollable: $0) },
+            // Shader uniforms are propagated in onPreDraw (which always runs
+            // updateScrollShaderOffset before draw); calling it here too would
+            // re-do the same work and fire markAllRowsDirty twice per input.
+            afterPrecise: { _ in requestRedraw() })
+    }
+
+    /// The scrollWheel body this view and every external grid view run.
+    /// `resolve` names the grid under the pointer, each view in its own
+    /// coordinates; `afterPrecise` is what the view does after a sub-cell
+    /// scroll to keep its own frames coming.
+    func handleGridScrollWheel(
+        _ event: NSEvent,
+        lock: inout ScrollTargetLock,
+        scale: CGFloat,
+        logTag: String,
+        resolve: (_ requireScrollable: Bool) -> ScrollTargetLock.Target,
+        afterPrecise: (_ newOffset: CGFloat) -> Void
+    ) {
         noteScrollGesturePhase(event)
-        scrollTargetLock.noteBegan(event)
+        lock.noteBegan(event)
+        defer { lock.noteFinished(event) }
         let deltaY = event.scrollingDeltaY
         let deltaX = event.scrollingDeltaX
         if deltaY == 0 && deltaX == 0 { return }
 
-        let location = convert(event.locationInWindow, from: nil)
-        let target = scrollTargetLock.target(for: event) {
-            resolveScrollTarget(at: location, requireScrollable: $0)
-        }
-
-        let scale = window?.backingScaleFactor ?? 2.0
         let modifier = buildModifierString(from: event.modifierFlags)
 
         if deltaY != 0 {
-            ZonvieCore.appLog("[scroll] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId)")
-
+            let target = lock.target(for: event, isVertical: true, resolve: resolve)
+            ZonvieCore.appLog("[\(logTag)] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
             let newOffset = handleScrollInput(
                 gridId: target.gridId,
                 row: target.row,
@@ -1838,23 +1847,19 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
                 hasPrecise: event.hasPreciseScrollingDeltas,
                 modifier: modifier
             )
-
             if event.hasPreciseScrollingDeltas {
-                // Shader uniforms are propagated in onPreDraw (which always
-                // runs updateScrollShaderOffset before draw); calling it
-                // here too would just re-do the same work and fire
-                // markAllRowsDirty twice per scroll input.
-                ZonvieCore.appLog("[scroll] stored offset=\(newOffset) requesting redraw")
-                requestRedraw()
+                ZonvieCore.appLog("[\(logTag)] stored offset=\(newOffset)")
+                afterPrecise(newOffset)
             }
         }
 
-        handleHorizontalScrollInput(
-            gridId: target.gridId, row: target.row, col: target.col,
-            deltaX: deltaX, deltaY: deltaY, scale: scale,
-            hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
-
-        scrollTargetLock.noteFinished(event)
+        if deltaX != 0 {
+            let target = lock.target(for: event, isVertical: false, resolve: resolve)
+            handleHorizontalScrollInput(
+                gridId: target.gridId, row: target.row, col: target.col,
+                deltaX: deltaX, deltaY: deltaY, scale: scale,
+                hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
+        }
     }
 
     /// Track the trackpad gesture lifecycle for the edge bounce. A held
@@ -3552,43 +3557,64 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 }
 
 // MARK: - NSTextInputClient (IME support)
-/// The grid a scroll event drives. A trackpad gesture resolves once at its
-/// start and keeps that target through its momentum, so a pointer drifting
-/// across a float's edge mid-gesture cannot hand the rest of the scroll to
-/// another grid; a wheel resolves per event. One per view.
+/// The grids a scroll event drives, one per axis. A trackpad gesture locks
+/// each axis on that axis's first delta and keeps it through its momentum, so
+/// a pointer drifting across a float's edge mid-gesture cannot hand the rest
+/// of the scroll to another grid; a wheel resolves per event. One per view.
+///
+/// Per axis because "can scroll" is a line-count test, a vertical rule: the
+/// vertical axis must skip a float that shows all its lines and the
+/// horizontal one must not. One lock for both either sent a diagonal swipe's
+/// vertical part to a float that could not scroll, or moved its horizontal
+/// part to the window below mid-gesture.
 struct ScrollTargetLock {
     typealias Target = (gridId: Int64, row: Int32, col: Int32)
-    private var locked: Target?
+    private var vertical: Target?
+    private var horizontal: Target?
 
     /// Call first for every event, delta or not: a gesture's .began carries
-    /// no delta, and the previous gesture's target must not survive into it.
+    /// no delta, and the previous gesture's targets must not survive into it.
     mutating func noteBegan(_ event: NSEvent) {
-        if event.phase.contains(.began) { locked = nil }
+        if event.phase.contains(.began) {
+            vertical = nil
+            horizontal = nil
+        }
     }
 
-    /// `resolve` takes whether the grid must be able to scroll: "can scroll"
-    /// is a line-count test, a vertical rule, so a sideways scroll does not
-    /// ask it.
-    mutating func target(for event: NSEvent, resolve: (_ requireScrollable: Bool) -> Target) -> Target {
-        let requireScrollable = abs(event.scrollingDeltaY) >= abs(event.scrollingDeltaX)
+    /// The grid this event's `isVertical` axis drives. `resolve` takes
+    /// whether the grid must be able to scroll.
+    mutating func target(
+        for event: NSEvent, isVertical: Bool,
+        resolve: (_ requireScrollable: Bool) -> Target
+    ) -> Target {
         let isGesture = !event.phase.isEmpty || !event.momentumPhase.isEmpty
         guard event.hasPreciseScrollingDeltas && isGesture else {
             // A wheel, or a phase-less precise event: never reuse a stale lock.
-            locked = nil
-            return resolve(requireScrollable)
+            vertical = nil
+            horizontal = nil
+            return resolve(isVertical)
         }
-        if let locked { return locked }
-        let resolved = resolve(requireScrollable)
-        locked = resolved
+        if isVertical {
+            if let vertical { return vertical }
+            let resolved = resolve(true)
+            vertical = resolved
+            return resolved
+        }
+        if let horizontal { return horizontal }
+        let resolved = resolve(false)
+        horizontal = resolved
         return resolved
     }
 
     /// Release once the gesture and its inertia are done. The gesture's own
-    /// .ended keeps the lock so momentum stays on the same grid.
+    /// .ended keeps the locks so momentum stays on the same grids. The events
+    /// that end a gesture carry no delta, so the caller runs this before it
+    /// returns on one.
     mutating func noteFinished(_ event: NSEvent) {
         if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled)
             || event.phase.contains(.cancelled) {
-            locked = nil
+            vertical = nil
+            horizontal = nil
         }
     }
 }
@@ -3691,6 +3717,29 @@ class GridInputView: MTKView, NSTextInputClient {
             scroller: verticalScroller, surfaceId: scrollbarSurfaceId, core: { [weak self] in self?.scrollbarCore })
         createdScrollbarController = controller
         return controller
+    }
+
+    /// Whether this surface has a scrollbar at all.
+    var hostsScrollbar: Bool { true }
+
+    /// Add the scroller, hidden until a viewport shows there is something to
+    /// scroll -- or shown at once in "always" mode. The views answered this
+    /// differently: one added it even when disabled and left it hit-testable
+    /// at alpha 0 until the first update.
+    func installScrollbar() {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled, hostsScrollbar else { return }
+        addSubview(verticalScroller)
+        verticalScroller.isHidden = !config.isAlways
+        verticalScroller.alphaValue = config.isAlways ? CGFloat(config.opacity) : 0.0
+    }
+
+    /// Re-apply "always" visibility when the view (re)joins a window.
+    func applyAlwaysScrollbarVisibility() {
+        let config = ZonvieConfig.shared.scrollbar
+        guard config.enabled, hostsScrollbar, config.isAlways else { return }
+        verticalScroller.isHidden = false
+        verticalScroller.alphaValue = CGFloat(config.opacity)
     }
 
     /// Pin the scroller to the right edge, full height.
@@ -3859,38 +3908,37 @@ extension MetalTerminalView: IMEPreeditHost {
 
     var imePreeditContainer: NSView { self }
 
-    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
-        let cell = imePreeditCellSize
-        if let core = core {
-            let cursor = core.getCursorPositionNonBlocking()
-            // Only a grid this window draws: another surface's start_row and
-            // start_col are in that surface's space. The external view makes
-            // the same refusal for a cursor that is not on it.
-            if cursor.row >= 0 && cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 {
-                // Cursor is grid-local; add the grid's screen offset.
-                var screenRow = Int(cursor.row)
-                var screenCol = Int(cursor.col)
-                for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
-                    screenRow = Int(grid.startRow) + Int(cursor.row)
-                    screenCol = Int(grid.startCol) + Int(cursor.col)
-                    break
-                }
-                let x = CGFloat(screenCol) * cell.width
-                let y = bounds.height - CGFloat(screenRow + 1) * cell.height
-                return CGPoint(x: x, y: y)
-            }
+    /// The cursor's cell in view points, or nil when this window does not
+    /// draw it: another surface's start_row and start_col are in that
+    /// surface's space. The overlay and the candidate window both come from
+    /// here, so they cannot disagree about whose cursor it is.
+    private func imeCursorRectInView() -> NSRect? {
+        guard let core else { return nil }
+        let cursor = core.getCursorPositionNonBlocking()
+        guard cursor.row >= 0, cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 else { return nil }
+        // Cursor is grid-local; add the grid's screen offset.
+        var screenRow = Int(cursor.row)
+        var screenCol = Int(cursor.col)
+        for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
+            screenRow = Int(grid.startRow) + Int(cursor.row)
+            screenCol = Int(grid.startCol) + Int(cursor.col)
+            break
         }
+        let cell = imePreeditCellSize
+        return NSRect(x: CGFloat(screenCol) * cell.width,
+                      y: bounds.height - CGFloat(screenRow + 1) * cell.height,
+                      width: cell.width, height: cell.height)
+    }
+
+    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
+        if let rect = imeCursorRectInView() { return rect.origin }
+        let cell = imePreeditCellSize
         return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
     }
 
     func imeFirstRect() -> NSRect {
         guard let win = window else { return .zero }
-        let scale = win.backingScaleFactor
-        let cellW = CGFloat(renderer.cellWidthPx) / scale
-        let rowH = CGFloat(renderer.cellHeightPx) / scale
-        var screenRow = 0
-        var screenCol = 0
-        if let core = core {
+        if let core {
             let cursor = core.getCursorPositionNonBlocking()
             // A grid an external window shows is placed by that window, in its
             // own coordinates, hosted float included: ask it.
@@ -3898,19 +3946,10 @@ extension MetalTerminalView: IMEPreeditHost {
                let showing = core.externalViewShowing(gridId: cursor.gridId) {
                 return showing.imeFirstRect()
             }
-            if cursor.row >= 0 && cursor.col >= 0 {
-                screenRow = Int(cursor.row)
-                screenCol = Int(cursor.col)
-                for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
-                    screenRow = Int(grid.startRow) + Int(cursor.row)
-                    screenCol = Int(grid.startCol) + Int(cursor.col)
-                    break
-                }
-            }
         }
-        let cursorXPt = CGFloat(screenCol) * cellW
-        let cursorYPt = bounds.height - CGFloat(screenRow + 1) * rowH
-        let rectInView = NSRect(x: cursorXPt, y: cursorYPt, width: cellW, height: rowH)
+        let cell = imePreeditCellSize
+        let rectInView = imeCursorRectInView()
+            ?? NSRect(x: 0, y: bounds.height - cell.height, width: cell.width, height: cell.height)
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 

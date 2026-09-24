@@ -24,34 +24,11 @@ const shelf_packer = @import("shelf_packer.zig");
 // (nvim_core.zig) so that the public ABI zonvie_core_get_emoji_cluster() is
 // instance-safe. Accessed via core.emoji_cluster_buf / core.emoji_cluster_len.
 
-/// Key for float overlay overflow map during ext grid composition.
-pub const FloatOverlayKey = packed struct { row: u32, col: u32 };
-
-/// Float overlay overflow map for ext grid composition.
-/// Maps (row, col) → optional extras. null extras means "float occupies this cell
-/// but has no overflow" (shadows the base grid's overflow).
-/// Using a HashMap gives O(1) lookup and last-write-wins when multiple floats
-/// overlap the same cell (matching row-cell overlay semantics).
-pub const FloatOverlayMap = std.AutoHashMapUnmanaged(FloatOverlayKey, ?[]const u32);
-
 pub const GridEntry = struct {
     grid_id: i64,
     zindex: i64,
     compindex: i64,
     order: u64,
-};
-
-pub const ExternalFloatAnchorEntry = struct {
-    anchor_grid_id: i64,
-    entry: GridEntry,
-
-    fn lessThan(_: void, a: ExternalFloatAnchorEntry, b: ExternalFloatAnchorEntry) bool {
-        if (a.anchor_grid_id != b.anchor_grid_id) return a.anchor_grid_id < b.anchor_grid_id;
-        if (a.entry.zindex != b.entry.zindex) return a.entry.zindex < b.entry.zindex;
-        if (a.entry.compindex != b.entry.compindex) return a.entry.compindex < b.entry.compindex;
-        if (a.entry.order != b.entry.order) return a.entry.order < b.entry.order;
-        return a.entry.grid_id < b.entry.grid_id;
-    }
 };
 
 const MAX_VERTEX_BYTES_PER_SURFACE: usize = 256 * 1024 * 1024;
@@ -391,73 +368,6 @@ fn replaceGridSurfaceRowVertexCount(
     ) catch return vertexBudgetExceeded(core);
 }
 
-// All persistent external-float composition scratch shares one aggregate
-// 8 MiB budget. Fixed partitions keep the guarantee local and deterministic:
-// no build order or previous high-water capacity can borrow from another
-// buffer and push the simultaneous retained total over the cap.
-const MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES: usize = 8 * 1024 * 1024;
-const MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES: usize = 3 * 1024 * 1024;
-const MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES: usize = 2 * 1024 * 1024;
-const MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES: usize = MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES -
-    MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES -
-    MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES;
-
-comptime {
-    std.debug.assert(
-        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(ExternalFloatAnchorEntry) <=
-            MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
-    );
-    std.debug.assert(
-        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(GridEntry) <=
-            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
-    );
-}
-
-/// Size a CSR buffer exactly and, for the counts array, zero it.
-///
-/// `ensureTotalCapacityPrecise` never shrinks, so the explicit length
-/// assignment is what keeps a shorter grid than the previous flush from
-/// leaving stale entries in the tail.
-fn csrResizeExact(
-    alloc: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged(usize),
-    len: usize,
-    comptime zero: bool,
-) !void {
-    try list.ensureTotalCapacityPrecise(alloc, len);
-    list.items.len = len;
-    if (zero) @memset(list.items, 0);
-}
-
-/// Turn per-row counts into CSR start offsets, in place.
-///
-/// The caller deposits each row's count at `offsets[row + 1]`, leaving
-/// `offsets[0]` zero; afterwards `offsets[row]` is that row's start and
-/// `offsets[offsets.len - 1]` is the total, which callers assert against
-/// their own count. Only this middle of the CSR build is shared: the counting
-/// and filling ends iterate different collections and emit into different
-/// arrays.
-fn csrOffsetsFromCounts(offsets: []usize) void {
-    for (1..offsets.len) |i| {
-        offsets[i] += offsets[i - 1];
-    }
-}
-
-/// Seed per-row write cursors from CSR offsets.
-///
-/// `write_offsets` is sized to `row_count`, one shorter than `offsets` -- the
-/// trailing total is not a cursor. The explicit length assignment matters:
-/// `ensureTotalCapacityPrecise` never shrinks, so a shorter grid than the
-/// previous flush would otherwise keep stale cursors in the tail.
-fn csrSeedWriteOffsets(
-    alloc: std.mem.Allocator,
-    write_offsets: *std.ArrayListUnmanaged(usize),
-    offsets: []const usize,
-    row_count: usize,
-) !void {
-    try csrResizeExact(alloc, write_offsets, row_count, false);
-    @memcpy(write_offsets.items, offsets[0..row_count]);
-}
 
 fn viewportCellScrollable(
     row: u32,
@@ -1819,7 +1729,7 @@ pub fn generateRowVertices(
                 run_glow,
                 p.glow_enabled,
             ));
-            const may_have_overflow = core.grid.overflowCountForGrid(run_grid_id) != 0 or core.flush_float_overlay != null;
+            const may_have_overflow = core.grid.overflowCountForGrid(run_grid_id) != 0;
             var has_ink = simdHasInkInRange(rc.scalars.items, @intCast(c), @intCast(end));
             if (!has_ink and may_have_overflow) {
                 var ink_col: u32 = run_start;
@@ -1859,9 +1769,7 @@ pub fn generateRowVertices(
                     core.shaping_src_cols.clearRetainingCapacity();
                     var shaping_scalar_capacity: usize = run_len;
                     if (may_have_overflow) {
-                        const persistent_clusters = core.grid.overflowCountForGrid(run_grid_id);
-                        const overlay_cells = if (core.flush_float_overlay) |overlay| overlay.count() else 0;
-                        const possible_clusters = @min(run_len, persistent_clusters +| overlay_cells);
+                        const possible_clusters = @min(run_len, core.grid.overflowCountForGrid(run_grid_id));
                         shaping_scalar_capacity +|= possible_clusters *| 15;
                     }
                     try ensureShapingScratch(core, shaping_scalar_capacity);
@@ -2970,25 +2878,6 @@ const ExternalScrollFastPathRegion = struct {
     col_end: u32,
 };
 
-fn externalFloatAnchorEntries(
-    entries: []const ExternalFloatAnchorEntry,
-    anchor_grid_id: i64,
-) []const ExternalFloatAnchorEntry {
-    var lo: usize = 0;
-    var hi: usize = entries.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (entries[mid].anchor_grid_id < anchor_grid_id) lo = mid + 1 else hi = mid;
-    }
-    const start = lo;
-    hi = entries.len;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (entries[mid].anchor_grid_id <= anchor_grid_id) lo = mid + 1 else hi = mid;
-    }
-    return entries[start..lo];
-}
-
 /// Whether one grid's pending scroll can be published as a row shift rather
 /// than a regeneration of the whole scrolled band. Every condition here is
 /// internal to the grid: composition also required full surface width and no
@@ -3215,7 +3104,6 @@ pub const FlushCtx = struct {
         // callback and on_flush_end accepted the transaction. Registration
         // order is intentional: this defer runs after the two defers below.
         defer {
-            ctx.core.ext_float_anchor_index_valid = false;
             // A reset still pending here was never consumed by a check: an
             // abort returned first (the cursor glyph lookup's `.aborted`).
             // Rows committed earlier point into the replaced atlas, so this is
@@ -4995,337 +4883,6 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
 fn cursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
     return c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE |
         (if (bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
-}
-
-const ExternalFloatRowRange = struct {
-    start: usize,
-    end: usize,
-};
-
-fn externalFloatVisibleRowRange(
-    core: *const Core,
-    float_grid_id: i64,
-    ext_start_row: i64,
-    ext_start_col: i64,
-    viewport_rows: u32,
-    viewport_cols: u32,
-) ?ExternalFloatRowRange {
-    const pos = core.grid.win_pos.get(float_grid_id) orelse return null;
-    const sg = core.grid.sub_grids.get(float_grid_id) orelse return null;
-    if (sg.rows == 0 or sg.cols == 0) return null;
-
-    const row0 = @as(i64, pos.row) - ext_start_row;
-    const row1 = row0 + @as(i64, sg.rows);
-    const col0 = @as(i64, pos.col) - ext_start_col;
-    const col1 = col0 + @as(i64, sg.cols);
-    if (row1 <= 0 or row0 >= @as(i64, viewport_rows) or
-        col1 <= 0 or col0 >= @as(i64, viewport_cols)) return null;
-
-    return .{
-        .start = @intCast(@max(@as(i64, 0), row0)),
-        .end = @intCast(@min(@as(i64, viewport_rows), row1)),
-    };
-}
-
-fn releaseOversizedExternalFloatScratch(
-    comptime T: type,
-    list: *std.ArrayListUnmanaged(T),
-    alloc: std.mem.Allocator,
-    max_bytes: usize,
-) void {
-    const max_entries = max_bytes / @sizeOf(T);
-    if (list.capacity <= max_entries) return;
-    list.deinit(alloc);
-    list.* = .empty;
-}
-
-/// Build one flush-local index of every float anchored to an external grid.
-/// The win_pos map is scanned once; per-anchor users then binary-search a
-/// contiguous, already layer-sorted slice instead of rescanning the map.
-fn buildExternalFloatAnchorIndexWithLimit(core: *Core, max_bytes: usize) !void {
-    core.ext_float_anchor_entries.clearRetainingCapacity();
-    releaseOversizedExternalFloatScratch(
-        ExternalFloatAnchorEntry,
-        &core.ext_float_anchor_entries,
-        core.alloc,
-        max_bytes,
-    );
-    core.ext_float_anchor_index_valid = false;
-
-    const max_entries = max_bytes / @sizeOf(ExternalFloatAnchorEntry);
-    var anchor_entry_count: usize = 0;
-    var count_it = core.grid.win_pos.iterator();
-    while (count_it.next()) |entry| {
-        if (!core.grid.external_grids.contains(entry.value_ptr.anchor_grid)) continue;
-        if (anchor_entry_count >= max_entries) return error.TooManyWindowPlacements;
-        anchor_entry_count += 1;
-    }
-    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, anchor_entry_count);
-
-    var win_it = core.grid.win_pos.iterator();
-    while (win_it.next()) |entry| {
-        const anchor_grid_id = entry.value_ptr.anchor_grid;
-        if (!core.grid.external_grids.contains(anchor_grid_id)) continue;
-        const layer = core.grid.win_layer.get(entry.key_ptr.*) orelse grid_mod.WinLayer{};
-        core.ext_float_anchor_entries.appendAssumeCapacity(.{
-            .anchor_grid_id = anchor_grid_id,
-            .entry = .{
-                .grid_id = entry.key_ptr.*,
-                .zindex = layer.zindex,
-                .compindex = layer.compindex,
-                .order = layer.order,
-            },
-        });
-    }
-    std.sort.block(
-        ExternalFloatAnchorEntry,
-        core.ext_float_anchor_entries.items,
-        {},
-        ExternalFloatAnchorEntry.lessThan,
-    );
-    core.ext_float_anchor_index_valid = true;
-}
-
-fn buildExternalFloatAnchorIndex(core: *Core) !void {
-    return buildExternalFloatAnchorIndexWithLimit(
-        core,
-        MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
-    );
-}
-
-/// The index is three usize arrays: sum their element counts and scale. Every
-/// step is checked because callers charge the result against a byte budget, and
-/// a wrapped size would pass a budget it actually blows.
-fn externalFloatRowIndexStorageByteSize(offsets: usize, write_offsets: usize, refs: usize) ?usize {
-    const usize_count_with_writes = std.math.add(usize, offsets, write_offsets) catch return null;
-    const usize_count = std.math.add(usize, usize_count_with_writes, refs) catch return null;
-    return std.math.mul(usize, usize_count, @sizeOf(usize)) catch null;
-}
-
-fn externalFloatPersistentScratchCapacityByteSize(core: *const Core) ?usize {
-    const anchor_bytes = std.math.mul(
-        usize,
-        core.ext_float_anchor_entries.capacity,
-        @sizeOf(ExternalFloatAnchorEntry),
-    ) catch return null;
-    const entry_bytes = std.math.mul(
-        usize,
-        core.ext_float_entries.capacity,
-        @sizeOf(GridEntry),
-    ) catch return null;
-    const row_index_bytes = externalFloatRowIndexStorageByteSize(
-        core.ext_float_row_offsets.capacity,
-        core.ext_float_row_write_offsets.capacity,
-        core.ext_float_row_entry_indices.capacity,
-    ) orelse return null;
-    const entry_and_anchor = std.math.add(usize, anchor_bytes, entry_bytes) catch return null;
-    return std.math.add(usize, entry_and_anchor, row_index_bytes) catch null;
-}
-
-fn externalFloatRowIndexByteSize(rows: usize, refs: usize) ?usize {
-    const offset_count = std.math.add(usize, rows, 1) catch return null;
-    return externalFloatRowIndexStorageByteSize(offset_count, rows, refs);
-}
-
-fn clearExternalFloatRowIndexStorage(core: *Core) void {
-    core.ext_float_row_offsets.deinit(core.alloc);
-    core.ext_float_row_offsets = .empty;
-    core.ext_float_row_write_offsets.deinit(core.alloc);
-    core.ext_float_row_write_offsets = .empty;
-    core.ext_float_row_entry_indices.deinit(core.alloc);
-    core.ext_float_row_entry_indices = .empty;
-}
-
-fn releaseOversizedExternalFloatRowIndex(core: *Core, max_bytes: usize) void {
-    const retained_bytes = externalFloatRowIndexStorageByteSize(
-        core.ext_float_row_offsets.capacity,
-        core.ext_float_row_write_offsets.capacity,
-        core.ext_float_row_entry_indices.capacity,
-    ) orelse max_bytes +| 1;
-    if (retained_bytes <= max_bytes) return;
-    clearExternalFloatRowIndexStorage(core);
-}
-
-/// Build a sorted, per-row index for floats visible in one external grid.
-/// The flattened row buckets preserve the global layer order because entries
-/// are inserted into every covered row in sorted order.
-fn buildExternalFloatRowIndexWithLimits(
-    core: *Core,
-    anchor_entries: []const ExternalFloatAnchorEntry,
-    ext_info: ?grid_mod.ExternalGridInfo,
-    viewport_rows: u32,
-    viewport_cols: u32,
-    max_index_bytes: usize,
-    max_entry_bytes: usize,
-) !u64 {
-    core.ext_float_index_generation +%= 1;
-    const generation = core.ext_float_index_generation;
-
-    core.ext_float_entries.clearRetainingCapacity();
-    releaseOversizedExternalFloatScratch(
-        GridEntry,
-        &core.ext_float_entries,
-        core.alloc,
-        max_entry_bytes,
-    );
-    core.ext_float_row_offsets.clearRetainingCapacity();
-    core.ext_float_row_write_offsets.clearRetainingCapacity();
-    core.ext_float_row_entry_indices.clearRetainingCapacity();
-    core.ext_float_row_index_valid = false;
-    releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-
-    const row_count: usize = viewport_rows;
-
-    const info = ext_info orelse return generation;
-    // An anchor with no position of its own composites at origin 0: that is
-    // the base redraw_handler applied when it stored the float's win_pos.
-    const ext_start_row: i64 = grid_mod.externalCompositeOriginRow(info);
-    const ext_start_col: i64 = grid_mod.externalCompositeOriginCol(info);
-
-    // anchor_entries is already in global layer order for this anchor. Count
-    // visible entries before allocating so invisible/missing/zero-cell floats
-    // do not contribute to the persistent high-water capacity.
-    const max_visible_entries = max_entry_bytes / @sizeOf(GridEntry);
-    var visible_entry_count: usize = 0;
-    for (anchor_entries) |anchor_entry| {
-        if (externalFloatVisibleRowRange(
-            core,
-            anchor_entry.entry.grid_id,
-            ext_start_row,
-            ext_start_col,
-            viewport_rows,
-            viewport_cols,
-        ) == null) continue;
-        if (visible_entry_count >= max_visible_entries) return error.TooManyWindowPlacements;
-        visible_entry_count += 1;
-    }
-    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, visible_entry_count);
-    for (anchor_entries) |anchor_entry| {
-        if (externalFloatVisibleRowRange(
-            core,
-            anchor_entry.entry.grid_id,
-            ext_start_row,
-            ext_start_col,
-            viewport_rows,
-            viewport_cols,
-        ) == null) continue;
-        core.ext_float_entries.appendAssumeCapacity(anchor_entry.entry);
-    }
-
-    var ref_count: usize = 0;
-    for (core.ext_float_entries.items) |entry| {
-        const range = externalFloatVisibleRowRange(
-            core,
-            entry.grid_id,
-            ext_start_row,
-            ext_start_col,
-            viewport_rows,
-            viewport_cols,
-        ) orelse continue;
-        ref_count = std.math.add(usize, ref_count, range.end - range.start) catch {
-            releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-            return error.LayoutTooComplex;
-        };
-    }
-
-    const required_bytes = externalFloatRowIndexByteSize(row_count, ref_count) orelse {
-        releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-        return error.LayoutTooComplex;
-    };
-    if (required_bytes > max_index_bytes) {
-        releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-        return error.LayoutTooComplex;
-    }
-    releaseOversizedExternalFloatRowIndex(core, max_index_bytes);
-
-    const offset_count = row_count + 1;
-    const projected_retained_bytes = externalFloatRowIndexStorageByteSize(
-        @max(core.ext_float_row_offsets.capacity, offset_count),
-        @max(core.ext_float_row_write_offsets.capacity, row_count),
-        @max(core.ext_float_row_entry_indices.capacity, ref_count),
-    ) orelse max_index_bytes +| 1;
-    if (projected_retained_bytes > max_index_bytes) {
-        clearExternalFloatRowIndexStorage(core);
-    }
-    try csrResizeExact(core.alloc, &core.ext_float_row_offsets, offset_count, true);
-
-    // Count references per visible row, then convert counts to offsets.
-    for (core.ext_float_entries.items) |entry| {
-        const range = externalFloatVisibleRowRange(
-            core,
-            entry.grid_id,
-            ext_start_row,
-            ext_start_col,
-            viewport_rows,
-            viewport_cols,
-        ) orelse continue;
-        for (range.start..range.end) |row| {
-            core.ext_float_row_offsets.items[row + 1] += 1;
-        }
-    }
-    csrOffsetsFromCounts(core.ext_float_row_offsets.items);
-
-    std.debug.assert(ref_count == core.ext_float_row_offsets.items[row_count]);
-    try csrResizeExact(core.alloc, &core.ext_float_row_entry_indices, ref_count, false);
-    try csrSeedWriteOffsets(core.alloc, &core.ext_float_row_write_offsets, core.ext_float_row_offsets.items, row_count);
-
-    // Filling in global sorted order keeps every row bucket sorted without a
-    // second per-row sort.
-    for (core.ext_float_entries.items, 0..) |entry, entry_index| {
-        const range = externalFloatVisibleRowRange(
-            core,
-            entry.grid_id,
-            ext_start_row,
-            ext_start_col,
-            viewport_rows,
-            viewport_cols,
-        ) orelse continue;
-        for (range.start..range.end) |row| {
-            const dst = core.ext_float_row_write_offsets.items[row];
-            core.ext_float_row_entry_indices.items[dst] = entry_index;
-            core.ext_float_row_write_offsets.items[row] = dst + 1;
-        }
-    }
-
-    core.ext_float_row_index_valid = true;
-    return generation;
-}
-
-fn buildExternalFloatRowIndexWithLimit(
-    core: *Core,
-    anchor_entries: []const ExternalFloatAnchorEntry,
-    ext_info: ?grid_mod.ExternalGridInfo,
-    viewport_rows: u32,
-    viewport_cols: u32,
-    max_index_bytes: usize,
-) !u64 {
-    return buildExternalFloatRowIndexWithLimits(
-        core,
-        anchor_entries,
-        ext_info,
-        viewport_rows,
-        viewport_cols,
-        max_index_bytes,
-        MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
-    );
-}
-
-fn buildExternalFloatRowIndex(
-    core: *Core,
-    anchor_entries: []const ExternalFloatAnchorEntry,
-    ext_info: ?grid_mod.ExternalGridInfo,
-    viewport_rows: u32,
-    viewport_cols: u32,
-) !u64 {
-    return buildExternalFloatRowIndexWithLimits(
-        core,
-        anchor_entries,
-        ext_info,
-        viewport_rows,
-        viewport_cols,
-        MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
-        MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
-    );
 }
 
 /// Generate and send vertices for external grids.
@@ -8474,25 +8031,11 @@ pub fn hideMsgHistory(self: *Core) void {
 }
 
 /// Look up overflow extras for a cell of the row being generated.
-/// First checks the ephemeral float overlay buffer (for ext grid composites),
-/// then falls back to the persistent overflow map.
 ///
 /// `row`/`col` are the row's own coordinates, which are grid-local: the
 /// grids that are not grid 1 compose their rows in their own space, and
 /// cell_overflow is keyed the same way.
 pub fn getOverflowForCell(core: *Core, rc: *const RenderCells, row: u32, col: u32) ?[]const u32 {
-    // Check ephemeral float overlay map first (set during ext grid flush).
-    // A hit means a float occupies this cell: value non-null = float has overflow,
-    // value null = float shadows base (no overflow). Either way, do NOT fall back.
-    if (core.flush_float_overlay) |map| {
-        const key = FloatOverlayKey{ .row = row, .col = col };
-        // Single lookup instead of contains()+get(): the map's value type is
-        // itself optional (null = float shadows base with no overflow), so
-        // unwrapping one Optional level here yields exactly that inner value.
-        if (map.get(key)) |v| return v;
-    }
-
-    // Fall back to persistent overflow map (no float overlay at this cell).
     // The grid-local count avoids a cell-key hash when only another grid owns
     // overflow clusters.
     const gid = rc.grid_ids.items[@intCast(col)];
@@ -12109,168 +11652,6 @@ test "flush begin abort does not arm atlas capacity recovery" {
     try std.testing.expect(core.atlas_negative_retry_at == null);
 }
 
-test "external float row index sorts once and buckets visible intersections" {
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-
-    try core.grid.resizeGrid(10, 4, 5);
-    try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 10, .start_col = 20 });
-    try core.grid.resizeGrid(20, 2, 2);
-    try core.grid.resizeGrid(21, 2, 2);
-    try core.grid.setWinFloatPos(20, 20, 10, 20, 20, 0, 10, true);
-    try core.grid.setWinFloatPos(21, 21, 11, 21, 10, 0, 10, true);
-
-    try buildExternalFloatAnchorIndex(&core);
-    const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 10);
-    const generation = try buildExternalFloatRowIndex(
-        &core,
-        anchor_entries,
-        core.grid.external_grids.get(10),
-        4,
-        5,
-    );
-    try std.testing.expectEqual(generation, core.ext_float_index_generation);
-    try std.testing.expectEqualSlices(i64, &.{ 21, 20 }, &.{
-        core.ext_float_entries.items[0].grid_id,
-        core.ext_float_entries.items[1].grid_id,
-    });
-
-    const offsets = core.ext_float_row_offsets.items;
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3, 4, 4 }, offsets);
-    try std.testing.expectEqualSlices(usize, &.{ 1, 0, 1, 0 }, core.ext_float_row_entry_indices.items);
-    try std.testing.expect(
-        externalFloatPersistentScratchCapacityByteSize(&core).? <=
-            MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES,
-    );
-
-    try std.testing.expectError(
-        error.LayoutTooComplex,
-        buildExternalFloatRowIndexWithLimit(
-            &core,
-            anchor_entries,
-            core.grid.external_grids.get(10),
-            4,
-            5,
-            1,
-        ),
-    );
-    try std.testing.expect(!core.ext_float_row_index_valid);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_offsets.capacity);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
-}
-
-test "external float persistent scratch partitions share one 8 MiB cap" {
-    try std.testing.expectEqual(
-        MAX_EXTERNAL_FLOAT_PERSISTENT_SCRATCH_BYTES,
-        MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES +
-            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES +
-            MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
-    );
-    try std.testing.expect(
-        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(ExternalFloatAnchorEntry) <=
-            MAX_EXTERNAL_FLOAT_ANCHOR_SCRATCH_BYTES,
-    );
-    try std.testing.expect(
-        grid_mod.MAX_WINDOW_PLACEMENTS * @sizeOf(GridEntry) <=
-            MAX_EXTERNAL_FLOAT_ENTRY_SCRATCH_BYTES,
-    );
-}
-
-test "external float anchor index groups many anchors after one map scan" {
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-
-    const anchor_count = 64;
-    for (0..anchor_count) |i| {
-        const anchor_id: i64 = @intCast(100 + i);
-        const float_id: i64 = @intCast(1000 + i);
-        try core.grid.resizeGrid(anchor_id, 2, 2);
-        try core.grid.putSyntheticExternal(anchor_id, .{
-            .win = anchor_id,
-            .start_row = @intCast(i * 2),
-            .start_col = 0,
-        });
-        try core.grid.resizeGrid(float_id, 1, 1);
-        try core.grid.setWinFloatPos(float_id, float_id, @intCast(i * 2), 0, @intCast(i), 0, anchor_id, true);
-    }
-
-    try buildExternalFloatAnchorIndex(&core);
-    const retained_capacity = core.ext_float_anchor_entries.capacity;
-    try std.testing.expectEqual(@as(usize, anchor_count), core.ext_float_anchor_entries.items.len);
-    for (0..anchor_count) |i| {
-        const anchor_id: i64 = @intCast(100 + i);
-        const entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, anchor_id);
-        try std.testing.expectEqual(@as(usize, 1), entries.len);
-        try std.testing.expectEqual(@as(i64, @intCast(1000 + i)), entries[0].entry.grid_id);
-    }
-
-    // Rebuilding the same layout reuses the persistent allocation.
-    core.ext_float_anchor_index_valid = false;
-    try buildExternalFloatAnchorIndex(&core);
-    try std.testing.expectEqual(retained_capacity, core.ext_float_anchor_entries.capacity);
-}
-
-test "external float anchor scratch reserves only matching placements" {
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-
-    try core.grid.resizeGrid(1, 1, 1);
-    for (0..128) |i| {
-        const grid_id: i64 = @intCast(1_000 + i);
-        try core.grid.setWinPos(grid_id, 0, 0, 0);
-    }
-    try core.grid.resizeGrid(5000, 1, 1);
-    try core.grid.putSyntheticExternal(5000, .{ .win = 5000, .start_row = 0, .start_col = 0 });
-    try core.grid.setWinFloatPos(5001, 0, 0, 0, 10, 0, 5000, true);
-
-    try buildExternalFloatAnchorIndex(&core);
-    try std.testing.expectEqual(@as(usize, 129), core.grid.win_pos.count());
-    try std.testing.expectEqual(@as(usize, 1), core.ext_float_anchor_entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), core.ext_float_anchor_entries.capacity);
-}
-
-test "external float visible scratch excludes invisible entries and releases hostile capacity" {
-    var core = Core.initForTest(std.testing.allocator);
-    defer core.deinitForTest();
-
-    try core.grid.resizeGrid(10, 4, 5);
-    try core.grid.putSyntheticExternal(10, .{ .win = 10, .start_row = 0, .start_col = 0 });
-    try core.grid.resizeGrid(20, 1, 1);
-    try core.grid.setWinFloatPos(20, 20, 0, 0, 100, 0, 10, true);
-    for (0..32) |i| {
-        const float_id: i64 = @intCast(100 + i);
-        try core.grid.resizeGrid(float_id, 1, 1);
-        try core.grid.setWinFloatPos(float_id, float_id, @intCast(100 + i), 0, @intCast(i), 0, 10, true);
-    }
-
-    try buildExternalFloatAnchorIndex(&core);
-    const anchor_entries = externalFloatAnchorEntries(core.ext_float_anchor_entries.items, 10);
-    _ = try buildExternalFloatRowIndex(&core, anchor_entries, core.grid.external_grids.get(10), 4, 5);
-    try std.testing.expectEqual(@as(usize, 1), core.ext_float_entries.items.len);
-    try std.testing.expectEqual(@as(usize, 1), core.ext_float_entries.capacity);
-    try std.testing.expectEqual(@as(i64, 20), core.ext_float_entries.items[0].grid_id);
-
-    // A prior hostile high-water capacity is dropped before a later bounded
-    // build, rather than surviving clearRetainingCapacity indefinitely.
-    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 64);
-    _ = try buildExternalFloatRowIndexWithLimits(
-        &core,
-        &.{},
-        core.grid.external_grids.get(10),
-        4,
-        5,
-        MAX_EXTERNAL_FLOAT_ROW_INDEX_BYTES,
-        @sizeOf(GridEntry),
-    );
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
-
-    try std.testing.expectError(
-        error.TooManyWindowPlacements,
-        buildExternalFloatAnchorIndexWithLimit(&core, @sizeOf(ExternalFloatAnchorEntry)),
-    );
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
-}
-
 test "external close detection visits known grids once and removes in place" {
     const Recorder = struct {
         fn close(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
@@ -13973,73 +13354,6 @@ test "resolveHlCached memoizes below the limit and resolves live above it" {
     _ = resolveHlCached(&core, 3, &cache, &valid2, limit, false, &unused_hits, &unused_misses);
     try std.testing.expectEqual(@as(u32, 0), unused_hits);
     try std.testing.expectEqual(@as(u32, 0), unused_misses);
-}
-
-test "the external-float storage size is the three arrays, and null at every overflow edge" {
-    // A wrapped size would pass a byte budget it actually blows, so each of the
-    // three checked operations has to answer null rather than a small number.
-    const max = std.math.maxInt(usize);
-    const cases = [_]struct { in: [3]usize, want: ?usize }{
-        .{ .in = .{ 0, 0, 0 }, .want = 0 },
-        .{ .in = .{ 1, 2, 3 }, .want = 6 * @sizeOf(usize) },
-        .{ .in = .{ 4, 4, 1024 }, .want = 1032 * @sizeOf(usize) },
-        // The offsets + write_offsets add.
-        .{ .in = .{ max, 1, 0 }, .want = null },
-        // The + refs add, on a sum that itself still fits.
-        .{ .in = .{ max / 2, max / 2, max }, .want = null },
-        // The scale by @sizeOf(usize), from both sides of its edge.
-        .{ .in = .{ max / @sizeOf(usize), 1, 0 }, .want = null },
-        .{ .in = .{ max / @sizeOf(usize), 0, 0 }, .want = (max / @sizeOf(usize)) * @sizeOf(usize) },
-    };
-    for (cases) |c| {
-        try std.testing.expectEqual(
-            c.want,
-            externalFloatRowIndexStorageByteSize(c.in[0], c.in[1], c.in[2]),
-        );
-    }
-}
-
-test "csrOffsetsFromCounts turns per-row counts into offsets and seeds write cursors" {
-    // Only the middle of the external-float row index's CSR build is reusable,
-    // so this covers exactly the part any such index calls.
-    const alloc = std.testing.allocator;
-
-    var offsets: std.ArrayListUnmanaged(usize) = .empty;
-    defer offsets.deinit(alloc);
-    var write_offsets: std.ArrayListUnmanaged(usize) = .empty;
-    defer write_offsets.deinit(alloc);
-
-    // Counts land in offsets[row + 1], as both callers write them: row 0 has
-    // 2 references, row 1 none, row 2 three, row 3 one.
-    const row_count: usize = 4;
-    try offsets.ensureTotalCapacityPrecise(alloc, row_count + 1);
-    offsets.items.len = row_count + 1;
-    @memcpy(offsets.items, &[_]usize{ 0, 2, 0, 3, 1 });
-
-    csrOffsetsFromCounts(offsets.items);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5, 6 }, offsets.items);
-    // The last entry is the total, which is what both callers assert against.
-    try std.testing.expectEqual(@as(usize, 6), offsets.items[row_count]);
-
-    try csrSeedWriteOffsets(alloc, &write_offsets, offsets.items, row_count);
-    // Each row's cursor starts at that row's offset, and the total is NOT
-    // copied -- write_offsets is one shorter than offsets.
-    try std.testing.expectEqualSlices(usize, &.{ 0, 2, 2, 5 }, write_offsets.items);
-    try std.testing.expectEqual(row_count, write_offsets.items.len);
-
-    // Seeding again over a longer previous run must not leave stale tail
-    // entries behind: both callers reuse these buffers across flushes.
-    var short_offsets = [_]usize{ 0, 1, 1 };
-    csrOffsetsFromCounts(&short_offsets);
-    try csrSeedWriteOffsets(alloc, &write_offsets, &short_offsets, 2);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, write_offsets.items);
-
-    // A grid with no rows is legal and must not touch the buffer.
-    var empty_offsets = [_]usize{0};
-    csrOffsetsFromCounts(&empty_offsets);
-    try std.testing.expectEqualSlices(usize, &.{0}, &empty_offsets);
-    try csrSeedWriteOffsets(alloc, &write_offsets, &empty_offsets, 0);
-    try std.testing.expectEqual(@as(usize, 0), write_offsets.items.len);
 }
 
 /// Recover the emitted corner order of a six-vertex solid quad.
