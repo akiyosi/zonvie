@@ -743,28 +743,39 @@ fn disableGlow(self: *Core) void {
 
 /// Parse vim.g.zonvie_glow response and apply configuration.
 /// Expected format: { groups = {"Keyword", "String", ...}, radius = 6, intensity = 0.6 }
+///
+/// The group set is replaced under grid_mu: this runs on the RPC thread, and a
+/// UI-thread retry flush holding grid_mu reads `glow_hl_ids` through a pointer,
+/// so a `put` that grew the map freed what it was reading. The flush that
+/// applies the result takes the lock itself, so it runs after the unlock.
 fn applyGlowConfig(self: *Core, result: mp.Value) void {
+    self.grid_mu.lockUncancelable(clock.io());
+    const enabled = applyGlowConfigLocked(self, result);
+    self.grid_mu.unlock(clock.io());
+    if (enabled) forceGlowFlush(self) else disableGlow(self);
+}
+
+/// Returns whether glow ends up enabled. Caller holds grid_mu.
+fn applyGlowConfigLocked(self: *Core, result: mp.Value) bool {
     // Free old group names and reset glow_all
     self.freeGlowGroupNames();
     self.glow_all = false;
 
     // nil means variable is not set
     if (result == .nil) {
-        disableGlow(self);
         if (self.glow_startup_retries > 0) {
             self.glow_startup_retries -= 1;
         }
-        return;
+        return false;
     }
 
     // Must be a map/dict
     if (result != .map) {
-        disableGlow(self);
         if (self.glow_startup_retries > 0) {
             self.glow_startup_retries -= 1;
         }
         self.log.write("glow config: unexpected type: {s}\n", .{@tagName(result)});
-        return;
+        return false;
     }
 
     const map = result.map;
@@ -813,11 +824,10 @@ fn applyGlowConfig(self: *Core, result: mp.Value) void {
         self.log.write("glow config: enabled, {d} groups, radius={d:.1}, intensity={d:.1}\n", .{
             self.glow_group_names.items.len, self.glow_radius_px, self.getGlowIntensity(),
         });
-        forceGlowFlush(self);
-    } else {
-        disableGlow(self);
-        self.log.write("glow config: disabled (no groups)\n", .{});
+        return true;
     }
+    self.log.write("glow config: disabled (no groups)\n", .{});
+    return false;
 }
 
 pub fn handleRpcRequest(self: *Core, arena: std.mem.Allocator, top: []mp.Value) void {
