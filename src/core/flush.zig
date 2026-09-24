@@ -1742,6 +1742,8 @@ pub fn generateRowVertices(
             if (has_ink) {
                 const baseX = @as(f32, @floatFromInt(run_start)) * cellW;
                 const baseY = @as(f32, @floatFromInt(r)) * cellH + topPad;
+                // The cell rows a row-scissored draw keeps; topPad is inside it.
+                const row_top = @as(f32, @floatFromInt(r)) * cellH;
                 const fg = VH.rgb(run_fg);
                 const glyph_scroll_flag: u32 = run_deco;
                 const run_has_glow = run_glow != 0;
@@ -2271,13 +2273,20 @@ pub fn generateRowVertices(
                                         const fb_baselineY: f32 = baseY + fb_ge.ascent_px;
                                         const fb_gx0: f32 = fallback_base_x + fb_ge.bbox_origin_px[0];
                                         const fb_gx1: f32 = fb_gx0 + fb_ge.bbox_size_px[0];
-                                        const fb_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
-                                        const fb_gy1: f32 = fb_gy0 + fb_ge.bbox_size_px[1];
+                                        const fb_raw_gy0: f32 = fb_baselineY - (fb_ge.bbox_origin_px[1] + fb_ge.bbox_size_px[1]);
+                                        const fb_span = vertexgen.trimBoxDrawingSpanY(
+                                            fb_scalar,
+                                            .{ .y0 = fb_raw_gy0, .y1 = fb_raw_gy0 + fb_ge.bbox_size_px[1], .v0 = fb_ge.uv_min[1], .v1 = fb_ge.uv_max[1] },
+                                            row_top,
+                                            row_top + cellH,
+                                        );
+                                        const fb_gy0: f32 = fb_span.y0;
+                                        const fb_gy1: f32 = fb_span.y1;
 
-                                        const fb_uv0: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_min[1] };
-                                        const fb_uv1: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_min[1] };
-                                        const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_ge.uv_max[1] };
-                                        const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_ge.uv_max[1] };
+                                        const fb_uv0: [2]f32 = .{ fb_ge.uv_min[0], fb_span.v0 };
+                                        const fb_uv1: [2]f32 = .{ fb_ge.uv_max[0], fb_span.v0 };
+                                        const fb_uv2: [2]f32 = .{ fb_ge.uv_min[0], fb_span.v1 };
+                                        const fb_uv3: [2]f32 = .{ fb_ge.uv_max[0], fb_span.v1 };
 
                                         const fb_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (fb_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                         const fb_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
@@ -2448,12 +2457,19 @@ pub fn generateRowVertices(
                                         const mc_baselineY: f32 = baseY + mc_ge.ascent_px;
                                         const mc_gx0: f32 = mc_base_x + mc_ge.bbox_origin_px[0];
                                         const mc_gx1: f32 = mc_gx0 + mc_ge.bbox_size_px[0];
-                                        const mc_gy0: f32 = mc_baselineY - (mc_ge.bbox_origin_px[1] + mc_ge.bbox_size_px[1]);
-                                        const mc_gy1: f32 = mc_gy0 + mc_ge.bbox_size_px[1];
-                                        const mc_uv0: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_min[1] };
-                                        const mc_uv1: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_min[1] };
-                                        const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_ge.uv_max[1] };
-                                        const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_ge.uv_max[1] };
+                                        const mc_raw_gy0: f32 = mc_baselineY - (mc_ge.bbox_origin_px[1] + mc_ge.bbox_size_px[1]);
+                                        const mc_span = vertexgen.trimBoxDrawingSpanY(
+                                            mc_scalar,
+                                            .{ .y0 = mc_raw_gy0, .y1 = mc_raw_gy0 + mc_ge.bbox_size_px[1], .v0 = mc_ge.uv_min[1], .v1 = mc_ge.uv_max[1] },
+                                            row_top,
+                                            row_top + cellH,
+                                        );
+                                        const mc_gy0: f32 = mc_span.y0;
+                                        const mc_gy1: f32 = mc_span.y1;
+                                        const mc_uv0: [2]f32 = .{ mc_ge.uv_min[0], mc_span.v0 };
+                                        const mc_uv1: [2]f32 = .{ mc_ge.uv_max[0], mc_span.v0 };
+                                        const mc_uv2: [2]f32 = .{ mc_ge.uv_min[0], mc_span.v1 };
+                                        const mc_uv3: [2]f32 = .{ mc_ge.uv_max[0], mc_span.v1 };
                                         const mc_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (mc_ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
                                         const mc_t_emit: i128 = if (log_glyph_timing) clock.nowNs() else 0;
                                         try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
@@ -2492,13 +2508,20 @@ pub fn generateRowVertices(
 
                             const gx0: f32 = penX + ge.bbox_origin_px[0] + x_off_px;
                             const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                            const gy0: f32 = (baselineY + y_off_px) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                            const gy1: f32 = gy0 + ge.bbox_size_px[1];
+                            const raw_gy0: f32 = (baselineY + y_off_px) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                            const span = vertexgen.trimBoxDrawingSpanY(
+                                if (next_cluster == this_cluster + 1) first_scalar else 0,
+                                .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
+                                row_top,
+                                row_top + cellH,
+                            );
+                            const gy0: f32 = span.y0;
+                            const gy1: f32 = span.y1;
 
-                            const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                            const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                            const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                            const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
+                            const uv0: [2]f32 = .{ ge.uv_min[0], span.v0 };
+                            const uv1: [2]f32 = .{ ge.uv_max[0], span.v0 };
+                            const uv2: [2]f32 = .{ ge.uv_min[0], span.v1 };
+                            const uv3: [2]f32 = .{ ge.uv_max[0], span.v1 };
 
                             // Retroactive suppression: if this glyph extends backward
                             // by >= 0.75*cellW, zero out preceding quads that have a
@@ -2696,13 +2719,20 @@ pub fn generateRowVertices(
                         const baselineY: f32 = baseY + ge.ascent_px;
                         const gx0: f32 = penX + ge.bbox_origin_px[0];
                         const gx1: f32 = gx0 + ge.bbox_size_px[0];
-                        const gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
-                        const gy1: f32 = gy0 + ge.bbox_size_px[1];
+                        const raw_gy0: f32 = (baselineY) - (ge.bbox_origin_px[1] + ge.bbox_size_px[1]);
+                        const span = vertexgen.trimBoxDrawingSpanY(
+                            scalar,
+                            .{ .y0 = raw_gy0, .y1 = raw_gy0 + ge.bbox_size_px[1], .v0 = ge.uv_min[1], .v1 = ge.uv_max[1] },
+                            row_top,
+                            row_top + cellH,
+                        );
+                        const gy0: f32 = span.y0;
+                        const gy1: f32 = span.y1;
 
-                        const uv0: [2]f32 = .{ ge.uv_min[0], ge.uv_min[1] };
-                        const uv1: [2]f32 = .{ ge.uv_max[0], ge.uv_min[1] };
-                        const uv2: [2]f32 = .{ ge.uv_min[0], ge.uv_max[1] };
-                        const uv3: [2]f32 = .{ ge.uv_max[0], ge.uv_max[1] };
+                        const uv0: [2]f32 = .{ ge.uv_min[0], span.v0 };
+                        const uv1: [2]f32 = .{ ge.uv_max[0], span.v0 };
+                        const uv2: [2]f32 = .{ ge.uv_min[0], span.v1 };
+                        const uv3: [2]f32 = .{ ge.uv_max[0], span.v1 };
 
                         if (ge.bbox_size_px[0] > 0 and ge.bbox_size_px[1] > 0) {
                             const pc_glyph_deco: u32 = glyph_scroll_flag | (if (run_has_glow) c_api.DECO_GLOW else 0) | (if (ge.bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
@@ -10683,6 +10713,165 @@ test "wide block geometry spans continuation across legacy and shaped runs" {
     try std.testing.expectApproxEqAbs(@as(f32, 20), max_x, 0.001);
     try std.testing.expectEqual(@as(u32, 1), state.shape_calls);
     try std.testing.expectEqual(@as(u32, 0), state.raster_calls);
+}
+
+test "box drawing glyph quads are trimmed to their cell rows" {
+    // Menlo's │ at 13pt is 33px of ink in a 30px cell: 1px above the row and
+    // 2px below. Rows drawn one scissored cell at a time clip that away; a
+    // full redraw did not, and on a root without background quads the two
+    // rows' overhangs blended twice at every join. Trimming the quad itself
+    // makes every draw path agree.
+    const State = struct {
+        entry: c_api.GlyphEntry,
+
+        fn ensure(ctx: ?*anyopaque, scalar: u32, out_entry: *c_api.GlyphEntry) callconv(.c) c_int {
+            _ = scalar;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            out_entry.* = self.entry;
+            return 1;
+        }
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = ctx;
+            _ = scalars;
+            _ = scalar_count;
+            _ = style_flags;
+            if (out_cap < 1) return 1;
+            out_glyph_ids[0] = 42;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 640;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        // The shaped path needs a phase-2 atlas; the glyph is already cached,
+        // so none of these is reached.
+        fn raster(ctx: ?*anyopaque, id: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = ctx;
+            _ = id;
+            _ = style_flags;
+            out_bitmap.* = std.mem.zeroes(c_api.GlyphBitmap);
+            return 0;
+        }
+
+        fn upload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, width: u32, height: u32) callconv(.c) void {
+            _ = ctx;
+            _ = width;
+            _ = height;
+        }
+
+        /// The glyph pass's vertical extent and texture v range.
+        fn glyphSpan(vertices: []const c_api.Vertex) [4]f32 {
+            var span = [4]f32{ std.math.inf(f32), -std.math.inf(f32), std.math.inf(f32), -std.math.inf(f32) };
+            for (vertices) |vertex| {
+                span[0] = @min(span[0], vertex.position[1]);
+                span[1] = @max(span[1], vertex.position[1]);
+                span[2] = @min(span[2], vertex.texCoord[1]);
+                span[3] = @max(span[3], vertex.texCoord[1]);
+            }
+            return span;
+        }
+    };
+
+    // Row 1 of 10px cells spans y 10..20. The glyph spans 9..22 with v
+    // running 0.1 per pixel from 0 at its top, so the cell's share is
+    // v 0.1..1.1.
+    var entry = std.mem.zeroes(c_api.GlyphEntry);
+    entry.uv_min = .{ 0, 0 };
+    entry.uv_max = .{ 0.1, 1.3 };
+    entry.bbox_origin_px = .{ 4, -4 };
+    entry.bbox_size_px = .{ 2, 13 };
+    entry.ascent_px = 8;
+    var state = State{ .entry = entry };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.initGlyphCache();
+    try core.grid.resizeGrid(1, 2, 1);
+    try core.row_cells.ensureTotalCapacity(core.alloc, 1);
+    core.row_cells.setLen(1);
+    @memset(core.row_cells.deco_base_flags.items, 0);
+    @memset(core.row_cells.glow_arr.items, 0);
+    core.ctx = &state;
+
+    var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
+    defer out.deinit(core.alloc);
+    const params = RowGenParams{
+        .row = 1,
+        .cols = 1,
+        .cell_w = 10,
+        .cell_h = 10,
+        .top_pad = 0,
+        .default_bg = 0,
+        .blur_enabled = false,
+        .background_opacity = 1,
+        .is_cmdline = false,
+        .glow_enabled = false,
+    };
+
+    // Shaped path, as both frontends run it: the glyph comes from the
+    // by-id cache.
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.raster;
+    core.cb.on_rasterize_glyph = State.raster;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+    const gid: u32 = 42;
+    const key = (@as(u64, gid) << 2);
+    const hash = gid *% 2654435761;
+    const probe = nvim_core.glyphCacheProbe(core.glyph_keys_by_id.?, key, hash);
+    core.glyph_cache_by_id.?[probe.insert] = entry;
+    core.glyph_keys_by_id.?[probe.insert] = key;
+
+    for ([_]bool{ true, false }) |shaped| {
+        if (!shaped) {
+            // The per-cell path, taken without shaping or a phase-2 atlas.
+            core.cb.on_shape_text_run = null;
+            core.cb.on_rasterize_glyph_by_id = null;
+            core.cb.on_rasterize_glyph = null;
+            core.cb.on_atlas_upload = null;
+            core.cb.on_atlas_create = null;
+            core.cb.on_atlas_ensure_glyph = State.ensure;
+        }
+
+        core.row_cells.set(0, 0x2502, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+        out.clearRetainingCapacity();
+        const box_stats = try generateRowVertices(&core, params, &out);
+        const box = State.glyphSpan(out.items[box_stats.pass_ends[1]..box_stats.pass_ends[2]]);
+        try std.testing.expectApproxEqAbs(@as(f32, 10), box[0], 0.001);
+        try std.testing.expectApproxEqAbs(@as(f32, 20), box[1], 0.001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.1), box[2], 0.001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.1), box[3], 0.001);
+
+        // Only box drawing: any other glyph keeps the ink it overhangs with.
+        core.row_cells.set(0, 0x2190, 0xFFFFFF, 0, highlight.Highlights.SP_NOT_SET, 1, 0, 0);
+        out.clearRetainingCapacity();
+        const arrow_stats = try generateRowVertices(&core, params, &out);
+        const arrow = State.glyphSpan(out.items[arrow_stats.pass_ends[1]..arrow_stats.pass_ends[2]]);
+        try std.testing.expectApproxEqAbs(@as(f32, 9), arrow[0], 0.001);
+        try std.testing.expectApproxEqAbs(@as(f32, 22), arrow[1], 0.001);
+    }
 }
 
 test "shaping includes overflow tails in input and cache key" {
