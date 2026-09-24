@@ -3204,7 +3204,14 @@ pub const FlushCtx = struct {
                 if (!aborted_at_flush_begin) {
                     ctx.core.grid.clearScrollState();
                     var sg_it = ctx.core.grid.sub_grids.valueIterator();
-                    while (sg_it.next()) |sg| sg.clearScrollState();
+                    while (sg_it.next()) |sg| {
+                        // The restored dirty set names only the rows the
+                        // scroll vacated, and the frontend dropped the shift
+                        // with the bracket. Without the op the retry can send
+                        // neither, so it sends every row.
+                        if (sg.last_scroll_op != null) sg.markAllDirty();
+                        sg.clearScrollState();
+                    }
                 }
             }
         }
@@ -15795,6 +15802,38 @@ test "a downward scroll publishes a negative shift and refills the top row" {
     try std.testing.expectEqual(@as(i32, -1), state.last_rows_delta);
     try std.testing.expectEqual(@as(u32, 1), state.rows_emitted);
     try std.testing.expectEqual(@as(u32, 0), state.last_row_start);
+}
+
+test "a publication refused after a row shift was sent regenerates the whole grid" {
+    // The frontend cancels the whole bracket when it refuses at on_flush_end,
+    // the shift included. The retry must not send only the vacated row as if
+    // the frontend had kept the shifted rows.
+    const Refuse = struct {
+        var core: ?*Core = null;
+        fn onEnd(ctx: ?*anyopaque) callconv(.c) void {
+            _ = ctx;
+            if (core) |c| c.flush_aborted = true;
+        }
+    };
+    var state = RowShiftSink{};
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try setUpRowShiftCore(&core, &state);
+
+    core.grid.scrollGrid(2, 0, 10, 0, 20, 1, 0);
+    core.cb.on_flush_end = Refuse.onEnd;
+    Refuse.core = &core;
+    defer Refuse.core = null;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 20);
+    try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
+
+    Refuse.core = null;
+    state = .{};
+    try flush_ctx.onFlush(10, 20);
+    const resent_shift = state.scroll_calls == 1 and state.rows_emitted == 1;
+    const regenerated = state.scroll_calls == 0 and state.rows_emitted == 10;
+    try std.testing.expect(resent_shift or regenerated);
 }
 
 test "same-region scrolls in a batch reach on_grid_scroll as one signed summed delta" {

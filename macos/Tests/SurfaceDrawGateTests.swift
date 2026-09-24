@@ -128,28 +128,26 @@ private enum SurfaceDrawGateTests {
     /// GridSurfaceRenderer.draw:
     ///
     ///     let shouldReusePreviousContents = !glowEnabled
-    ///         && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur
+    ///         && (useGpuScrollCopy || canDirtyOnlyWithBlur
     ///             || (!smoothScrolling && (dirtyRectPxOpt != nil || hasAnyDirtyInRowMode)))
     ///     forceReusePreviousContents: !glowEnabled
-    ///         && (canBlinkFastPath || useGpuScrollCopy || canDirtyOnlyWithBlur)
+    ///         && (useGpuScrollCopy || canDirtyOnlyWithBlur)
     private static func verifyMainLoadAction() {
-        for mask in 0..<(1 << 7) {
+        for mask in 0..<(1 << 6) {
             let glow = bit(mask, 0)
-            let blinkFast = bit(mask, 1)
-            let gpuScroll = bit(mask, 2)
-            let dirtyBlur = bit(mask, 3)
-            let smooth = bit(mask, 4)
-            let rect = bit(mask, 5)
-            let rowDirty = bit(mask, 6)
+            let gpuScroll = bit(mask, 1)
+            let dirtyBlur = bit(mask, 2)
+            let smooth = bit(mask, 3)
+            let rect = bit(mask, 4)
+            let rowDirty = bit(mask, 5)
 
             let originalReuse = !glow
-                && (blinkFast || gpuScroll || dirtyBlur
+                && (gpuScroll || dirtyBlur
                     || (!smooth && (rect || rowDirty)))
-            let originalForce = !glow && (blinkFast || gpuScroll || dirtyBlur)
+            let originalForce = !glow && (gpuScroll || dirtyBlur)
 
             let terms = SurfaceLoadActionTerms(
                 glowEnabled: glow,
-                canBlinkFastPath: blinkFast,
                 useGpuScrollCopy: gpuScroll,
                 canDirtyOnlyWithBlur: dirtyBlur,
                 hasDirtyRect: rect,
@@ -170,11 +168,11 @@ private enum SurfaceDrawGateTests {
     ///         && !isDecoratedSurface
     ///         && !glowEnabled
     ///         && (partialHostedContents || reuseHostedContents || reuseRootContents
-    ///             || canBlinkFastPath || useGpuScrollCopy || cursorOnlyFrame
+    ///             || useGpuScrollCopy || cursorOnlyFrame
     ///             || canDirtyOnlyWithBlur || (!smoothScrolling && hasAnyDirtyInRowMode))
     ///     forceReusePreviousContents: committedFontIsCurrent && !layoutDamageSnapshot
     ///         && !isDecoratedSurface && !glowEnabled
-    ///         && (reuseHostedContents || reuseRootContents || canBlinkFastPath
+    ///         && (reuseHostedContents || reuseRootContents
     ///             || useGpuScrollCopy || canDirtyOnlyWithBlur)
     ///
     /// `layerDrawSnapshot.isEmpty` is enumerated as `layersOutsideDirtySet`,
@@ -182,21 +180,20 @@ private enum SurfaceDrawGateTests {
     /// not describe. It is NOT "hosts layers" — the main surface hosts them and
     /// passes false, because its layer work is inside its dirty-row term.
     private static func verifyExternalLoadAction() {
-        for mask in 0..<(1 << 14) {
+        for mask in 0..<(1 << 13) {
             let glow = bit(mask, 0)
             let fontCurrent = bit(mask, 1)
             let layoutDamage = bit(mask, 2)
             let decorated = bit(mask, 3)
             let hasLayers = bit(mask, 4)
-            let blinkFast = bit(mask, 5)
-            let gpuScroll = bit(mask, 6)
-            let dirtyBlur = bit(mask, 7)
-            let cursorOnly = bit(mask, 8)
-            let reuseHosted = bit(mask, 9)
-            let reuseRoot = bit(mask, 10)
-            let partialHosted = bit(mask, 11)
-            let smooth = bit(mask, 12)
-            let rowDirty = bit(mask, 13)
+            let gpuScroll = bit(mask, 5)
+            let dirtyBlur = bit(mask, 6)
+            let cursorOnly = bit(mask, 7)
+            let reuseHosted = bit(mask, 8)
+            let reuseRoot = bit(mask, 9)
+            let partialHosted = bit(mask, 10)
+            let smooth = bit(mask, 11)
+            let rowDirty = bit(mask, 12)
 
             // No cursor-only arm: a cursor-only frame is reuseRoot or
             // reuseHosted now, and the arm that stood alone granted reuse
@@ -207,12 +204,12 @@ private enum SurfaceDrawGateTests {
                 && !decorated
                 && !glow
                 && (partialHosted || reuseHosted || reuseRoot
-                    || blinkFast || gpuScroll
+                    || gpuScroll
                     || dirtyBlur || (!smooth && rowDirty))
             _ = cursorOnly
             let originalForce = fontCurrent && !layoutDamage
                 && !decorated && !glow
-                && (reuseHosted || reuseRoot || blinkFast || gpuScroll || dirtyBlur)
+                && (reuseHosted || reuseRoot || gpuScroll || dirtyBlur)
 
             let terms = SurfaceLoadActionTerms(
                 glowEnabled: glow,
@@ -220,7 +217,6 @@ private enum SurfaceDrawGateTests {
                 hasLayoutDamage: layoutDamage,
                 isDecoratedSurface: decorated,
                 layersOutsideDirtySet: hasLayers,
-                canBlinkFastPath: blinkFast,
                 useGpuScrollCopy: gpuScroll,
                 canDirtyOnlyWithBlur: dirtyBlur,
                 reuseHostedContents: reuseHosted,
@@ -315,8 +311,7 @@ private enum SurfaceDrawGateTests {
     /// GridSurfaceRenderer.draw's row ladder:
     ///
     ///     if use2Pass {
-    ///         if canBlinkFastPath            -> the cursor's row, scissored
-    ///         else if canDirtyOnlyWithBlur   -> dirty rows, banded, 2-pass
+    ///         if canDirtyOnlyWithBlur        -> dirty rows, banded, 2-pass
     ///         else                           -> smoothRowRange, 2-pass
     ///     } else if smoothScrolling          -> smoothRowRange, 1-pass
     ///     else if !glowEnabled && (!dirtyRows.isEmpty || anyLayerWork)
@@ -325,24 +320,20 @@ private enum SurfaceDrawGateTests {
     ///     else                               -> 0..<safeRowCount
     ///
     /// The main surface has no root scroll blit — grid 1 is the ext_multigrid
-    /// container — so that term is false throughout, and `canBlinkFastPath`
-    /// itself requires `use2Pass`, so it is enumerated only where it can occur.
+    /// container — so that term is false throughout.
     private static func verifyMainRowPass() {
-        for mask in 0..<(1 << 8) {
+        for mask in 0..<(1 << 7) {
             let use2Pass = bit(mask, 0)
-            let blinkFast = bit(mask, 1) && use2Pass
-            let dirtyBlur = bit(mask, 2)
-            let smooth = bit(mask, 3)
-            let glow = bit(mask, 4)
-            let rowDirty = bit(mask, 5)
-            let sizeChg = bit(mask, 6)
-            let loaded = bit(mask, 7)
+            let dirtyBlur = bit(mask, 1)
+            let smooth = bit(mask, 2)
+            let glow = bit(mask, 3)
+            let rowDirty = bit(mask, 4)
+            let sizeChg = bit(mask, 5)
+            let loaded = bit(mask, 6)
 
             let original: SurfaceRowPassPlan
             if use2Pass {
-                if blinkFast {
-                    original = .blinkFastPathRow
-                } else if dirtyBlur && loaded {
+                if dirtyBlur && loaded {
                     // On this surface canDirtyOnlyWithBlur implies .load; the
                     // conjunct is stated so the two ladders read alike.
                     original = .dirtyRowsOnly
@@ -359,7 +350,6 @@ private enum SurfaceDrawGateTests {
 
             let shared = SurfaceRowPassTerms(
                 useTwoPass: use2Pass,
-                canBlinkFastPath: blinkFast,
                 isSmoothScrolling: smooth,
                 canDirtyOnlyWithBlur: dirtyBlur,
                 loadedPreviousContents: loaded,
@@ -375,8 +365,7 @@ private enum SurfaceDrawGateTests {
     /// ExternalGridView.draw's row ladder:
     ///
     ///     if use2Pass {
-    ///         if canBlinkFastPath                          -> the cursor's row
-    ///         else if useGpuScrollCopy                     -> vacated band + dirty
+    ///         if useGpuScrollCopy                          -> vacated band + dirty
     ///         else if canDirtyOnlyWithBlur && load == .load -> dirty rows
     ///         else                                         -> smoothRowRange
     ///     } else if smoothScrolling                        -> smoothRowRange
@@ -385,16 +374,15 @@ private enum SurfaceDrawGateTests {
     ///             && !drawableSizeChanged && load == .load -> dirty rows
     ///     else                                             -> 0..<safeRowCount
     private static func verifyExternalRowPass() {
-        for mask in 0..<(1 << 9) {
+        for mask in 0..<(1 << 8) {
             let use2Pass = bit(mask, 0)
-            let blinkFast = bit(mask, 1) && use2Pass
-            let gpuScroll = bit(mask, 2)
-            let dirtyBlur = bit(mask, 3)
-            let smooth = bit(mask, 4)
-            let glow = bit(mask, 5)
-            let rowDirty = bit(mask, 6)
-            let sizeChg = bit(mask, 7)
-            let loaded = bit(mask, 8)
+            let gpuScroll = bit(mask, 1)
+            let dirtyBlur = bit(mask, 2)
+            let smooth = bit(mask, 3)
+            let glow = bit(mask, 4)
+            let rowDirty = bit(mask, 5)
+            let sizeChg = bit(mask, 6)
+            let loaded = bit(mask, 7)
             // Decorated surfaces always clear, so `loaded` is false for them;
             // enumerating the pair independently would assert on states that
             // cannot occur. Both are enumerated, tied the way the surface ties
@@ -403,9 +391,7 @@ private enum SurfaceDrawGateTests {
 
             let original: SurfaceRowPassPlan
             if use2Pass {
-                if blinkFast {
-                    original = .blinkFastPathRow
-                } else if gpuScroll {
+                if gpuScroll {
                     original = .dirtyRowsAfterScrollBlit
                 } else if dirtyBlur && loaded {
                     original = .dirtyRowsOnly
@@ -424,7 +410,6 @@ private enum SurfaceDrawGateTests {
 
             let shared = SurfaceRowPassTerms(
                 useTwoPass: use2Pass,
-                canBlinkFastPath: blinkFast,
                 rootScrollBlitVacatedBand: gpuScroll,
                 isSmoothScrolling: smooth,
                 canDirtyOnlyWithBlur: dirtyBlur,
@@ -689,9 +674,9 @@ private enum SurfaceDrawGateTests {
         // Both outcomes must actually occur, or the loops assert nothing.
         // Every plan the enum can name must actually be produced, or an arm
         // above is unreachable and asserts nothing.
-        if planSeen.count != 5 {
+        if planSeen.count != 4 {
             failures += 1
-            print("FAIL: only \(planSeen.count) of 5 row-pass plans occurred: \(planSeen.sorted())")
+            print("FAIL: only \(planSeen.count) of 4 row-pass plans occurred: \(planSeen.sorted())")
         }
         if skipSeen == 0 || drawSeen == 0 || forceSeen == 0 || noForceSeen == 0 {
             failures += 1
