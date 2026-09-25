@@ -155,8 +155,24 @@ final class SessionKeyInput {
         // This OS repeat is replaced by an immediate synthesized one, then
         // the display link paces the rest.
         replayHeldKey()
-        core?.terminalView?.activateSurfaceDrawLoop()
+        // The owner's draw loop runs the safety tick; keep it running.
+        (owner as? SurfaceDrawLoopHost)?.activateSurfaceDrawLoop()
         startRepeatDisplayLink()
+    }
+
+    /// Whether `view` holds the running synthesized repeat. Its draw loop is
+    /// the repeat's safety clock then and must not park. Main thread only.
+    func synthesisHeld(by view: NSView) -> Bool {
+        os_unfair_lock_lock(&keyRepeatLock)
+        defer { os_unfair_lock_unlock(&keyRepeatLock) }
+        return synthRepeatActive && heldKeyOwner === view
+    }
+
+    /// Disarm when `view`, leaving its window, holds the key: it can no longer
+    /// deliver the keyUp that would end the repeat.
+    func disarmIfHeld(by view: NSView, reason: String) {
+        guard heldKeyOwner === view else { return }
+        disarmKeyRepeatSynthesis(reason)
     }
 
     /// Replay on the main thread (initial takeover, and the safety path).

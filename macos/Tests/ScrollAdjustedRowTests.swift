@@ -219,6 +219,14 @@ struct ScrollAdjustedRowTests {
             "a zero cell height returns zero"
         )
 
+        // A drag a fraction of a cell above the grid is row -1 (floored),
+        // which is what starts Neovim's drag autoscroll; truncation made it 0.
+        expect(
+            scrollAdjustedLocalRow(pointPxY: -5, cellHeightPx: cell, band: plain, scrollOffsetPx: 0),
+            -1,
+            "a point above the grid is row -1"
+        )
+
         verifyDisplacedFollowerHit()
 
         if failures == 0 {

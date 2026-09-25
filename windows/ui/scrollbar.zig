@@ -84,7 +84,7 @@ pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
     // mode shifts content horizontally and must keep the track at the top.
     return .{
         .hwnd = hwnd,
-        .state = &app.scrollbar,
+        .state = &app.surf.scrollbar,
         .root_grid = 1,
         .dpi_scale = app.dpi_scale,
         .top_offset_px = @floatFromInt(input.surfaceOriginPx(app, true).y),
@@ -97,7 +97,7 @@ pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
 pub fn externalSurface(ext_win: *app_mod.ExternalWindow, grid_id: i64) Surface {
     return .{
         .hwnd = ext_win.hwnd,
-        .state = &ext_win.scrollbar,
+        .state = &ext_win.surf.scrollbar,
         .root_grid = grid_id,
         .dpi_scale = ext_win.dpi_scale,
         .top_offset_px = 0,
@@ -372,7 +372,8 @@ pub fn mouseDown(app: *App, sf: Surface, mouse_x: i32, mouse_y: i32) bool {
     var client: c.RECT = undefined;
     _ = c.GetClientRect(sf.hwnd, &client);
 
-    const hit = hitTest(app, sf, client.right, client.bottom, mouse_x, mouse_y);
+    const geom = geometry(app, sf, client.right, client.bottom);
+    const hit: ScrollbarHit = if (app.config.scrollbar.enabled) scrollbarHitFrom(geom, mouse_x, mouse_y) else .none;
     if (applog.isEnabled()) applog.appLog("[scrollbar] mouseDown grid={d} x={d} y={d} hit={s}\n", .{ sf.root_grid, mouse_x, mouse_y, @tagName(hit) });
 
     if (app.corep == null) return false;
@@ -381,11 +382,7 @@ pub fn mouseDown(app: *App, sf: Surface, mouse_x: i32, mouse_y: i32) bool {
     switch (hit) {
         .knob => {
             st.dragging = true;
-            st.drag_start_y = mouse_y;
-            var vp: app_mod.ViewportInfo = undefined;
-            if (getViewportNonBlocking(app, scrollbarGrid(app, sf.root_grid), &vp) != .none) {
-                st.drag_start_topline = vp.topline;
-            }
+            st.drag_grab_px = @as(f32, @floatFromInt(mouse_y)) - geom.knob_top;
             _ = c.SetCapture(sf.hwnd);
             return true;
         },
@@ -422,12 +419,13 @@ pub fn mouseMove(app: *App, sf: Surface, mouse_y: i32) void {
     if (getViewportNonBlocking(app, grid, &vp) == .none) return;
     if (vp.botline - vp.topline <= 0) return;
 
-    // The drawn knob's own travel, so the knob stays under the pointer.
+    // The drawn knob's own travel, and the point of it the press grabbed, so
+    // the knob stays under the pointer instead of jumping to centre on it.
     const knob_height = geom.knob_bottom - geom.knob_top;
     const knob_travel = (geom.track_bottom - geom.track_top) - knob_height;
     if (knob_travel <= 0) return;
 
-    const mouse_in_track: f32 = @as(f32, @floatFromInt(mouse_y)) - geom.track_top - knob_height / 2.0;
+    const mouse_in_track: f32 = @as(f32, @floatFromInt(mouse_y)) - geom.track_top - sf.state.drag_grab_px;
     const scroll_ratio = @max(0.0, @min(1.0, mouse_in_track / knob_travel));
 
     // The line the ratio names is the core's rule, shared with both macOS
