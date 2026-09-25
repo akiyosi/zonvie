@@ -289,60 +289,11 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     var drawLoopIdleCounter = DrawLoopIdleCounter()
     let drawLoopTraceName = "main"
 
-    // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
-    // only while the core reports a pending deadline. Replaces the former
-    // always-on CVDisplayLink (see scheduleMsgTimer).
-    private var msgTimer: Timer?
-
     private func dirtyLog(_ msg: @autoclosure () -> String) {
         if Self.dirtyLogEnabled {
             ZonvieCore.appLog(msg())
         }
     }
-
-    // MARK: - Msg throttle timer (replaces the always-on display link)
-
-    /// Schedule a one-shot tick at the core's next pending msg timeout.
-    /// No timer is armed when the core reports no pending work (idle case),
-    /// so the app does not wake the CPU while the editor is idle.
-    /// Main thread only.
-    func scheduleMsgTimer() {
-        msgTimer?.invalidate()
-        msgTimer = nil
-        guard let core else { return }
-        // Skip while minimized: the Zig core's grid state must not be queried
-        // while the window is in the Dock, and nothing is visible anyway.
-        if window?.isMiniaturized == true { return }
-        let ms = core.tryNextMsgTimeoutMs()
-        if ms == -2 {
-            // Core's grid lock was busy (mid-flush). Do NOT treat this as
-            // "nothing pending" -- an already-armed auto-hide deadline could
-            // be missed. Retry shortly instead of polling every frame.
-            msgTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: false) { [weak self] _ in
-                self?.scheduleMsgTimer()
-            }
-            return
-        }
-        guard ms >= 0 else { return }  // -1 => nothing pending
-        msgTimer = Timer.scheduledTimer(withTimeInterval: Double(max(0, ms)) / 1000.0,
-                                        repeats: false) { [weak self] _ in
-            guard let self else { return }
-            // Re-check at fire time: the window may have been minimized after
-            // the timer was armed.  The Zig core's grid state must not be
-            // queried while the window is in the Dock.  Let the timer die here;
-            // windowDidDeminiaturize re-arms it on restore.
-            if self.window?.isMiniaturized == true { return }
-            self.core?.tickMsgThrottle()
-            self.scheduleMsgTimer()  // re-arm for the next deadline, if any
-        }
-    }
-
-    /// Stop the msg throttle timer (e.g. while minimized). Main thread only.
-    func cancelMsgTimer() {
-        msgTimer?.invalidate()
-        msgTimer = nil
-    }
-
 
     private var keyInput: SessionKeyInput? { core?.keyInput }
 
@@ -392,7 +343,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // render (holding j at the end of the buffer).
         if drawLoopIdleCounter.noteIdle(
             hadRecentCommit: renderer?.hadRecentCommit(withinNs: 50_000_000) == true,
-            heldActive: keyInput?.synthRepeatActive == true
+            heldActive: keyInput?.synthesisHeld(by: self) == true
         ) {
             deactivateSurfaceDrawLoop()
         }
@@ -552,25 +503,16 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             // Ensure layer transparency settings are applied after window is available
             applyLayerTransparency()
         } else {
-            msgTimer?.invalidate()
-            msgTimer = nil
+            core?.cancelMsgTimer()
             // The view is leaving its window (tab/window closed, possibly
             // while a key is still held): disarm proactively so the
             // repeat-pacing CVDisplayLink stops and releases its extra
             // retain (see SessionKeyInput.startRepeatDisplayLink).
-            keyInput?.disarmKeyRepeatSynthesis("view detached from window")
+            keyInput?.disarmIfHeld(by: self, reason: "view detached from window")
         }
     }
 
-    deinit {
-        msgTimer?.invalidate()
-        msgTimer = nil
-    }
-
     // MARK: - Mouse Input
-
-    /// Track which button is being held for drag events
-    private var heldMouseButton: String? = nil
 
     /// Grid info cached at drag start: dragging a separator resizes the grids,
     /// so hitTestGrid would return different coordinates for the same pixel
@@ -585,70 +527,9 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
     private var dragGridCache: DragGridCache? = nil
 
-    override func mouseDown(with event: NSEvent) {
-        super.mouseDown(with: event)
-        window?.makeFirstResponder(self)
-        heldMouseButton = "left"
-        sendMouseEvent(button: "left", action: "press", event: event)
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        super.mouseUp(with: event)
-        heldMouseButton = nil
-        sendMouseEvent(button: "left", action: "release", event: event)
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        super.mouseDragged(with: event)
-        sendMouseEvent(button: "left", action: "drag", event: event)
-    }
-
-    override func rightMouseDown(with event: NSEvent) {
-        super.rightMouseDown(with: event)
-        heldMouseButton = "right"
-        sendMouseEvent(button: "right", action: "press", event: event)
-    }
-
-    override func rightMouseUp(with event: NSEvent) {
-        super.rightMouseUp(with: event)
-        heldMouseButton = nil
-        sendMouseEvent(button: "right", action: "release", event: event)
-    }
-
-    override func rightMouseDragged(with event: NSEvent) {
-        super.rightMouseDragged(with: event)
-        sendMouseEvent(button: "right", action: "drag", event: event)
-    }
-
-    override func otherMouseDown(with event: NSEvent) {
-        super.otherMouseDown(with: event)
-        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
-        if let btn {
-            heldMouseButton = btn
-            sendMouseEvent(button: btn, action: "press", event: event)
-        }
-    }
-
-    override func otherMouseUp(with event: NSEvent) {
-        super.otherMouseUp(with: event)
-        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
-        if btn != nil {
-            heldMouseButton = nil
-            sendMouseEvent(button: btn!, action: "release", event: event)
-        }
-    }
-
-    override func otherMouseDragged(with event: NSEvent) {
-        super.otherMouseDragged(with: event)
-        let btn = surfaceOtherMouseButtonName(event.buttonNumber)
-        if let btn {
-            sendMouseEvent(button: btn, action: "drag", event: event)
-        }
-    }
-
     /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
 
-    private func sendMouseEvent(button: String, action: String, event: NSEvent) {
+    override func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
         guard let core else { return }
 
         let location = convert(event.locationInWindow, from: nil)
@@ -1309,8 +1190,11 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             pointPx: pointPx,
             cellW: cellW,
             cellH: cellH,
-            globalRow: Int32(pointPx.y / cellH),
-            globalCol: Int32(pointPx.x / cellW)
+            // Floored, not truncated: a drag a fraction of a cell above or left
+            // of the grid names row/column -1, which starts Neovim's drag
+            // autoscroll, as Windows' floor division does.
+            globalRow: Int32((pointPx.y / cellH).rounded(.down)),
+            globalCol: Int32((pointPx.x / cellW).rounded(.down))
         )
     }
 
@@ -1408,8 +1292,24 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // Non-scrollable floats are transparent to scrolling, so a scrollable
         // grid directly beneath one — another float or the base window — shows
         // through (req #1).
-        _ = core.getVisibleGridsCached()
+        let grids = core.getVisibleGridsCached()
         let target = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: requireScrollable)
+        // A follower drawn displaced by an ease is found where it is drawn,
+        // as hitTestGrid finds it for a click and the external surface finds
+        // it for a wheel: otherwise a wheel over it scrolled the window behind.
+        if let displaced = resolveDisplacedFollowerHit(
+            pointPxY: geo.pointPx.y,
+            cellHeightPx: geo.cellH,
+            globalCol: globalCol,
+            staticGridId: target?.gridId ?? 1,
+            followers: renderer?.drawnFollowerOffsetsPx() ?? [:],
+            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
+            resolve: { row, col in
+                self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable)
+            }
+        ) {
+            return displaced
+        }
         guard let t = target else { return (1, globalRow, globalCol) }
         return (t.gridId, t.row, t.col)
     }
@@ -1622,6 +1522,68 @@ class GridInputView: MTKView, NSTextInputClient {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
+    }
+
+    // MARK: - Mouse buttons
+
+    /// Send one button event to Neovim, resolved against this surface's grids.
+    /// Each surface resolves the grid a point names its own way.
+    func sendGridMouseEvent(button: String, action: String, event: NSEvent) {}
+
+    // Every press takes first responder, so keys follow the grid clicked;
+    // the main surface used to take it on the left button only.
+    override func mouseDown(with event: NSEvent) {
+        super.mouseDown(with: event)
+        window?.makeFirstResponder(self)
+        sendGridMouseEvent(button: "left", action: "press", event: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        sendGridMouseEvent(button: "left", action: "release", event: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        sendGridMouseEvent(button: "left", action: "drag", event: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        super.rightMouseDown(with: event)
+        window?.makeFirstResponder(self)
+        sendGridMouseEvent(button: "right", action: "press", event: event)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        super.rightMouseUp(with: event)
+        sendGridMouseEvent(button: "right", action: "release", event: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        super.rightMouseDragged(with: event)
+        sendGridMouseEvent(button: "right", action: "drag", event: event)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        super.otherMouseDown(with: event)
+        window?.makeFirstResponder(self)
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
+            sendGridMouseEvent(button: btn, action: "press", event: event)
+        }
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        super.otherMouseUp(with: event)
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
+            sendGridMouseEvent(button: btn, action: "release", event: event)
+        }
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        super.otherMouseDragged(with: event)
+        if let btn = surfaceOtherMouseButtonName(event.buttonNumber) {
+            sendGridMouseEvent(button: btn, action: "drag", event: event)
+        }
     }
 
     func insertText(_ string: Any, replacementRange: NSRange) {

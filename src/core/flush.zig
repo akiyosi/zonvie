@@ -3906,8 +3906,12 @@ pub const FlushCtx = struct {
                             });
                         }
                     }
-                    // Clear unconditionally so sendExternalGridVertices sees clean state.
-                    ctx.core.atlas_reset_during_flush = false;
+                    // Cleared so sendExternalGridVertices sees clean state. Not
+                    // on abort: a row error breaks out before the reset check
+                    // above, and the outer defer must still see that reset —
+                    // rows other passes committed this flush point into the
+                    // replaced atlas. An aborted flush runs no external pass.
+                    if (!ctx.core.flush_aborted) ctx.core.atlas_reset_during_flush = false;
                     // Skip on abort — see the clearDirty() guard above.
                     if (!ctx.core.flush_aborted) ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {

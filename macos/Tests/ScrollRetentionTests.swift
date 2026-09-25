@@ -727,23 +727,17 @@ private enum ScrollRetentionTests {
         require(untouched.contains(5), "and leaves the original mark where it was")
     }
 
-    /// A surface whose in-bracket row marks land in the pending set as well as
-    /// in its own flush set, which is what ExternalGridView's
-    /// submitVerticesRowRaw does. Its commit has to move one of those groups
-    /// and not the other, told apart by the snapshot the bracket opened with.
+    /// ExternalGridView's commit: in-bracket marks live only in the flush set,
+    /// so the pending set holds only marks an earlier bracket left. Those are
+    /// shifted against the published shift, then this bracket's are merged
+    /// back unshifted (the core sends every shift hint before the rows).
     private static func verifyOnlyCarriedMarksAreShiftedAtCommit() {
         // Row 10 was marked by an EARLIER bracket and no draw consumed it.
         // Row 3 was marked by THIS bracket, after the core had already sent
         // the shift hint, so it names a post-shift row already.
-        let carried: IndexSet = [10]
-        var pending: IndexSet = [10, 3]
-        mergePublishedScrollDirtyRows(
-            pending: &pending,
-            carried: carried,
-            rowStart: 0,
-            rowEnd: 20,
-            rowsDelta: 1
-        )
+        var pending: IndexSet = [10]
+        shiftSurfaceRowIndices(&pending, rowStart: 0, rowEnd: 20, rowsDelta: 1)
+        pending.formUnion([3])
         require(pending.contains(9), "a mark carried from an earlier bracket follows its content")
         require(!pending.contains(10), "and does not stay at the pre-shift row")
         require(pending.contains(3), "a mark made after the hint stays where it was made")
@@ -759,15 +753,8 @@ private enum ScrollRetentionTests {
         // mark's content moved up one, the new mark's content is what was just
         // drawn there. Both need painting, so neither may swallow the other.
         // Deriving the carried group by subtraction loses the first of them.
-        let bothCarried: IndexSet = [7]
         var both: IndexSet = [7]
-        mergePublishedScrollDirtyRows(
-            pending: &both,
-            carried: bothCarried,
-            rowStart: 0,
-            rowEnd: 20,
-            rowsDelta: 1
-        )
+        shiftSurfaceRowIndices(&both, rowStart: 0, rowEnd: 20, rowsDelta: 1)
         // commitFlush merges this bracket's own marks back in afterwards.
         both.formUnion([7])
         require(both.contains(6), "the carried mark's content is followed to its new row")

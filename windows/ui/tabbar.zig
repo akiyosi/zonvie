@@ -7,6 +7,7 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const window_mod = @import("../window.zig");
+const input = @import("../input.zig");
 const TablineState = app_mod.TablineState;
 const TabEntry = app_mod.TabEntry;
 
@@ -21,8 +22,8 @@ const tab_font_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
 /// Extract the display name (basename) from a tab entry.
 /// Returns the length of the display name written to out_buf.
 fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
-    if (tab.name_len > 0) {
-        const display = app_mod.baseName(tab.name[0..tab.name_len]);
+    const display = app_mod.baseName(tab.name[0..tab.name_len]);
+    if (display.len > 0) {
         @memcpy(out_buf[0..display.len], display);
         return display.len;
     } else {
@@ -315,15 +316,31 @@ pub fn tablineHitTest(app: *App, client_width: c_int, tab_count: usize, x: c_int
     return .none;
 }
 
+/// Drop the titlebar tab bar's hover and repaint its band. For every way the
+/// pointer can leave it: into the non-client area, below it into the editor,
+/// or out of the window altogether.
+pub fn clearTablineHover(app: *App, hwnd: c.HWND) void {
+    if (!app.ext_tabline_enabled or app.tabline_style != .titlebar) return;
+    if (app.tabline_state.hovered_tab == null and
+        app.tabline_state.hovered_close == null and
+        app.tabline_state.hovered_window_btn == null and
+        !app.tabline_state.hovered_new_tab_btn) return;
+    app.tabline_state.hovered_tab = null;
+    app.tabline_state.hovered_close = null;
+    app.tabline_state.hovered_window_btn = null;
+    app.tabline_state.hovered_new_tab_btn = false;
+    var tabline_rect: c.RECT = .{
+        .left = 0,
+        .top = 0,
+        .right = 4096,
+        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
+    };
+    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+}
+
 pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     // Track mouse leave
-    var tme: c.TRACKMOUSEEVENT = .{
-        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
-        .dwFlags = c.TME_LEAVE,
-        .hwndTrack = hwnd,
-        .dwHoverTime = 0,
-    };
-    _ = c.TrackMouseEvent(&tme);
+    input.trackMouseLeave(hwnd);
 
     var rect: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &rect);
@@ -2157,13 +2174,7 @@ pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 /// Handle mouse move in sidebar area
 pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     // Track mouse leave
-    var tme: c.TRACKMOUSEEVENT = .{
-        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
-        .dwFlags = c.TME_LEAVE,
-        .hwndTrack = hwnd,
-        .dwHoverTime = 0,
-    };
-    _ = c.TrackMouseEvent(&tme);
+    input.trackMouseLeave(hwnd);
 
     const row_h = app.scalePx(TablineState.SIDEBAR_ROW_HEIGHT);
     const close_size = app.scalePx(TablineState.SIDEBAR_CLOSE_SIZE);

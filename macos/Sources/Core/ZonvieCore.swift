@@ -108,6 +108,56 @@ final class ZonvieCore {
     /// The keyDown path and key-repeat synthesis every surface shares.
     let keyInput = SessionKeyInput()
 
+    // Drives msg_show throttle / auto-hide ticks via a one-shot timer armed
+    // only while the core reports a pending deadline. The session's, not the
+    // main view's: messages show in external windows too, and the main window
+    // being in the Dock stopped them there.
+    private var msgTimer: Timer?
+
+    /// Every window of this session is in the Dock: nothing shows a message,
+    /// and the core is not queried.
+    private var allSessionWindowsMiniaturized: Bool {
+        guard terminalView?.window?.isMiniaturized == true else { return false }
+        return !externalWindows.values.contains { $0.isVisible && !$0.isMiniaturized }
+    }
+
+    /// Schedule a one-shot tick at the core's next pending msg timeout.
+    /// No timer is armed when the core reports no pending work (idle case),
+    /// so the app does not wake the CPU while the editor is idle.
+    /// Main thread only.
+    func scheduleMsgTimer() {
+        msgTimer?.invalidate()
+        msgTimer = nil
+        if allSessionWindowsMiniaturized { return }
+        let ms = tryNextMsgTimeoutMs()
+        if ms == -2 {
+            // Core's grid lock was busy (mid-flush). Do NOT treat this as
+            // "nothing pending" -- an already-armed auto-hide deadline could
+            // be missed. Retry shortly instead of polling every frame.
+            msgTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: false) { [weak self] _ in
+                self?.scheduleMsgTimer()
+            }
+            return
+        }
+        guard ms >= 0 else { return }  // -1 => nothing pending
+        msgTimer = Timer.scheduledTimer(withTimeInterval: Double(max(0, ms)) / 1000.0,
+                                        repeats: false) { [weak self] _ in
+            guard let self else { return }
+            // Re-check at fire time: the windows may have been minimized
+            // after the timer was armed. Let the timer die here;
+            // windowDidDeminiaturize re-arms it on restore.
+            if self.allSessionWindowsMiniaturized { return }
+            self.tickMsgThrottle()
+            self.scheduleMsgTimer()  // re-arm for the next deadline, if any
+        }
+    }
+
+    /// Stop the msg throttle timer. Main thread only.
+    func cancelMsgTimer() {
+        msgTimer?.invalidate()
+        msgTimer = nil
+    }
+
     static var appLogEnabled = false
     /// When true, only [perf...] tagged lines reach the on_log callback at the
     /// core boundary. Set from config.log.perfOnly during configureLogging.
@@ -1389,7 +1439,7 @@ final class ZonvieCore {
                 // here on the core thread) is released before scheduleMsgTimer
                 // queries tryNextMsgTimeoutMs(), which re-acquires it.
                 DispatchQueue.main.async {
-                    me.terminalView?.scheduleMsgTimer()
+                    me.scheduleMsgTimer()
                 }
                 // Commit external grids directly from core thread — commitFlush()
                 // is thread-safe (uses tripleBufferLock). This eliminates async
@@ -1717,7 +1767,7 @@ final class ZonvieCore {
             zonvie_core_set_msg_hover(core, gridId, hovered ? 1 : 0)
             // Pausing or resuming moved the earliest deadline, so the one-shot
             // timer armed for the old one has to be re-armed.
-            self.terminalView?.scheduleMsgTimer()
+            self.scheduleMsgTimer()
         }
     }
 
@@ -3353,16 +3403,7 @@ final class ZonvieCore {
 
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
-
-        cursorBlinkState = true
-        cursorBlinkPhase = 0
-
-        // Propagate reset to all external grid views so they don't
-        // get stuck in blink-off state after a mode transition.
-        for (_, gridView) in externalGridViews {
-            gridView.cursorBlinkState = true
-            gridView.setNeedsDisplay(gridView.bounds)
-        }
+        resetBlinkToVisible()
 
         // Do not arm the timer while the window is not frontmost/visible.
         // The cursor is left solid-visible (state reset above). The
@@ -3443,14 +3484,19 @@ final class ZonvieCore {
     func stopCursorBlinking() {
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
+        resetBlinkToVisible()
+    }
+
+    /// Put every surface of this session in the visible blink phase, so none
+    /// stays stuck off after a mode transition. The main view reads the state
+    /// only when it draws: left in the off phase it kept the cursor hidden
+    /// until something else redrew it. Stopping the blink did this; starting
+    /// it redrew the external views only.
+    private func resetBlinkToVisible() {
         let wasHidden = !cursorBlinkState
         cursorBlinkState = true
         cursorBlinkPhase = 0
-        // The main view reads the state only when it draws; stopped in the
-        // off phase it would keep the cursor hidden until something else
-        // redraws it.
         if wasHidden { requestRedraw() }
-
         for (_, gridView) in externalGridViews {
             gridView.cursorBlinkState = true
             gridView.setNeedsDisplay(gridView.bounds)
@@ -4218,6 +4264,11 @@ final class ZonvieCore {
                     window.close()
                 }
                 self.externalWindows.removeAll()
+                // Its message, prompt and mini panels are floating windows
+                // of their own and would outlive it the same way.
+                self.hideMessageWindow()
+                self.hidePromptWindow()
+                for state in self.miniWindows.values { state.window?.orderOut(nil) }
                 win.close()
                 return
             }
@@ -4295,8 +4346,34 @@ final class ZonvieCore {
         if renderer.isFlushOpen { return true }
         if externalFlushAborted || !coreFlushActive { return false }
         if renderer.beginFlush() { return true }
-        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=1")
+        abortFlushAfterBeginFailure(surface: 1)
+        return false
+    }
+
+    private func beginExternalFlushIfNeeded(_ gridView: ExternalGridView) -> Bool {
+        // Outside on_flush_begin..on_flush_end nothing would commit or cancel
+        // the bracket; it would answer .alreadyOpen for good and never publish.
+        if externalFlushAborted || !coreFlushActive { return false }
+        gridView.renderTraceFlushId = renderTraceFlushId
+        switch gridView.beginFlushIfNeeded() {
+        case .alreadyOpen:
+            return true
+        case .opened:
+            extViewsScratch.append(gridView)
+            return true
+        case .failed:
+            abortFlushAfterBeginFailure(surface: gridView.gridId)
+            return false
+        }
+    }
+
+    /// A surface refused to open its bracket: abort the core's flush, the
+    /// atlas transaction and every bracket this flush opened, and retry. The
+    /// main renderer's abort is a no-op when it had not joined.
+    private func abortFlushAfterBeginFailure(surface: Int64) {
+        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=\(surface)")
         externalFlushAborted = true
+        terminalView?.renderer.abortFlush()
         sharedResources?.abortFlushTransaction()
         if let core {
             zonvie_core_abort_flush(core)
@@ -4307,34 +4384,6 @@ final class ZonvieCore {
         }
         extViewsScratch.removeAll(keepingCapacity: true)
         scheduleFlushRetry()
-        return false
-    }
-
-    private func beginExternalFlushIfNeeded(_ gridView: ExternalGridView) -> Bool {
-        if externalFlushAborted { return false }
-        gridView.renderTraceFlushId = renderTraceFlushId
-        switch gridView.beginFlushIfNeeded() {
-        case .alreadyOpen:
-            return true
-        case .opened:
-            extViewsScratch.append(gridView)
-            return true
-        case .failed:
-            ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=\(gridView.gridId)")
-            externalFlushAborted = true
-            terminalView?.renderer.abortFlush()
-            sharedResources?.abortFlushTransaction()
-            if let core {
-                zonvie_core_abort_flush(core)
-            }
-            for opened in extViewsScratch {
-                opened.cancelFlush()
-                _ = opened.consumeFlushFailed()
-            }
-            extViewsScratch.removeAll(keepingCapacity: true)
-            scheduleFlushRetry()
-            return false
-        }
     }
     private var externalWindowDelegates: [Int64: ExternalWindowDelegate] = [:]
     /// Pending background color configuration (applied when window is created)
@@ -6445,6 +6494,9 @@ final class ZonvieCore {
                 anchorContentView.layoutSubtreeIfNeeded()
                 let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
                 let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+                // The anchor window's own scale: its cells are laid out in
+                // its own points, which differ from the main window's on a
+                // screen of another density.
                 let frame = popupmenuWindowRect(
                     anchorRow: startRow,
                     anchorCol: startCol,
@@ -6452,7 +6504,7 @@ final class ZonvieCore {
                     windowHeight: windowHeight,
                     cellW: cellW,
                     cellH: cellH,
-                    scale: scale,
+                    scale: anchorWindow.backingScaleFactor,
                     referenceFrame: anchorContentFrame,
                     screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
                 )
@@ -6657,6 +6709,7 @@ final class ZonvieCore {
                 anchorContentView.layoutSubtreeIfNeeded()
                 let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
                 let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+                // The anchor window's own scale, as for a new popupmenu.
                 return popupmenuWindowRect(
                     anchorRow: startRow,
                     anchorCol: startCol,
@@ -6664,7 +6717,7 @@ final class ZonvieCore {
                     windowHeight: windowHeight,
                     cellW: cellW,
                     cellH: cellH,
-                    scale: scale,
+                    scale: anchorWindow.backingScaleFactor,
                     referenceFrame: anchorContentFrame,
                     screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
                 )
@@ -6931,7 +6984,10 @@ final class ZonvieCore {
               let containerView = window.contentView,
               let mainView = self.terminalView,
               let renderer = mainView.renderer else { return nil }
-        let scale = mainView.window?.backingScaleFactor ?? 1.0
+        // The window's own scale, as resizeExternalWindows uses: its view
+        // builds its drawable from it, and a decorated window on a screen of
+        // another density was sized for the main window's pixels.
+        let scale = window.backingScaleFactor
         return DecoratedGridContext(window: window, containerView: containerView, renderer: renderer, scale: scale)
     }
 
@@ -8263,12 +8319,9 @@ final class ZonvieCore {
             // Window-based: bottom-right of the window where cursor is.
             // A float grid (e.g. telescope prompt) is not a window — anchor
             // to the main window instead of the float's host.
-            let targetWindow = windowCompositingCursorGrid(mainWindow)
-            let targetFrame = targetWindow.frame
-            let targetContentRect = targetWindow.contentLayoutRect
-            anchorX = targetFrame.origin.x + targetContentRect.width
-            let contentOriginY = targetFrame.origin.y + (targetFrame.height - targetContentRect.height - targetContentRect.origin.y)
-            anchorY = contentOriginY
+            let content = gridContentScreenFrame(of: windowCompositingCursorGrid(mainWindow))
+            anchorX = content.maxX
+            anchorY = content.minY
 
         case .grid:
             // Grid-based: bottom-right of the grid where cursor is
@@ -8290,8 +8343,7 @@ final class ZonvieCore {
             // IS a window: a grid an external window merely contains answers
             // no to the second and yes to the first.
             let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
-            let anchorFrame = anchorWindow.frame
-            let anchorContentRect = anchorWindow.contentLayoutRect
+            let content = gridContentScreenFrame(of: anchorWindow)
 
             let gridRightPt: CGFloat
             let gridBottomPt: CGFloat
@@ -8302,13 +8354,12 @@ final class ZonvieCore {
                 gridRightPt = CGFloat(grid.startCol + grid.cols) * (cellWidthPx / scale)
                 gridBottomPt = CGFloat(grid.startRow + grid.rows) * (cellHeightPx / scale)
             } else {
-                gridRightPt = anchorContentRect.width
-                gridBottomPt = anchorContentRect.height
+                gridRightPt = content.width
+                gridBottomPt = content.height
             }
 
-            anchorX = anchorFrame.origin.x + gridRightPt
-            let contentOriginY = anchorFrame.origin.y + (anchorFrame.height - anchorContentRect.height - anchorContentRect.origin.y)
-            anchorY = contentOriginY + (anchorContentRect.height - gridBottomPt)
+            anchorX = content.minX + gridRightPt
+            anchorY = content.maxY - gridBottomPt
         }
 
         let visibleMinis = MiniWindowId.allCases.filter { miniWindows[$0]?.isVisible == true }
@@ -8356,6 +8407,16 @@ final class ZonvieCore {
     /// Returns the terminal view's frame in screen coordinates.
     /// Uses the actual Auto Layout position, so tab bar, sidebar, and title bar
     /// offsets are automatically accounted for without style-specific branching.
+    /// The screen rect a window's grid content occupies: the terminal view's
+    /// for the main window, whose content view also holds the tab bar or
+    /// sidebar; the content layout rect for an external window, whose content
+    /// is the grid. Reading `contentLayoutRect` for the main window put a box
+    /// anchored to a grid off by the chrome.
+    private func gridContentScreenFrame(of window: NSWindow) -> NSRect {
+        if window === terminalView?.window, let frame = terminalViewScreenFrame() { return frame }
+        return window.convertToScreen(window.contentLayoutRect)
+    }
+
     private func terminalViewScreenFrame() -> NSRect? {
         guard let mainView = terminalView, let window = mainView.window else { return nil }
         // Ensure Auto Layout has resolved before reading the frame.
@@ -8462,16 +8523,7 @@ final class ZonvieCore {
             // Window-based: use the window where cursor is.
             // A float grid (e.g. telescope prompt) is not a window — anchor
             // to the main window instead of the float's host.
-            let targetWindow = windowCompositingCursorGrid(mainWindow)
-            let targetFrame = targetWindow.frame
-            let targetContentRect = targetWindow.contentLayoutRect
-            let contentOriginY = targetFrame.origin.y + (targetFrame.height - targetContentRect.height - targetContentRect.origin.y)
-            return NSRect(
-                x: targetFrame.origin.x,
-                y: contentOriginY,
-                width: targetContentRect.width,
-                height: targetContentRect.height
-            )
+            return gridContentScreenFrame(of: windowCompositingCursorGrid(mainWindow))
 
         case .grid:
             guard let renderer = mainView.renderer else {
@@ -8486,8 +8538,7 @@ final class ZonvieCore {
             let targetGrid = cursorAnchorGrid(in: grids)
 
             let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
-            let anchorFrame = anchorWindow.frame
-            let anchorContentRect = anchorWindow.contentLayoutRect
+            let content = gridContentScreenFrame(of: anchorWindow)
 
             if let grid = targetGrid {
                 let gridLeftPt = CGFloat(grid.startCol) * (cellWidthPx / scale)
@@ -8495,10 +8546,9 @@ final class ZonvieCore {
                 let gridWidthPt = CGFloat(grid.cols) * (cellWidthPx / scale)
                 let gridHeightPt = CGFloat(grid.rows) * (cellHeightPx / scale)
 
-                let contentOriginY = anchorFrame.origin.y + (anchorFrame.height - anchorContentRect.height - anchorContentRect.origin.y)
                 return NSRect(
-                    x: anchorFrame.origin.x + gridLeftPt,
-                    y: contentOriginY + (anchorContentRect.height - gridTopPt - gridHeightPt),
+                    x: content.minX + gridLeftPt,
+                    y: content.maxY - gridTopPt - gridHeightPt,
                     width: gridWidthPt,
                     height: gridHeightPt
                 )

@@ -365,12 +365,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
-        // Stop the msg throttle timer while in the Dock: a timer that fires here
-        // would query the Zig core's grid state, which must not happen while the
-        // window is minimized.
+        // Re-evaluate the msg throttle timer: it stops once every window of
+        // the session is in the Dock, and keeps running for messages shown in
+        // an external window that is still up.
         let win = notification.object as? NSWindow ?? window
         if let vc = win?.contentViewController as? ViewController {
-            vc.core?.terminalView?.cancelMsgTimer()
+            vc.core?.scheduleMsgTimer()
         }
     }
 
@@ -382,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Re-arm the msg throttle timer explicitly rather than relying on a
             // flush to do it: a pending auto-hide deadline armed before minimize
             // must resume firing on restore.
-            vc.core?.terminalView?.scheduleMsgTimer()
+            vc.core?.scheduleMsgTimer()
         }
     }
 

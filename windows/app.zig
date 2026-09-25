@@ -135,14 +135,25 @@ pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
     return n;
 }
 
-/// Basename of a path-like name: the part after the last '/' or '\\'.
-/// Returns the whole string when there is no separator.
+/// Basename of a path-like name: the part after the last '/' or '\\',
+/// ignoring trailing separators as macOS's lastPathComponent does, so
+/// `oil:///home/u/proj/` names `proj` rather than nothing. Returns the whole
+/// string when there is no separator.
 pub fn baseName(name: []const u8) []const u8 {
+    var end = name.len;
+    while (end > 1 and (name[end - 1] == '/' or name[end - 1] == '\\')) end -= 1;
+    const trimmed = name[0..end];
     var last: usize = 0;
-    for (name, 0..) |ch, j| {
+    for (trimmed, 0..) |ch, j| {
         if (ch == '/' or ch == '\\') last = j + 1;
     }
-    return name[last..];
+    return trimmed[last..];
+}
+
+test "baseName ignores trailing separators" {
+    try std.testing.expectEqualStrings("proj", baseName("oil:///home/u/proj/"));
+    try std.testing.expectEqualStrings("a.zig", baseName("src\\a.zig"));
+    try std.testing.expectEqualStrings("name", baseName("name"));
 }
 
 // =========================================================================
@@ -652,6 +663,10 @@ pub const TripleBufferedSurface = struct {
     pub const SET_COUNT = render_pipeline_helpers.SparseRowSyncStorage.set_count;
     sets: [SET_COUNT]VertexSet = .{ .{}, .{}, .{} },
     pool: SlotPool = .{}, // Shared slot pool across all sets
+    /// The grid this surface's rows belong to: 1 for the main window, its
+    /// own grid for an external one. Cursor rows are rows of the cursor's
+    /// grid, so they name root rows only when that grid is this one.
+    root_grid_id: i64 = 1,
 
     // --- rotation_mu protects these fields ---
     rotation_mu: std.Io.Mutex = .init,
@@ -995,7 +1010,14 @@ pub const TripleBufferedSurface = struct {
                     self.pending_paint_full = true;
                 };
             }
-            if (self.pending_dirty.bit_length == row_count) {
+            // A cursor on a layer: its rows are that grid's, and marking
+            // them here dirtied unrelated root rows (a whole-width band of
+            // grid 1 on the main window, which is empty under multigrid). A
+            // cursor changing grids repaints whole on its own.
+            const cursor_on_root = self.committed_cursor_layer_grid_id == self.root_grid_id;
+            if (!cursor_on_root) {
+                // Nothing of the root to redraw.
+            } else if (self.pending_dirty.bit_length == row_count) {
                 var cursor_dirty_storage: [2]usize = undefined;
                 for (render_pipeline_helpers.cursorDirtyRows(
                     self.main_cursor_flush_old_row,
@@ -2407,8 +2429,9 @@ pub const ScrollbarState = struct {
     target_alpha: f32 = 0.0,
     hover: bool = false,
     dragging: bool = false,
-    drag_start_y: i32 = 0,
-    drag_start_topline: i64 = 0,
+    // Where on the knob the press landed, from its top edge: the knob keeps
+    // that point under the pointer for the whole drag.
+    drag_grab_px: f32 = 0,
     repeat_dir: i8 = 0, // -1 = page up, 1 = page down, 0 = none
     repeat_timer: c.UINT_PTR = 0,
     hide_timer: c.UINT_PTR = 0,
@@ -2421,39 +2444,87 @@ pub const ScrollbarState = struct {
     last_viewport_botline: i64 = -1,
 };
 
-pub const ExternalWindow = struct {
-    hwnd: c.HWND,
-    window_wake_cookie: usize,
-    win_id: i64 = 0, // Neovim window handle
-    renderer: d3d11.Renderer,
-
-    // Shared CPU-side surface state (vertices, grid dims, dirty tracking).
+/// What every window's surface keeps, the main window's and each external
+/// window's alike: the vertex state, the triple buffer, the draw buffers, the
+/// scrollbar, and the paint-retry and atlas bookkeeping. They were loose fields
+/// on App for the main window and a parallel set on ExternalWindow, so every
+/// helper took them one by one.
+pub const WindowSurface = struct {
+    // CPU-side surface state (grid dims, dirty tracking).
     surface: SurfaceState = .{},
-
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
     tbs: TripleBufferedSurface = .{},
-
-    // GPU vertex buffers (not in SurfaceState — ownership/deinit stays here).
-    vb: ?*c.ID3D11Buffer = null,
-    vb_bytes: usize = 0,
-    vert_count: usize = 0,
-    needs_redraw: bool = false,
+    // The draw buffers.
+    paint: SurfacePaintState = .{},
+    // The overlay scrollbar (ui/scrollbar.zig).
+    scrollbar: ScrollbarState = .{},
     /// This flush owes the window an invalidate. Set under `app.mu` by work
     /// that joins the open flush (core callbacks, and a window seeding its
     /// write set mid-flush), cleared only by onFlushEnd or a failed flush —
     /// never by paint: `needs_redraw` is also cleared by paint, and a paint
     /// landing mid-flush erased the request before onFlushEnd read it,
     /// leaving the window a flush behind.
+
     flush_needs_invalidate: bool = false,
     paint_retry: PaintRetryState = .{},
     paint_retry_deadline_ms: u64 = 0,
+    // The App's atlas_upload_seq this window's last paint saw (syncSharedAtlas).
+    atlas_seen_upload_seq: u64 = 0,
+    // OLE drop target. See ui/drop_target.zig; opaque here so app.zig carries
+    // none of the COM plumbing.
+    drop_target: ?*anyopaque = null,
+
+    /// A paint of this surface succeeded: the retry it was owed is done.
+    pub fn completePaintRetry(self: *WindowSurface) void {
+        self.paint_retry_deadline_ms = 0;
+        _ = self.paint_retry.succeeded();
+    }
+
+    pub const RecoveryVB = struct { buffer: *c.ID3D11Buffer, row_bytes: usize };
+
+    /// Detach one of this surface's device-bound buffers without calling COM,
+    /// for device-loss teardown; the caller releases it after dropping app.mu.
+    /// `row_bytes` is what a row buffer returns to the row budget. Caller
+    /// holds app.mu.
+    pub fn detachOneRecoveryVB(self: *WindowSurface) ?RecoveryVB {
+        if (detachOneSurfaceGpuVB(&self.surface)) |vb| return .{ .buffer = vb, .row_bytes = 0 };
+        if (detachOneRowVB(self.paint.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes };
+        if (self.paint.cursor_vb) |vb| {
+            self.paint.cursor_vb = null;
+            self.paint.cursor_vb_bytes = 0;
+            return .{ .buffer = vb, .row_bytes = 0 };
+        }
+        if (self.paint.scrollbar_vb) |vb| {
+            self.paint.scrollbar_vb = null;
+            self.paint.scrollbar_vb_bytes = 0;
+            return .{ .buffer = vb, .row_bytes = 0 };
+        }
+        return null;
+    }
+};
+
+pub const ExternalWindow = struct {
+    hwnd: c.HWND,
+    window_wake_cookie: usize,
+    win_id: i64 = 0, // Neovim window handle
+    renderer: d3d11.Renderer,
+
+    /// The state every window's surface keeps; see WindowSurface.
+    surf: WindowSurface = .{},
+
+
+    // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
+
+    // GPU vertex buffers (not in SurfaceState — ownership/deinit stays here).
+    vb: ?*c.ID3D11Buffer = null,
+    vb_bytes: usize = 0,
+    vert_count: usize = 0,
+    needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
-    // The App's atlas_upload_seq this window's last paint saw (syncSharedAtlas).
-    atlas_seen_upload_seq: u64 = 0,
     // DPI scale of the monitor this external window is currently on (may
     // differ from app.dpi_scale on a mixed-DPI multi-monitor setup). Used
     // ONLY for this window's own scrollbar hit-test geometry — NOT for font
@@ -2465,7 +2536,6 @@ pub const ExternalWindow = struct {
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
     flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
-    paint: SurfacePaintState = .{},
 
     // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
     suppress_resize_callback: bool = false,
@@ -2496,9 +2566,11 @@ pub const ExternalWindow = struct {
     /// keeps the unconditional behaviour rather than silently losing its blink.
     has_committed_cursor: bool = true,
 
-    scrollbar: ScrollbarState = .{},
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
+    // The left press landed on the copy button; only then does its release
+    // copy (a press on the message text slid onto the button did not).
+    copy_button_pressed: bool = false,
     // A copy just succeeded, so the button shows a checkmark instead of the
     // copy icon until TIMER_COPY_BUTTON_REVERT fires.
     copy_button_copied: bool = false,
@@ -2506,9 +2578,6 @@ pub const ExternalWindow = struct {
     // view's auto-hide countdown. Tracked here so an ordinary mouse move does
     // not take the core's grid lock on every WM_MOUSEMOVE.
     msg_hover: bool = false,
-    // OLE drop target (cmdline surface only). See ui/drop_target.zig; opaque
-    // here so app.zig carries none of the COM plumbing.
-    drop_target: ?*anyopaque = null,
 
     // Scratch buffer for vertex copy during paint (avoids per-frame alloc).
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
@@ -2524,7 +2593,7 @@ pub const ExternalWindow = struct {
     paint_drew_root_rows: bool = false,
 
     pub fn recomputeVertCount(self: *ExternalWindow) void {
-        self.vert_count = self.surface.recomputeVertCount();
+        self.vert_count = self.surf.surface.recomputeVertCount();
     }
 
     pub fn deinit(
@@ -2543,12 +2612,12 @@ pub const ExternalWindow = struct {
         self.paint_row_ranges.deinit(alloc);
         self.flat_draw_scratch.deinit(alloc);
         // Release GPU VBs from row_verts before deinitCpuState frees the list.
-        for (self.surface.row_verts.items) |*rv| {
+        for (self.surf.surface.row_verts.items) |*rv| {
             if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
         }
-        self.surface.deinitCpuState(alloc);
-        self.paint.deinit(alloc, row_vb_budget);
-        self.tbs.deinit(alloc); // Handles slot release + pool deinit
+        self.surf.surface.deinitCpuState(alloc);
+        self.surf.paint.deinit(alloc, row_vb_budget);
+        self.surf.tbs.deinit(alloc); // Handles slot release + pool deinit
         if (self.vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
         }
@@ -2651,31 +2720,36 @@ pub fn snapshotSurfaceVerts(
     return true;
 }
 
-pub fn snapshotSurfaceRows(
+/// Flatten a committed set into `scratch` for a surface drawn as one list
+/// (decorated and flat-mode windows). The committed set, not the per-row
+/// mirror the core thread writes one callback at a time: a paint landing
+/// between two rows of a flush showed new and old rows together, and a
+/// cancelled flush left its partial rows on screen until the resend.
+/// `set` must be held by the paint (acquireForPaint).
+pub fn snapshotSetRows(
     alloc: std.mem.Allocator,
     scratch: *std.ArrayListUnmanaged(Vertex),
     row_ranges: *std.ArrayListUnmanaged(PaintRowRange),
-    row_mode: bool,
-    row_verts: []const RowVerts,
-    flat_verts: []const Vertex,
-    vert_count: usize,
+    set: *const VertexSet,
+    pool: *const SlotPool,
 ) bool {
     scratch.clearRetainingCapacity();
     row_ranges.clearRetainingCapacity();
-    scratch.ensureTotalCapacity(alloc, vert_count) catch return false;
-
-    if (row_mode) {
-        row_ranges.ensureTotalCapacity(alloc, row_verts.len) catch return false;
-        var start: usize = 0;
-        for (row_verts) |rv| {
-            const count = rv.verts.items.len;
-            if (count == 0) continue;
-            scratch.appendSliceAssumeCapacity(rv.verts.items);
-            row_ranges.appendAssumeCapacity(.{ .start = start, .count = count });
-            start += count;
-        }
-    } else {
-        scratch.appendSliceAssumeCapacity(flat_verts[0..vert_count]);
+    if (!set.row_mode) {
+        scratch.ensureTotalCapacity(alloc, set.flat_verts.items.len) catch return false;
+        scratch.appendSliceAssumeCapacity(set.flat_verts.items);
+        return true;
+    }
+    scratch.ensureTotalCapacity(alloc, set.recomputeVertCount(pool)) catch return false;
+    row_ranges.ensureTotalCapacity(alloc, set.row_map.items.len) catch return false;
+    var start: usize = 0;
+    for (set.row_map.items) |m| {
+        if (m.slot == SLOT_NONE) continue;
+        const verts = pool.slotPtrConst(m.slot).verts.items;
+        if (verts.len == 0) continue;
+        scratch.appendSliceAssumeCapacity(verts);
+        row_ranges.appendAssumeCapacity(.{ .start = start, .count = verts.len });
+        start += verts.len;
     }
     return true;
 }
@@ -3476,6 +3550,44 @@ pub const SharedAtlasSync = struct {
     /// New pixels reached the texture since this window's last paint.
     uploaded: bool,
 };
+
+/// Reposition the ext-float and mini windows after a window they may anchor
+/// to moved or resized: with msg_pos `window` or `grid` that is the cursor's
+/// window, main or external. A coalescing timer on the main window, so a drag
+/// does not flood the queue (SetTimer resets a pending one of the same id).
+pub fn scheduleFloatReposition(app: *App) void {
+    if (app.hwnd) |main_hwnd| _ = c.SetTimer(main_hwnd, TIMER_REPOSITION_FLOATS, 15, null);
+}
+
+/// The work area of the monitor `hwnd` is on (the primary one's full screen
+/// when there is none), so a box anchored to the display neither sits under
+/// the taskbar nor lands on another monitor.
+pub fn monitorWorkArea(hwnd: ?c.HWND) c.RECT {
+    if (hwnd) |h| {
+        var mi: c.MONITORINFO = undefined;
+        mi.cbSize = @sizeOf(c.MONITORINFO);
+        const monitor = c.MonitorFromWindow(h, c.MONITOR_DEFAULTTONEAREST);
+        if (monitor != null and c.GetMonitorInfoW(monitor, &mi) != 0) return mi.rcWork;
+    }
+    return .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+}
+
+/// Resize `g`'s swapchain to its window's client area before a paint draws.
+/// Recreating it later -- inside drawEx or the present -- drops what was
+/// already drawn into the old back texture while the present still treats the
+/// new one as valid. True when it resized: every row must be redrawn. May pump
+/// messages (DXGI). UI thread, caller holds g's context lock.
+pub fn resizeSurfaceIfNeeded(g: *d3d11.Renderer, force: bool) !bool {
+    if (!force) {
+        var rc: c.RECT = undefined;
+        _ = c.GetClientRect(g.hwnd, &rc);
+        const cw: u32 = @intCast(@max(1, rc.right - rc.left));
+        const ch: u32 = @intCast(@max(1, rc.bottom - rc.top));
+        if (cw == g.width and ch == g.height) return false;
+    }
+    try g.resize();
+    return true;
+}
 
 /// Bring the one atlas texture every window samples up to date and bind it to
 /// `g`: resized to the atlas, then the uploads it is owed. It is the main
@@ -4831,17 +4943,15 @@ pub fn releasePaintSnapshot(
 /// under rotation_mu, never nested.
 pub fn failSurfacePaint(
     app: *App,
-    surface: *SurfaceState,
-    tbs: *TripleBufferedSurface,
-    retry: *PaintRetryState,
+    ws: *WindowSurface,
     device_lost: bool,
 ) ?PaintRetryState.Ticket {
     app.mu.lockUncancelable(core.clock.io());
-    surface.paint_full = true;
+    ws.surface.paint_full = true;
     app.mu.unlock(core.clock.io());
-    tbs.requestFullPaint();
+    ws.tbs.requestFullPaint();
     if (device_lost) return null;
-    return retry.fail();
+    return ws.paint_retry.fail();
 }
 
 /// What a surface owns across paints and lends to one row frame: its row VB
@@ -5111,9 +5221,10 @@ pub fn drawSurfaceRowFrame(
 /// What a surface owns across paints for its row pass: the row-frame state
 /// plus the growable row VB list and the scratch the scroll shift uses.
 pub const RowPassSurface = struct {
-    pub fn of(tbs: *TripleBufferedSurface, paint: *SurfacePaintState) RowPassSurface {
+    pub fn of(ws: *WindowSurface) RowPassSurface {
+        const paint = &ws.paint;
         return .{
-            .tbs = tbs,
+            .tbs = &ws.tbs,
             .row_vbs = &paint.row_vbs,
             .row_vbs_shift_scratch = &paint.row_vbs_shift_scratch,
             .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
@@ -5470,7 +5581,6 @@ pub const App = struct {
     flush_retry_armed_failure_epoch: u64 = 0,
     flush_retry_consumed_failure_epoch: u64 = 0,
     flush_retry_observed_success_epoch: u64 = 0,
-    main_paint_retry_deadline_ms: u64 = 0,
     external_paint_retry_deadline_ms: u64 = 0,
     device_lost_retry_deadline_ms: u64 = 0,
 
@@ -5523,12 +5633,9 @@ pub const App = struct {
     // graceful-quit path instead of hiding back to the tray (close_to_tray).
     tray_quit_requested: bool = false,
 
-    // Main surface vertex state (shared structure with external windows).
+    // The main window's surface, the same type every external window keeps.
     // paint_full=false: main window uses explicit dirty tracking; external windows default to true.
-    surface: SurfaceState = .{ .paint_full = false },
-
-    // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
-    tbs: TripleBufferedSurface = .{},
+    surf: WindowSurface = .{ .surface = .{ .paint_full = false } },
     // Cross-thread flush bracket state. The core thread publishes it from
     // onFlushBegin and clears it while atomically committing/cancelling in
     // onFlushEnd. Main and external TBS write sets join lazily on mutation;
@@ -5555,8 +5662,6 @@ pub const App = struct {
     // captures record this when mutated so onFlushEnd can discard only data
     // produced by a failed transaction while preserving older valid seeds.
     core_flush_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    // The main window's draw buffers; every external window holds its own.
-    paint: SurfacePaintState = .{},
     // Shared by every surface's row buffers.
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
@@ -5571,7 +5676,6 @@ pub const App = struct {
 
     // WM_PAINT(row) persistent buffers (avoid per-frame alloc/free)
     wm_paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .empty,
-    paint_retry: PaintRetryState = .{},
 
     cursor: ?Cursor = null,
 
@@ -5579,11 +5683,6 @@ pub const App = struct {
 
     // ---- NEW: self-managed damage queue (avoid OS update region dependency) ----
     paint_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
-
-    // Set by vertex callbacks when dirty state changes during a flush.
-    // Checked and cleared by onFlushEnd to decide whether to InvalidateRect.
-    // Skips InvalidateRect for flushes with no visual changes (e.g. msg_showcmd-only).
-    flush_needs_invalidate: bool = false,
 
     // Set (under app.mu) by vertex callbacks that hit OOM mid-flush, paired
     // with zonvie_core_abort_flush (which makes the CORE keep its dirty
@@ -5656,8 +5755,6 @@ pub const App = struct {
     atlas_upload: render_pipeline_helpers.AtlasUploadLedger = .{},
     atlas_upload_cursor: u64 = 0,
     atlas_upload_seq: u64 = 0,
-    // The atlas_upload_seq the main window's last paint saw.
-    main_atlas_seen_upload_seq: u64 = 0,
 
     // Device-loss recovery state (WM_APP_DEVICE_LOST_RECOVER). `posted`
     // dedupes the paint-side trigger. Failed attempts drive a bounded
@@ -5768,8 +5865,6 @@ pub const App = struct {
     cursor_blink_on_ms: u32 = 0,
     cursor_blink_off_ms: u32 = 0,
 
-    // The main window's overlay scrollbar (ui/scrollbar.zig).
-    scrollbar: ScrollbarState = .{},
     cursor_is_hand: bool = false, // URL hover: hand cursor
     url_cache_grid: i64 = 0,
     url_cache_row: i32 = 0,
@@ -5916,11 +6011,6 @@ pub const App = struct {
     clipboard_set_data: ?[*]const u8 = null,
     clipboard_set_len: usize = 0,
 
-    // OLE drop target for the main window (ui/drop_target.zig). Null when
-    // RegisterDragDrop failed, in which case WM_DROPFILES still delivers drops
-    // without the drag-cursor badge. Typed opaque to keep app.zig free of the
-    // COM plumbing.
-    main_drop_target: ?*anyopaque = null,
 
     // SSH auth prompt state (owned copy - core frees original after callback)
     ssh_prompt_owned: ?[]u8 = null,
@@ -6026,42 +6116,6 @@ pub const App = struct {
         self.wm_paint_reinvalidate_all = true;
     }
 
-    pub fn ensureRowStorage(self: *App, row: u32) void {
-        // Enforce maximum row limit
-        if (row >= max_row_buffers) {
-            if (applog.isEnabled()) applog.appLog("[win] row {d} exceeds max_row_buffers ({d})\n", .{ row, max_row_buffers });
-            return;
-        }
-
-        const need: usize = @intCast(row + 1);
-        if (self.surface.row_verts.items.len >= need) return;
-
-        // grow row_verts to (row+1)
-        const old_len = self.surface.row_verts.items.len;
-        self.surface.row_verts.resize(self.alloc, need) catch return;
-
-        // init new slots
-        var i: usize = old_len;
-        while (i < need) : (i += 1) {
-            self.surface.row_verts.items[i] = .{};
-        }
-    }
-
-    /// Shrink row_verts if significantly oversized (> 2x needed)
-    pub fn maybeShrinkRowStorage(self: *App, needed_rows: u32) void {
-        if (needed_rows == 0) return;
-        const needed: usize = @intCast(needed_rows);
-        // Only shrink if array is more than 2x the needed size
-        if (self.surface.row_verts.items.len > needed * 2) {
-            // Free excess RowVerts' inner arrays
-            for (self.surface.row_verts.items[needed..]) |*rv| {
-                rv.verts.deinit(self.alloc);
-            }
-            self.surface.row_verts.shrinkRetainingCapacity(needed);
-            if (applog.isEnabled()) applog.appLog("[win] shrunk row_verts from {d} to {d}\n", .{ self.surface.row_verts.items.len + (self.surface.row_verts.items.len - needed), needed });
-        }
-    }
-
     /// Non-blocking visible grids query with complete-snapshot cache fallback
     /// (UI thread only). Busy, allocation failure, and truncated queries keep
     /// the last complete cache. Buffers grow only when the visible-grid count
@@ -6127,12 +6181,7 @@ pub const App = struct {
         const pos_mode = self.config.messages.msg_pos.ext_float;
 
         switch (pos_mode) {
-            .display => {
-                // Display-based: use entire screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                return c.RECT{ .left = 0, .top = 0, .right = screen_w, .bottom = screen_h };
-            },
+            .display => return monitorWorkArea(self.hwnd),
             .window => {
                 // Window-based: use the window where cursor is
                 const cursor_grid = self.last_cursor_grid;
@@ -6307,17 +6356,17 @@ pub const App = struct {
         }
 
         // Main surface: release GPU VBs from row_verts, then CPU state
-        for (self.surface.row_verts.items) |*rv| {
+        for (self.surf.surface.row_verts.items) |*rv| {
             if (rv.vb) |p| {
                 const rel = p.*.lpVtbl.*.Release orelse null;
                 if (rel) |f| _ = f(p);
             }
         }
-        self.surface.deinitCpuState(self.alloc);
+        self.surf.surface.deinitCpuState(self.alloc);
 
         // Triple-buffered surface cleanup (handles slot release + pool deinit)
-        self.tbs.deinit(self.alloc);
-        self.paint.deinit(self.alloc, &self.row_vb_budget);
+        self.surf.tbs.deinit(self.alloc);
+        self.surf.paint.deinit(self.alloc, &self.row_vb_budget);
 
         // WM_PAINT(row) scratch
         self.row_tmp_verts.deinit(self.alloc);
@@ -6914,9 +6963,9 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
     const rows: u32 = @intCast(@max(1, h / ch));
     const cols: u32 = @intCast(@max(1, w / cw));
 
-    if (rows != app.surface.rows or cols != app.surface.cols) {
-        app.surface.rows = rows;
-        app.surface.cols = cols;
+    if (rows != app.surf.surface.rows or cols != app.surf.surface.cols) {
+        app.surf.surface.rows = rows;
+        app.surf.surface.cols = cols;
         app.seed_pending = true;
         app.seed_clear_pending = true;
         app.row_valid_count = 0;
@@ -6927,11 +6976,6 @@ pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
             app.row_valid.unsetAll();
         } else if (app.row_valid.bit_length != 0) {
             app.row_valid.unsetAll();
-        }
-        // Clear old row vertex data to prevent ghost rendering from stale vertices.
-        for (app.surface.row_verts.items) |*rv| {
-            rv.verts.clearRetainingCapacity();
-            rv.gen +%= 1;
         }
         if (applog.isEnabled()) applog.appLog(
             "[win] bootstrap rows/cols from client rows={d} cols={d} cell={d}x{d} client={d}x{d} row_mode_max_row_end=0\n",

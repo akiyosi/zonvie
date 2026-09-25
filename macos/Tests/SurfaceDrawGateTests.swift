@@ -125,6 +125,88 @@ private enum SurfaceDrawGateTests {
         }
     }
 
+    /// The blink-toggle-with-no-cursor skip. GridSurfaceRenderer.draw had:
+    ///
+    ///     rowMode && blinkStateChanged && !hasNewCommit && dirtyRows.isEmpty
+    ///         && !anyLayerWork && dirtyRectPxOpt == nil && !smoothScrolling
+    ///         && !drawableSizeChanged && hasPresentedOnce
+    ///         && currentCursorCount == 0 && !anyCustomShaderNeedsAnimation
+    ///
+    /// and ExternalGridView.draw:
+    ///
+    ///     blinkStateChanged && !layoutDamage && layerSnapshot.isEmpty
+    ///         && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged
+    ///         && !scrollOffsetChanged && !smoothScrolling && hasPresentedOnce
+    ///         && !(cursorDirty || hasNewCommit) && vertexCount == 0
+    ///         && !shaderAnimates
+    ///
+    /// The shared predicate is main's exactly. For the external surface it
+    /// also requires row mode, and no longer refuses merely because the
+    /// surface hosts a layer: hosted work arrives as a commit or dirty rows,
+    /// which it refuses on already. Both now draw a frame whose shader cursor
+    /// moved; the external one used to drop that move.
+    private static func verifyBlinkOnlySkip() {
+        for mask in 0..<(1 << 11) {
+            let presented = bit(mask, 0)
+            let blink = bit(mask, 1)
+            let newCommit = bit(mask, 2)
+            let dirty = bit(mask, 3)
+            let layerWork = bit(mask, 4)
+            let rect = bit(mask, 5)
+            let smooth = bit(mask, 6)
+            let sizeChg = bit(mask, 7)
+            let anim = bit(mask, 8)
+            let noCursor = bit(mask, 9)
+            let shaderCur = bit(mask, 10)
+            let mainOriginal = blink && !newCommit && !dirty && !layerWork && !rect
+                && !smooth && !sizeChg && presented && noCursor && !anim
+            let mainShared = SurfaceIdleTerms(
+                hasPresentedOnce: presented,
+                hasNewCommit: newCommit,
+                hasDirtyRows: dirty,
+                hasDirtyRect: rect,
+                hasLayerWork: layerWork,
+                isSmoothScrolling: smooth,
+                blinkStateChanged: blink,
+                drawableSizeChanged: sizeChg,
+                shaderAnimates: anim,
+                shaderCursorMoved: shaderCur
+            ).skipsBlinkWithNoCursor(cursorVertexCount: noCursor ? 0 : 1)
+            check(mainShared, mainOriginal && !shaderCur, "main blink mask=\(mask)")
+        }
+        for mask in 0..<(1 << 12) {
+            let rowMode = bit(mask, 0)
+            let presented = bit(mask, 1)
+            let blink = bit(mask, 2)
+            let dirty = bit(mask, 3)
+            let pendingScroll = bit(mask, 4)
+            let sizeChg = bit(mask, 5)
+            let scrollOff = bit(mask, 6)
+            let cursorDirty = bit(mask, 7)
+            let newCommit = bit(mask, 8)
+            let smooth = bit(mask, 9)
+            let rect = bit(mask, 10)
+            let noCursor = bit(mask, 11)
+            let externalOriginal = blink && !rect && !dirty && !pendingScroll
+                && !sizeChg && !scrollOff && !smooth && presented
+                && !(cursorDirty || newCommit) && noCursor
+            let externalShared = SurfaceIdleTerms(
+                hasPresentedOnce: presented,
+                rowModeSatisfied: rowMode,
+                hasNewCommit: newCommit,
+                hasCursorUpdate: cursorDirty,
+                hasDirtyRows: dirty,
+                hasDirtyRect: rect,
+                hasStagedScroll: pendingScroll,
+                scrollOffsetChanged: scrollOff,
+                isSmoothScrolling: smooth,
+                blinkStateChanged: blink,
+                drawableSizeChanged: sizeChg
+            ).skipsBlinkWithNoCursor(cursorVertexCount: noCursor ? 0 : 1)
+            check(externalShared, externalOriginal && rowMode, "external blink mask=\(mask)")
+        }
+    }
+
     /// GridSurfaceRenderer.draw:
     ///
     ///     let shouldReusePreviousContents = !glowEnabled
@@ -654,6 +736,7 @@ private enum SurfaceDrawGateTests {
         verifyCursorOwner()
         verifyScrollOffsetLatch()
         verifyExternalSurface()
+        verifyBlinkOnlySkip()
         verifyMainLoadAction()
         verifyExternalLoadAction()
         verifyIdleCounter()

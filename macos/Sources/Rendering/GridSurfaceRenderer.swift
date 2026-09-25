@@ -1391,7 +1391,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
-            inflightRowBuffers: { (self.inflightRowBuffer(gridId: gridId, atSlot: $0), nil) }
+            inflightRowBuffers: { self.inflightRowBuffers(gridId: gridId, atSlot: $0) }
         )
         if !submitted {
             // Same contract as the root grid's submitVerticesRowRaw: a row that
@@ -1472,30 +1472,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         lock.lock()
         bracketOpen = false
         lock.unlock()
-    }
-
-    private func requirePreparedRowCapacity(
-        row: Int,
-        vertexCount: Int,
-        totalRows: Int,
-        rowIsPhysical: Bool = false,
-        useWriteMapping: Bool = false
-    ) -> Bool {
-        let ok = requireSurfaceRowCapacity(
-            bufferSets: bufferSets,
-            ledger: rowCapacity,
-            lock: lock,
-            lockHeld: false,
-            row: row,
-            vertexCount: vertexCount,
-            totalRows: totalRows,
-            maxRowBuffers: maxRowBuffers,
-            mappingSetIndex: useWriteMapping ? writeSetIndex : flushSourceSetIndex,
-            rowIsPhysical: rowIsPhysical,
-            logLabel: "Renderer"
-        )
-        if !ok { flushFailed = true }
-        return ok
     }
 
     /// True while this surface still owes a provisioning pass, or is in the
@@ -1587,34 +1563,20 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         )
     }
 
-    /// Buffer at the given physical slot in whichever set is currently GPU
-    /// in-flight, or nil when none. With semaphore=1 at most one set is
-    /// in-flight at any instant (the completion handler decrements under
-    /// lock BEFORE signaling). Buffer objects only alias across sets at the
-    /// same physical slot index: shallow copies preserve array positions and
-    /// slot remaps permute the logical->slot mapping, not the buffers array.
-    /// Must be called from the core thread during flush (the in-flight set
-    /// is never the write set, so its rowState is stable while we read it).
-    private func inflightRowBuffer(gridId: Int64, atSlot slot: Int) -> MTLBuffer? {
+    /// `gridId`'s buffers at physical `slot` in the sets a GPU frame is still
+    /// reading (surfaceInflightRowBuffers). Every grid rotates through the
+    /// same set indices, so `gpuInFlightCount` selects them for any grid.
+    /// Core thread during flush: the in-flight set is never the write set,
+    /// so its rowState is stable while it is read.
+    private func inflightRowBuffers(gridId: Int64, atSlot slot: Int) -> (MTLBuffer?, MTLBuffer?) {
         lock.lock()
         defer { lock.unlock() }
-        guard let sets = gridBuffers.existingSets(for: gridId) else { return nil }
-        for i in 0..<3 where gpuInFlightCount[i] > 0 {
-            let bufs = sets[i].rowState.buffers
-            return slot < bufs.count ? bufs[slot] : nil
-        }
-        return nil
-    }
-
-    /// The root grid's in-flight buffer at `slot`. Every grid rotates through
-    /// the same set indices, so `gpuInFlightCount` selects the in-flight set
-    /// for any of them.
-    private func inflightRowBuffer(atSlot slot: Int) -> MTLBuffer? {
-        inflightRowBuffer(gridId: 1, atSlot: slot)
+        guard let sets = gridBuffers.existingSets(for: gridId) else { return (nil, nil) }
+        return surfaceInflightRowBuffers(sets: sets, gpuInFlightCount: gpuInFlightCount, slot: slot)
     }
 
     /// Main vertex buffer of the set currently GPU in-flight (see
-    /// inflightRowBuffer(atSlot:) for the invariants).
+    /// inflightRowBuffers(gridId:atSlot:) for the invariants).
     private func inflightMainBuffer() -> MTLBuffer? {
         lock.lock()
         defer { lock.unlock() }
@@ -2207,7 +2169,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     ///
     /// | stage | this surface | ExternalGridView |
     /// |---|---|---|
-    /// | begin | drop while row capacity provisions; `retention.beginFlush`; drop the staged shader cursor; reseed the cursor owner | same drop; `carriedDirtyRows`; font generation; `bracketStagedGrids` |
+    /// | begin | drop while row capacity provisions; `retention.beginFlush`; drop the staged shader cursor; reseed the cursor owner | same drop; font generation; `bracketStagedGrids` |
     /// | first row write | `prepareMainWriteState`: pick set, sync rows, `prepareLayerGridsForWrite` | `prepareRowWriteState`: pick set, copy each layer grid's row state, `retention.beginFlush`, capture retained rows, sync rows |
     /// | abort | `endBracketWithoutPublishing`, from `abortFlush` | `cancelFlush` |
     /// | commit | retained rows published; `pendingCursorOnlyCommit` | font generation verdict; `layoutContracted` |
@@ -2708,17 +2670,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
 
         if updateCursor {
-            if cursorCount > 0, let cursorPtr {
-                ensureCursorBufferInSet(cursorSet, vertexCount: cursorCount)
-                if let cvb = cursorSlots[cursorSet].vertexBuffer {
-                    memcpy(cvb.contents(), cursorPtr, cursorCount * MemoryLayout<Vertex>.stride)
-                    cursorSlots[cursorSet].vertexCount = cursorCount
-                } else {
-                    cursorSlots[cursorSet].vertexCount = 0
-                }
+            if !cursorSlots[cursorSet].write(device: shared.device, ptr: cursorPtr, count: cursorCount) {
+                flushFailed = true
+            } else if cursorCount > 0, let cursorPtr {
                 updateCursorShaderStateFromVerts(cursorPtr: cursorPtr, cursorCount: cursorCount)
-            } else {
-                cursorSlots[cursorSet].vertexCount = 0
             }
         }
     }
@@ -3004,7 +2959,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // synthesized key repeat is armed: its safety tick is the top of
             // this function. Showing the window repaints it (occlusion and
             // deminiaturize handlers), which re-activates the loop as needed.
-            if let terminalView = view as? MetalTerminalView, terminalView.core?.keyInput.synthRepeatActive != true {
+            if let terminalView = view as? MetalTerminalView,
+               terminalView.core?.keyInput.synthesisHeld(by: terminalView) != true {
                 terminalView.deactivateSurfaceDrawLoop()
             }
             return
@@ -3378,21 +3334,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 drawableSize: view.drawableSize
             )
 
-            // "Blink-only frame" = blinkStateChanged is the ONLY change this draw.
-            // Used both for skipMainPass later AND for the cursor==0 skipFrame
-            // early-return below — defined here so both can share the predicate
-            // safely (the early-return must NOT trigger when there are dirty
-            // rows / dirtyRectPxOpt / new commits / scroll, otherwise we drop
-            // updates already consumed under the lock).
-            let isBlinkOnlyFrame = blinkStateChanged
-                && !hasNewCommit
-                && dirtyRows.isEmpty
-                && !anyLayerWork
-                && dirtyRectPxOpt == nil
-                && !smoothScrolling
-                && !drawableSizeChanged
-                && hasPresentedOnceSnapshot
-
             // If nothing changed, do not encode/present a new frame.
             // MTKView may call draw(in:) for reasons other than Neovim "flush" (e.g. window expose).
             //
@@ -3419,6 +3360,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 shaderCursorMoved: shaderCursorMovedThisFrame
             )
             let idleGateSkips = idleTerms.skipsFrame
+            // "Blink-only frame" = blinkStateChanged is the ONLY change this
+            // draw. Used both for skipMainPass later and for the no-cursor
+            // skip below.
+            let isBlinkOnlyFrame = idleTerms.isBlinkOnly
             // The defect this gate term exists for, stated as a check: a frame
             // skipped while the shader is still showing an older cursor rect
             // means nothing will ask for the new one again. It fired fifteen
@@ -3438,21 +3383,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Blink toggled with no cursor to draw: the toggle is invisible in
-            // either state, so the whole draw cycle — drawable acquire, copy
-            // pass (~2.9ms), present, next-vsync wake — is wasted. Skip and
-            // acknowledge the toggle so blinkStateChanged stops firing. Common
-            // when the cursor is hidden (t_vi, long-running commands).
-            //
-            // isBlinkOnlyFrame already covers !hasNewCommit, dirtyRows.isEmpty,
-            // !anyLayerWork, dirtyRectPxOpt == nil, !smoothScrolling,
-            // !drawableSizeChanged and hasPresentedOnce — critical, because
-            // those were consumed under the lock above and skipping without
-            // checking them would lose the update.
-            if rowMode
-                && isBlinkOnlyFrame
-                && currentCursorCount == 0
-                && !shared.anyCustomShaderNeedsAnimation {
+            // Blink toggled with no cursor to draw (shared with
+            // ExternalGridView). Skip and acknowledge the toggle so
+            // blinkStateChanged stops firing. Common when the cursor is hidden
+            // (t_vi, long-running commands).
+            if rowMode && idleTerms.skipsBlinkWithNoCursor(cursorVertexCount: currentCursorCount) {
                 blink.lastRendered = cursorBlinkStateSnapshot
                 FrameTracer.trace(.drawSkipNoChange, a: 4)
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
@@ -4502,17 +4437,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                             // root-side extraction to fall back on: the root
                             // pass takes only gridId == 1 retained rows.
                             let retainedForGlowCount = collectLayerRetainedRows(layer.gridId)
-                            for pass in 0..<2 {
-                                if pass == 0 {
-                                    guard let occludePipe = shared.glowOccludePipeline else { continue }
-                                    enc.setRenderPipelineState(occludePipe)
-                                } else {
-                                    enc.setRenderPipelineState(extractPipe)
-                                }
-                                encodeSurfaceResolvedRows(
-                                    encoder: enc,
-                                    rows: 0..<(rowCount + retainedForGlowCount)
-                                ) { row in
+                            encodeSurfaceLayerGlowRows(
+                                encoder: enc,
+                                rows: 0..<(rowCount + retainedForGlowCount),
+                                resolve: { row in
                                     resolveSurfaceLayerRow(
                                         row,
                                         set: set,
@@ -4521,26 +4449,24 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                                         retainedIndices: self.retainedIndexScratch,
                                         cellHeightPx: Float(cellHi)
                                     )
-                                }
-                            }
+                                },
+                                occludePipeline: shared.glowOccludePipeline,
+                                extractPipeline: extractPipe
+                            )
                         }
                     }
 
                     // Cursor glow
+                    // The surface's whole offset array stays bound.
                     if cursorBlinkStateSnapshot, currentCursorCount > 0, let cvb = committedCursor.vertexBuffer {
-                        var ct: Float = 0
-                        // The cursor is in its own layer's pixel space.
-                        bindLayerTransform(
+                        encodeSurfaceCursorGlowExtract(
                             encoder: enc,
-                            LayerTransform(
-                                originPx: cursorLayerOriginSnapshot,
-                                extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
-                            )
+                            vertexBuffer: cvb,
+                            vertexCount: currentCursorCount,
+                            layerOriginPx: cursorLayerOriginSnapshot,
+                            viewportMetrics: viewportMetrics,
+                            bindScrollOffsets: { _ in }
                         )
-                        enc.setVertexBytes(&ct, length: MemoryLayout<Float>.size, index: 3)
-                        enc.setVertexBuffer(cvb, offset: 0, index: 0)
-                        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: currentCursorCount)
-                        bindLayerTransform(encoder: enc, viewportMetrics.layerTransform)
                     }
                     }
 
@@ -4565,7 +4491,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 t_drawable_start = CFAbsoluteTimeGetCurrent()
             }
             FrameTracer.trace(.drawableAcquireBegin)
-            guard let drawable = view.currentDrawable else {
+            let acquired = view.currentDrawable
+            // Emitted whether or not a drawable came back: the acquire that
+            // returns nil after ~1s is the stall analyze.py pairs Begin/End for.
+            FrameTracer.trace(.drawableAcquireEnd)
+            guard let drawable = acquired else {
                 FrameTracer.trace(.drawSkipNoDrawable)
                 // Commit the already-encoded persistent-texture work so Metal
                 // can reclaim the command buffer. A full dirty retry heals the
@@ -4575,7 +4505,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 bailWithoutSubmit("no drawable after back-buffer encode")
                 return
             }
-            FrameTracer.trace(.drawableAcquireEnd)
             if ZonvieCore.appLogEnabled {
                 let drawable_us = (CFAbsoluteTimeGetCurrent() - t_drawable_start) * 1_000_000
                 ZonvieCore.appLogPerf("[perf] draw_acquire_drawable us=\(String(format: "%.1f", drawable_us))")
@@ -5031,32 +4960,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         }
     }
 
-    /// Ensure one cursor slot's vertex buffer has room for `vertexCount`.
-    ///
-    /// No COW detach: a cursor callback replaces the cursor outright, so a slot
-    /// never shares a buffer with the committed one (see
-    /// `prepareCursorWriteState`). Allocate only when nil or too small.
-    private func ensureCursorBufferInSet(_ setIdx: Int, vertexCount: Int) {
-        let vc = max(0, vertexCount)
-        guard let needed = surfaceSafeNeededBytes(vertexCount: vc) else {
-            flushFailed = true
-            return
-        }
-        let slot = cursorSlots[setIdx]
-        guard slot.vertexBuffer == nil || needed > slot.vertexBufferCap else { return }
-        guard let nextCap = surfaceGrowCapacity(current: slot.vertexBufferCap, needed: max(1, needed)) else {
-            flushFailed = true
-            return
-        }
-        slot.vertexBufferCap = nextCap
-        slot.vertexBuffer = shared.device.makeBuffer(length: nextCap, options: .storageModeShared)
-        if slot.vertexBuffer == nil {
-            slot.vertexBufferCap = 0
-            flushFailed = true
-        }
-    }
-
-
     /// Raise the retention to cover a band this many rows wide. Set from the
     /// scroll input path, where a wheel event's row count is known.
     func setRetentionDepthRows(_ rows: Int) {
@@ -5269,7 +5172,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             || totalCols != sourceSet.knownTotalCols
         // Allocate synchronously: the async pre-provisioning gate this replaced
         // does not converge under sustained scroll (same reasoning as
-        // ExternalGridView.applyRowScroll). requirePreparedRowCapacity below
+        // ExternalGridView.applyRowScroll). requireSurfaceRowCapacity below
         // only records a real allocation failure for the async recovery path.
         let submitted = submitSurfaceRowVertices(
             target: bufferSets[writeSetIndex],
@@ -5281,14 +5184,23 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
-            inflightRowBuffers: { (self.inflightRowBuffer(atSlot: $0), nil) }
+            inflightRowBuffers: { self.inflightRowBuffers(gridId: 1, atSlot: $0) }
         )
         if !submitted {
-            _ = requirePreparedRowCapacity(
+            // Records the rows this surface still owes, for the provisioning
+            // pass the retry drives.
+            _ = requireSurfaceRowCapacity(
+                bufferSets: bufferSets,
+                ledger: rowCapacity,
+                lock: lock,
+                lockHeld: false,
                 row: rowStart,
                 vertexCount: count,
                 totalRows: totalRows,
-                useWriteMapping: true
+                maxRowBuffers: maxRowBuffers,
+                mappingSetIndex: writeSetIndex,
+                rowIsPhysical: false,
+                logLabel: "Renderer"
             )
             flushFailed = true
         } else if changesRowStructure {

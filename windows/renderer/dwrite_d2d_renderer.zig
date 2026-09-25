@@ -255,17 +255,22 @@ pub const Renderer = struct {
 
         var loaded = false;
         if (family_raw.len > 0) {
-            const cands = core.config.splitFontFamilyList(aa, family_raw) catch &.{};
-            for (cands) |cand_str| {
-                const resolved = core.redraw_handler.parseGuiFontCandidate(aa, cand_str) catch continue;
-                if (resolved.name.len == 0) continue;
-                const parsed_pt: f32 = @floatCast(resolved.point_size);
+            // The core's "name\tsize\tfeatures" lines, as onGuiFont reads
+            // them: a bare entry inherits `default_pt` and features are kept.
+            const lines = core.config.formatFontFamilyAsCandidateList(aa, family_raw, default_pt, "") catch "";
+            var line_it = std.mem.splitScalar(u8, lines, '\n');
+            while (line_it.next()) |entry| {
+                var fields = std.mem.splitScalar(u8, entry, '\t');
+                const cand_name = fields.next() orelse continue;
+                if (cand_name.len == 0) continue;
+                const parsed_pt = std.fmt.parseFloat(f32, fields.next() orelse "") catch 0;
+                const cand_features = fields.next() orelse "";
                 const cand_pt: f32 = if (size_explicit or parsed_pt <= 0) default_pt else parsed_pt;
-                self.setFontUtf8WithFeatures(resolved.name, cand_pt, "") catch |e| {
-                    if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ resolved.name, cand_pt, e });
+                self.setFontUtf8WithFeatures(cand_name, cand_pt, cand_features) catch |e| {
+                    if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ cand_name, cand_pt, e });
                     continue;
                 };
-                if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: selected '{s}' pt={d}\n", .{ resolved.name, cand_pt });
+                if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: selected '{s}' pt={d}\n", .{ cand_name, cand_pt });
                 loaded = true;
                 break;
             }
