@@ -21,6 +21,16 @@ func surfaceOtherMouseButtonName(_ buttonNumber: Int) -> String? {
     }
 }
 
+/// Neovim's modifier prefix for a mouse event ("S", "C", "A", "D").
+func neovimModifierString(_ flags: NSEvent.ModifierFlags) -> String {
+    var mods = ""
+    if flags.contains(.shift) { mods += "S" }
+    if flags.contains(.control) { mods += "C" }
+    if flags.contains(.option) { mods += "A" }
+    if flags.contains(.command) { mods += "D" }
+    return mods
+}
+
 /// One surface's scrollbar: which grid its knob shows, when the knob moves,
 /// shows and hides, and what a click or drag on it asks the core for.
 ///
@@ -238,143 +248,24 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         requestRedraw(nil)
     }
 
-    // --- Scroll state for smooth scrolling ---
-    // Per-grid accumulated scroll offset in pixels (for sub-cell smooth scrolling)
-    private var scrollOffsetPx: [Int64: CGFloat] = [:]
-    /// Reused by tickSmoothScroll to collect the external surfaces' seeds
-    /// without allocating on the per-frame path.
-    private var externalSeedScratch: [(gridId: Int64, rowsDelta: Int)] = []
     // Persistent scratch buffers for updateScrollShaderOffset, reused via
     // removeAll(keepingCapacity: true) instead of building fresh arrays
     // (compactMap/etc.) every call — this runs in the pre-draw path on
     // every scrolled frame.
     private var scrollOffsetInfoScratch: [GridSurfaceRenderer.ScrollOffsetInfo] = []
-    private var scrollOffsetStaleKeysScratch: [Int64] = []
     private var gridInfoMapScratch: [Int64: ZonvieCore.GridInfo] = [:]
     private var visibleGridIdsScratch: Set<Int64> = []
     // Reused by the fixedRects collection below; updateFixedFloatRects()
     // copies elements into the renderer's own storage rather than aliasing
     // this buffer, so reusing it here doesn't force a COW detach there.
     private var fixedFloatRectsScratch: [GridSurfaceRenderer.FixedFloatRect] = []
-    // Lock protecting scrollOffsetPx from concurrent access between
-    // the RPC thread (processPendingScrollClears via submitVerticesRowRaw)
-    // and the main thread (handleScrollInput, updateScrollShaderOffset).
-    // Lock order: scrollOffsetLock -> pendingSentScrollLock (never reversed).
-    private let scrollOffsetLock = NSLock()
     // Tracks whether the previous updateScrollShaderOffset call had any
     // offsets, so the idle (empty) case can skip rebuilding the
     // Dictionary/Set/array below every frame while still running the one
     // "just went empty" transition call that clears the renderer's state.
     private var hadScrollOffsetsLastCall = false
 
-    // Scroll commands sent to Neovim and not yet answered. Incremented on send,
-    // decremented by the rows a grid_scroll reports. It bounds how far the
-    // lookahead may run and feeds the buffer-edge detection (requests that stop
-    // being answered) — it is NOT proof of who scrolled: one notification can
-    // carry several rows and take the count to zero mid-gesture.
-    private var pendingSentScroll: [Int64: Int] = [:]
-    private let pendingSentScrollLock = NSLock()
-
-    // Windows this gesture is moving besides the one it was aimed at — the rest
-    // of a 'scrollbind' group. They receive the same compensation and the same
-    // finger travel, so they ease out together. Guarded by scrollOffsetLock.
-    private var gestureBoundGrids: Set<Int64> = []
-
-    // The grid whose window has our 'smoothscroll' borrowed, and whether the
-    // enable request still has to be retried. Main thread only (scroll input
-    // and the pre-draw tick).
-    private var smoothScrollBorrowedGrid: Int64?
-    private var smoothScrollBorrowPending = false
-    /// Windows whose borrow was handed back but whose request the core refused.
-    /// Drained by the frame tick until it accepts.
-    private var smoothScrollHandback: Set<Int64> = []
-
-    // Thread-safe scroll reconciliation queues (grid_scroll events from the Zig
-    // thread), carrying the signed distance the content moved in rows.
-    //
-    // The event arrives while its own flush is still running, and the vertices
-    // that actually move those rows are published by that flush's commit — so
-    // it is staged here and released to the drain only when the commit lands
-    // (renderer.onCommitPublished). Reconciling earlier moves the picture back
-    // by a row for one frame and forward again the next, which is what a
-    // trackpad scroll showed as judder. This mirrors how the smooth-scroll row
-    // retention is published: with the vertices it belongs to, never ahead.
-    private var stagedScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
-    private var pendingScrollClear: [(gridId: Int64, rowsDelta: Int)] = []
-    private let pendingScrollClearLock = NSLock()
-
-    // Stale scroll detection: timestamp of the first unanswered tick per grid.
-    // When pendingSentScroll > 0 but no grid_scroll arrives for a while, the
-    // scroll likely hit a buffer boundary (Neovim can't scroll further).
-    // Time-based (not frame-counted) so multiple tick callers per frame
-    // (main onPreDraw + external views) cannot distort the thresholds.
-    private var scrollStaleSince: [Int64: CFAbsoluteTime] = [:]
-
-    // --- Edge bounce (rubber-band) state ---
-    // Grids whose scroll hit a buffer edge. Value is the blocked direction:
-    // +1 = top edge (positive offset, "up" refused), -1 = bottom edge.
-    // Protected by scrollOffsetLock. While blocked, further input toward the
-    // edge gets rubber-band resistance; once the gesture and momentum end,
-    // the offset eases back to 0 (bounce-back).
-    private var scrollEdgeBlocked: [Int64: CGFloat] = [:]
-    // Lock-free hint for the per-frame tick's early exit. May lag behind
-    // removals (harmless extra lock acquisition) but inserts happen on the
-    // main thread — the same thread as the tick — so it never under-reports
-    // an active bounce.
-    private var scrollEdgeBlockedHint = false
-    // Trackpad gesture lifecycle: true while a scroll gesture is running, i.e.
-    // from .began/.changed until .ended/.cancelled. Fingers merely resting
-    // (.mayBegin) do NOT set it — that carries no delta and can be resolved by
-    // .cancelled without one, and treating it as a gesture let a resting hand
-    // claim every grid's scrolls with no expiry. Gates the bounce-back so a
-    // held overscroll stays put until the fingers lift (native rubber-band
-    // feel); a hand put back on the pad mid-bounce no longer freezes it.
-    // Momentum does NOT gate the bounce: like the native one, it starts as
-    // soon as the edge is hit and swallows the remaining momentum.
-    // Written on the main thread, read on the core thread as a hint — see
-    // noteScrollGesturePhase for what the lock does and does not cover.
-    private var scrollGestureTouching = false
-    // True while a momentum phase is running. Only used to keep momentum
-    // events from refreshing lastPreciseScrollInputTime, which would gate the
-    // bounce-back of unrelated grids.
-    private var scrollMomentumRunning = false
-    // Last precise scroll input timestamp: fallback gate for phase-less
-    // precise events (devices without a gesture lifecycle).
-    private var lastPreciseScrollInputTime: CFAbsoluteTime = 0
-    // Grid the current gesture is driving. The three fields above describe the
-    // pad, not a grid, so scroll ownership must additionally match this id: a
-    // grid Neovim scrolls on its own is not the finger's just because a
-    // gesture is running elsewhere. Cleared when the fingers lift so a later
-    // gesture cannot inherit it; during the momentum that follows, ownership
-    // rests on the in-flight count and the lookahead set until the first
-    // momentum event re-establishes the id.
-    private var gestureScrollGridId: Int64?
-    // Grids the reconciliation already cancelled a scroll against. The seed
-    // guard infers "the gesture settled this grid" from the in-flight count
-    // and the lookahead set, but the reconciliation drains both on its way
-    // out, so after it runs those two cannot distinguish "already paid" from
-    // "never involved" — and the seed would pay the same row a second time.
-    // Recorded under scrollOffsetLock, which both sites already hold.
-    // Lifetime is one tickSmoothScroll, not one flush: the reconciliation also
-    // drains from the core thread's vertex callbacks, so a mark can outlive
-    // the commit that set it when several commits land between two draws. The
-    // failure that costs is over-suppression — one row loses its ease — never
-    // the double payment this exists to prevent.
-    private var reconciledThisTick: Set<Int64> = []
-    // Last tick timestamp: dedupes multiple tick callers in the same frame
-    // and scales the bounce decay by actual elapsed time.
-    private var lastScrollEdgeTickTime: CFAbsoluteTime = 0
-
     override var scrollbarCore: ZonvieCore? { core }
-
-    /// Scroll offset below this threshold (in pixels) is treated as zero and removed.
-    /// Used consistently in processPendingScrollClears, updateScrollShaderOffset,
-    /// and tickScrollEdgeBounce to prevent stale zero-offset entries from keeping
-    /// offsets.isEmpty == false (which would trigger markAllRowsDirty every frame).
-    private static let scrollOffsetEpsilon: CGFloat = 1.0
-    /// Wheel events the lookahead may send for one scroll input. Also the
-    /// bound `fastScrollThresholdPt` derives the discrete cut-over from.
-    private static let maxLookaheadEventsPerInput = 3
 
     /// Upper bound on the total scroll-offset entry count (directly-scrolled
     /// windows + followed floats combined) passed to the renderer each
@@ -383,85 +274,9 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     /// comfortably above any realistic simultaneous scroll-source count.
     static let maxScrollOffsets = 128
 
-    /// Stale-scroll thresholds: seconds without a grid_scroll response (while
-    /// scrolls are pending) after which the scroll is considered blocked at a
-    /// buffer edge. The short threshold applies when the viewport confirms the
-    /// edge; the long one is the safety fallback when viewport info is missing
-    /// or disagrees — a genuinely slow response mid-buffer must not be
-    /// mistaken for an edge, while folds at end of buffer (which the viewport
-    /// check cannot see) must still decay eventually.
-    private static let scrollEdgeConfirmedSeconds: TimeInterval = 0.066
-    private static let scrollEdgeFallbackSeconds: TimeInterval = 0.2
-
-    /// Per-60fps-frame decay factor for the edge bounce-back animation,
-    /// scaled by actual elapsed time in the tick. From a full overscroll this
-    /// eases to epsilon in ~250ms.
-    private static let scrollBounceDecayPerFrame: CGFloat = 0.75
-
-    /// Per-60fps-frame decay factor for the keyboard sub-row ease. Neovim
-    /// delivers whole rows, and the moment one lands drifts by a few ms
-    /// against the frame clock, so occasionally a frame gets none and the next
-    /// gets two. Holding the picture back by the scrolled distance and easing
-    /// it forward turns that into fractional motion. Steady-state lag is
-    /// h * d / (1 - d) — one row at 0.5, which is the price of covering the
-    /// jitter without reading as an animation.
-    ///
-    /// `ZONVIE_SMOOTH_SCROLL_DECAY` overrides it (0 < d < 1) so the ease can be
-    /// slowed until it is visible — at 0.5 it is deliberately too fast to read
-    /// as motion, which makes "is it animating at all?" impossible to answer by
-    /// eye. Values near 0.9 make one step take about half a second. The offset
-    /// is still clamped to what the retention ring covers, so a very slow decay
-    /// holds at that ceiling rather than easing from further away.
-    private static let smoothScrollDecayPerFrame: CGFloat = {
-        guard let raw = ProcessInfo.processInfo.environment["ZONVIE_SMOOTH_SCROLL_DECAY"],
-              let d = Double(raw), d > 0, d < 1 else { return 0.5 }
-        return CGFloat(d)
-    }()
-
-    /// Rows each scrolled window's content has travelled upwards, accumulated
-    /// from on_grid_scroll. Paired with the renderer's per-layer placement
-    /// travel to tell a float what it has actually performed.
-    ///
-    /// A landing hands the anchor a compensation that cancels the rows its
-    /// content just moved, so the picture does not jump when the flush lands
-    /// and the finger consumes the compensation instead. A float following
-    /// that anchor inherits the compensation, but Neovim re-places the float
-    /// through win_float_pos, which need not reach the frontend in the same
-    /// commit. In the frames between, the float carries a compensation for a
-    /// step it has not taken — the debt this ledger measures.
-    /// Guarded by scrollOffsetLock.
-    private var anchorLandedRowsUp: [Int64: Int] = [:]
-
     /// The anchor counters as the frame's offsets saw them. Main thread only,
     /// filled inside the hold that reads scrollOffsetPx.
     private var anchorLandedRowsUpScratch: [Int64: Int] = [:]
-
-    /// Grids whose scroll offset is owned by the keyboard ease (as opposed to
-    /// a trackpad gesture). Guarded by scrollOffsetLock.
-    private var smoothScrollGrids: Set<Int64> = []
-
-    /// Grids whose offset is the lookahead compensation of a trackpad gesture:
-    /// Neovim has already scrolled a row the finger has not travelled yet, and
-    /// the offset holds the picture where the finger says it should be. The
-    /// finger consumes it pixel by pixel, so it must not decay while the
-    /// gesture lasts. Guarded by scrollOffsetLock.
-    private var gestureLookaheadGrids: Set<Int64> = []
-
-    /// How long after the last precise scroll event the ease keeps out of a
-    /// grid's offset. Covers the gap between a gesture's last event and the
-    /// grid_scroll it produced coming back through the flush.
-    private static let smoothScrollGestureGuardSeconds: TimeInterval = 0.2
-
-    /// Scratch for the per-frame seed drain; kept as a field so the tick does
-    /// not allocate a dictionary every frame.
-    private var seedScratch: [Int64: Int] = [:]
-    private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
-
-    /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
-    /// renderer clamp (clampVisualScrollOffsetPx) and the rubber-band
-    /// resistance curve — they must agree or the band stops responding before
-    /// (or keeps stretching past) what the renderer can display.
-    private static let scrollMaxOverscrollCells: CGFloat = 2.0
 
     // --- Active draw loop (mirrors ExternalGridView.activateDrawLoop pattern) ---
     // During rapid updates (scrolling, typing), switch MTKView to continuous
@@ -529,383 +344,19 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
 
-    /// Send committed text to Neovim immediately on the keyDown path.
-    /// Why: a prior design buffered repeats in a single-slot `pendingInput`
-    /// flushed by displayLink. That added 2-8ms of pre-send latency, which
-    /// gave Neovim a window to batch consecutive keystroke responses into
-    /// one flush (visible as "0-row frame, then 2-row jump" stutter during
-    /// held-`j` scrolling), and silently dropped extras when keys arrived
-    /// faster than vsync.
-    private func sendInputNow(_ text: String) {
-        sendInputForHeldKey(text)
-        // Keep the active draw loop alive so the response is drawn promptly.
-        drawLoopIdleCounter.noteActive()
-    }
-
-    /// Send committed text and record it for repeat synthesis. An external
-    /// window's grid view sends through here so a key held over it is
-    /// replayable by the same synthesizer.
-    func sendInputForHeldKey(_ text: String) {
-        // Record what a fresh keyDown actually sent, so synthesized repeats
-        // can replay exactly the same input (see Key Repeat Synthesis below).
-        if keyRepeatCaptureActive {
-            keyRepeatCapturedText = text
-            keyRepeatCapturedCount += 1
-        }
-        core?.sendInput(text)
-    }
-
-    // MARK: - Key Repeat Synthesis
-    //
-    // macOS key-repeat delivery is not metronomic: the system repeat timer
-    // (and especially Karabiner-Elements' virtual-device path) can drift and
-    // beat against the 60Hz display, dropping ~1 repeat/sec and producing a
-    // visible scroll hitch (see tmp/ scroll-jank investigation, runs 1-8).
-    // Instead of trusting the OS cadence, zonvie uses OS events only as
-    // edges: the initial keyDown is processed normally and its outgoing
-    // input recorded; the FIRST OS auto-repeat proves the key is repeatable
-    // (this also keeps press-and-hold/accent-popup behavior intact, since
-    // those keys never produce OS repeats) and hands the cadence over to a
-    // synthesizer.
-    //
-    // EXPERIMENT (decoupled-key-repeat, tmp/project_scroll_jank_investigation
-    // Run11-12): the synthesizer used to fire from the draw callback (main
-    // thread), tying repeat-send timing to render-loop pacing. That couples
-    // the two: a compositor-side stall in nextDrawable() (unavoidable, see
-    // Run11) delays the next draw(in:) call and, with it, the next repeat
-    // send, one-for-one. A dedicated CVDisplayLink (its own thread, per
-    // Apple's docs) now drives send timing instead, so a render stall no
-    // longer perturbs input cadence — matching how Neovide's OS-driven
-    // (non-synthesized) repeats are unaffected by its own render stalls.
-    // draw(in:)'s tick is kept only for the IME/focus safety-disarm check,
-    // which must run on the main thread (AppKit calls).
-    //
-    // sendInput/sendKeyEvent's Zig-core path is safe for this concurrent
-    // caller: nextMsgId() is atomic and sendRaw() already serializes through
-    // write_queue_mu; only the shared key_buf escape scratch buffer needed a
-    // new lock (key_buf_mu, core-side).
-
-    /// What the initial keyDown sent to Neovim; replayed verbatim per repeat.
-    private enum HeldKeyAction {
-        case text(String)
-        case keyEvent(mods: UInt32, characters: String?, charactersIgnoringModifiers: String?)
-    }
-    // Guards the fields below: written from the main thread (keyDown/keyUp,
-    // takeOverKeyRepeat, disarmKeyRepeatSynthesis) and read+partially-written
-    // (synthNextFire) from the display-link callback thread.
-    private var keyRepeatLock = os_unfair_lock()
-    private var heldKeyCode: UInt16? = nil
-    private var heldKeyAction: HeldKeyAction? = nil
-    /// The view the held key was pressed in. The safety net below must ask
-    /// THAT window whether it is still the key window: while an external
-    /// window holds focus this one is not, and checking itself would disarm
-    /// every repeat the external window starts.
-    private weak var heldKeyOwner: KeyRepeatOwner? = nil
-    private(set) var synthRepeatActive = false
-    /// Bumped by disarmKeyRepeatSynthesis. The display-link tick snapshots it
-    /// under the lock and replayHeldKeyOffMain re-validates it immediately
-    /// before the send, narrowing (not closing) the window in which a keyUp
-    /// still lets one extra keystroke through. The send must stay OUTSIDE the
-    /// lock: it reaches Core.sendRawClassified, which polls in 50ms steps
-    /// while SSH auth is pending, and the main thread takes this same lock
-    /// every frame in tickKeyRepeatSynthesis().
-    private var keyRepeatGeneration: UInt64 = 0
-    /// CLOCK_UPTIME_RAW seconds of the next synthesized fire.
-    private var synthNextFire: Double = 0
-    private var synthInterval: Double = 1.0 / 60.0
-    // Capture window: set for the duration of a fresh keyDown's processing.
-    // Main thread only (only ever read/written from the real keyDown path,
-    // never from the display-link repeat path — see replayHeldKeyOffMain).
-    private var keyRepeatCaptureActive = false
-    private var keyRepeatCapturedText: String? = nil
-    private var keyRepeatCapturedCount = 0
-
-    private var repeatDisplayLink: CVDisplayLink? = nil
-    /// Extra retain on self held while the display link may still fire;
-    /// released in stopRepeatDisplayLink(). See startRepeatDisplayLink().
-    private var repeatDisplayLinkContext: Unmanaged<MetalTerminalView>? = nil
-
-    private static func uptimeNow() -> Double {
-        return Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) / 1_000_000_000.0
-    }
-
-    /// Record the held key after a fresh keyDown was processed.
-    private func armHeldKey(owner: KeyRepeatOwner, code: UInt16, action: HeldKeyAction) {
-        heldKeyOwner = owner
-        heldKeyCode = code
-        heldKeyAction = action
-    }
-
-    private func disarmKeyRepeatSynthesis(_ reason: String) {
-        os_unfair_lock_lock(&keyRepeatLock)
-        let wasActive = synthRepeatActive
-        synthRepeatActive = false
-        keyRepeatGeneration &+= 1
-        heldKeyCode = nil
-        heldKeyAction = nil
-        heldKeyOwner = nil
-        os_unfair_lock_unlock(&keyRepeatLock)
-        if wasActive {
-            ZonvieCore.appLogScrollMode("[keyRepeat] disarm (\(reason))")
-        }
-        stopRepeatDisplayLink()
-    }
-
-    /// First OS auto-repeat observed for the held key: take over the cadence.
-    private func takeOverKeyRepeat(owner: KeyRepeatOwner) {
-        // The repeats are arriving at `owner`, which need not be the view the
-        // key was pressed in: focus can move during the ~0.5s before the first
-        // one (a cmdline window closing on its own last Backspace, say). The
-        // safety net has to follow the view actually receiving them, or it
-        // reads the departed window's key status and disarms immediately.
-        heldKeyOwner = owner
-        // NSEvent.keyRepeatInterval mirrors the user's key-repeat setting.
-        // Clamp defensively; 0 would spin and >1s is nonsense for repeats.
-        let interval = max(1.0 / 120.0, min(1.0, NSEvent.keyRepeatInterval))
-        os_unfair_lock_lock(&keyRepeatLock)
-        synthInterval = interval
-        synthRepeatActive = true
-        synthNextFire = Self.uptimeNow() + interval
-        let code = heldKeyCode ?? 0
-        os_unfair_lock_unlock(&keyRepeatLock)
-        ZonvieCore.appLogScrollMode("[keyRepeat] takeover keyCode=0x\(String(code, radix: 16)) interval_ms=\(String(format: "%.2f", interval * 1000.0))")
-        // This OS repeat is replaced by an immediate synthesized one, then
-        // the display link paces the rest.
-        replayHeldKey()
-        activateSurfaceDrawLoop()
-        startRepeatDisplayLink()
-    }
-
-    /// Replay on the main thread (initial takeover, and the safety path).
-    private func replayHeldKey() {
-        guard let code = heldKeyCode, let action = heldKeyAction else {
-            disarmKeyRepeatSynthesis("no held action")
-            return
-        }
-        switch action {
-        case .text(let t):
-            sendInputNow(t)
-        case .keyEvent(let mods, let chars, let charsIg):
-            core?.sendKeyEvent(
-                keyCode: UInt32(code),
-                mods: mods,
-                characters: chars,
-                charactersIgnoringModifiers: charsIg
-            )
-        }
-    }
-
-    /// Replay from the display-link callback thread. Must not touch
-    /// keyRepeatCaptureActive/keyRepeatCapturedText (main-thread only; a
-    /// synthesized repeat is never captured) or read AppKit state directly.
-    private func replayHeldKeyOffMain(code: UInt16, action: HeldKeyAction, generation: UInt64) {
-        // Last check before the send, and it must be the LAST statement before
-        // it: a keyUp running disarmKeyRepeatSynthesis on the main thread any
-        // time up to this point must suppress the repeat, or the user sees one
-        // extra character. Checking earlier (e.g. straight after the tick's own
-        // critical section) is worthless -- nothing runs in between, so it only
-        // re-observes state the tick already held the lock for.
-        //
-        // This narrows the race to the few instructions between the unlock and
-        // the send; it does not eliminate it. Closing it completely would mean
-        // holding keyRepeatLock across the send, which is not acceptable: the
-        // send reaches Core.sendRawClassified, which sleeps in 50ms steps while
-        // SSH auth is pending (bounded only by the 60s auth timeout), and the
-        // main thread takes this same lock every frame from draw(in:) via
-        // tickKeyRepeatSynthesis().
-        os_unfair_lock_lock(&keyRepeatLock)
-        let stillArmed = synthRepeatActive && keyRepeatGeneration == generation
-        os_unfair_lock_unlock(&keyRepeatLock)
-        guard stillArmed else { return }
-        FrameTracer.trace(.inputSend, a: UInt64(code))
-        switch action {
-        case .text(let t):
-            core?.sendInput(t)
-        case .keyEvent(let mods, let chars, let charsIg):
-            core?.sendKeyEvent(
-                keyCode: UInt32(code),
-                mods: mods,
-                characters: chars,
-                charactersIgnoringModifiers: charsIg
-            )
-        }
-        // No activeDrawIdleFrames reset here: notifyDrawIdle() already resets
-        // it every frame while synthRepeatActive is set (checked on the main
-        // thread from the draw loop itself), so a cross-thread async dispatch
-        // from this callback would be redundant. A prior version dispatched
-        // one here per repeat tick (~60/s while held).
-    }
-
-    /// Called from the display-link callback (its own thread, per Apple's
-    /// CVDisplayLink docs — not main). Determines whether a repeat is due
-    /// and, if so, sends it directly: this is the whole point of the
-    /// experiment — a main-thread render stall (nextDrawable under
-    /// compositor backpressure) must not delay this send.
-    private func tickKeyRepeatSynthesisOffMain() {
-        os_unfair_lock_lock(&keyRepeatLock)
-        guard synthRepeatActive, let code = heldKeyCode, let action = heldKeyAction else {
-            os_unfair_lock_unlock(&keyRepeatLock)
-            return
-        }
-        let now = Self.uptimeNow()
-        let interval = synthInterval
-        // Mirrors the main-thread tick's half-tick tolerance, but there is no
-        // single well-defined "tick period" off the render clock, so use half
-        // the repeat interval itself as the tolerance window.
-        guard now >= synthNextFire - interval * 0.5 else {
-            os_unfair_lock_unlock(&keyRepeatLock)
-            return
-        }
-        synthNextFire += interval
-        if synthNextFire < now {
-            synthNextFire = now + interval
-        }
-        let generation = keyRepeatGeneration
-        os_unfair_lock_unlock(&keyRepeatLock)
-        // replayHeldKeyOffMain re-validates `generation` immediately before the
-        // send; see its comment for why the check lives there and not here, and
-        // why the send stays outside the lock.
-        replayHeldKeyOffMain(code: code, action: action, generation: generation)
-    }
-
-    private func startRepeatDisplayLink() {
-        guard repeatDisplayLink == nil else { return }
-        var link: CVDisplayLink?
-        let status = CVDisplayLinkCreateWithActiveCGDisplays(&link)
-        guard status == kCVReturnSuccess, let link else {
-            ZonvieCore.appLogScrollMode("[keyRepeat] CVDisplayLinkCreateWithActiveCGDisplays failed status=\(status)")
-            return
-        }
-        // Retained (not passUnretained): the display link's callback runs on
-        // its own thread and may fire at any point until CVDisplayLinkStop
-        // takes effect. An unretained context would dangle if this view were
-        // deallocated (e.g. its tab/window closed) while a repeat was still
-        // armed — deinit had no stopRepeatDisplayLink() call, so the link
-        // could keep running past the view's lifetime. The extra retain here
-        // keeps self alive until stopRepeatDisplayLink() releases it below.
-        let retained = Unmanaged.passRetained(self)
-        repeatDisplayLinkContext = retained
-        CVDisplayLinkSetOutputCallback(link, { _, _, _, _, _, ctx in
-            guard let ctx else { return kCVReturnSuccess }
-            let view = Unmanaged<MetalTerminalView>.fromOpaque(ctx).takeUnretainedValue()
-            view.tickKeyRepeatSynthesisOffMain()
-            return kCVReturnSuccess
-        }, retained.toOpaque())
-        CVDisplayLinkStart(link)
-        repeatDisplayLink = link
-    }
-
-    private func stopRepeatDisplayLink() {
-        guard let link = repeatDisplayLink else { return }
-        CVDisplayLinkStop(link)
-        repeatDisplayLink = nil
-        repeatDisplayLinkContext?.release()
-        repeatDisplayLinkContext = nil
-    }
-
-    /// Called from the renderer's draw entry every frame (main thread).
-    /// No-op unless a synthesized repeat is armed. Only the safety-disarm
-    /// check remains here; send timing is driven by the display link.
-    func tickKeyRepeatSynthesis() {
-        os_unfair_lock_lock(&keyRepeatLock)
-        let active = synthRepeatActive
-        os_unfair_lock_unlock(&keyRepeatLock)
-        guard active else { return }
-        // Safety net: lost keyUps (Cmd-Tab etc.) and IME activation must
-        // never leave a key repeating forever. Asked of the view holding the
-        // key, which is an external window's whenever one started the repeat.
-        // An owner that has gone away cannot deliver the keyUp that would end
-        // this, so its disappearance is itself a reason to stop; every arm
-        // records an owner, so nil here means deallocated, not unset.
-        guard let owner = heldKeyOwner else {
-            disarmKeyRepeatSynthesis("owner gone")
-            return
-        }
-        if owner.hasMarkedText() || owner.window?.isKeyWindow != true {
-            disarmKeyRepeatSynthesis("safety")
-        }
-    }
-
-    /// The repeat gate every grid view's keyDown runs first. True means
-    /// synthesis owns this key's cadence and the caller must drop the event.
-    ///
-    /// External windows come through here too. Their keyDowns reach Neovim
-    /// via this view's core, so without the gate a key held over one runs on
-    /// the OS repeat timer and beats against the display: measured 2.2
-    /// stalled frames/s, against 0.33/s for the same grid driven by
-    /// synthesis.
-    func keyRepeatSwallowsOSRepeat(_ event: NSEvent, owner: KeyRepeatOwner) -> Bool {
-        if event.isARepeat {
-            if synthRepeatActive && event.keyCode == heldKeyCode {
-                return true  // synthesis owns this key's cadence; swallow OS repeats
-            }
-            if !synthRepeatActive, event.keyCode == heldKeyCode,
-               heldKeyAction != nil, !owner.hasMarkedText()
-            {
-                takeOverKeyRepeat(owner: owner)
-                return true
-            }
-            // Unknown repeat state: stay transparent, process normally.
-            return false
-        }
-        // Fresh press (also rollover to another key): previous synthesis
-        // no longer matches reality.
-        disarmKeyRepeatSynthesis("new keyDown")
-        return false
-    }
-
-    /// Record a held key an external grid view sent with sendKeyEvent.
-    func armHeldKeyEvent(
-        owner: KeyRepeatOwner,
-        code: UInt16,
-        mods: UInt32,
-        characters: String?,
-        charactersIgnoringModifiers: String?
-    ) {
-        armHeldKey(owner: owner, code: code, action: .keyEvent(
-            mods: mods,
-            characters: characters,
-            charactersIgnoringModifiers: charactersIgnoringModifiers
-        ))
-    }
-
-    /// Open the capture window around an external grid view's keyDown so the
-    /// text it ends up sending through sendInputForHeldKey is recorded.
-    func beginHeldKeyCapture(isRepeat: Bool) {
-        keyRepeatCaptureActive = !isRepeat
-        keyRepeatCapturedText = nil
-        keyRepeatCapturedCount = 0
-    }
-
-    /// Close it, arming the key only for a clean single-send press.
-    func endHeldKeyCapture(owner: KeyRepeatOwner, code: UInt16) {
-        guard keyRepeatCaptureActive else { return }
-        keyRepeatCaptureActive = false
-        guard keyRepeatCapturedCount == 1, let t = keyRepeatCapturedText,
-              !owner.hasMarkedText() else { return }
-        armHeldKey(owner: owner, code: code, action: .text(t))
-    }
-
-    /// Disarm from an external grid view's keyUp or flagsChanged. A nil `code`
-    /// means "whatever is held": any modifier change invalidates the recorded
-    /// input (e.g. j -> C-j).
-    func disarmKeyRepeat(ifHeld code: UInt16?, reason: String) {
-        guard let held = heldKeyCode else { return }
-        if let code, code != held { return }
-        disarmKeyRepeatSynthesis(reason)
-    }
+    private var keyInput: SessionKeyInput? { core?.keyInput }
 
     override func keyUp(with event: NSEvent) {
         // The same call an external grid view makes; this surface open-coded
         // the held-key test the API already performs.
-        disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
+        keyInput?.disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
         super.keyUp(with: event)
     }
 
     override func flagsChanged(with event: NSEvent) {
         // Any modifier change invalidates the recorded input (e.g. j -> C-j),
         // which is what a nil `ifHeld` means.
-        disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
+        keyInput?.disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
         super.flagsChanged(with: event)
     }
 
@@ -941,7 +392,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // render (holding j at the end of the buffer).
         if drawLoopIdleCounter.noteIdle(
             hadRecentCommit: renderer?.hadRecentCommit(withinNs: 50_000_000) == true,
-            heldActive: synthRepeatActive
+            heldActive: keyInput?.synthRepeatActive == true
         ) {
             deactivateSurfaceDrawLoop()
         }
@@ -1029,30 +480,20 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         }
 
         renderer.onCommitPublished = { [weak self] in
-            self?.publishStagedScrollClears()
+            self?.scrollModel?.publishStagedScrollClears()
         }
 
         renderer.onBeforeCommittedSnapshot = { [weak self] in
             guard let self else { return }
-            self.processPendingScrollClears()
+            self.scrollModel?.processPendingScrollClears()
             self.updateScrollShaderOffset()
         }
 
         renderer.onPreDraw = { [weak self] in
-            // Clear the offsets grid_scroll left pending before any vertices
-            // are drawn, or split windows shift twice.
-            self?.processPendingScrollClears()
-            // Hand 'smoothscroll' back once the gesture is over. Frame-driven
-            // so a missed .ended phase cannot leave the user's option flipped.
-            self?.tickGestureSmoothScroll()
-            // Advance the sub-row ease (seed + decay) for keyboard scrolling.
-            self?.tickSmoothScroll()
-            // Detect buffer-edge blocked scrolls and run the rubber-band
-            // bounce-back animation once the gesture/momentum ends.
-            self?.tickScrollEdgeBounce()
+            self?.scrollModel?.serviceFrame()
             // Keep the draw loop alive while an edge bounce is held/animating,
             // so the bounce-back keeps ticking after input events stop.
-            if let self, self.isPaused, self.isScrollEdgeBounceActive() {
+            if let self, self.isPaused, self.scrollModel?.isScrollEdgeBounceActive() == true {
                 self.activateSurfaceDrawLoop()
             }
             // Update shader with current scroll offsets (safe to call here on main thread).
@@ -1116,20 +557,14 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             // The view is leaving its window (tab/window closed, possibly
             // while a key is still held): disarm proactively so the
             // repeat-pacing CVDisplayLink stops and releases its extra
-            // retain on self (see startRepeatDisplayLink) instead of relying
-            // on deinit, which cannot run while that retain is outstanding.
-            disarmKeyRepeatSynthesis("view detached from window")
+            // retain (see SessionKeyInput.startRepeatDisplayLink).
+            keyInput?.disarmKeyRepeatSynthesis("view detached from window")
         }
     }
 
     deinit {
         msgTimer?.invalidate()
         msgTimer = nil
-        // Belt-and-suspenders: viewDidMoveToWindow(nil) already disarms (and
-        // releases the display-link's retain on self) on the normal
-        // detachment path. This covers any path that reaches deinit without
-        // going through that first — a no-op if already stopped.
-        stopRepeatDisplayLink()
     }
 
     // MARK: - Mouse Input
@@ -1213,20 +648,11 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
     /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
 
-    func buildModifierString(from flags: NSEvent.ModifierFlags) -> String {
-        var mods = ""
-        if flags.contains(.shift) { mods += "S" }
-        if flags.contains(.control) { mods += "C" }
-        if flags.contains(.option) { mods += "A" }
-        if flags.contains(.command) { mods += "D" }
-        return mods
-    }
-
     private func sendMouseEvent(button: String, action: String, event: NSEvent) {
         guard let core else { return }
 
         let location = convert(event.locationInWindow, from: nil)
-        let modifier = buildModifierString(from: event.modifierFlags)
+        let modifier = neovimModifierString(event.modifierFlags)
 
         // The press claims its grid for every button, and the drag and release
         // that follow stay on it: Neovim keeps a drag on the window the press
@@ -1248,9 +674,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             guard let g = pointerGeometry(at: location) else { return }
             let globalCol = g.globalCol
 
-            scrollOffsetLock.lock()
-            let dragOffsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[cache.gridId] ?? 0, cellHeightPx: g.cellH)
-            scrollOffsetLock.unlock()
+            let dragOffsetPx = scrollModel?.visualScrollOffsetPx(gridId: cache.gridId, cellHeightPx: g.cellH) ?? 0
 
             // The band the press cached, not the grid as it stands now: a drag
             // that resizes the grids would otherwise answer a different
@@ -1571,7 +995,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
 
     func submitVerticesRowRaw(rowStart: Int, rowCount: Int, ptr: UnsafePointer<zonvie_vertex>?, count: Int, flags: UInt32, totalRows: Int, totalCols: Int) {
-        processPendingScrollClears()
+        scrollModel?.processPendingScrollClears()
 
         renderer.submitVerticesRowRaw(rowStart: rowStart, rowCount: rowCount, ptr: ptr, count: count, flags: flags, totalRows: totalRows, totalCols: totalCols)
 
@@ -1640,272 +1064,24 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     override func keyDown(with event: NSEvent) {
-        handleGridKeyDown(event, owner: self, traceSurface: 1)
-    }
-
-    /// One keyDown for every grid view. `owner` is the view the event reached:
-    /// its marked text, input context and window decide composition and when a
-    /// repeat must stop. This view supplies the core and the repeat synthesis,
-    /// whose pacing every surface shares — an external view's keys left on the
-    /// OS repeat timer beat against the display and stalled a frame at a time.
-    /// The two views spelled this body out separately.
-    func handleGridKeyDown(_ event: NSEvent, owner: KeyRepeatOwner, traceSurface: Int64) {
-        guard let core else { return }
-
-        let m = event.modifierFlags
-
-        // Check if Option key should be treated as Meta (Alt) based on config.
-        // Left Option raw flag: 0x20, Right Option raw flag: 0x40.
-        let optionIsMeta = KeyCharacterSelection.optionActsAsMeta(
-            hasOption: m.contains(.option),
-            modifierRawValue: m.rawValue,
-            optionAsMeta: core.getOptionAsMeta()
-        )
-        let hasControlOrCommand = m.contains(.control) || m.contains(.command) || optionIsMeta
-
-        // evt_ts: NSEvent.timestamp (kernel event time, seconds since boot) in ms.
-        // Comparing evt_ts deltas against handler-entry deltas separates the
-        // repeat generator's cadence from main-runloop delivery quantization.
-        ZonvieCore.appLogScrollMode("[keyDown] surface=\(traceSurface) keyCode=0x\(String(event.keyCode, radix: 16)) chars=\(event.characters ?? "") hasMarked=\(owner.hasMarkedText()) ctrl/cmd=\(hasControlOrCommand) isRepeat=\(event.isARepeat) evt_ts=\(String(format: "%.3f", event.timestamp * 1000.0))")
-
-        // --- Key repeat synthesis (see MARK above) ---
-        let swallowed = keyRepeatSwallowsOSRepeat(event, owner: owner)
-        // External views only: this surface records its sends where the
-        // synthesis sends them, and test/perf/analyze.py counts every tag-12
-        // row as a send.
-        if FrameTracer.enabled, owner !== self {
-            FrameTracer.trace(
-                .inputSend,
-                a: UInt64(event.keyCode),
-                b: (event.isARepeat ? 1 : 0) | (swallowed ? 2 : 0),
-                seq: UInt32(truncatingIfNeeded: traceSurface)
-            )
-        }
-        if swallowed { return }
-
-        // If IME is composing (has marked text), let IME handle all keys
-        // except Escape which cancels composition.
-        if owner.consumeKeyDuringComposition(event) { return }
-
-        // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
-
-        if hasControlOrCommand || isSpecialKey {
-            let mods = KeyCharacterSelection.modifierMask(
-                control: m.contains(.control),
-                optionIsMeta: optionIsMeta,
-                shift: m.contains(.shift),
-                command: m.contains(.command),
-                ctrlBit: UInt32(ZONVIE_MOD_CTRL),
-                altBit: UInt32(ZONVIE_MOD_ALT),
-                shiftBit: UInt32(ZONVIE_MOD_SHIFT),
-                superBit: UInt32(ZONVIE_MOD_SUPER)
-            )
-
-            let chars = KeyCharacterSelection.primaryCharacters(
-                optionIsMeta: optionIsMeta,
-                characters: event.characters,
-                charactersIgnoringModifiers: event.charactersIgnoringModifiers
-            )
-
-            ZonvieCore.appLogScrollMode("[keyDown] -> sendKeyEvent (special/mod) optMeta=\(optionIsMeta) chars=\(chars ?? "nil")")
-            core.sendKeyEvent(
-                keyCode: UInt32(event.keyCode),
-                mods: mods,
-                characters: chars,
-                charactersIgnoringModifiers: event.charactersIgnoringModifiers
-            )
-            // Cmd shortcuts must not synthesize repeats; everything else
-            // (arrows, Ctrl-d, ...) is a replayable held-key candidate.
-            if !event.isARepeat && !m.contains(.command) {
-                armHeldKeyEvent(
-                    owner: owner,
-                    code: event.keyCode,
-                    mods: mods,
-                    characters: chars,
-                    charactersIgnoringModifiers: event.charactersIgnoringModifiers
-                )
-            }
-            return
-        }
-
-        // `:` <-> `;` swap (config-gated). Handle it here, on the keyDown path
-        // for a single keypress, rather than in sendInputNow: paste also flows
-        // through sendInputNow, and swapping there would corrupt pasted text
-        // containing `:`/`;`. These two ASCII chars never start IME
-        // composition, so bypassing IME for them is safe. The held action
-        // stores the swapped char so synthesized repeats replay it verbatim.
-        // `endHeldKeyCapture` also refuses to arm while text is marked, which
-        // cannot happen here: the guard already required none.
-        if ZonvieConfig.shared.input.swapColonSemicolon, !owner.hasMarkedText(),
-           let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
-        {
-            beginHeldKeyCapture(isRepeat: event.isARepeat)
-            // Only this surface's own draw loop is kept awake for the reply.
-            if owner === self { sendInputNow(swapped) } else { sendInputForHeldKey(swapped) }
-            endHeldKeyCapture(owner: owner, code: event.keyCode)
-            return
-        }
-
-        // Plain key: capture what this keyDown sends (via IME insertText) so
-        // repeats can replay it. Only a clean single-send keyDown is a
-        // synthesis candidate.
-        beginHeldKeyCapture(isRepeat: event.isARepeat)
-        defer { endHeldKeyCapture(owner: owner, code: event.keyCode) }
-
-        // Let the system handle IME input.
-        if let ctx = owner.inputContext, ctx.handleEvent(event) {
-            ZonvieCore.appLogScrollMode("[keyDown] -> inputContext.handleEvent returned true")
-            return
-        }
-        ZonvieCore.appLogScrollMode("[keyDown] -> interpretKeyEvents fallback")
-        // Fallback: interpret key events directly.
-        owner.interpretKeyEvents([event])
+        keyInput?.handleGridKeyDown(event, owner: self, traceSurface: 1)
     }
 
     // MARK: - Smooth Scrolling
 
     private var scrollTargetLock = ScrollTargetLock()
 
-    /// Shared by this view and every external grid view, like the vertical
-    /// scroll state; a new gesture or a new target grid starts it empty.
-    private var horizontalScroll = HorizontalScrollAccumulator()
-    private var horizontalScrollGridId: Int64 = 0
-
-    /// Send the horizontal part of a scroll input. Shared with external grid
-    /// views, like handleScrollInput.
-    func handleHorizontalScrollInput(
-        gridId: Int64, row: Int32, col: Int32,
-        deltaX: CGFloat, deltaY: CGFloat, scale: CGFloat,
-        hasPrecise: Bool, modifier: String
-    ) {
-        guard let core else { return }
-        if gridId != horizontalScrollGridId {
-            horizontalScroll = HorizontalScrollAccumulator()
-            horizontalScrollGridId = gridId
-        }
-        // 'mousescroll' hor: columns one event moves. Paying one event per
-        // that many cells keeps the text with the finger; 0 disables it.
-        let colsPerEvent = core.getMouseScrollHor()
-        guard colsPerEvent > 0 else { return }
-        let stepPx = CGFloat(renderer.cellWidthPx) * CGFloat(colsPerEvent)
-        let steps = horizontalScroll.consume(
-            deltaX: deltaX, deltaY: deltaY, precise: hasPrecise, scale: scale, stepPx: stepPx)
-        guard steps != 0 else { return }
-        // AppKit turns Shift + a vertical mouse wheel into horizontal deltas.
-        // That Shift chose the axis; passed on, it would make every notch
-        // <S-ScrollWheelLeft>, a whole page.
-        let axisSwapped = !hasPrecise && deltaY == 0 && modifier.contains("S")
-        let sentModifier = axisSwapped ? modifier.replacingOccurrences(of: "S", with: "") : modifier
-        let direction = steps > 0 ? "left" : "right"
-        for _ in 0..<abs(steps) {
-            core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: sentModifier)
-        }
-    }
+    private var scrollModel: SessionScrollModel? { core?.scrollModel }
 
     override func scrollWheel(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
-        handleGridScrollWheel(
+        scrollModel?.handleGridScrollWheel(
             event, lock: &scrollTargetLock, scale: window?.backingScaleFactor ?? 2.0, logTag: "scroll",
             resolve: { resolveScrollTarget(at: location, requireScrollable: $0) },
             // Shader uniforms are propagated in onPreDraw (which always runs
             // updateScrollShaderOffset before draw); calling it here too would
             // re-do the same work and fire markAllRowsDirty twice per input.
             afterPrecise: { _ in requestRedraw() })
-    }
-
-    /// The scrollWheel body this view and every external grid view run.
-    /// `resolve` names the grid under the pointer, each view in its own
-    /// coordinates; `afterPrecise` is what the view does after a sub-cell
-    /// scroll to keep its own frames coming.
-    func handleGridScrollWheel(
-        _ event: NSEvent,
-        lock: inout ScrollTargetLock,
-        scale: CGFloat,
-        logTag: String,
-        resolve: (_ requireScrollable: Bool) -> ScrollTargetLock.Target,
-        afterPrecise: (_ newOffset: CGFloat) -> Void
-    ) {
-        noteScrollGesturePhase(event)
-        lock.noteBegan(event)
-        defer { lock.noteFinished(event) }
-        let deltaY = event.scrollingDeltaY
-        let deltaX = event.scrollingDeltaX
-        if deltaY == 0 && deltaX == 0 { return }
-
-        let modifier = buildModifierString(from: event.modifierFlags)
-
-        if deltaY != 0 {
-            let target = lock.target(for: event, isVertical: true, resolve: resolve)
-            ZonvieCore.appLog("[\(logTag)] deltaY=\(deltaY) hasPrecise=\(event.hasPreciseScrollingDeltas) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
-            let newOffset = handleScrollInput(
-                gridId: target.gridId,
-                row: target.row,
-                col: target.col,
-                deltaY: deltaY,
-                scale: scale,
-                hasPrecise: event.hasPreciseScrollingDeltas,
-                modifier: modifier
-            )
-            if event.hasPreciseScrollingDeltas {
-                ZonvieCore.appLog("[\(logTag)] stored offset=\(newOffset)")
-                afterPrecise(newOffset)
-            }
-        }
-
-        if deltaX != 0 {
-            let target = lock.target(for: event, isVertical: false, resolve: resolve)
-            handleHorizontalScrollInput(
-                gridId: target.gridId, row: target.row, col: target.col,
-                deltaX: deltaX, deltaY: deltaY, scale: scale,
-                hasPrecise: event.hasPreciseScrollingDeltas, modifier: modifier)
-        }
-    }
-
-    /// Track the trackpad gesture lifecycle for the edge bounce. A held
-    /// overscroll must stay put while fingers are down; bounce-back starts as
-    /// soon as they lift. Called from scrollWheel of this view and of external
-    /// grid views (shared scroll state).
-    func noteScrollGesturePhase(_ event: NSEvent) {
-        if event.phase.contains(.began) { horizontalScroll = HorizontalScrollAccumulator() }
-        // Written on the main thread, read on the core thread by
-        // processPendingScrollClears when it decides who owns a scroll — so
-        // the writes take the same lock that read is already holding.
-        //
-        // Only the id COMPARISONS are covered — `padIsDriving` reads the id for
-        // nil-ness and the phase booleans before taking the lock at all, as
-        // does tickScrollEdgeBounce for its early exit. Those reads are hints:
-        // a few microseconds of staleness is nothing against the 0.2 s window
-        // the terms carry (0.03 s for the edge-bounce exit), and a stale
-        // Optional tag can only name a grid that was valid a moment ago.
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        let phase = event.phase
-        // .mayBegin is fingers landing, not a scroll: it carries no delta and
-        // may be resolved by .cancelled without one. Treating it as an active
-        // gesture let a resting hand claim every grid's scrolls and hold the
-        // keyboard ease off for as long as the fingers stayed down — the only
-        // term here with no expiry of its own.
-        if phase.contains(.began) || phase.contains(.changed) {
-            scrollGestureTouching = true
-        } else if phase.contains(.ended) || phase.contains(.cancelled) {
-            scrollGestureTouching = false
-            // Lift: drop the recent-input window so a blocked offset starts
-            // its bounce-back on the very next tick.
-            lastPreciseScrollInputTime = 0
-            // The gesture is over, so it no longer speaks for any grid: a
-            // later gesture on a different grid must not inherit this id.
-            // The momentum that follows still owns whatever it has in flight
-            // through the in-flight count and the lookahead set, and its first
-            // event re-establishes the id.
-            gestureScrollGridId = nil
-        }
-        let momentum = event.momentumPhase
-        if momentum.contains(.began) || momentum.contains(.changed) {
-            scrollMomentumRunning = true
-        } else if momentum.contains(.ended) || momentum.contains(.cancelled) {
-            scrollMomentumRunning = false
-        }
     }
 
     /// Whether the MAIN window composites this grid.
@@ -1937,16 +1113,15 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         let drawableHeight = Float((drawableHi / cellHi) * cellHi)
         guard drawableHeight > 0 else { return }
 
-        // Idle fast path: nothing to do once scrollOffsetPx has been empty
+        // Idle fast path: nothing to do once the model has held no offset
         // for more than one call. appendFloatScrollOffsets() itself no-ops
-        // when offsets (built from scrollOffsetPx) is empty, so "no floats
-        // need servicing" is already implied here -- skip building the
-        // Dictionary/Set/array below entirely. The FIRST empty call after a
-        // non-empty one still falls through, so the transition still
-        // propagates an empty state to the renderer (clearing stale offsets).
-        scrollOffsetLock.lock()
-        let isEmptyNow = scrollOffsetPx.isEmpty
-        scrollOffsetLock.unlock()
+        // when offsets is empty, so "no floats need servicing" is already
+        // implied here -- skip building the Dictionary/Set/array below
+        // entirely. The FIRST empty call after a non-empty one still falls
+        // through, so the transition still propagates an empty state to the
+        // renderer (clearing stale offsets).
+        guard let scrollModel = scrollModel else { return }
+        let isEmptyNow = !scrollModel.hasOffsets
         if isEmptyNow && !hadScrollOffsetsLastCall {
             return
         }
@@ -1957,64 +1132,25 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // + manual insert loops) instead of grids.map + Dictionary(uniqueKeysWithValues:)
         // + Set(...) — this runs in the pre-draw path on every scrolled frame.
         let grids = core.getVisibleGridsCached()
-        // The float ledger's other half, read once per frame under the
-        // renderer's lock rather than per float.
-        // The external surfaces' half of the same ledger. Merged after the main
-        // renderer's, which clears the scratch; the two never name the same
-        // grid, because a grid is placed by exactly one surface.
         gridInfoMapScratch.removeAll(keepingCapacity: true)
         for g in grids { gridInfoMapScratch[g.gridId] = g }
         let gridInfoMap = gridInfoMapScratch
 
-        // Prune stale entries: remove gridIds that are no longer visible.
-        // visibleGridIdsScratch and scrollOffsetStaleKeysScratch are reused
-        // below (cleared again) for the near-zero-offset pruning pass —
-        // safe since both passes are sequential, non-overlapping uses
-        // within this same call.
         visibleGridIdsScratch.removeAll(keepingCapacity: true)
         for key in gridInfoMap.keys { visibleGridIdsScratch.insert(key) }
-        scrollOffsetLock.lock()
-        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
-        for key in scrollOffsetPx.keys where !visibleGridIdsScratch.contains(key) {
-            scrollOffsetStaleKeysScratch.append(key)
-        }
-        for key in scrollOffsetStaleKeysScratch {
-            scrollOffsetPx.removeValue(forKey: key)
-            scrollEdgeBlocked.removeValue(forKey: key)
-        }
-        // A destroyed grid's ledger describes a float that no longer exists,
-        // and its id is reused by the next float a scroll creates. The
-        // baselines live with the surfaces that draw the floats now; only the
-        // anchor counter is still this view's.
-        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
-        for key in anchorLandedRowsUp.keys where !visibleGridIdsScratch.contains(key) {
-            scrollOffsetStaleKeysScratch.append(key)
-        }
-        for key in scrollOffsetStaleKeysScratch {
-            anchorLandedRowsUp.removeValue(forKey: key)
-        }
 
         let ndcScale: Float = 2.0 / drawableHeight
 
-        scrollOffsetStaleKeysScratch.removeAll(keepingCapacity: true)
         scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
-        for (gridId, offsetPx) in scrollOffsetPx {
-            guard let info = gridInfoMap[gridId] else { continue }
-            let clampedOffsetPx = clampVisualScrollOffsetPx(offsetPx, cellHeightPx: CGFloat(cellHeightPx))
-            // Skip near-zero offsets to ensure offsets.isEmpty becomes true,
-            // preventing markAllRowsDirty from firing every frame. Also prune
-            // the entry itself — otherwise scrollOffsetPx never becomes empty
-            // for this grid, permanently disabling the idle fast path above
-            // and causing this function to rebuild the offsets array every
-            // call indefinitely.
-            guard abs(clampedOffsetPx) >= Self.scrollOffsetEpsilon else {
-                scrollOffsetStaleKeysScratch.append(gridId)
-                continue
-            }
-            // Pruned above whatever surface draws it -- the map is this view's
-            // and every surface reads its offsets from it -- but only entered
-            // here when the MAIN renderer is the one drawing it.
-            guard mainSurfaceDraws(info) else { continue }
+        scrollModel.collectFrameOffsets(
+            visible: visibleGridIdsScratch,
+            cellHeightPx: CGFloat(cellHeightPx),
+            anchors: &anchorLandedRowsUpScratch
+        ) { gridId, clampedOffsetPx in
+            // Pruned whatever surface draws it -- every surface reads its
+            // offsets from the one model -- but only entered here when the
+            // MAIN renderer is the one drawing it.
+            guard let info = gridInfoMap[gridId], mainSurfaceDraws(info) else { return }
 
             let gridTopPx = Float(info.startRow) * cellHeightPx
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
@@ -2032,19 +1168,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
                 zindex: Int32(clamping: info.zindex)
             ))
         }
-        for key in scrollOffsetStaleKeysScratch {
-            scrollOffsetPx.removeValue(forKey: key)
-        }
-        // The anchor counters, taken with the offsets they belong to.
-        // processPendingScrollClears moves a grid's landed rows and its
-        // compensation in the same iteration of the same lock; read in a
-        // second acquisition, the float ledger could be handed a counter from
-        // after a landing and an offset from before it, and withhold nothing
-        // for a row the compensation had just gained. Measured as a 33.1px
-        // step with the placement standing still.
-        anchorLandedRowsUpScratch.removeAll(keepingCapacity: true)
-        for (gridId, rows) in anchorLandedRowsUp { anchorLandedRowsUpScratch[gridId] = rows }
-        scrollOffsetLock.unlock()
 
         // Propagate the underlying window's sub-cell offset to float windows that
         // sit over it. Neovim repositions floats discretely (cell granularity) on
@@ -2143,1131 +1266,8 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     /// Left in place rather than deleted; do not write code that relies on it
     /// running.
     private func clearAllScrollOffsets() {
-        scrollOffsetLock.lock()
-        scrollOffsetPx.removeAll()
-        scrollEdgeBlocked.removeAll()
-        scrollOffsetLock.unlock()
+        scrollModel?.clearAllOffsets()
         renderer.clearScrollOffsets()
-    }
-
-    // MARK: - Public Scroll API (for external windows)
-
-    /// Tell the renderer which rows of each visible grid its smooth scroll may
-    /// retain an outgoing row from. A vertical split or a float always fails
-    /// the core's row-scroll fast path (partial width), so the grid_scroll
-    /// capture is the only thing that can keep their outgoing row alive. A
-    /// full-width grid normally belongs to the fast path, but that path only
-    /// sees rows that actually shifted — a 'smoothscroll' window repaints
-    /// instead — so it is armed as well, and the fast path stands down for a
-    /// grid this one already retained.
-    ///
-    /// Note the spans are never disarmed in practice (see
-    /// clearAllScrollOffsets), so one gesture arms every grid for the session.
-    private func armScrollRetention(gridId: Int64) {
-        guard GridSurfaceRenderer.smoothScrollEnabled, let core else { return }
-        // The band a wheel event opens is as wide as the rows it moves, so the
-        // retention has to keep that many to cover it.
-        renderer.setRetentionDepthRows(core.getMouseScrollVer())
-        let grids = core.getVisibleGridsCached()
-        // 'scrollbind' (:vert diffsplit) answers one gesture by scrolling every
-        // bound window, and each of them opens a band of its own. Arming only
-        // the window under the finger left the others with nothing to fill
-        // theirs. Which ones move is Neovim's decision and is not known until
-        // the scrolls arrive, so every visible grid is armed and the ones that
-        // do not move simply never capture.
-        // Grid 1 is not a window: its span would take in the tabline and status
-        // rows, and a retained row from there is content that never scrolled.
-        for candidate in grids where candidate.gridId != gridId && candidate.gridId != 1 {
-            armScrollRetentionSpan(for: candidate, grids: grids)
-        }
-        guard let info = grids.first(where: { $0.gridId == gridId }) else { return }
-
-        armScrollRetentionSpan(for: info, grids: grids)
-    }
-
-    /// The rows one grid's smooth scroll may retain an outgoing row from.
-    private func armScrollRetentionSpan(for info: ZonvieCore.GridInfo, grids: [ZonvieCore.GridInfo]) {
-        // A grid an external window draws, as its root or as a layer, keeps its
-        // rows in that window's surface, so the span is armed there. Spans are
-        // grid-local either way.
-        switch core?.resolveExternalGridRoute(gridId: info.gridId) {
-        case .externalRoot(let view), .externalLayer(let view):
-            view.setScrollCaptureBounds(
-                gridId: info.gridId,
-                top: Int(info.marginTop),
-                bottomEx: Int(info.rows - info.marginBottom)
-            )
-            return
-        case .deferred:
-            return
-        default:
-            break
-        }
-
-        // Armed for full-width windows too, which used to be left to the
-        // row-scroll fast path alone. That path only sees rows that actually
-        // shifted, so when Neovim repaints a 'smoothscroll' window instead of
-        // scrolling it, nothing was staged and the band opened with no rows to
-        // fill it. The fast path now stands down for a grid this one already
-        // retained, so the two cannot stage the same movement twice.
-        // Grid-local rows, like the external case above: each grid keeps its
-        // own row buffers, so a span in surface rows would index the wrong set.
-        renderer.setGridScrollCaptureBounds(
-            gridId: info.gridId,
-            bounds: (
-                top: Int(info.marginTop),
-                bottomEx: Int(info.rows - info.marginBottom)
-            )
-        )
-    }
-
-    func handleScrollInput(
-        gridId: Int64,
-        row: Int32,
-        col: Int32,
-        deltaY: CGFloat,
-        scale: CGFloat,
-        hasPrecise: Bool,
-        modifier: String = ""
-    ) -> CGFloat {
-        guard let core else { return 0 }
-
-        let rowHeightPx = CGFloat(renderer.cellHeightPx)
-        guard rowHeightPx > 0 else { return 0 }
-
-        // grid=1 (global grid) does not support pixel-based smooth scrolling
-        // gridId < 0 means Zonvie-managed external windows (ext_messages, ext_cmdline)
-        // which don't receive grid_scroll events from Neovim
-        var effectiveHasPrecise = hasPrecise && gridId > 1
-
-        // Disable pixel scrolling for terminal UI tools (lazygit, tig, etc.)
-        // Detection: terminal mode + cursor not visible (busy)
-        // When a terminal UI tool is running, the cursor is typically hidden (busy_start).
-        if effectiveHasPrecise {
-            let (mode, cursorVisible) = core.getModeStateNonBlocking()
-            if mode == "terminal" && !cursorVisible {
-                effectiveHasPrecise = false
-            }
-        }
-
-        // How many rows one wheel event is worth ('mousescroll' ver). The
-        // sub-cell model asks Neovim for rows before the finger has travelled
-        // them and cancels each arrival against the pixel offset it holds, so
-        // an event has to be accounted as the N rows it really moves. Assuming
-        // one made a fast gesture jump the other N-1 per event.
-        // 'ver:0' disables mouse scrolling in Neovim, so there is nothing to
-        // account with and pixel scrolling is not attempted at all.
-        let rowsPerWheelEvent = core.getMouseScrollVer()
-        if rowsPerWheelEvent < 1 {
-            effectiveHasPrecise = false
-        }
-
-        // Instant edge detection from the (non-blocking) viewport cache:
-        // engage the rubber band on the first overscroll pixel instead of
-        // waiting for the stale-frame fallback. Checked before the fast-scroll
-        // switch — a hard flick at the edge must stretch the band, not switch
-        // to discrete mode (whose scrolls the edge would refuse anyway).
-        // nil = viewport unavailable (no info, or lock busy with empty cache).
-        let edgeBlockedNow: Bool? = effectiveHasPrecise
-            ? isScrollBlockedAtEdge(gridId: gridId, deltaY: deltaY)
-            : nil
-
-        // Disable pixel scrolling for fast scrolling to prevent overwhelming Neovim
-        // If deltaY is large (fast scroll), switch to cell-based scrolling
-        if effectiveHasPrecise && edgeBlockedNow != true {
-            // What the lookahead below can request in one input (see its
-            // `scrollCount < Self.maxLookaheadEventsPerInput`); the rule and
-            // its reasons are on the function.
-            let fastScrollThreshold = CGFloat(fastScrollThresholdPt(
-                rowHeightPx: Double(rowHeightPx),
-                rowsPerWheelEvent: rowsPerWheelEvent,
-                maxEventsPerInput: Self.maxLookaheadEventsPerInput,
-                scale: Double(scale)
-            ))
-            if abs(deltaY) > fastScrollThreshold {
-                effectiveHasPrecise = false
-                // Clear any accumulated offset when switching to fast mode,
-                // and hand ownership of this grid back with it. The discrete
-                // path below books nothing, so every scroll it sends comes
-                // back with sentCount == 0 — but while the fingers are still
-                // down, gestureScrollGridId and gestureLookaheadGrids keep
-                // answering "the gesture owns this grid", and
-                // processPendingScrollClears then credits the arrival's whole
-                // distance to the offset. Nothing consumes that, so the
-                // picture carries up to a clamp's worth of displacement for
-                // the body of every fast flick (26% of reconciliations in a
-                // real trackpad log arrived this way). Discrete scrolling asks
-                // for whole rows and wants no sub-cell compensation, so those
-                // arrivals belong in the Neovim-initiated branch, which clears
-                // the offset. A later slow event re-establishes ownership.
-                scrollOffsetLock.lock()
-                scrollOffsetPx.removeValue(forKey: gridId)
-                scrollStaleSince.removeValue(forKey: gridId)
-                scrollEdgeBlocked.removeValue(forKey: gridId)
-                gestureLookaheadGrids.remove(gridId)
-                if gestureScrollGridId == gridId {
-                    gestureScrollGridId = nil
-                    // The bound windows belonged to that gesture. Left behind,
-                    // they would hold a compensation nothing pays down.
-                    for bound in gestureBoundGrids {
-                        scrollOffsetPx.removeValue(forKey: bound)
-                        gestureLookaheadGrids.remove(bound)
-                    }
-                    gestureBoundGrids.removeAll(keepingCapacity: true)
-                }
-                scrollOffsetLock.unlock()
-                pendingSentScrollLock.lock()
-                pendingSentScroll.removeValue(forKey: gridId)
-                pendingSentScrollLock.unlock()
-            }
-        }
-
-        if effectiveHasPrecise {
-            // Arm the outgoing-row retention before any scroll request goes
-            // out: Neovim's grid_scroll can come back within a millisecond,
-            // ahead of the next frame, so the geometry cannot be picked up
-            // from the pre-draw pass. Takes the renderer lock, so it must
-            // stay outside scrollOffsetLock (the order the rest of this file
-            // keeps).
-            armScrollRetention(gridId: gridId)
-
-            // Trackpad: implement sub-cell smooth scrolling for external grids
-            let deltaYPx = deltaY * scale
-
-            // Borrow 'smoothscroll' BEFORE any wheel event goes out. Both travel
-            // the same ordered RPC channel, so a request sent afterwards leaves
-            // the gesture's first event to be processed under the old quantum:
-            // on a 'wrap'ped line that moves four or five screen rows against a
-            // booking of three, and the difference is visible as a row-sized
-            // jolt at exactly the moment a gesture starts. Measured — every
-            // gesture's first grid_scroll arrived before the borrow landed.
-            //
-            // Taken before scrollOffsetLock: the core call acquires the grid
-            // lock, and nothing else here nests those two.
-            requestGestureSmoothScroll(gridId: gridId)
-
-            // Read pending scroll count OUTSIDE scrollOffsetLock to avoid deadlock
-            pendingSentScrollLock.lock()
-            let alreadyPending = pendingSentScroll[gridId] ?? 0
-            pendingSentScrollLock.unlock()
-
-            // Counted in ROWS, not events: one event answers for
-            // rowsPerWheelEvent of them, and what the lookahead has to know is
-            // the distance already asked for. The backpressure cap is scaled
-            // to match so it still admits the same eight events it always did
-            // — as a row count it would otherwise throttle a fast gesture the
-            // moment 'mousescroll' was above one.
-            let maxTotalPending = 8 * rowsPerWheelEvent
-            let canSendMore = alreadyPending < maxTotalPending
-            let stepPx = rowHeightPx * CGFloat(rowsPerWheelEvent)
-
-            // Hold scrollOffsetLock for entire read-modify-write (TOCTOU fix).
-            // processPendingScrollClears also acquires this lock, but it runs on the
-            // core thread during flush, not concurrently with main-thread scroll input.
-            scrollOffsetLock.lock()
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
-            if let edgeBlockedNow {
-                let sign: CGFloat = deltaYPx > 0 ? 1 : -1
-                if edgeBlockedNow {
-                    // Viewport says this direction is refused — mark the edge
-                    // immediately. The stale-time path in tickScrollEdgeBounce
-                    // remains as fallback when viewport info is missing or
-                    // inexact (e.g. folds at end of buffer).
-                    if currentOffset * sign >= 0 {
-                        scrollEdgeBlocked[gridId] = sign
-                        scrollEdgeBlockedHint = true
-                    }
-                } else if scrollEdgeBlocked[gridId] == sign {
-                    // Fresh viewport disproves the block in this direction —
-                    // a false positive from the stale-time fallback or from a
-                    // stale lock-busy cache. Unblock so scrolling resumes.
-                    scrollEdgeBlocked.removeValue(forKey: gridId)
-                }
-            }
-            let blockedSign = scrollEdgeBlocked[gridId] ?? 0
-            let pushingIntoEdge = blockedSign != 0
-                && deltaYPx * blockedSign > 0
-                && currentOffset * blockedSign >= 0
-
-            var newOffset: CGFloat
-            var scrollCount = 0
-            var sendUp = false
-            if pushingIntoEdge {
-                // Pushing into a blocked edge: apply rubber-band resistance
-                // (response fades quadratically toward the visual clamp) and
-                // send no scroll commands — the edge refuses them. Fingers
-                // refresh the recent-input window so the band holds while
-                // touched; momentum does not, so the bounce-back decays the
-                // band concurrently and swallows the remaining momentum,
-                // like the native rubber band.
-                let maxOverscrollPx = rowHeightPx * Self.scrollMaxOverscrollCells
-                let frac = min(1.0, abs(currentOffset) / maxOverscrollPx)
-                newOffset = currentOffset + deltaYPx * (1.0 - frac) * (1.0 - frac)
-                if scrollGestureTouching {
-                    lastPreciseScrollInputTime = CFAbsoluteTimeGetCurrent()
-                }
-            } else {
-                // Momentum events must not refresh the recent-input window:
-                // it would gate the bounce-back of unrelated grids.
-                if !scrollMomentumRunning {
-                    lastPreciseScrollInputTime = CFAbsoluteTimeGetCurrent()
-                }
-                var canSendNow = canSendMore
-                if blockedSign != 0 {
-                    // Reversing away from a blocked edge.
-                    scrollEdgeBlocked.removeValue(forKey: gridId)
-                    // Drop pending scrolls only when provably dead (no response
-                    // for scrollEdgeFallbackSeconds). A viewport-detected block
-                    // can still have live in-flight scrolls from the approach;
-                    // their grid_scroll responses must stay accounted for.
-                    if let since = scrollStaleSince[gridId],
-                       CFAbsoluteTimeGetCurrent() - since >= Self.scrollEdgeFallbackSeconds {
-                        scrollStaleSince.removeValue(forKey: gridId)
-                        pendingSentScrollLock.lock()
-                        pendingSentScroll.removeValue(forKey: gridId)
-                        pendingSentScrollLock.unlock()
-                        canSendNow = true
-                    }
-                }
-
-                newOffset = currentOffset + deltaYPx
-
-                // Keep Neovim one row ahead of the finger rather than asking for
-                // a row only once the finger has travelled a whole one. The row
-                // that comes back is cancelled against the distance grid_scroll
-                // reports (processPendingScrollClears), so the picture does not
-                // move when it lands; the finger then consumes that
-                // compensation pixel by pixel and the row appears exactly as it
-                // is crossed. Asking at the threshold instead leaves the
-                // crossing racing an asynchronous commit, which is what a
-                // trackpad scroll showed as judder.
-                //
-                // The offset is not consumed here either way: what the picture
-                // owes is settled against content that actually arrived.
-                let sendDirection: CGFloat = deltaYPx > 0 ? 1 : -1
-                // A row already asked for but not yet landed is already ahead.
-                var lookaheadPx = newOffset - sendDirection * rowHeightPx * CGFloat(alreadyPending)
-                // Counted here, sent after the lock: the send is an RPC
-                // write the core treats as potentially blocking, and the core
-                // thread takes this lock under grid_mu.
-                while lookaheadPx * sendDirection > 0 && canSendNow && scrollCount < Self.maxLookaheadEventsPerInput {
-                    scrollCount += 1
-                    lookaheadPx -= sendDirection * stepPx
-                }
-                if scrollCount > 0 { sendUp = sendDirection > 0 }
-            }
-
-            // Clamp stored offset to the same visual range the renderer can display.
-            // Keeping state and presentation aligned avoids input/render divergence
-            // during sustained trackpad scrolling.
-            newOffset = clampVisualScrollOffsetPx(newOffset, cellHeightPx: rowHeightPx)
-
-            // Store final offset (atomic with read above — no TOCTOU gap).
-            // Note: the stale counter is NOT reset on input — it must keep
-            // ticking during a held gesture so tickScrollEdgeBounce can detect
-            // a blocked edge. Bounce-back is gated on gesture/momentum state
-            // instead, so it never fights active user input.
-            scrollOffsetPx[gridId] = newOffset
-            // A bound window ('scrollbind') is given the same compensation when
-            // its scroll lands, but the finger only ever paid down the grid it
-            // was aimed at — so that compensation sat at a full step and the
-            // window stayed displaced instead of easing back. The finger's
-            // travel is the only thing that consumes an offset, so it has to
-            // reach every window this gesture is moving.
-            //
-            // Only a window that is still holding compensation. A bound window
-            // that has settled on the cell grid drops its entry and is skipped
-            // until its next arrival re-creates it — and that arrival is the
-            // proof it is still moving. Paying a window with no entry instead
-            // meant one that had stopped being scrolled at all (its own buffer
-            // edge, or the gesture pushing into the driver's) accumulated the
-            // finger's travel with nothing to credit it back, and no decay
-            // path reaches it: it stays displaced until Neovim next scrolls it.
-            //
-            // Clamped like the driver above all the same, so a window whose
-            // arrivals stop mid-gesture cannot bank travel it will never be
-            // credited for and then ignore a reversed finger.
-            for bound in gestureBoundGrids where bound != gridId {
-                guard let held = scrollOffsetPx[bound] else { continue }
-                let paid = clampVisualScrollOffsetPx(
-                    held + deltaYPx,
-                    cellHeightPx: rowHeightPx
-                )
-                if abs(paid) < Self.scrollOffsetEpsilon {
-                    scrollOffsetPx.removeValue(forKey: bound)
-                    gestureLookaheadGrids.remove(bound)
-                } else {
-                    scrollOffsetPx[bound] = paid
-                }
-            }
-            // This is the grid the pad is driving; gesture ownership of an
-            // incoming grid_scroll is decided against it.
-            gestureScrollGridId = gridId
-            scrollOffsetLock.unlock()
-
-            for _ in 0..<scrollCount {
-                core.sendMouseScroll(
-                    gridId: gridId,
-                    row: row,
-                    col: col,
-                    direction: sendUp ? "up" : "down",
-                    modifier: modifier
-                )
-            }
-
-            if FrameTracer.enabled {
-                var packed = UInt64(min(scrollCount, 255))
-                packed |= UInt64(min(alreadyPending, 255)) << 8
-                if blockedSign != 0 { packed |= 1 << 16 }
-                if pushingIntoEdge { packed |= 1 << 17 }
-                FrameTracer.trace(
-                    .gestureScrollInput,
-                    a: UInt64(bitPattern: Int64(round(deltaYPx * 1000))),
-                    b: packed,
-                    seq: UInt32(truncatingIfNeeded: gridId)
-                )
-            }
-
-            // Track how many scroll commands we sent (outside scrollOffsetLock)
-            if scrollCount > 0 {
-                pendingSentScrollLock.lock()
-                pendingSentScroll[gridId, default: 0] += scrollCount * rowsPerWheelEvent
-                pendingSentScrollLock.unlock()
-            }
-
-            // Keep the draw clock running while scrolls are in flight or a
-            // sub-cell offset is showing: edge detection and bounce-back
-            // advance on draw ticks, and at a buffer edge Neovim sends no
-            // flushes, so flush-driven activation never fires (a paused loop
-            // would freeze the rubber band, e.g. while the finger holds still).
-            if isPaused && (abs(newOffset) >= Self.scrollOffsetEpsilon || alreadyPending + scrollCount > 0) {
-                activateSurfaceDrawLoop()
-            }
-
-            return newOffset
-        } else {
-            // Mouse wheel / fast scroll: send directly with acceleration
-            let direction = deltaY > 0 ? "up" : "down"
-
-            // The acceleration is measured in ROWS of finger travel, but one
-            // wheel event moves 'mousescroll' ver of them — sending one event
-            // per row runs the content ahead of the finger by exactly that
-            // factor, which is what made a fast flick overshoot. A discrete
-            // wheel notch still sends one event: its travel is under a row, so
-            // the division never reduces it below the floor of one.
-            // 'ver:0' disables mouse scrolling in Neovim, so there is no row
-            // count to divide by; the events it sends are ignored anyway.
-            let deltaYPx = abs(deltaY) * scale
-            let rowsTravelled = Int(deltaYPx / rowHeightPx)
-            let scrollCount = rowsPerWheelEvent > 0
-                ? max(1, rowsTravelled / rowsPerWheelEvent)
-                : 1
-
-            for _ in 0..<scrollCount {
-                core.sendMouseScroll(gridId: gridId, row: row, col: col, direction: direction, modifier: modifier)
-            }
-            return 0
-        }
-    }
-
-    /// Direction-specific buffer-edge check from the non-blocking viewport
-    /// cache. deltaY > 0 scrolls "up" (blocked at the buffer top); negative
-    /// scrolls "down" (blocked once the last line reached the window top,
-    /// which is where Neovim stops). Returns nil when viewport info is
-    /// unavailable — the stale-time fallback in tickScrollEdgeBounce covers
-    /// that case.
-    private func isScrollBlockedAtEdge(gridId: Int64, deltaY: CGFloat) -> Bool? {
-        guard let vp = core?.getViewportNonBlocking(gridId: gridId), vp.lineCount > 0 else {
-            return nil
-        }
-        if deltaY > 0 { return vp.topline <= 0 }
-        return vp.topline >= vp.lineCount - 1
-    }
-
-    /// Drop all scroll bookkeeping for a grid (offset, edge flag, stale time,
-    /// pending sends). Caller must hold scrollOffsetLock.
-    private func clearScrollStateLocked(gridId: Int64) {
-        scrollOffsetPx.removeValue(forKey: gridId)
-        scrollEdgeBlocked.removeValue(forKey: gridId)
-        scrollStaleSince.removeValue(forKey: gridId)
-        pendingSentScrollLock.lock()
-        pendingSentScroll.removeValue(forKey: gridId)
-        pendingSentScrollLock.unlock()
-    }
-
-    /// Record how far a grid's content just moved (thread-safe, callable from
-    /// any thread). Called from ZonvieCore on grid_scroll. rowsDelta is signed
-    /// and already summed over the scrolls the notification stands for, so it
-    /// is the distance to reconcile — the number of calls is not.
-    /// Staged until the flush carrying those rows commits.
-    func clearScrollOffsetForGrid(_ gridId: Int64, rowsDelta: Int) {
-        guard rowsDelta != 0 else { return }
-        // The reconciliation staged below hands the gesture a row of
-        // compensation to ease out; retain the outgoing row now, while the
-        // flush's source set still holds it, so the vacated band shows the
-        // row that left instead of the edge-row background stretch (the
-        // neighbouring row's highlight) on grids the row-scroll fast path
-        // cannot cover.
-        if GridSurfaceRenderer.smoothScrollEnabled {
-            scrollOffsetLock.lock()
-            let offset = scrollOffsetPx[gridId] ?? 0
-            let lookahead = gestureLookaheadGrids.contains(gridId)
-            scrollOffsetLock.unlock()
-            pendingSentScrollLock.lock()
-            let sent = pendingSentScroll[gridId] ?? 0
-            pendingSentScrollLock.unlock()
-            // Mirrors processPendingScrollClears' gestureOwns: only a scroll
-            // whose compensation will displace the grid needs its row kept —
-            // an unowned (keyboard/nvim) scroll here clears the offset, and
-            // the draw path would prune the retained row unused.
-            //
-            // padIsDriving covers the bound windows of a 'scrollbind' group on
-            // their first arrival, where none of the three terms above hold yet:
-            // the offset that displaces them is installed by the reconciliation
-            // this callback stages, so waiting for it would mean capturing a
-            // step too late and opening their band over nothing.
-            let padIsDriving = gestureScrollGridId != nil
-                && gridId != 1
-                && (scrollGestureTouching
-                    || scrollMomentumRunning
-                    || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
-            if sent > 0 || lookahead || padIsDriving || abs(offset) >= Self.scrollOffsetEpsilon {
-                // The route publishStagedScrollClears takes: the surface
-                // that draws the grid owns its rows. Asking only whether the
-                // grid IS an external window sent a float one hosts to the main
-                // renderer, which does not draw it — the band that float's
-                // offset opened was left to the edge stretch.
-                switch core?.resolveGridRoute(gridId: gridId) {
-                case .externalRoot(let view), .externalLayer(let view):
-                    // An external window's rows live in its own surface, not
-                    // the main composite, so the capture belongs to it. It
-                    // cannot happen here: its flush bracket opens lazily on
-                    // first content, which is after this callback, and opening
-                    // discards anything staged before it. Hand over the
-                    // distance instead and let it capture when the bracket
-                    // opens — the committed set still holds the on-screen rows
-                    // at that point.
-                    view.noteGridScroll(gridId: gridId, rowsDelta: rowsDelta)
-                case .deferred:
-                    break
-                default:
-                    renderer.captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta)
-                }
-            }
-        }
-        pendingScrollClearLock.lock()
-        stagedScrollClear.append((gridId: gridId, rowsDelta: rowsDelta))
-        pendingScrollClearLock.unlock()
-    }
-
-    /// Release what the main surface's commit landed. Called from the renderer
-    /// on the core thread with no renderer lock held.
-    ///
-    /// A grid an external surface draws is left staged for that surface's own
-    /// commit (`publishStagedScrollClears(ownedBy:)`): its rows land there, and
-    /// releasing its compensation here — a moment earlier, on the same thread
-    /// — let a draw of that surface pair the credit with rows it had not been
-    /// given yet, one row step early.
-    func publishStagedScrollClears() {
-        publishStagedScrollClears { gridId in
-            switch core?.resolveGridRoute(gridId: gridId) {
-            case .externalRoot, .externalLayer: return false
-            default: return true
-            }
-        }
-    }
-
-    /// Release what `view`'s commit landed. Called under that view's lock.
-    /// Returns how many entries were released.
-    @discardableResult
-    func publishStagedScrollClears(ownedBy view: ExternalGridView) -> Int {
-        publishStagedScrollClears { gridId in
-            switch core?.resolveGridRoute(gridId: gridId) {
-            case .externalRoot(let owner): return owner === view
-            case .externalLayer(let host): return host === view
-            default: return false
-            }
-        }
-    }
-
-    @discardableResult
-    private func publishStagedScrollClears(where owned: (Int64) -> Bool) -> Int {
-        pendingScrollClearLock.lock()
-        var released = 0
-        if !stagedScrollClear.isEmpty {
-            var kept = 0
-            for entry in stagedScrollClear {
-                if owned(entry.gridId) {
-                    pendingScrollClear.append(entry)
-                    released += 1
-                } else {
-                    stagedScrollClear[kept] = entry
-                    kept += 1
-                }
-            }
-            stagedScrollClear.removeLast(stagedScrollClear.count - kept)
-        }
-        pendingScrollClearLock.unlock()
-        return released
-    }
-
-    /// Per-frame scroll edge tick. Called from onPreDraw and from external
-    /// grid views; a time-based guard dedupes multiple callers per frame.
-    ///
-    /// Edge detection (fallback): when pendingSentScroll > 0 but no
-    /// grid_scroll response arrives, the scroll may have hit a buffer edge.
-    /// The viewport is consulted to confirm: a confirmed edge blocks after
-    /// scrollEdgeConfirmedSeconds, while a missing or disagreeing viewport
-    /// (slow response mid-buffer, folds at end of buffer) only blocks after
-    /// scrollEdgeFallbackSeconds. The primary, instant detection happens in
-    /// handleScrollInput from the same viewport cache.
-    ///
-    /// Bounce-back: once the trackpad gesture and its momentum end, blocked
-    /// offsets ease back to 0 (native rubber-band feel). While the user holds
-    /// the overscroll, the offset stays put.
-    private func tickScrollEdgeBounce() {
-        let rowHeightPx = CGFloat(renderer.cellHeightPx)
-        guard rowHeightPx > 0 else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastScrollEdgeTickTime >= 0.008 else { return }
-        // Elapsed time in 60fps frames, for rate-independent decay.
-        let elapsedFrames = min((now - lastScrollEdgeTickTime) * 60.0, 3.0)
-        lastScrollEdgeTickTime = now
-
-        pendingSentScrollLock.lock()
-        let pendingSnapshot = pendingSentScroll
-        pendingSentScrollLock.unlock()
-
-        // Cheap early exit without taking scrollOffsetLock (render-path rule).
-        // The hint may lag behind removals (one harmless extra pass) but
-        // inserts happen on this thread, so it never under-reports.
-        if pendingSnapshot.isEmpty && !scrollEdgeBlockedHint { return }
-
-        // Input is active while fingers are down; the timestamp fallback
-        // covers phase-less precise events. Momentum deliberately does not
-        // count: a blocked edge bounces back immediately, swallowing the
-        // remaining momentum (native rubber-band behavior).
-        let inputActive = scrollGestureTouching || now - lastPreciseScrollInputTime < 0.03
-
-        scrollOffsetLock.lock()
-        defer {
-            scrollEdgeBlockedHint = !scrollEdgeBlocked.isEmpty
-            scrollOffsetLock.unlock()
-        }
-
-        // 1) Edge detection fallback: track time without a grid_scroll response.
-        for (gridId, pendingCount) in pendingSnapshot {
-            guard pendingCount > 0 else { continue }
-
-            let since: CFAbsoluteTime
-            if let existing = scrollStaleSince[gridId] {
-                since = existing
-            } else {
-                scrollStaleSince[gridId] = now
-                since = now
-            }
-            guard scrollEdgeBlocked[gridId] == nil else { continue }
-
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
-            // Confirm with the viewport when possible. tryLock inside
-            // scrollOffsetLock cannot deadlock against the core thread's
-            // grid_mu -> scrollOffsetLock order because it never blocks.
-            let confirmed = abs(currentOffset) >= Self.scrollOffsetEpsilon
-                && isScrollBlockedAtEdge(gridId: gridId, deltaY: currentOffset) == true
-            let threshold = confirmed ? Self.scrollEdgeConfirmedSeconds : Self.scrollEdgeFallbackSeconds
-            guard now - since >= threshold else { continue }
-
-            if abs(currentOffset) < Self.scrollOffsetEpsilon {
-                // No visual offset to bounce — just drop the dead pending state.
-                clearScrollStateLocked(gridId: gridId)
-                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) cleared (offset was \(currentOffset))")
-            } else {
-                scrollEdgeBlocked[gridId] = currentOffset > 0 ? 1 : -1
-                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) blocked at edge, offset=\(currentOffset) pending=\(pendingCount) confirmed=\(confirmed)")
-            }
-        }
-
-        // 2) Bounce-back: ease blocked offsets to 0 once input has ended.
-        guard !inputActive && !scrollEdgeBlocked.isEmpty else { return }
-        let decay = CGFloat(pow(Double(Self.scrollBounceDecayPerFrame), elapsedFrames))
-        for (gridId, _) in scrollEdgeBlocked {
-            let currentOffset = scrollOffsetPx[gridId] ?? 0
-            let eased = currentOffset * decay
-            if abs(eased) < Self.scrollOffsetEpsilon {
-                clearScrollStateLocked(gridId: gridId)
-                ZonvieCore.appLog("[scrollEdge] gridId=\(gridId) bounce settled (was \(currentOffset))")
-            } else {
-                scrollOffsetPx[gridId] = eased
-            }
-        }
-    }
-
-    /// Ask Neovim to turn 'smoothscroll' on for the grid the gesture is
-    /// driving. Idempotent on the Neovim side, but only sent once per gesture;
-    /// a request that could not be issued is retried by the tick below.
-    private func requestGestureSmoothScroll(gridId: Int64) {
-        guard GridSurfaceRenderer.smoothScrollEnabled, let core else { return }
-        if smoothScrollBorrowedGrid == gridId, !smoothScrollBorrowPending { return }
-        // A gesture that moved to another grid hands the old one back first.
-        // Queued rather than issued once: the core refuses while the grid lock
-        // is busy, which is most of a flush, and this was the one hand-back
-        // with nothing left holding the id afterwards. It heals on the next
-        // gesture over that window either way, but "either way" can be never.
-        if let previous = smoothScrollBorrowedGrid, previous != gridId {
-            smoothScrollHandback.insert(previous)
-        }
-        smoothScrollHandback.remove(gridId)
-        smoothScrollBorrowedGrid = gridId
-        smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
-        ZonvieCore.appLog("[ss_borrow] request grid=\(gridId) pending=\(smoothScrollBorrowPending)")
-    }
-
-    /// Hand 'smoothscroll' back once the gesture and its momentum are done.
-    ///
-    /// Frame-driven rather than tied to the .ended phase: that phase can be
-    /// missed (a cancelled gesture, a window losing focus mid-scroll), and the
-    /// option is the user's, not ours to keep. Retried until the core accepts
-    /// it, since the request is dropped when the grid lock is busy.
-    private func tickGestureSmoothScroll() {
-        // The bound windows belong to one gesture. Once it and its momentum are
-        // done their offsets are decayed by tickSmoothScroll like any other, but
-        // the membership must not carry into the next gesture, which may be
-        // driving an entirely different window.
-        if !scrollGestureTouching, !scrollMomentumRunning,
-           CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime > Self.smoothScrollGestureGuardSeconds {
-            scrollOffsetLock.lock()
-            gestureBoundGrids.removeAll(keepingCapacity: true)
-            scrollOffsetLock.unlock()
-        }
-        guard let core else { return }
-        for handback in smoothScrollHandback where core.setGestureSmoothScroll(gridId: handback, enable: false) {
-            smoothScrollHandback.remove(handback)
-        }
-        guard let gridId = smoothScrollBorrowedGrid else { return }
-        if smoothScrollBorrowPending {
-            smoothScrollBorrowPending = !core.setGestureSmoothScroll(gridId: gridId, enable: true)
-        }
-        let idleFor = CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime
-        guard !scrollGestureTouching,
-              !scrollMomentumRunning,
-              idleFor > Self.smoothScrollGestureGuardSeconds
-        else { return }
-        if core.setGestureSmoothScroll(gridId: gridId, enable: false) {
-            smoothScrollBorrowedGrid = nil
-            smoothScrollBorrowPending = false
-        }
-    }
-
-    func processPendingScrollClears() {
-        pendingScrollClearLock.lock()
-        let pending = pendingScrollClear
-        pendingScrollClear.removeAll(keepingCapacity: true)
-        pendingScrollClearLock.unlock()
-
-        guard !pending.isEmpty else { return }
-
-        let rowHeightPx = CGFloat(renderer.cellHeightPx)
-        // One wheel event's worth of rows, the unit the lookahead books in and
-        // therefore the most it may ever be running ahead by. Read once: it is
-        // a lock-free atomic, but this loop runs per arrival.
-        let rowsPerWheelEventForClamp = core?.getMouseScrollVer() ?? 1
-        // Whether the pad is mid-gesture at all. The per-grid questions below
-        // add who the gesture is for.
-        let padIsDriving = gestureScrollGridId != nil
-            && (scrollGestureTouching
-                || scrollMomentumRunning
-                || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds)
-
-        scrollOffsetLock.lock()
-        for (gridId, rowsDelta) in pending {
-            // The content this window owns has now moved, and the branches
-            // below hand it the compensation that cancels the move. A float
-            // following this window inherits that compensation, so record the
-            // distance here: until the float's own placement travels the same
-            // way, it is carrying a compensation for a step it has not taken.
-            anchorLandedRowsUp[gridId, default: 0] += rowsDelta
-
-            // grid_scroll received — reset stale tracking for this grid.
-            // A response also proves the grid is not blocked at a buffer edge.
-            scrollStaleSince.removeValue(forKey: gridId)
-            scrollEdgeBlocked.removeValue(forKey: gridId)
-
-            // Check if this is a response to our scroll command or Neovim-initiated
-            pendingSentScrollLock.lock()
-            let sentCount = pendingSentScroll[gridId] ?? 0
-            // A bound window may be seeded below, before the credit is taken,
-            // so this is not captured until then.
-            var currentOffset = scrollOffsetPx[gridId] ?? 0
-            // The in-flight count is bookkeeping for how many requests are
-            // outstanding, not proof of who scrolled: one notification can
-            // carry several rows and take the count to zero while the gesture
-            // is still going. Treating what follows as Neovim's own scroll
-            // would drop the offset instead of cancelling it — a jump per
-            // occurrence, which is what remained after the lookahead landed.
-            // A grid still holding lookahead compensation, or one whose gesture
-            // is still live, stays the gesture's.
-            //
-            // The pad-state terms describe the pad, not a grid, so they only
-            // speak for the grid the gesture is actually driving. Without that
-            // qualification a resting finger makes every scroll look like the
-            // gesture's: a keyboard scroll would have a row added to its
-            // offset instead of cleared, with the ease seed suppressed and
-            // nothing left to decay it, and an unrelated split scrolled by
-            // Neovim would pick up a phantom row of its own.
-            let gestureDrivesThisGrid = gestureScrollGridId == gridId && padIsDriving
-            // 'scrollbind' (:vert diffsplit) answers one wheel event by
-            // scrolling every bound window, and only the window the event was
-            // aimed at carries a booking. The others used to reach the
-            // Neovim-initiated branch below and have their offset dropped, so
-            // they stepped a row at a time while the window under the finger
-            // moved by pixels.
-            //
-            // The tie is the BATCH, not the pad: bound windows are scrolled by
-            // the same keystroke and arrive together. Asking only whether the
-            // pad was busy let anything Neovim scrolled during a gesture claim
-            // an offset — including grid 1, whose displacement drags the
-            // tabline and status rows with it.
-            let boundToThisGesture = padIsDriving
-                && gridId != 1
-                && gestureScrollGridId != gridId
-                && pending.contains { $0.gridId == gestureScrollGridId }
-            if boundToThisGesture, gestureBoundGrids.insert(gridId).inserted,
-               scrollOffsetPx[gridId] == nil,
-               let driving = gestureScrollGridId, let banked = scrollOffsetPx[driving] {
-                // Seeded from the driver on the way in. A bound window is only
-                // recognised when its first scroll shares a batch with the
-                // driver's, by which time the finger has banked a round trip's
-                // travel that this window was never paid — starting it from
-                // zero left the two panes of a diff a fraction of a row apart
-                // for the rest of the gesture.
-                //
-                // Into `currentOffset`, not just the dictionary: the credit
-                // below is taken from this value, and writing only the map left
-                // the seed to be overwritten by the credit it was supposed to
-                // shift. Pinned by ScrollRetentionTests' "a seeded bound window
-                // lands where the driver does".
-                currentOffset = banked
-                scrollOffsetPx[gridId] = banked
-            }
-            let gestureOwns = sentCount > 0
-                || gestureLookaheadGrids.contains(gridId)
-                || gestureDrivesThisGrid
-                || boundToThisGesture
-            if gestureOwns {
-                // These rows are the lookahead the gesture asked for before the
-                // finger got there.
-                smoothScrollGrids.remove(gridId)
-                let toConsume = min(sentCount, abs(rowsDelta))
-                pendingSentScroll[gridId] = sentCount - toConsume
-                pendingSentScrollLock.unlock()
-
-                // Cancel the distance the compensation was taken out for, so
-                // the picture stays where the finger left it. What is left is
-                // the compensation the finger then consumes pixel by pixel —
-                // the row appears as it is crossed, with no frame in which the
-                // content has moved and the offset has not.
-                //
-                // Booked rows, not reported rows: 'mousescroll' counts buffer
-                // lines while grid_scroll counts screen rows, so on a 'wrap'ped
-                // buffer one wheel event books ver rows and Neovim answers with
-                // every row those lines occupy — four times as many for a line
-                // spanning four rows. Crediting the report would drive the
-                // offset past zero and out the other side. Where nothing was
-                // booked there is no better number than the report itself, and
-                // the healthy case has the two equal, so this only bites where
-                // the units genuinely disagree.
-                let credited = ScrollRetention.creditedOffsetPx(
-                    heldPx: currentOffset,
-                    bookedRows: sentCount,
-                    rowsDelta: rowsDelta,
-                    rowHeightPx: rowHeightPx,
-                    stepRows: rowsPerWheelEventForClamp,
-                    // Membership alone is not enough: nothing takes a grid out
-                    // of the set when it BECOMES the driver, so scrolling the
-                    // other pane of a diff within the gesture guard would have
-                    // handed the driver the bound rule and disabled the deepen
-                    // clamp its wrapped over-reports depend on.
-                    bound: gestureScrollGridId != gridId && gestureBoundGrids.contains(gridId),
-                    epsilonPx: Self.scrollOffsetEpsilon
-                )
-                let newOffset = credited ?? 0
-                if credited == nil {
-                    scrollOffsetPx.removeValue(forKey: gridId)
-                    gestureLookaheadGrids.remove(gridId)
-                    // Settling here erases both signals the seed guard reads,
-                    // so record the payment explicitly. Only this branch needs
-                    // it: the else below keeps the grid in the lookahead set,
-                    // which already blocks the seed. Recorded under exactly the
-                    // conditions tickSmoothScroll needs to reach its clear, so
-                    // a mark can never outlive the only thing that erases it.
-                    if GridSurfaceRenderer.smoothScrollEnabled, rowHeightPx > 0 {
-                        reconciledThisTick.insert(gridId)
-                    }
-                } else {
-                    scrollOffsetPx[gridId] = newOffset
-                    gestureLookaheadGrids.insert(gridId)
-                }
-                ZonvieCore.appLog("[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) sentCount=\(sentCount) offset=\(currentOffset) -> \(newOffset)")
-                if FrameTracer.enabled {
-                    FrameTracer.trace(
-                        .gestureScrollClear,
-                        a: UInt64(bitPattern: Int64(rowsDelta)),
-                        b: UInt64(max(0, sentCount - toConsume)),
-                        seq: UInt32(truncatingIfNeeded: gridId)
-                    )
-                }
-            } else if smoothScrollGrids.contains(gridId) {
-                pendingSentScrollLock.unlock()
-                // The keyboard ease owns this grid's offset: it is the lag the
-                // ease deliberately holds, not a stale trackpad offset, and
-                // tickSmoothScroll decays it out. Clearing here would snap the
-                // picture back to cell alignment every scrolled frame — this
-                // function also runs on the core thread during vertex
-                // submission, so it cannot see a seed the flush has not
-                // committed yet.
-            } else {
-                pendingSentScrollLock.unlock()
-                // Neovim-initiated scroll (j/k keys, etc.) - clear offset
-                smoothScrollGrids.remove(gridId)
-                gestureLookaheadGrids.remove(gridId)
-                scrollOffsetPx.removeValue(forKey: gridId)
-                ZonvieCore.appLog(
-                    "[processPendingScrollClears] gridId=\(gridId) rowsDelta=\(rowsDelta) nvim-initiated, clearing offset=\(currentOffset)"
-                )
-            }
-        }
-        scrollOffsetLock.unlock()
-        // Note: updateScrollShaderOffset() is called in onPreDraw, not here,
-        // to avoid deadlock when this is called from Zig thread (which holds grid_mu).
-    }
-
-    /// Seed and decay the keyboard sub-row scroll ease. Seeding first and
-    /// decaying second settles at one row of lag; decaying first would settle
-    /// at two, which is past what the retention ring can cover.
-    private func tickSmoothScroll() {
-        guard GridSurfaceRenderer.smoothScrollEnabled else { return }
-        let rowHeightPx = CGFloat(renderer.cellHeightPx)
-        guard rowHeightPx > 0 else { return }
-
-        let now = CFAbsoluteTimeGetCurrent()
-        let elapsedFrames = lastSmoothScrollTickTime > 0
-            ? min(max((now - lastSmoothScrollTickTime) * 60.0, 0.0), 3.0)
-            : 1.0
-        lastSmoothScrollTickTime = now
-
-        // A seed exists only for a single-row step whose outgoing row was
-        // retained — the shape a held key produces. Page motion and
-        // non-fast-path redraws seed nothing and simply land where they land;
-        // rows may still be retained for them, but with no offset to show
-        // them in, the draw path prunes them unused.
-        seedScratch.removeAll(keepingCapacity: true)
-        for seed in renderer.takeSmoothScrollSeeds() {
-            seedScratch[seed.gridId, default: 0] += seed.rowsDelta
-        }
-        // An external window opens its steps on its own surface, so its seeds
-        // are held by its own retention. The offsets they feed are this view's
-        // shared per-grid store, so they are spent here alongside the main
-        // surface's rather than on a second, competing decay clock.
-        externalSeedScratch.removeAll(keepingCapacity: true)
-        core?.appendExternalSmoothScrollSeeds(into: &externalSeedScratch)
-        for seed in externalSeedScratch {
-            seedScratch[seed.gridId, default: 0] += seed.rowsDelta
-        }
-
-        // A trackpad gesture asks Neovim for a row before the finger has
-        // travelled it, and the row arrives back here as an ordinary row scroll.
-        // Its seed is applied the same way either way — it is what stops the
-        // picture jumping when the row lands — but the gesture's compensation is
-        // consumed by the finger rather than by the decay, so the two owners are
-        // told apart below.
-        pendingSentScrollLock.lock()
-        let pendingSent = pendingSentScroll
-        pendingSentScrollLock.unlock()
-        let gestureActive = scrollGestureTouching
-            || scrollMomentumRunning
-            || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
-
-        scrollOffsetLock.lock()
-        let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
-        for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
-            // A gesture-owned grid is already square: its rows were cancelled
-            // against the distance the notification reported, which exists for
-            // every scroll — where a seed only exists for one the renderer
-            // could retain a row for. Seeding it as well would pay twice.
-            guard !gestureActive,
-                  (pendingSent[gridId] ?? 0) == 0,
-                  !gestureLookaheadGrids.contains(gridId),
-                  !reconciledThisTick.contains(gridId) else { continue }
-            // Content moved up by rowsDelta rows, so draw it that much lower
-            // and let the decay below carry it up over the next few frames.
-            // Not clamped here: the clamp belongs after the decay, or a frame
-            // that lands two rows at once has its whole jump clipped straight
-            // back onto the glass — the exact case the ease exists for.
-            scrollOffsetPx[gridId] = (scrollOffsetPx[gridId] ?? 0) + CGFloat(rowsDelta) * rowHeightPx
-            smoothScrollGrids.insert(gridId)
-        }
-        // A payment is only good against the seed published alongside it, so
-        // the record lives exactly one tick. A grid marked without a seed
-        // arriving (the renderer retains no row for a multi-row scroll) simply
-        // clears here.
-        reconciledThisTick.removeAll(keepingCapacity: true)
-
-        // Once the gesture and its momentum are over, whatever compensation the
-        // finger did not consume is handed to the ease: the row it stands for
-        // has already been scrolled, so the picture animates the rest of the way
-        // instead of sitting part-way into a row.
-        if !gestureActive, !gestureLookaheadGrids.isEmpty {
-            for gridId in gestureLookaheadGrids {
-                smoothScrollGrids.insert(gridId)
-            }
-            gestureLookaheadGrids.removeAll(keepingCapacity: true)
-        }
-
-        if !smoothScrollGrids.isEmpty {
-            let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
-            for gridId in Array(smoothScrollGrids) {
-                // Clamped to what the retention ring can cover: past that the
-                // vacated band has no row to show.
-                let decayed = (scrollOffsetPx[gridId] ?? 0) * decay
-                let eased = max(-maxOffsetPx, min(maxOffsetPx, decayed))
-                if abs(eased) < Self.scrollOffsetEpsilon {
-                    scrollOffsetPx.removeValue(forKey: gridId)
-                    smoothScrollGrids.remove(gridId)
-                } else {
-                    scrollOffsetPx[gridId] = eased
-                }
-            }
-        }
-        let easeActive = !smoothScrollGrids.isEmpty
-        // Computed only when the tracer will consume it: the reduction allocates,
-        // and this runs every eased frame.
-        var tracedOffsetPx: CGFloat = 0
-        if FrameTracer.enabled, easeActive {
-            for gridId in smoothScrollGrids {
-                tracedOffsetPx = max(tracedOffsetPx, abs(scrollOffsetPx[gridId] ?? 0))
-            }
-        }
-        scrollOffsetLock.unlock()
-
-        if FrameTracer.enabled {
-            // The visual position is content_rows * h - offset, so smoothness
-            // has to be reconstructed from the offset actually applied each
-            // frame; the content row delta alone no longer shows it.
-            FrameTracer.trace(
-                .smoothScrollOffset,
-                a: UInt64(Int64(round(tracedOffsetPx * 1000))),
-                b: UInt64(Int64(round(rowHeightPx * 1000)))
-            )
-        }
-
-        // The last key of a hold produces no further flushes, so the ease
-        // needs the draw clock kept alive to settle.
-        if easeActive && isPaused {
-            activateSurfaceDrawLoop()
-        }
-    }
-
-    /// Service shared smooth-scroll state for external windows that reuse the
-    /// main view's scroll offset storage but do not run the main view's
-    /// onPreDraw hook every frame.
-    func serviceSharedScrollStateForExternalView() {
-        processPendingScrollClears()
-        // Hand 'smoothscroll' back once the gesture is over, and advance the
-        // sub-row ease. Both are frame-driven and both were previously reached
-        // only through the main view's onPreDraw, so a grid living in an
-        // external window never eased at all -- its steps seeded an offset
-        // nothing spent, and the picture jumped a whole row. Running them from
-        // every surface's frame also means a paused or occluded main window
-        // cannot stall an external window's animation. Calling twice in one
-        // frame is harmless: the decay is wall-clock based, so the second call
-        // advances it by ~0.
-        tickGestureSmoothScroll()
-        tickSmoothScroll()
-        tickScrollEdgeBounce()
-    }
-
-    /// Whether a trackpad gesture is compensating this grid's scrolls through
-    /// the finger, in which case an arriving row owes no ease seed.
-    ///
-    /// Mirrors the first three terms of the grid_scroll handler's gate and
-    /// deliberately drops its fourth, `abs(offset) >= epsilon`. That term means
-    /// "something is displaced", which an ease in flight also satisfies — so a
-    /// key struck mid-ease read as gesture-owned and its row lost the seed that
-    /// would have carried it.
-    func gestureOwnsScroll(gridId: Int64) -> Bool {
-        pendingSentScrollLock.lock()
-        let sent = pendingSentScroll[gridId] ?? 0
-        pendingSentScrollLock.unlock()
-        if sent > 0 { return true }
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        if gestureLookaheadGrids.contains(gridId) { return true }
-        guard gestureScrollGridId != nil, gridId != 1 else { return false }
-        return scrollGestureTouching
-            || scrollMomentumRunning
-            || CFAbsoluteTimeGetCurrent() - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
-    }
-
-    /// True while a sub-row ease is running (for the given grid, or any grid
-    /// when nil). Views use this to keep their draw loop alive while the ease
-    /// settles, the way `isScrollEdgeBounceActive` does for the bounce.
-    func isSmoothScrollActive(gridId: Int64? = nil) -> Bool {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        if let gridId { return smoothScrollGrids.contains(gridId) }
-        return !smoothScrollGrids.isEmpty
-    }
-
-    /// True while an edge bounce is held or animating (for the given grid, or
-    /// any grid when nil). Views use this to keep their draw loop alive while
-    /// the bounce-back animation runs.
-    func isScrollEdgeBounceActive(gridId: Int64? = nil) -> Bool {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        if let gridId { return scrollEdgeBlocked[gridId] != nil }
-        return !scrollEdgeBlocked.isEmpty
-    }
-
-    /// The clamped visual offset one grid's content is currently drawn at, in
-    /// drawable pixels: displayed Y == static Y + this. An external view maps a
-    /// pointer event back onto the rows the frame actually shows with it, the
-    /// way hitTestGrid does for the main window.
-    func visualScrollOffsetPx(gridId: Int64, cellHeightPx: CGFloat) -> CGFloat {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: cellHeightPx)
-    }
-
-    /// Scroll offset info for one grid, for an external window's shader update.
-    /// nil when the grid is gone or its offset has settled.
-    func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> GridSurfaceRenderer.ScrollOffsetInfo? {
-        guard let core else { return nil }
-
-        scrollOffsetLock.lock()
-        let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(cellHeightPx))
-        scrollOffsetLock.unlock()
-        // The main surface's threshold (updateScrollShaderOffset): below it an
-        // offset is settled, and drawing it here kept an external surface in a
-        // smooth scroll the main surface had already ended.
-        if abs(offsetPx) < Self.scrollOffsetEpsilon { return nil }
-
-        // Get grid info for margins (non-blocking)
-        let grids = core.getVisibleGridsCached()
-        guard let info = grids.first(where: { $0.gridId == gridId }) else { return nil }
-
-        let ndcScale: Float = 2.0 / drawableHeight
-        let gridTopPx = Float(info.startRow) * cellHeightPx
-        let gridTopYNDC = 1.0 - gridTopPx * ndcScale
-
-        return GridSurfaceRenderer.ScrollOffsetInfo(
-            gridId: gridId,
-            offsetYPx: Float(offsetPx),
-            gridTopYNDC: gridTopYNDC,
-            gridRows: info.rows,
-            marginTop: info.marginTop,
-            marginBottom: info.marginBottom
-        )
     }
 
     /// A view point in the drawable's pixel space, with the cell grid it is
@@ -3361,9 +1361,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         // Adjust for smooth scroll offset: during scrolling, content rows are
         // visually shifted by scrollOffsetPx. Without this adjustment, clicking
         // on visually-shifted content selects the wrong row.
-        scrollOffsetLock.lock()
-        let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[bestGridId] ?? 0, cellHeightPx: cellH)
-        scrollOffsetLock.unlock()
+        let offsetPx = scrollModel?.visualScrollOffsetPx(gridId: bestGridId, cellHeightPx: cellH) ?? 0
 
         if adjustForSmoothScroll, let grid = grids.first(where: { $0.gridId == bestGridId }) {
             localRow = scrollAdjustedLocalRow(
@@ -3526,34 +1524,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         return true
     }
 
-    /// The anchor's landed-rows counter. The main surface does not use this —
-    /// it takes the whole map with the offsets, in one hold — but an external
-    /// surface has no access to that hold and asks per layer at draw time.
-    func anchorLandedRowsUpSnapshot(_ anchorGridId: Int64) -> Int {
-        scrollOffsetLock.lock()
-        defer { scrollOffsetLock.unlock() }
-        return anchorLandedRowsUp[anchorGridId] ?? 0
-    }
-
-    private func clampVisualScrollOffsetPx(_ offsetPx: CGFloat, cellHeightPx: CGFloat) -> CGFloat {
-        let safeCellHeightPx = max(0, cellHeightPx)
-        // One wheel event hands the gesture a whole event's worth of
-        // compensation to consume. Clamping below that would discard the part
-        // it cannot show, and the picture would jump by exactly that much when
-        // the rows land — so the ceiling has to be at least 'mousescroll' ver
-        // rows, with the overscroll allowance as the floor.
-        //
-        // Bounded by what the retention can cover: displacing further than
-        // that leaves part of the band with no retained row, and the edge
-        // stretch then paints over the rows that ARE retained. A 'mousescroll'
-        // past the depth loses the excess to a jump either way; taking it here
-        // at least keeps the band consistent.
-        let ver = min(core?.getMouseScrollVer() ?? 0, ScrollRetention.maxDepthRows)
-        let cells = max(Self.scrollMaxOverscrollCells, CGFloat(ver))
-        let maxOffsetPx = safeCellHeightPx * cells
-        guard maxOffsetPx > 0 else { return 0 }
-        return max(-maxOffsetPx, min(maxOffsetPx, offsetPx))
-    }
 }
 
 // MARK: - NSTextInputClient (IME support)
@@ -3953,7 +1923,7 @@ extension MetalTerminalView: IMEPreeditHost {
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 
-    func imeSendCommitted(_ text: String) { sendInputNow(text) }
+    func imeSendCommitted(_ text: String) { keyInput?.sendInputKeepingMainAwake(text) }
 }
 
 // MARK: - Preedit Overlay View

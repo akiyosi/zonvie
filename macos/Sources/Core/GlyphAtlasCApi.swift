@@ -11,8 +11,8 @@ public func zonvie_macos_rasterize_glyph(
 ) -> Int32 {
     guard let ctx, let outBitmap else { return 0 }
     let zc = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = zc.terminalView else { return 0 }
-    return view.renderer.rasterizeGlyphOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
+    guard let atlas = zc.sharedAtlas else { return 0 }
+    return atlas.rasterizeOnly(scalar: scalar, styleFlags: styleFlags, corePtr: zc.corePtr, outBitmap: outBitmap) ? 1 : 0
 }
 
 @_cdecl("zonvie_macos_atlas_upload")
@@ -26,8 +26,8 @@ public func zonvie_macos_atlas_upload(
 ) {
     guard let ctx, let bitmap else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = core.terminalView else { return }
-    let result = view.renderer.uploadAtlasRegion(destX: destX, destY: destY, width: width, height: height, bitmap: bitmap)
+    guard let atlas = core.sharedAtlas else { return }
+    let result = atlas.uploadRegion(destX: Int(destX), destY: Int(destY), width: Int(width), height: Int(height), bitmap: bitmap)
     switch result {
     case .uploaded:
         break
@@ -68,8 +68,8 @@ public func zonvie_macos_atlas_create(
 ) {
     guard let ctx else { return }
     let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-    guard let view = core.terminalView else { return }
-    guard !view.renderer.recreateAtlasTexture(width: atlasW, height: atlasH) else { return }
+    guard let atlas = core.sharedAtlas else { return }
+    guard !atlas.recreateTexture(width: Int(atlasW), height: Int(atlasH)) else { return }
     // Keep the old committed front texture and reject this transaction. The
     // core checks flush_aborted immediately after this void callback, so it
     // cannot compute/cache new UVs or publish the write set against the old

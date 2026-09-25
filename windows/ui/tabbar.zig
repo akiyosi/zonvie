@@ -269,6 +269,52 @@ pub fn plusButtonSizePx(app: *App) c_int {
     return app.scalePx(20);
 }
 
+/// What a titlebar-tabline point is on. Hover, press, the pressed-button
+/// tracking and WM_NCHITTEST each wrote this geometry out themselves; the
+/// + button's press alone ignored its vertical extent.
+pub const TablineHit = union(enum) {
+    none,
+    window_button: u8, // 0 min, 1 max, 2 close
+    tab: usize,
+    close: usize, // a tab's close button
+    new_tab,
+};
+
+fn tabLeftPx(app: *App, tab_width: c_int, idx: usize) c_int {
+    return app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(idx)) * (tab_width + 1);
+}
+
+fn inRect(x: c_int, y: c_int, left: c_int, top: c_int, w: c_int, h: c_int) bool {
+    return x >= left and x < left + w and y >= top and y < top + h;
+}
+
+/// `tab_count` is passed so WM_NCHITTEST can read it under app.mu.
+pub fn tablineHitTest(app: *App, client_width: c_int, tab_count: usize, x: c_int, y: c_int) TablineHit {
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    if (y < 0 or y >= bar_height) return .none;
+
+    const btn_start_x = client_width - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    if (x >= btn_start_x) {
+        const idx = @divTrunc(x - btn_start_x, app.scalePx(TablineState.WINDOW_BTN_WIDTH));
+        return if (idx >= 0 and idx < 3) .{ .window_button = @intCast(idx) } else .none;
+    }
+    if (tab_count == 0) return .none;
+
+    const count: c_int = @intCast(tab_count);
+    const tab_width = tabWidthPx(app, client_width, count);
+    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
+    for (0..tab_count) |i| {
+        const tab_x = tabLeftPx(app, tab_width, i);
+        if (x < tab_x or x >= tab_x + tab_width) continue;
+        const close_x = tab_x + tab_width - close_size - app.scalePx(6);
+        const close_y = @divTrunc(bar_height - close_size, 2);
+        return if (inRect(x, y, close_x, close_y, close_size, close_size)) .{ .close = i } else .{ .tab = i };
+    }
+    const plus_size = plusButtonSizePx(app);
+    if (inRect(x, y, plusButtonXPx(app, count, tab_width), @divTrunc(bar_height - plus_size, 2), plus_size, plus_size)) return .new_tab;
+    return .none;
+}
+
 pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     // Track mouse leave
     var tme: c.TRACKMOUSEEVENT = .{
@@ -285,15 +331,10 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // DPI-scaled constants
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
     // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
     // threshold, which should be constant in physical pixels regardless of DPI.
     const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
-    const close_margin = app.scalePx(6);
-    const plus_offset = app.scalePx(8);
-    const plus_btn_size = plusButtonSizePx(app);
+    const hit = tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y);
 
     // Handle dragging
     if (app.tabline_state.dragging_tab) |drag_idx| {
@@ -377,17 +418,8 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle close button pressed state - track if mouse leaves the button
     if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
-        const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-        if (tab_count > 0 and pressed_tab_idx < app.tabline_state.tab_count) {
-            const tab_width = tabWidthPx(app, client_width, tab_count);
-
-            const tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + @as(c_int, @intCast(pressed_tab_idx)) * (tab_width + 1);
-            const close_x = tab_x + tab_width - close_size - close_margin;
-            const close_y = @divTrunc(bar_height - close_size, 2);
-
-            const is_still_over_close = (x >= close_x and x < close_x + close_size and
-                y >= close_y and y < close_y + close_size);
-
+        if (pressed_tab_idx < app.tabline_state.tab_count) {
+            const is_still_over_close = hit == .close and hit.close == pressed_tab_idx;
             if (!is_still_over_close) {
                 // Mouse left the close button - cancel the press
                 if (applog.isEnabled()) applog.appLog("[tabline] mouseMove: close button cancelled (mouse left)\n", .{});
@@ -406,15 +438,8 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle new tab button pressed state - track if mouse leaves the button
     if (app.tabline_state.new_tab_button_pressed) {
-        const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-        if (tab_count > 0) {
-            const tab_width = tabWidthPx(app, client_width, tab_count);
-            const plus_x = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH) + tab_count * (tab_width + 1) + plus_offset;
-
-            const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
-            const is_still_over_plus = (x >= plus_x and x < plus_x + plus_btn_size and y >= plus_top and y < plus_top + plus_btn_size);
-
-            if (!is_still_over_plus) {
+        if (app.tabline_state.tab_count > 0) {
+            if (hit != .new_tab) {
                 // Mouse left the + button - cancel the press
                 if (applog.isEnabled()) applog.appLog("[tabline] mouseMove: new tab button cancelled (mouse left)\n", .{});
                 app.tabline_state.new_tab_button_pressed = false;
@@ -428,11 +453,7 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // Handle window button pressed state - track if mouse leaves the button
     if (app.tabline_state.pressed_window_btn) |pressed_btn| {
-        const btn_start_x = client_width - btns_total;
-        const btn_x = btn_start_x + @as(c_int, pressed_btn) * btn_w;
-        const is_still_over_btn = (x >= btn_x and x < btn_x + btn_w and
-            y >= 0 and y < bar_height);
-
+        const is_still_over_btn = hit == .window_button and hit.window_button == pressed_btn;
         if (!is_still_over_btn) {
             // Mouse left the window button - cancel the press
             if (applog.isEnabled()) applog.appLog("[tabline] mouseMove: window button {d} cancelled (mouse left)\n", .{pressed_btn});
@@ -443,57 +464,14 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
         return;
     }
 
-    var new_hovered_tab: ?usize = null;
-    var new_hovered_close: ?usize = null;
-    var new_hovered_window_btn: ?u8 = null;
-
-    // Check window control buttons first (they're on the right)
-    const btn_start_x = client_width - btns_total;
-    if (x >= btn_start_x and y >= 0 and y < bar_height) {
-        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
-        if (btn_idx >= 0 and btn_idx < 3) {
-            new_hovered_window_btn = @intCast(btn_idx);
-        }
-    } else {
-        // Check tabs
-        const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-        if (tab_count > 0) {
-            const tab_width = tabWidthPx(app, client_width, tab_count);
-
-            var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-            for (0..app.tabline_state.tab_count) |i| {
-                if (x >= tab_x and x < tab_x + tab_width) {
-                    new_hovered_tab = i;
-
-                    // Check close button
-                    const close_x = tab_x + tab_width - close_size - close_margin;
-                    const close_y = @divTrunc(bar_height - close_size, 2);
-                    if (x >= close_x and x < close_x + close_size and
-                        y >= close_y and y < close_y + close_size)
-                    {
-                        new_hovered_close = i;
-                    }
-                    break;
-                }
-                tab_x += tab_width + 1;
-            }
-        }
-    }
-
-    // Check + button hover
-    var new_hovered_new_tab_btn: bool = false;
-    {
-        const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
-        if (tab_count_for_plus > 0) {
-            const tab_width_for_plus = tabWidthPx(app, client_width, tab_count_for_plus);
-            const plus_x = plusButtonXPx(app, tab_count_for_plus, tab_width_for_plus);
-
-            const plus_top = @divTrunc(bar_height - plus_btn_size, 2);
-            if (x >= plus_x and x < plus_x + plus_btn_size and y >= plus_top and y < plus_top + plus_btn_size) {
-                new_hovered_new_tab_btn = true;
-            }
-        }
-    }
+    const new_hovered_window_btn: ?u8 = if (hit == .window_button) hit.window_button else null;
+    const new_hovered_tab: ?usize = switch (hit) {
+        .tab => |i| i,
+        .close => |i| i,
+        else => null,
+    };
+    const new_hovered_close: ?usize = if (hit == .close) hit.close else null;
+    const new_hovered_new_tab_btn = hit == .new_tab;
 
     if (new_hovered_tab != app.tabline_state.hovered_tab or
         new_hovered_close != app.tabline_state.hovered_close or
@@ -512,95 +490,51 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: x={d} y={d}\n", .{ x, y });
 
-    // DPI-scaled constants
-    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
-    const close_margin = app.scalePx(6);
-    const plus_btn_size = plusButtonSizePx(app);
-
     var rect: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &rect);
     const client_width = rect.right;
 
-    // Check window control buttons first
-    const btn_start_x = client_width - btns_total;
-    if (x >= btn_start_x and y >= 0 and y < bar_height) {
-        // Window button area - record pressed state, action on mouseUp
-        const btn_idx = @divTrunc(x - btn_start_x, btn_w);
-        if (btn_idx >= 0 and btn_idx < 3) {
-            if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{btn_idx});
-            app.tabline_state.pressed_window_btn = @intCast(btn_idx);
+    // Buttons record their pressed state and act on mouseUp; capture so the
+    // mouseUp arrives even if the pointer leaves.
+    switch (tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y)) {
+        .window_button => |b| {
+            if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{b});
+            app.tabline_state.pressed_window_btn = b;
             _ = c.SetCapture(hwnd);
             _ = c.InvalidateRect(hwnd, null, 0);
-        }
-        return;
-    }
+        },
+        .close => |i| {
+            if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
+            app.tabline_state.close_button_pressed = i;
+            _ = c.SetCapture(hwnd);
+            _ = c.InvalidateRect(hwnd, null, 0); // Redraw for pressed state
+        },
+        .tab => |i| {
+            // Start potential drag - first select this tab
+            if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: starting drag on tab {d}\n", .{i});
+            const tab_width = tabWidthPx(app, client_width, @intCast(app.tabline_state.tab_count));
+            app.tabline_state.drag_start_x = x;
+            app.tabline_state.drag_offset_x = x - tabLeftPx(app, tab_width, i);
+            app.tabline_state.drag_current_x = x;
+            app.tabline_state.dragging_tab = i;
+            app.tabline_state.drop_target_index = i;
 
-    // Check close button on tabs
-    const tab_count: c_int = @intCast(app.tabline_state.tab_count);
-    if (tab_count > 0) {
-        const tab_width = tabWidthPx(app, client_width, tab_count);
-
-        if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: tab_count={d} tab_width={d}\n", .{ tab_count, tab_width });
-
-        var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-        for (0..app.tabline_state.tab_count) |i| {
-            if (x >= tab_x and x < tab_x + tab_width) {
-                // Check if on close button
-                const close_x = tab_x + tab_width - close_size - close_margin;
-                const close_y = @divTrunc(bar_height - close_size, 2);
-                if (x >= close_x and x < close_x + close_size and
-                    y >= close_y and y < close_y + close_size)
-                {
-                    // Close button - record pressed state, action on mouseUp
-                    if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
-                    app.tabline_state.close_button_pressed = i;
-                    _ = c.SetCapture(hwnd); // Capture to get mouseUp even if mouse leaves
-                    _ = c.InvalidateRect(hwnd, null, 0); // Redraw for pressed state
-                    return;
-                }
-
-                // Start potential drag - first select this tab
-                if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: starting drag on tab {d}\n", .{i});
-                app.tabline_state.drag_start_x = x;
-                app.tabline_state.drag_offset_x = x - tab_x;
-                app.tabline_state.drag_current_x = x;
-                app.tabline_state.dragging_tab = i;
-                app.tabline_state.drop_target_index = i;
-
-                // Select the tab being dragged so :tabmove works on it
-                // Use nvim_command API so it works even in terminal mode
-                if (app.corep) |corep| {
-                    var cmd_buf: [16]u8 = undefined;
-                    const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{i + 1}) catch return;
-                    app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-                }
-
-                _ = c.SetCapture(hwnd);
-                return;
+            // Select the tab being dragged so :tabmove works on it
+            // Use nvim_command API so it works even in terminal mode
+            if (app.corep) |corep| {
+                var cmd_buf: [16]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabnext", .{i + 1}) catch return;
+                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
             }
-            tab_x += tab_width + 1;
-        }
-    }
-
-    // Check + button
-    const tab_count_for_plus: c_int = @intCast(app.tabline_state.tab_count);
-    if (tab_count_for_plus > 0) {
-        const tab_width_for_plus = tabWidthPx(app, client_width, tab_count_for_plus);
-        const plus_x = plusButtonXPx(app, tab_count_for_plus, tab_width_for_plus);
-
-        if (x >= plus_x and x < plus_x + plus_btn_size) {
-            // New tab button pressed - record state, action on mouseUp
+            _ = c.SetCapture(hwnd);
+        },
+        .new_tab => {
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: new tab button pressed\n", .{});
             app.tabline_state.new_tab_button_pressed = true;
             _ = c.SetCapture(hwnd);
-            return;
-        }
+        },
+        .none => {},
     }
-
-    // Empty area - no action needed on mouseDown
 }
 
 /// Handle mouse up on tabline - finish drag or handle click

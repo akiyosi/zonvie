@@ -645,6 +645,44 @@ func copyRetainedScrollableRow(
     return (dstBuf, kept)
 }
 
+/// Copy one outgoing row's own scrollable vertices into the retention ring
+/// and append it to the open step. A row with nothing to retain is skipped,
+/// and the band falls back to the edge stretch. `readRow` is where the row
+/// currently sits in `cs`, `targetRow` where it must be drawn; they differ by
+/// more than rowsDelta once a replayed step has moved content the source set
+/// has not caught up with. Both surfaces' grid-scroll captures run it.
+func captureSurfaceRetainedRow(
+    from cs: SurfaceBufferSet,
+    gridId: Int64,
+    readRow: Int,
+    targetRow: Int,
+    cellHeightPx: Float,
+    retention: ScrollRetention,
+    scrollableMask: UInt32
+) {
+    guard readRow >= 0, readRow < cs.rowLogicalToSlot.count else { return }
+    let slot = cs.rowLogicalToSlot[readRow]
+    guard slot >= 0, slot < cs.rowState.counts.count, slot < cs.rowState.buffers.count else { return }
+    let vc = cs.rowState.counts[slot]
+    guard vc > 0, let srcBuf = cs.rowState.buffers[slot] else { return }
+    let sourceRow = slot < cs.rowSlotSourceRows.count ? cs.rowSlotSourceRows[slot] : readRow
+    guard let copied = copyRetainedScrollableRow(
+        retention: retention,
+        srcBuf: srcBuf,
+        vertexCount: vc,
+        gridId: gridId,
+        scrollableMask: scrollableMask
+    ) else { return }
+    retention.stage(RetainedScrollRow(
+        buffer: copied.buffer,
+        count: copied.count,
+        gridId: gridId,
+        sourceRow: sourceRow,
+        targetRow: targetRow,
+        cellHeightPx: cellHeightPx
+    ))
+}
+
 /// Maps a layer's vertex space to clip space, mirroring `LayerTransform` in
 /// Shaders.metal. Core row vertices arrive in grid-local pixels; the identity
 /// value (scale 1, offset 0) submits clip-space vertices unchanged.
@@ -1065,14 +1103,33 @@ func resolveSurfaceCursorPlacement(
 /// Resolve a retained row in grid-local pixels, including a prior slot shift.
 func resolveSurfaceGridRow(_ set: SurfaceBufferSet, row: Int, cellHeightPx: Float)
     -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
-    guard row >= 0, row < set.rowLogicalToSlot.count else { return nil }
-    let slot = set.rowLogicalToSlot[row]
-    guard slot >= 0, slot < set.rowState.buffers.count,
-          slot < set.rowState.counts.count,
-          let buffer = set.rowState.buffers[slot], set.rowState.counts[slot] > 0
+    resolveSurfaceRowSlot(
+        row: row,
+        rowLogicalToSlot: set.rowLogicalToSlot,
+        buffers: set.rowState.buffers,
+        counts: set.rowState.counts,
+        rowSlotSourceRows: set.rowSlotSourceRows,
+        cellHeightPx: cellHeightPx
+    )
+}
+
+/// resolveSurfaceGridRow over arrays a surface has already snapshotted. Pixels,
+/// y down: the vertices live at their source row and must appear at `row`.
+func resolveSurfaceRowSlot(
+    row: Int,
+    rowLogicalToSlot: [Int],
+    buffers: [MTLBuffer?],
+    counts: [Int],
+    rowSlotSourceRows: [Int],
+    cellHeightPx: Float
+) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
+    guard row >= 0, row < rowLogicalToSlot.count else { return nil }
+    let slot = rowLogicalToSlot[row]
+    guard slot >= 0, slot < buffers.count, slot < counts.count,
+          let buffer = buffers[slot], counts[slot] > 0
     else { return nil }
-    let source = slot < set.rowSlotSourceRows.count ? set.rowSlotSourceRows[slot] : row
-    return (set.rowState.counts[slot], buffer, Float(row - source) * cellHeightPx)
+    let source = slot < rowSlotSourceRows.count ? rowSlotSourceRows[slot] : row
+    return (counts[slot], buffer, Float(row - source) * cellHeightPx)
 }
 
 /// Refill `scratch` with the indices in `retained` that belong to `gridId` at
@@ -1123,6 +1180,31 @@ func resolveSurfaceLayerRow(
 /// clip.
 func surfaceLayerScissorPadY(topPx: Float) -> Int {
     topPx == topPx.rounded(.down) ? 0 : 1
+}
+
+/// The rectangle a layer drawn at `originPx` is clipped to, in a target
+/// `scale` times the surface's size (the glow pass renders at half size).
+/// nil when nothing of it is on the target.
+func makeSurfaceLayerScissor(
+    originPx: simd_float2,
+    viewportOriginPx: simd_float2 = simd_float2(0, 0),
+    cols: Int,
+    rows: Int,
+    cellWidthPx: Int,
+    cellHeightPx: Int,
+    scale: Float = 1,
+    targetWidth: Int,
+    targetHeight: Int
+) -> MTLScissorRect? {
+    let topPx = (viewportOriginPx.y + originPx.y) * scale
+    return clampScissor(
+        x: Int(((viewportOriginPx.x + originPx.x) * scale).rounded(.down)),
+        y: Int(topPx.rounded(.down)),
+        width: Int(Float(cols * cellWidthPx) * scale),
+        height: Int(Float(rows * cellHeightPx) * scale) + surfaceLayerScissorPadY(topPx: topPx),
+        targetWidth: targetWidth,
+        targetHeight: targetHeight
+    )
 }
 
 final class SurfaceBufferSet {
@@ -3965,6 +4047,79 @@ func drawSurfaceBackgroundClearBand(
 }
 
 
+/// The state a glow extract pass starts from: atlas, sampler, the background
+/// alpha the occlusion pass reads at fragment buffer(1) -- the same one the
+/// main pass paints with, so the two agree on what a layer hides -- the
+/// surface's scroll offsets, and a zero row translation. The pipeline is the
+/// bloom helper's.
+func bindSurfaceGlowExtractState(
+    encoder enc: MTLRenderCommandEncoder,
+    atlasTexture: MTLTexture?,
+    sampler: MTLSamplerState,
+    backgroundAlphaBuffer: MTLBuffer?,
+    bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
+) {
+    if let atlasTexture {
+        enc.setFragmentTexture(atlasTexture, index: 0)
+    }
+    enc.setFragmentSamplerState(sampler, index: 0)
+    if let backgroundAlphaBuffer {
+        enc.setFragmentBuffer(backgroundAlphaBuffer, offset: 0, index: 1)
+    }
+    bindScrollOffsets(enc)
+    var zeroTranslation: Float = 0
+    enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+}
+
+/// Draw each resolved row with the pipeline already bound.
+func encodeSurfaceResolvedRows<C: Collection>(
+    encoder enc: MTLRenderCommandEncoder,
+    rows: C,
+    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?
+) where C.Element == Int {
+    for row in rows {
+        guard let resolved = resolve(row), resolved.vc > 0 else { continue }
+        var rowTranslation = resolved.translationY
+        enc.setVertexBytes(&rowTranslation, length: MemoryLayout<Float>.size, index: 3)
+        enc.setVertexBuffer(resolved.vb, offset: 0, index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: resolved.vc)
+    }
+}
+
+/// The state every row pass starts from: viewport, pipeline, atlas, the
+/// surface's scroll offsets, fragment state and a zero row translation. Both
+/// surfaces' back passes and the cursor overlay open with it.
+func beginSurfaceRowPass(
+    encoder enc: MTLRenderCommandEncoder,
+    viewportMetrics: SurfaceViewportMetrics,
+    pipeline: MTLRenderPipelineState,
+    atlasTexture: MTLTexture?,
+    sampler: MTLSamplerState,
+    backgroundAlphaBuffer: MTLBuffer?,
+    cursorBlinkBuffer: MTLBuffer?,
+    fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand],
+    fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval],
+    bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
+) {
+    viewportMetrics.applyViewport(to: enc)
+    enc.setRenderPipelineState(pipeline)
+    if let atlasTexture {
+        enc.setFragmentTexture(atlasTexture, index: 0)
+    }
+    enc.setFragmentSamplerState(sampler, index: 0)
+    bindScrollOffsets(enc)
+    bindSurfaceFragmentState(
+        encoder: enc,
+        viewportMetrics: viewportMetrics,
+        backgroundAlphaBuffer: backgroundAlphaBuffer,
+        cursorBlinkBuffer: cursorBlinkBuffer,
+        fixedFloatBands: fixedFloatBands,
+        fixedFloatIntervals: fixedFloatIntervals
+    )
+    var zeroTranslation: Float = 0
+    enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+}
+
 /// Copy `input` into `output` through a fullscreen render pass.
 ///
 /// A render pass rather than an MTLBlitCommandEncoder: a blit's internal
@@ -4032,23 +4187,18 @@ func encodeSurfaceCursorOverlay(
     rpd.colorAttachments[0].storeAction = .store
     prepare(rpd)
     guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return false }
-    viewportMetrics.applyViewport(to: enc)
-    enc.setRenderPipelineState(pipeline)
-    if let atlasTexture {
-        enc.setFragmentTexture(atlasTexture, index: 0)
-    }
-    enc.setFragmentSamplerState(sampler, index: 0)
-    bindScrollOffsets(enc)
-    bindSurfaceFragmentState(
+    beginSurfaceRowPass(
         encoder: enc,
         viewportMetrics: viewportMetrics,
+        pipeline: pipeline,
+        atlasTexture: atlasTexture,
+        sampler: sampler,
         backgroundAlphaBuffer: backgroundAlphaBuffer,
         cursorBlinkBuffer: cursorBlinkBuffer,
         fixedFloatBands: fixedFloatBands,
-        fixedFloatIntervals: fixedFloatIntervals
+        fixedFloatIntervals: fixedFloatIntervals,
+        bindScrollOffsets: bindScrollOffsets
     )
-    var zeroTranslation: Float = 0
-    enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
     // The cursor is in its own layer's pixel space; applyViewport above set the
     // viewport to the root layer's.
     bindLayerTransform(

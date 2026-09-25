@@ -25,6 +25,8 @@
 		AB9AE9C82EF23C170072639A /* ZonvieCore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C72EF23C170072639A /* ZonvieCore.swift */; };
 		AB9AE9CA2EF2A2130072639A /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C92EF2A2130072639A /* main.swift */; };
 		AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */; };
+		ACF001512F2000010072639A /* SessionScrollModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001502F2000010072639A /* SessionScrollModel.swift */; };
+		ACF001532F2000010072639A /* SessionKeyInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001522F2000010072639A /* SessionKeyInput.swift */; };
 		AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */; };
 		AB9AE9CF2EF900000072639A /* ExternalGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF900000072639A /* ExternalGridView.swift */; };
 		AB9AE9D12F0000010072639A /* zonvie.icns in Resources */ = {isa = PBXBuildFile; fileRef = AB9AE9D22F0000010072639A /* zonvie.icns */; };
@@ -64,6 +66,8 @@
 		AB9AE9C72EF23C170072639A /* ZonvieCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZonvieCore.swift; sourceTree = "<group>"; };
 		AB9AE9C92EF2A2130072639A /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = HBFTBridge.c; sourceTree = "<group>"; };
+		ACF001502F2000010072639A /* SessionScrollModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionScrollModel.swift; sourceTree = "<group>"; };
+		ACF001522F2000010072639A /* SessionKeyInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionKeyInput.swift; sourceTree = "<group>"; };
 		AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlasCApi.swift; sourceTree = "<group>"; };
 		AB9AE9D02EF900000072639A /* ExternalGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalGridView.swift; sourceTree = "<group>"; };
 		AB9AE9D22F0000010072639A /* zonvie.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = zonvie.icns; sourceTree = "<group>"; };
@@ -146,6 +150,8 @@
 				ACF002002F2000020072639A /* FlushRetryBackoff.swift */,
 				ACF00A012F3000010072639A /* KeyCharacterSelection.swift */,
 				AB9AE9CD2EF834000072639A /* GlyphAtlasCApi.swift */,
+				ACF001522F2000010072639A /* SessionKeyInput.swift */,
+				ACF001502F2000010072639A /* SessionScrollModel.swift */,
 			);
 			path = Core;
 			sourceTree = "<group>";
@@ -291,6 +297,8 @@
 			files = (
 				AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */,
 				AB9AE9CE2EF834000072639A /* GlyphAtlasCApi.swift in Sources */,
+				ACF001532F2000010072639A /* SessionKeyInput.swift in Sources */,
+				ACF001512F2000010072639A /* SessionScrollModel.swift in Sources */,
 				AB9AE9BD2EF22AED0072639A /* GridSurfaceRenderer.swift in Sources */,
 				ABCA11BA2EFB01020072639A /* CustomShaderPipeline.swift in Sources */,
 				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
