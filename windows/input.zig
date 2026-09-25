@@ -696,6 +696,80 @@ pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
 /// Which grid a surface-local point belongs to, and the point rebased into it.
 pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
 
+/// The button a mouse message names, and its held-button code (the one
+/// heldMouseButtonName reads back): 1 left, 2 right, 3 middle, 4/5 X1/X2.
+pub fn mouseButton(msg: c.UINT, wParam: c.WPARAM) struct { name: [*:0]const u8, code: u8 } {
+    return switch (msg) {
+        c.WM_RBUTTONDOWN, c.WM_RBUTTONUP => .{ .name = "right", .code = 2 },
+        c.WM_MBUTTONDOWN, c.WM_MBUTTONUP => .{ .name = "middle", .code = 3 },
+        // HIWORD(wParam) is XBUTTON1 (1) or XBUTTON2 (2).
+        c.WM_XBUTTONDOWN, c.WM_XBUTTONUP => if (@as(u16, @truncate(wParam >> 16)) == 1)
+            .{ .name = "x1", .code = 4 }
+        else
+            .{ .name = "x2", .code = 5 },
+        else => .{ .name = "left", .code = 1 },
+    };
+}
+
+/// What a button message returns: WM_XBUTTON* want TRUE.
+pub fn mouseButtonResult(msg: c.UINT) c.LRESULT {
+    return if (msg == c.WM_XBUTTONDOWN or msg == c.WM_XBUTTONUP) 1 else 0;
+}
+
+/// A press the editor takes, at `target`, for either window procedure.
+/// Another button pressed mid left-drag leaves the drag -- its held state,
+/// press grid and capture -- to the left button: taking over the held state
+/// lost the left release once this button was let go. Capture so a drag that
+/// leaves the window keeps arriving; not again mid-drag, since whether
+/// re-capturing notifies WM_CAPTURECHANGED is not worth depending on.
+pub fn pressEditorButton(app: *App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, target: MouseTarget) void {
+    const b = mouseButton(msg, wParam);
+    if (app.mouse_button_held != 1) {
+        app.mouse_button_held = b.code;
+        app.mouse_press_grid_id = target.grid_id;
+    }
+    if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
+    sendMouseButton(app, target.grid_id, b.name, .press, target.x, target.y, wParam);
+}
+
+pub const ButtonRelease = struct {
+    /// The grid the press chose; 0 when the press never reached the editor
+    /// (chrome, scrollbar, copy button), which then gets no release either.
+    press_grid: i64,
+    /// Another button let go mid left-drag: the drag, its capture and its
+    /// release still belong to the left button.
+    left_drag_continues: bool,
+};
+
+/// Read and clear the press state before anything can return early: a
+/// branch that returned first left a button held, and every later
+/// WM_MOUSEMOVE then dragged with no button down.
+pub fn takeButtonRelease(app: *App, msg: c.UINT) ButtonRelease {
+    const rel: ButtonRelease = .{
+        .press_grid = app.mouse_press_grid_id,
+        .left_drag_continues = app.mouse_button_held == 1 and msg != c.WM_LBUTTONUP,
+    };
+    if (!rel.left_drag_continues) {
+        app.mouse_button_held = 0;
+        app.mouse_press_grid_id = 0;
+    }
+    return rel;
+}
+
+/// Release to the editor at `target` -- pinned by the caller to the grid the
+/// press chose -- if the press reached it.
+pub fn releaseEditorButton(app: *App, msg: c.UINT, wParam: c.WPARAM, rel: ButtonRelease, target: MouseTarget) void {
+    if (rel.press_grid == 0) return;
+    sendMouseButton(app, target.grid_id, mouseButton(msg, wParam).name, .release, target.x, target.y, wParam);
+}
+
+/// Capture was taken away: no button-up will arrive, and it is the only
+/// place the held state ends.
+pub fn cancelMouseButtons(app: *App) void {
+    app.mouse_button_held = 0;
+    app.mouse_press_grid_id = 0;
+}
+
 /// Resolve a surface-local pixel against the layers that surface composites,
 /// back to front, so a click on a float reaches the float.
 ///

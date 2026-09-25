@@ -1326,27 +1326,27 @@ fn releaseMainRecoveryBuffers(app: *App) void {
         var vb = app_mod.detachOneSurfaceGpuVB(&app.surface);
         var row_vb_bytes: usize = 0;
         if (vb == null) {
-            if (app_mod.detachOneRowVB(app.row_vbs.items)) |detached| {
+            if (app_mod.detachOneRowVB(app.paint.row_vbs.items)) |detached| {
                 vb = detached.buffer;
                 row_vb_bytes = detached.bytes;
             }
         }
         if (vb == null) {
-            vb = app.cursor_vb;
-            app.cursor_vb = null;
-            app.cursor_vb_bytes = 0;
+            vb = app.paint.cursor_vb;
+            app.paint.cursor_vb = null;
+            app.paint.cursor_vb_bytes = 0;
         }
         if (vb == null) {
-            vb = app.scrollbar_vb;
-            app.scrollbar_vb = null;
-            app.scrollbar_vb_bytes = 0;
+            vb = app.paint.scrollbar_vb;
+            app.paint.scrollbar_vb = null;
+            app.paint.scrollbar_vb_bytes = 0;
         }
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
             if (row_vb_bytes != 0) {
                 app.row_vb_budget.release(
-                    &app.row_vb_retained_bytes,
+                    &app.paint.row_vb_retained_bytes,
                     row_vb_bytes,
                 );
             }
@@ -1380,7 +1380,7 @@ fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.Ext
         var vb = app_mod.detachOneSurfaceGpuVB(&ext_win.surface);
         var row_vb_bytes: usize = 0;
         if (vb == null) {
-            if (app_mod.detachOneRowVB(ext_win.row_vbs.items)) |detached| {
+            if (app_mod.detachOneRowVB(ext_win.paint.row_vbs.items)) |detached| {
                 vb = detached.buffer;
                 row_vb_bytes = detached.bytes;
             }
@@ -1391,21 +1391,21 @@ fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.Ext
             ext_win.vb_bytes = 0;
         }
         if (vb == null) {
-            vb = ext_win.cursor_vb;
-            ext_win.cursor_vb = null;
-            ext_win.cursor_vb_bytes = 0;
+            vb = ext_win.paint.cursor_vb;
+            ext_win.paint.cursor_vb = null;
+            ext_win.paint.cursor_vb_bytes = 0;
         }
         if (vb == null) {
-            vb = ext_win.scrollbar_vb;
-            ext_win.scrollbar_vb = null;
-            ext_win.scrollbar_vb_bytes = 0;
+            vb = ext_win.paint.scrollbar_vb;
+            ext_win.paint.scrollbar_vb = null;
+            ext_win.paint.scrollbar_vb_bytes = 0;
         }
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
             if (row_vb_bytes != 0) {
                 app.row_vb_budget.release(
-                    &ext_win.row_vb_retained_bytes,
+                    &ext_win.paint.row_vb_retained_bytes,
                     row_vb_bytes,
                 );
             }
@@ -1886,41 +1886,15 @@ pub export fn WndProc(
                         const client_x = x - window_rect.left;
                         const client_width = window_rect.right - window_rect.left;
 
-                        // Check window control buttons (min/max/close) on the right
-                        const btn_start_x = client_width - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-                        if (client_x >= btn_start_x) {
-                            // On window buttons - return HTCLIENT so our click handler works
-                            return c.HTCLIENT;
-                        }
-
-                        // Check if clicking on a tab or + button
+                        // Window buttons, tabs and the + button take the click;
+                        // the empty rest of the bar drags the window.
                         app.mu.lockUncancelable(core.clock.io());
                         const tab_count = app.tabline_state.tab_count;
                         app.mu.unlock(core.clock.io());
-
-                        if (tab_count > 0) {
-                            // Same geometry the tabline draws and hit-tests with.
-                            const tab_count_i: i32 = @intCast(tab_count);
-                            const tab_width = tabline_mod.tabWidthPx(app, client_width, tab_count_i);
-
-                            var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-                            for (0..tab_count) |_| {
-                                if (client_x >= tab_x and client_x < tab_x + tab_width) {
-                                    // On a tab - return HTCLIENT so clicks go to the app
-                                    return c.HTCLIENT;
-                                }
-                                tab_x += tab_width + 1;
-                            }
-
-                            const plus_x = tabline_mod.plusButtonXPx(app, tab_count_i, tab_width);
-                            const plus_size = tabline_mod.plusButtonSizePx(app);
-                            if (client_x >= plus_x and client_x < plus_x + plus_size) {
-                                return c.HTCLIENT;
-                            }
-                        }
-
-                        // Empty area in tabbar - allow dragging
-                        return c.HTCAPTION;
+                        return switch (tabline_mod.tablineHitTest(app, client_width, tab_count, client_x, y - window_rect.top)) {
+                            .none => c.HTCAPTION,
+                            else => c.HTCLIENT,
+                        };
                     }
 
                     // Below tabbar - normal client area
@@ -2195,13 +2169,10 @@ pub export fn WndProc(
                     t_snapshot_start_ns = core.clock.nowNs();
                 }
 
-                // Read core-owned render settings before entering the atlas
-                // reader transaction. Keep the transaction free of core
-                // callbacks so atlas reset admission remains one-way and does
-                // not acquire grid_mu from the UI paint path.
-                const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
-                const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
-                const glow_radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else @as(f32, 1.0);
+                const glow = app_mod.glowPaintSettings(app);
+                const glow_enabled = glow.enabled;
+                const glow_intensity = glow.intensity;
+                const glow_radius_scale = glow.radius_scale;
 
                 // The atlas transaction must cover the TBS and atlas snapshots,
                 // not only the eventual draw. Otherwise a reset can commit
@@ -2261,7 +2232,7 @@ pub export fn WndProc(
                 const shared_metrics_gen_snapshot: u64 = app.shared_metrics_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
                 const row_h_px_snapshot: u32 = app.rowHeightPx();
-                const scrollbar_alpha_snapshot = app.scrollbar_alpha;
+                const scrollbar_alpha_snapshot = app.scrollbar.alpha;
 
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
                 // Take pointers to the option payloads instead.
@@ -2283,15 +2254,9 @@ pub export fn WndProc(
                 // Guard with renderer mutex (recreateAtlasTexture sets the flag
                 // under a.mu).
                 if (atlas_ptr) |a| {
-                    var reset_pending = false;
-                    {
-                        a.mu.lockUncancelable(core.clock.io());
-                        defer a.mu.unlock(core.clock.io());
-                        reset_pending = a.atlas_reset_pending;
-                        if (reset_pending) a.atlas_reset_pending = false;
-                        atlas_generation = a.atlas_reset_generation;
-                    }
-                    if (reset_pending) {
+                    const gen = app_mod.atlasPaintGeneration(a, true);
+                    atlas_generation = gen.generation;
+                    if (gen.reset) {
                         // The texture itself is resized by syncSharedAtlas
                         // below, after app.mu is released (D3D creation can
                         // pump messages).
@@ -2306,7 +2271,7 @@ pub export fn WndProc(
 
                 // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
                 // The bitset iterator yields sorted, unique row indices — no dedup needed.
-                const dirty_row_keys = &app.wm_paint_dirty_row_keys;
+                const dirty_row_keys = &app.paint.dirty_row_keys;
                 dirty_row_keys.clearRetainingCapacity();
                 var paint_snapshot_ok = true;
 
@@ -2498,9 +2463,9 @@ pub export fn WndProc(
                         // buffers retained by a previous row-mode frame.
                         _ = app_mod.resizeRowVBsForPaint(
                             app.alloc,
-                            &app.row_vbs,
+                            &app.paint.row_vbs,
                             &app.row_vb_budget,
-                            &app.row_vb_retained_bytes,
+                            &app.paint.row_vb_retained_bytes,
                             0,
                         );
 
@@ -2573,7 +2538,7 @@ pub export fn WndProc(
                         }
 
                         // Build sorted, deduplicated list of rows to draw.
-                        const rows_to_draw = &app.wm_paint_rows_to_draw;
+                        const rows_to_draw = &app.paint.rows_to_draw;
 
                         // Transparency mode (opacity<1.0) must force full rows too:
                         // preserve_back=false clears back_tex entirely in drawEx, so if only
@@ -2616,7 +2581,7 @@ pub export fn WndProc(
                         // already repaints most of the surface. Same reasoning,
                         // and the same fix, as drawNormalExternalSurfaceRowMode.
                         const cursor_grid_changed =
-                            tbs_snapshot.cursor_layer_grid_id != app.last_painted_cursor_grid;
+                            tbs_snapshot.cursor_layer_grid_id != app.paint.last_painted_cursor_grid;
                         // Everything seed-shaped is this driver's own
                         // "repaint everything" request; the terms both drivers
                         // share live in render_helpers.paintPolicy.
@@ -2793,7 +2758,7 @@ pub export fn WndProc(
                         // width band it can only refill from one grid — never
                         // has to run.
                         const cursor_erase_rows: [2]?u32 = .{
-                            app.last_painted_cursor_row,
+                            app.paint.last_painted_cursor_row,
                             committed_cursor.last_cursor_row,
                         };
                         render_helpers.insertCursorEraseRows(
@@ -2804,23 +2769,17 @@ pub export fn WndProc(
                             cursor_grid == 1,
                         );
 
-                        // Use persistent buffer to avoid per-frame alloc/free.
-                        const present_rects = &app.wm_paint_present_rects;
-                        present_rects.clearRetainingCapacity();
-                        var present_rects_fallback_full = false;
                         // Reserve every rect this paint can add: one span per
                         // dirty row, the copied paint damage, one per layer,
                         // and nine singletons — restored and captured
                         // scrollbar, rcPaint, gutter, cursor, three chrome
-                        // strips, scroll damage. The external driver reserves
-                        // its exact count the same way. Any rect that still
-                        // cannot be added forces a full present rather than a
-                        // truncated list consuming dirty state.
-                        const present_rect_capacity = rows_to_draw.items.len +
-                            paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 9;
-                        present_rects.ensureTotalCapacity(app.alloc, present_rect_capacity) catch {
-                            present_rects_fallback_full = true;
-                        };
+                        // strips, scroll damage.
+                        var present = app_mod.PresentRectBuilder.begin(
+                            &app.paint.present_rects,
+                            app.alloc,
+                            rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 9,
+                        );
+                        const present_rects = present.list;
 
                         // The scrollbar is alpha-blended into retained back_tex.
                         // Restore only its narrow saved underlay before applying
@@ -2832,34 +2791,16 @@ pub export fn WndProc(
                             recoverMainPaintFailure(hwnd, app);
                             return 0;
                         };
-                        if (restored_scrollbar_rect) |restored_rect| {
-                            present_rects.append(app.alloc, restored_rect) catch {
-                                present_rects_fallback_full = true;
-                            };
-                        }
+                        present.addOpt(restored_scrollbar_rect);
 
                         // Build full-width present_rects initially.
                         // After the row drawing loop, we may replace with cursor rects if no content changed.
                         // Add content_y_offset for ext_tabline (present_rects are in screen coords)
                         const present_y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
                         if (rows_to_draw.items.len != 0) {
-                            // Shared with the external driver. The reservation
-                            // above covers one slot per row; when it failed the
-                            // present is already full, so the spans are moot.
-                            if (!present_rects_fallback_full) {
-                                present_rects.items.len += render_helpers.rowSpanRects(
-                                    c.RECT,
-                                    rows_to_draw.items,
-                                    present_y_offset,
-                                    client.right,
-                                    row_h_px,
-                                    present_rects.unusedCapacitySlice(),
-                                );
-                            }
-                        } else if (dirty != null) {
-                            present_rects.append(app.alloc, dirty.?) catch {
-                                present_rects_fallback_full = true;
-                            };
+                            present.addRowSpans(rows_to_draw.items, present_y_offset, client.right, row_h_px);
+                        } else {
+                            present.addOpt(dirty);
                         }
 
                         // Add bottom gutter rect if client area extends beyond the grid area.
@@ -2878,24 +2819,13 @@ pub export fn WndProc(
                                     .right = client.right,
                                     .bottom = client.bottom,
                                 };
-                                present_rects.append(app.alloc, gutter_rc) catch {
-                                    present_rects_fallback_full = true;
-                                };
+                                present.add(gutter_rc);
                             }
                         }
 
                         // Always include explicit paint rects (cursor damage) in present set.
-                        if (paint_rects_snapshot.items.len != 0) {
-                            present_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch {
-                                present_rects_fallback_full = true;
-                            };
-                        }
-
-                        if (cursor_rc_opt) |cr| {
-                            present_rects.append(app.alloc, cr) catch {
-                                present_rects_fallback_full = true;
-                            };
-                        }
+                        for (paint_rects_snapshot.items) |r| present.add(r);
+                        present.addOpt(cursor_rc_opt);
 
                         // Track in each grid whether this paint built a present rect.
                         // The core thread can make a layer dirty after the loop
@@ -2938,59 +2868,22 @@ pub export fn WndProc(
                         // covers the chrome anyway.
                         if (present_rects.items.len != 0) {
                             if (content_y_offset_i32 > 0) {
-                                present_rects.append(app.alloc, .{
-                                    .left = 0,
-                                    .top = 0,
-                                    .right = client.right,
-                                    .bottom = content_y_offset_i32,
-                                }) catch {
-                                    present_rects_fallback_full = true;
-                                };
+                                present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
                             }
                             if (content_x_offset_i32 > 0) {
-                                present_rects.append(app.alloc, .{
-                                    .left = 0,
-                                    .top = 0,
-                                    .right = content_x_offset_i32,
-                                    .bottom = client.bottom,
-                                }) catch {
-                                    present_rects_fallback_full = true;
-                                };
+                                present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
                             }
                             if (sidebar_right_width) |rw| {
                                 const right_strip_left: i32 =
                                     client.right - @as(i32, @intCast(rw));
                                 if (rw > 0 and right_strip_left > 0) {
-                                    present_rects.append(app.alloc, .{
-                                        .left = right_strip_left,
-                                        .top = 0,
-                                        .right = client.right,
-                                        .bottom = client.bottom,
-                                    }) catch {
-                                        present_rects_fallback_full = true;
-                                    };
+                                    present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
                                 }
                             }
                         }
 
-                        // Clamp first, then compact in place with O(n log n)
-                        // sorting plus a linear safe-union pass. The previous
-                        // all-pairs containment scan reached O(rows^2) for
-                        // alternating dirty rows on the accepted 20,000-row
-                        // boundary.
-                        // Clamped to the back buffer, as the external driver
-                        // clamps: a rect past it is what the presenter turns
-                        // into full damage, and the client rect can be a
-                        // resize ahead of the buffer.
-                        if (present_rects.items.len != 0) {
-                            present_rects.items.len = render_helpers.clampPresentRects(
-                                c.RECT,
-                                present_rects.items,
-                                @intCast(g.width),
-                                @intCast(g.height),
-                            );
-                            present_rects.items.len = render_helpers.compactDamageRects(c.RECT, present_rects.items);
-                        }
+                        // The client rect can be a resize ahead of the buffer.
+                        present.finish(g.width, g.height);
 
                         // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
                         if (applog.isEnabled()) {
@@ -3130,17 +3023,7 @@ pub export fn WndProc(
                         // pixel shift, the layer plan under app.mu (after the
                         // renderer context, the order the layer draw uses), then
                         // the row frame. Layer present rects were added above.
-                        const pass = app_mod.drawSurfaceRowPass(g, app, .{
-                            .tbs = &app.tbs,
-                            .row_vbs = &app.row_vbs,
-                            .row_vbs_shift_scratch = &app.row_vbs_shift_scratch,
-                            .scroll_rows_merge_scratch = &app.scroll_rows_merge_scratch,
-                            .row_vb_retained_bytes = &app.row_vb_retained_bytes,
-                            .cursor_vb = &app.cursor_vb,
-                            .cursor_vb_bytes = &app.cursor_vb_bytes,
-                            .last_painted_cursor_row = &app.last_painted_cursor_row,
-                            .last_painted_cursor_grid = &app.last_painted_cursor_grid,
-                        }, .{
+                        const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.tbs, &app.paint), .{
                             .snapshot = tbs_snapshot,
                             .rows_to_draw = rows_to_draw,
                             .row_vb_len = committed.row_map.items.len,
@@ -3274,7 +3157,7 @@ pub export fn WndProc(
                             .skipped_empty = skipped_empty,
                             .custom_shader = g.custom_shader_pipelines.items.len != 0,
                             .present_rects = present_rects.items.len,
-                            .present_rects_overflowed = present_rects_fallback_full,
+                            .present_rects_overflowed = present.full,
                             .seed = .{
                                 .pending = seed_pending_snapshot,
                                 .clear = seed_clear,
@@ -3296,22 +3179,10 @@ pub export fn WndProc(
                         // would narrow it to a partial present without the
                         // chrome bands.
                         if (pass.scroll_damage) |sr| if (present_rects.items.len != 0) {
-                            present_rects.append(app.alloc, sr) catch {
-                                present_rects_fallback_full = true;
-                            };
-                            // Clamped like every rect above it. applyScrollShift
-                            // clips this rect to the renderer width but not to
-                            // the client height, and a rect that clamps to
-                            // EMPTY inside the presenter marks every swapchain
-                            // buffer fully damaged (see clampBackDamageRect);
-                            // the external driver appends it before its clamp
-                            // for the same reason.
-                            present_rects.items.len = render_helpers.clampPresentRects(
-                                c.RECT,
-                                present_rects.items,
-                                @intCast(g.width),
-                                @intCast(g.height),
-                            );
+                            present.add(sr);
+                            // applyScrollShift clips this rect to the renderer
+                            // width but not to the client height.
+                            present.clamp(g.width, g.height);
                         };
 
                         if (log_enabled) applog.appLog(
@@ -3339,31 +3210,22 @@ pub export fn WndProc(
                                 // alpha-blended overlay. The next fade/update paint
                                 // restores this clean copy instead of clearing and
                                 // regenerating the entire row set.
-                                if (app.config.scrollbar.enabled and scrollbar_alpha_snapshot > 0.001) {
-                                    var scrollbar_verts: [12]core.Vertex = undefined;
-                                    const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
-                                    if (scrollbar_vert_count != 0) {
-                                        if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
-                                            const captured_scrollbar_rect = app_mod.drawScrollbarOverlayOverUnderlay(
-                                                g,
-                                                &app.scrollbar_vb,
-                                                &app.scrollbar_vb_bytes,
-                                                scrollbar_verts[0..scrollbar_vert_count],
-                                                track_rect,
-                                            ) catch |e| {
-                                                if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
-                                                break :present_frame;
-                                            };
-                                            // Same rule as the scroll rect: an
-                                            // empty list already presents it.
-                                            if (captured_scrollbar_rect) |captured_rect| if (present_rects.items.len != 0) {
-                                                present_rects.append(app.alloc, captured_rect) catch {
-                                                    present_rects_fallback_full = true;
-                                                };
-                                            };
-                                        }
-                                    }
-                                }
+                                const captured_scrollbar_rect = scrollbar.drawOverlay(
+                                    app,
+                                    g,
+                                    scrollbar.mainSurface(hwnd, app),
+                                    scrollbar_alpha_snapshot,
+                                    client.right,
+                                    client.bottom,
+                                    &app.paint.scrollbar_vb,
+                                    &app.paint.scrollbar_vb_bytes,
+                                ) catch |e| {
+                                    if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
+                                    break :present_frame;
+                                };
+                                // Same rule as the scroll rect: an empty list
+                                // already presents it.
+                                if (present_rects.items.len != 0) present.addOpt(captured_scrollbar_rect);
 
                                 // When seed_clear is true, the back buffer was just cleared.
                                 // We must do a full present to sync the cleared state to all swapchain buffers,
@@ -3383,7 +3245,7 @@ pub export fn WndProc(
                                 // since its present grew the shader pass.
                                 // Re-asked: the scrollbar overlay above can have
                                 // overflowed the rect list since the gate ran.
-                                present_in.present_rects_overflowed = present_rects_fallback_full;
+                                present_in.present_rects_overflowed = present.full;
                                 const present_gate = render_helpers.presentGate(present_in);
                                 const force_full_present = present_gate.full;
                                 const present_rects_slice: []const c.RECT =
@@ -4548,27 +4410,11 @@ pub export fn WndProc(
                     messages.updateMiniText(app, .custom, "");
                     messages.updateMiniWindows(app);
                 }
-            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE) {
-                // Start fade-out animation after timeout
-                _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_AUTOHIDE);
+            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE or wParam == TIMER_SCROLLBAR_FADE or wParam == TIMER_SCROLLBAR_REPEAT) {
                 if (getApp(hwnd)) |app| {
-                    app.scrollbar_hide_timer = 0;
-                    scrollbar.hideScrollbar(hwnd, app);
-                }
-            } else if (wParam == TIMER_SCROLLBAR_FADE) {
-                // Update scrollbar fade animation
-                if (getApp(hwnd)) |app| {
-                    scrollbar.updateScrollbarFade(hwnd, app);
-                }
-            } else if (wParam == TIMER_SCROLLBAR_REPEAT) {
-                // Continuous page scroll while holding mouse on track
-                if (getApp(hwnd)) |app| {
-                    if (app.scrollbar_repeat_dir != 0) {
-                        scrollbar.scrollbarPageScroll(app, app.scrollbar_repeat_dir);
-                        // After first delay, switch to faster interval
-                        _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
-                        app.scrollbar_repeat_timer = c.SetTimer(hwnd, TIMER_SCROLLBAR_REPEAT, SCROLLBAR_REPEAT_INTERVAL, null);
-                    }
+                    _ = scrollbar.onTimer(app, scrollbar.mainSurface(hwnd, app), wParam);
+                } else {
+                    _ = c.KillTimer(hwnd, wParam);
                 }
             } else if (wParam == TIMER_CURSOR_BLINK) {
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
@@ -4736,6 +4582,7 @@ pub export fn WndProc(
                         var i: usize = 0;
                         while (i < app.shader_anim_external_renderers.items.len) : (i += 1) {
                             const renderer = app.shader_anim_external_renderers.items[i];
+                            external_windows.syncExternalShaderFrame(app, renderer.hwnd, renderer, null);
                             renderer.presentShaderAnimationFrame();
                             anim_dev_lost = anim_dev_lost or renderer.device_lost;
                         }
@@ -5080,12 +4927,12 @@ pub export fn WndProc(
 
                     // Detach singleton objects only. Row buffers are detached
                     // one at a time below so no COM Release runs under app.mu.
-                    old_cursor_vb = app.cursor_vb;
-                    app.cursor_vb = null;
-                    app.cursor_vb_bytes = 0;
-                    old_scrollbar_vb = app.scrollbar_vb;
-                    app.scrollbar_vb = null;
-                    app.scrollbar_vb_bytes = 0;
+                    old_cursor_vb = app.paint.cursor_vb;
+                    app.paint.cursor_vb = null;
+                    app.paint.cursor_vb_bytes = 0;
+                    old_scrollbar_vb = app.paint.scrollbar_vb;
+                    app.paint.scrollbar_vb = null;
+                    app.paint.scrollbar_vb_bytes = 0;
                     old_main_renderer = app.renderer;
                     app.renderer = null;
 
@@ -5899,14 +5746,17 @@ pub export fn WndProc(
         },
 
         // Mouse button events
-        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_XBUTTONDOWN => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
                 const pos = input.mousePosFromLParam(lParam);
                 const x = pos.x;
                 const y = pos.y;
 
-                // Check tabline/sidebar area first (when ext_tabline enabled)
+                // Check tabline/sidebar area first (when ext_tabline enabled).
+                // X buttons too: they had a handler of their own that skipped
+                // the chrome and the scrollbar and reached Neovim at a clamped
+                // cell under the tab bar.
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
                         // Every button, as the sidebar does: a right press on
@@ -5915,7 +5765,7 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONDOWN) {
                                 tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
                         var client_rect_sb: c.RECT = undefined;
@@ -5931,42 +5781,17 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONDOWN) {
                                 tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     }
                 }
 
                 // Check scrollbar hit first (left button only)
                 if (msg == c.WM_LBUTTONDOWN) {
-                    if (scrollbar.scrollbarMouseDown(hwnd, app, @as(i32, x), @as(i32, y))) {
+                    if (scrollbar.mouseDown(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
                         return 0; // Handled by scrollbar
                     }
                 }
-
-                // Another button pressed mid left-drag leaves the drag, its
-                // capture and its release to the left button, as the external
-                // window does.
-                const left_drag = app.mouse_button_held == 1;
-
-                // Capture mouse to receive WM_MOUSEMOVE outside window
-                if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
-
-                // Determine button name
-                const button: [*:0]const u8 = switch (msg) {
-                    c.WM_LBUTTONDOWN => blk: {
-                        app.mouse_button_held = 1;
-                        break :blk "left";
-                    },
-                    c.WM_RBUTTONDOWN => blk: {
-                        if (!left_drag) app.mouse_button_held = 2;
-                        break :blk "right";
-                    },
-                    c.WM_MBUTTONDOWN => blk: {
-                        if (!left_drag) app.mouse_button_held = 3;
-                        break :blk "middle";
-                    },
-                    else => "left",
-                };
 
                 // A float composited into this window is one of its layers,
                 // not a window of its own, so the press has to say which grid
@@ -5976,32 +5801,19 @@ pub export fn WndProc(
                 // path -- and it measured the cost on 0.12.2, a middle press
                 // over a float pasting destructively into the buffer behind it.
                 const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
-                if (!left_drag) app.mouse_press_grid_id = target.grid_id;
-                input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
-
-                return 0;
+                input.pressEditorButton(app, hwnd, msg, wParam, target);
+                return input.mouseButtonResult(msg);
             }
         },
 
-        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP, c.WM_XBUTTONUP => {
             if (getApp(hwnd)) |app| {
-                // Read and clear the press state before anything can return
-                // early, as ExternalWndProc does. The tabline, sidebar and
-                // scrollbar branches below all `return 0` without reaching the
-                // editor path, so clearing there left a button held: every
-                // later WM_MOUSEMOVE then passed the drag gate and Neovim saw a
-                // selection following a pointer with no button down.
-                const press_grid = app.mouse_press_grid_id;
-                const left_drag_continues = app.mouse_button_held == 1 and msg != c.WM_LBUTTONUP;
-                if (!left_drag_continues) {
-                    app.mouse_button_held = 0;
-                    app.mouse_press_grid_id = 0;
-                }
+                const rel = input.takeButtonRelease(app, msg);
                 // A press the editor received is released to it, wherever the
                 // pointer is now: the chrome branches below kept the release
                 // (and, for right and middle, the capture) from a drag that
                 // ended over the tab bar or sidebar.
-                const press_reached_editor = press_grid != 0;
+                const press_reached_editor = rel.press_grid != 0;
 
                 // Extract position from lParam (needed for tabline check)
                 const pos_x_up = input.mousePosFromLParam(lParam);
@@ -6013,8 +5825,8 @@ pub export fn WndProc(
                 // released into the chrome branches below, which returned
                 // before ending the drag -- capture stayed, and every later
                 // move scrolled the buffer.
-                if (msg == c.WM_LBUTTONUP and (app.scrollbar_dragging or app.scrollbar_repeat_timer != 0)) {
-                    scrollbar.scrollbarMouseUp(hwnd, app);
+                if (msg == c.WM_LBUTTONUP and (app.scrollbar.dragging or app.scrollbar.repeat_timer != 0)) {
+                    scrollbar.mouseUp(app, scrollbar.mainSurface(hwnd, app));
                     return 0;
                 }
 
@@ -6025,7 +5837,7 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
                         if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or
@@ -6047,90 +5859,22 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     }
                 }
 
                 // Release mouse capture
-                if (!left_drag_continues) _ = c.ReleaseCapture();
-
-                // A press the chrome swallowed (a sidebar right-click, a
-                // button dragged off) has no release to send, as on external
-                // windows.
-                if (!press_reached_editor) return 0;
-
-                // Determine button name
-                const button: [*:0]const u8 = switch (msg) {
-                    c.WM_LBUTTONUP => "left",
-                    c.WM_RBUTTONUP => "right",
-                    c.WM_MBUTTONUP => "middle",
-                    else => "left",
-                };
-
-                // Extract position from lParam
-                const pos = input.mousePosFromLParam(lParam);
-                const x = pos.x;
-                const y = pos.y;
+                if (!rel.left_drag_continues) _ = c.ReleaseCapture();
 
                 // Pinned to the grid the press chose, at that layer's CURRENT
                 // origin: re-resolving here would move the release into another
                 // window the moment the pointer left the float, and Neovim
-                // would place the selection's end there.
-                const up_target = input.rebaseMainWindowTarget(app, press_grid, @as(i32, x), @as(i32, y));
-                input.sendMouseButton(app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
-
-                return 0;
-            }
-        },
-
-        c.WM_XBUTTONDOWN => {
-            if (getApp(hwnd)) |app| {
-                const left_drag = app.mouse_button_held == 1;
-                if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
-
-                const pos = input.mousePosFromLParam(lParam);
-                const x = pos.x;
-                const y = pos.y;
-
-                // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
-                const x_button: u16 = @truncate(wParam >> 16);
-                const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
-                if (!left_drag) app.mouse_button_held = if (x_button == 1) 4 else 5;
-
-                const x_target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
-                if (!left_drag) app.mouse_press_grid_id = x_target.grid_id;
-                input.sendMouseButton(app, x_target.grid_id, button, .press, x_target.x, x_target.y, wParam);
-
-                // WM_XBUTTONDOWN requires returning TRUE
-                return 1;
-            }
-        },
-
-        c.WM_XBUTTONUP => {
-            if (getApp(hwnd)) |app| {
-                // ReleaseCapture sends WM_CAPTURECHANGED synchronously, which
-                // zeroes the press grid; read it first, as the other buttons
-                // and the external window do.
-                const press_grid = app.mouse_press_grid_id;
-                const left_drag_continues = app.mouse_button_held == 1;
-                if (!left_drag_continues) _ = c.ReleaseCapture();
-
-                const pos = input.mousePosFromLParam(lParam);
-                const x = pos.x;
-                const y = pos.y;
-
-                const x_button: u16 = @truncate(wParam >> 16);
-                const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
-
-                if (!left_drag_continues) app.mouse_button_held = 0;
-
-                const x_up = input.rebaseMainWindowTarget(app, press_grid, @as(i32, x), @as(i32, y));
-                if (!left_drag_continues) app.mouse_press_grid_id = 0;
-                input.sendMouseButton(app, x_up.grid_id, button, .release, x_up.x, x_up.y, wParam);
-
-                // WM_XBUTTONUP requires returning TRUE
-                return 1;
+                // would place the selection's end there. A press the chrome
+                // swallowed gets no release.
+                const up_target = input.rebaseMainWindowTarget(app, rel.press_grid, @as(i32, x_up), @as(i32, y_up));
+                input.releaseEditorButton(app, msg, wParam, rel, up_target);
+                return input.mouseButtonResult(msg);
             }
         },
 
@@ -6226,7 +5970,7 @@ pub export fn WndProc(
                 // as its release does (press_reached_editor, and the scrollbar
                 // release ahead of the chrome branches): the chrome neither
                 // consumes the move nor lights a hover under it.
-                const editor_drag = app.scrollbar_dragging or
+                const editor_drag = app.scrollbar.dragging or
                     (app.mouse_button_held != 0 and app.mouse_press_grid_id != 0);
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
@@ -6287,37 +6031,22 @@ pub export fn WndProc(
                 }
 
                 // Handle scrollbar dragging
-                if (app.scrollbar_dragging) {
-                    scrollbar.scrollbarMouseMove(hwnd, app, @as(i32, y));
+                if (app.scrollbar.dragging) {
+                    scrollbar.mouseMove(app, scrollbar.mainSurface(hwnd, app), @as(i32, y));
                     return 0;
                 }
 
-                // Check hover mode scrollbar
-                if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
-                    var client: c.RECT = undefined;
-                    _ = c.GetClientRect(hwnd, &client);
-                    const hit = scrollbar.scrollbarHitTest(app, client.right, client.bottom, @as(i32, x), @as(i32, y));
-                    const in_scrollbar = hit != .none;
-
-                    if (in_scrollbar and !app.scrollbar_hover) {
-                        app.scrollbar_hover = true;
-                        scrollbar.showScrollbar(hwnd, app);
-                        // A pointer leaving through the right edge sends no
-                        // further WM_MOUSEMOVE: ask for WM_MOUSELEAVE, as the
-                        // external window does, or the bar stays up.
-                        var tme: c.TRACKMOUSEEVENT = .{
-                            .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
-                            .dwFlags = c.TME_LEAVE,
-                            .hwndTrack = hwnd,
-                            .dwHoverTime = 0,
-                        };
-                        _ = c.TrackMouseEvent(&tme);
-                    } else if (!in_scrollbar and app.scrollbar_hover) {
-                        app.scrollbar_hover = false;
-                        if (!app.config.scrollbar.isAlways() and !app.config.scrollbar.isScroll()) {
-                            scrollbar.hideScrollbar(hwnd, app);
-                        }
-                    }
+                if (scrollbar.hover(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
+                    // A pointer leaving through the right edge sends no
+                    // further WM_MOUSEMOVE: ask for WM_MOUSELEAVE, as the
+                    // external window does, or the bar stays up.
+                    var tme: c.TRACKMOUSEEVENT = .{
+                        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+                        .dwFlags = c.TME_LEAVE,
+                        .hwndTrack = hwnd,
+                        .dwHoverTime = 0,
+                    };
+                    _ = c.TrackMouseEvent(&tme);
                 }
 
                 // Only send drag events if a button is held
@@ -6581,12 +6310,7 @@ pub export fn WndProc(
         c.WM_MOUSELEAVE => {
             // Mouse left the client area - clear sidebar hover states
             if (getApp(hwnd)) |app| {
-                if (app.scrollbar_hover) {
-                    app.scrollbar_hover = false;
-                    if (!app.config.scrollbar.isAlways() and !app.config.scrollbar.isScroll()) {
-                        scrollbar.hideScrollbar(hwnd, app);
-                    }
-                }
+                scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
                 if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
                     if (app.tabline_state.hovered_tab != null or
                         app.tabline_state.hovered_close != null or
@@ -6619,24 +6343,9 @@ pub export fn WndProc(
                 // the only place the editor drag ends: a held button left set
                 // here turns every later hover into a drag. ExternalWndProc has
                 // cleared both for the same reason since 5e7e9cb.
-                app.mouse_button_held = 0;
-                app.mouse_press_grid_id = 0;
-                // Scrollbar drag and track-repeat are both armed on button-down
-                // and cleared only in scrollbarMouseUp. With capture stolen,
-                // WM_LBUTTONUP never arrives here: the repeat timer would keep
-                // issuing page scrolls, and scrollbar_dragging would leave every
-                // later button-up-less WM_MOUSEMOVE scrolling the buffer. The
-                // drag is cancelled rather than committed — its pending line was
-                // never confirmed by a mouse-up.
-                if (app.scrollbar_dragging) {
-                    app.scrollbar_dragging = false;
-                    app.scrollbar_pending_line = -1;
-                }
-                if (app.scrollbar_repeat_timer != 0 or app.scrollbar_repeat_dir != 0) {
-                    _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
-                    app.scrollbar_repeat_timer = 0;
-                    app.scrollbar_repeat_dir = 0;
-                }
+                input.cancelMouseButtons(app);
+                // The scrollbar's drag and track-repeat end the same way.
+                scrollbar.cancelPointer(scrollbar.mainSurface(hwnd, app));
                 if (app.ext_tabline_enabled) {
                     const had_state = app.tabline_state.dragging_tab != null or
                         app.tabline_state.close_button_pressed != null or
