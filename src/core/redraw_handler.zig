@@ -478,6 +478,24 @@ pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
     };
 }
 
+/// Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+/// into `out`; tokens that are not a feature are skipped, whitespace around a
+/// token is ignored. Returns how many were written (at most `out.len`). The
+/// one reading of a candidate line's feature field for every frontend.
+pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        if (n == out.len) break;
+        const tok = std.mem.trim(u8, raw, " \t");
+        if (parseFontFeatureToken(tok)) |f| {
+            out[n] = f;
+            n += 1;
+        }
+    }
+    return n;
+}
+
 pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).

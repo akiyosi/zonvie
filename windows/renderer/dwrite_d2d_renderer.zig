@@ -260,13 +260,10 @@ pub const Renderer = struct {
             const lines = core.config.formatFontFamilyAsCandidateList(aa, family_raw, default_pt, "") catch "";
             var line_it = std.mem.splitScalar(u8, lines, '\n');
             while (line_it.next()) |entry| {
-                var fields = std.mem.splitScalar(u8, entry, '\t');
-                const cand_name = fields.next() orelse continue;
-                if (cand_name.len == 0) continue;
-                const parsed_pt = std.fmt.parseFloat(f32, fields.next() orelse "") catch 0;
-                const cand_features = fields.next() orelse "";
-                const cand_pt: f32 = if (size_explicit or parsed_pt <= 0) default_pt else parsed_pt;
-                self.setFontUtf8WithFeatures(cand_name, cand_pt, cand_features) catch |e| {
+                const cand = core.config.parseFontCandidateLine(entry, default_pt, size_explicit) orelse continue;
+                const cand_name = cand.name;
+                const cand_pt = cand.point_size;
+                self.setFontUtf8WithFeatures(cand_name, cand_pt, cand.features) catch |e| {
                     if (applog.isEnabled()) applog.appLog("[d2d] initMetrics: skipped '{s}' pt={d}: {any}\n", .{ cand_name, cand_pt, e });
                     continue;
                 };
@@ -2041,47 +2038,13 @@ pub const Renderer = struct {
     /// Parse comma-separated features string into font_features array.
     /// Format: "+liga,-dlig,ss01=2"
     fn parseFontFeatures(self: *Renderer, features_str: []const u8) void {
-        var i: usize = 0;
-        while (i < features_str.len and self.font_feature_count < MAX_FONT_FEATURES) {
-            // Find next comma
-            var j = i;
-            while (j < features_str.len and features_str[j] != ',') : (j += 1) {}
-            const tok = features_str[i..j];
-
-            if (self.parseOneFeature(tok)) |feat| {
-                self.font_features[self.font_feature_count] = feat;
-                self.font_feature_count += 1;
-            }
-
-            i = if (j < features_str.len) j + 1 else j;
+        var parsed: [MAX_FONT_FEATURES]core.redraw_handler.FontFeature = undefined;
+        const n = core.redraw_handler.parseFontFeatureList(features_str, parsed[0 .. MAX_FONT_FEATURES - self.font_feature_count]);
+        for (parsed[0..n]) |f| {
+            const feat = dwriteFontFeature(f) orelse continue;
+            self.font_features[self.font_feature_count] = feat;
+            self.font_feature_count += 1;
         }
-    }
-
-    fn parseOneFeature(_: *Renderer, tok: []const u8) ?DWriteFontFeature {
-        if (tok.len == 0) return null;
-
-        var tag_str: []const u8 = undefined;
-        var value: u32 = 1;
-
-        if (tok[0] == '+' or tok[0] == '-') {
-            tag_str = tok[1..];
-            value = if (tok[0] == '+') 1 else 0;
-        } else if (std.mem.indexOfScalar(u8, tok, '=')) |eq| {
-            tag_str = tok[0..eq];
-            value = std.fmt.parseInt(u32, tok[eq + 1 ..], 10) catch return null;
-        } else {
-            tag_str = tok;
-        }
-
-        if (tag_str.len != 4) return null;
-
-        // Pack 4-char tag into u32 (big-endian, matching DWRITE_FONT_FEATURE_TAG)
-        const nameTag: u32 = @as(u32, tag_str[0]) |
-            (@as(u32, tag_str[1]) << 8) |
-            (@as(u32, tag_str[2]) << 16) |
-            (@as(u32, tag_str[3]) << 24);
-
-        return DWriteFontFeature{ .nameTag = nameTag, .parameter = value };
     }
 
     /// Get glyph index for a scalar, applying OpenType features if set.
@@ -2965,6 +2928,18 @@ fn isEmojiPresentation(scalar: u32) bool {
     };
 }
 
+/// A core feature as DirectWrite takes it: the tag packed little-endian
+/// (DWRITE_MAKE_OPENTYPE_TAG). A negative value (a variation axis such as
+/// slnt) has no DirectWrite feature parameter and is dropped.
+fn dwriteFontFeature(f: core.redraw_handler.FontFeature) ?DWriteFontFeature {
+    if (f.value < 0) return null;
+    const nameTag: u32 = @as(u32, f.tag[0]) |
+        (@as(u32, f.tag[1]) << 8) |
+        (@as(u32, f.tag[2]) << 16) |
+        (@as(u32, f.tag[3]) << 24);
+    return .{ .nameTag = nameTag, .parameter = @intCast(f.value) };
+}
+
 /// Pack a 4-char OpenType tag into u32 (little-endian, matching DWRITE_FONT_FEATURE_TAG).
 fn packTag(comptime s: *const [4]u8) u32 {
     return @as(u32, s[0]) | (@as(u32, s[1]) << 8) | (@as(u32, s[2]) << 16) | (@as(u32, s[3]) << 24);
@@ -3280,4 +3255,42 @@ fn utf8ToUtf16Alloc(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
 
 fn L(comptime s: []const u8) [*:0]const u16 {
     return std.unicode.utf8ToUtf16LeStringLiteral(s);
+}
+
+fn shapeForTest(r: *Renderer, text: []const u8, out: *[16]u32) []const u32 {
+    var scalars: [16]u32 = undefined;
+    for (text, 0..) |ch, i| scalars[i] = ch;
+    var clusters: [16]u32 = undefined;
+    var xa: [16]i32 = undefined;
+    var xo: [16]i32 = undefined;
+    var yo: [16]i32 = undefined;
+    const n = r.shapeTextRunDWrite(&scalars, text.len, 0, out, &clusters, &xa, &xo, &yo, out.len);
+    return out[0..@min(n, out.len)];
+}
+
+// A [font] family entry's features reach DirectWrite: the config string goes
+// through initMetrics (the core's candidate list and feature parser) into
+// GetGlyphs. Cascadia Code ships with Windows 11 and draws `->`, `==`, `!=`,
+// `<=`, `=>` as contextual alternates; skipped where it is not installed.
+test "[font] family features change what DirectWrite shapes" {
+    const alloc = std.testing.allocator;
+    const hwnd = c.GetDesktopWindow() orelse return error.SkipZigTest;
+    const family = "Cascadia Code";
+
+    var plain = Renderer.initMetrics(alloc, hwnd, family ++ ":h14", 14, false) catch return error.SkipZigTest;
+    defer plain.deinit();
+    if (!std.mem.eql(u8, plain.font_name_utf8[0..plain.font_name_utf8_len], family)) return error.SkipZigTest;
+
+    var off = try Renderer.initMetrics(alloc, hwnd, family ++ ":h14:-liga:-calt", 14, false);
+    defer off.deinit();
+    try std.testing.expectEqualStrings(family, off.font_name_utf8[0..off.font_name_utf8_len]);
+    try std.testing.expectEqual(@as(u32, 2), off.font_feature_count);
+
+    var changed: usize = 0;
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>" }) |s| {
+        var a: [16]u32 = undefined;
+        var b: [16]u32 = undefined;
+        if (!std.mem.eql(u32, shapeForTest(&plain, s, &a), shapeForTest(&off, s, &b))) changed += 1;
+    }
+    try std.testing.expect(changed > 0);
 }

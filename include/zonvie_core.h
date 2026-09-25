@@ -1630,6 +1630,28 @@ ZONVIE_API int32_t zonvie_core_popupmenu_top(
     int32_t ref_bottom,
     int32_t screen_top);
 
+/* Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+   into out_features, whose entries have the layout of zonvie_font_feature
+   (zonvie_hbft.h: char tag[4]; int32_t value). Writes at most cap entries and
+   returns how many. Tokens that are not a feature are skipped.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_parse_font_features(
+    const char *list, size_t len, void *out_features, size_t cap);
+
+/* Read one "<name>\t<size>[\t<features>]" line of a font candidate list (the
+   on_guifont payload, or the config font_family list): the name is
+   line[0..*out_name_len], the feature list line[*out_features_offset..] of
+   *out_features_len bytes. The size is the line's unless size_explicit
+   ([font] size wins over guifont) or the line carries none, then default_pt.
+   Returns false for a line with no name or no size field.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_parse_font_candidate(
+    const char *line, size_t len, float default_pt, bool size_explicit,
+    size_t *out_name_len, float *out_point_size,
+    size_t *out_features_offset, size_t *out_features_len);
+
 /* A saved window origin kept inside an area (the work area of the monitor
    holding it): each axis clamped to [area_min, area_max - size]. The axes
    carry no direction, so Y may grow up or down.

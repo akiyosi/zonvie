@@ -664,6 +664,29 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(font_family_list_tests).step);
 
+    // OpenType features reach the macOS shaper (HBFTBridge.c + HarfBuzz).
+    // Needs a ligature font already on the system; skips without one.
+    if (host_os == .macos and target.result.os.tag == .macos) {
+        const shaping_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("test/font_shaping_test.zig"),
+            .imports = &.{
+                .{ .name = "zonvie_core", .module = core_mod },
+                .{ .name = "toml", .module = zig_toml.module("toml") },
+            },
+        });
+        shaping_test_mod.addCSourceFile(.{ .file = b.path("macos/Sources/Font/HBFTBridge.c") });
+        // Include and library paths come from pkg-config, as for the app.
+        shaping_test_mod.linkSystemLibrary("freetype", .{});
+        shaping_test_mod.linkSystemLibrary("harfbuzz", .{});
+        const shaping_tests = b.addTest(.{
+            .root_module = shaping_test_mod,
+        });
+        test_step.dependOn(&b.addRunArtifact(shaping_tests).step);
+    }
+
     // Ligature vertex tests
     const lig_test_mod = b.createModule(.{
         .target = target,
