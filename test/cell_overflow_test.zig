@@ -316,11 +316,16 @@ test "scrollGrid normalizes extreme delta and clears subgrid overflow with cells
         try std.testing.expectEqual(@as(u32, 0), cell.hl);
     }
     try std.testing.expectEqual(@as(u32, 0), countOverflowForGrid(&g, 2));
-    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.top);
-    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.bot);
-    try std.testing.expectEqual(@as(u32, 0), g.pending_scroll.?.left);
-    try std.testing.expectEqual(@as(u32, 4), g.pending_scroll.?.right);
-    try std.testing.expectEqual(@as(i32, -4), g.pending_scroll.?.rows);
+    // The normalized region is recorded on the grid that scrolled. A
+    // main-surface window grid draws as its own layer, so its scroll no
+    // longer writes grid 1's pending_scroll.
+    const op = g.sub_grids.get(2).?.last_scroll_op.?;
+    try std.testing.expectEqual(@as(u32, 0), op.top);
+    try std.testing.expectEqual(@as(u32, 4), op.bot);
+    try std.testing.expectEqual(@as(u32, 0), op.left);
+    try std.testing.expectEqual(@as(u32, 4), op.right);
+    try std.testing.expectEqual(@as(i32, -4), op.rows);
+    try std.testing.expect(g.pending_scroll == null);
 }
 
 test "scrollGrid rejects reversed normalized region without touching overflow" {
@@ -387,8 +392,6 @@ const flush_mod = zonvie_core.flush_mod;
 const nvim_core = zonvie_core.nvim_core;
 const Core = nvim_core.Core;
 const RenderCells = flush_mod.RenderCells;
-const FloatOverlayKey = flush_mod.FloatOverlayKey;
-const FloatOverlayMap = flush_mod.FloatOverlayMap;
 
 /// Create a minimal RenderCells with grid_ids set to a single value.
 fn setupRenderCells(alloc: std.mem.Allocator, cols: u32, grid_id: i64) !RenderCells {
@@ -399,51 +402,7 @@ fn setupRenderCells(alloc: std.mem.Allocator, cols: u32, grid_id: i64) !RenderCe
     return rc;
 }
 
-test "FloatOverlayMap last-write-wins with overlapping floats" {
-    const alloc = std.testing.allocator;
-    var map = FloatOverlayMap{};
-    defer map.deinit(alloc);
-
-    const vs16 = [_]u32{0xFE0F};
-    const zwj = [_]u32{0x200D};
-
-    // Float A writes VS16 at (5, 10)
-    try map.put(alloc, .{ .row = 5, .col = 10 }, &vs16);
-    // Float B overwrites same cell with no overflow (null = shadow)
-    try map.put(alloc, .{ .row = 5, .col = 10 }, null);
-
-    // Last write wins: null (shadowed, no overflow)
-    const result = map.get(.{ .row = 5, .col = 10 });
-    try std.testing.expect(result != null); // key exists
-    try std.testing.expect(result.? == null); // but extras is null
-
-    // Reverse scenario: float A has no overflow, float B has ZWJ
-    try map.put(alloc, .{ .row = 6, .col = 10 }, null);
-    try map.put(alloc, .{ .row = 6, .col = 10 }, &zwj);
-
-    const result2 = map.get(.{ .row = 6, .col = 10 });
-    try std.testing.expect(result2 != null);
-    try std.testing.expect(result2.? != null);
-    try std.testing.expectEqual(@as(u32, 0x200D), result2.?.?[0]);
-}
-
-test "FloatOverlayMap shadows base grid overflow" {
-    const alloc = std.testing.allocator;
-    var map = FloatOverlayMap{};
-    defer map.deinit(alloc);
-
-    // Float occupies (3, 7) without overflow → shadows base
-    try map.put(alloc, .{ .row = 3, .col = 7 }, null);
-
-    // Verify: key exists, value is null (shadow)
-    try std.testing.expect(map.contains(.{ .row = 3, .col = 7 }));
-    try std.testing.expect(map.get(.{ .row = 3, .col = 7 }).? == null);
-
-    // Cell not covered by float → no entry
-    try std.testing.expect(!map.contains(.{ .row = 3, .col = 8 }));
-}
-
-test "getOverflowForCell prefers float overlay over persistent map" {
+test "getOverflowForCell reads a grid's own overflow at grid-local coordinates" {
     const alloc = std.testing.allocator;
 
     // Create a Core with test grid
@@ -458,62 +417,27 @@ test "getOverflowForCell prefers float overlay over persistent map" {
     var rc = try setupRenderCells(alloc, 80, 5);
     defer rc.deinit(alloc);
 
-    // Without float overlay: should find base grid's VS16
     const base_result = flush_mod.getOverflowForCell(&core, &rc, 2, 3);
     try std.testing.expect(base_result != null);
     try std.testing.expectEqual(@as(u32, 0xFE0F), base_result.?[0]);
 
-    // With float overlay that shadows (2, 3) with null (no overflow)
-    var map = FloatOverlayMap{};
-    defer map.deinit(alloc);
-    try map.put(alloc, .{ .row = 2, .col = 3 }, null);
-    core.flush_float_overlay = &map;
-
-    // Float shadows base → should return null (NOT the base VS16)
-    const shadowed = flush_mod.getOverflowForCell(&core, &rc, 2, 3);
-    try std.testing.expect(shadowed == null);
-
-    // Cell not covered by float → falls back to persistent map
-    const fallback = flush_mod.getOverflowForCell(&core, &rc, 2, 4);
-    try std.testing.expect(fallback == null); // no overflow at (2, 4)
-
-    // Float with its own VS16 at (2, 5)
-    const float_vs16 = [_]u32{0xFE0F};
-    try map.put(alloc, .{ .row = 2, .col = 5 }, &float_vs16);
-
-    const float_result = flush_mod.getOverflowForCell(&core, &rc, 2, 5);
-    try std.testing.expect(float_result != null);
-    try std.testing.expectEqual(@as(u32, 0xFE0F), float_result.?[0]);
-
-    // Clean up
-    core.flush_float_overlay = null;
+    // No overflow at (2, 4).
+    try std.testing.expect(flush_mod.getOverflowForCell(&core, &rc, 2, 4) == null);
 }
 
-test "cellIsEmojiCluster with float overlay" {
+test "cellIsEmojiCluster sees a VS16 tail" {
     const alloc = std.testing.allocator;
 
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
 
     try core.grid.resizeGrid(5, 10, 80);
-    try core.grid.putCellGridCluster(5, 0, 0, 0x26A0, 0, &.{0xFE0F}); // base has VS16
+    try core.grid.putCellGridCluster(5, 0, 0, 0x26A0, 0, &.{0xFE0F});
 
     var rc = try setupRenderCells(alloc, 80, 5);
     defer rc.deinit(alloc);
 
-    // Without overlay: base VS16 visible
     try std.testing.expect(flush_mod.cellIsEmojiCluster(&core, &rc, 0, 0));
-
-    // Float shadows with no overflow
-    var map = FloatOverlayMap{};
-    defer map.deinit(alloc);
-    try map.put(alloc, .{ .row = 0, .col = 0 }, null);
-    core.flush_float_overlay = &map;
-
-    // Shadowed: no VS16
-    try std.testing.expect(!flush_mod.cellIsEmojiCluster(&core, &rc, 0, 0));
-
-    core.flush_float_overlay = null;
 }
 
 test "cellIsEmojiCluster detects ZWJ in overflow" {

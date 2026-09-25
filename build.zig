@@ -22,6 +22,22 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
     const host_os = @import("builtin").os.tag;
 
+    // Run only the tests whose name contains this substring, e.g.
+    // `zig build e2e -Dtest-filter=scrollbind`. Wired into the three
+    // multi-scenario binaries: `test`, `e2e` and `gui-test`. A binary whose
+    // names all miss the filter simply runs nothing and passes.
+    //
+    // This exists so that iterating on one scenario never means editing a
+    // shared registration file: commenting out or deleting other scenarios to
+    // go faster loses them silently, because the build still succeeds.
+    const test_filter = b.option(
+        []const u8,
+        "test-filter",
+        "Run only tests whose name contains this substring (test, e2e, gui-test)",
+    );
+    const test_filters: []const []const u8 =
+        if (test_filter) |f| &.{f} else &.{};
+
     // TOML parser dependency
     const zig_toml = b.dependency("zig-toml", .{
         .target = target,
@@ -196,6 +212,42 @@ pub fn build(b: *std.Build) !void {
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
+    // Unit tests for windows/app.zig and what it imports: the layer draw
+    // planner, input, logging, and the DirectWrite renderer's shaping,
+    // GSUB-trigger, variation-axis and font-face tests against installed fonts.
+    // It reaches Win32 through the renderer, so it builds only for a Windows
+    // target and runs only on a Windows host (`zig build test` there).
+    var windows_app_tests: ?*std.Build.Step.Compile = null;
+    if (target.result.os.tag == .windows) {
+        const app_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("windows/app.zig"),
+            .imports = &.{
+                .{ .name = "zonvie_core", .module = core_mod },
+                .{ .name = "toml", .module = zig_toml.module("toml") },
+            },
+        });
+        app_test_mod.linkLibrary(core_lib);
+        for ([_][]const u8{
+            "user32", "gdi32",   "kernel32", "imm32",    "dwrite",
+            "d2d1",   "ole32",   "d3d11",    "dxgi",     "d3dcompiler_47",
+            "dcomp",  "dwmapi",  "credui",   "advapi32", "shell32",
+            "winmm",  "msimg32", "comdlg32",
+        }) |name| app_test_mod.linkSystemLibrary(name, .{});
+        const app_tests = b.addTest(.{
+            .name = "zonvie-app-test",
+            .root_module = app_test_mod,
+            .filters = test_filters,
+        });
+        windows_app_tests = app_tests;
+        const app_test_step = b.step("windows-app-test", "Build the Windows app unit tests");
+        app_test_step.dependOn(&b.addInstallArtifact(app_tests, .{
+            .dest_dir = .{ .override = .{ .custom = "../windows/zig-out" } },
+        }).step);
+    }
+
     // Win32 contract test for the top-level HWND wake cookie storage. Compile
     // it with every Windows frontend build; execute it when the build host can
     // create a real Win32 window.
@@ -219,6 +271,9 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     if (host_os == .windows and target.result.os.tag == .windows) {
         test_step.dependOn(&b.addRunArtifact(wake_state_tests).step);
+        // The DirectWrite shaping, GSUB trigger and font-face tests need a real
+        // Windows font stack, so they run here rather than on the CI Linux job.
+        if (windows_app_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     // macOS external-grid font reset intersection test. It uses barriers to
@@ -271,6 +326,21 @@ pub fn build(b: *std.Build) !void {
         run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
         test_step.dependOn(&run_font_cell_fit_test.step);
 
+        // A variable font's Bold/Italic faces are instances of one file:
+        // FreeType must be handed their coordinates, merged with the user's.
+        const compile_font_instance_axes_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_font_instance_axes_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_font_instance_axes_test.addFileArg(b.path("macos/Sources/Font/FontInstanceAxes.swift"));
+        compile_font_instance_axes_test.addFileArg(b.path("macos/Tests/FontInstanceAxesTests.swift"));
+        compile_font_instance_axes_test.addArg("-o");
+        const font_instance_axes_test_exe = compile_font_instance_axes_test.addOutputFileArg("font-instance-axes-tests");
+        const run_font_instance_axes_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_font_instance_axes_test.addFileArg(font_instance_axes_test_exe);
+        test_step.dependOn(&run_font_instance_axes_test.step);
+
         // Which of an NSEvent's two character strings a modified key carries.
         // The rule lived inline in both keyDown handlers and drifted; it is a
         // pure pick, so it is pinned here rather than left to a GUI run.
@@ -303,10 +373,42 @@ pub fn build(b: *std.Build) !void {
         run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
         test_step.dependOn(&run_scroll_retention_test.step);
 
+        // The one rule that turns a pixel into a grid row while a sub-row ease
+        // is running. It had a second, band-less copy on the drag path, so a
+        // press and the drag after it disagreed about the same pixel.
+        const compile_scroll_row_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_scroll_row_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_scroll_row_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
+        compile_scroll_row_test.addFileArg(b.path("macos/Tests/ScrollAdjustedRowTests.swift"));
+        compile_scroll_row_test.addArg("-o");
+        const scroll_row_test_exe = compile_scroll_row_test.addOutputFileArg("scroll-adjusted-row-tests");
+        const run_scroll_row_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_scroll_row_test.addFileArg(scroll_row_test_exe);
+        test_step.dependOn(&run_scroll_row_test.step);
+
         // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
         // back texture, and the vacated band always inside the rows the
         // caller redraws. The blit itself is checked against a real texture
         // when a Metal device exists.
+        // The one gate that decides whether a surface draws at all. Both
+        // surfaces' original chains are transcribed in the test and every
+        // assignment of their terms is enumerated against the shared one.
+        const compile_draw_gate_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_draw_gate_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_draw_gate_test.addFileArg(b.path("macos/Sources/Rendering/SurfaceDrawGate.swift"));
+        compile_draw_gate_test.addFileArg(b.path("macos/Tests/SurfaceDrawGateTests.swift"));
+        compile_draw_gate_test.addArg("-o");
+        const draw_gate_test_exe = compile_draw_gate_test.addOutputFileArg("surface-draw-gate-tests");
+        const run_draw_gate_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_draw_gate_test.addFileArg(draw_gate_test_exe);
+        test_step.dependOn(&run_draw_gate_test.step);
+
         const compile_row_scroll_blit_plan_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
         compile_row_scroll_blit_plan_test.addArgs(&.{
             "-module-cache-path",
@@ -326,6 +428,7 @@ pub fn build(b: *std.Build) !void {
     // as a separate module do not execute the dependency module's own tests.
     const core_tests = b.addTest(.{
         .root_module = core_mod,
+        .filters = test_filters,
     });
     test_step.dependOn(&b.addRunArtifact(core_tests).step);
 
@@ -401,23 +504,50 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(cursor_style_tests).step);
 
-    // Scroll fast path tests
-    const scroll_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("test/scroll_fast_path_test.zig"),
-        .imports = &.{
-            .{ .name = "zonvie_core", .module = core_mod },
-            .{ .name = "toml", .module = zig_toml.module("toml") },
-        },
-    });
-    const scroll_tests = b.addTest(.{
-        .root_module = scroll_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(scroll_tests).step);
-
     // Message routing tests. msg_route.zig is std-only, so it is exposed as a
     // standalone module rather than pulled in through zonvie_core.
+    // Which grid a pointer names. The rule both frontends were applying
+    // separately, hoisted here; pure and inline-tested, so it runs on the
+    // build host rather than needing a Windows one.
+    const pointer_target_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/pointer_target.zig"),
+    });
+    const pointer_target_tests = b.addTest(.{ .root_module = pointer_target_test_mod });
+    test_step.dependOn(&b.addRunArtifact(pointer_target_tests).step);
+
+    // Whether a viewport needs a scrollbar and where its knob sits. Same
+    // shape: the arithmetic both frontends had written out, with the corners
+    // their two versions disagreed about pinned by the tests.
+    const scrollbar_metrics_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/scrollbar_metrics.zig"),
+    });
+    const scrollbar_metrics_tests = b.addTest(.{ .root_module = scrollbar_metrics_test_mod });
+    test_step.dependOn(&b.addRunArtifact(scrollbar_metrics_tests).step);
+
+    // The cursor's rectangle from its grid-local vertices. Same shape again:
+    // the bounds and the pixel inflation both frontends had written out.
+    const cursor_rect_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/cursor_rect.zig"),
+    });
+    const cursor_rect_tests = b.addTest(.{ .root_module = cursor_rect_test_mod });
+    test_step.dependOn(&b.addRunArtifact(cursor_rect_tests).step);
+
+    // Whether an external popupmenu opens below or above its anchor. Same
+    // shape: the two frontends flipped against different edges.
+    const popup_placement_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/core/popup_placement.zig"),
+    });
+    const popup_placement_tests = b.addTest(.{ .root_module = popup_placement_test_mod });
+    test_step.dependOn(&b.addRunArtifact(popup_placement_tests).step);
+
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -471,10 +601,15 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(&b.addRunArtifact(msg_split_lua_tests).step);
 
     // Platform-independent Windows damage compaction regression tests.
+    // `render_pipeline_helpers.zig` reaches the core for the row-scroll blit
+    // arithmetic, so this module needs the same import win_mod has.
     const windows_render_helpers_test_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("windows/render_pipeline_helpers_test.zig"),
+        .imports = &.{
+            .{ .name = "zonvie_core", .module = core_mod },
+        },
     });
     const windows_render_helpers_tests = b.addTest(.{
         .root_module = windows_render_helpers_test_mod,
@@ -552,6 +687,29 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(font_family_list_tests).step);
 
+    // OpenType features reach the macOS shaper (HBFTBridge.c + HarfBuzz).
+    // Needs a ligature font already on the system; skips without one.
+    if (host_os == .macos and target.result.os.tag == .macos) {
+        const shaping_test_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .root_source_file = b.path("test/font_shaping_test.zig"),
+            .imports = &.{
+                .{ .name = "zonvie_core", .module = core_mod },
+                .{ .name = "toml", .module = zig_toml.module("toml") },
+            },
+        });
+        shaping_test_mod.addCSourceFile(.{ .file = b.path("macos/Sources/Font/HBFTBridge.c") });
+        // Include and library paths come from pkg-config, as for the app.
+        shaping_test_mod.linkSystemLibrary("freetype", .{});
+        shaping_test_mod.linkSystemLibrary("harfbuzz", .{});
+        const shaping_tests = b.addTest(.{
+            .root_module = shaping_test_mod,
+        });
+        test_step.dependOn(&b.addRunArtifact(shaping_tests).step);
+    }
+
     // Ligature vertex tests
     const lig_test_mod = b.createModule(.{
         .target = target,
@@ -584,6 +742,7 @@ pub fn build(b: *std.Build) !void {
     });
     const e2e_tests = b.addTest(.{
         .root_module = e2e_mod,
+        .filters = test_filters,
     });
     const e2e_run = b.addRunArtifact(e2e_tests);
     // Force rerun — results depend on the external nvim binary.
@@ -613,6 +772,7 @@ pub fn build(b: *std.Build) !void {
         }
         const gui_tests = b.addTest(.{
             .root_module = gui_mod,
+            .filters = test_filters,
         });
         const gui_run = b.addRunArtifact(gui_tests);
         // Force rerun — results depend on the external app and nvim.

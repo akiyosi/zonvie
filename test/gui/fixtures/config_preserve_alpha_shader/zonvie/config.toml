@@ -1,0 +1,12 @@
+# A custom shader chain compiled with preserve_alpha ON. That setting is the
+# whole point of this fixture: the decorated variant of the chain is always
+# compiled with it OFF, so the two variants differ here and a surface that
+# picks the wrong one can be told apart.
+[window]
+blur = false
+opacity = 1.0
+
+[shaders]
+enabled = true
+preserve_alpha = true
+paths = ["test/gui/fixtures/shaders/static_probe.glsl"]

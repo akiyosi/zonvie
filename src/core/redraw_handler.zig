@@ -478,6 +478,24 @@ pub fn parseFontFeatureToken(tok: []const u8) ?FontFeature {
     };
 }
 
+/// Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+/// into `out`; tokens that are not a feature are skipped, whitespace around a
+/// token is ignored. Returns how many were written (at most `out.len`). The
+/// one reading of a candidate line's feature field for every frontend.
+pub fn parseFontFeatureList(list: []const u8, out: []FontFeature) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |raw| {
+        if (n == out.len) break;
+        const tok = std.mem.trim(u8, raw, " \t");
+        if (parseFontFeatureToken(tok)) |f| {
+            out[n] = f;
+            n += 1;
+        }
+    }
+    return n;
+}
+
 pub fn parseGuiFontCandidate(arena: std.mem.Allocator, cand: []const u8) !GuiFontResolved {
     // Format: "Name:h14:+ss01:-liga:cv02=3" etc.
     // We keep name as-is (already unescaped by parseGuiFontList).
@@ -1425,15 +1443,6 @@ pub fn handleRedraw(
                         return err;
                     };
 
-                    // Update external grid target size so NDC viewport matches the actual grid.
-                    // Only for grids that are actual external windows (ext_windows splits
-                    // or UI-extension grids like popupmenu/messages). Float windows
-                    // (e.g. Telescope) must NOT get entries here — they render on the
-                    // global grid and their NDC uses sg.rows/sg.cols directly.
-                    if (grid.external_grids.contains(grid_id) or grid.ext_windows_grids.contains(grid_id)) {
-                        try grid.external_grid_target_sizes.put(grid.alloc, grid_id, .{ .rows = height, .cols = width });
-                    }
-
                     // Record the global grid size so core can detect a
                     // Neovim-initiated resize (`:set columns=` / `:set lines=`)
                     // after the batch completes.
@@ -1693,7 +1702,6 @@ pub fn handleRedraw(
                     // On hide (tab switch), keep tracking so win_pos can restore.
                     if (is_close) {
                         _ = grid.ext_windows_grids.remove(grid_id);
-                        _ = grid.external_grid_target_sizes.remove(grid_id);
                     }
                 }
             },
@@ -1819,11 +1827,10 @@ pub fn handleRedraw(
                                 base_row = @as(i64, p.row);
                                 base_col = @as(i64, p.col);
                             } else if (grid.external_grids.get(anchor_grid)) |ext| {
-                                // anchor_grid is an external window - use its stored position
-                                if (ext.start_row >= 0 and ext.start_col >= 0) {
-                                    base_row = @as(i64, ext.start_row);
-                                    base_col = @as(i64, ext.start_col);
-                                }
+                                // anchor_grid is an external window: its origin,
+                                // the one Grid.surfacePlacement takes back out.
+                                base_row = grid_mod.externalCompositeOriginRow(ext);
+                                base_col = grid_mod.externalCompositeOriginCol(ext);
                             }
                         }
 
@@ -1878,6 +1885,9 @@ pub fn handleRedraw(
                         zindex,
                         compindex,
                         anchor_grid,
+                        // t[6] is mouse_enabled in every observed form. A float
+                        // that refuses the mouse must not win a hit test.
+                        if (t[6] == .bool) t[6].bool else true,
                     ) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("[win_float_pos] rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
@@ -1942,7 +1952,7 @@ pub fn handleRedraw(
                     const row = checkedGridCoord(row_i) orelse continue;
                     const col: u32 = 0;
                     // msg_set_pos has no win handle; pass 0 (no window mapping stored)
-                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1) catch |err| switch (err) {
+                    grid.setWinFloatPos(grid_id, 0, row, col, zindex, compindex, 1, true) catch |err| switch (err) {
                         error.TooManyWindowPlacements => {
                             log.write("msg_set_pos rejected grid={d}: TooManyWindowPlacements\n", .{grid_id});
                             return error.TooManyWindowPlacements;
@@ -2044,6 +2054,18 @@ pub fn handleRedraw(
                         try hl.define(id_u32, fg, bg, sp, reverse, blend_u8, styles, has_url);
                     } else {
                         try hl.define(id_u32, null, null, null, false, 0, Styles{}, false);
+                    }
+
+                    // ext_hlstate's fourth element: the groups this attribute
+                    // id was composed from, innermost last. `hi_name` is the
+                    // syntax group, `ui_name` the builtin the UI knows it by;
+                    // record both, because a user names either one.
+                    if (t.len >= 4 and t[3] == .arr) {
+                        for (t[3].arr) |iv| {
+                            if (iv != .map) continue;
+                            if (mapGetStr(iv.map, "hi_name")) |n| try hl.addAttrName(id_u32, n);
+                            if (mapGetStr(iv.map, "ui_name")) |n| try hl.addAttrName(id_u32, n);
+                        }
                     }
                 }
             },
@@ -2344,12 +2366,7 @@ pub fn handleRedraw(
                     // Resolved once per grid_line tuple (grid_id is constant within
                     // it); used by the repeat clamp below. A per-cell sub_grids
                     // lookup here would be a hash probe on the grid_line hot path.
-                    const grid_cols: u32 = if (grid_id == 1)
-                        grid.cols
-                    else if (grid.sub_grids.get(grid_id)) |sg|
-                        sg.cols
-                    else
-                        0;
+                    const grid_cols: u32 = if (grid.bufForConst(grid_id)) |buf| buf.cols else 0;
 
                     // "hl" is a state that persists across cell tuples within THIS grid_line event.
                     // - If hl is omitted, keep previous hl value.

@@ -7,6 +7,24 @@ const d3d11 = app_mod.d3d11;
 const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
+const input = @import("../input.zig");
+
+/// The grid a `.grid`-anchored message box hangs off: the cursor's, or, for a
+/// cursor inside a float (a telescope prompt), the window the float is
+/// anchored to. Grid 1 when the chain dead-ends. macOS's cursorAnchorGrid.
+fn cursorAnchorGridId(grids: []const app_mod.GridInfo, cursor_grid: i64) i64 {
+    var current: i64 = cursor_grid;
+    var hops: u32 = 0;
+    while (hops < 8) : (hops += 1) {
+        const g = for (grids) |g| {
+            if (g.grid_id == current) break g;
+        } else return 1;
+        if (g.zindex <= 0) return g.grid_id;
+        current = g.anchor_grid;
+    }
+    return 1;
+}
+
 
 /// Hand a prepared request to the UI thread and wake it. Caller must already
 /// hold app.mu.
@@ -401,10 +419,11 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         window_x = app_rect.left + @divTrunc(app_width - window_width, 2);
         window_y = app_rect.bottom - window_height - app.scalePx(40);
     } else {
-        // Top-right for regular messages (screen coordinates like msg_history/macOS)
-        const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-        window_x = screen_w - window_width - app.scalePx(10);
-        window_y = app.scalePx(10);
+        // Top-right of the main window's monitor for regular messages
+        // (screen coordinates like msg_history/macOS)
+        const work = app_mod.monitorWorkArea(app.hwnd);
+        window_x = work.right - window_width - app.scalePx(10);
+        window_y = work.top + app.scalePx(10);
     }
 
     // Check if this is a return_prompt (preserve layout from confirm dialog)
@@ -579,16 +598,14 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
                 pos_x = mi.rcWork.left + @divTrunc(work_w - window_w, 2);
                 pos_y = mi.rcWork.top + @divTrunc(work_h - window_h, 3);
             } else {
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @divTrunc(screen_w - window_w, 2);
-                pos_y = @divTrunc(screen_h - window_h, 3);
+                const work = app_mod.monitorWorkArea(app.hwnd);
+                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
             }
         } else {
-            const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-            const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-            pos_x = @divTrunc(screen_w - window_w, 2);
-            pos_y = @divTrunc(screen_h - window_h, 3);
+            const work = app_mod.monitorWorkArea(app.hwnd);
+            pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+            pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
         }
     } else {
         pos_x = current_rect.left;
@@ -664,11 +681,11 @@ pub fn updateExtFloatPositions(app: *App) void {
 
     // Copy window info
     const msg_show_hwnd: ?c.HWND = if (msg_show_entry) |e| e.hwnd else null;
-    const msg_show_rows: u32 = if (msg_show_entry) |e| e.surface.rows else 0;
-    const msg_show_cols: u32 = if (msg_show_entry) |e| e.surface.cols else 0;
+    const msg_show_rows: u32 = if (msg_show_entry) |e| e.surf.surface.rows else 0;
+    const msg_show_cols: u32 = if (msg_show_entry) |e| e.surf.surface.cols else 0;
     const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
-    const msg_history_rows: u32 = if (msg_history_entry) |e| e.surface.rows else 0;
-    const msg_history_cols: u32 = if (msg_history_entry) |e| e.surface.cols else 0;
+    const msg_history_rows: u32 = if (msg_history_entry) |e| e.surf.surface.rows else 0;
+    const msg_history_cols: u32 = if (msg_history_entry) |e| e.surf.surface.cols else 0;
     // When using DWM custom titlebar, client area extends into the titlebar.
     // Compute offset to position floats below the custom titlebar area.
     const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
@@ -680,19 +697,12 @@ pub fn updateExtFloatPositions(app: *App) void {
     // Calculate target rect based on position mode (mutex unlocked, safe to call core functions)
     var target_rect: c.RECT = undefined;
     switch (pos_mode) {
-        .display => {
-            target_rect = .{
-                .left = 0,
-                .top = 0,
-                .right = c.GetSystemMetrics(c.SM_CXSCREEN),
-                .bottom = c.GetSystemMetrics(c.SM_CYSCREEN),
-            };
-        },
+        .display => target_rect = app_mod.monitorWorkArea(main_hwnd),
         .window => {
             // Window-based: use cursor's window
             if (cursor_ext_hwnd) |hwnd| {
                 if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+                    target_rect = app_mod.monitorWorkArea(main_hwnd);
                 }
             } else {
                 var client_rect: c.RECT = undefined;
@@ -706,7 +716,7 @@ pub fn updateExtFloatPositions(app: *App) void {
                         .bottom = pt.y + client_rect.bottom,
                     };
                 } else {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+                    target_rect = app_mod.monitorWorkArea(main_hwnd);
                 }
             }
         },
@@ -715,7 +725,7 @@ pub fn updateExtFloatPositions(app: *App) void {
             if (cursor_ext_hwnd) |hwnd| {
                 // Cursor is in external window
                 if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+                    target_rect = app_mod.monitorWorkArea(main_hwnd);
                 }
             } else {
                 // Get grid bounds from core (safe now, outside of callback)
@@ -835,9 +845,10 @@ pub fn updateMiniWindows(app: *App) void {
 
     switch (mini_pos_mode) {
         .display => {
-            // Display-based: bottom-right of screen
-            anchor_x = c.GetSystemMetrics(c.SM_CXSCREEN);
-            anchor_y = c.GetSystemMetrics(c.SM_CYSCREEN);
+            // Display-based: bottom-right of the main window's monitor.
+            const work = app_mod.monitorWorkArea(main_hwnd);
+            anchor_x = work.right;
+            anchor_y = work.bottom;
         },
         .window => {
             // Window-based: check if cursor is in external window
@@ -880,9 +891,13 @@ pub fn updateMiniWindows(app: *App) void {
             var grid_right_px: c_int = client_rect.right;
             var grid_bottom_px: c_int = client_rect.bottom;
 
-            // Check if cursor is in external window first
+            // The window the cursor is in, walked out of any float.
+            const cached: []const app_mod.GridInfo = if (app.corep) |corep| app.getVisibleGridsCached(corep) else &.{};
+            const anchor_grid = cursorAnchorGridId(cached, cursor_grid);
+
+            // Check if that window is an external one first
             app.mu.lockUncancelable(core.clock.io());
-            const ext_win = app.external_windows.get(cursor_grid);
+            const ext_win = app.external_windows.get(anchor_grid);
             app.mu.unlock(core.clock.io());
 
             if (ext_win) |ew| {
@@ -895,20 +910,17 @@ pub fn updateMiniWindows(app: *App) void {
                     anchor_y = client_origin.y + grid_bottom_px;
                 }
             } else {
-                // Try to get grid bounds from core (non-blocking)
-                if (app.corep) |corep| {
-                    const cached = app.getVisibleGridsCached(corep);
-                    if (cached.len > 0) {
-                        for (cached) |grid| {
-                            if (grid.grid_id == cursor_grid) {
-                                const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
-                                const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
-                                grid_right_px = @intCast(end_col * cell_w);
-                                // cell_h already includes linespace; do NOT add linespace again.
-                                grid_bottom_px = @intCast(end_row * cell_h);
-                                break;
-                            }
-                        }
+                // Grid bounds from the core's (non-blocking) snapshot, in the
+                // editor area: the tab bar or sidebar sits before it.
+                for (cached) |grid| {
+                    if (grid.grid_id == anchor_grid) {
+                        const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
+                        const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
+                        const origin = input.surfaceOriginPx(app, true);
+                        grid_right_px = origin.x + @as(c_int, @intCast(end_col * cell_w));
+                        // cell_h already includes linespace; do NOT add linespace again.
+                        grid_bottom_px = origin.y + @as(c_int, @intCast(end_row * cell_h));
+                        break;
                     }
                 }
                 anchor_x = client_origin.x + grid_right_px;
@@ -919,7 +931,7 @@ pub fn updateMiniWindows(app: *App) void {
 
     // Count visible minis and build stack order
     var stacked_height_px: c_int = 0;
-    for (0..3) |idx| {
+    for (0..app.mini_windows.len) |idx| {
         app.mu.lockUncancelable(core.clock.io());
         const text_len = app.mini_windows[idx].text_len;
         var text_buf: [256]u8 = undefined;
@@ -1135,7 +1147,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     app.mu.lockUncancelable(core.clock.io());
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
-    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+    inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
         const idx = @intFromEnum(id);
         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
             if (mini_hwnd == hwnd) {

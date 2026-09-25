@@ -122,12 +122,11 @@ fn getCwdUtf8(alloc: std.mem.Allocator) ?[]u8 {
 }
 
 /// Single-instance mode: forward file arguments to an already-running instance
-/// via WM_COPYDATA, then let the caller exit. Builds a bare Ex command (no
-/// leading ':') of the form "tab drop <abs1> <abs2> ..." — or "drop <abs>" for
-/// a single file when [server] open_mode == "current" — and posts it to the
-/// existing window. Paths are made absolute (the running instance may have a
-/// different working directory) and escaped for Neovim's command line, mirroring
-/// the WM_DROPFILES handler in window.zig. An empty path list sends an empty
+/// via WM_COPYDATA, then let the caller exit. The payload is a tab-per-file
+/// flag -- '0' only for a single file when [server] open_mode == "current",
+/// the macOS rule -- then the absolute paths (the running instance may have a
+/// different working directory), NUL-separated and unescaped: the receiver
+/// hands them to zonvie_core_drop_paths. An empty path list sends an empty
 /// payload, which just brings the existing window to the front.
 fn forwardFilesToInstance(
     alloc: std.mem.Allocator,
@@ -140,13 +139,13 @@ fn forwardFilesToInstance(
 
     if (paths.len > 0) {
         const use_current = paths.len == 1 and std.mem.eql(u8, cfg.server.open_mode, "current");
-        buf.appendSlice(alloc, if (use_current) "drop" else "tab drop") catch return;
+        buf.append(alloc, if (use_current) '0' else '1') catch return;
 
         const cwd = getCwdUtf8(alloc);
         defer if (cwd) |w| alloc.free(w);
 
-        for (paths) |p| {
-            buf.append(alloc, ' ') catch return;
+        for (paths, 0..) |p, i| {
+            if (i > 0) buf.append(alloc, 0) catch return;
 
             // Resolve to an absolute path against this process's cwd so the
             // running instance opens the file the user meant. Does not require
@@ -160,9 +159,7 @@ fn forwardFilesToInstance(
             };
             defer if (abs.ptr != p.ptr) alloc.free(abs);
 
-            for (abs) |ch| {
-                if (window.escapeNeovimByte(ch)) |e| buf.appendSlice(alloc, e) catch return else buf.append(alloc, ch) catch return;
-            }
+            buf.appendSlice(alloc, abs) catch return;
         }
     }
 
@@ -685,8 +682,7 @@ pub fn main() u8 {
 
     // Enable logging if configured (CLI --log overrides config)
     if (cli_log_path) |path| {
-        applog.setLogPath(path);
-        applog.setEnabled(true);
+        applog.forceEnabled(path);
     } else if (config.log.enabled) {
         applog.setLogPath(config.log.path);
         applog.setEnabled(true);

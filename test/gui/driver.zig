@@ -44,7 +44,9 @@ pub const capture = switch (builtin.os.tag) {
 };
 
 pub const default_app_rel_path = switch (builtin.os.tag) {
-    .windows => "windows/zig-out/bin/zonvie.exe",
+    // build.zig installs the Windows exe directly into windows/zig-out, with
+    // no bin/ subdirectory.
+    .windows => "windows/zig-out/zonvie.exe",
     else => "macos/.derived/Build/Products/Debug/zonvie.app/Contents/MacOS/zonvie",
 };
 
@@ -105,6 +107,10 @@ pub const Options = struct {
     /// empty shared fixtures dir; scenarios that need a config.toml ship
     /// their own fixture dir (<dir>/zonvie/config.toml layout).
     config_dir: []const u8 = "test/gui/fixtures/config",
+    /// Extra environment for the app, as {name, value} pairs. For settings the
+    /// app reads from the environment rather than from config.toml, which a
+    /// fixture cannot reach.
+    app_env: []const [2][]const u8 = &.{},
 };
 
 pub const Gui = struct {
@@ -159,8 +165,15 @@ pub const Gui = struct {
         errdefer alloc.free(g.listen_addr);
 
         // 1. Shared nvim server (headless, clean).
+        //
+        // `-n` disables swap files ('noswapfile'), for the same reason
+        // test/e2e/harness.zig passes it: every scenario spawns an nvim and
+        // kills it, so each one leaves a swap file behind in the user's real
+        // state directory. They accumulate across runs until nvim answers
+        // E325 "swap file exists" with a |hit-enter| prompt — in the user's
+        // own editor, not just in the tests. A harness never needs swap.
         g.nvim_child = try std.process.spawn(gui_io.io(), .{
-            .argv = &.{ nvim_path, "--clean", "--headless", "--listen", g.listen_addr },
+            .argv = &.{ nvim_path, "--clean", "-n", "--headless", "--listen", g.listen_addr },
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
@@ -191,8 +204,29 @@ pub const Gui = struct {
         defer alloc.free(fixtures_abs);
         try g.app_env.put(if (builtin.os.tag == .windows) "APPDATA" else "XDG_CONFIG_HOME", fixtures_abs);
 
-        // Optional home isolation (persisted app state, frame autosave).
-        if (opts.home_dir) |home| {
+        for (opts.app_env) |pair| {
+            try g.app_env.put(pair[0], pair[1]);
+        }
+
+        // Home isolation (persisted app state, frame autosave). A scenario
+        // may name the dir, for relaunch comparisons; otherwise every Gui
+        // gets a fresh one of its own. On macOS the app restores its window
+        // frame from NSUserDefaults, which live under HOME, so a scenario
+        // that did not isolate it ran at whatever frame the user's own
+        // zonvie — or the previous scenario's app — saved last. Two
+        // scenarios that assumed a geometry (a float under the window's
+        // centre, a margin band with no sub-cell remainder) failed or flaked
+        // on that alone. Windows keeps the opt-in: its persisted state under
+        // USERPROFILE has not been shown to matter, and the change has not
+        // had a hardware run.
+        const isolate_home = opts.home_dir != null or builtin.os.tag != .windows;
+        if (isolate_home) {
+            var home_buf: [128]u8 = undefined;
+            const home: []const u8 = opts.home_dir orelse blk: {
+                const fresh = try std.fmt.bufPrint(&home_buf, "tmp/gui_home/{d}_{d}", .{ currentPid(), seq });
+                std.Io.Dir.cwd().deleteTree(gui_io.io(), fresh) catch {};
+                break :blk fresh;
+            };
             std.Io.Dir.cwd().createDirPath(gui_io.io(), home) catch {};
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);

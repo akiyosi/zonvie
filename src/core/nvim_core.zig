@@ -17,6 +17,7 @@ const rpc_session = @import("rpc_session.zig");
 const rpc_transport = @import("rpc_transport.zig");
 const shelf_packer = @import("shelf_packer.zig");
 const vertexgen = @import("vertexgen.zig");
+const pointer_target = @import("pointer_target.zig");
 const clock = @import("clock.zig");
 
 /// Re-exported here so callers in this file can spell `Stream` without
@@ -30,11 +31,17 @@ pub const KnownExtGridInfo = struct { win: i64, start_row: i32, start_col: i32, 
 
 pub const GLYPH_CACHE_INVALID_KEY: u64 = std.math.maxInt(u64);
 
-/// Flushes a shifted-out row stays in the reclamation liveness set. macOS keeps
-/// at most two retained scroll rows and shifts them one flush at a time; one
-/// flush of slack covers the hand-off. An expired shadow only ever delays
-/// reclamation, so erring high is the safe direction.
+/// Flushes a shifted-out row stays in the reclamation liveness set. macOS shifts
+/// its retained rows one flush at a time, and an expired shadow only ever delays
+/// reclamation, so the extra flush of slack is the safe direction.
 pub const retained_shadow_expiry: u8 = 3;
+
+/// Vacated rows the shadow holds at once. macOS `ScrollRetention`
+/// (macos/Sources/Rendering/MetalTypes.swift) can draw `maxDepthRows` (4)
+/// retained rows for each of `maxRetainedGrids` (8) grids without this core's
+/// mirror; holding fewer would let reclamation free a shelf still being drawn.
+/// Windows retains nothing (`swapAndShiftRows` clears vacated rows outright).
+pub const retained_shadow_slots: usize = 4 * 8;
 const TRANSIENT_GLYPH_RETRY_INITIAL_NS: i128 = 250 * std.time.ns_per_ms;
 const TRANSIENT_GLYPH_RETRY_MAX_NS: i128 = 4 * std.time.ns_per_s;
 const TRANSIENT_GLYPH_RETRY_MAX_ATTEMPTS: u8 = 5;
@@ -75,16 +82,23 @@ pub const TransportKind = enum {
     socket,
 };
 
-pub const Callbacks = struct {
-    on_vertices_partial: ?*const fn (
-        ctx: ?*anyopaque,
-        main_verts: ?[*]const c_api.Vertex,
-        main_count: usize,
-        cursor_verts: ?[*]const c_api.Vertex,
-        cursor_count: usize,
-        flags: u32,
-    ) callconv(.c) void = null,
+/// One grid's per-row glyph UVs, mirroring what the frontend is showing for
+/// that grid. `valid` marks the rows this core can answer for; a row that is
+/// neither valid nor dirty means reclamation must not run.
+pub const GlyphMirror = struct {
+    rows: std.ArrayListUnmanaged(std.ArrayListUnmanaged(f32)) = .empty,
+    valid: std.DynamicBitSetUnmanaged = .{},
 
+    pub fn deinit(self: *GlyphMirror, alloc: std.mem.Allocator) void {
+        for (self.rows.items) |*row| row.deinit(alloc);
+        self.rows.deinit(alloc);
+        self.rows = .empty;
+        self.valid.deinit(alloc);
+        self.valid = .{};
+    }
+};
+
+pub const Callbacks = struct {
     on_vertices_row: ?*const fn (
         ctx: ?*anyopaque,
         grid_id: i64,
@@ -342,16 +356,6 @@ pub const Callbacks = struct {
     on_get_ascii_table: ?c_api.GetAsciiTableFn = null,
 
     // Main row-buffer scroll fast path notification
-    on_main_row_scroll: ?*const fn (
-        ctx: ?*anyopaque,
-        row_start: u32,
-        row_end: u32,
-        col_start: u32,
-        col_end: u32,
-        rows_delta: i32,
-        total_rows: u32,
-        total_cols: u32,
-    ) callconv(.c) void = null,
 
     // External grid (sub-grid) row-buffer scroll fast path notification
     on_grid_row_scroll: ?*const fn (
@@ -371,11 +375,22 @@ pub const Callbacks = struct {
     /// frontend last supplied via updateLayoutPx, i.e. Neovim changed it
     /// rather than echoing the UI's own resize request.
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    /// Per-surface layer placement: a full replacement of the layer list for
+    /// one surface, fired only when the list changed.
+    on_surface_layout: ?*const fn (
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const c_api.Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void = null,
+    /// Neovim destroyed the grid; the frontend may release its buffers.
+    on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
 };
 
 const GridEntry = flush.GridEntry;
-const CachedSubgrid = flush.CachedSubgrid;
-const SubgridSnapshot = flush.SubgridSnapshot;
 const STYLE_BOLD = flush.STYLE_BOLD;
 const STYLE_ITALIC = flush.STYLE_ITALIC;
 const RenderCells = flush.RenderCells;
@@ -438,6 +453,14 @@ pub fn shapeCacheHash2(scalars: []const u32, style_flags: u32) u64 {
     return if (h == 0) 1 else h;
 }
 
+/// The command that closes Neovim window `win_id` on a user's request.
+/// pcall: the window may already be gone, or be the last one (E444), and
+/// neither should surface as an error. Null when there is no window.
+pub fn formatWinCloseCommand(buf: []u8, win_id: i64) ?[]const u8 {
+    if (win_id <= 0) return null;
+    return std.fmt.bufPrint(buf, "lua pcall(vim.api.nvim_win_close, {d}, false)", .{win_id}) catch null;
+}
+
 /// Cumulative attempt/busy counters for a single grid_mu tryLock call site.
 /// See the perf_lock_* fields on Core for why these must be atomic.
 pub const LockContentionStat = struct {
@@ -456,6 +479,16 @@ pub const RedrawRecoveryState = enum {
     await_attach,
 };
 
+/// One sub-grid's vertex row ledger as it stood when a flush attempt began.
+/// `live` is cleared at the start of every snapshot, so an entry left stale
+/// belongs to a grid destroyed since and is not restored onto a replacement
+/// that reuses the id.
+pub const SubGridLedgerSnapshot = struct {
+    counts: std.ArrayListUnmanaged(usize) = .empty,
+    surface_vertex_count: usize = 0,
+    live: bool = false,
+};
+
 pub const Core = struct {
     pub const MAX_WRITE_QUEUE_SIZE: usize = 4 * 1024 * 1024; // 4MB cap for write queue
     const UI_STATE_WRITE_RESERVE_SIZE: usize = 64 * 1024;
@@ -468,7 +501,6 @@ pub const Core = struct {
     ctx: ?*anyopaque,
 
     last_sent_content_rev: u64 = 0,
-    last_sent_cursor_rev: u64 = 0,
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
     // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
@@ -490,104 +522,39 @@ pub const Core = struct {
     hl: Highlights,
 
     // Reusable vertex buffers (avoid alloc/free on every flush)
-    main_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
     cursor_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
 
     row_verts: std.ArrayListUnmanaged(c_api.Vertex) = .empty,
-    // Partial-only main submission preserves global five-pass ordering by
-    // accumulating under-decoration, glyph, strike, and overline layers here.
-    // Capacities are retained across flushes; no per-frame buffers are created.
-    partial_layer_verts: [4]std.ArrayListUnmanaged(c_api.Vertex) = .{
-        .empty,
-        .empty,
-        .empty,
-        .empty,
-    },
 
-    // Scroll-aware flush: per-row vertex cache.
-    // Each entry holds the last emitted vertices for that row.
-    // On scroll, entries are logically shifted and y-coordinates adjusted.
-    // Invalidated on resize, guifont, atlas reset.
-    scroll_cache: std.ArrayListUnmanaged(std.ArrayListUnmanaged(c_api.Vertex)) = .empty,
-    scroll_cache_valid: std.DynamicBitSetUnmanaged = .{},
-    scroll_cache_rows: u32 = 0,
-    /// The row buffer currently being composed, while it is being composed.
-    /// A row only reaches scroll_cache once it is finished, so without this the
-    /// mid-flush collection cannot see the quads the in-progress row has
-    /// already emitted and would reclaim the shelves they point into. Held as a
-    /// pointer, not a slice: the list grows as the row is built.
+    /// Per-grid mirror of the atlas rows every grid is currently showing.
+    /// Reclamation decides liveness from what the frontend holds, and every
+    /// grid emits its own rows, so no single mirror can answer for the screen.
+    /// Only the glyph UV is kept, not the vertices: that is all shelf
+    /// resolution needs, and it is orders of magnitude smaller.
+    glyph_mirror: std.AutoHashMapUnmanaged(i64, GlyphMirror) = .{},
+    /// The row buffer currently being composed. A row reaches its grid's mirror
+    /// only once finished, so without this the mid-flush collection would
+    /// reclaim shelves the in-progress row already points into. A pointer, not
+    /// a slice: the list grows as the row is built.
     inflight_row_verts: ?*const std.ArrayListUnmanaged(c_api.Vertex) = null,
     /// Set when the frontend declined to publish a frame this core had already
-    /// regenerated rows for. scroll_cache then holds the refused frame while
-    /// the screen still shows the previous one, so it no longer describes what
-    /// is displayed and cannot be used to prove a shelf is unreferenced.
-    /// Cleared by the next accepted publication.
+    /// regenerated rows for: the mirrors then describe the refused frame rather
+    /// than the screen, so they cannot prove a shelf is unreferenced. Cleared
+    /// by the next accepted publication.
     display_mirror_stale: bool = false,
-    /// Copies of the rows the scroll fast path most recently shifted out of the
-    /// viewport. macOS retains those rows in a renderer-owned buffer ring to
-    /// ease a scroll sub-row, and keeps drawing them for a few frames after
-    /// this core has already overwritten their cache slots. That ring is
-    /// invisible here, so reclamation would see their glyphs as unreferenced.
-    retained_shadow: [2]std.ArrayListUnmanaged(c_api.Vertex) = .{ .empty, .empty },
-    retained_shadow_age: [2]u8 = .{ retained_shadow_expiry, retained_shadow_expiry },
+    /// UVs of rows a row-shift hint vacated. macOS keeps drawing a retained
+    /// copy of such a row out of its own buffer ring for a few frames after
+    /// this core stopped mirroring it, so those shelves must stay live.
+    retained_uv_shadow: [retained_shadow_slots]std.ArrayListUnmanaged(f32) = @splat(.empty),
+    retained_shadow_age: [retained_shadow_slots]u8 = @splat(retained_shadow_expiry),
     retained_shadow_next: usize = 0,
-    main_vertex_row_counts: std.ArrayListUnmanaged(usize) = .empty,
-    main_surface_vertex_count: usize = 0,
-    main_vertex_row_ledger_valid: bool = true,
     flush_vertex_count_aggregate: usize = 0,
     vertex_budget_transaction_active: bool = false,
-    vertex_budget_main_touched: bool = false,
     vertex_budget_touched_grid_head: ?i64 = null,
 
-    // Subgrid layout snapshot for scroll fast path.
-    // Stores the (grid_id, row_start, row_end) of every composited subgrid
-    // from the previous successful flush. Compared against the current layout
-    // to detect position changes, additions, and removals that invalidate
-    // cached row vertices inside the scroll region.
-    prev_subgrid_snapshots: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
-    // Current-layout normalization and row-dedup scratch for the subgrid
-    // scroll-cache diff. Capacities persist across flushes.
-    subgrid_diff_current: std.ArrayListUnmanaged(SubgridSnapshot) = .empty,
-    subgrid_diff_row_marks: std.ArrayListUnmanaged(u32) = .empty,
-    subgrid_diff_row_generation: u32 = 0,
-
     // Reusable scratch buffers (zero-allocation hot path)
-    tmp_cells: RenderCells = .{},
     row_cells: RenderCells = .{},
-    grid_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
-    // Sort scratch for float overlays anchored to an external grid — same
-    // (zindex, compindex, order, grid_id) ordering as grid_entries, but kept
-    // separate since it's populated by a different function
-    // (sendExternalGridVerticesFiltered) that can run within the same flush
-    // cycle as the main composite path that owns grid_entries.
-    ext_float_entries: std.ArrayListUnmanaged(GridEntry) = .empty,
-    // One win_pos scan per flush, grouped by external anchor and layer order.
-    ext_float_anchor_entries: std.ArrayListUnmanaged(flush.ExternalFloatAnchorEntry) = .empty,
-    ext_float_anchor_index_valid: bool = false,
-    // Flush-local row index for floats composited into an external grid.
-    // Entries are built once per anchor grid, sorted once, then referenced by
-    // per-row buckets so dirty rows never rescan/sort the full win_pos map.
-    ext_float_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_entry_indices: std.ArrayListUnmanaged(usize) = .empty,
-    ext_float_row_index_valid: bool = false,
-    ext_float_index_generation: u64 = 0,
-    cached_subgrids_buf: std.ArrayListUnmanaged(flush.CachedSubgrid) = .empty,
-    // Persistent main-composition row buckets. The exact layout snapshot
-    // avoids rebuilding these on content-only flushes.
-    main_subgrid_row_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_write_offsets: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_indices: std.ArrayListUnmanaged(usize) = .empty,
-    main_subgrid_row_layout: std.ArrayListUnmanaged(flush.MainSubgridRowLayout) = .empty,
-    main_subgrid_row_index_rows: u32 = 0,
-    main_subgrid_row_index_valid: bool = false,
-    main_subgrid_row_index_generation: u64 = 0,
-    // The buckets store positions into the per-flush cached_subgrids slice, so
-    // reuse additionally requires that slice to have the same length. A grid
-    // clipped entirely off the bottom of the main grid contributes nothing to
-    // the layout accounting, so a resize that adds or drops one changes the
-    // slice without advancing layout_generation.
-    main_subgrid_row_index_cached_len: usize = 0,
+    grid_entries: c_api.render_layout.List(GridEntry) = .{},
     key_buf: std.ArrayListUnmanaged(u8) = .empty,
     // Guards key_buf: sendInput/sendKeyEvent may now be called from a
     // frontend-owned display-link thread (macOS key-repeat synthesis) as
@@ -755,6 +722,14 @@ pub const Core = struct {
     flush_row_counts_snapshot: std.ArrayListUnmanaged(usize) = .empty,
     flush_main_vertex_count_snapshot: usize = 0,
     flush_row_ledger_snapshot_valid: bool = false,
+    /// The same ledger, per sub-grid. Only the main grid used to be remembered,
+    /// so a rejection invalidated every sub-grid's accounting and forced a full
+    /// reshape of each — and under ext_multigrid the sub-grids hold every
+    /// window while grid 1 is only a container, so the exact restore protected
+    /// the cheapest surface. Entries and their buffers are reused across
+    /// flushes; a steady-state flush allocates nothing here.
+    flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SubGridLedgerSnapshot) = .empty,
+    flush_subgrid_aggregate_snapshot: usize = 0,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -864,6 +839,15 @@ pub const Core = struct {
 
     // Tracking for external windows (to detect new/closed external grids)
     known_external_grids: std.AutoHashMapUnmanaged(i64, KnownExtGridInfo) = .{},
+    /// Last layer list published per surface, so on_surface_layout only fires
+    /// when the list actually changed.
+    last_surface_layout: std.AutoHashMapUnmanaged(i64, flush.SurfaceLayoutSig) = .{},
+    layout_budget: c_api.render_layout.Budget = .{},
+    /// Persistent build buffer for one surface's layer list; grown on layout
+    /// change only, never per flush.
+    layout_scratch: c_api.render_layout.List(c_api.Layer) = .{},
+    /// Persistent list of the grids that emit their own rows in a flush.
+    emit_grid_ids: c_api.render_layout.List(i64) = .{},
 
     // ext_cmdline UI extension flag (set before start)
     ext_cmdline_enabled: bool = false,
@@ -975,6 +959,11 @@ pub const Core = struct {
     // Heap-allocated highlight cache buffers (sized by hl_cache_size, allocated on first flush)
     hl_cache_buf: ?[]highlight.ResolvedAttrWithStyles = null,
     hl_valid_buf: ?[]bool = null,
+    /// Whether this flush has cleared hl_valid_buf. Its bits are keyed by
+    /// Neovim's global hl_id and no hl_attr_define lands inside a flush, so
+    /// one clear serves every grid; the first pass to resolve a highlight
+    /// clears, and on_flush_end re-arms it.
+    hl_valid_cleared_in_flush: bool = false,
     hl_cache_initialized: bool = false,
 
     // Dynamic glyph caches (allocated on first use, reallocated if size changes)
@@ -994,14 +983,6 @@ pub const Core = struct {
     shaping_col_widths: std.ArrayListUnmanaged(u32) = .empty,
     /// Maps each shaping_scalars entry back to its composited column index.
     shaping_src_cols: std.ArrayListUnmanaged(u32) = .empty,
-
-    /// Pointer to the float overlay overflow map for the current ext grid.
-    /// Set during ext grid composition, null during main grid / non-ext-grid paths.
-    flush_float_overlay: ?*const flush.FloatOverlayMap = null,
-
-    /// Persistent float overlay map reused across flushes (avoids per-flush allocation).
-    /// Cleared and repopulated for each ext grid that has float overlays.
-    flush_float_overlay_buf: flush.FloatOverlayMap = .{},
 
     /// Per-instance emoji cluster context for the current rasterize callback.
     /// Set during flush vertex generation, read by on_rasterize_glyph callbacks.
@@ -1063,7 +1044,6 @@ pub const Core = struct {
     // Owned copy of nvim path (kept alive for runLoop thread)
     nvim_path_owned: ?[]const u8 = null,
 
-    // SSH mode flags
     is_ssh_mode: bool = false,
     ssh_auth_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ssh_auth_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1085,6 +1065,9 @@ pub const Core = struct {
     // 'ver:0' disables mouse scrolling in Neovim and reports 0, which the
     // frontend treats as "no row count to reason with".
     mousescroll_ver: std.atomic.Value(u32) = std.atomic.Value(u32).init(3),
+    // Columns one horizontal wheel event scrolls: the 'hor' component, from
+    // the same reporter. Neovim's default is 6.
+    mousescroll_hor: std.atomic.Value(u32) = std.atomic.Value(u32).init(6),
 
     // IME preedit-via-extmark state. Written from the frontend UI thread (IME
     // composition callbacks) and also from the RPC thread (resetSessionState
@@ -1097,16 +1080,18 @@ pub const Core = struct {
     // 0 means no pending request
     quit_request_msgid: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
 
-    // Clipboard setup done flag
     clipboard_setup_done: bool = false,
 
     // Neon glow configuration (read from vim.g.zonvie_glow)
-    // glow_enabled and glow_intensity are atomic: written by RPC thread, read by frontend draw thread.
+    // glow_enabled, glow_intensity and glow_radius are atomic: written by RPC thread, read by frontend draw thread.
     glow_enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     glow_all: bool = false, // true = apply glow to all cells (groups = "all")
-    glow_radius_px: f32 = 6.0,
+    glow_radius_px_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 6.0))),
     glow_intensity_bits: std.atomic.Value(u32) = std.atomic.Value(u32).init(@bitCast(@as(f32, 0.8))),
     glow_hl_ids: ?std.AutoHashMap(u32, void) = null,
+    /// Attribute ids already reported by `noteGlowMiss`, so a refusal is said
+    /// once rather than per cell per frame.
+    glow_miss_seen: std.AutoHashMap(u32, void) = undefined,
     // Owned strings — each element is alloc.dupe'd from RPC response
     glow_group_names: std.ArrayListUnmanaged([]const u8) = .empty,
     // Atomic msgid for tracking pending glow config RPC request (0 = no pending)
@@ -1119,12 +1104,31 @@ pub const Core = struct {
         return @bitCast(self.glow_intensity_bits.load(.acquire));
     }
 
+    pub fn getGlowRadiusPx(self: *const Core) f32 {
+        return @bitCast(self.glow_radius_px_bits.load(.acquire));
+    }
+
+    /// `radius` as a multiplier on the blur's tap offsets, which is the only
+    /// form a Dual Kawase chain can take it in: the chain's depth is fixed, so
+    /// what a radius buys is how far each tap reaches.
+    ///
+    /// The default radius maps to 1.0, so a config that never sets one keeps
+    /// exactly the spread the chain had before this was wired up. A smaller
+    /// radius concentrates the same light into fewer pixels, which is what
+    /// makes it brighter; the clamp keeps the taps close enough together that
+    /// the chain still reads as a blur rather than as rings.
+    pub fn getGlowRadiusScale(self: *const Core) f32 {
+        const default_radius_px: f32 = 6.0;
+        return std.math.clamp(self.getGlowRadiusPx() / default_radius_px, 0.33, 2.0);
+    }
+
     pub fn isHardRenderFailure(reason: anyerror) bool {
         return switch (reason) {
             error.GridTooLarge,
             error.TooManySubgrids,
             error.TooManyWindowPlacements,
             error.LayoutTooComplex,
+            error.LayoutBudgetExceeded,
             error.VertexBudgetExceeded,
             error.MessageTooLarge,
             error.FrameTooLarge,
@@ -1172,9 +1176,12 @@ pub const Core = struct {
         self.glow_intensity_bits.store(@bitCast(val), .release);
     }
 
+    pub fn setGlowRadiusPx(self: *Core, val: f32) void {
+        self.glow_radius_px_bits.store(@bitCast(val), .release);
+    }
+
     pub fn init(alloc: std.mem.Allocator, cb: Callbacks, ctx: ?*anyopaque) Core {
-        var grid = Grid.init(alloc);
-        grid.setRowIndexBudgetEnabled(cb.on_vertices_row != null);
+        const grid = Grid.init(alloc);
         return .{
             .alloc = alloc,
             .cb = cb,
@@ -1182,6 +1189,7 @@ pub const Core = struct {
             .log = .{ .cb = cb.on_log, .ctx = ctx },
             .grid = grid,
             .hl = Highlights.init(alloc),
+            .glow_miss_seen = std.AutoHashMap(u32, void).init(alloc),
         };
     }
 
@@ -1194,6 +1202,7 @@ pub const Core = struct {
             .log = .{ .cb = null, .ctx = null },
             .grid = Grid.init(alloc),
             .hl = Highlights.init(alloc),
+            .glow_miss_seen = std.AutoHashMap(u32, void).init(alloc),
         };
     }
 
@@ -1220,35 +1229,16 @@ pub const Core = struct {
         self.grid.deinit();
 
         // Scratch buffers.
-        self.main_verts.deinit(self.alloc);
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
         self.flush_dirty_snapshot.deinit(self.alloc);
         self.flush_row_counts_snapshot.deinit(self.alloc);
-        for (&self.partial_layer_verts) |*layer| layer.deinit(self.alloc);
-        for (self.scroll_cache.items) |*row_cache| {
-            row_cache.deinit(self.alloc);
-        }
-        self.scroll_cache.deinit(self.alloc);
-        for (&self.retained_shadow) |*shadow| shadow.deinit(self.alloc);
-        self.scroll_cache_valid.deinit(self.alloc);
-        self.main_vertex_row_counts.deinit(self.alloc);
-        self.tmp_cells.deinit(self.alloc);
+        var subgrid_ledger_it = self.flush_subgrid_ledgers.valueIterator();
+        while (subgrid_ledger_it.next()) |entry| entry.counts.deinit(self.alloc);
+        self.flush_subgrid_ledgers.deinit(self.alloc);
+        for (&self.retained_uv_shadow) |*shadow| shadow.deinit(self.alloc);
         self.row_cells.deinit(self.alloc);
-        self.grid_entries.deinit(self.alloc);
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.cached_subgrids_buf.deinit(self.alloc);
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.prev_subgrid_snapshots.deinit(self.alloc);
-        self.subgrid_diff_current.deinit(self.alloc);
-        self.subgrid_diff_row_marks.deinit(self.alloc);
+        self.grid_entries.deinit();
         self.key_buf.deinit(self.alloc);
         self.write_queue.deinit(self.alloc);
         self.write_spare_queue.deinit(self.alloc);
@@ -1273,17 +1263,28 @@ pub const Core = struct {
         self.shaping_scalars.deinit(self.alloc);
         self.shaping_col_widths.deinit(self.alloc);
         self.shaping_src_cols.deinit(self.alloc);
-        self.flush_float_overlay_buf.deinit(self.alloc);
 
         // Glow state.
         self.freeGlowGroupNames();
         self.glow_group_names.deinit(self.alloc);
         if (self.glow_hl_ids) |*m| m.deinit();
         self.glow_hl_ids = null;
+        self.glow_miss_seen.deinit();
 
         // Session state.
         self.known_external_grids.deinit(self.alloc);
         self.known_external_grids = .{};
+        {
+            var mirror_it = self.glyph_mirror.valueIterator();
+            while (mirror_it.next()) |m| m.deinit(self.alloc);
+            self.glyph_mirror.deinit(self.alloc);
+            self.glyph_mirror = .{};
+        }
+        flush.releaseSurfaceLayouts(self);
+        self.last_surface_layout.deinit(self.alloc);
+        self.last_surface_layout = .{};
+        self.layout_scratch.deinit();
+        self.emit_grid_ids.deinit();
         self.msg_line_cache.deinit(self.alloc);
         self.msg_line_cache = .empty;
         self.msg_line_cache_build.deinit(self.alloc);
@@ -1350,7 +1351,7 @@ pub const Core = struct {
     ///     win_layer / viewport(_margins) / cell_overflow / grid_metrics.
     ///     The new server never sends grid_destroy for grid_ids it does
     ///     not know about, so leftover entries would be rendered as
-    ///     stale floats (flush.zig:rebuildMain) and reported as visible
+    ///     stale floats (flush.zig's main rebuild) and reported as visible
     ///     by getVisibleGridsSnapshotLocked (hit-testing).
     ///   - ext UI state: cmdline_states / cmdline_block / popupmenu /
     ///     tabline_state / message_state / msg_history_state. The new
@@ -1359,7 +1360,7 @@ pub const Core = struct {
     ///   - cursor state: cursor_grid may point at a now-deleted sub_grid.
     ///   - Core-side flush bookkeeping: last_sent_*_rev, msg throttle
     ///     state, last_cmd snapshot, popupmenu Lua-mirror handles,
-    ///     pre_cmdline cursor snapshot, prev_subgrid_snapshots.
+    ///     pre_cmdline cursor snapshot.
     ///
     /// Frontend overlay teardown:
     ///   - external_grids cleanup below already fires on_external_window_close
@@ -1510,6 +1511,17 @@ pub const Core = struct {
         }
         self.known_external_grids.deinit(self.alloc);
         self.known_external_grids = .{};
+        {
+            var mirror_it = self.glyph_mirror.valueIterator();
+            while (mirror_it.next()) |m| m.deinit(self.alloc);
+            self.glyph_mirror.deinit(self.alloc);
+            self.glyph_mirror = .{};
+        }
+        flush.releaseSurfaceLayouts(self);
+        self.last_surface_layout.deinit(self.alloc);
+        self.last_surface_layout = .{};
+        self.layout_scratch.deinit();
+        self.emit_grid_ids.deinit();
         self.grid.external_grids.deinit(self.alloc);
         self.grid.external_grids = .{};
         // ext_windows_grids: grid_id -> win_id mapping. Without clearing,
@@ -1517,10 +1529,6 @@ pub const Core = struct {
         // the redraw_handler.zig stale-detection path that re-promotes
         // it to external (redraw_handler.zig:~1171).
         self.grid.ext_windows_grids.clearRetainingCapacity();
-        // external_grid_target_sizes: dimensions used to match resize
-        // events to known external grids (redraw_handler.zig:~960).
-        // Stale entries would feed the wrong size into the new session.
-        self.grid.external_grid_target_sizes.clearRetainingCapacity();
         // pending_ext_window_grids: grids waiting for their first
         // grid_resize before the frontend window is created.
         self.grid.pending_ext_window_grids.clearRetainingCapacity();
@@ -1530,6 +1538,36 @@ pub const Core = struct {
         self.grid.pending_grid_resizes.clearRetainingCapacity();
         self.grid.pending_win_ops.clearRetainingCapacity();
         self.grid.pending_main_grid_size = null;
+
+        // The frontends key per-grid render storage by grid_id and release it
+        // only on on_grid_destroy -- the ABI says a grid that merely leaves the
+        // layout keeps its buffers. resetForNewSession frees the sub-grids
+        // outright and drops destroyed_pending with them, so without this the
+        // storage for every id the NEW session never reaches is stranded for
+        // the life of the process, GPU buffers included. Neovim restarts its
+        // grid_id counter per server, so a long session that ended high leaves
+        // a tail no short session reclaims.
+        //
+        // Fired here, before the sub-grids go, for the same reason the external
+        // windows above are closed here: this is the last moment the old ids
+        // are still known, and the frontend must hear about them while its own
+        // maps still match.
+        // Fired outside a flush bracket on purpose: there is no transaction to
+        // publish against here, and the frontends treat that form as "release
+        // now" rather than staging it into a list the next flush would clear.
+        // A grid already removed from sub_grids still owes its destroy, so the
+        // pending list is drained here too -- resetForNewSession is about to
+        // discard it.
+        if (self.cb.on_grid_destroy) |cb| {
+            var sg_it = self.grid.sub_grids.keyIterator();
+            while (sg_it.next()) |grid_id_ptr| {
+                cb(self.ctx, grid_id_ptr.*);
+            }
+            for (self.grid.destroyed_pending.items) |grid_id| {
+                if (self.grid.sub_grids.contains(grid_id)) continue;
+                cb(self.ctx, grid_id);
+            }
+        }
 
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
@@ -1557,17 +1595,16 @@ pub const Core = struct {
         // runs under grid_mu (see handleRedraw); resetting them inside
         // this critical section keeps the flush invariants consistent.
         self.last_sent_content_rev = 0;
-        self.last_sent_cursor_rev = 0;
         self.last_ext_cursor_grid = 1;
         self.last_ext_cursor_rev = 0;
         self.pre_cmdline_cursor_grid = 1;
         self.pre_cmdline_cursor_row = 0;
         self.pre_cmdline_cursor_col = 0;
-        self.main_surface_vertex_count = 0;
-        self.main_vertex_row_ledger_valid = false;
+        self.grid.main_buf.surface_vertex_count = 0;
+        self.grid.main_buf.vertex_row_ledger_valid = false;
         self.flush_vertex_count_aggregate = 0;
         self.vertex_budget_transaction_active = false;
-        self.vertex_budget_main_touched = false;
+        self.grid.main_buf.vertex_budget_touched = false;
         self.vertex_budget_touched_grid_head = null;
         self.popupmenu_win_id = null;
         self.popupmenu_buf_id = null;
@@ -1598,43 +1635,6 @@ pub const Core = struct {
         self.last_cmd_len = 0;
         self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
-
-        // Subgrid layout snapshot for scroll fast path: stale entries
-        // would reference grid_ids the new session has not (yet) created.
-        self.prev_subgrid_snapshots.clearRetainingCapacity();
-
-        // The row buckets describe the previous session's placement maps.
-        // Release their hostile-input high-water capacity together with the
-        // placement maps and force the first new-session row flush to rebuild.
-        self.main_subgrid_row_offsets.deinit(self.alloc);
-        self.main_subgrid_row_offsets = .empty;
-        self.main_subgrid_row_write_offsets.deinit(self.alloc);
-        self.main_subgrid_row_write_offsets = .empty;
-        self.main_subgrid_row_indices.deinit(self.alloc);
-        self.main_subgrid_row_indices = .empty;
-        self.main_subgrid_row_layout.deinit(self.alloc);
-        self.main_subgrid_row_layout = .empty;
-        self.main_subgrid_row_index_rows = 0;
-        self.main_subgrid_row_index_valid = false;
-        self.main_subgrid_row_index_generation = 0;
-        self.main_subgrid_row_index_cached_len = 0;
-
-        // External-float scratch is bounded during a session, but a hostile
-        // previous peer may have driven it to that high-water mark. Session
-        // changes are cold paths, so release rather than retain these buffers.
-        self.ext_float_anchor_entries.deinit(self.alloc);
-        self.ext_float_anchor_entries = .empty;
-        self.ext_float_entries.deinit(self.alloc);
-        self.ext_float_entries = .empty;
-        self.ext_float_row_offsets.deinit(self.alloc);
-        self.ext_float_row_offsets = .empty;
-        self.ext_float_row_write_offsets.deinit(self.alloc);
-        self.ext_float_row_write_offsets = .empty;
-        self.ext_float_row_entry_indices.deinit(self.alloc);
-        self.ext_float_row_entry_indices = .empty;
-        self.ext_float_anchor_index_valid = false;
-        self.ext_float_row_index_valid = false;
-        self.ext_float_index_generation +%= 1;
 
         self.log.write("resetProtocolState: cleared UI protocol state (transport_reset={any})\n", .{reset_transport});
     }
@@ -1893,75 +1893,137 @@ pub const Core = struct {
         }
     }
 
-    /// Ensure scroll_cache has exactly `target_rows` entries.
-    /// Grows or shrinks the per-row vertex lists as needed.
-    pub fn ensureScrollCache(self: *Core, target_rows: u32) !void {
-        const cur = self.scroll_cache_rows;
-        if (cur == target_rows and
-            self.scroll_cache.items.len == target_rows and
-            self.main_vertex_row_counts.items.len == target_rows) return;
-
-        // Shrink: deinit excess row buffers
-        if (self.scroll_cache.items.len > target_rows) {
-            for (self.scroll_cache.items[target_rows..]) |*row_buf| {
-                row_buf.deinit(self.alloc);
-            }
-            self.scroll_cache.items.len = target_rows;
+    /// Record the glyph UVs one grid's row is showing. Called with the row's
+    /// freshly generated vertices, before they reach the frontend.
+    pub fn recordGlyphMirrorRow(
+        self: *Core,
+        grid_id: i64,
+        row: u32,
+        rows_total: u32,
+        verts: []const c_api.Vertex,
+    ) void {
+        const gop = self.glyph_mirror.getOrPut(self.alloc, grid_id) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .{};
+        const m = gop.value_ptr;
+        if (m.rows.items.len != rows_total) {
+            for (m.rows.items) |*r| r.deinit(self.alloc);
+            // deinit leaves the lists undefined; drop them before the resize so
+            // a failed grow cannot leave freed lists behind for a second free.
+            m.rows.clearRetainingCapacity();
+            m.rows.resize(self.alloc, rows_total) catch {
+                m.valid.deinit(self.alloc);
+                m.valid = .{};
+                return;
+            };
+            for (m.rows.items) |*r| r.* = .empty;
+            m.valid.deinit(self.alloc);
+            m.valid = std.DynamicBitSetUnmanaged.initEmpty(self.alloc, rows_total) catch {
+                m.valid = .{};
+                return;
+            };
         }
-
-        // Grow: append empty row buffers
-        while (self.scroll_cache.items.len < target_rows) {
-            try self.scroll_cache.append(self.alloc, .empty);
+        if (row >= m.rows.items.len) return;
+        var dst = &m.rows.items[row];
+        dst.clearRetainingCapacity();
+        // Glyph quads only: a solid quad carries the (-1,-1) sentinel and
+        // references no shelf. The dedup drops a quad's repeat of each v.
+        var last: f32 = std.math.nan(f32);
+        for (verts) |v| {
+            if (v.texCoord[0] < 0) continue;
+            if (v.texCoord[1] == last) continue;
+            dst.append(self.alloc, v.texCoord[1]) catch {
+                if (row < m.valid.bit_length) m.valid.unset(row);
+                return;
+            };
+            last = v.texCoord[1];
         }
-
-        const old_count_len = self.main_vertex_row_counts.items.len;
-        try self.main_vertex_row_counts.ensureTotalCapacity(self.alloc, target_rows);
-        self.main_vertex_row_counts.items.len = target_rows;
-        if (target_rows > old_count_len) {
-            @memset(self.main_vertex_row_counts.items[old_count_len..], 0);
-        } else if (target_rows < old_count_len and self.main_vertex_row_ledger_valid) {
-            // resize() has already shortened the slice; recompute only on a
-            // structural shrink, never on the per-row hot path.
-            const old_surface_vertex_count = self.main_surface_vertex_count;
-            self.main_surface_vertex_count = 0;
-            for (self.main_vertex_row_counts.items) |count| {
-                self.main_surface_vertex_count +|= count;
-            }
-            self.flush_vertex_count_aggregate -|=
-                old_surface_vertex_count -| self.main_surface_vertex_count;
-        }
-
-        // Resize the valid bitset
-        if (self.scroll_cache_valid.bit_length != target_rows) {
-            self.scroll_cache_valid.deinit(self.alloc);
-            self.scroll_cache_valid = .{}; // zero state so use-after-free cannot occur on alloc failure
-            self.scroll_cache_rows = 0; // invalidate cache_ready check in flush
-            self.scroll_cache_valid = try std.DynamicBitSetUnmanaged.initEmpty(self.alloc, target_rows);
-        }
-
-        self.scroll_cache_rows = target_rows;
+        if (row < m.valid.bit_length) m.valid.set(row);
     }
 
-    /// Invalidate all scroll cache entries (e.g., on resize, guifont, atlas reset).
-    /// Also releases per-row vertex capacity to reclaim peak memory from prior frames.
-    pub fn invalidateScrollCache(self: *Core) void {
-        // Free per-row vertex buffers to release peak capacity
-        for (self.scroll_cache.items) |*row_buf| {
-            row_buf.deinit(self.alloc);
+    /// Move a grid's mirrored rows the way its row-shift hint moved the
+    /// frontend's, so the mirror keeps describing what is on screen.
+    pub fn shiftGlyphMirror(self: *Core, grid_id: i64, top: u32, bot: u32, rows_delta: i32) void {
+        const m = self.glyph_mirror.getPtr(grid_id) orelse return;
+        if (rows_delta == 0 or bot <= top or bot > m.rows.items.len) return;
+        const height: u32 = bot - top;
+        const shift: u32 = @intCast(@abs(rows_delta));
+        if (shift == 0 or shift >= height) return;
+        const rows = m.rows.items;
+        if (rows_delta > 0) {
+            var r: u32 = top;
+            while (r + shift < bot) : (r += 1) {
+                std.mem.swap(std.ArrayListUnmanaged(f32), &rows[r], &rows[r + shift]);
+                self.copyMirrorValid(m, r, r + shift);
+            }
+            var v: u32 = bot - shift;
+            while (v < bot) : (v += 1) {
+                self.shadowDepartedRow(&rows[v]);
+                rows[v].clearRetainingCapacity();
+                if (v < m.valid.bit_length) m.valid.unset(v);
+            }
+        } else {
+            var r: u32 = bot;
+            while (r > top + shift) {
+                r -= 1;
+                std.mem.swap(std.ArrayListUnmanaged(f32), &rows[r], &rows[r - shift]);
+                self.copyMirrorValid(m, r, r - shift);
+            }
+            var v: u32 = top;
+            while (v < top + shift) : (v += 1) {
+                self.shadowDepartedRow(&rows[v]);
+                rows[v].clearRetainingCapacity();
+                if (v < m.valid.bit_length) m.valid.unset(v);
+            }
         }
-        self.scroll_cache.items.len = 0;
+    }
 
-        if (self.scroll_cache_valid.bit_length != 0) {
-            self.scroll_cache_valid.unsetAll();
+    fn copyMirrorValid(self: *Core, m: *GlyphMirror, dst: u32, src: u32) void {
+        _ = self;
+        if (dst >= m.valid.bit_length or src >= m.valid.bit_length) return;
+        if (m.valid.isSet(src)) m.valid.set(dst) else m.valid.unset(dst);
+    }
+
+    /// Free a destroyed grid's mirror outright: grid ids only increase, so
+    /// keeping them pins every closed split's and float's shelves forever.
+    pub fn removeGlyphMirror(self: *Core, grid_id: i64) void {
+        const kv = self.glyph_mirror.fetchRemove(grid_id) orelse return;
+        var m = kv.value;
+        for (m.rows.items) |*r| r.deinit(self.alloc);
+        m.rows.deinit(self.alloc);
+        m.valid.deinit(self.alloc);
+    }
+
+    pub fn invalidateAllGlyphMirrors(self: *Core) void {
+        var it = self.glyph_mirror.valueIterator();
+        while (it.next()) |m| {
+            for (m.rows.items) |*r| r.clearRetainingCapacity();
+            if (m.valid.bit_length != 0) m.valid.unsetAll();
         }
-        self.scroll_cache_rows = 0;
-        self.main_vertex_row_counts.clearRetainingCapacity();
-        self.flush_vertex_count_aggregate -|= self.main_surface_vertex_count;
-        self.main_surface_vertex_count = 0;
-        self.main_vertex_row_ledger_valid = true;
+    }
 
-        // Reset subgrid snapshot so the next flush treats all subgrids as new.
-        self.prev_subgrid_snapshots.clearRetainingCapacity();
+    /// Drop everything this core mirrors of the displayed frame (e.g. on
+    /// resize, guifont, atlas reset) and reset every surface's vertex ledger.
+    ///
+    /// The glyph mirrors were always cleared for all grids; the ledger reset
+    /// covered the main grid alone, which is the container under ext_multigrid.
+    /// Sub-grids kept counting a frame that no longer exists, and — since the
+    /// abort path now snapshots their ledgers too — main's zeroed ledger would
+    /// be captured as "what the committed frame holds" and restored as a lie.
+    pub fn invalidateMirroredFrameState(self: *Core) void {
+        self.invalidateAllGlyphMirrors();
+        @memset(self.grid.main_buf.vertex_row_counts, 0);
+        self.flush_vertex_count_aggregate -|= self.grid.main_buf.surface_vertex_count;
+        self.grid.main_buf.surface_vertex_count = 0;
+        self.grid.main_buf.vertex_row_ledger_valid = true;
+
+        var sg_it = self.grid.sub_grids.valueIterator();
+        while (sg_it.next()) |sg| {
+            @memset(sg.vertex_row_counts, 0);
+            self.flush_vertex_count_aggregate -|= sg.surface_vertex_count;
+            sg.surface_vertex_count = 0;
+            sg.vertex_row_ledger_valid = true;
+        }
+        self.grid.subgrid_surface_vertex_count = 0;
     }
 
     /// Deinitialize glyph caches (call before changing cache sizes or on destroy)
@@ -1982,7 +2044,6 @@ pub const Core = struct {
             self.alloc.free(buf);
             self.glyph_keys_non_ascii = null;
         }
-        // Phase B: glyph-ID cache
         if (self.glyph_cache_by_id) |buf| {
             self.alloc.free(buf);
             self.glyph_cache_by_id = null;
@@ -2139,6 +2200,16 @@ pub const Core = struct {
         self.hl_cache_buf = hl_buf;
         self.hl_valid_buf = valid_buf;
         self.hl_cache_initialized = true;
+    }
+
+    /// The highlight validity bits, cleared once per flush.
+    pub fn hlValidForFlush(self: *Core) []bool {
+        const valid = self.hl_valid_buf orelse return &.{};
+        if (!self.hl_valid_cleared_in_flush) {
+            @memset(valid, false);
+            self.hl_valid_cleared_in_flush = true;
+        }
+        return valid;
     }
 
     /// Free highlight cache buffers.
@@ -2368,9 +2439,8 @@ pub const Core = struct {
 
     fn beginNegativeGlyphReprobe(self: *Core) void {
         self.invalidateNegativeGlyphCacheEntries();
-        self.invalidateScrollCache();
+        self.invalidateMirroredFrameState();
         self.grid.markAllDirty();
-        self.grid.scroll_fast_path_blocked = true;
         var sg_it = self.grid.sub_grids.valueIterator();
         while (sg_it.next()) |sg| {
             sg.markAllDirty();
@@ -2652,75 +2722,98 @@ pub const Core = struct {
         if (packer.shelfIndexForYOrdered(order, y)) |idx| live[idx] = true;
     }
 
-    /// True when every main-grid row the frontend is currently showing is
-    /// either mirrored in scroll_cache (so its atlas references are readable
-    /// here) or already dirty (so this flush regenerates it before publishing).
-    /// Without this, a retained row whose vertices the core cannot inspect
-    /// could keep a glyph that garbage collection would recycle underneath it.
+    /// True when grid 1, every visible sub-grid and every surface the frontend
+    /// owns is accounted for; see gridAccountedForCollect.
     fn mainRowsAccountedForCollect(self: *Core) bool {
-        const rows = self.scroll_cache_rows;
-        if (rows == 0 or rows != self.grid.rows) return false;
-        if (self.scroll_cache.items.len < rows) return false;
-        if (self.scroll_cache_valid.bit_length < rows) return false;
-        if (self.grid.dirty_all) return true;
+        if (!self.gridAccountedForCollect(1, &self.grid.main_buf)) return false;
+        var it = self.grid.sub_grids.iterator();
+        while (it.next()) |entry| {
+            const grid_id = entry.key_ptr.*;
+            const sg = entry.value_ptr;
+            if (sg.rows == 0 or sg.cols == 0) continue;
+            const visible = self.grid.win_pos.contains(grid_id) or
+                self.grid.external_grids.contains(grid_id);
+            if (!visible) continue;
+            if (!self.gridAccountedForCollect(grid_id, sg)) return false;
+        }
+        // A surface the frontend still shows without a visible buffer here
+        // (destroyed, or a hidden synthetic grid) is read from its mirror
+        // alone: every row it holds must be valid, or it could keep a glyph
+        // this collection recycles.
+        var known_it = self.known_external_grids.keyIterator();
+        while (known_it.next()) |key| {
+            const grid_id = key.*;
+            if (self.grid.sub_grids.contains(grid_id) and self.grid.external_grids.contains(grid_id)) continue;
+            const m = self.glyph_mirror.getPtr(grid_id) orelse return false;
+            if (m.valid.bit_length < m.rows.items.len) return false;
+            if (m.valid.count() != m.rows.items.len) return false;
+        }
+        return true;
+    }
+
+    /// True when every row `grid_id` is showing is either mirrored here (so its
+    /// atlas references are readable) or already dirty (so this flush
+    /// regenerates it first). Otherwise a retained row this core cannot see
+    /// could keep a glyph reclamation recycles underneath it.
+    fn gridAccountedForCollect(self: *Core, grid_id: i64, buf: *const grid_mod.GridBuf) bool {
+        const rows = buf.rows;
+        if (rows == 0 or buf.cols == 0) return true;
+        if (buf.dirty_all) return true;
+        const m = self.glyph_mirror.getPtr(grid_id) orelse return false;
+        if (m.rows.items.len < rows) return false;
         var r: u32 = 0;
         while (r < rows) : (r += 1) {
-            if (self.scroll_cache_valid.isSet(r)) continue;
-            if (r < self.grid.dirty_rows.bit_length and self.grid.dirty_rows.isSet(r)) continue;
+            if (r < m.valid.bit_length and m.valid.isSet(r)) continue;
+            if (buf.isRowDirty(r)) continue;
             return false;
         }
         return true;
     }
 
-    /// Reclaim atlas shelves that nothing on screen references any more.
-    ///
-    /// The high-cardinality case this exists for is a full-width CJK buffer:
-    /// every entering row brings a screenful-fraction of never-seen glyphs, so
-    /// a bump-only atlas fills within seconds and the only previous recovery
-    /// was a full reset — which clears every glyph cache, forces a whole
-    /// viewport rebuild, and refills the atlas immediately, i.e. it spirals.
-    ///
-    /// Liveness comes from the vertices the frontend is actually holding
-    /// (scroll_cache mirrors the retained main rows; cursor_verts mirrors the
-    /// cursor layer), never from glyph-cache reachability — a cache entry can
-    /// be displaced by a hash collision while its glyph stays on screen, so
-    /// "no cache entry points here" does not mean "nothing draws this".
-    ///
-    /// Returns true when at least one shelf became reusable.
-    /// Reclaim atlas space before this flush generates anything, while
-    /// scroll_cache still mirrors exactly what the frontend is showing.
-    ///
-    /// Collecting mid-generation instead was actively harmful: the rows this
-    /// flush had already recomposed were not in scroll_cache yet, so the
-    /// glyphs it had just packed looked unreferenced, were reclaimed, and had
-    /// to be rasterized all over again on the next pass — the atlas never held
-    /// a screenful for longer than one flush.
-    /// Keep a copy of a row the scroll fast path is about to drop from the
-    /// cache, so reclamation still counts the glyphs a frontend-retained copy
-    /// of that row may keep drawing. Failing to copy costs reclamation accuracy
-    /// only, never the scroll, so it is not reported to the caller.
-    pub fn captureRetainedShadow(self: *Core, verts: []const c_api.Vertex) void {
-        if (verts.len == 0) return;
-        const slot = self.retained_shadow_next % self.retained_shadow.len;
-        const buf = &self.retained_shadow[slot];
+    /// Keep the UVs of a row a row-shift hint just vacated, so reclamation
+    /// still counts glyphs the frontend's retained copy may keep drawing during
+    /// the sub-row ease. A failed copy costs reclamation accuracy only, so it
+    /// is not reported to the caller.
+    fn shadowDepartedRow(self: *Core, row: *std.ArrayListUnmanaged(f32)) void {
+        if (row.items.len == 0) return;
+        const slot = self.retained_shadow_next % self.retained_uv_shadow.len;
+        const buf = &self.retained_uv_shadow[slot];
         buf.clearRetainingCapacity();
-        buf.ensureTotalCapacity(self.alloc, verts.len) catch {
+        buf.appendSlice(self.alloc, row.items) catch {
             self.retained_shadow_age[slot] = retained_shadow_expiry;
             return;
         };
-        buf.appendSliceAssumeCapacity(verts);
         self.retained_shadow_age[slot] = 0;
-        self.retained_shadow_next = (slot + 1) % self.retained_shadow.len;
+        self.retained_shadow_next = (slot + 1) % self.retained_uv_shadow.len;
+    }
+
+    /// Test seam: whether a departed row's UV is still counted live.
+    pub fn departedUvIsLive(self: *Core, uv_y: f32) bool {
+        for (self.retained_shadow_age, &self.retained_uv_shadow) |age, *buf| {
+            if (age >= retained_shadow_expiry) continue;
+            for (buf.items) |u| {
+                if (u == uv_y) return true;
+            }
+        }
+        return false;
     }
 
     fn ageRetainedShadows(self: *Core) void {
-        for (&self.retained_shadow_age, &self.retained_shadow) |*age, *buf| {
+        for (&self.retained_shadow_age, &self.retained_uv_shadow) |*age, *buf| {
             if (age.* >= retained_shadow_expiry) continue;
             age.* += 1;
             if (age.* >= retained_shadow_expiry) buf.clearRetainingCapacity();
         }
     }
 
+    /// Reclaim atlas space before this flush generates anything, while the
+    /// glyph mirrors still describe exactly what the frontend is showing.
+    ///
+    /// Collecting mid-generation instead was actively harmful: the rows this
+    /// flush had already recomposed were not mirrored yet, so the glyphs it had
+    /// just packed looked unreferenced, were reclaimed, and had to be
+    /// rasterized again on the next pass — the atlas never held a screenful for
+    /// longer than one flush.
     pub fn collectAtlasGarbageIfNeeded(self: *Core) void {
         self.ageRetainedShadows();
         if (self.atlas_packer == null) return;
@@ -2748,32 +2841,33 @@ pub const Core = struct {
         if (self.atlas_packer) |*p| p.beginEpoch();
     }
 
+    /// Reclaim atlas shelves that nothing on screen references any more.
+    ///
+    /// The high-cardinality case this exists for is a full-width CJK buffer:
+    /// every entering row brings a screenful-fraction of never-seen glyphs, so
+    /// a bump-only atlas fills within seconds and the only previous recovery
+    /// was a full reset — which clears every glyph cache, forces a whole
+    /// viewport rebuild, and refills the atlas immediately, i.e. it spirals.
+    ///
+    /// Liveness comes from the vertices the frontend is actually holding (the
+    /// per-grid glyph mirrors cover the retained rows; cursor_verts mirrors the
+    /// cursor layer), never from glyph-cache reachability — a cache entry can
+    /// be displaced by a hash collision while its glyph stays on screen, so
+    /// "no cache entry points here" does not mean "nothing draws this".
+    ///
+    /// Returns true when at least one shelf became reusable.
     fn collectAtlasGarbage(self: *Core) bool {
         const log_on = self.log.cb != null;
         if (!self.isPhase2Atlas()) return false;
         if (self.atlas_packer == null) return false;
-        // A grid the frontend owns a surface for (external window, float,
-        // popupmenu) retains its own rows, and this core keeps no vertex mirror
-        // of them. Keyed on the ownership map itself rather than on its
-        // intersection with sub_grids: a grid can lose its GridBuf while the
-        // surface is still on screen, and intersecting missed exactly that
-        // window. Grids only composited into the main grid are covered by the
-        // main-row scan below.
-        if (self.known_external_grids.count() > 0) {
-            if (log_on) self.log.write(
-                "[perf] atlas_gc skip=external_grid count={d}\n",
-                .{self.known_external_grids.count()},
-            );
-            return false;
-        }
         if (self.display_mirror_stale) {
             if (log_on) self.log.write("[perf] atlas_gc skip=display_mirror_stale\n", .{});
             return false;
         }
         if (!self.mainRowsAccountedForCollect()) {
             if (log_on) self.log.write(
-                "[perf] atlas_gc skip=rows scroll_cache_rows={d} grid_rows={d} dirty_all={any}\n",
-                .{ self.scroll_cache_rows, self.grid.rows, self.grid.dirty_all },
+                "[perf] atlas_gc skip=rows mirrored_grids={d} grid_rows={d} dirty_all={any}\n",
+                .{ self.glyph_mirror.count(), self.grid.rows, self.grid.main_buf.dirty_all },
             );
             return false;
         }
@@ -2803,19 +2897,23 @@ pub const Core = struct {
         var y_order: [shelf_packer.max_shelves]u16 = undefined;
         const order = y_order[0..packer.buildYOrder(&y_order)];
 
-        const rows = self.scroll_cache_rows;
-        var r: u32 = 0;
-        while (r < rows) : (r += 1) {
-            if (!self.scroll_cache_valid.isSet(r)) continue;
-            for (self.scroll_cache.items[r].items) |v| {
-                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+        // Every grid's own mirror: under ext_multigrid the main grid holds
+        // almost nothing, so its rows alone would miss most glyphs on screen.
+        var mirror_it = self.glyph_mirror.iterator();
+        while (mirror_it.next()) |entry| {
+            const m = entry.value_ptr;
+            for (m.rows.items, 0..) |row_uvs, r| {
+                if (r >= m.valid.bit_length or !m.valid.isSet(r)) continue;
+                for (row_uvs.items) |uv_y| {
+                    markShelfLiveForUv(packer, order, &live, uv_y);
+                }
             }
         }
         for (self.cursor_verts.items) |v| {
             markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
         }
-        // The row this flush is composing right now. Its quads are not in
-        // scroll_cache yet, and a glyph it took from the cache was allocated in
+        // The row this flush is composing right now. Its quads are not
+        // mirrored yet, and a glyph it took from the cache was allocated in
         // an earlier epoch, so the epoch guard does not cover it either.
         if (self.inflight_row_verts) |row| {
             for (row.items) |v| {
@@ -2824,10 +2922,10 @@ pub const Core = struct {
         }
         // Rows the frontend may still be drawing out of its own retained copy,
         // whose cache slots this core has already reused.
-        for (self.retained_shadow_age, &self.retained_shadow) |age, *buf| {
+        for (self.retained_shadow_age, &self.retained_uv_shadow) |age, *buf| {
             if (age >= retained_shadow_expiry) continue;
-            for (buf.items) |v| {
-                markShelfLiveForUv(packer, order, &live, v.texCoord[1]);
+            for (buf.items) |uv_y| {
+                markShelfLiveForUv(packer, order, &live, uv_y);
             }
         }
 
@@ -3026,7 +3124,21 @@ pub const Core = struct {
     /// arms bounded maintenance retries. Upload/create failures use
     /// flush_aborted and still return null, immediately rejecting the whole
     /// transaction rather than publishing a blank.
-    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+    /// Rasterize one glyph through a frontend callback, time it, and pack the
+    /// result into the atlas.
+    ///
+    /// The two entry points below differ in one callback and one decision, and
+    /// both had the whole body written out. `arm_transient_retry` is required
+    /// rather than defaulted so a third caller has to answer it: it arms the
+    /// bounded reprobe that recovers a glyph the rasterizer failed to produce
+    /// once, and the two existing callers answer it differently — see each.
+    fn ensureGlyphRasterized(
+        self: *Core,
+        key: u32,
+        style_flags: u32,
+        rasterize: c_api.RasterizeGlyphFn,
+        arm_transient_retry: bool,
+    ) ?c_api.GlyphEntry {
         const log_on = self.log.cb != null;
         const t_total: i128 = if (log_on) clock.nowNs() else 0;
         defer if (log_on) {
@@ -3037,10 +3149,10 @@ pub const Core = struct {
 
         if (!self.ensureAtlasInit()) return null;
 
-        // Ask frontend to rasterize (no packing / UV)
+        // Ask the frontend to rasterize (no packing / UV).
         var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
         const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = self.cb.on_rasterize_glyph.?(self.ctx, scalar, style_flags, &bm);
+        const ok = rasterize(self.ctx, key, style_flags, &bm);
         if (log_on) {
             const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
             self.perf_rasterize_ns_total +%= dt;
@@ -3048,11 +3160,23 @@ pub const Core = struct {
         }
         if (self.flush_aborted) return null;
         if (ok == 0) {
-            self.recordTransientGlyphNegative();
+            if (arm_transient_retry) self.recordTransientGlyphNegative();
             return blankGlyphEntry(&bm);
         }
 
         return self.packAndUploadBitmap(&bm);
+    }
+
+    pub fn ensureGlyphPhase2(self: *Core, scalar: u32, style_flags: u32) ?c_api.GlyphEntry {
+        return self.ensureGlyphRasterized(
+            scalar,
+            style_flags,
+            self.cb.on_rasterize_glyph.?,
+            // A scalar that failed to rasterize is the case the bounded
+            // reprobe exists for: a font the frontend had not finished
+            // loading yet answers on a later attempt.
+            true,
+        );
     }
 
     /// Phase B: Resolve a shaped glyph by its glyph ID (post-shaping).
@@ -3061,30 +3185,17 @@ pub const Core = struct {
     /// primary-face misses commonly succeed through the caller's scalar/fallback
     /// font path. Only a final scalar miss starts the bounded retry episode.
     pub fn ensureGlyphByID(self: *Core, glyph_id: u32, style_flags: u32) ?c_api.GlyphEntry {
-        const log_on = self.log.cb != null;
-        const t_total: i128 = if (log_on) clock.nowNs() else 0;
-        defer if (log_on) {
-            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_total));
-            self.perf_atlas_total_ns_total +%= dt;
-            self.perf_atlas_total_calls +%= 1;
-        };
-
-        if (!self.ensureAtlasInit()) return null;
-
-        var bm: c_api.GlyphBitmap = std.mem.zeroes(c_api.GlyphBitmap);
-        const t_r: i128 = if (log_on) clock.nowNs() else 0;
-        const ok = self.cb.on_rasterize_glyph_by_id.?(self.ctx, glyph_id, style_flags, &bm);
-        if (log_on) {
-            const dt: u64 = @intCast(@max(0, clock.nowNs() - t_r));
-            self.perf_rasterize_ns_total +%= dt;
-            self.perf_rasterize_calls +%= 1;
-        }
-        if (self.flush_aborted) return null;
-        if (ok == 0) {
-            return blankGlyphEntry(&bm);
-        }
-
-        return self.packAndUploadBitmap(&bm);
+        return self.ensureGlyphRasterized(
+            glyph_id,
+            style_flags,
+            self.cb.on_rasterize_glyph_by_id.?,
+            // NOT armed, which is how this path has always behaved. A shaped
+            // glyph that fails to rasterize caches a blank and is not
+            // reprobed. Nothing on record says that was decided rather than
+            // omitted — the two bodies were maintained apart — so it is
+            // preserved here and named, not quietly changed.
+            false,
+        );
     }
 
     /// Reset core atlas: clear packer, invalidate cache, recreate texture.
@@ -3246,6 +3357,7 @@ pub const Core = struct {
         row: i32,
         col: i32,
     ) void {
+        if (!pointer_target.buttonReachesNeovim(grid_id)) return;
         self.requestMouseInput(button, action, modifier, grid_id, row, col) catch |e| {
             self.log.write("sendMouseInput err: {any}\n", .{e});
         };
@@ -3254,8 +3366,10 @@ pub const Core = struct {
     /// Scroll view to specified line number (1-based).
     /// If use_bottom is true, positions the line at the bottom of the screen (zb).
     /// Otherwise, positions at the top (zt).
-    pub fn scrollToLine(self: *Core, line: i64, use_bottom: bool) void {
-        self.requestScrollToLine(line, use_bottom) catch |e| {
+    /// `grid_id` names the window to scroll — the surface whose scrollbar was
+    /// dragged, not whichever one holds the cursor.
+    pub fn scrollToLine(self: *Core, grid_id: i64, line: i64, use_bottom: bool) void {
+        self.requestScrollToLine(grid_id, line, use_bottom) catch |e| {
             self.log.write("scrollToLine err: {any}\n", .{e});
         };
     }
@@ -3271,6 +3385,27 @@ pub const Core = struct {
 
     /// Get list of visible grids for hit-testing.
     /// Returns number of grids written (up to out.len).
+    /// The grid a surface's scrollbar should show: the cursor's grid when this
+    /// surface composites it, and the surface's own root otherwise.
+    ///
+    /// Both frontends asked for grid -1 — the cursor's grid, wherever it is —
+    /// on the MAIN window, so moving the cursor into an external window made
+    /// the main window's knob follow content it does not draw. Both asked an
+    /// external window for its own root, so a float that window hosts scrolled
+    /// without moving the knob beside it. One surface, one rule.
+    ///
+    /// Null when grid_mu is held; the caller keeps the knob where it is, which
+    /// is what it already does for a busy viewport read.
+    pub fn tryScrollbarGridForSurface(self: *Core, surface_id: i64) ?i64 {
+        if (!self.grid_mu.tryLock()) return null;
+        defer self.grid_mu.unlock(clock.io());
+        const cursor_grid = self.grid.cursor_grid;
+        if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
+            if (owner == surface_id) return cursor_grid;
+        }
+        return surface_id;
+    }
+
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
@@ -3324,6 +3459,12 @@ pub const Core = struct {
                 .anchor_grid = 1,
                 .follows_scroll = 0,
                 .is_external = 0,
+                // The container grid always accepts the mouse, belongs to the
+                // main surface, and sits behind everything drawn on it.
+                .mouse_enabled = 1,
+                .placed_by_surface = 1,
+                .compindex = 0,
+                .draw_order = 0,
             };
             written += 1;
         }
@@ -3339,6 +3480,10 @@ pub const Core = struct {
             const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
             if (written < out.len) {
+                // In the space of the surface that places it, as the header
+                // promises: a float an external window hosts is stored in
+                // global units.
+                const placed = self.grid.surfacePlacement(pos);
                 const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
                     .zindex = 0,
                     .compindex = 0,
@@ -3349,8 +3494,8 @@ pub const Core = struct {
                 out[written] = .{
                     .grid_id = gid,
                     .zindex = layer.zindex,
-                    .start_row = grid_mod.saturatingI32FromU32(pos.row),
-                    .start_col = grid_mod.saturatingI32FromU32(pos.col),
+                    .start_row = if (placed) |p| std.math.lossyCast(i32, p.row) else grid_mod.saturatingI32FromU32(pos.row),
+                    .start_col = if (placed) |p| std.math.lossyCast(i32, p.col) else grid_mod.saturatingI32FromU32(pos.col),
                     .rows = grid_mod.saturatingI32FromU32(sg.rows),
                     .cols = grid_mod.saturatingI32FromU32(sg.cols),
                     .margin_top = grid_mod.saturatingI32FromU32(margins.top),
@@ -3361,6 +3506,15 @@ pub const Core = struct {
                     .anchor_grid = pos.anchor_grid,
                     .follows_scroll = if (pos.follows_scroll) 1 else 0,
                     .is_external = 0,
+                    .mouse_enabled = if (pos.mouse_enabled) 1 else 0,
+                    // The same answer flush.collectSurfaceLayerEntries uses to
+                    // decide whose layer list this grid belongs in; 0 when no
+                    // surface draws it (broken or cyclic anchor chain, or a
+                    // surface with no buffer yet). `orelse 1` named the main
+                    // surface for a grid the flush drew nowhere.
+                    .placed_by_surface = flush.placedSurfaceForGrid(&self.grid, gid) orelse 0,
+                    .compindex = layer.compindex,
+                    .draw_order = layer.order,
                 };
                 written += 1;
             }
@@ -3391,6 +3545,11 @@ pub const Core = struct {
                     .anchor_grid = 1,
                     .follows_scroll = 0,
                     .is_external = 1,
+                    // An external grid is the root of its own surface.
+                    .mouse_enabled = 1,
+                    .placed_by_surface = gid,
+                    .compindex = 0,
+                    .draw_order = 0,
                 };
                 written += 1;
             }
@@ -3599,7 +3758,6 @@ pub const Core = struct {
         const dw = if (drawable_w_px == 0) 1 else drawable_w_px;
         const dh = if (drawable_h_px == 0) 1 else drawable_h_px;
 
-        // NDC positions depend on both cell and drawable dimensions.
         const drawable_dims_changed = (dw != self.drawable_w_px or dh != self.drawable_h_px);
         const cell_dims_changed = (cw != self.cell_w_px or ch != self.cell_h_px);
 
@@ -3607,6 +3765,14 @@ pub const Core = struct {
         const rows = @max(@as(u32, 1), dh / ch);
         const grid_dims_changed = (rows != self.last_layout_rows or cols != self.last_layout_cols);
         const vertex_geometry_changed = drawable_dims_changed or cell_dims_changed or grid_dims_changed;
+        // What a regeneration actually owes. Vertex positions are grid-local
+        // pixels — neither `drawable_w_px` nor `drawable_h_px` is read anywhere
+        // in vertex generation — so a drawable-only resize bakes nothing new
+        // and the frontend re-renders on its own changed drawable regardless.
+        // The sub-grid branch below has always used this narrower test; main
+        // used the wide one and paid a full regeneration plus a cursor_rev bump
+        // for every pixel of a live drag-resize.
+        const vertex_content_changed = cell_dims_changed or grid_dims_changed;
 
         self.drawable_w_px = dw;
         self.drawable_h_px = dh;
@@ -3620,9 +3786,7 @@ pub const Core = struct {
         // This is done here to avoid a separate lock acquisition in setScreenCols.
         self.grid.screen_cols = cols;
 
-        // Any geometry input change invalidates baked NDC positions, including
-        // drawable-only resizes and row/column changes at the same cell size.
-        if (vertex_geometry_changed) {
+        if (vertex_content_changed) {
             self.grid.markAllDirty();
             // Cursor geometry is submitted independently of row vertices.
             self.grid.cursor_rev +%= 1;
@@ -3743,6 +3907,26 @@ pub const Core = struct {
             0x0D => "CR", // VK_RETURN
             0x09 => "Tab", // VK_TAB
             0x1B => "Esc", // VK_ESCAPE
+            0x2D => "Insert", // VK_INSERT
+            // VK_F1..VK_F12, verified against the mingw winuser.h this target
+            // compiles with. Both frontends already classify these as special
+            // and route them here; without a name the Windows path reached
+            // `chars.len == 0` and sent nothing at all, and the macOS path fell
+            // through to the text branch and inserted the raw private-use
+            // codepoint AppKit reports. The caller wraps the name and applies
+            // modifiers, so <S-F1>, <C-F5> and <M-F4> follow from the row.
+            0x70 => "F1",
+            0x71 => "F2",
+            0x72 => "F3",
+            0x73 => "F4",
+            0x74 => "F5",
+            0x75 => "F6",
+            0x76 => "F7",
+            0x77 => "F8",
+            0x78 => "F9",
+            0x79 => "F10",
+            0x7A => "F11",
+            0x7B => "F12",
             else => null,
         };
     }
@@ -3763,6 +3947,24 @@ pub const Core = struct {
             36 => "CR",
             48 => "Tab",
             53 => "Esc",
+            // NSF1FunctionKey..NSF12FunctionKey (U+F704..U+F70F). Each keycode
+            // was confirmed against the character AppKit actually reports for
+            // it on this hardware; the order is NOT contiguous. Insert is
+            // deliberately absent: keycode 114 is Help on Apple's own layout
+            // and AppKit reports it as NSHelpFunctionKey, so calling it
+            // <Insert> is a product decision rather than a missing row.
+            122 => "F1",
+            120 => "F2",
+            99 => "F3",
+            118 => "F4",
+            96 => "F5",
+            97 => "F6",
+            98 => "F7",
+            100 => "F8",
+            101 => "F9",
+            109 => "F10",
+            103 => "F11",
+            111 => "F12",
             else => null,
         };
     }
@@ -3772,7 +3974,6 @@ pub const Core = struct {
     pub fn formatKeyEvent(out_buf: []u8, keycode: u32, mods: u32, chars: []const u8, ign: []const u8) ?[]const u8 {
         var pos: usize = 0;
 
-        // Helper to append a byte
         const appendByte = struct {
             fn f(buf: []u8, p: *usize, byte: u8) bool {
                 if (p.* >= buf.len) return false;
@@ -3782,7 +3983,6 @@ pub const Core = struct {
             }
         }.f;
 
-        // Helper to append a slice
         const appendSlice = struct {
             fn f(buf: []u8, p: *usize, s: []const u8) bool {
                 if (p.* + s.len > buf.len) return false;
@@ -4424,8 +4624,8 @@ pub const Core = struct {
         try rpc.packInt(buf, self.alloc, @as(i64, @intCast(cols)));
         try rpc.packInt(buf, self.alloc, @as(i64, @intCast(rows)));
 
-        // Option count: ext_multigrid, rgb (always) + optional ext_*
-        var opt_count: u32 = 2;
+        // Option count: ext_multigrid, ext_hlstate, rgb (always) + optional ext_*
+        var opt_count: u32 = 3;
         if (self.ext_windows_enabled) opt_count += 1;
         if (self.ext_cmdline_enabled) opt_count += 1;
         if (self.ext_popupmenu_enabled) opt_count += 1;
@@ -4433,6 +4633,12 @@ pub const Core = struct {
         if (self.ext_tabline_enabled) opt_count += 1;
         try rpc.packMap(buf, self.alloc, opt_count);
         try rpc.packStr(buf, self.alloc, "ext_multigrid");
+        try rpc.packBool(buf, self.alloc, true);
+        // Without this, `hl_attr_define` carries no `info`, and a cell's
+        // attribute id cannot be traced back to the highlight groups it was
+        // composed from -- which is the only way to answer "does this cell
+        // belong to Keyword?" for `vim.g.zonvie_glow`.
+        try rpc.packStr(buf, self.alloc, "ext_hlstate");
         try rpc.packBool(buf, self.alloc, true);
         try rpc.packStr(buf, self.alloc, "rgb");
         try rpc.packBool(buf, self.alloc, true);
@@ -4599,12 +4805,11 @@ pub const Core = struct {
         self.log.write("rpc send: nvim_ui_try_resize (id={d}, rows={d}, cols={d})\n", .{ id, rows, cols });
     }
 
-    /// Request resize of a specific grid (for external windows).
     /// Request Neovim to resize an external grid.
-    /// Does NOT update external_grid_target_sizes here — the authoritative
-    /// update happens in grid_resize (redraw_handler.zig) when Neovim confirms
-    /// the new size. Updating target_sizes eagerly would cause viewport_rows
-    /// to temporarily mismatch the NDC baked into existing row vertices (e.g.
+    ///
+    /// The published surface size follows `sg.rows`/`sg.cols`, which only move
+    /// once Neovim confirms via grid_resize. Anticipating the requested size
+    /// here would mismatch the NDC baked into existing row vertices (e.g. the
     /// frontend requests 44 rows but Neovim keeps 45 including winbar).
     pub fn requestTryResizeGrid(self: *Core, grid_id: i64, rows: u32, cols: u32) void {
         self.requestTryResizeGridInternal(grid_id, rows, cols) catch |e| {
@@ -4642,6 +4847,22 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
     }
 
+    /// Ask Neovim to close the window shown in `grid_id`, the way a user
+    /// closing an external OS window asks for it. Returns false when the grid
+    /// has no Neovim window. Both frontends call this, so the command lives
+    /// in one place.
+    pub fn requestWinClose(self: *Core, grid_id: i64) !bool {
+        const win_id = blk: {
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
+            break :blk self.grid.getWinId(grid_id) orelse 0;
+        };
+        var buf: [64]u8 = undefined;
+        const cmd = formatWinCloseCommand(&buf, win_id) orelse return false;
+        try self.requestCommand(cmd);
+        return true;
+    }
+
     pub fn requestCommand(self: *Core, cmd: []const u8) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
@@ -4655,6 +4876,43 @@ pub const Core = struct {
         try self.sendRaw(buf.items);
 
         self.log.write("rpc send: nvim_command (id={d}) {s}\n", .{ id, cmd });
+    }
+
+    /// Open files with `:drop` -- all in one command -- or `:tab drop`, one
+    /// per file. The paths go as arguments and the server escapes them with
+    /// its own fnameescape, so the rules are the server OS's, not a table
+    /// each frontend kept. A file that fails (a swap-file prompt, say) is
+    /// reported and the rest still open, as separate typed commands did.
+    pub fn requestDropPaths(self: *Core, paths: []const []const u8, tab_per_file: bool) !void {
+        const id = self.nextMsgId();
+        var buf: rpc.Buf = .empty;
+        defer buf.deinit(self.alloc);
+        try self.packDropPathsRequest(&buf, id, paths, tab_per_file);
+        try self.sendRaw(buf.items);
+        self.log.write("rpc send: drop paths (id={d}) count={d} tab={}\n", .{ id, paths.len, tab_per_file });
+    }
+
+    fn packDropPathsRequest(self: *Core, buf: *rpc.Buf, id: i64, paths: []const []const u8, tab_per_file: bool) !void {
+        const lua_code =
+            \\local tab_per_file, paths = ...
+            \\local esc = vim.tbl_map(vim.fn.fnameescape, paths)
+            \\local function run(cmd)
+            \\  local ok, err = pcall(vim.cmd, cmd)
+            \\  if not ok then vim.notify(tostring(err), vim.log.levels.ERROR) end
+            \\end
+            \\if tab_per_file then
+            \\  for _, p in ipairs(esc) do run('tab drop ' .. p) end
+            \\elseif #esc > 0 then
+            \\  run('drop ' .. table.concat(esc, ' '))
+            \\end
+        ;
+        try self.sendRequestHeader(buf, id, "nvim_exec_lua");
+        try rpc.packArray(buf, self.alloc, 2);
+        try rpc.packStr(buf, self.alloc, lua_code);
+        try rpc.packArray(buf, self.alloc, 2);
+        try rpc.packBool(buf, self.alloc, tab_per_file);
+        try rpc.packArray(buf, self.alloc, paths.len);
+        for (paths) |p| try rpc.packStr(buf, self.alloc, p);
     }
 
     /// Request graceful quit (called by frontend on window close button).
@@ -4745,12 +5003,65 @@ pub const Core = struct {
             return;
         }
         var map = &(self.glow_hl_ids.?);
-        for (self.glow_group_names.items) |name| {
-            if (self.hl.groups.get(name)) |hl_id| {
-                map.put(hl_id, {}) catch {};
+
+        // A cell carries an *attribute* id, so that is what has to go in the
+        // set. Walk the attribute table and take every id composed from a
+        // named group: one name spans many ids once Neovim composes a group
+        // with search, extmarks or the cursorline, and every one of those
+        // composites is still that group on screen.
+        var it = self.hl.attr_names.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.*) |attr_name| {
+                for (self.glow_group_names.items) |want| {
+                    if (std.mem.eql(u8, attr_name, want)) {
+                        map.put(entry.key_ptr.*, {}) catch {};
+                        break;
+                    }
+                }
             }
         }
-        self.glow_enabled.store(self.glow_group_names.items.len > 0, .release);
+
+        // `hl_group_set` also reports attribute ids, for the builtins the UI
+        // styles its own chrome with. Keep honouring it: it arrives before the
+        // attribute table on a fresh attach.
+        for (self.glow_group_names.items) |name| {
+            if (self.hl.groups.get(name)) |attr_id| {
+                map.put(attr_id, {}) catch {};
+            }
+        }
+
+        // Enabled means "some cell can glow", which is what the frontends gate
+        // their bloom pass on. Naming groups that resolve to nothing used to
+        // report enabled and then light nothing.
+        self.glow_enabled.store(map.count() > 0, .release);
+
+        self.log.write("glow resolve: {d} attr ids for {d} groups\n", .{
+            map.count(),
+            self.glow_group_names.items.len,
+        });
+    }
+
+    /// Say, once per attribute id, that a cell asked to glow and was refused.
+    /// The id is what `cellGlow` actually matches on, and it is not what
+    /// `:Inspect` shows -- a group can reach the screen under several composed
+    /// ids, and only the ones the attribute table named are in the set.
+    pub fn noteGlowMiss(self: *Core, attr_id: u32) void {
+        const gop = self.glow_miss_seen.getOrPut(attr_id) catch return;
+        if (gop.found_existing) return;
+        var names_buf: [192]u8 = undefined;
+        var used: usize = 0;
+        if (self.hl.attr_names.get(attr_id)) |names| {
+            for (names) |n| {
+                if (names_buf.len - used < n.len + 1) break;
+                if (used != 0) {
+                    names_buf[used] = ',';
+                    used += 1;
+                }
+                @memcpy(names_buf[used..][0..n.len], n);
+                used += n.len;
+            }
+        }
+        self.log.write("glow miss: attr={d} names=[{s}]\n", .{ attr_id, names_buf[0..used] });
     }
 
     /// Request vim.g.zonvie_glow from Neovim via RPC.
@@ -4859,7 +5170,6 @@ pub const Core = struct {
         var lua_buf: [split_lua_buf_len]u8 = undefined;
         const lua_code = try buildSplitLua(&lua_buf, line_count, enter, timeout_ms);
 
-        // Send nvim_exec_lua with content as argument
         try self.requestExecLuaWithArg(lua_code, content);
         self.log.write("rpc send: createMessageSplit (lines={d}, height={d}, enter={any}, timeout_ms={d})\n", .{ line_count, splitHeight(line_count), enter, timeout_ms });
     }
@@ -5265,35 +5575,48 @@ pub const Core = struct {
 
     /// Scroll view to specified line number (1-based) via nvim_exec_lua.
     /// If use_bottom is true, positions the line at the bottom (zb), otherwise at the top (zt).
-    fn requestScrollToLine(self: *Core, line: i64, use_bottom: bool) !void {
+    fn requestScrollToLine(self: *Core, grid_id: i64, line: i64, use_bottom: bool) !void {
         const id = self.nextMsgId();
         var buf: rpc.Buf = .empty;
         defer buf.deinit(self.alloc);
 
         try self.sendRequestHeader(&buf, id, "nvim_exec_lua");
 
-        // Lua code: args are passed as varargs
-        // arg1 = line number, arg2 = use_bottom (0 or 1)
-        // Use normal command to scroll (same approach as nvim-scrollview)
-        // Temporarily set scrolloff=0 to allow scrolling to the very end of file
+        // Resolve grid_id -> Neovim winid, exactly as requestPageScroll does:
+        // a drag on one window's scrollbar must move THAT window, and this ran
+        // on the current one, so dragging the main window's knob scrolled an
+        // external window whenever the cursor was in it.
+        const winid: i64 = blk: {
+            self.grid_mu.lockUncancelable(clock.io());
+            defer self.grid_mu.unlock(clock.io());
+            break :blk self.grid.getWinId(grid_id) orelse 0;
+        };
+
+        // Lua code: args are passed as varargs.
+        // Temporarily set scrolloff=0 to allow scrolling to the very end of
+        // file; inside nvim_win_call `vim.wo` is the target window's.
         const lua_code =
-            \\local line, use_bottom = select(1, ...), select(2, ...)
-            \\local so = vim.wo.scrolloff
-            \\vim.wo.scrolloff = 0
-            \\if use_bottom == 1 then
-            \\  vim.cmd('keepjumps normal! ' .. line .. 'Gzb')
-            \\else
-            \\  vim.cmd('keepjumps normal! ' .. line .. 'Gzt')
-            \\end
-            \\vim.wo.scrolloff = so
+            \\local line, use_bottom, winid = ...
+            \\local win = winid > 0 and winid or vim.api.nvim_get_current_win()
+            \\vim.api.nvim_win_call(win, function()
+            \\  local so = vim.wo.scrolloff
+            \\  vim.wo.scrolloff = 0
+            \\  if use_bottom == 1 then
+            \\    vim.cmd('keepjumps normal! ' .. line .. 'Gzb')
+            \\  else
+            \\    vim.cmd('keepjumps normal! ' .. line .. 'Gzt')
+            \\  end
+            \\  vim.wo.scrolloff = so
+            \\end)
         ;
 
         // nvim_exec_lua(code, args) - args is array with two integers
         try rpc.packArray(&buf, self.alloc, 2);
         try rpc.packStr(&buf, self.alloc, lua_code);
-        try rpc.packArray(&buf, self.alloc, 2);
+        try rpc.packArray(&buf, self.alloc, 3);
         try rpc.packInt(&buf, self.alloc, line);
         try rpc.packInt(&buf, self.alloc, if (use_bottom) @as(i64, 1) else @as(i64, 0));
+        try rpc.packInt(&buf, self.alloc, winid);
 
         try self.sendRaw(buf.items);
 
@@ -5596,25 +5919,25 @@ pub const Core = struct {
 fn checkScrollLedgerResizeAllocationFailure(alloc: std.mem.Allocator) !void {
     var core = Core.initForTest(alloc);
     defer core.deinitForTest();
-    try core.ensureScrollCache(2);
-    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22 });
+    // The main row ledger is allocated by GridBuf.resize, so a grid resize is
+    // what can fail here.
+    try core.grid.resize(2, 80);
+    @memcpy(core.grid.main_buf.vertex_row_counts, &[_]usize{ 11, 22 });
 
-    core.ensureScrollCache(64) catch |err| {
+    core.grid.resize(64, 80) catch |err| {
+        // GridBuf.resize is transactional: a failed grow leaves the previous
+        // ledger, not a half-built one.
         try std.testing.expectEqualSlices(
             usize,
             &.{ 11, 22 },
-            core.main_vertex_row_counts.items[0..2],
+            core.grid.main_buf.vertex_row_counts,
         );
-        if (core.main_vertex_row_counts.items.len > 2) {
-            for (core.main_vertex_row_counts.items[2..]) |count| {
-                try std.testing.expectEqual(@as(usize, 0), count);
-            }
-        }
+        try std.testing.expectEqual(@as(u32, 2), core.grid.rows);
         return err;
     };
 }
 
-test "scroll ledger resize remains initialized on allocation failure" {
+test "main row ledger resize remains initialized on allocation failure" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         checkScrollLedgerResizeAllocationFailure,
@@ -5622,21 +5945,57 @@ test "scroll ledger resize remains initialized on allocation failure" {
     );
 }
 
-test "scroll ledger structural changes keep vertex aggregate synchronized" {
+test "main row ledger structural changes cannot leave stale per-row counts" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
 
-    try core.ensureScrollCache(3);
-    @memcpy(core.main_vertex_row_counts.items, &[_]usize{ 11, 22, 33 });
-    core.main_surface_vertex_count = 66;
+    try core.grid.resize(3, 80);
+    try std.testing.expectEqual(@as(usize, 3), core.grid.main_buf.vertex_row_counts.len);
+    @memcpy(core.grid.main_buf.vertex_row_counts, &[_]usize{ 11, 22, 33 });
+    core.grid.main_buf.surface_vertex_count = 66;
     core.flush_vertex_count_aggregate = 166;
 
-    try core.ensureScrollCache(2);
-    try std.testing.expectEqual(@as(usize, 33), core.main_surface_vertex_count);
-    try std.testing.expectEqual(@as(usize, 133), core.flush_vertex_count_aggregate);
+    // A structural shrink reallocates the ledger, so no row keeps a count from
+    // a different shape. The flush aggregate is rederived from the surviving
+    // surface totals at the next syncVertexBudgetAggregate, so it is the
+    // surface total that has to be reset here.
+    try core.grid.resize(2, 80);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.main_buf.vertex_row_counts.len);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.main_buf.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
+    try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
 
-    core.invalidateScrollCache();
-    try std.testing.expectEqual(@as(usize, 0), core.main_surface_vertex_count);
+    // invalidateMirroredFrameState zeroes the counts in place and removes the main
+    // surface's contribution from the aggregate.
+    core.grid.main_buf.vertex_row_counts[0] = 40;
+    core.grid.main_buf.vertex_row_counts[1] = 26;
+    core.grid.main_buf.surface_vertex_count = 66;
+    core.flush_vertex_count_aggregate = 166;
+    core.invalidateMirroredFrameState();
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.main_buf.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
+
+    // A sub-grid's ledger is reset on the same terms. Under ext_multigrid the
+    // sub-grids hold every window while grid 1 is a container, so resetting the
+    // main ledger alone left the real surfaces counting a frame that no longer
+    // exists — and the abort path would then snapshot that stale count as the
+    // accounting the committed frame owns.
+    try core.grid.resizeGrid(2, 2, 80);
+    try std.testing.expectEqual(@as(usize, 2), core.grid.sub_grids.getPtr(2).?.vertex_row_counts.len);
+    const sub = core.grid.sub_grids.getPtr(2).?;
+    sub.vertex_row_counts[0] = 7;
+    sub.vertex_row_counts[1] = 9;
+    sub.surface_vertex_count = 16;
+    sub.vertex_row_ledger_valid = false;
+    core.grid.subgrid_surface_vertex_count = 16;
+    core.flush_vertex_count_aggregate = 116;
+
+    core.invalidateMirroredFrameState();
+    try std.testing.expectEqualSlices(usize, &.{ 0, 0 }, core.grid.sub_grids.getPtr(2).?.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.sub_grids.getPtr(2).?.surface_vertex_count);
+    try std.testing.expect(core.grid.sub_grids.getPtr(2).?.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 0), core.grid.subgrid_surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 100), core.flush_vertex_count_aggregate);
 }
 
@@ -6621,9 +6980,6 @@ test "session reset republishes the latest desired resize" {
     // cleared, but the queue can still be discarded by reconnect cleanup.
     core.pending_resize_valid = false;
     core.ui_attached.store(true, .release);
-    try core.ext_float_anchor_entries.ensureTotalCapacityPrecise(core.alloc, 32);
-    try core.ext_float_entries.ensureTotalCapacityPrecise(core.alloc, 32);
-    try core.ext_float_row_entry_indices.ensureTotalCapacityPrecise(core.alloc, 32);
     try core.hl.define(9, 0x123456, null, null, false, 0, .{}, false);
     try core.hl.setGroup("SessionOnly", 9);
 
@@ -6632,9 +6988,6 @@ test "session reset republishes the latest desired resize" {
     try std.testing.expect(core.pending_resize_valid);
     try std.testing.expectEqual(@as(u32, 47), core.pending_resize_rows);
     try std.testing.expectEqual(@as(u32, 113), core.pending_resize_cols);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_anchor_entries.capacity);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_entries.capacity);
-    try std.testing.expectEqual(@as(usize, 0), core.ext_float_row_entry_indices.capacity);
     try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
     try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
 }
@@ -6755,6 +7108,42 @@ test "redraw recovery rejects old epoch and admits fresh attach replay" {
     rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
     try std.testing.expectEqual(@as(u32, 'A'), core.grid.getCell(0, 0).cp);
     try std.testing.expectEqual(@as(u8, 1), core.redraw_recovery_attempts);
+}
+
+test "dropped paths reach the server unescaped, for its own fnameescape" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var buf: rpc.Buf = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const paths = [_][]const u8{ "/tmp/a b*.txt", "C:\\x\\[y].md" };
+    try core.packDropPathsRequest(&buf, 7, &paths, true);
+
+    // Each path travels as its own msgpack string, byte for byte: the
+    // frontends' escape tables (which missed `*` and turned `\` into `\\` for
+    // a Windows server) are out of the loop.
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "/tmp/a b*.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "C:\\x\\[y].md") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\\ ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "fnameescape") != null);
+}
+
+test "mousescroll report carries both the ver and hor components" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var params = [_]mp.Value{ .{ .int = 5 }, .{ .int = 1 } };
+    var top = [_]mp.Value{ .{ .int = 2 }, .{ .str = "zonvie_mousescroll" }, .{ .arr = &params } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top);
+    try std.testing.expectEqual(@as(u32, 5), core.mousescroll_ver.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), core.mousescroll_hor.load(.acquire));
+
+    // An older reporter sends ver alone; hor keeps its last value.
+    var ver_only = [_]mp.Value{.{ .int = 2 }};
+    var top_ver_only = [_]mp.Value{ .{ .int = 2 }, .{ .str = "zonvie_mousescroll" }, .{ .arr = &ver_only } };
+    rpc_session.handleRpcNotification(&core, std.testing.allocator, &top_ver_only);
+    try std.testing.expectEqual(@as(u32, 2), core.mousescroll_ver.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), core.mousescroll_hor.load(.acquire));
 }
 
 test "redraw recovery retains resize that cannot queue after fresh attach" {
@@ -7113,6 +7502,51 @@ test "complete visible-grid snapshot reports truncation from one lock state" {
     try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
 }
 
+test "a float an external window hosts is reported in that window's cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 20, 40);
+    // A detached split: external window 3 kept its main-grid origin (5, 7).
+    try core.grid.resizeGrid(3, 10, 30);
+    _ = try core.grid.setWinExternalPosAt(3, 43, 5, 7);
+    // Float 4 at (2, 1) inside it, stored the way redraw_handler stores it:
+    // with the window's origin added.
+    try core.grid.resizeGrid(4, 3, 10);
+    try core.grid.setWinFloatPos(4, 44, 5 + 2, 7 + 1, 50, 0, 3, true);
+
+    var out: [4]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    var found = false;
+    for (out[0..count]) |g| {
+        if (g.grid_id != 4) continue;
+        found = true;
+        try std.testing.expectEqual(@as(i64, 3), g.placed_by_surface);
+        try std.testing.expectEqual(@as(i32, 2), g.start_row);
+        try std.testing.expectEqual(@as(i32, 1), g.start_col);
+    }
+    try std.testing.expect(found);
+}
+
+test "a grid no surface places reports no placing surface" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 4, 8);
+    // A float whose anchor chain ends at a grid that does not exist: the
+    // flush draws it on no surface. The snapshot said the main surface did,
+    // so the pointer resolver and the macOS offset builder counted a grid
+    // nobody draws.
+    try core.grid.resizeGrid(4, 2, 3);
+    try core.grid.win_pos.put(core.grid.alloc, 4, .{ .row = 1, .col = 1, .anchor_grid = 99 });
+
+    var out: [2]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(i64, 4), out[1].grid_id);
+    try std.testing.expectEqual(@as(i64, 0), out[1].placed_by_surface);
+}
+
 test "visible-grid and cursor snapshots saturate hostile stored u32 fields" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -7197,9 +7631,6 @@ fn initCoreForAtlasGcTest(core: *Core, rows: u32) !void {
     core.cb.on_atlas_create = AtlasGcTestCallbacks.create;
 
     try core.grid.resize(rows, 4);
-    try core.ensureScrollCache(rows);
-    var r: u32 = 0;
-    while (r < rows) : (r += 1) core.scroll_cache_valid.set(r);
 
     var packer = shelf_packer.ShelfPacker.init(16, 4096);
     _ = packer.alloc(12, 1).?;
@@ -7228,16 +7659,58 @@ test "atlas reclamation runs when the frontend owns no surface" {
     try std.testing.expect(recycledShelfCount(&core) > 0);
 }
 
-test "atlas reclamation stands down for a frontend-owned surface" {
+/// The UV of a glyph on closed shelf `index` of initCoreForAtlasGcTest's
+/// packer.
+fn shelfUvY(core: *Core, index: u32) f32 {
+    const packer = &(core.atlas_packer.?);
+    const y: f32 = @floatFromInt(packer.shelves[index].y);
+    return (y + 0.5) / @as(f32, @floatFromInt(packer.height));
+}
+
+/// A clean 2x2 external window whose two rows are mirrored, both on the
+/// packer's first closed shelf.
+fn addMirroredExternalSurface(core: *Core, grid_id: i64, with_buffer: bool) !void {
+    if (with_buffer) {
+        try core.grid.resizeGrid(grid_id, 2, 2);
+        try core.grid.external_grids.put(core.alloc, grid_id, .{ .win = grid_id, .start_row = 0, .start_col = 0 });
+        const sg = core.grid.sub_grids.getPtr(grid_id).?;
+        sg.dirty_all = false;
+        if (sg.dirty_rows.bit_length != 0) sg.dirty_rows.unsetAll();
+    }
+    try core.known_external_grids.put(core.alloc, grid_id, .{ .win = grid_id, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    const v = [_]c_api.Vertex{mirrorGlyphVert(grid_id, shelfUvY(core, 0))};
+    core.recordGlyphMirrorRow(grid_id, 0, 2, &v);
+    core.recordGlyphMirrorRow(grid_id, 1, 2, &v);
+}
+
+test "atlas reclamation counts a frontend-owned surface like any other grid" {
+    // Every surface's rows are mirrored now, so a float or external window is
+    // read the way the main grid is. Refusing whenever one existed turned
+    // reclamation off for the session under ext_windows, and whenever the
+    // cmdline, popupmenu or a message was up, leaving only full resets.
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, true);
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    // The shelf the surface draws from survives; the other goes.
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+    try std.testing.expect(core.atlas_packer.?.shelves[1].recycled);
+}
+
+test "atlas reclamation stands down for a surface row it cannot read" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try initCoreForAtlasGcTest(&core, 4);
 
-    // The ordinary shape of a float: cell storage, placement, and a frontend
-    // surface the core was told about.
+    // Clean, so not regenerated this flush, and never mirrored.
     try core.grid.resizeGrid(7, 2, 2);
     try core.grid.external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0 });
     try core.known_external_grids.put(core.alloc, 7, .{ .win = 7, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
+    const sg = core.grid.sub_grids.getPtr(7).?;
+    sg.dirty_all = false;
+    if (sg.dirty_rows.bit_length != 0) sg.dirty_rows.unsetAll();
 
     try std.testing.expect(!core.collectAtlasGarbage());
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
@@ -7245,8 +7718,7 @@ test "atlas reclamation stands down for a frontend-owned surface" {
 
 test "atlas reclamation stands down for a surface that outlived its grid buffer" {
     // grid_destroy can drop the GridBuf while the frontend surface is still on
-    // screen. Deriving eligibility from sub_grids missed exactly that window
-    // and reclaimed shelves the surface was still drawing from.
+    // screen. With no mirror either, nothing says what it still draws.
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
     try initCoreForAtlasGcTest(&core, 4);
@@ -7256,4 +7728,140 @@ test "atlas reclamation stands down for a surface that outlived its grid buffer"
 
     try std.testing.expect(!core.collectAtlasGarbage());
     try std.testing.expectEqual(@as(u32, 0), recycledShelfCount(&core));
+}
+
+test "a surface that outlived its grid buffer is read from its mirror" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try initCoreForAtlasGcTest(&core, 4);
+    try addMirroredExternalSurface(&core, 7, false);
+    try std.testing.expect(!core.grid.sub_grids.contains(7));
+
+    try std.testing.expect(core.collectAtlasGarbage());
+    try std.testing.expect(!core.atlas_packer.?.shelves[0].recycled);
+    try std.testing.expect(core.atlas_packer.?.shelves[1].recycled);
+
+    // Once its mirror cannot be trusted, the collector stands down again.
+    var fresh = Core.initForTest(std.testing.allocator);
+    defer fresh.deinitForTest();
+    try initCoreForAtlasGcTest(&fresh, 4);
+    try addMirroredExternalSurface(&fresh, 7, false);
+    fresh.glyph_mirror.getPtr(7).?.valid.unset(1);
+    try std.testing.expect(!fresh.collectAtlasGarbage());
+}
+
+
+/// One glyph quad's worth of vertices carrying `uv_y`, for the mirror tests.
+fn mirrorGlyphVert(grid_id: i64, uv_y: f32) c_api.Vertex {
+    return .{
+        .position = .{ 0, 0 },
+        .texCoord = .{ 0.5, uv_y },
+        .color = .{ 0, 0, 0, 0 },
+        .grid_id = grid_id,
+        .deco_flags = 0,
+        .deco_phase = 0,
+    };
+}
+
+test "a destroyed grid's glyph mirror is freed, not merely emptied" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const v = [_]c_api.Vertex{mirrorGlyphVert(7, 0.25)};
+    core.recordGlyphMirrorRow(7, 0, 1, &v);
+    try std.testing.expect(core.glyph_mirror.contains(7));
+
+    core.removeGlyphMirror(7);
+    try std.testing.expect(!core.glyph_mirror.contains(7));
+    // Idempotent: destroy is drained once per flush but a grid id can be
+    // reported destroyed after its rows are already gone.
+    core.removeGlyphMirror(7);
+}
+
+test "shiftGlyphMirror moves rows the way the frontend's row-shift does" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    var r: u32 = 0;
+    while (r < 4) : (r += 1) {
+        const uv: f32 = @as(f32, @floatFromInt(r)) * 0.1 + 0.1;
+        const v = [_]c_api.Vertex{mirrorGlyphVert(2, uv)};
+        core.recordGlyphMirrorRow(2, r, 4, &v);
+    }
+
+    core.shiftGlyphMirror(2, 0, 4, 1);
+    const m = core.glyph_mirror.getPtr(2).?;
+    // Content moved up: row 0 now shows what row 1 held.
+    try std.testing.expectEqual(@as(f32, 0.2), m.rows.items[0].items[0]);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.items[3].items.len);
+    try std.testing.expect(!m.valid.isSet(3));
+
+    core.shiftGlyphMirror(2, 0, 4, -1);
+    try std.testing.expectEqual(@as(f32, 0.2), m.rows.items[1].items[0]);
+    try std.testing.expectEqual(@as(usize, 0), m.rows.items[0].items.len);
+    try std.testing.expect(!m.valid.isSet(0));
+}
+
+test "a row a shift vacated stays live while the frontend may still draw it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    const v = [_]c_api.Vertex{mirrorGlyphVert(2, 0.75)};
+    core.recordGlyphMirrorRow(2, 0, 4, &v);
+
+    // Row 0 leaves through the top; the frontend keeps drawing its retained
+    // copy for the sub-row ease, so its shelf must not be reclaimed yet.
+    core.shiftGlyphMirror(2, 0, 4, 1);
+    try std.testing.expect(core.departedUvIsLive(0.75));
+
+    var i: u8 = 0;
+    while (i < retained_shadow_expiry) : (i += 1) core.ageRetainedShadows();
+    try std.testing.expect(!core.departedUvIsLive(0.75));
+}
+
+test "a drawable-only resize regenerates nothing" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(4, 10);
+    try core.grid.resizeGrid(2, 4, 10);
+    try core.grid.setWinPos(2, 102, 0, 0);
+
+    // Cell 2x2 so the drawable can grow by less than a cell without changing
+    // the derived rows/cols. 20/2 = 10 cols, 8/2 = 4 rows.
+    _ = core.updateLayoutPxLocked(20, 8, 2, 2);
+    // Without a live session the resize RPC cannot be accepted, so settle the
+    // remembered layout by hand; otherwise grid_dims_changed stays true.
+    core.last_layout_rows = 4;
+    core.last_layout_cols = 10;
+    core.grid.main_buf.dirty_all = false;
+    core.grid.sub_grids.getPtr(2).?.dirty_all = false;
+    const cursor_rev_before = core.grid.cursor_rev;
+
+    // One pixel wider: same cell size, still 10 cols and 4 rows, so no vertex
+    // changes. Positions are grid-local pixels and nothing in vertex generation
+    // reads the drawable size, which is what made the wide gate waste a full
+    // regeneration on every pixel of a live drag-resize.
+    _ = core.updateLayoutPxLocked(21, 8, 2, 2);
+    try std.testing.expect(!core.grid.main_buf.dirty_all);
+    try std.testing.expect(!core.grid.sub_grids.getPtr(2).?.dirty_all);
+    try std.testing.expectEqual(cursor_rev_before, core.grid.cursor_rev);
+
+    // A cell-size change still regenerates every surface.
+    _ = core.updateLayoutPxLocked(21, 8, 3, 3);
+    try std.testing.expect(core.grid.main_buf.dirty_all);
+    try std.testing.expect(core.grid.sub_grids.getPtr(2).?.dirty_all);
+    try std.testing.expect(core.grid.cursor_rev != cursor_rev_before);
+}
+
+test "a window close asked by the frontend names that window and tolerates it being gone" {
+    var buf: [96]u8 = undefined;
+    // pcall: the window may already be closed, or be the last one (E444);
+    // either way the request must not surface an error to the user.
+    try std.testing.expectEqualStrings(
+        "lua pcall(vim.api.nvim_win_close, 1002, false)",
+        formatWinCloseCommand(&buf, 1002).?,
+    );
+    // No Neovim window behind the grid: nothing to ask.
+    try std.testing.expect(formatWinCloseCommand(&buf, 0) == null);
+    try std.testing.expect(formatWinCloseCommand(&buf, -3) == null);
 }

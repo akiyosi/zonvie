@@ -1,0 +1,5 @@
+[log]
+enabled = true
+verbose = true
+perf_only = false
+scroll_only = false

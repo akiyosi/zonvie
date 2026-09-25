@@ -139,6 +139,16 @@ fn blobSize(b: ?*ID3DBlob) usize {
     return @intCast(get_sz(p));
 }
 
+/// Say why glow is off. `prepareBloomShaders` is attempted once per renderer
+/// and every one of its exits disables bloom for the rest of the process, so a
+/// silent one leaves no way to tell a failed compile from a config that never
+/// asked for glow. This goes through applog rather than dbgLog because the
+/// builds users run are not Debug builds.
+fn bloomUnavailable(comptime fmt: []const u8, args: anytype) void {
+    if (!applog.isEnabled()) return;
+    applog.appLog("[d3d] bloom unavailable, glow disabled: " ++ fmt ++ "\n", args);
+}
+
 fn dumpBlobAsText(prefix: []const u8, b: ?*ID3DBlob) void {
     const p = b orelse return;
 
@@ -251,6 +261,17 @@ pub const Renderer = struct {
     /// that SPIRV-Cross generates for `layout(location=0) in vec2 vUV`.
     vs_custom_post: ?*c.ID3D11VertexShader = null,
     ps_glow_extract: ?*c.ID3D11PixelShader = null,
+    /// One-shot latch for the per-frame bloom gates, which would otherwise
+    /// repeat their reason every frame.
+    bloom_skip_logged: bool = false,
+    /// `vim.g.zonvie_glow.radius` as a tap-offset multiplier. Set from the
+    /// core each paint; 1.0 is the default radius, so a config that never sets
+    /// one keeps the spread the chain had before radius was wired up.
+    glow_radius_scale: f32 = 1.0,
+    /// Attenuates extracted glow by a layer's background coverage, so a glyph
+    /// behind an opaque layer does not bloom through it.
+    ps_glow_occlude: ?*c.ID3D11PixelShader = null,
+    occlude_blend: ?*c.ID3D11BlendState = null,
     ps_kawase_down: ?*c.ID3D11PixelShader = null,
     ps_kawase_up: ?*c.ID3D11PixelShader = null,
     ps_glow_composite: ?*c.ID3D11PixelShader = null,
@@ -258,6 +279,12 @@ pub const Renderer = struct {
     additive_blend: ?*c.ID3D11BlendState = null,
     bilinear_sampler: ?*c.ID3D11SamplerState = null,
     glow_cb: ?*c.ID3D11Buffer = null,
+    /// Vertex-stage b0: maps a layer's vertex space to clip space. See
+    /// LayerTransform in windows/shaders/main.hlsl.
+    layer_cb: ?*c.ID3D11Buffer = null,
+    /// Last value written to layer_cb, so redundant updates are skipped.
+    layer_cb_value: [8]f32 = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+    layer_cb_valid: bool = false,
 
     // User-supplied custom post-process shaders (Phase 2 macOS parity).
     // Loaded from config `[shaders].paths` after renderer init. Empty when
@@ -337,6 +364,16 @@ pub const Renderer = struct {
     // Background transparency (0.0-1.0, 1.0 = opaque)
     opacity: f32 = 1.0,
 
+    // Mirrors config [window] blur for this renderer's surface. Under blur
+    // the core emits every default-background run at alpha 0.5 whatever the
+    // opacity (src/core/flush.zig), and on a main surface with layers it
+    // drops that run entirely (skip_default_bg), so the row draw has to
+    // overwrite each band itself even at opacity 1.0.
+    // Set from init's `blur` parameter, not assigned afterwards: a surface
+    // that forgot the assignment rendered the alpha-0.5 rows over its own
+    // previous frame and ghosted, and nothing failed to build.
+    blur_enabled: bool = false,
+
     // Neovim default background color (0x00RRGGBB), used for the
     // ClearRenderTargetView color. Without this, the bottom/right
     // remainder strip below/right of the cell-aligned NDC viewport
@@ -405,7 +442,9 @@ pub const Renderer = struct {
     }
 
     /// Initialize with a pre-created D3D11 device (from createDeviceOnly).
-    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext) !Renderer {
+    /// `create_atlas`: only the main renderer owns a glyph atlas texture; an
+    /// external one borrows it (borrowAtlas) on every paint.
+    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext, create_atlas: bool) !Renderer {
         // Take our own COM reference on the App-owned device/context so this
         // renderer's deinit() can Release() without over-releasing the App's
         // reference. App creates this device via createDeviceOnly() and
@@ -417,6 +456,7 @@ pub const Renderer = struct {
             .alloc = alloc,
             .hwnd = hwnd,
             .opacity = opacity,
+            .blur_enabled = blur,
             .device = device,
             .ctx = device_ctx,
         };
@@ -458,19 +498,22 @@ pub const Renderer = struct {
         _ = c.QueryPerformanceCounter(&t1);
         dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
-        _ = c.QueryPerformanceCounter(&t0);
-        try self.createAtlasTexture(self.atlas_w, self.atlas_h);
-        _ = c.QueryPerformanceCounter(&t1);
-        dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (create_atlas) {
+            _ = c.QueryPerformanceCounter(&t0);
+            try self.createAtlasTexture(self.atlas_w, self.atlas_h);
+            _ = c.QueryPerformanceCounter(&t1);
+            dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         return self;
     }
 
-    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32) !Renderer {
+    pub fn init(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool) !Renderer {
         var self: Renderer = .{
             .alloc = alloc,
             .hwnd = hwnd,
             .opacity = opacity,
+            .blur_enabled = blur,
         };
         // Five `try` fail points follow (createDeviceAndSwapchain/
         // createBackTargets/createPipeline/ensureVertexBuffer/
@@ -556,12 +599,15 @@ pub const Renderer = struct {
         safeRelease(&self.vs_fullscreen);
         safeRelease(&self.vs_custom_post);
         safeRelease(&self.ps_glow_extract);
+        safeRelease(&self.ps_glow_occlude);
+        safeRelease(&self.occlude_blend);
         safeRelease(&self.ps_kawase_down);
         safeRelease(&self.ps_kawase_up);
         safeRelease(&self.ps_glow_composite);
         safeRelease(&self.additive_blend);
         safeRelease(&self.bilinear_sampler);
         safeRelease(&self.glow_cb);
+        safeRelease(&self.layer_cb);
 
         // Custom shader resources
         for (self.custom_shader_pipelines.items) |*p| p.deinit();
@@ -981,6 +1027,8 @@ pub const Renderer = struct {
 
         try self.resize();
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
 
         if (applog.isEnabled()) {
             applog.appLog(
@@ -1319,7 +1367,7 @@ pub const Renderer = struct {
         // Custom shader pass used to live here but was moved to the
         // present paths. Calling it at THIS point (before opts.present's
         // branch below) would run the shader on a back_tex that hasn't been
-        // populated yet in row-mode (rows land via drawSurfaceRowsVB after
+        // populated yet in row-mode (rows land via drawSurfaceRowsVBFromSlots after
         // drawEx returns), and also leaves the pipeline state (VS/PS/slot0
         // SRV) dirty, which breaks subsequent row drawVB calls that inherit
         // that state. drawCustomShaderPass is invoked from the present paths
@@ -1333,7 +1381,7 @@ pub const Renderer = struct {
         if (opts.present) {
             // Custom post-process shader pass: runs on the fully-rendered
             // back_tex (already populated here — unlike row-mode, where rows
-            // land via drawSurfaceRowsVB after drawEx returns, this present
+            // land via drawSurfaceRowsVBFromSlots after drawEx returns, this present
             // branch runs after all of this frame's content is in back_tex)
             // and writes its output directly into the current swapchain bb.
             // Skip the back->bb copy below when it handled the frame,
@@ -1532,9 +1580,6 @@ pub const Renderer = struct {
     pub fn presentFromBackRectsWithCursorNoResize(
         self: *Renderer,
         rects: []const c.RECT,
-        cursor_vb: ?*c.ID3D11Buffer,
-        cursor_vert_count: usize,
-        cursor_scissor: ?c.RECT,
         force_full_copy: bool,
         scroll_rect: ?*const c.RECT,
         scroll_offset: ?*const c.POINT,
@@ -1585,9 +1630,6 @@ pub const Renderer = struct {
             t_copy_ns = core.clock.nowNs();
         }
 
-        _ = cursor_vb;
-        _ = cursor_vert_count;
-        _ = cursor_scissor;
         if (log_enabled) {
             t_cursor_ns = core.clock.nowNs();
         }
@@ -1817,6 +1859,8 @@ pub const Renderer = struct {
     /// Draw tabline texture as a full-width quad at the top of the window.
     /// Call this after clearing but before drawing main content.
     pub fn drawTablineTexture(self: *Renderer) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const srv = self.tabline_srv orelse return;
         const ctx = self.ctx orelse return error.NoContext;
         const width = self.tabline_width;
@@ -1962,6 +2006,8 @@ pub const Renderer = struct {
 
     /// Draw sidebar texture as a vertical strip at left or right of window.
     pub fn drawSidebarTexture(self: *Renderer, is_right: bool) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const srv = self.sidebar_srv orelse return;
         const ctx = self.ctx orelse return error.NoContext;
         const sb_width = self.sidebar_width_tex;
@@ -2307,6 +2353,8 @@ pub const Renderer = struct {
     /// Used for rows with vert_count==0 ("clear row" per core contract).
     /// Lazily creates and caches a 6-vertex VB with the default bg color.
     pub fn drawClearRow(self: *Renderer) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
         const bg_rgb = self.default_bg_rgb.load(.acquire);
         const need_rebuild = (self.clear_row_vb == null or bg_rgb != self.clear_row_vb_bg);
 
@@ -2338,6 +2386,22 @@ pub const Renderer = struct {
             self.clear_row_vb_bg = bg_rgb;
         }
         try self.drawVB(self.clear_row_vb.?, 6);
+    }
+
+    /// drawClearRow with blending OFF: the scissored band becomes exactly
+    /// (bg * opacity, opacity) instead of that blended over whatever the row
+    /// held before. On a translucent surface every redraw of a row would
+    /// otherwise compound its alpha toward opaque (0.5 -> 0.75 -> 0.875 ...),
+    /// which is what a layer redrawn every paint did — and a glyph that
+    /// vanished (a closed split's separator) would keep showing through.
+    pub fn drawClearRowOverwrite(self: *Renderer) !void {
+        const ctx = self.ctx orelse return error.NoContext;
+        const ctx_vtbl = ctx.*.lpVtbl;
+        const set_blend = ctx_vtbl.*.OMSetBlendState orelse return error.D3DBlendMissing;
+        var blend_factor: [4]f32 = .{ 0, 0, 0, 0 };
+        set_blend(ctx, null, &blend_factor, 0xFFFFFFFF);
+        defer if (self.blend) |bl| set_blend(ctx, bl, &blend_factor, 0xFFFFFFFF);
+        try self.drawClearRow();
     }
 
     /// Set viewport and scissor to full window size.
@@ -2998,8 +3062,9 @@ pub const Renderer = struct {
     }
 
     fn ensureGlowTextures(self: *Renderer) void {
-        const hw = @max(1, self.width / 2);
-        const hh = @max(1, self.height / 2);
+        const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
+        const hw = chain.half_w_px;
+        const hh = chain.half_h_px;
         if (self.glow_extract_tex != null and self.glow_half_w == hw and self.glow_half_h == hh) return;
 
         // Release old textures
@@ -3040,12 +3105,10 @@ pub const Renderer = struct {
         if (c.FAILED(create_srv(dev, @ptrCast(tex1.?), null, &srv1)) or srv1 == null) return;
         self.glow_extract_srv = srv1;
 
-        // Mip textures: 1/4, 1/8, 1/16
-        var mw = @max(1, hw / 2);
-        var mh = @max(1, hh / 2);
-        for (0..3) |i| {
-            td.Width = mw;
-            td.Height = mh;
+        // Mip textures, sized by the same plan the passes are driven from.
+        for (0..core.glow_chain.mip_count) |i| {
+            td.Width = chain.mip_w_px[i];
+            td.Height = chain.mip_h_px[i];
 
             var tex_m: ?*c.ID3D11Texture2D = null;
             if (c.FAILED(create_tex(dev, &td, null, &tex_m)) or tex_m == null) return;
@@ -3058,9 +3121,6 @@ pub const Renderer = struct {
             var srv_m: ?*c.ID3D11ShaderResourceView = null;
             if (c.FAILED(create_srv(dev, @ptrCast(tex_m.?), null, &srv_m)) or srv_m == null) return;
             self.glow_mip_srv[i] = srv_m;
-
-            mw = @max(1, mw / 2);
-            mh = @max(1, mh / 2);
         }
 
         self.glow_half_w = hw;
@@ -3184,12 +3244,19 @@ pub const Renderer = struct {
     fn bloomShadersReady(self: *const Renderer) bool {
         return self.vs_fullscreen != null and
             self.ps_glow_extract != null and
+            self.ps_glow_occlude != null and
             self.ps_kawase_down != null and
             self.ps_kawase_up != null and
             self.ps_glow_composite != null;
     }
 
-    /// Compile the five bloom shaders before a glow-enabled paint is queued.
+    fn noteBloomSkip(self: *Renderer, reason: []const u8) void {
+        if (self.bloom_skip_logged) return;
+        self.bloom_skip_logged = true;
+        bloomUnavailable("{s}", .{reason});
+    }
+
+    /// Compile the bloom shaders before a glow-enabled paint is queued.
     /// No-op once built. Keeping this opt-in avoids the ~50 ms cost for
     /// configs that never enable glow without charging the first WM_PAINT.
     /// Returns `true` when every shader is ready to use.
@@ -3198,10 +3265,19 @@ pub const Renderer = struct {
         if (self.bloom_prepare_attempted) return false;
         self.bloom_prepare_attempted = true;
 
-        const dev = self.device orelse return false;
+        const dev = self.device orelse {
+            bloomUnavailable("no device", .{});
+            return false;
+        };
         const dev_vtbl = dev.*.lpVtbl;
-        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse return false;
-        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse return false;
+        const create_vs_fn = dev_vtbl.*.CreateVertexShader orelse {
+            bloomUnavailable("CreateVertexShader unavailable", .{});
+            return false;
+        };
+        const create_ps_fn = dev_vtbl.*.CreatePixelShader orelse {
+            bloomUnavailable("CreatePixelShader unavailable", .{});
+            return false;
+        };
         const hlsl = @embedFile("../shaders/main.hlsl");
 
         const BloomEntry = struct {
@@ -3211,12 +3287,13 @@ pub const Renderer = struct {
         const bloom_entries = [_]BloomEntry{
             .{ .entry = "VSFullscreen", .target = "vs_5_0" },
             .{ .entry = "PSGlowExtract", .target = "ps_5_0" },
+            .{ .entry = "PSGlowOcclude", .target = "ps_5_0" },
             .{ .entry = "PSKawaseDown", .target = "ps_5_0" },
             .{ .entry = "PSKawaseUp", .target = "ps_5_0" },
             .{ .entry = "PSGlowComposite", .target = "ps_5_0" },
         };
 
-        var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{ null, null, null, null, null };
+        var bloom_blobs: [bloom_entries.len]?*ID3DBlob = .{null} ** bloom_entries.len;
         defer for (&bloom_blobs) |*b| blobRelease(b.*);
 
         for (bloom_entries, 0..) |be, idx| {
@@ -3226,30 +3303,51 @@ pub const Renderer = struct {
             const hr_b = D3DCompile(hlsl.ptr, hlsl.len, null, null, null, be.entry, be.target, 0, 0, &blob, &err_b);
             if (hr_b != 0 or blob == null) {
                 dumpBlobAsText("[D3DCompile bloom] ", err_b);
-                dbgLog("[d3d] WARNING: bloom shader '{s}' compile failed, bloom disabled\n", .{be.entry});
+                bloomUnavailable("'{s}' compile failed hr=0x{x}", .{ be.entry, @as(u32, @bitCast(hr_b)) });
                 return false;
             }
             bloom_blobs[idx] = blob;
         }
 
         if (self.vs_fullscreen == null) {
-            const bp0 = blobPtr(bloom_blobs[0]) orelse return false;
+            const bp0 = blobPtr(bloom_blobs[0]) orelse {
+                bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[0].entry});
+                return false;
+            };
             const bs0 = blobSize(bloom_blobs[0]);
             var vs_fs: ?*c.ID3D11VertexShader = null;
-            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) return false;
+            if (c.FAILED(create_vs_fn(dev, bp0, bs0, null, &vs_fs)) or vs_fs == null) {
+                bloomUnavailable("CreateVertexShader rejected '{s}'", .{bloom_entries[0].entry});
+                return false;
+            }
             self.vs_fullscreen = vs_fs;
         }
 
-        inline for (.{ 1, 2, 3, 4 }, .{ &self.ps_glow_extract, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
+        inline for (.{ 1, 2, 3, 4, 5 }, .{ &self.ps_glow_extract, &self.ps_glow_occlude, &self.ps_kawase_down, &self.ps_kawase_up, &self.ps_glow_composite }) |idx, field| {
             if (field.* == null) {
-                const bp = blobPtr(bloom_blobs[idx]) orelse return false;
+                const bp = blobPtr(bloom_blobs[idx]) orelse {
+                    bloomUnavailable("'{s}' produced no bytecode", .{bloom_entries[idx].entry});
+                    return false;
+                };
                 const bs = blobSize(bloom_blobs[idx]);
                 var ps_out: ?*c.ID3D11PixelShader = null;
-                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) return false;
+                if (c.FAILED(create_ps_fn(dev, bp, bs, null, &ps_out)) or ps_out == null) {
+                    bloomUnavailable("CreatePixelShader rejected '{s}'", .{bloom_entries[idx].entry});
+                    return false;
+                }
                 field.* = ps_out;
             }
         }
-        return self.bloomShadersReady();
+        const ready = self.bloomShadersReady();
+        if (!ready) {
+            bloomUnavailable("a shader slot stayed null after preparation", .{});
+        } else if (applog.isEnabled()) {
+            // Say so on success too: preparation runs once, and without this
+            // line a silent log cannot distinguish "bloom is fine" from "this
+            // build predates the failure reporting".
+            applog.appLog("[d3d] bloom shaders ready ({d} entries)\n", .{bloom_entries.len});
+        }
+        return ready;
     }
 
     /// Compile `VSCustomPost` from main.hlsl the first time it's needed.
@@ -3887,6 +3985,28 @@ pub const Renderer = struct {
     }
 
     /// Execute post-process bloom: extract → Dual Kawase downsample/upsample → composite.
+    /// Switch the extract pass between adding a layer's own light (`false`)
+    /// and scaling the light under it by that layer's background coverage
+    /// (`true`). Returns false when occlusion is unavailable, in which case
+    /// nothing was bound and the caller must skip that sub-pass.
+    pub fn setBloomOccludePass(self: *Renderer, ctx: *c.ID3D11DeviceContext, occlude: bool) bool {
+        const vt = ctx.*.lpVtbl;
+        const ps_set = vt.*.PSSetShader orelse return false;
+        const om_blend = vt.*.OMSetBlendState orelse return false;
+        var bf: [4]f32 = .{ 0, 0, 0, 0 };
+        if (occlude) {
+            const ps = self.ps_glow_occlude orelse return false;
+            const bl = self.occlude_blend orelse return false;
+            ps_set(ctx, ps, null, 0);
+            om_blend(ctx, bl, &bf, 0xFFFFFFFF);
+            return true;
+        }
+        const ps = self.ps_glow_extract orelse return false;
+        ps_set(ctx, ps, null, 0);
+        om_blend(ctx, self.blend, &bf, 0xFFFFFFFF);
+        return true;
+    }
+
     pub const BloomRowsDrawFn = *const fn (
         ?*const anyopaque,
         *Renderer,
@@ -3923,9 +4043,6 @@ pub const Renderer = struct {
         const ia_set_il = ctx_vtbl.*.IASetInputLayout orelse return;
         const draw_fn = ctx_vtbl.*.Draw orelse return;
         const clear_rtv = ctx_vtbl.*.ClearRenderTargetView orelse return;
-
-        const hw = self.glow_half_w;
-        const hh = self.glow_half_h;
 
         // --- Pass 1: Glow extract → glow_extract_tex (1/2 res) ---
         // Apply content viewport offset (sidebar/tabline) scaled to half resolution.
@@ -3968,20 +4085,14 @@ pub const Renderer = struct {
             }
             self.drawVertices(cursor) catch return;
 
+
             ps_set_fn(ctx, self.ps.?, null, 0);
         }
 
         // Helper: compute mip dimensions
-        const mip_widths: [3]u32 = .{
-            @max(1, hw / 2),
-            @max(1, hw / 4),
-            @max(1, hw / 8),
-        };
-        const mip_heights: [3]u32 = .{
-            @max(1, hh / 2),
-            @max(1, hh / 4),
-            @max(1, hh / 8),
-        };
+        // The chain's geometry is the core's (src/core/glow_chain.zig): which
+        // texture each pass reads and writes, and at what size.
+        const chain = core.glow_chain.plan(self.width, self.height, self.glow_radius_scale);
 
         // Setup common state for fullscreen passes
         vs_set_fn(ctx, self.vs_fullscreen.?, null, 0);
@@ -3993,84 +4104,69 @@ pub const Renderer = struct {
         var samps: [1]?*c.ID3D11SamplerState = .{self.bilinear_sampler.?};
         ps_set_samp(ctx, 1, 1, @ptrCast(&samps));
 
-        // --- Downsample chain: extract → mip[0] → mip[1] → mip[2] ---
-        for (0..3) |level| {
-            // Unbind SRV slot 1 to avoid RTV/SRV hazard
-            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
-
-            var rtvs: [1]?*c.ID3D11RenderTargetView = .{self.glow_mip_rtv[level].?};
-            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
-
-            var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
-                .TopLeftY = 0,
-                .Width = @floatFromInt(mip_widths[level]),
-                .Height = @floatFromInt(mip_heights[level]),
-                .MinDepth = 0,
-                .MaxDepth = 1,
-            };
-            rs_set_vp(ctx, 1, &vp);
-
-            var sr: c.D3D11_RECT = .{
-                .left = 0,
-                .top = 0,
-                .right = @intCast(mip_widths[level]),
-                .bottom = @intCast(mip_heights[level]),
-            };
-            rs_set_sc(ctx, 1, &sr);
-
-            // Source: extract for level 0, mip[level-1] otherwise
-            const src_srv = if (level == 0) self.glow_extract_srv.? else self.glow_mip_srv[level - 1].?;
-            var srvs: [1]?*c.ID3D11ShaderResourceView = .{src_srv};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
-
-            ps_set_fn(ctx, self.ps_kawase_down.?, null, 0);
-            draw_fn(ctx, 3, 0);
+        // GlowParams carries the radius the Kawase taps stretch by as well as
+        // the composite's intensity, so it is bound for the whole chain rather
+        // than just the last pass.
+        const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
+        if (self.glow_cb) |gcb| {
+            const gcb_res: *c.ID3D11Resource = @ptrCast(gcb);
+            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+            if (!c.FAILED(mapDiscard(ctx, gcb_res, &mapped))) {
+                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
+                dst.* = .{ intensity, self.glow_radius_scale, 0, 0 };
+                unmap0(ctx, gcb_res);
+            }
+            var cbs: [1]?*c.ID3D11Buffer = .{gcb};
+            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
         }
 
-        // --- Upsample chain: mip[2] → mip[1] → mip[0] → extractTex ---
-        for (0..3) |i| {
-            const level = 2 - i;
+        // Down then up, both the same shape: unbind the source slot, bind the
+        // pass's target, size the viewport to it, bind the source, draw.
+        for ([2][core.glow_chain.mip_count]core.glow_chain.Pass{ chain.down, chain.up }, 0..) |passes, stage| {
+            const ps = if (stage == 0) self.ps_kawase_down.? else self.ps_kawase_up.?;
+            for (passes[0..chain.level_count]) |pass| {
+                // Unbind SRV slot 1 to avoid an RTV/SRV hazard on the texture
+                // this pass is about to write.
+                var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
+                ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
 
-            // Unbind SRV slot 1
-            var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
+                const dst_rtv = if (pass.dst == core.glow_chain.extract_target)
+                    self.glow_extract_rtv.?
+                else
+                    self.glow_mip_rtv[@intCast(pass.dst)].?;
+                var rtvs: [1]?*c.ID3D11RenderTargetView = .{dst_rtv};
+                om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
 
-            // Destination: mip[level-1] for level > 0, extract for level 0
-            const dst_rtv = if (level == 0) self.glow_extract_rtv.? else self.glow_mip_rtv[level - 1].?;
-            var rtvs: [1]?*c.ID3D11RenderTargetView = .{dst_rtv};
-            om_set_rt(ctx, 1, @ptrCast(&rtvs), null);
+                var vp: c.D3D11_VIEWPORT = .{
+                    .TopLeftX = 0,
+                    .TopLeftY = 0,
+                    .Width = @floatFromInt(pass.dst_w_px),
+                    .Height = @floatFromInt(pass.dst_h_px),
+                    .MinDepth = 0,
+                    .MaxDepth = 1,
+                };
+                rs_set_vp(ctx, 1, &vp);
 
-            // Viewport = destination size
-            const dst_w: u32 = if (level == 0) hw else mip_widths[level - 1];
-            const dst_h: u32 = if (level == 0) hh else mip_heights[level - 1];
+                var sr: c.D3D11_RECT = .{
+                    .left = 0,
+                    .top = 0,
+                    .right = @intCast(pass.dst_w_px),
+                    .bottom = @intCast(pass.dst_h_px),
+                };
+                rs_set_sc(ctx, 1, &sr);
 
-            var vp: c.D3D11_VIEWPORT = .{
-                .TopLeftX = 0,
-                .TopLeftY = 0,
-                .Width = @floatFromInt(dst_w),
-                .Height = @floatFromInt(dst_h),
-                .MinDepth = 0,
-                .MaxDepth = 1,
-            };
-            rs_set_vp(ctx, 1, &vp);
+                const src_srv = if (pass.src == core.glow_chain.extract_target)
+                    self.glow_extract_srv.?
+                else
+                    self.glow_mip_srv[@intCast(pass.src)].?;
+                var srvs: [1]?*c.ID3D11ShaderResourceView = .{src_srv};
+                ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
-            var sr: c.D3D11_RECT = .{
-                .left = 0,
-                .top = 0,
-                .right = @intCast(dst_w),
-                .bottom = @intCast(dst_h),
-            };
-            rs_set_sc(ctx, 1, &sr);
-
-            // Source: mip[level] (the smaller texture we're upsampling from)
-            var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.glow_mip_srv[level].?};
-            ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
-
-            ps_set_fn(ctx, self.ps_kawase_up.?, null, 0);
-            draw_fn(ctx, 3, 0);
+                ps_set_fn(ctx, ps, null, 0);
+                draw_fn(ctx, 3, 0);
+            }
         }
+
 
         // --- Composite → back buffer (additive blend) ---
         {
@@ -4101,24 +4197,13 @@ pub const Renderer = struct {
             var srvs: [1]?*c.ID3D11ShaderResourceView = .{self.glow_extract_srv.?};
             ps_set_srv(ctx, 1, 1, @ptrCast(&srvs));
 
-            const gcb_res: *c.ID3D11Resource = @ptrCast(self.glow_cb.?);
-            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
-            const hr_map = mapDiscard(ctx, gcb_res, &mapped);
-            if (!c.FAILED(hr_map)) {
-                const dst: *[4]f32 = @ptrCast(@alignCast(mapped.pData));
-                dst.* = .{ intensity, 0, 0, 0 };
-                unmap0(ctx, gcb_res);
-            }
-
-            const ps_set_cb = ctx_vtbl.*.PSSetConstantBuffers orelse return;
-            var cbs: [1]?*c.ID3D11Buffer = .{self.glow_cb.?};
-            ps_set_cb(ctx, 0, 1, @ptrCast(&cbs));
-
             om_set_blend(ctx, self.additive_blend.?, &blend_factor, 0xFFFFFFFF);
 
             ps_set_fn(ctx, self.ps_glow_composite.?, null, 0);
 
+
             draw_fn(ctx, 3, 0);
+
 
             // --- Restore state ---
             ps_set_srv(ctx, 1, 1, @ptrCast(&null_srvs));
@@ -4185,10 +4270,23 @@ pub const Renderer = struct {
         vp_w: u32,
         vp_h: u32,
     ) void {
-        if (!self.bloomShadersReady()) return;
+        // Every gate below runs per frame and drops glow without a trace, so
+        // each one says so once. `prepareBloomShaders` logs its own failure;
+        // reaching the shaders-not-ready gate without that line means glow was
+        // asked for before preparation ran.
+        if (!self.bloomShadersReady()) {
+            self.noteBloomSkip("shaders not ready");
+            return;
+        }
         self.ensureGlowTextures();
-        if (!self.glowTexturesComplete()) return;
-        const ctx = self.ctx orelse return;
+        if (!self.glowTexturesComplete()) {
+            self.noteBloomSkip("glow render targets incomplete");
+            return;
+        }
+        const ctx = self.ctx orelse {
+            self.noteBloomSkip("no device context");
+            return;
+        };
         const ctx_vtbl = ctx.*.lpVtbl;
         self.drawBloomPasses(ctx, ctx_vtbl, &.{}, cursor, intensity, vp_x, vp_y, vp_w, vp_h, rows_ctx, draw_rows_fn);
     }
@@ -4238,6 +4336,30 @@ pub const Renderer = struct {
         const built = try self.buildAtlasTexture(w, h);
         self.atlas_tex = built.tex;
         self.atlas_srv = built.srv;
+    }
+
+    /// Sample `owner`'s atlas texture: one texture for every window on the
+    /// device, uploaded once. Held with this renderer's own reference, so an
+    /// owner that recreates it cannot free what this renderer binds (a
+    /// present between paints included). False, holding nothing, when the
+    /// devices differ -- device-lost recovery rebuilds the owner first.
+    pub fn borrowAtlas(self: *Renderer, owner: *const Renderer) bool {
+        if (self.device != owner.device or owner.atlas_tex == null or owner.atlas_srv == null) {
+            safeRelease(&self.atlas_srv);
+            safeRelease(&self.atlas_tex);
+            return false;
+        }
+        if (self.atlas_tex != owner.atlas_tex) {
+            safeRelease(&self.atlas_srv);
+            safeRelease(&self.atlas_tex);
+            addRef(owner.atlas_tex.?);
+            addRef(owner.atlas_srv.?);
+            self.atlas_tex = owner.atlas_tex;
+            self.atlas_srv = owner.atlas_srv;
+        }
+        self.atlas_w = owner.atlas_w;
+        self.atlas_h = owner.atlas_h;
+        return true;
     }
 
     /// Recreate atlas texture if dimensions changed. No-op for same-size resets.
@@ -4497,6 +4619,28 @@ pub const Renderer = struct {
             self.additive_blend = ab;
         }
 
+        // --- Glow occlusion blend (ZERO, INV_SRC_ALPHA) ---
+        // Scales the extracted light already in the target by the coverage a
+        // layer's background paints over it, instead of adding to it.
+        {
+            const create_blend = dev_vtbl.*.CreateBlendState orelse return error.D3DCreateBlendFailed;
+
+            var obd: c.D3D11_BLEND_DESC = std.mem.zeroes(c.D3D11_BLEND_DESC);
+            obd.RenderTarget[0].BlendEnable = c.TRUE;
+            obd.RenderTarget[0].SrcBlend = c.D3D11_BLEND_ZERO;
+            obd.RenderTarget[0].DestBlend = c.D3D11_BLEND_INV_SRC_ALPHA;
+            obd.RenderTarget[0].BlendOp = c.D3D11_BLEND_OP_ADD;
+            obd.RenderTarget[0].SrcBlendAlpha = c.D3D11_BLEND_ZERO;
+            obd.RenderTarget[0].DestBlendAlpha = c.D3D11_BLEND_INV_SRC_ALPHA;
+            obd.RenderTarget[0].BlendOpAlpha = c.D3D11_BLEND_OP_ADD;
+            obd.RenderTarget[0].RenderTargetWriteMask = 0x0F;
+
+            var ob: ?*c.ID3D11BlendState = null;
+            const hr_ob = create_blend(dev, &obd, &ob);
+            if (c.FAILED(hr_ob) or ob == null) return error.D3DCreateBlendFailed;
+            self.occlude_blend = ob;
+        }
+
         // --- Bilinear sampler for bloom blur ---
         {
             const create_samp = dev_vtbl.*.CreateSamplerState orelse return error.D3DCreateSamplerFailed;
@@ -4528,6 +4672,70 @@ pub const Renderer = struct {
             const hr_gcb = create_buf(dev, &cbd, null, &gcb);
             if (c.FAILED(hr_gcb) or gcb == null) return error.D3DCreateVSCBFailed;
             self.glow_cb = gcb;
+        }
+
+        // --- Layer transform constant buffer (32 bytes: 4 x float2) ---
+        {
+            const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVSCBFailed;
+
+            var cbd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
+            cbd.ByteWidth = 32;
+            cbd.Usage = c.D3D11_USAGE_DYNAMIC;
+            cbd.BindFlags = c.D3D11_BIND_CONSTANT_BUFFER;
+            cbd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
+
+            var lcb: ?*c.ID3D11Buffer = null;
+            const hr_lcb = create_buf(dev, &cbd, null, &lcb);
+            if (c.FAILED(hr_lcb) or lcb == null) return error.D3DCreateVSCBFailed;
+            self.layer_cb = lcb;
+            self.layer_cb_valid = false;
+        }
+    }
+
+    /// Bind the vertex stage's layer transform. Every draw afterwards uses it
+    /// until it is set again. `extent_px` is the pixel space incoming vertices
+    /// are expressed in; pass 0 for both to submit clip-space vertices under
+    /// the identity transform.
+    pub fn setLayerTransform(
+        self: *Renderer,
+        origin_x_px: f32,
+        origin_y_px: f32,
+        extent_w_px: f32,
+        extent_h_px: f32,
+    ) void {
+        const value: [8]f32 = if (extent_w_px <= 0 or extent_h_px <= 0)
+            .{ 1, 1, 0, 0, 0, 0, 0, 0 }
+        else .{
+            2.0 / extent_w_px,
+            -2.0 / extent_h_px,
+            origin_x_px * 2.0 / extent_w_px - 1.0,
+            1.0 - origin_y_px * 2.0 / extent_h_px,
+            origin_x_px,
+            origin_y_px,
+            0,
+            0,
+        };
+        const ctx = self.ctx orelse return;
+        const ctx_vtbl = ctx.*.lpVtbl orelse return;
+        const cb = self.layer_cb orelse return;
+
+        if (self.layer_cb_valid and std.mem.eql(f32, &self.layer_cb_value, &value)) {
+            // Already resident; the binding below is idempotent but cheap.
+        } else {
+            const res: *c.ID3D11Resource = @ptrCast(cb);
+            var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
+            const hr = mapDiscard(ctx, res, &mapped);
+            if (c.FAILED(hr)) return;
+            const dst: *[8]f32 = @ptrCast(@alignCast(mapped.pData));
+            dst.* = value;
+            unmap0(ctx, res);
+            self.layer_cb_value = value;
+            self.layer_cb_valid = true;
+        }
+
+        if (ctx_vtbl.*.VSSetConstantBuffers) |set_cbs| {
+            var cbs: [1]?*c.ID3D11Buffer = .{cb};
+            set_cbs(ctx, 0, 1, @ptrCast(&cbs));
         }
     }
 

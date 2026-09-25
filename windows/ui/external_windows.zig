@@ -12,10 +12,11 @@ const dialogs = @import("dialogs.zig");
 const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
+const callbacks = @import("../callbacks.zig");
 const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
 
-const ExternalSurfaceKind = enum {
+pub const ExternalSurfaceKind = enum {
     normal,
     cmdline,
     popupmenu,
@@ -31,7 +32,7 @@ fn externalWakeCookie(hwnd: c.HWND) usize {
     return window_mod.windowWakeCookie(hwnd);
 }
 
-fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
+pub fn classifyExternalSurface(grid_id: i64) ExternalSurfaceKind {
     return switch (grid_id) {
         app_mod.CMDLINE_GRID_ID => .cmdline,
         app_mod.POPUPMENU_GRID_ID => .popupmenu,
@@ -57,9 +58,10 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
     ext_win.msg_hover = hovered;
 }
 
-/// Client-pixel padding a decorated external surface adds around its grid:
-/// the cmdline's icon strip and padding, a message surface's padding, and the
-/// copy-content button's trailing reservation.
+/// Client-pixel padding an external surface adds around its grid: the
+/// cmdline's icon strip and padding, a message surface's padding, the
+/// copy-content button's trailing reservation, and a normal window's
+/// "always" scrollbar strip.
 ///
 /// Every site that sizes an external window must go through this. The two
 /// resize paths in callbacks.zig used to re-derive the first two terms and
@@ -67,7 +69,7 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
 /// message window was open sent it back one copy-button width too narrow.
 pub const ExternalSurfaceInsets = struct { w: c_int, h: c_int };
 
-pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
+pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64, dpi_scale: f32) ExternalSurfaceInsets {
     const kind = classifyExternalSurface(grid_id);
     const is_cmdline = kind == .cmdline;
     const is_msg = kind == .msg_show or kind == .msg_history;
@@ -76,10 +78,45 @@ pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64) ExternalSurfaceInsets {
         app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
     const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
     const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
+    // WM_SIZE reads a normal window's columns back through
+    // effectiveContentWidthAt, which takes the "always" scrollbar strip off;
+    // sizing without it lost columns under the strip and shrank the grid on
+    // the next user resize.
+    const scrollbar_strip: c_int = if (kind == .normal and app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
+        @intFromFloat(app_mod.scrollbarReservedWidth(dpi_scale))
+    else
+        0;
 
     return .{
-        .w = cmdline_icon_w + cmdline_padding + msg_padding + copyButtonReservedPx(app, kind),
+        .w = cmdline_icon_w + cmdline_padding + msg_padding + scrollbar_strip + copyButtonReservedPx(app, kind),
         .h = cmdline_padding + msg_padding,
+    };
+}
+
+/// Client-pixel origin of a decorated external surface's content inside its own
+/// window: past the cmdline's icon strip and padding, or a message surface's
+/// padding. Normal and popupmenu surfaces draw at their client origin.
+///
+/// The companion of externalSurfaceInsetsPx, and it has the same rule: every
+/// site that places core content for a decorated surface goes through this.
+/// The cursor-shader forwarding path did not exist when the draw branches were
+/// written and re-derived nothing at all, so it translated the cmdline's cursor
+/// by the client origin alone -- leaving cursor shaders burning one padding
+/// above and one icon strip left of the cursor they were tracking.
+pub const DecoratedContentOrigin = struct { x: f32, y: f32 };
+
+pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedContentOrigin {
+    return switch (kind) {
+        .cmdline => .{
+            .x = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT +
+                app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT),
+            .y = @floatFromInt(app_mod.CMDLINE_PADDING),
+        },
+        .msg_show, .msg_history => blk: {
+            const pad: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            break :blk .{ .x = pad, .y = pad };
+        },
+        .normal, .popupmenu => .{ .x = 0, .y = 0 },
     };
 }
 
@@ -95,9 +132,13 @@ pub fn clampCmdlineWidthToWorkArea(app: *App, grid_id: i64, client_w: c_int) c_i
     return @min(client_w, mi.rcWork.right - mi.rcWork.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
 }
 
-/// Map a decorated surface's content rect to the NDC scale and offset the
-/// vertex shader applies. The cmdline and message paths differ only in where
-/// the content starts; the conversion itself was identical.
+/// Map a decorated surface's content rect to the scale and offset that take a
+/// core vertex from grid-local pixels to this window's clip space. The cmdline
+/// and message paths differ only in where the content starts.
+///
+/// A decorated surface mixes core content and frontend chrome in one vertex
+/// array and one draw, so the content is transformed on the CPU here and the
+/// whole array is submitted under the identity layer transform.
 const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
 
 fn decoratedContentNdcTransform(
@@ -108,15 +149,13 @@ fn decoratedContentNdcTransform(
     window_w: f32,
     window_h: f32,
 ) ContentNdcTransform {
-    const left_ndc: f32 = content_left / window_w * 2.0 - 1.0;
-    const right_ndc: f32 = (content_left + content_w) / window_w * 2.0 - 1.0;
-    const top_ndc: f32 = 1.0 - content_top / window_h * 2.0;
-    const bottom_ndc: f32 = 1.0 - (content_top + content_h) / window_h * 2.0;
+    _ = content_w;
+    _ = content_h;
     return .{
-        .scale_x = (right_ndc - left_ndc) / 2.0,
-        .scale_y = (top_ndc - bottom_ndc) / 2.0,
-        .offset_x = (right_ndc + left_ndc) / 2.0,
-        .offset_y = (top_ndc + bottom_ndc) / 2.0,
+        .scale_x = 2.0 / window_w,
+        .scale_y = -2.0 / window_h,
+        .offset_x = content_left / window_w * 2.0 - 1.0,
+        .offset_y = 1.0 - content_top / window_h * 2.0,
     };
 }
 
@@ -342,8 +381,8 @@ fn drawDecoratedExternalSurface(
 
             app.mu.lockUncancelable(core.clock.io());
             const ext_win_relookup = app.external_windows.get(grid_id);
-            const content_rows = if (ext_win_relookup) |ew| ew.surface.rows else 0;
-            const content_cols = if (ext_win_relookup) |ew| ew.surface.cols else 0;
+            const content_rows = if (ext_win_relookup) |ew| ew.surf.surface.rows else 0;
+            const content_cols = if (ext_win_relookup) |ew| ew.surf.surface.cols else 0;
             const copy_hover = if (ext_win_relookup) |ew| ew.copy_button_hover else false;
             const copy_copied = if (ext_win_relookup) |ew| ew.copy_button_copied else false;
             const cell_w = app.cell_w_px;
@@ -366,8 +405,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT);
-            const content_top: f32 = @floatFromInt(app_mod.CMDLINE_PADDING);
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -442,7 +482,17 @@ fn drawDecoratedExternalSurface(
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
             const pum_verts = scratch.items;
-            @memcpy(pum_verts[0..vert_count], verts[0..vert_count]);
+            // Core vertices are grid-local pixels, and this draw path binds
+            // the identity transform for the frontend's own clip-space
+            // chrome (the border appended below). Map them here as the
+            // cmdline and message branches do; the popupmenu has no insets,
+            // so its content starts at the window's top-left.
+            const ndc = decoratedContentNdcTransform(0, 0, window_w, window_h, window_w, window_h);
+            for (verts[0..vert_count], 0..) |v, i| {
+                pum_verts[i] = v;
+                pum_verts[i].position[0] = v.position[0] * ndc.scale_x + ndc.offset_x;
+                pum_verts[i].position[1] = v.position[1] * ndc.scale_y + ndc.offset_y;
+            }
 
             app.mu.lockUncancelable(core.clock.io());
             const border_r = app.cmdline_border_color[0];
@@ -464,8 +514,8 @@ fn drawDecoratedExternalSurface(
 
             app.mu.lockUncancelable(core.clock.io());
             const ext_win_relookup2 = app.external_windows.get(grid_id);
-            const content_rows = if (ext_win_relookup2) |ew| ew.surface.rows else 0;
-            const content_cols = if (ext_win_relookup2) |ew| ew.surface.cols else 0;
+            const content_rows = if (ext_win_relookup2) |ew| ew.surf.surface.rows else 0;
+            const content_cols = if (ext_win_relookup2) |ew| ew.surf.surface.cols else 0;
             const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
             const copy_copied = if (ext_win_relookup2) |ew| ew.copy_button_copied else false;
             const cell_w = app.cell_w_px;
@@ -486,8 +536,9 @@ fn drawDecoratedExternalSurface(
                 return;
             }
 
-            const content_left: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
-            const content_top: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
+            const content_origin = decoratedContentOriginPx(app, kind);
+            const content_left: f32 = content_origin.x;
+            const content_top: f32 = content_origin.y;
             const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
             const scale_x = ndc.scale_x;
             const scale_y = ndc.scale_y;
@@ -555,13 +606,14 @@ fn drawNormalExternalSurface(
     scrollbar_alpha: f32,
     dirty_row_keys: []u32,
     force_full: bool,
-    glow_enabled: bool,
-    glow_intensity: f32,
+    glow: app_mod.GlowPaintSettings,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
-) !bool {
+) !ExternalPresentFacts {
     const log_enabled = applog.isEnabled();
-    ext_win.paint_present_rects.clearRetainingCapacity();
+    ext_win.surf.paint.present_rects.clearRetainingCapacity();
+    // The flat path redraws every row; the row path narrows this.
+    ext_win.paint_drew_root_rows = true;
 
     // All normal modes share the same retained back_tex. Restore a prior
     // row/flat scrollbar before either path mutates or clears it.
@@ -580,8 +632,7 @@ fn drawNormalExternalSurface(
             scrollbar_alpha,
             dirty_row_keys,
             force_full,
-            glow_enabled,
-            glow_intensity,
+            glow,
             tbs_snap,
             row_h_px_snapshot,
             restored_scrollbar_rect,
@@ -591,9 +642,9 @@ fn drawNormalExternalSurface(
     // Flat-mode fallback: snapshot-based flat draw (decorated surfaces or non-row-mode).
     _ = app_mod.resizeRowVBsForPaint(
         app.alloc,
-        &ext_win.row_vbs,
+        &ext_win.surf.paint.row_vbs,
         &app.row_vb_budget,
-        &ext_win.row_vb_retained_bytes,
+        &ext_win.surf.paint.row_vb_retained_bytes,
         0,
     );
     if (log_enabled) applog.appLog("[win] drawNormalExternalSurface: flat mode grid_id={d}\n", .{grid_id});
@@ -606,34 +657,24 @@ fn drawNormalExternalSurface(
         vert_count,
         cursor_blink_visible,
         &[_]app_mod.Vertex{},
-        glow_enabled,
-        glow_intensity,
+        glow.enabled,
+        glow.intensity,
     );
 
     // Keep the alpha overlay out of the full-content draw so flat↔row mode
     // transitions use the same clean-underlay contract.
-    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
-        var scrollbar_verts: [12]app_mod.Vertex = undefined;
-        const scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
-            app,
-            scrollbar_alpha,
-            grid_id,
-            @intCast(g.width),
-            @intCast(g.height),
-            &scrollbar_verts,
-            ext_win.dpi_scale,
-        );
-        if (scrollbar_vert_count != 0) {
-            if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (try g.captureScrollbarUnderlay(track_rect)) |_| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
-                }
-            }
-        }
-    }
+    _ = try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.surf.paint.scrollbar_vb, &ext_win.surf.paint.scrollbar_vb_bytes);
     // Flat drawEx redraws/clears the complete retained back texture.
-    return true;
+    return .{ .force_full_rows = true };
 }
+
+/// What a normal external paint's draw leaves for the present decision
+/// (render_pipeline_helpers.presentGate, the main driver's gate).
+const ExternalPresentFacts = struct {
+    force_full_rows: bool,
+    present_rects_overflowed: bool = false,
+    custom_shader: bool = false,
+};
 
 /// Row-mode VB rendering for normal external windows.
 /// Uses TBS committed set + drawRowModeSetupAndRowsFromSlots for lock-free rendering.
@@ -649,16 +690,20 @@ fn drawNormalExternalSurfaceRowMode(
     scrollbar_alpha: f32,
     dirty_row_keys: []u32,
     force_full: bool,
-    glow_enabled: bool,
-    glow_intensity: f32,
+    glow: app_mod.GlowPaintSettings,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
     restored_scrollbar_rect: ?c.RECT,
-) !bool {
+) !ExternalPresentFacts {
     const log_enabled = applog.isEnabled();
     const fallback_row_h = row_h_px_snapshot;
     const row_h_px: i32 = @intCast(fallback_row_h);
-    const content_right: i32 = @intCast(g.width);
+    // Reserve the scrollbar strip in "always" mode, as the main window's paint
+    // does. An external window shows a permanently visible scrollbar in that
+    // mode too (scrollbar.zig's isAlways branches are on the external helpers),
+    // but its content width was the raw client width, so the rightmost column
+    // was drawn under the track.
+    const content_right: i32 = @intCast(app_mod.effectiveContentWidthAt(app, g.width, ext_win.dpi_scale));
 
     // back_tex is persistent, so we only need to redraw dirty rows. Present
     // queues the resulting damage for every FLIP_SEQUENTIAL buffer; each
@@ -667,12 +712,37 @@ fn drawNormalExternalSurfaceRowMode(
     // premultiplied alpha blending accumulates alpha on redrawn rows
     // unless back_tex is cleared first, which requires force_full to
     // set preserve_back=false → should_clear=true in drawEx.
-    const force_full_rows = force_full or
-        glow_enabled or
-        (g.opacity < 1.0);
+    // Layers do NOT force full rows: they carry their own per-layer redraw
+    // plan (planLayerFrame / drawSurfaceLayers), the same one the main window
+    // runs, and forcing every row here skipped the root's pixel-copy scroll
+    // and the plan's own partial redraw for the sake of a float sitting on the
+    // surface.
+    const has_layers = tbs_snap.layers.len > 1;
+    // The cursor moving to another grid does force one, though. The row left
+    // over from the last paint is that grid's own row, and the only origin
+    // this frame knows is the one the cursor is on NOW: a cursor leaving a
+    // float at surface row 11 would have row 1 repainted instead, and the old
+    // block would sit in the float until something else happened to redraw it.
+    // A window switch is a user action, and the frames around one are already
+    // repainting most of the surface, so buying correctness with a full paint
+    // costs little. Placing each remembered row with its own grid would be the
+    // narrower fix; it needs the surface coordinates of a grid that may no
+    // longer be placed, which is more machinery than the case is worth.
+    const cursor_grid_changed = tbs_snap.cursor_layer_grid_id != ext_win.surf.paint.last_painted_cursor_grid;
+    const paint_policy = render_pipeline_helpers.paintPolicy(.{
+        .force_full = force_full,
+        .cursor_grid_changed = cursor_grid_changed,
+        .glow_enabled = glow.enabled,
+        .opacity = g.opacity,
+        // An external window keeps no back-buffer validity flag of its own, so
+        // it asserts one; that is exactly what its previous bare
+        // `!force_full_rows` preserve_back meant.
+        .back_tex_valid = true,
+    });
+    const force_full_rows = paint_policy.force_full_rows;
 
     // Build sorted, deduplicated rows_to_draw list in per-window scratch.
-    const rows_to_draw = &ext_win.paint_rows_to_draw;
+    const rows_to_draw = &ext_win.surf.paint.rows_to_draw;
 
     const ext_rows = tbs_committed.rows;
     if (!app_mod.computeRowsToDraw(
@@ -684,230 +754,213 @@ fn drawNormalExternalSurfaceRowMode(
         ext_rows, // max_valid_row = total rows (no row_verts_len / rows mismatch on ext)
     )) return error.OutOfMemory;
 
+    const cursor_row_before = ext_win.surf.paint.last_painted_cursor_row;
+
+    // The rows the cursor overlay would otherwise erase: where the previous
+    // cursor was baked into back_tex, and where this one lands. Repainting
+    // them from their own grid's vertices is what removes the previous cursor,
+    // so the overlay's blink-off clear — a full-content-width band that would
+    // wipe the layers drawn over this row — never has to run. Same two rows
+    // the main window collects (window.zig's cursor_erase_rows).
+    const cursor_erase_rows: [2]?u32 = .{
+        cursor_row_before,
+        tbs_cursor.last_cursor_row,
+    };
+    const cursor_on_root = tbs_snap.cursor_layer_grid_id == grid_id;
+    // Where the cursor's own grid sits inside this surface. Its rows are that
+    // grid's local rows, so everything that turns one into a surface rectangle
+    // — the overlay draw and the present damage alike — has to add this.
+    const cursor_layer_origin_px = render_pipeline_helpers.layerOriginPx(
+        app_mod.SurfaceLayer,
+        tbs_snap.layers.slice(),
+        tbs_snap.cursor_layer_grid_id,
+        grid_id,
+    );
+    const cursor_layer_x_px: i32 = cursor_layer_origin_px[0];
+    const cursor_layer_y_px: i32 = cursor_layer_origin_px[1];
+    // Unconditionally, as the main driver does for `cursor_grid == 1`. Claiming
+    // both rows from their own grid's vertices is what removes the previous
+    // cursor, including an in-place shape change that leaves the row otherwise
+    // unchanged. This used to be claimed only when layers were present, and the
+    // no-layer case was covered by the overlay's erase branch instead — a
+    // full-content-width clear that the layer case already had to forbid.
+    //
+    // Whether content rows were drawn is read before the erase rows join them,
+    // as the main driver reads it: a frame that only redraws the cursor's two
+    // rows leaves the rest sampling the atlas as it was before the upload.
+    ext_win.paint_drew_root_rows = rows_to_draw.items.len != 0;
+    render_pipeline_helpers.insertCursorEraseRows(
+        app.alloc,
+        rows_to_draw,
+        cursor_erase_rows,
+        ext_rows,
+        cursor_on_root,
+    );
+
     const has_cursor = tbs_cursor.verts.items.len > 0;
+    // Publish it for the blink timer, which must not invalidate a surface whose
+    // pixels a toggle cannot change. Recorded before the early-out below so a
+    // surface that just lost its cursor stops being invalidated immediately.
+    ext_win.has_committed_cursor = has_cursor;
     const has_scrollbar_work = scrollbar_alpha > 0.001 or
         restored_scrollbar_rect != null or
         g.hasScrollbarUnderlay();
-    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and !has_scrollbar_work) {
+    // A layer's own rows can be the only thing that changed: the host was
+    // invalidated for exactly that, and grid 1 holds no cells under
+    // ext_multigrid, so rows_to_draw is empty and the layer would never draw.
+    const any_layer_dirty = blk_dirty: {
+        if (!has_layers) break :blk_dirty false;
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        for (tbs_snap.layers.slice()[1..]) |layer| {
+            const state = app.layer_grids.get(layer.grid_id) orelse continue;
+            if (state.dirty) break :blk_dirty true;
+        }
+        break :blk_dirty false;
+    };
+    // A committed scroll is work too: acquireForPaint has already consumed
+    // it, so returning here would lose the back_tex and row-VB shift for good.
+    const has_scroll_work = tbs_snap.scroll_rect != null or tbs_snap.vb_shift != 0;
+    if (rows_to_draw.items.len == 0 and !force_full_rows and !has_cursor and
+        !has_scrollbar_work and !any_layer_dirty and !has_scroll_work)
+    {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
-        ext_win.paint_present_rects.clearRetainingCapacity();
-        return false;
+        ext_win.surf.paint.present_rects.clearRetainingCapacity();
+        return .{ .force_full_rows = false };
     }
-
-    const cursor_row_before = ext_win.last_painted_cursor_row;
-    var scroll_damage: ?c.RECT = null;
 
     const draw_params = app_mod.RowModeDrawParams{
         .content_height = app_mod.snappedContentHeight(g.height, fallback_row_h, 0),
         .row_h_px = row_h_px,
         .content_right = content_right,
-        .preserve_back = !force_full_rows,
+        .preserve_back = paint_policy.preserve_back,
+        .root_rows_may_be_empty = has_layers,
+        // The root layer drives the pixel space core vertices arrive in.
+        .layer_origin_x_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+        .layer_origin_y_px = if (tbs_snap.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+        .bloom_layers = if (has_layers) .{ .app = app, .layers = tbs_snap.layers.slice() } else null,
     };
 
-    // Ensure row_vbs array covers committed set's row count.
-    {
-        const need_len: usize = @intCast(tbs_committed.rows);
-        if (!app_mod.resizeRowVBsForPaint(
-            app.alloc,
-            &ext_win.row_vbs,
-            &app.row_vb_budget,
-            &ext_win.row_vb_retained_bytes,
-            need_len,
-        ))
-            return error.OutOfMemory;
-    }
-
-    // Apply scroll pixel shift (shared with main window).
-    // Scroll state is bundled in tbs_snap, atomically consistent with committed set.
-    if (!force_full_rows) {
-        if (tbs_snap.scroll_rect) |sr| {
-            const shift_result = app_mod.applyScrollShift(
-                g,
-                app.alloc,
-                ext_win.row_vbs.items,
-                &ext_win.row_vbs_shift_scratch,
-                rows_to_draw,
-                &ext_win.scroll_rows_merge_scratch,
-                sr,
-                tbs_snap.scroll_dy_px,
-                tbs_snap.vb_shift,
-                tbs_snap.scroll_row_start,
-                tbs_snap.scroll_row_end,
-                &ext_win.last_painted_cursor_row,
-                row_h_px,
-                ext_rows,
-                0, // no content_y_offset for external windows
-            );
-            if (!shift_result.rows_complete) return error.OutOfMemory;
-            scroll_damage = shift_result.scroll_rect;
-        }
-    } else {
-        // Consume pending shift state to avoid stale accumulation.
-        if (tbs_snap.vb_shift != 0 and tbs_snap.scroll_row_end > tbs_snap.scroll_row_start) {
-            const abs_shift: u32 = @intCast(if (tbs_snap.vb_shift < 0) -tbs_snap.vb_shift else tbs_snap.vb_shift);
-            app_mod.ensureShiftScratch(app.alloc, &ext_win.row_vbs_shift_scratch, abs_shift);
-            app_mod.shiftRowVBs(ext_win.row_vbs.items, tbs_snap.vb_shift, tbs_snap.scroll_row_start, tbs_snap.scroll_row_end, ext_win.row_vbs_shift_scratch.items);
-        }
-    }
-
-    // TBS lock-free draw: committed set is protected by refcount,
-    // no app.mu needed during VB upload + draw.
-    const result = try app_mod.drawRowModeSetupAndRowsFromSlots(
-        g,
-        &app.row_vb_budget,
-        &ext_win.row_vb_retained_bytes,
-        tbs_committed.row_map.items,
-        &ext_win.tbs.pool,
-        ext_win.row_vbs.items,
-        rows_to_draw.items,
-        draw_params,
+    // Damage for this frame: every row span plus one rectangle per layer. The
+    // layer rectangles are appended by the row pass under the lock its plan
+    // runs in, the spans after the draws. The pass can grow the redraw set
+    // (scroll ghosts, rows a layer was dragged onto), never past the row count.
+    var present = app_mod.PresentRectBuilder.begin(
+        &ext_win.surf.paint.present_rects,
+        app.alloc,
+        @as(usize, @max(rows_to_draw.items.len, ext_rows)) + 5 + tbs_snap.layers.len,
     );
+
+    // Shared with the main window. An external window's back_tex is always
+    // valid, so preserving it is exactly "not a full redraw".
+    const pass = try app_mod.drawSurfaceRowPass(g, app, .of(&ext_win.surf), .{
+        .snapshot = tbs_snap,
+        .rows_to_draw = rows_to_draw,
+        .row_vb_len = @intCast(tbs_committed.rows),
+        .total_rows = ext_rows,
+        .preserve_back = paint_policy.preserve_back,
+        .layer_paint_full = force_full_rows,
+        .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+        .layer_present = .{
+            .rects = present.list,
+            .right = @intCast(g.width),
+            .bottom = @intCast(draw_params.content_height),
+        },
+        .frame = .{
+            .root_grid_id = grid_id,
+            .layers = &.{},
+            .row_map = tbs_committed.row_map.items,
+            .rows_to_draw = &.{},
+            .cursor_verts = tbs_cursor.verts.items,
+            .cursor_row = tbs_cursor.last_cursor_row,
+            .cursor_grid = tbs_snap.cursor_layer_grid_id,
+            .cursor_erase_rows = cursor_erase_rows,
+            .cursor_layer_origin = .{ @floatFromInt(cursor_layer_x_px), @floatFromInt(cursor_layer_y_px) },
+            .blink_visible = cursor_blink_visible,
+            .force_full_rows = force_full_rows,
+            .layer_layout_stale = false,
+            .layer_commit_stale = false,
+            .glow = if (glow.enabled) app_mod.RowFrameGlow{
+                .intensity = glow.intensity,
+                .radius_scale = glow.radius_scale,
+                .cursor_visible = cursor_blink_visible,
+            } else null,
+            .draw_params = draw_params,
+            .log_enabled = log_enabled,
+        },
+    });
+    const row_frame = pass.frame;
+    const scroll_damage = pass.scroll_damage;
 
     if (log_enabled) {
         applog.appLog(
             "[win] drawNormalExtRowMode: grid_id={d} drawn={d} skipped={d} failed={d} rows_to_draw={d}\n",
-            .{ grid_id, result.metrics.drawn_rows, result.metrics.skipped_empty, result.metrics.failed_rows, rows_to_draw.items.len },
+            .{ grid_id, row_frame.rows.metrics.drawn_rows, row_frame.rows.metrics.skipped_empty, row_frame.rows.metrics.failed_rows, rows_to_draw.items.len },
         );
     }
-    if (result.metrics.failed_rows != 0) return error.RowVBRenderFailed;
-
-    // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-    try app_mod.drawCursorOverlay(g, .{
-        .cursor_verts = tbs_cursor.verts.items,
-        .cursor_row = tbs_cursor.last_cursor_row,
-        .cursor_vb = &ext_win.cursor_vb,
-        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
-        .row_vbs = ext_win.row_vbs.items,
-        .row_map = tbs_committed.row_map.items,
-        .pool = &ext_win.tbs.pool,
-        .blink_visible = cursor_blink_visible,
-        .content_right = content_right,
-        .content_height = draw_params.content_height,
-        .row_h_px = row_h_px,
-        .ctx_ptr = result.ctx_ptr,
-        .rs_set_sc_fn = result.rs_set_sc_fn,
-        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-        // External windows preserve back_tex and may not redraw the cursor row on
-        // an in-place shape change, so erase the stale overlay before redrawing.
-        // A full-row frame already cleared the back texture and redrew every row;
-        // clearing again would accumulate alpha on the cursor row when transparent.
-        .erase_cursor_row = !force_full_rows,
-        .row_already_redrawn = force_full_rows,
-    });
+    if (row_frame.row_vb_budget_exceeded) return error.RowVBPhysicalBudgetExceeded;
+    // This frame is incomplete: fail the paint the same way a root row does,
+    // rather than present missing or mismatched rows and let the consumed
+    // redraw plan make them permanent.
+    if (row_frame.incomplete()) return error.RowVBRenderFailed;
 
     // Build the exact retained-back damage before drawing the overlays below.
     // The renderer carries this damage independently for every rotating flip
     // buffer, so a buffer not current this frame catches up when it rotates in.
-    // The main window builds the same row-run spans in window.zig. The two are
-    // NOT shared: this path reserves exactly rows + 5 up front and appends with
-    // appendAssumeCapacity, while the main path appends fallibly and swallows
-    // the error, backed by its force-full-present fallback. A shared helper
-    // returning Allocator.Error would force a `catch unreachable` here; one
-    // taking pre-reserved capacity would turn the main path's tolerant catch
-    // into a panic on a short reservation. Reviewed under the 2026-08-25 audit,
-    // observation 1, finding 332; left duplicated on purpose. The tail is
-    // already shared through compactDamageRects.
-    const present_rects = &ext_win.paint_present_rects;
-    present_rects.clearRetainingCapacity();
-    present_rects.ensureTotalCapacity(app.alloc, rows_to_draw.items.len + 5) catch return error.OutOfMemory;
-
-    var span_start: ?u32 = null;
-    var span_end: u32 = 0;
-    for (rows_to_draw.items) |row| {
-        if (span_start == null) {
-            span_start = row;
-            span_end = row + 1;
-        } else if (row == span_end) {
-            span_end += 1;
-        } else {
-            present_rects.appendAssumeCapacity(.{
-                .left = 0,
-                .top = @as(i32, @intCast(span_start.?)) * row_h_px,
-                .right = @intCast(g.width),
-                .bottom = @as(i32, @intCast(span_end)) * row_h_px,
-            });
-            span_start = row;
-            span_end = row + 1;
-        }
-    }
-    if (span_start) |start_row| {
-        present_rects.appendAssumeCapacity(.{
-            .left = 0,
-            .top = @as(i32, @intCast(start_row)) * row_h_px,
-            .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(span_end)) * row_h_px,
-        });
-    }
-    if (scroll_damage) |rect| present_rects.appendAssumeCapacity(rect);
-    if (restored_scrollbar_rect) |rect| present_rects.appendAssumeCapacity(rect);
+    // The row-run spans the main driver builds too (rowSpanRects), written
+    // into the rows + 5 slots reserved before the layer plan above, which
+    // publishes each drawn layer's rectangle into the same list.
+    present.addRowSpans(rows_to_draw.items, 0, @intCast(g.width), row_h_px);
+    present.addOpt(scroll_damage);
+    present.addOpt(restored_scrollbar_rect);
 
     // Cursor shape/blink changes can clear/redraw a row even when no content
     // row was dirty. Include both the old and new overlay rows.
+    //
+    // Both are rows of the cursor's OWN grid, so a cursor inside a layer needs
+    // that layer's origin added to reach the surface row it was drawn on —
+    // the same term drawCursorOverlay draws it with. Without it a float's
+    // cursor was drawn at one row and presented at another, so a cursor-only
+    // update or a blink tick could reach back_tex and never reach the screen.
+    // (The main window builds this rect from the cursor vertices plus the same
+    // origin; see window.zig's cursor_rc_opt.)
+    const cursor_rect_top_px: i32 = cursor_layer_y_px;
     if (cursor_row_before) |row| {
-        present_rects.appendAssumeCapacity(.{
+        present.add(.{
             .left = 0,
-            .top = @as(i32, @intCast(row)) * row_h_px,
+            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(row + 1)) * row_h_px,
+            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
     }
-    if (ext_win.last_painted_cursor_row) |row| {
-        present_rects.appendAssumeCapacity(.{
+    if (ext_win.surf.paint.last_painted_cursor_row) |row| {
+        present.add(.{
             .left = 0,
-            .top = @as(i32, @intCast(row)) * row_h_px,
+            .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
-            .bottom = @as(i32, @intCast(row + 1)) * row_h_px,
+            .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
-    }
-
-    // Bloom/glow post-process.
-    // Cursor verts are stored separately from the row VBs.
-    // Pass cursor snapshot for bloom only when cursor is visible (same as main window).
-    if (glow_enabled) {
-        const bloom_cursor = if (cursor_blink_visible) tbs_cursor.verts.items else &[_]app_mod.Vertex{};
-        app_mod.drawBloomRowsOverlay(
-            g,
-            tbs_committed.row_map.items,
-            &ext_win.tbs.pool,
-            ext_win.row_vbs.items,
-            bloom_cursor,
-            glow_intensity,
-            draw_params,
-        );
     }
 
     // Scrollbar overlay. Capture the clean, fully-composited strip after
     // bloom so restoring it on the next fade tick does not punch a no-glow
     // seam through the right edge.
-    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
-        var scrollbar_verts: [12]app_mod.Vertex = undefined;
-        const scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
-            app,
-            scrollbar_alpha,
-            grid_id,
-            @intCast(g.width),
-            @intCast(g.height),
-            &scrollbar_verts,
-            ext_win.dpi_scale,
-        );
-        if (scrollbar_vert_count != 0) {
-            if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (try g.captureScrollbarUnderlay(track_rect)) |captured_rect| {
-                    try app_mod.drawScrollbarOverlay(g, &ext_win.scrollbar_vb, &ext_win.scrollbar_vb_bytes, scrollbar_verts[0..scrollbar_vert_count]);
-                    present_rects.appendAssumeCapacity(captured_rect);
-                }
-            }
-        }
-    }
+    present.addOpt(try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.surf.paint.scrollbar_vb, &ext_win.surf.paint.scrollbar_vb_bytes));
 
-    if (present_rects.items.len > 1) {
-        present_rects.items.len = render_pipeline_helpers.compactDamageRects(c.RECT, present_rects.items);
-    }
+    // The producers above can name rows past the surface -- a stale
+    // `cursor_row_before` after a shrink, a scroll rect, a restored scrollbar
+    // rect.
+    present.finish(g.width, g.height);
 
-    // A custom shader writes the complete current swapchain buffer. Mark all
-    // rotating buffers full so disabling the shader cannot expose stale shader
-    // pixels outside this frame's terminal dirty rectangles.
-    return force_full_rows or g.custom_shader_pipelines.items.len != 0;
+    // A custom shader writes the complete current swapchain buffer, so the
+    // gate marks all rotating buffers full and disabling the shader cannot
+    // expose stale shader pixels outside this frame's terminal dirty
+    // rectangles. A rect that could not be added presents in full too.
+    return .{
+        .force_full_rows = force_full_rows,
+        .present_rects_overflowed = present.full,
+        .custom_shader = g.custom_shader_pipelines.items.len != 0,
+    };
 }
 
 pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
@@ -965,6 +1018,7 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
                 .start_row = start_row,
                 .start_col = start_col,
                 .seq = item.seq, // preserve so existing in-flight message still matches
+                .session_generation = app.external_session_generation.load(.acquire),
                 .create_in_progress = item.create_in_progress,
                 .update_revision = item.update_revision +% 1,
             };
@@ -985,6 +1039,7 @@ pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, col
         .start_row = start_row,
         .start_col = start_col,
         .seq = seq,
+        .session_generation = app.external_session_generation.load(.acquire),
     }) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to queue external window request: {any}\n", .{e});
         if (app.corep) |corep| core.zonvie_core_abort_flush(corep);
@@ -1100,14 +1155,14 @@ fn servicePaintRetryDeadlines(app: *App, now_ms: u64) void {
     var it = app.external_windows.valueIterator();
     while (it.next()) |ext_win_ptr| {
         const ext_win = ext_win_ptr.*;
-        if (ext_win.paint_retry_deadline_ms != 0 and ext_win.paint_retry_deadline_ms <= now_ms) {
-            ext_win.paint_retry_deadline_ms = 0;
-            _ = ext_win.paint_retry.timerFired(ext_win.paint_retry.generation);
+        if (ext_win.surf.paint_retry_deadline_ms != 0 and ext_win.surf.paint_retry_deadline_ms <= now_ms) {
+            ext_win.surf.paint_retry_deadline_ms = 0;
+            _ = ext_win.surf.paint_retry.timerFired(ext_win.surf.paint_retry.generation);
             _ = c.InvalidateRect(ext_win.hwnd, null, c.FALSE);
-        } else if (ext_win.paint_retry_deadline_ms != 0 and
-            (next_deadline_ms == 0 or ext_win.paint_retry_deadline_ms < next_deadline_ms))
+        } else if (ext_win.surf.paint_retry_deadline_ms != 0 and
+            (next_deadline_ms == 0 or ext_win.surf.paint_retry_deadline_ms < next_deadline_ms))
         {
-            next_deadline_ms = ext_win.paint_retry_deadline_ms;
+            next_deadline_ms = ext_win.surf.paint_retry_deadline_ms;
         }
     }
     app.mu.unlock(core.clock.io());
@@ -1156,69 +1211,73 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
 
     // Reserve the legacy surface copy.
     if (pv.surface.row_mode) {
-        if (row_count != 0 and !ext_win.surface.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
+        if (row_count != 0 and !ext_win.surf.surface.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
         for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            ext_win.surface.row_verts.items[row_idx].verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
+            ext_win.surf.surface.row_verts.items[row_idx].verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
         }
     } else {
-        ext_win.surface.verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch return false;
+        ext_win.surf.surface.verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch return false;
     }
-    ext_win.surface.cursor_verts.ensureTotalCapacity(app.alloc, pv.surface.cursor_verts.items.len) catch return false;
+    ext_win.surf.surface.cursor_verts.ensureTotalCapacity(app.alloc, pv.surface.cursor_verts.items.len) catch return false;
 
     // A window published during an active core flush joins that transaction.
     // Seed its write set so later row callbacks and onFlushEnd publish one
     // complete frame; outside a flush, initialize the committed set directly.
-    const cs = if (ext_win.tbs.is_in_flush)
-        ext_win.tbs.writeSet()
+    const cs = if (ext_win.surf.tbs.is_in_flush)
+        ext_win.surf.tbs.writeSet()
     else
-        &ext_win.tbs.sets[ext_win.tbs.committed_index];
-    if (ext_win.tbs.is_in_flush) {
-        if (!ext_win.tbs.prepareRowSyncTracking(app.alloc, row_count)) return false;
-        ext_win.tbs.requireFullRowSync();
+        &ext_win.surf.tbs.sets[ext_win.surf.tbs.committed_index];
+    if (ext_win.surf.tbs.is_in_flush) {
+        if (!ext_win.surf.tbs.prepareRowSyncTracking(app.alloc, row_count)) return false;
+        ext_win.surf.tbs.requireFullRowSync();
     }
     if (pv.surface.row_mode) {
         if (row_count != 0 and !cs.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
         for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
             const mapping = &cs.row_map.items[row_idx];
             if (mapping.slot == app_mod.SLOT_NONE) {
-                const new_idx = ext_win.tbs.pool.acquireSlot(app.alloc) orelse return false;
+                const new_idx = ext_win.surf.tbs.pool.acquireSlot(app.alloc) orelse return false;
                 mapping.slot = new_idx;
-                ext_win.tbs.pool.retain(new_idx);
+                ext_win.surf.tbs.pool.retain(new_idx);
             }
-            const slot = ext_win.tbs.pool.slotPtr(mapping.slot);
+            const slot = ext_win.surf.tbs.pool.slotPtr(mapping.slot);
             slot.verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
         }
     } else {
         cs.flat_verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch return false;
     }
-    if (!ext_win.tbs.reserveMainCursorCapacity(app.alloc, pv.surface.cursor_verts.items.len)) return false;
+    if (!ext_win.surf.tbs.reserveMainCursorCapacity(app.alloc, pv.surface.cursor_verts.items.len)) return false;
 
     // All allocations succeeded. Publish the complete surface atomically
     // while app.mu still excludes core vertex callbacks.
-    ext_win.surface.row_mode = pv.surface.row_mode;
-    ext_win.surface.rows = pv.surface.rows;
-    ext_win.surface.cols = pv.surface.cols;
+    ext_win.surf.surface.row_mode = pv.surface.row_mode;
+    ext_win.surf.surface.rows = pv.surface.rows;
+    ext_win.surf.surface.cols = pv.surface.cols;
+    ext_win.surf.surface.metrics_gen = pv.metrics_gen;
     ext_win.needs_redraw = true;
+    // Joined the open flush above: onFlushEnd owes this window the
+    // invalidate, and the paint that follows clears needs_redraw.
+    if (ext_win.surf.tbs.is_in_flush) ext_win.surf.flush_needs_invalidate = true;
 
     if (pv.surface.row_mode) {
-        ext_win.surface.verts.clearRetainingCapacity();
+        ext_win.surf.surface.verts.clearRetainingCapacity();
         for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            const dst_row = &ext_win.surface.row_verts.items[row_idx];
+            const dst_row = &ext_win.surf.surface.row_verts.items[row_idx];
             dst_row.verts.clearRetainingCapacity();
             dst_row.verts.appendSliceAssumeCapacity(src_row.verts.items);
             dst_row.gen = src_row.gen;
             dst_row.origin_row = src_row.origin_row;
         }
-        _ = ext_win.surface.truncateRows(app.alloc, pv.surface.rows);
+        _ = ext_win.surf.surface.truncateRows(app.alloc, pv.surface.rows);
         ext_win.recomputeVertCount();
     } else {
-        ext_win.surface.verts.clearRetainingCapacity();
-        ext_win.surface.verts.appendSliceAssumeCapacity(pv.surface.verts.items);
+        ext_win.surf.surface.verts.clearRetainingCapacity();
+        ext_win.surf.surface.verts.appendSliceAssumeCapacity(pv.surface.verts.items);
         ext_win.vert_count = pv.surface.verts.items.len;
     }
-    ext_win.surface.cursor_verts.clearRetainingCapacity();
-    ext_win.surface.cursor_verts.appendSliceAssumeCapacity(pv.surface.cursor_verts.items);
-    ext_win.surface.last_cursor_row = pv.surface.last_cursor_row;
+    ext_win.surf.surface.cursor_verts.clearRetainingCapacity();
+    ext_win.surf.surface.cursor_verts.appendSliceAssumeCapacity(pv.surface.cursor_verts.items);
+    ext_win.surf.surface.last_cursor_row = pv.surface.last_cursor_row;
 
     cs.row_mode = pv.surface.row_mode;
     cs.rows = pv.surface.rows;
@@ -1227,7 +1286,7 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     if (pv.surface.row_mode) {
         cs.flat_verts.clearRetainingCapacity();
         for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            const slot = ext_win.tbs.pool.slotPtr(cs.row_map.items[row_idx].slot);
+            const slot = ext_win.surf.tbs.pool.slotPtr(cs.row_map.items[row_idx].slot);
             slot.verts.clearRetainingCapacity();
             slot.verts.appendSliceAssumeCapacity(src_row.verts.items);
             slot.origin_row = src_row.origin_row;
@@ -1237,23 +1296,27 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
         while (extra < cs.row_map.items.len) : (extra += 1) {
             const mapping = &cs.row_map.items[extra];
             if (mapping.slot != app_mod.SLOT_NONE) {
-                ext_win.tbs.pool.release(app.alloc, mapping.slot);
+                ext_win.surf.tbs.pool.release(app.alloc, mapping.slot);
                 mapping.slot = app_mod.SLOT_NONE;
             }
         }
     } else {
-        cs.releaseAllSlots(app.alloc, &ext_win.tbs.pool);
+        cs.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
         cs.row_map.clearRetainingCapacity();
         cs.flat_verts.clearRetainingCapacity();
         cs.flat_verts.appendSliceAssumeCapacity(pv.surface.verts.items);
     }
-    if (!ext_win.tbs.storeMainCursor(
+    if (!ext_win.surf.tbs.storeMainCursor(
         app.alloc,
         pv.surface.cursor_verts.items,
         pv.surface.last_cursor_row,
     )) return false;
-    ext_win.tbs.markFlushPaintFull();
-    if (!ext_win.tbs.is_in_flush) ext_win.tbs.commitFlush(app.alloc);
+    // The seed's cursor is this root's, as the cursor callback would have
+    // staged it. The TBS starts with grid 1 as owner, which made a root
+    // scroll keep a stale cursor and a later empty cursor look foreign.
+    if (pv.surface.cursor_verts.items.len != 0) ext_win.surf.tbs.stageCursorLayerGrid(grid_id);
+    ext_win.surf.tbs.markFlushPaintFull();
+    if (!ext_win.surf.tbs.is_in_flush) ext_win.surf.tbs.commitFlush(app.alloc);
 
     var applied = app.pending_external_verts.swapRemove(idx);
     applied.deinit(app.alloc);
@@ -1302,14 +1365,19 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     const cell_w = app.cell_w_px;
     const cell_h = app.rowHeightPx();
 
-    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    const surface_dpi_scale: f32 = blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        break :blk if (app.external_windows.get(req.grid_id)) |w| w.dpi_scale else app.dpi_scale;
+    };
+    const insets = externalSurfaceInsetsPx(app, req.grid_id, surface_dpi_scale);
     var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
     const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
     client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
 
-    const style: c.DWORD = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW;
-    const ex_style: c.DWORD = (if (is_special_window) @as(c.DWORD, @intCast(c.WS_EX_TOPMOST)) else 0) |
-        @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP));
+    const styles = externalWindowStyles(is_special_window);
+    const style = styles.style;
+    const ex_style = styles.ex_style;
     var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
     _ = c.AdjustWindowRectEx(&rect, style, 0, ex_style);
     const window_w = rect.right - rect.left;
@@ -1327,10 +1395,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         break :blk null;
     } else null;
     const main_hwnd = app.hwnd;
-    const main_y_offset: c_int = if (anchor_hwnd == null and app.ext_tabline_enabled and app.content_hwnd == null)
-        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
-    else
-        0;
+    // Relative to the main window, cells start at its surface origin, as on
+    // creation; an anchor external window has none.
+    const surface_origin = input.surfaceOriginPx(app, anchor_hwnd == null);
     app.mu.unlock(core.clock.io());
     const hwnd = target_hwnd orelse return false;
 
@@ -1342,8 +1409,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         if (origin_hwnd) |origin| {
             var client_origin: c.POINT = .{ .x = 0, .y = 0 };
             if (c.ClientToScreen(origin, &client_origin) != 0) {
-                x = client_origin.x + @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
-                const anchor_y = client_origin.y + main_y_offset + @as(c_int, @intCast(req.start_row)) * @as(c_int, @intCast(cell_h));
+                const anchor_x = client_origin.x + surface_origin.x + @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
+                const anchor_y = client_origin.y + surface_origin.y + @as(c_int, @intCast(req.start_row)) * @as(c_int, @intCast(cell_h));
+                x = if (is_popupmenu) popupmenuPositionX(anchor_x, window_w, origin) else anchor_x;
                 y = if (is_popupmenu) popupmenuPositionY(anchor_y, @intCast(cell_h), window_h, origin) else anchor_y;
             } else {
                 flags |= c.SWP_NOMOVE;
@@ -1393,7 +1461,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const is_msg_show = (req.grid_id == app_mod.MESSAGE_GRID_ID);
     const is_msg_history = (req.grid_id == app_mod.MSG_HISTORY_GRID_ID);
 
-    const insets = externalSurfaceInsetsPx(app, req.grid_id);
+    const insets = externalSurfaceInsetsPx(app, req.grid_id, app.dpi_scale);
     var client_w: c_int = content_w + insets.w;
     const client_h: c_int = content_h + insets.h;
     client_w = clampCmdlineWidthToWorkArea(app, req.grid_id, client_w);
@@ -1401,10 +1469,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
     const is_special_window = is_cmdline or is_popupmenu or is_msg_show or is_msg_history;
-    const dwStyle: c.DWORD = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW;
-    // Always use WS_EX_NOREDIRECTIONBITMAP: all rendering via DXGI + DirectComposition.
-    const dwExStyle: c.DWORD = (if (is_special_window) @as(c.DWORD, @intCast(c.WS_EX_TOPMOST)) else @as(c.DWORD, 0)) |
-        @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP));
+    const styles = externalWindowStyles(is_special_window);
+    const dwStyle = styles.style;
+    const dwExStyle = styles.ex_style;
 
     var rect: c.RECT = .{
         .left = 0,
@@ -1424,7 +1491,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // Restore saved position from previous tab switch (only for regular external windows)
     if (!is_special_window) {
-        if (app.saved_external_window_positions.get(req.grid_id)) |saved| {
+        const saved_opt = app.saved_external_window_positions.get(req.grid_id);
+        if (saved_opt != null and saved_opt.?.session_generation == req.session_generation) {
+            const saved = saved_opt.?;
             pos_x = saved.x;
             pos_y = saved.y;
             if (applog.isEnabled()) applog.appLog("[win] restored saved position for grid_id={d}: ({d},{d})\n", .{ req.grid_id, pos_x, pos_y });
@@ -1475,6 +1544,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
                 pos_x = client_pt.x + px_x;
                 if (is_popupmenu) {
+                    pos_x = popupmenuPositionX(pos_x, window_w, ahwnd);
                     pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, ahwnd);
                 } else {
                     pos_y = client_pt.y + px_y;
@@ -1489,17 +1559,17 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 var client_pt: c.POINT = .{ .x = 0, .y = 0 };
                 _ = c.ClientToScreen(main_hwnd, &client_pt);
 
-                // Calculate position in pixels from cell coordinates
-                const px_x: c_int = @intCast(@as(i32, @intCast(req.start_col)) * @as(i32, @intCast(cell_w)));
-                var px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)));
-
-                // When ext_tabline is enabled, grid coordinates start below the tabbar
-                if (app.ext_tabline_enabled and app.content_hwnd == null) {
-                    px_y += app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT);
-                }
+                // Cell coordinates start at the main surface's origin: below a
+                // titlebar tabline, right of a left sidebar. The rule the mouse
+                // and IME use; this added the tab bar for every style and never
+                // the sidebar.
+                const origin = input.surfaceOriginPx(app, true);
+                const px_x: c_int = @intCast(@as(i32, @intCast(req.start_col)) * @as(i32, @intCast(cell_w)) + origin.x);
+                const px_y: c_int = @intCast(@as(i32, @intCast(req.start_row)) * @as(i32, @intCast(cell_h)) + origin.y);
 
                 pos_x = client_pt.x + px_x;
                 if (is_popupmenu) {
+                    pos_x = popupmenuPositionX(pos_x, window_w, main_hwnd);
                     pos_y = popupmenuPositionY(client_pt.y + px_y, @intCast(cell_h), window_h, main_hwnd);
                 } else {
                     pos_y = client_pt.y + px_y;
@@ -1523,11 +1593,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 pos_y = msg_rect.bottom + 4; // 4px gap below message window
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window below message: ({d},{d})\n", .{ pos_x, pos_y });
             } else {
-                // Fallback: center on screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @divTrunc(screen_w - window_w, 2);
-                pos_y = @divTrunc(screen_h - window_h, 3);
+                // Fallback: center on the main window's monitor
+                const work = app_mod.monitorWorkArea(app.hwnd);
+                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window position (fallback): ({d},{d})\n", .{ pos_x, pos_y });
             }
         } else {
@@ -1538,19 +1607,26 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             app.mu.unlock(core.clock.io());
 
             if (saved_x != null and saved_y != null) {
-                // Use saved position, but ensure window stays on screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @max(0, @min(saved_x.?, screen_w - window_w));
-                pos_y = @max(0, @min(saved_y.?, screen_h - window_h));
+                // Use saved position, kept inside the work area of the
+                // monitor it is on. SM_CXSCREEN/SM_CYSCREEN are the primary
+                // monitor: a cmdline dragged to another monitor was pulled
+                // back to it, and one left of it (negative x) to x=0.
+                var work: c.RECT = .{ .left = 0, .top = 0, .right = c.GetSystemMetrics(c.SM_CXSCREEN), .bottom = c.GetSystemMetrics(c.SM_CYSCREEN) };
+                var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+                const saved_pt: c.POINT = .{ .x = saved_x.?, .y = saved_y.? };
+                const monitor = c.MonitorFromPoint(saved_pt, c.MONITOR_DEFAULTTONEAREST);
+                if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) work = monitor_info.rcWork;
+                // The core's rule, shared with macOS.
+                app_mod.zonvie_core_clamp_window_origin(saved_x.?, saved_y.?, window_w, window_h, work.left, work.top, work.right, work.bottom, &pos_x, &pos_y);
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window using saved position: ({d},{d})\n", .{ pos_x, pos_y });
             } else {
-                // Default: center on screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                pos_x = @divTrunc(screen_w - window_w, 2);
-                pos_y = @divTrunc(screen_h - window_h, 3); // Slightly above center (1/3 from top)
-                if (applog.isEnabled()) applog.appLog("[win] cmdline window position (default): ({d},{d}) screen=({d},{d})\n", .{ pos_x, pos_y, screen_w, screen_h });
+                // Default: center on the main window's monitor, slightly
+                // above center (1/3 from top)
+                const work = app_mod.monitorWorkArea(app.hwnd);
+                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
+                if (applog.isEnabled()) applog.appLog("[win] cmdline window position (default): ({d},{d})\n", .{ pos_x, pos_y });
             }
         }
     } else if (is_popupmenu and req.start_row == -1) {
@@ -1565,20 +1641,25 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 const cmdline_content_x: c_int =
                     @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
                     @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
-                const popupmenu_padding: c_int = 8;
-                // Position above cmdline window with small gap
-                pos_x = cmdline_rect.left + cmdline_content_x +
-                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)) -
-                    popupmenu_padding;
-                pos_y = cmdline_rect.top - window_h - 4; // 4px gap
+                // Position above cmdline window with small gap. The popupmenu
+                // draws at its client origin (decoratedContentOriginPx), so
+                // its column lines up with no inset to subtract.
+                pos_x = popupmenuPositionX(cmdline_rect.left + cmdline_content_x +
+                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)), window_w, cw.hwnd);
+                // Above or below is the core's rule, shared with macOS.
+                var screen_top: c_int = std.math.minInt(c_int);
+                var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+                monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+                const monitor = c.MonitorFromWindow(cw.hwnd, c.MONITOR_DEFAULTTONEAREST);
+                if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
+                pos_y = app_mod.zonvie_core_cmdline_popupmenu_top(cmdline_rect.top, cmdline_rect.bottom, window_h, 4, screen_top);
                 if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
             }
         } else {
-            // Fallback: center on screen
-            const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-            const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-            pos_x = @divTrunc(screen_w - window_w, 2);
-            pos_y = @divTrunc(screen_h - window_h, 2);
+            // Fallback: center on the main window's monitor
+            const work = app_mod.monitorWorkArea(app.hwnd);
+            pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+            pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 2);
             if (applog.isEnabled()) applog.appLog("[win] popupmenu fallback center: ({d},{d})\n", .{ pos_x, pos_y });
         }
     } else if (is_msg_history or is_msg_show) {
@@ -1638,12 +1719,44 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         window_mod.applyWindowBackdrop(hwnd);
     }
 
+    // The insets above were sized at the main window's DPI, before this
+    // window existed. One created on a monitor of another density gets no
+    // WM_DPICHANGED for it, so its "always" scrollbar strip stayed the wrong
+    // width: covering the last column or leaving a gap.
+    {
+        const own_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd))) / 96.0;
+        if (own_scale != app.dpi_scale) {
+            const own = externalSurfaceInsetsPx(app, req.grid_id, own_scale);
+            if (own.w != insets.w) {
+                var own_rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w + own.w, .bottom = client_h };
+                _ = c.AdjustWindowRectEx(&own_rect, dwStyle, 0, dwExStyle);
+                _ = c.SetWindowPos(hwnd, null, 0, 0, own_rect.right - own_rect.left, own_rect.bottom - own_rect.top, c.SWP_NOMOVE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+            }
+        }
+    }
+
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
-    // Initialize D3D11 renderer for external window (with transparency if enabled)
-    var renderer = d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity) catch |e| {
-        if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.init failed for external window: {any}\n", .{e});
+    // Share the App device: app.layer_grids row buffers are drawn by whichever
+    // surface places the grid. Until it is published, retry rather than open
+    // on a device of our own.
+    var renderer = blk: {
+        const device = app.d3d_device orelse break :blk null;
+        const device_ctx = app.d3d_ctx orelse break :blk null;
+        break :blk d3d11.Renderer.initWithDevice(
+            app.alloc,
+            hwnd,
+            app.config.window.opacity,
+            app.config.window.blur,
+            device,
+            device_ctx,
+            false,
+        ) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
+            break :blk null;
+        };
+    } orelse {
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
@@ -1740,16 +1853,23 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     };
     ext_window_ptr.* = app_mod.ExternalWindow{
+        .session_generation = req.session_generation,
         .hwnd = hwnd.?,
         .window_wake_cookie = app_mod.nextWindowWakeCookie(),
         .win_id = req.win,
         .renderer = renderer,
-        .surface = .{ .rows = req.rows, .cols = req.cols },
+        .surf = .{
+            .surface = .{ .rows = req.rows, .cols = req.cols },
+            .tbs = .{ .root_grid_id = req.grid_id },
+        },
         .is_float_external = is_float,
+        // WM_DPICHANGED only reports a later move; the scrollbar strip and
+        // resize insets read this from the first resize on.
+        .dpi_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd.?))) / 96.0,
     };
     if (!window_mod.installWindowWakeCookie(hwnd.?, ext_window_ptr.window_wake_cookie)) {
         app.mu.unlock(core.clock.io());
-        ext_window_ptr.tbs.deinit(app.alloc);
+        ext_window_ptr.surf.tbs.deinit(app.alloc);
         app.alloc.destroy(ext_window_ptr);
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
@@ -1762,9 +1882,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // and all later callbacks then land in the same set committed by
     // onFlushEnd. A new TBS always has free sets, so failure here is allocation
     // pressure and the retained lifecycle request must retry.
-    if (app.core_flush_active.load(.acquire) and !ext_window_ptr.tbs.beginFlush(app.alloc)) {
+    if (app.core_flush_active.load(.acquire) and !ext_window_ptr.surf.tbs.beginFlush(app.alloc)) {
         app.mu.unlock(core.clock.io());
-        ext_window_ptr.tbs.deinit(app.alloc);
+        ext_window_ptr.surf.tbs.deinit(app.alloc);
         app.alloc.destroy(ext_window_ptr);
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
@@ -1775,7 +1895,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     app.external_windows.put(app.alloc, req.grid_id, ext_window_ptr) catch |e| {
         if (applog.isEnabled()) applog.appLog("[win] failed to store external window: {any}\n", .{e});
         app.mu.unlock(core.clock.io());
-        ext_window_ptr.tbs.deinit(app.alloc);
+        ext_window_ptr.surf.tbs.deinit(app.alloc);
         app.alloc.destroy(ext_window_ptr);
         var tmp_renderer = renderer;
         tmp_renderer.deinit();
@@ -1805,8 +1925,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
-    // Set last_cursor_grid to this grid
-    app.last_cursor_grid = req.grid_id;
+    // Only a window the cursor enters, as on macOS: a popupmenu or message
+    // window gets no cursor report to correct it, so recording it named a
+    // grid the cursor never moved to (the blink gate and msg_pos asked it).
+    const cursor_may_enter = !is_special_window or is_cmdline;
+    if (cursor_may_enter) app.last_cursor_grid = req.grid_id;
 
     // Set App pointer as user data for WndProc access
     app_mod.setApp(hwnd.?, app);
@@ -1843,12 +1966,18 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     app.mu.unlock(core.clock.io());
 
+    // Layout and rows may have arrived before this HWND was registered.
+    // Never acquire the core lock while holding app.mu (callbacks take the
+    // locks in the opposite direction).
+    core.zonvie_core_force_resend(app.corep);
+    if (app.corep) |corep| app_mod.zonvie_core_retry_flush(corep);
+
     // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
     // call and must not run with app.mu held. Registration is what makes the
     // drag cursor show that a drop here inserts a path rather than opening the
     // file; the DragAcceptFiles above stays as the fallback if it fails.
     if (is_cmdline) {
-        ext_window_ptr.drop_target = drop_target.register(app, hwnd, true);
+        ext_window_ptr.surf.drop_target = drop_target.register(app, hwnd, true);
     }
 
     // Now call SetWindowPos outside the lock to avoid deadlock
@@ -1873,8 +2002,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         }
     }
 
-    // Activate this external window
-    _ = c.SetForegroundWindow(hwnd);
+    // Activate a window the cursor enters. A popupmenu or message window is
+    // shown SW_SHOWNA; taking the foreground took it from the window the
+    // cursor is in, with no cursor report to give it back.
+    if (cursor_may_enter) _ = c.SetForegroundWindow(hwnd);
     return .published;
 }
 
@@ -1985,6 +2116,21 @@ pub fn closePendingExternalWindowsOnUIThread(app: *App) void {
 
 /// Actually close external window (must be called on UI thread)
 /// Removes from HashMap and destroys the window
+/// The window styles of an external window, for creation and for the
+/// AdjustWindowRectEx of every later resize, which must agree. A special
+/// window (cmdline, popupmenu, msg_show, msg_history) is a borderless topmost
+/// tool window: an ownerless popup without WS_EX_TOOLWINDOW gets a taskbar
+/// button and an Alt-Tab entry, so typing `:` flashed one up. Always
+/// WS_EX_NOREDIRECTIONBITMAP: all rendering goes via DXGI + DirectComposition.
+fn externalWindowStyles(is_special_window: bool) struct { style: c.DWORD, ex_style: c.DWORD } {
+    const special_ex: c.DWORD = @intCast(c.WS_EX_TOPMOST | c.WS_EX_TOOLWINDOW);
+    return .{
+        .style = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW,
+        .ex_style = (if (is_special_window) special_ex else @as(c.DWORD, 0)) |
+            @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP)),
+    };
+}
+
 pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     if (applog.isEnabled()) applog.appLog("[win] closeExternalWindowOnUIThread: grid_id={d}\n", .{grid_id});
 
@@ -2001,9 +2147,15 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         }
     }
 
-    // Save window position before removing (for tab switch restoration)
+    // Save window position before removing (for tab switch restoration), for
+    // the session that created the window only. The old server's windows
+    // close after a restart or connect, and saving them then handed their
+    // positions to the new server's windows that reuse the ids.
     if (app.external_windows.get(grid_id)) |ew| {
-        if (ew.hwnd) |hwnd| {
+        const current_generation = app.external_session_generation.load(.acquire);
+        if (ew.session_generation != current_generation) {
+            _ = app.saved_external_window_positions.remove(grid_id);
+        } else if (ew.hwnd) |hwnd| {
             var rect: c.RECT = undefined;
             if (c.GetWindowRect(hwnd, &rect) != 0) {
                 // Evict oldest entry (smallest grid_id) when inserting a new key
@@ -2023,6 +2175,7 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
                 app.saved_external_window_positions.put(app.alloc, grid_id, .{
                     .x = rect.left,
                     .y = rect.top,
+                    .session_generation = current_generation,
                 }) catch {};
                 if (applog.isEnabled()) applog.appLog("[win] saved position for grid_id={d}: ({d},{d})\n", .{ grid_id, rect.left, rect.top });
             }
@@ -2056,9 +2209,19 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
 
         // Revoke before deinit's DestroyWindow: OLE holds a reference to the
         // target for as long as the window is registered.
-        if (ext_win.drop_target) |target| {
+        if (ext_win.surf.drop_target) |target| {
             drop_target.revoke(ext_win.hwnd, @ptrCast(@alignCast(target)));
-            ext_win.drop_target = null;
+            ext_win.surf.drop_target = null;
+        }
+
+        // deinit detaches the window from the App before destroying it, so
+        // the WM_CAPTURECHANGED DestroyWindow sends cannot end a press this
+        // window holds; left set, every later hover elsewhere is a drag.
+        if (c.GetCapture() == ext_win.hwnd) {
+            input.cancelMouseButtons(app);
+            app.mu.lockUncancelable(core.clock.io());
+            scrollbar.cancelPointer(scrollbar.externalSurface(ext_win, grid_id));
+            app.mu.unlock(core.clock.io());
         }
 
         // deinit handles DestroyWindow and resource cleanup
@@ -2156,14 +2319,7 @@ pub export fn ExternalWndProc(
     switch (msg) {
         // Keep the acrylic backdrop blurred when the window is inactive by
         // forcing DWM to treat it as active (matches the main window).
-        c.WM_NCACTIVATE => {
-            if (app_mod.getApp(hwnd)) |app| {
-                if (app.config.window.blur) {
-                    return c.DefWindowProcW(hwnd, msg, 1, lParam);
-                }
-            }
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
+        c.WM_NCACTIVATE => return input.ncActivate(app_mod.getApp(hwnd), hwnd, msg, wParam, lParam),
         0x02E0 => { // WM_DPICHANGED
             if (app_mod.getApp(hwnd)) |app| {
                 // Device/D2D/renderer creation in WM_APP_DEVICE_LOST_RECOVER
@@ -2230,26 +2386,14 @@ pub export fn ExternalWndProc(
                 var retry_it = app.external_windows.valueIterator();
                 while (retry_it.next()) |ext_win_ptr| {
                     if (ext_win_ptr.*.hwnd == hwnd) {
-                        ext_win_ptr.*.paint_retry_deadline_ms = 0;
-                        ext_win_ptr.*.paint_retry.paintStarted();
+                        ext_win_ptr.*.surf.paint_retry_deadline_ms = 0;
+                        ext_win_ptr.*.surf.paint_retry.paintStarted();
                         break;
                     }
                 }
                 app.mu.unlock(core.clock.io());
-                if (app.wm_paint_in_progress or
-                    app.in_present_shader_animation_frame or
-                    app.glow_prepare_in_progress or
-                    app.device_lost_recovering or
-                    app.main_resize_in_progress or
-                    app.main_dpi_change_in_progress)
-                {
-                    // Reentrant WM_PAINT on the shared App/Renderer — see
-                    // the identical guard in window.zig's WM_PAINT handler
-                    // for why this must not call into g.lockContext().
-                    var ps_reentrant: c.PAINTSTRUCT = undefined;
-                    _ = c.BeginPaint(hwnd, &ps_reentrant);
-                    _ = c.EndPaint(hwnd, &ps_reentrant);
-                    app.wm_paint_reinvalidate_all = true;
+                if (app.paintReentrancyBlocked()) {
+                    app.consumeReentrantPaint(hwnd);
                     return 0;
                 }
                 app.wm_paint_in_progress = true;
@@ -2266,7 +2410,7 @@ pub export fn ExternalWndProc(
                     }
                 }
                 // Check if this is a mini window
-                inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+                inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
                     const idx = @intFromEnum(id);
                     if (app.mini_windows[idx].hwnd) |mini_hwnd| {
                         if (mini_hwnd == hwnd) {
@@ -2288,7 +2432,24 @@ pub export fn ExternalWndProc(
             return 0;
         },
         c.WM_CLOSE => {
-            // Don't destroy - just hide or let the core handle it
+            // Closing an external window closes the Neovim window it shows,
+            // as on macOS; the HWND is torn down when Neovim confirms through
+            // on_external_window_close. Hiding it instead left the Neovim
+            // window alive, still receiving rows, with nothing to bring it
+            // back. Decorated windows (cmdline, popupmenu, messages) and a
+            // grid with no Neovim window keep the old hide.
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                const grid_id: ?i64 = if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.grid_id else null;
+                app.mu.unlock(core.clock.io());
+                if (grid_id) |gid| {
+                    if (gid >= 0) {
+                        if (app.corep) |corep| {
+                            if (app_mod.zonvie_core_request_win_close(corep, gid) != 0) return 0;
+                        }
+                    }
+                }
+            }
             _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
         },
@@ -2315,91 +2476,31 @@ pub export fn ExternalWndProc(
         // Forward keyboard input to core (same as main window)
         c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
-                const vk: u32 = @intCast(wParam);
-                const mods = input.queryMods();
-                const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
-                const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
-
-                // Check if IME is composing
-                app.mu.lockUncancelable(core.clock.io());
-                const ime_composing = app.ime_composing;
-                app.mu.unlock(core.clock.io());
-
-                // Skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
-                if (ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK)) {
-                    // Let IME handle Enter/Backspace
-                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-                }
-
-                // Special keys (arrows, function keys, etc.) go through send_key_event
-                if (input.isSpecialVk(vk)) {
-                    input.sendKeyEventToCore(app, keycode, mods, null, null);
-                    return 0;
-                }
-
-                // Ctrl/Alt combos: use toUnicodePairUtf8 to get character for <C-x> etc.
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    var tmp_chars: [16]u16 = undefined;
-                    var tmp_ign: [16]u16 = undefined;
-                    var out_chars: [8]u8 = undefined;
-                    var out_ign: [8]u8 = undefined;
-
-                    const pair = input.toUnicodePairUtf8(
-                        vk,
-                        scancode,
-                        &tmp_chars,
-                        &tmp_ign,
-                        &out_chars,
-                        &out_ign,
-                    );
-
-                    input.sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
-                    return 0;
-                }
-                // Otherwise let WM_CHAR handle normal text
+                if (input.handleKeyDownMessage(app, wParam, lParam)) return 0;
             }
         },
         c.WM_CHAR, c.WM_SYSCHAR => {
             if (app_mod.getApp(hwnd)) |app| {
-                const mods = input.queryMods();
-
-                // Skip if Ctrl/Alt (handled in WM_KEYDOWN)
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    return 0;
-                }
-
-                const ch0: u16 = @as(u16, @intCast(wParam));
-
-                // Skip control characters handled by WM_KEYDOWN
-                if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
-                    app.pending_high_surrogate_char = 0;
-                    return 0;
-                }
-
-                // Pair surrogate halves for non-BMP characters (emoji etc).
-                var tmp: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
-                    app.pending_high_surrogate_char = ch0;
-                    return 0;
-                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_char;
-                    app.pending_high_surrogate_char = 0;
-                    if (hi == 0) return 0;
-                    s = input.utf16UnitsToUtf8(&tmp, hi, ch0);
-                } else {
-                    app.pending_high_surrogate_char = 0;
-                    s = input.utf16UnitsToUtf8(&tmp, ch0, null);
-                }
-
-                if (s) |text| {
-                    input.sendKeyEventToCore(app, 0, mods, text, null);
-                }
+                input.handleCharMessage(app, wParam);
                 return 0;
             }
         },
         c.WM_SIZE => {
+            // SIZE_MINIMIZED: an iconic window keeps reporting a non-zero
+            // client rect, so deriving rows/cols from it and asking Neovim to
+            // resize would hand it a one-row split and destroy the layout. A
+            // normal external window carries a minimize box, so this is
+            // reachable. The main window's handler has always returned here.
+            // IsIconic too: the size replays (timer, fallback message,
+            // deferred service) send a synthetic WM_SIZE with wParam 0, and
+            // one landing while the window is minimized is the same request.
+            // The main window's replayMainSize has that check; these had not.
+            const SIZE_MINIMIZED = 1;
+            if (wParam == SIZE_MINIMIZED or c.IsIconic(hwnd) != 0) return 0;
+
             if (app_mod.getApp(hwnd)) |app| {
+                // Boxes anchored to this window follow it (msg_pos window/grid).
+                app_mod.scheduleFloatReposition(app);
                 // See WM_DPICHANGED's identical guard above — device-lost
                 // recovery can reenter this handler on the same UI thread
                 // while still holding app.mu/atlas.mu for parts of its own
@@ -2423,14 +2524,20 @@ pub export fn ExternalWndProc(
                 // Find grid_id and ext_window for this hwnd
                 var grid_id: ?i64 = null;
                 var suppress = false;
+                var surface_dpi_scale: f32 = app.dpi_scale;
                 if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
                     grid_id = hit.grid_id;
                     suppress = hit.win.suppress_resize_callback;
+                    surface_dpi_scale = hit.win.dpi_scale;
                 }
 
                 const cell_w = app.cell_w_px;
                 const cell_h = app.rowHeightPx();
                 const corep = app.corep;
+                // Same reservation the paint applies, and the same one the main
+                // window's grid-size derivation has always applied: in "always"
+                // mode the scrollbar owns a strip that is not text.
+                const content_w = app_mod.effectiveContentWidthAt(app, client_w, surface_dpi_scale);
 
                 app.mu.unlock(core.clock.io());
 
@@ -2440,7 +2547,7 @@ pub export fn ExternalWndProc(
 
                 if (grid_id) |gid| {
                     if (cell_w > 0 and cell_h > 0) {
-                        const new_cols: u32 = client_w / cell_w;
+                        const new_cols: u32 = content_w / cell_w;
                         const new_rows: u32 = client_h / cell_h;
 
                         if (new_rows > 0 and new_cols > 0) {
@@ -2454,35 +2561,32 @@ pub export fn ExternalWndProc(
             }
             return 0;
         },
-        c.WM_MOUSEWHEEL => {
+        c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL => {
             if (app_mod.getApp(hwnd)) |app| {
-                // Find grid_id and ext_window for this hwnd
+                const horizontal = msg == c.WM_MOUSEHWHEEL;
                 app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
+                const hit = findExternalWindowByHwndLocked(app, hwnd);
                 app.mu.unlock(core.clock.io());
 
-                if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, false);
+                if (hit) |h| {
+                    input.handleMouseWheel(hwnd, wParam, lParam, app, h.grid_id, horizontal);
 
-                    // Show scrollbar on scroll if in scroll mode
-                    if (app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
-                        scrollbar.showScrollbarForExternal(hwnd, ext_window.?);
-                        // Auto-hide after delay
-                        const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
-                        _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+                    // Show scrollbar on vertical scroll if in scroll mode
+                    if (!horizontal and app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
+                        scrollbar.show(app, scrollbar.externalSurface(h.win, h.grid_id));
                     }
                 }
                 return 0;
             }
         },
 
-        c.WM_MOUSEHWHEEL => {
+        // --- Scrollbar and grid mouse handling for external windows ---
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_XBUTTONDOWN => {
             if (app_mod.getApp(hwnd)) |app| {
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
+
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
                 var ext_window: ?*app_mod.ExternalWindow = null;
@@ -2493,36 +2597,59 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (grid_id != null and ext_window != null) {
-                    input.handleMouseWheel(hwnd, wParam, lParam, app, grid_id.?, true);
+                    // The window's own chrome claims the press first, so the
+                    // copy button's release is not interpreted as a scrollbar
+                    // or grid interaction. Left button only: the others have
+                    // no chrome meaning and go straight to the editor.
+                    if (msg == c.WM_LBUTTONDOWN) {
+                        ext_window.?.copy_button_pressed = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
+                        if (ext_window.?.copy_button_pressed) return 0;
+                        if (scrollbar.mouseDown(app, scrollbar.externalSurface(ext_window.?, grid_id.?), x, y)) {
+                            return 0;
+                        }
+                    }
+
+                    // Only a real window grid is an editor target. The cmdline,
+                    // popupmenu and message surfaces carry sentinel grid ids
+                    // the core forwards to Neovim unchanged, which resolves
+                    // them against the screen instead: a click on a message
+                    // moved the cursor in the buffer behind it, and a middle
+                    // click pasted there. The core refuses such a button for
+                    // every frontend (pointer_target.buttonReachesNeovim);
+                    // returning here also keeps the press from capturing.
+                    if (classifyExternalSurface(grid_id.?) != .normal) return 0;
+
+                    // A float anchored inside this window is one of its layers,
+                    // not a window of its own, so the press has to say which
+                    // grid it landed on -- Neovim trusts the id it is given.
+                    const target = input.resolveSurfaceTarget(app, &ext_window.?.surf.tbs, grid_id.?, false, x, y);
+                    input.pressEditorButton(app, hwnd, msg, wParam, target);
+                    return input.mouseButtonResult(msg);
                 }
-                return 0;
             }
         },
 
-        // --- Scrollbar mouse handling for external windows ---
-        c.WM_LBUTTONDOWN => {
-            if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
-
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
-
-                if (grid_id != null and ext_window != null) {
-                    // Claim the press so the copy button's release is not
-                    // interpreted as a scrollbar or grid interaction.
-                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
-                    if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
-                        return 0;
-                    }
+        c.WM_SETCURSOR => {
+            const hit_test: u16 = @truncate(@as(usize, @bitCast(lParam)));
+            if (hit_test == c.HTCLIENT) {
+                if (app_mod.getApp(hwnd)) |app| {
+                    const p = input.cursorClientPos(hwnd);
+                    app.mu.lockUncancelable(core.clock.io());
+                    const hit = findExternalWindowByHwndLocked(app, hwnd);
+                    app.mu.unlock(core.clock.io());
+                    // Only a real window grid is an editor target (see the
+                    // button handler); its layers resolve as a click would.
+                    const target: ?input.MouseTarget = if (hit) |h|
+                        (if (classifyExternalSurface(h.grid_id) == .normal)
+                            input.resolveSurfaceTarget(app, &h.win.surf.tbs, h.grid_id, false, p.x, p.y)
+                        else
+                            null)
+                    else
+                        null;
+                    if (input.showUrlCursor(app, target)) return 1;
                 }
             }
+            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
         c.WM_CAPTURECHANGED => {
@@ -2530,24 +2657,15 @@ pub export fn ExternalWndProc(
             // only place the scrollbar track repeat is killed — without this it
             // keeps issuing page scrolls indefinitely.
             if (app_mod.getApp(hwnd)) |app| {
+                // Same reason the editor drag must end: a held button left set
+                // here turns every later hover into a drag.
+                input.cancelMouseButtons(app);
                 app.mu.lockUncancelable(core.clock.io());
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     const ew = entry.value_ptr.*;
                     if (ew.hwnd != hwnd) continue;
-                    // The drag is cancelled rather than committed: its pending
-                    // line was never confirmed by a mouse-up. Leaving
-                    // scrollbar_dragging set would make every later
-                    // button-up-less WM_MOUSEMOVE scroll the buffer.
-                    if (ew.scrollbar_dragging) {
-                        ew.scrollbar_dragging = false;
-                        ew.scrollbar_pending_line = -1;
-                    }
-                    if (ew.scrollbar_repeat_timer != 0 or ew.scrollbar_repeat_dir != 0) {
-                        _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
-                        ew.scrollbar_repeat_timer = 0;
-                        ew.scrollbar_repeat_dir = 0;
-                    }
+                    scrollbar.cancelPointer(scrollbar.externalSurface(ew, entry.key_ptr.*));
                     break;
                 }
                 app.mu.unlock(core.clock.io());
@@ -2555,10 +2673,13 @@ pub export fn ExternalWndProc(
             return 0;
         },
 
-        c.WM_LBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP, c.WM_XBUTTONUP => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
+
+                const rel = input.takeButtonRelease(app, msg);
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2569,8 +2690,38 @@ pub export fn ExternalWndProc(
                 }
                 app.mu.unlock(core.clock.io());
 
+                // ReleaseCapture posts WM_CAPTURECHANGED to this window
+                // synchronously, and that handler drops scrollbar_dragging and
+                // the pending line with it. Release only after the scrollbar
+                // has committed its final position below, or a drag ends where
+                // it started.
+                defer if (!rel.left_drag_continues) {
+                    _ = c.ReleaseCapture();
+                };
+
                 if (grid_id != null and ext_window != null) {
-                    if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
+                    // Mirrors the press gate: a sentinel-grid surface never
+                    // sent a press, so it must not send a release either.
+                    const editor_target = classifyExternalSurface(grid_id.?) == .normal;
+                    // The press chose the grid; the release must not re-choose
+                    // it, or letting go outside the float ends the selection in
+                    // the window behind it.
+                    const up_target = input.rebaseSurfaceTarget(app, &ext_window.?.surf.tbs, grid_id.?, false, rel.press_grid, x, y);
+                    if (msg != c.WM_LBUTTONUP) {
+                        if (editor_target) input.releaseEditorButton(app, msg, wParam, rel, up_target);
+                        return input.mouseButtonResult(msg);
+                    }
+                    // The scrollbar first, as on the main window: a knob drag
+                    // ending over the copy button must end the drag.
+                    const sb = &ext_window.?.surf.scrollbar;
+                    if (sb.dragging or sb.repeat_timer != 0) {
+                        scrollbar.mouseUp(app, scrollbar.externalSurface(ext_window.?, grid_id.?));
+                        return 0;
+                    }
+                    const copy_pressed = ext_window.?.copy_button_pressed;
+                    ext_window.?.copy_button_pressed = false;
+                    if (copy_pressed) {
+                        if (!hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
                         if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
                             // Brief acknowledgement so the click has visible
                             // feedback even though the surface itself does not
@@ -2587,15 +2738,19 @@ pub export fn ExternalWndProc(
                         }
                         return 0;
                     }
-                    scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
+                    if (editor_target) {
+                        input.releaseEditorButton(app, msg, wParam, rel, up_target);
+                    }
+                    return 0;
                 }
             }
         },
 
         c.WM_MOUSEMOVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                const x: i32 = @bitCast(@as(u32, @intCast(lParam & 0xFFFF)));
-                const y: i32 = @bitCast(@as(u32, @intCast((lParam >> 16) & 0xFFFF)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2610,8 +2765,8 @@ pub export fn ExternalWndProc(
                     const ext_win = ext_window.?;
 
                     // Handle scrollbar dragging
-                    if (ext_win.scrollbar_dragging) {
-                        scrollbar.scrollbarMouseMoveForExternal(hwnd, app, ext_win, grid_id.?, y);
+                    if (ext_win.surf.scrollbar.dragging) {
+                        scrollbar.mouseMove(app, scrollbar.externalSurface(ext_win, grid_id.?), y);
                         return 0;
                     }
 
@@ -2627,32 +2782,22 @@ pub export fn ExternalWndProc(
                     // included — the message must not vanish under it.
                     setMsgHover(app, ext_win, grid_id.?, true);
 
-                    // Check for scrollbar hover
-                    if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
-                        var client: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client);
-                        const hit = scrollbar.scrollbarHitTestForExternal(app, grid_id.?, client.right, client.bottom, x, y, ext_win.dpi_scale);
-                        if (hit != .none) {
-                            if (!ext_win.scrollbar_hover) {
-                                ext_win.scrollbar_hover = true;
-                                scrollbar.showScrollbarForExternal(hwnd, ext_win);
-                            }
-                        } else {
-                            if (ext_win.scrollbar_hover) {
-                                ext_win.scrollbar_hover = false;
-                                scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
-                            }
-                        }
-                    }
+                    // WM_MOUSELEAVE is tracked below on every move.
+                    _ = scrollbar.hover(app, scrollbar.externalSurface(ext_win, grid_id.?), x, y);
 
                     // Track mouse for WM_MOUSELEAVE
-                    var tme: c.TRACKMOUSEEVENT = .{
-                        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
-                        .dwFlags = c.TME_LEAVE,
-                        .hwndTrack = hwnd,
-                        .dwHoverTime = 0,
-                    };
-                    _ = c.TrackMouseEvent(&tme);
+                    input.trackMouseLeave(hwnd);
+
+                    // A held button makes this a drag. The scrollbar drag
+                    // returned above, so anything reaching here belongs to the
+                    // editor's own selection -- on a real window grid only,
+                    // for the reason the press gate states.
+                    if (classifyExternalSurface(grid_id.?) == .normal) {
+                        if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
+                            const drag_target = input.rebaseSurfaceTarget(app, &ext_win.surf.tbs, grid_id.?, false, app.mouse_press_grid_id, x, y);
+                            input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
+                        }
+                    }
                 }
             }
         },
@@ -2683,8 +2828,7 @@ pub export fn ExternalWndProc(
                         ext_win.copy_button_hover = false;
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
-                    ext_win.scrollbar_hover = false;
-                    scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
+                    scrollbar.leave(app, scrollbar.externalSurface(ext_win, grid_id.?));
                 }
             }
         },
@@ -2707,8 +2851,8 @@ pub export fn ExternalWndProc(
                     if (ext_win.hwnd == hwnd and
                         ext_win.window_wake_cookie == @as(usize, @bitCast(lParam)))
                     {
-                        should_invalidate = ext_win.paint_retry.timerFired(@intCast(wParam));
-                        if (should_invalidate) ext_win.paint_retry_deadline_ms = 0;
+                        should_invalidate = ext_win.surf.paint_retry.timerFired(@intCast(wParam));
+                        if (should_invalidate) ext_win.surf.paint_retry_deadline_ms = 0;
                         break;
                     }
                 }
@@ -2751,18 +2895,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
-                    if (timer_id == app_mod.TIMER_SCROLLBAR_FADE) {
-                        scrollbar.updateScrollbarFadeForExternal(hwnd, app, ext_win);
-                        return 0;
-                    } else if (timer_id == app_mod.TIMER_SCROLLBAR_REPEAT) {
-                        if (grid_id != null and ext_win.scrollbar_repeat_dir != 0) {
-                            // Change to faster interval after first fire
-                            if (ext_win.scrollbar_repeat_timer != 0) {
-                                _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
-                                ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_INTERVAL, null);
-                            }
-                            scrollbar.scrollbarPageScrollForExternal(app, grid_id.?, ext_win.scrollbar_repeat_dir);
-                        }
+                    if (scrollbar.onTimer(app, scrollbar.externalSurface(ext_win, grid_id.?), timer_id)) {
                         return 0;
                     } else if (timer_id == app_mod.TIMER_COPY_BUTTON_REVERT) {
                         _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_REVERT);
@@ -2771,29 +2904,15 @@ pub export fn ExternalWndProc(
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
                         return 0;
-                    } else if (timer_id == app_mod.TIMER_SCROLLBAR_AUTOHIDE) {
-                        // Auto-hide scrollbar after scroll mode timeout
-                        _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE);
-                        scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
-                        return 0;
                     }
                 }
             }
         },
 
         // --- IME message handling for external windows ---
-        c.WM_IME_STARTCOMPOSITION => {
-            if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_STARTCOMPOSITION hwnd={*}\n", .{hwnd});
-            if (app_mod.getApp(hwnd)) |app| {
-                input.resetImeComposition(app, false);
-
-                // Position IME candidate window at cursor (using this external window)
-                input.positionImeCandidateWindow(hwnd, app);
-
-                // Trigger redraw to hide cursor during IME composition
-                _ = c.InvalidateRect(hwnd, null, 0);
-            }
-            return 0;
+        c.WM_IME_STARTCOMPOSITION, c.WM_IME_ENDCOMPOSITION, c.WM_IME_CHAR => {
+            // The redraw hides the cursor during composition and shows it after.
+            if (input.imeEdgeMessage(app_mod.getApp(hwnd), hwnd, msg, wParam, true)) |r| return r;
         },
 
         c.WM_IME_COMPOSITION => {
@@ -2805,29 +2924,6 @@ pub export fn ExternalWndProc(
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
-        c.WM_IME_ENDCOMPOSITION => {
-            if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_ENDCOMPOSITION hwnd={*}\n", .{hwnd});
-            if (app_mod.getApp(hwnd)) |app| {
-                input.resetImeComposition(app, true);
-
-                // Clear any inline preedit extmark and hide the overlay.
-                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
-                input.hideImePreeditOverlay(app);
-
-                // Trigger redraw to show cursor after IME composition ends
-                _ = c.InvalidateRect(hwnd, null, 0);
-            }
-            return 0;
-        },
-
-        c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim.
-            if (applog.isEnabled()) applog.appLog("[IME][ext] WM_IME_CHAR wParam=0x{x}\n", .{wParam});
-            if (app_mod.getApp(hwnd)) |app| {
-                input.handleImeChar(app, @intCast(wParam));
-                return 0;
-            }
-        },
 
         c.WM_SETFOCUS => {
             // Post message to update IME position asynchronously
@@ -2881,6 +2977,8 @@ pub export fn ExternalWndProc(
         // Save cmdline window position when moved
         c.WM_MOVE => {
             if (app_mod.getApp(hwnd)) |app| {
+                // Boxes anchored to this window follow it (msg_pos window/grid).
+                app_mod.scheduleFloatReposition(app);
                 app.mu.lockUncancelable(core.clock.io());
                 defer app.mu.unlock(core.clock.io());
 
@@ -2908,11 +3006,17 @@ pub export fn ExternalWndProc(
 /// Set the clear color for an external window from cached highlight group bg colors.
 /// Uses values pre-resolved in updateExternalWindowColors (UI thread, safe context).
 /// Does NOT call core APIs that acquire grid_mu — safe for WM_PAINT context.
-/// Float-origin normal windows use NormalFloat; ext_windows splits use default bg.
+/// A normal window clears with the default background whether or not it was
+/// born a float: under blur the core drops a surface root's default-background
+/// runs while it hosts a layer, and the clear is what shows under them. A
+/// float-origin window used to clear with NormalFloat, which painted its
+/// Normal cells (`winhighlight=NormalFloat:Normal`) in the wrong colour; its
+/// NormalFloat cells arrive as explicit quads anyway. Same rule as macOS.
 fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind, ext_win: *const app_mod.ExternalWindow) void {
+    _ = ext_win;
     app.mu.lockUncancelable(core.clock.io());
     const cached_bg: u32 = switch (kind) {
-        .normal => if (ext_win.is_float_external) app.cached_normal_float_bg else 0xFFFFFFFF,
+        .normal => 0xFFFFFFFF,
         .cmdline, .msg_show, .msg_history => app.cached_msg_area_bg,
         .popupmenu => app.cached_pmenu_bg,
     };
@@ -2974,11 +3078,11 @@ fn armExternalPaintRetry(
     ext_win: *app_mod.ExternalWindow,
     ticket: app_mod.PaintRetryState.Ticket,
 ) void {
-    ext_win.paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
+    ext_win.surf.paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
     if (app.external_paint_retry_deadline_ms == 0 or
-        ext_win.paint_retry_deadline_ms < app.external_paint_retry_deadline_ms)
+        ext_win.surf.paint_retry_deadline_ms < app.external_paint_retry_deadline_ms)
     {
-        app.external_paint_retry_deadline_ms = ext_win.paint_retry_deadline_ms;
+        app.external_paint_retry_deadline_ms = ext_win.surf.paint_retry_deadline_ms;
     }
     if (!window_mod.scheduleReliableWindowMessage(
         hwnd,
@@ -2986,7 +3090,7 @@ fn armExternalPaintRetry(
         ticket.generation,
         @bitCast(ext_win.window_wake_cookie),
         ticket.delay_ms,
-    )) _ = ext_win.paint_retry.timerArmFailed(ticket.generation);
+    )) _ = ext_win.surf.paint_retry.timerArmFailed(ticket.generation);
 }
 
 fn scheduleExternalSizeReplay(hwnd: c.HWND, app: *App) void {
@@ -3033,39 +3137,38 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
 }
 
 fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
-    var post_device_recovery = false;
+    var device_lost = false;
     var main_hwnd: ?c.HWND = null;
-    var retry_ticket: ?app_mod.PaintRetryState.Ticket = null;
     app.mu.lockUncancelable(core.clock.io());
     const ext_win = app.external_windows.get(grid_id);
+    // No needs_redraw here: onFlushEnd reads it on every flush and nothing
+    // but a paint clears it, so the failing window was invalidated at flush
+    // rate and never waited for the retry below. The retry timer, or device
+    // recovery, is what wakes it -- as it is for the main window.
     if (ext_win) |ew| {
-        ew.surface.paint_full = true;
-        ew.needs_redraw = true;
-        retry_ticket = ew.paint_retry.fail();
-        if (ew.renderer.device_lost) {
-            post_device_recovery = true;
-            main_hwnd = app.hwnd;
-        }
+        device_lost = ew.renderer.device_lost;
+        main_hwnd = app.hwnd;
     }
     app.mu.unlock(core.clock.io());
-    if (ext_win) |ew| {
-        ew.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ew.tbs.pending_paint_full = true;
-        ew.tbs.rotation_mu.unlock(core.clock.io());
-    }
-    if (retry_ticket) |ticket| {
-        if (ext_win) |ew| armExternalPaintRetry(app, hwnd, ew, ticket);
-    }
-    if (post_device_recovery) {
-        if (main_hwnd) |target| {
-            window_mod.postDeviceLostRecovery(target, app);
-        }
+    const ew = ext_win orelse return;
+    const ticket = app_mod.failSurfacePaint(app, &ew.surf, device_lost);
+    if (device_lost) {
+        if (main_hwnd) |target| window_mod.postDeviceLostRecovery(target, app);
+    } else if (ticket) |t| {
+        armExternalPaintRetry(app, hwnd, ew, t);
     }
 }
 
-fn completeExternalPaintRetry(ext_win: *app_mod.ExternalWindow) void {
-    ext_win.paint_retry_deadline_ms = 0;
-    _ = ext_win.paint_retry.succeeded();
+/// Abandon a paint that has taken its reference but not yet installed the
+/// `finishExternalWindowPaint` defer. `app.mu` is still held at that point and
+/// the reference has to be released under it, which the deferred release
+/// cannot do (it takes `app.mu` itself). Nothing else the deferred release
+/// does applies here: a close cannot have become pending while this thread
+/// held `app.mu`. Unlocks `app.mu`.
+fn abandonExternalPaintBeforeDeferLocked(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hwnd: c.HWND) void {
+    ext_win.paint_ref_count -= 1;
+    app.mu.unlock(core.clock.io());
+    requeueExternalFullPaint(app, grid_id, hwnd);
 }
 
 /// Update cached border/icon colors for external windows (cmdline, popupmenu).
@@ -3081,18 +3184,17 @@ pub fn updateExternalWindowColors(app: *App) void {
 
     // Resolve highlight group bg colors for external window clear color cache.
     // Read during WM_PAINT (setExternalWindowClearColor) where grid_mu is unsafe.
-    var normal_float_bg: u32 = 0xFFFFFFFF;
     var msg_area_bg: u32 = 0xFFFFFFFF;
     var pmenu_bg: u32 = 0xFFFFFFFF;
 
-    // All 5 highlight groups in one grid_mu acquisition instead of 5
+    // All 4 highlight groups in one grid_mu acquisition instead of 4
     // separate lock round-trips (was: Search, Comment each own call, then
-    // NormalFloat/MsgArea/Pmenu each own call).
+    // MsgArea/Pmenu each own call).
     if (app.corep) |corep| {
-        const names = [_]?[*:0]const u8{ "Search", "Comment", "NormalFloat", "MsgArea", "Pmenu" };
-        var fg: [5]u32 = undefined;
-        var bg: [5]u32 = undefined;
-        var found: [5]i32 = undefined;
+        const names = [_]?[*:0]const u8{ "Search", "Comment", "MsgArea", "Pmenu" };
+        var fg: [4]u32 = undefined;
+        var bg: [4]u32 = undefined;
+        var found: [4]i32 = undefined;
         _ = app_mod.zonvie_core_get_hl_by_names_batch(corep, &names, &fg, &bg, &found, names.len);
 
         if (found[0] != 0) {
@@ -3105,32 +3207,119 @@ pub fn updateExternalWindowColors(app: *App) void {
             icon_g = @as(f32, @floatFromInt((fg[1] >> 8) & 0xFF)) / 255.0;
             icon_b = @as(f32, @floatFromInt(fg[1] & 0xFF)) / 255.0;
         }
-        if (found[2] != 0) normal_float_bg = bg[2];
-        if (found[3] != 0) msg_area_bg = bg[3];
-        if (found[4] != 0) pmenu_bg = bg[4];
+        if (found[2] != 0) msg_area_bg = bg[2];
+        if (found[3] != 0) pmenu_bg = bg[3];
     }
 
     app.mu.lockUncancelable(core.clock.io());
     app.cmdline_border_color = .{ border_r, border_g, border_b };
     app.cmdline_icon_color = .{ icon_r, icon_g, icon_b };
-    app.cached_normal_float_bg = normal_float_bg;
     app.cached_msg_area_bg = msg_area_bg;
     app.cached_pmenu_bg = pmenu_bg;
     app.mu.unlock(core.clock.io());
 }
 
 /// Paint an external window (simpler rendering path than main window)
+pub const ShaderCursorForward = struct {
+    verts: []const app_mod.Vertex,
+    /// Where the grid's cells start inside a decorated surface (the
+    /// cmdline's past its icon strip and padding).
+    content_origin: DecoratedContentOrigin,
+    /// A cursor on a grid this surface draws as a LAYER is in that layer's
+    /// pixels, and the layer sits at its own origin inside the surface.
+    layer_origin: [2]i32,
+};
+
+/// Put this external renderer's custom shaders in the main window's shader
+/// universe: its screen size, this window's offset in it, its time origin and
+/// its cursor uniforms. Without it each window got its own compressed shader
+/// space (a star field squeezed into the cmdline bar) and saw no cursor.
+/// Called from paint, which also forwards a cursor this surface draws into
+/// the main renderer first, and from the shader animation tick, which
+/// presents without a paint and used to keep the offset and cursor of the
+/// window's last paint.
+pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, cursor: ?ShaderCursorForward) void {
+    if (g_sh.custom_shader_pipelines.items.len == 0) return;
+    var screen_w: u32 = g_sh.width;
+    var screen_h: u32 = g_sh.height;
+    var off_x: f32 = 0;
+    var off_y: f32 = 0;
+    if (app.hwnd) |main_hwnd| {
+        if (app.renderer) |*main_r| {
+            if (main_r.width != 0 and main_r.height != 0) {
+                screen_w = main_r.width;
+                screen_h = main_r.height;
+            }
+        }
+        // Client origins on both sides: GetWindowRect includes the frame and
+        // title bar of a WS_OVERLAPPEDWINDOW, which pushed the offset into
+        // the decoration strip. Shader pixels live in client coords.
+        var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+        var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+        if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
+            off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
+            off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
+        }
+        if (cursor) |cur| if (cur.verts.len != 0) {
+            if (app.renderer) |*main_r2| {
+                // The cursor's own box, from the core's cursor_rect as the
+                // main driver takes it: a bar or underline stays one.
+                // Ghostty's cursor shaders treat iCurrentCursor.y as the
+                // BOTTOM edge of the cursor rect.
+                if (core.cursor_rect.bounds(
+                    core.Vertex,
+                    cur.verts,
+                    off_x + cur.content_origin.x + @as(f32, @floatFromInt(cur.layer_origin[0])),
+                    off_y + cur.content_origin.y + @as(f32, @floatFromInt(cur.layer_origin[1])),
+                )) |cb| {
+                    main_r2.setCursorShaderState(
+                        .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                        cur.verts[0].color,
+                    );
+                }
+            }
+        };
+        if (app.renderer) |*main_r3| {
+            // Mirror cursor uniforms + iTime origin from main, or
+            // iTime - iTimeCursorChange is nonsense in this renderer.
+            if (main_r3.custom_shader_start_qpc != 0) {
+                g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
+            }
+            g_sh.shader_cursor_current = main_r3.shader_cursor_current;
+            g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
+            g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
+            g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
+            g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+        }
+    }
+    g_sh.shader_screen_w = screen_w;
+    g_sh.shader_screen_h = screen_h;
+    g_sh.shader_window_offset_x = off_x;
+    g_sh.shader_window_offset_y = off_y;
+}
+
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow start hwnd={*}\n", .{hwnd});
     var ps: c.PAINTSTRUCT = undefined;
     _ = c.BeginPaint(hwnd, &ps);
     defer _ = c.EndPaint(hwnd, &ps);
 
-    // Read core-owned render settings before entering the atlas reader
-    // transaction. Keeping core calls outside minimizes reader lifetime and
-    // avoids needless non-blocking atlas-reset abort/retry cycles.
-    const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
-    const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
+    // While minimized, GetClientRect returns the iconic size, and the deferred
+    // resize below derives `size_mismatch` from exactly that — so the swapchain
+    // and back_tex would be rebuilt at icon size and their contents discarded,
+    // leaving the next restore to present an empty surface. A normal external
+    // window is WS_OVERLAPPEDWINDOW and carries a minimize box, and it is
+    // invalidated from onFlushEnd and finishActiveOperation regardless of
+    // iconic state. The main window has always returned here; BeginPaint above
+    // has already consumed the paint region, so Windows stops re-issuing it.
+    // The SIZE_MINIMIZED guard in WM_SIZE protects the grid resize; this one
+    // protects the surface.
+    if (c.IsIconic(hwnd) != 0) return;
+
+    const glow = app_mod.glowPaintSettings(app);
+    const glow_enabled = glow.enabled;
+    const glow_intensity = glow.intensity;
+    const glow_radius_scale = glow.radius_scale;
 
     app.mu.lockUncancelable(core.clock.io());
 
@@ -3173,10 +3362,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Cover the committed-set and atlas-generation snapshots as well as the
     // draw. A reset that commits in the gap between those snapshots and a
     // late admission check would pair old vertex UVs with the new atlas.
-    if (!app.beginAtlasPaint()) {
-        ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ext_win.tbs.pending_paint_full = true;
-        ext_win.tbs.rotation_mu.unlock(core.clock.io());
+    if (!app.beginAtlasPaintOrRequestFull(&ext_win.surf.tbs)) {
         app.mu.unlock(core.clock.io());
         return;
     }
@@ -3189,17 +3375,21 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: paint_ref_count++ -> {d}\n", .{ext_win.paint_ref_count});
 
     // TBS: acquire committed set for painting (lock-free vertex reads).
-    const tbs_snapshot = ext_win.tbs.acquireForPaint(app.alloc);
-    defer {
-        const needs_reinvalidate = ext_win.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
-        if (ext_win.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
-            if (!app.atlas_reset_active.load(.seq_cst)) {
-                _ = c.InvalidateRect(hwnd, null, 0);
-            }
-        }
-    }
-    const tbs_committed = &ext_win.tbs.sets[tbs_snapshot.committed_index];
-    const tbs_cursor = &ext_win.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
+    const tbs_snapshot = ext_win.surf.tbs.acquireForPaint(app.alloc);
+    defer if (app_mod.releasePaintSnapshot(
+        &ext_win.surf.tbs,
+        tbs_snapshot,
+        &ext_win.surf.paint_retry,
+        app.atlas_reset_active.load(.seq_cst),
+    )) {
+        _ = c.InvalidateRect(hwnd, null, 0);
+    };
+    const tbs_committed = &ext_win.surf.tbs.sets[tbs_snapshot.committed_index];
+    const tbs_cursor = &ext_win.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
+    // For the blink timer, on every kind: the normal row path re-records it
+    // below, but a decorated surface kept the initial `true` and repainted
+    // on every blink tick with no cursor to toggle.
+    ext_win.has_committed_cursor = tbs_cursor.verts.items.len > 0;
     // Shared font/cell/linespace metrics are protected by app.mu. Pair the
     // snapshot with the generation stored alongside the committed row
     // vertices so an old vertex set is never drawn using new scissor/row
@@ -3212,192 +3402,75 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
-    // Update custom-shader screen-space override so this HWND samples
-    // the main window's shader universe at its own offset/size. Without
-    // this, each ext window would get its own compressed shader space
-    // (a star field squeezed into the cmdline bar, etc.).
+    // A cursor on this surface is forwarded into the main renderer's shader
+    // cursor state (see syncExternalShaderFrame).
     if (gpu_ptr) |g_sh| {
-        if (g_sh.custom_shader_pipelines.items.len > 0) {
-            var screen_w: u32 = g_sh.width;
-            var screen_h: u32 = g_sh.height;
-            var off_x: f32 = 0;
-            var off_y: f32 = 0;
-            if (app.hwnd) |main_hwnd| {
-                if (app.renderer) |*main_r| {
-                    if (main_r.width != 0 and main_r.height != 0) {
-                        screen_w = main_r.width;
-                        screen_h = main_r.height;
-                    }
-                }
-                // Use each HWND's client-area origin rather than
-                // GetWindowRect. GetWindowRect includes any window
-                // frame / title bar (WS_OVERLAPPEDWINDOW on regular
-                // external windows), so subtracting it pushes the
-                // shader offset into the decoration strip — the
-                // rendered shader pixels in the client area end up
-                // shifted by the frame thickness. Shader pixels live
-                // in client coords, so use client origins on both
-                // sides.
-                var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
-                    off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
-                    off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
-                }
-                // If this ext surface holds the active cursor (cmdline
-                // / popupmenu / float window currently has focus),
-                // forward its rect into the main renderer's shader
-                // cursor state so cursor shaders track the visible
-                // cursor instead of the main grid's stale cursor. The
-                // ext verts are in this view's local NDC; translate
-                // to main-window drawable px using the offset above.
-                const ext_cursor_verts = tbs_cursor.verts.items;
-                if (ext_cursor_verts.len != 0) {
-                    if (app.renderer) |*main_r2| {
-                        var minx_c: f32 = ext_cursor_verts[0].position[0];
-                        var maxx_c: f32 = minx_c;
-                        var miny_c: f32 = ext_cursor_verts[0].position[1];
-                        var maxy_c: f32 = miny_c;
-                        for (ext_cursor_verts) |v| {
-                            if (v.position[0] < minx_c) minx_c = v.position[0];
-                            if (v.position[0] > maxx_c) maxx_c = v.position[0];
-                            if (v.position[1] < miny_c) miny_c = v.position[1];
-                            if (v.position[1] > maxy_c) maxy_c = v.position[1];
-                        }
-                        const ext_w_f: f32 = @floatFromInt(g_sh.width);
-                        const ext_h_f: f32 = @floatFromInt(g_sh.height);
-                        // Position the cursor at the NDC center, but
-                        // size it using main grid's cell metrics. ext
-                        // cmdline / popupmenu drawables are often
-                        // taller than a single cell (multi-row
-                        // prompt / padding) and cursor verts span the
-                        // full NDC y = -1..+1, so translating that
-                        // across the full ext drawable height makes
-                        // the cursor SDF render at the drawable's
-                        // height instead of the actual cell height.
-                        const center_x = off_x + (minx_c + maxx_c + 2.0) * 0.25 * ext_w_f;
-                        const center_y = off_y + (2.0 - miny_c - maxy_c) * 0.25 * ext_h_f;
-                        const cell_w: f32 = @floatFromInt(app.cell_w_px);
-                        const cell_h: f32 = @floatFromInt(app.rowHeightPx());
-                        const left_main = center_x - cell_w * 0.5;
-                        const right_main = center_x + cell_w * 0.5;
-                        const top_main = center_y - cell_h * 0.5;
-                        const bot_main = center_y + cell_h * 0.5;
-                        // Ghostty's cursor shaders treat iCurrentCursor.y
-                        // as the BOTTOM edge of the cursor rect.
-                        const cv0 = ext_cursor_verts[0];
-                        main_r2.setCursorShaderState(
-                            .{ left_main, bot_main, right_main - left_main, bot_main - top_main },
-                            cv0.color,
-                        );
-                    }
-                }
-
-                if (app.renderer) |*main_r3| {
-                    // Mirror cursor uniforms + iTime origin from main
-                    // so cursor shaders work in cmdline / popupmenu /
-                    // float windows. Without this, ext renderers see
-                    // (0, 0, 0, 0) for iCurrentCursor and a separate
-                    // iTime origin, so iTime - iTimeCursorChange ends
-                    // up nonsense for shaders rendered through the ext
-                    // renderer's shader pass.
-                    if (main_r3.custom_shader_start_qpc != 0) {
-                        g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
-                    }
-                    g_sh.shader_cursor_current = main_r3.shader_cursor_current;
-                    g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
-                    g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
-                    g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
-                    g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
-                }
-            }
-            g_sh.shader_screen_w = screen_w;
-            g_sh.shader_screen_h = screen_h;
-            g_sh.shader_window_offset_x = off_x;
-            g_sh.shader_window_offset_y = off_y;
-        }
+        syncExternalShaderFrame(app, hwnd, g_sh, .{
+            .verts = tbs_cursor.verts.items,
+            .content_origin = decoratedContentOriginPx(app, surface_kind),
+            .layer_origin = render_pipeline_helpers.layerOriginPx(
+                app_mod.SurfaceLayer,
+                tbs_snapshot.layers.slice(),
+                tbs_snapshot.cursor_layer_grid_id,
+                grid_id,
+            ),
+        });
     }
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;
     const is_row_mode_normal = tbs_row_mode and surface_kind == .normal;
 
-    // Snapshot vertex data. Row-mode normal surfaces use TBS committed set
-    // (lock-free via refcount). Decorated surfaces and flat-mode still need snapshot.
+    // Snapshot vertex data. Row-mode normal surfaces draw the TBS committed
+    // set in place; decorated and flat-mode surfaces draw it flattened.
     var vert_count = ext_win.vert_count;
     if (!is_row_mode_normal) {
-        if (!app_mod.snapshotSurfaceRows(
+        if (!app_mod.snapshotSetRows(
             app.alloc,
             &ext_win.paint_scratch,
             &ext_win.paint_row_ranges,
-            ext_win.surface.row_mode,
-            ext_win.surface.row_verts.items,
-            ext_win.surface.verts.items,
-            vert_count,
+            tbs_committed,
+            &ext_win.surf.tbs.pool,
         )) {
-            ext_win.surface.paint_full = true;
-            ext_win.needs_redraw = true;
-            ext_win.paint_ref_count -= 1;
-            app.mu.unlock(core.clock.io());
-            ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-            ext_win.tbs.pending_paint_full = true;
-            ext_win.tbs.rotation_mu.unlock(core.clock.io());
-            requeueExternalFullPaint(app, grid_id, hwnd);
+            abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: failed to grow scratch buffer\n", .{});
             return;
         }
-        // Append cursor vertices so decorated surfaces (cmdline) can render the cursor.
-        const cursor_items = tbs_cursor.verts.items;
+        // Append cursor vertices so decorated surfaces (cmdline) can render the
+        // cursor, on the blink phase the main driver's flat path uses.
+        const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
+            app_mod.Vertex,
+            tbs_cursor.verts.items,
+            ext_win.cursor_blink_state,
+        );
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
-                ext_win.surface.paint_full = true;
-                ext_win.needs_redraw = true;
-                ext_win.paint_ref_count -= 1;
-                app.mu.unlock(core.clock.io());
-                ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                ext_win.tbs.pending_paint_full = true;
-                ext_win.tbs.rotation_mu.unlock(core.clock.io());
-                requeueExternalFullPaint(app, grid_id, hwnd);
+                abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
                 return;
             };
             ext_win.paint_scratch.appendSliceAssumeCapacity(cursor_items);
-            vert_count = ext_win.paint_scratch.items.len;
         }
+        vert_count = ext_win.paint_scratch.items.len;
     }
 
     const cursor_blink_visible = ext_win.cursor_blink_state;
     ext_win.needs_redraw = false;
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
-    const dirty_row_keys = &ext_win.paint_dirty_row_keys;
+    const dirty_row_keys = &ext_win.surf.paint.dirty_row_keys;
     dirty_row_keys.clearRetainingCapacity();
     var dirty_snapshot_ok = true;
     if (is_row_mode_normal) {
-        const dirty_count = ext_win.tbs.paint_dirty_snapshot.count();
-        dirty_row_keys.ensureTotalCapacity(app.alloc, dirty_count) catch {
-            dirty_snapshot_ok = false;
-        };
-        if (dirty_snapshot_ok) {
-            var dit = ext_win.tbs.paint_dirty_snapshot.iterator(.{});
-            while (dit.next()) |row_idx| {
-                dirty_row_keys.appendAssumeCapacity(@intCast(row_idx));
-            }
-        }
+        dirty_snapshot_ok = ext_win.surf.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
     }
     if (!dirty_snapshot_ok) {
-        ext_win.surface.paint_full = true;
-        ext_win.paint_ref_count -= 1;
-        app.mu.unlock(core.clock.io());
-        ext_win.tbs.rotation_mu.lockUncancelable(core.clock.io());
-        ext_win.tbs.pending_paint_full = true;
-        ext_win.tbs.rotation_mu.unlock(core.clock.io());
-        requeueExternalFullPaint(app, grid_id, hwnd);
+        abandonExternalPaintBeforeDeferLocked(app, ext_win, grid_id, hwnd);
         return;
     }
-    var ext_paint_full = tbs_snapshot.paint_full or ext_win.surface.paint_full;
-    ext_win.surface.paint_full = false;
+    var ext_paint_full = tbs_snapshot.paint_full or ext_win.surf.surface.paint_full;
+    ext_win.surf.surface.paint_full = false;
 
-    // Check if renderer resize is needed (deferred from onExternalVertices to avoid deadlock)
+    // Check if renderer resize is needed (deferred from onVerticesRow to avoid deadlock)
     const needs_resize = ext_win.needs_renderer_resize;
     if (needs_resize) {
         ext_win.needs_renderer_resize = false;
@@ -3408,20 +3481,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Copy scrollbar_alpha for later use (scrollbar rendering in normal external windows)
     // This avoids use-after-free if the window is closed while we're painting
-    const scrollbar_alpha = ext_win.scrollbar_alpha;
+    const scrollbar_alpha = ext_win.surf.scrollbar.alpha;
 
-    // Check if we need to upload the full atlas (a TRUE reset happened since
-    // this window last fully re-uploaded — not just "some glyph was added").
-    // Guarded by a.mu: recreateAtlasTexture() bumps this field from
-    // ensureGlyph, which can run concurrently with this paint (same pattern as the
-    // atlas_reset_pending read elsewhere in this function).
-    var current_atlas_reset_generation: u64 = 0;
-    if (atlas_ptr) |a| {
-        a.mu.lockUncancelable(core.clock.io());
-        current_atlas_reset_generation = a.atlas_reset_generation;
-        a.mu.unlock(core.clock.io());
-    }
-    const need_full_atlas_upload = ext_win.atlas_reset_generation < current_atlas_reset_generation;
+    const current_atlas_reset_generation: u64 = if (atlas_ptr) |a| app_mod.atlasPaintGeneration(a, false).generation else 0;
 
     // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
 
@@ -3430,7 +3492,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Ensure paint_ref_count is decremented when we exit (handles all return paths)
     defer finishExternalWindowPaint(app, grid_id);
 
-    if (is_row_mode_normal and tbs_committed.metrics_gen != shared_metrics_gen_snapshot) {
+    // Vertices generated against metrics this paint no longer has are
+    // refused before any are drawn: every kind of window draws the committed
+    // TBS set. The main driver refuses the same way.
+    if (tbs_committed.metrics_gen != shared_metrics_gen_snapshot) {
         requeueExternalFullPaint(app, grid_id, hwnd);
         return;
     }
@@ -3441,54 +3506,24 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (gpu_ptr) |g| {
         g.lockContext();
         defer g.unlockContext();
-
-        // Resize this external window's own D3D atlas texture to match the
-        // shared/configured atlas_size (mirrors the main window's WM_PAINT
-        // handling at window.zig:1320-1336). Without this, external windows'
-        // GPU atlas textures stay frozen at the d3d11.Renderer default
-        // (2048x2048) forever, causing silently-dropped UpdateSubresource
-        // uploads or wrong-denominator UVs whenever atlas_size != 2048.
-        // recreateAtlasTextureIfNeeded no-ops cheaply when size is unchanged
-        // (see d3d11_renderer.zig:4103), so this is safe to call every paint.
-        if (atlas_ptr) |a| {
-            var cur_atlas_w: u32 = 0;
-            var cur_atlas_h: u32 = 0;
-            {
-                a.mu.lockUncancelable(core.clock.io());
-                defer a.mu.unlock(core.clock.io());
-                cur_atlas_w = a.atlas_w;
-                cur_atlas_h = a.atlas_h;
-            }
-            g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: D3D atlas texture recreation failed: {any}\n", .{e});
-                requeueExternalFullPaint(app, grid_id, hwnd);
-                return;
-            };
-        }
+        // The blur reads the radius from the renderer. Set once for every
+        // kind of paint: only the row pass used to, so a decorated or flat
+        // surface kept whatever radius an earlier paint left.
+        g.glow_radius_scale = glow_radius_scale;
 
         // Perform deferred renderer resize (outside app.mu lock to avoid deadlock)
         // WARNING: D3D/DXGI operations can pump Win32 messages internally.
         // This means WM_APP_CLOSE_EXTERNAL_WINDOW could be processed during resize,
         // freeing ext_win and invalidating our `g` pointer. We must re-validate after resize.
         //
-        // Also detect client-area size mismatch (e.g. WM_SIZE from user drag-resize)
-        // that was not captured by needs_renderer_resize. If the renderer back_tex
-        // is recreated inside presentOnlyFromBack AFTER row drawing, all drawn
-        // content is lost. Resizing here and forcing a full repaint prevents that.
-        const size_mismatch = blk: {
-            if (needs_resize) break :blk true;
-            var rc: c.RECT = undefined;
-            _ = c.GetClientRect(g.hwnd, &rc);
-            const cw: u32 = @intCast(@max(1, rc.right - rc.left));
-            const ch: u32 = @intCast(@max(1, rc.bottom - rc.top));
-            break :blk (cw != g.width or ch != g.height);
+        // Also catches a client-area size mismatch (e.g. WM_SIZE from user
+        // drag-resize) that was not captured by needs_renderer_resize.
+        const resized = app_mod.resizeSurfaceIfNeeded(g, needs_resize) catch |e| {
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
+            requeueExternalFullPaint(app, grid_id, hwnd);
+            return;
         };
-        if (size_mismatch) {
-            g.resize() catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow deferred resize failed: {any}\n", .{e});
-                requeueExternalFullPaint(app, grid_id, hwnd);
-                return;
-            };
+        if (resized) {
             // back_tex was recreated — force full repaint so all rows are redrawn.
             ext_paint_full = true;
 
@@ -3504,23 +3539,18 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
 
-        // Upload atlas to external window's D3D context.
-        // Uses since-based cursor so each window independently tracks its
-        // position in the append-only pending_uploads queue.
+        // The shared atlas texture (the main renderer's), brought up to
+        // date and borrowed. Refused -- a failed upload, or a renderer still
+        // on a device recovery has replaced -- it is not drawn against.
+        var ext_atlas_uploaded = false;
         if (atlas_ptr) |a| {
-            if (need_full_atlas_upload) {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
-            }
-            const upload = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
-            if (upload.success) {
-                ext_win.atlas_upload_cursor = upload.cursor;
-                if (need_full_atlas_upload) {
-                    ext_win.atlas_reset_generation = current_atlas_reset_generation;
-                }
-            } else {
+            const sync = app_mod.syncSharedAtlas(app, a, g, current_atlas_reset_generation, &ext_win.surf.atlas_seen_upload_seq);
+            if (!sync.ok) {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: shared atlas sync failed\n", .{});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }
+            ext_atlas_uploaded = sync.uploaded;
         }
 
         // Set clear color from cached highlight group bg colors (no grid_mu acquisition).
@@ -3532,14 +3562,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // by an earlier normal row-mode incarnation of this window.
             _ = app_mod.resizeRowVBsForPaint(
                 app.alloc,
-                &ext_win.row_vbs,
+                &ext_win.surf.paint.row_vbs,
                 &app.row_vb_budget,
-                &ext_win.row_vb_retained_bytes,
+                &ext_win.surf.paint.row_vb_retained_bytes,
                 0,
             );
 
             // cmdline/msg_show/msg_history derive their content dims from
-            // ext_win.surface.rows/cols (same computation as the matching
+            // ext_win.surf.surface.rows/cols (same computation as the matching
             // internal checks inside drawDecoratedExternalSurface). A
             // transient zero-dimension state there returns a plain success
             // (not an error), so without this check execution would fall
@@ -3547,12 +3577,12 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // from the previous frame (see LOW-13 in the fix-plan doc).
             if (surface_kind == .cmdline or surface_kind == .msg_show or surface_kind == .msg_history) {
                 app.mu.lockUncancelable(core.clock.io());
-                const content_rows = ext_win.surface.rows;
-                const content_cols = ext_win.surface.cols;
+                const content_rows = ext_win.surf.surface.rows;
+                const content_cols = ext_win.surf.surface.cols;
                 app.mu.unlock(core.clock.io());
                 if (content_rows == 0 or content_cols == 0) {
                     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: skipping draw+present for zero-dimension grid_id={d}\n", .{grid_id});
-                    completeExternalPaintRetry(ext_win);
+                    ext_win.surf.completePaintRetry();
                     return;
                 }
             }
@@ -3572,11 +3602,11 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present succeeded\n", .{});
-            completeExternalPaintRetry(ext_win);
+            ext_win.surf.completePaintRetry();
             return;
         }
 
-        const force_full_present = drawNormalExternalSurface(
+        const present_facts = drawNormalExternalSurface(
             g,
             app,
             ext_win,
@@ -3589,43 +3619,61 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             scrollbar_alpha,
             dirty_row_keys.items,
             ext_paint_full,
-            glow_enabled,
-            glow_intensity,
+            glow,
             tbs_snapshot,
             row_h_px_snapshot,
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow normal draw failed: {any}\n", .{e});
             if (e == error.RowVBPhysicalBudgetExceeded) {
-                app.row_vb_budget_failed = true;
-                if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
                 return;
             }
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         };
 
-        if (is_row_mode_normal) {
+        const metrics_still_current = !is_row_mode_normal or blk: {
             app.mu.lockUncancelable(core.clock.io());
-            const metrics_still_current = app.shared_metrics_gen == shared_metrics_gen_snapshot;
-            app.mu.unlock(core.clock.io());
-            if (!metrics_still_current) {
-                requeueExternalFullPaint(app, grid_id, hwnd);
-                return;
-            }
-        }
+            defer app.mu.unlock(core.clock.io());
+            break :blk app.shared_metrics_gen == shared_metrics_gen_snapshot;
+        };
 
-        if (!force_full_present and ext_win.paint_present_rects.items.len == 0) {
+        // Asked for, not failed: this frame still presents what it drew, as
+        // the main driver's does.
+        if (render_pipeline_helpers.atlasUploadOwesFullPaint(ext_atlas_uploaded, ext_win.paint_drew_root_rows)) {
+            if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: atlas uploaded with no root row drawn, repainting\n", .{});
+            app.mu.lockUncancelable(core.clock.io());
+            ext_win.surf.surface.paint_full = true;
+            app.mu.unlock(core.clock.io());
+            ext_win.surf.tbs.requestFullPaint();
+            _ = c.InvalidateRect(hwnd, null, 0);
+        }
+        // The main driver's gate, with no seed; an incomplete frame was
+        // refused above, by the draw's error.
+        const present_gate = render_pipeline_helpers.presentGate(.{
+            .metrics_ok = metrics_still_current,
+            .force_full_rows = present_facts.force_full_rows,
+            .present_rects_overflowed = present_facts.present_rects_overflowed,
+            .custom_shader = present_facts.custom_shader,
+            .preserve_back = true,
+            .rows = 0,
+            .rows_to_draw = 0,
+            .skipped_empty = 0,
+            .present_rects = ext_win.surf.paint.present_rects.items.len,
+        });
+        if (present_gate.verdict == .refuse) {
+            requeueExternalFullPaint(app, grid_id, hwnd);
+            return;
+        }
+        if (present_gate.verdict == .skip) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
-            completeExternalPaintRetry(ext_win);
+            ext_win.surf.completePaintRetry();
             return;
         }
 
         g.presentFromBackRectsWithCursorNoResize(
-            ext_win.paint_present_rects.items,
-            null,
-            0,
-            null,
-            force_full_present,
+            ext_win.surf.paint.present_rects.items,
+            present_gate.full,
             null,
             null,
         ) catch |e| {
@@ -3637,7 +3685,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;
         }
-        completeExternalPaintRetry(ext_win);
+        ext_win.surf.completePaintRetry();
     } else {
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
         requeueExternalFullPaint(app, grid_id, hwnd);
@@ -3657,14 +3705,17 @@ const MAX_WIN_INFOS = 32;
 
 /// Collect layout info for all visible windows. Caller must hold app.mu.
 /// `include_main`: all ext_windows operations pass true. Parameter retained for future use.
-/// Main window is registered as grid 2 (Neovim's default editor grid).
+/// Entries are OS windows keyed by surface id: the main window is 1 whatever
+/// grids it holds, an external window its own root grid. The main window used
+/// to be grid 2, which is only its grid until that window is externalized --
+/// then two entries shared the id. Same keys as macOS `allWindowLayoutInfos`.
 /// Called from the core thread; GetWindowRect/SetWindowPos are thread-safe Win32 APIs,
 /// and app.mu serializes access against concurrent window operations.
 fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_INFOS]WindowInfo, count: usize } {
     var result: [MAX_WIN_INFOS]WindowInfo = undefined;
     var count: usize = 0;
 
-    // Main window (grid 2)
+    // Main window (surface 1)
     if (include_main) {
         if (app.hwnd) |main_hwnd| {
             var rect: c.RECT = std.mem.zeroes(c.RECT);
@@ -3674,7 +3725,7 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
             // zonvie_core_get_win_id would re-acquire grid_mu causing deadlock.
             // Callers that need win_id must resolve it separately.
             const main_win_id: i64 = 0;
-            result[count] = .{ .grid_id = 2, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
+            result[count] = .{ .grid_id = 1, .win_id = main_win_id, .rect = rect, .hwnd = main_hwnd };
             count += 1;
         }
     }
@@ -3690,7 +3741,10 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
         if (grid_id < 0) continue; // Skip special windows (cmdline, popupmenu, etc.)
         const ext = entry.value_ptr.*;
         if (ext.is_pending_close) continue;
-        if (c.IsWindowVisible(ext.hwnd) == 0) continue; // Skip hidden windows
+        // Skip hidden and minimized windows. IsWindowVisible is still true for
+        // an iconic one, whose rect is the off-screen minimized position; macOS
+        // leaves those out through `isVisible`.
+        if (c.IsWindowVisible(ext.hwnd) == 0 or c.IsIconic(ext.hwnd) != 0) continue;
         var rect: c.RECT = std.mem.zeroes(c.RECT);
         _ = c.GetWindowRect(ext.hwnd, &rect);
         result[count] = .{ .grid_id = grid_id, .win_id = ext.win_id, .rect = rect, .hwnd = ext.hwnd };
@@ -3700,384 +3754,185 @@ fn collectWindowInfos(app: *App, include_main: bool) struct { infos: [MAX_WIN_IN
     return .{ .infos = result, .count = count };
 }
 
-/// Find nearest window in direction. Returns matching WindowInfo or null.
-/// direction: 0=down, 1=up, 2=right, 3=left
-/// Falls back to the nearest window overall when no candidate is found in the strict direction
-/// (e.g. when window centers align on the checked axis).
-fn findInDirection(infos: []const WindowInfo, ref_grid: i64, direction: i32, count: i32) ?WindowInfo {
-    // Find reference
-    var ref_cx: i32 = 0;
-    var ref_cy: i32 = 0;
-    var found_ref = false;
-    for (infos) |info| {
-        if (info.grid_id == ref_grid) {
-            ref_cx = @divTrunc(info.rect.left + info.rect.right, 2);
-            ref_cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-            found_ref = true;
-            break;
-        }
-    }
-    if (!found_ref) return null;
-
-    // Collect directional candidates
-    var candidates: [MAX_WIN_INFOS]WindowInfo = undefined;
-    var distances: [MAX_WIN_INFOS]i32 = undefined;
-    var cand_count: usize = 0;
-
-    for (infos) |info| {
-        if (info.grid_id == ref_grid) continue;
-        const cx = @divTrunc(info.rect.left + info.rect.right, 2);
-        const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-
-        const match = switch (direction) {
-            0 => cy > ref_cy, // down (Win32: higher Y = lower on screen)
-            1 => cy < ref_cy, // up
-            2 => cx > ref_cx, // right
-            3 => cx < ref_cx, // left
-            else => false,
-        };
-        if (match) {
-            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
-            candidates[cand_count] = info;
-            distances[cand_count] = dist;
-            cand_count += 1;
-        }
-    }
-
-    // Fallback: if no directional candidates, collect all other windows
-    if (cand_count == 0) {
-        for (infos) |info| {
-            if (info.grid_id == ref_grid) continue;
-            const cx = @divTrunc(info.rect.left + info.rect.right, 2);
-            const cy = @divTrunc(info.rect.top + info.rect.bottom, 2);
-            const dist = absI32(cx - ref_cx) + absI32(cy - ref_cy);
-            candidates[cand_count] = info;
-            distances[cand_count] = dist;
-            cand_count += 1;
-        }
-    }
-
-    if (cand_count == 0) return null;
-
-    // Sort by distance (simple selection sort)
-    for (0..cand_count) |i| {
-        var min_idx = i;
-        for (i + 1..cand_count) |j| {
-            if (distances[j] < distances[min_idx]) min_idx = j;
-        }
-        if (min_idx != i) {
-            std.mem.swap(WindowInfo, &candidates[i], &candidates[min_idx]);
-            std.mem.swap(i32, &distances[i], &distances[min_idx]);
-        }
-    }
-
-    const idx: usize = if (count > 0) @intCast(count - 1) else 0;
-    return if (idx < cand_count) candidates[idx] else candidates[0];
+/// The surface id of the OS window showing `grid_id`: the external window
+/// that is the grid or hosts it, otherwise the main window (1). The window
+/// ops were handed raw grid ids, so a split of the main window other than
+/// grid 2, or a float an external window hosts, found no window to start
+/// from. Caller must hold app.mu.
+fn showingSurfaceIdLocked(app: *App, grid_id: i64) i64 {
+    const shown = callbacks.externalWindowShowingGridLocked(app, grid_id) orelse return 1;
+    return shown.root_grid_id;
 }
 
-/// Calculate popupmenu Y position, preferring below the anchor cell.
-/// Falls back to above if below would go off-screen.
-/// Mirrors macOS popupmenuWindowRect() logic adapted to Windows coords (Y-down).
-fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd: c.HWND) c_int {
-    const below_y = anchor_top + cell_h;
-    const above_y = anchor_top - popup_h;
-
-    // Get work area (screen minus taskbar) for the monitor containing ref_hwnd
+/// Calculate popupmenu Y position, preferring below the anchor cell and
+/// flipping above when the popup would run past the bottom of the window the
+/// anchor is in — the core's rule (zonvie_core_popupmenu_top), shared with
+/// macOS. It used to flip only at the monitor work area, so near the bottom
+/// of a window that was not at the bottom of the screen the popup hung below
+/// the window here and flipped up on macOS.
+/// Popupmenu X: the anchor column (the Windows popupmenu draws at its client
+/// origin, so no text inset), shifted left to stay inside the work area of the
+/// monitor holding the reference window -- the core's rule, shared with macOS.
+fn popupmenuPositionX(anchor_left: c_int, popup_w: c_int, ref_hwnd: c.HWND) c_int {
+    var screen_left: c_int = std.math.minInt(c_int);
+    var screen_right: c_int = std.math.maxInt(c_int);
     var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
     monitor_info.cbSize = @sizeOf(c.MONITORINFO);
     const monitor = c.MonitorFromWindow(ref_hwnd, c.MONITOR_DEFAULTTONEAREST);
     if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) {
-        const screen_bottom = monitor_info.rcWork.bottom;
-        const screen_top = monitor_info.rcWork.top;
-
-        // Prefer below; if it overflows screen bottom, try above
-        if (below_y + popup_h <= screen_bottom) {
-            return below_y;
-        } else if (above_y >= screen_top) {
-            return above_y;
-        }
+        screen_left = monitor_info.rcWork.left;
+        screen_right = monitor_info.rcWork.right;
     }
-
-    // Fallback: below
-    return below_y;
+    return app_mod.zonvie_core_popupmenu_left(anchor_left, popup_w, 0, screen_left, screen_right);
 }
 
-fn absI32(v: i32) i32 {
-    return if (v < 0) -v else v;
+fn popupmenuPositionY(anchor_top: c_int, cell_h: c_int, popup_h: c_int, ref_hwnd: c.HWND) c_int {
+    // The reference window's client bottom, in screen coordinates.
+    var ref_bottom: c_int = std.math.maxInt(c_int);
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(ref_hwnd, &client) != 0) {
+        var pt: c.POINT = .{ .x = 0, .y = client.bottom };
+        if (c.ClientToScreen(ref_hwnd, &pt) != 0) ref_bottom = pt.y;
+    }
+    // The usable screen top for the monitor holding the reference window.
+    var screen_top: c_int = std.math.minInt(c_int);
+    var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+    const monitor = c.MonitorFromWindow(ref_hwnd, c.MONITOR_DEFAULTTONEAREST);
+    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
+
+    return app_mod.zonvie_core_popupmenu_top(anchor_top, cell_h, popup_h, ref_bottom, screen_top);
 }
 
-/// Append a two-window position swap (A moves to B's position keeping A's
-/// size; B moves to A's position keeping B's size) to app.deferred_win_ops.
-/// Appends after any ops a previous call queued whose
-/// WM_APP_DEFERRED_WIN_POS the UI thread has not drained yet — resetting the
-/// count here would silently drop that earlier op set. Returns false (drops
-/// the swap) when fewer than 2 slots remain. Caller MUST hold app.mu while
-/// calling this, and MUST PostMessageW(hwnd, WM_APP_DEFERRED_WIN_POS, 0, 0)
-/// after unlocking -- SetWindowPos on a cross-thread-owned window sends
-/// WM_SIZE synchronously to the UI thread, which calls
-/// updateLayoutToCore -> grid_mu.lock(); calling it directly from the core
-/// thread while grid_mu is held (as this function's callers are) deadlocks.
-/// This mirrors the existing onWinRotate/onWinResizeEqual deferred pattern.
-fn queueSwapWindowPositions(app: *App, hwnd_a: c.HWND, rect_a: c.RECT, hwnd_b: c.HWND, rect_b: c.RECT) bool {
+const win_layout = core.win_layout;
+
+/// Rows closer than this in centre height are one row in reading order: the
+/// band macOS uses (20pt), scaled.
+fn layoutRowBandPx(app: *App) f64 {
+    return @floatFromInt(app.scalePx(20));
+}
+
+/// `infos` as frames for the core's window-layout plan, each id its index.
+/// Win32 rects are already top-left, y down.
+fn layoutFrames(infos: []const WindowInfo, out: *[MAX_WIN_INFOS]win_layout.Frame) []win_layout.Frame {
+    for (infos, 0..) |info, i| {
+        out[i] = .{
+            .id = @intCast(i),
+            .x = @floatFromInt(info.rect.left),
+            .y = @floatFromInt(info.rect.top),
+            .w = @floatFromInt(info.rect.right - info.rect.left),
+            .h = @floatFromInt(info.rect.bottom - info.rect.top),
+        };
+    }
+    return out[0..infos.len];
+}
+
+fn infoIndex(infos: []const WindowInfo, surface_id: i64) ?usize {
+    for (infos, 0..) |info, i| if (info.grid_id == surface_id) return i;
+    return null;
+}
+
+fn roundPx(v: f64) c_int {
+    return @intFromFloat(@round(v));
+}
+
+fn frameMoved(rect: c.RECT, frame: win_layout.Frame) bool {
+    return rect.left != roundPx(frame.x) or rect.top != roundPx(frame.y) or
+        rect.right - rect.left != roundPx(frame.w) or rect.bottom - rect.top != roundPx(frame.h);
+}
+
+/// Queue every window the plan moved or resized, after any ops a previous call
+/// queued whose WM_APP_DEFERRED_WIN_POS the UI thread has not drained -- a reset
+/// count would drop them. Returns how many were appended: 0 when nothing
+/// changed, or when they would not all fit (none is queued then, so no window
+/// moves without the one it swaps with). Caller holds app.mu and posts
+/// WM_APP_DEFERRED_WIN_POS after unlocking: SetWindowPos on a window another
+/// thread owns sends WM_SIZE to the UI thread, which takes grid_mu, and these
+/// callbacks run with grid_mu held.
+fn queuePlannedFrames(app: *App, infos: []const WindowInfo, frames: []const win_layout.Frame) usize {
     const base = app.deferred_win_ops_count;
-    if (base + 2 > App.MAX_DEFERRED_WIN_OPS) {
-        if (applog.isEnabled()) applog.appLog("[win] queueSwapWindowPositions: deferred_win_ops full, dropping swap\n", .{});
-        return false;
+    var changed: usize = 0;
+    for (infos, frames) |info, frame| {
+        if (frameMoved(info.rect, frame)) changed += 1;
     }
-    const w_a = rect_a.right - rect_a.left;
-    const h_a = rect_a.bottom - rect_a.top;
-    const w_b = rect_b.right - rect_b.left;
-    const h_b = rect_b.bottom - rect_b.top;
-    app.deferred_win_ops[base] = .{ .hwnd = hwnd_a, .x = rect_b.left, .y = rect_b.top, .w = w_a, .h = h_a, .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE };
-    app.deferred_win_ops[base + 1] = .{ .hwnd = hwnd_b, .x = rect_a.left, .y = rect_a.top, .w = w_b, .h = h_b, .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE };
-    app.deferred_win_ops_count = base + 2;
-    return true;
+    if (changed == 0) return 0;
+    if (base > App.MAX_DEFERRED_WIN_OPS or changed > App.MAX_DEFERRED_WIN_OPS - base) {
+        if (applog.isEnabled()) applog.appLog("[win] window layout: deferred_win_ops full, dropping\n", .{});
+        return 0;
+    }
+    var i = base;
+    for (infos, frames) |info, frame| {
+        if (!frameMoved(info.rect, frame)) continue;
+        app.deferred_win_ops[i] = .{
+            .hwnd = info.hwnd,
+            .x = roundPx(frame.x),
+            .y = roundPx(frame.y),
+            .w = roundPx(frame.w),
+            .h = roundPx(frame.h),
+            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
+        };
+        i += 1;
+    }
+    app.deferred_win_ops_count = i;
+    return changed;
 }
 
-/// Sort window infos spatially: top-to-bottom, left-to-right.
-fn sortSpatially(infos: []WindowInfo) void {
-    for (0..infos.len) |i| {
-        var min_idx = i;
-        for (i + 1..infos.len) |j| {
-            const a_cy = @divTrunc(infos[min_idx].rect.top + infos[min_idx].rect.bottom, 2);
-            const b_cy = @divTrunc(infos[j].rect.top + infos[j].rect.bottom, 2);
-            const a_cx = @divTrunc(infos[min_idx].rect.left + infos[min_idx].rect.right, 2);
-            const b_cx = @divTrunc(infos[j].rect.left + infos[j].rect.right, 2);
-            if (b_cy < a_cy or (b_cy == a_cy and b_cx < a_cx)) {
-                min_idx = j;
-            }
+/// Plan `op` over every visible window with the core's window-layout rule and
+/// queue what moved. `source_grid` names the window the event came from, by
+/// grid; it is mapped to the OS window showing that grid. Shared by every
+/// window-layout callback, which each carried its own copy of the geometry.
+fn planAndQueueWindowLayout(app: *App, op: win_layout.Op, arg: i32, count: i32, source_grid: ?i64, name: []const u8) void {
+    if (applog.isEnabled()) applog.appLog("[win] {s}: arg={d} count={d}\n", .{ name, arg, count });
+    app.mu.lockUncancelable(core.clock.io());
+    const coll = collectWindowInfos(app, true);
+    const hwnd = app.hwnd;
+    const infos = coll.infos[0..coll.count];
+    var frame_buf: [MAX_WIN_INFOS]win_layout.Frame = undefined;
+    const frames = layoutFrames(infos, &frame_buf);
+    const source_index: ?usize = if (source_grid) |g| infoIndex(infos, showingSurfaceIdLocked(app, g)) else 0;
+    var queued: usize = 0;
+    if (source_index) |si| {
+        if (win_layout.plan(op, arg, count, @intCast(si), layoutRowBandPx(app), frames)) {
+            queued = queuePlannedFrames(app, infos, frames);
         }
-        if (min_idx != i) std.mem.swap(WindowInfo, &infos[i], &infos[min_idx]);
+    }
+    app.mu.unlock(core.clock.io());
+    if (queued == 0) return;
+
+    const posted = if (hwnd) |h| c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) != 0 else false;
+    if (!posted) {
+        if (applog.isEnabled()) applog.appLog("[win] {s}: PostMessageW failed\n", .{name});
+        // Remove only what this call appended. If a drain already consumed
+        // it, there is nothing to remove.
+        app.mu.lockUncancelable(core.clock.io());
+        if (app.deferred_win_ops_count >= queued) app.deferred_win_ops_count -= queued;
+        app.mu.unlock(core.clock.io());
     }
 }
 
 pub fn onWinMove(ctx: ?*anyopaque, grid_id: i64, win: i64, flags: i32) callconv(.c) void {
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_move: grid={d} flags={d}\n", .{ grid_id, flags });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-
-    var queued = false;
-    const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, grid_id, flags, 1)) |target| {
-        // Find source rect
-        for (infos) |info| {
-            if (info.grid_id == grid_id) {
-                queued = queueSwapWindowPositions(app, info.hwnd, info.rect, target.hwnd, target.rect);
-                break;
-            }
-        }
-    }
-    app.mu.unlock(core.clock.io());
-
-    if (queued) {
-        if (hwnd) |h| {
-            if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-                if (applog.isEnabled()) applog.appLog("[win] on_win_move: PostMessageW failed\n", .{});
-                // Remove only the 2 ops this call appended. If a drain already
-                // consumed them (count < 2), there is nothing to remove.
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.deferred_win_ops_count >= 2) app.deferred_win_ops_count -= 2;
-                app.mu.unlock(core.clock.io());
-            }
-        }
-    }
+    planAndQueueWindowLayout(app, .move, flags, 1, grid_id, "on_win_move");
 }
 
 pub fn onWinExchange(ctx: ?*anyopaque, grid_id: i64, win: i64, count: i32) callconv(.c) void {
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: grid={d} count={d}\n", .{ grid_id, count });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count]);
-
-    // Find source index
-    var src_idx: ?usize = null;
-    for (sorted[0..coll.count], 0..) |info, i| {
-        if (info.grid_id == grid_id) {
-            src_idx = i;
-            break;
-        }
-    }
-    const si = src_idx orelse {
-        app.mu.unlock(core.clock.io());
-        return;
-    };
-
-    // count=0 means "next window" (default for <C-w>x without count prefix)
-    const effective_count: i32 = if (count == 0) 1 else count;
-    const n: i32 = @intCast(coll.count);
-    var dst: i32 = @as(i32, @intCast(si)) + effective_count;
-    dst = @mod(dst, n);
-    if (dst < 0) dst += n;
-    const di: usize = @intCast(dst);
-    var queued = false;
-    if (di != si) {
-        queued = queueSwapWindowPositions(app, sorted[si].hwnd, sorted[si].rect, sorted[di].hwnd, sorted[di].rect);
-    }
-    app.mu.unlock(core.clock.io());
-
-    if (queued) {
-        if (hwnd) |h| {
-            if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-                if (applog.isEnabled()) applog.appLog("[win] on_win_exchange: PostMessageW failed\n", .{});
-                // Remove only the 2 ops this call appended. If a drain already
-                // consumed them (count < 2), there is nothing to remove.
-                app.mu.lockUncancelable(core.clock.io());
-                if (app.deferred_win_ops_count >= 2) app.deferred_win_ops_count -= 2;
-                app.mu.unlock(core.clock.io());
-            }
-        }
-    }
+    planAndQueueWindowLayout(app, .exchange, 0, count, grid_id, "on_win_exchange");
 }
 
-/// Defers SetWindowPos to UI thread via PostMessage to avoid blocking the core
-/// thread on cross-thread message processing while grid_mu is held.
 pub fn onWinRotate(ctx: ?*anyopaque, grid_id: i64, win: i64, direction: i32, count: i32) callconv(.c) void {
     _ = grid_id;
     _ = win;
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: direction={d} count={d}\n", .{ direction, count });
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd orelse {
-        app.mu.unlock(core.clock.io());
-        return;
-    };
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    var sorted: [MAX_WIN_INFOS]WindowInfo = coll.infos;
-    sortSpatially(sorted[0..coll.count]);
-
-    // Save original positions (left, top) only — each window keeps its own size
-    var lefts: [MAX_WIN_INFOS]c.LONG = undefined;
-    var tops: [MAX_WIN_INFOS]c.LONG = undefined;
-    for (0..coll.count) |i| {
-        lefts[i] = sorted[i].rect.left;
-        tops[i] = sorted[i].rect.top;
-    }
-
-    // count=0 means "rotate once" (default for <C-w>r without count prefix).
-    // Reject malformed negative counts and reduce huge counts modulo the number
-    // of windows instead of doing attacker-controlled O(count * windows) work.
-    if (count < 0) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    const n = coll.count;
-    const effective_count: usize = @mod(if (count == 0) @as(usize, 1) else @as(usize, @intCast(count)), n);
-    if (effective_count == 0) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-
-    // Append after any ops still awaiting their WM_APP_DEFERRED_WIN_POS drain
-    // (resetting the count here would silently drop that earlier op set).
-    const base = app.deferred_win_ops_count;
-    if (base > App.MAX_DEFERRED_WIN_OPS or n > App.MAX_DEFERRED_WIN_OPS - base) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    for (0..n) |i| {
-        // Compute directly from the immutable position snapshot. This keeps
-        // even attacker-sized counts O(window_count), after the modulo above.
-        const source_index = if (direction == 0)
-            (i + n - effective_count) % n
-        else
-            (i + effective_count) % n;
-        app.deferred_win_ops[base + i] = .{
-            .hwnd = sorted[i].hwnd,
-            .x = lefts[source_index],
-            .y = tops[source_index],
-            .w = sorted[i].rect.right - sorted[i].rect.left,
-            .h = sorted[i].rect.bottom - sorted[i].rect.top,
-            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-        };
-    }
-    app.deferred_win_ops_count = base + n;
-    // Post while app.mu still excludes both the UI drain and other appenders;
-    // a failed post can therefore roll back exactly this transaction.
-    if (c.PostMessageW(hwnd, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-        app.deferred_win_ops_count = base;
-        if (applog.isEnabled()) applog.appLog("[win] on_win_rotate: PostMessageW failed\n", .{});
-    }
-    app.mu.unlock(core.clock.io());
+    planAndQueueWindowLayout(app, .rotate, direction, count, null, "on_win_rotate");
 }
 
-/// Make all windows equal size (including main window).
-/// Defers SetWindowPos to UI thread via PostMessage to avoid deadlock:
-/// SetWindowPos on the main window from core thread sends WM_SIZE → updateLayoutToCore → grid_mu.lock()
-/// while grid_mu is already held by the core thread during this callback.
+/// Make all windows equal size (including main window), top-left corners kept.
 pub fn onWinResizeEqual(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal\n", .{});
-
-    app.mu.lockUncancelable(core.clock.io());
-    const coll = collectWindowInfos(app, true);
-    const hwnd = app.hwnd;
-
-    if (coll.count < 2) {
-        app.mu.unlock(core.clock.io());
-        return;
-    }
-    const infos = coll.infos[0..coll.count];
-
-    // Calculate average size
-    var total_w: i32 = 0;
-    var total_h: i32 = 0;
-    for (infos) |info| {
-        total_w += info.rect.right - info.rect.left;
-        total_h += info.rect.bottom - info.rect.top;
-    }
-    const n: i32 = @intCast(coll.count);
-    const avg_w = @divTrunc(total_w, n);
-    const avg_h = @divTrunc(total_h, n);
-
-    // Append after any ops still awaiting their WM_APP_DEFERRED_WIN_POS drain
-    // (resetting the count here would silently drop that earlier op set).
-    const base = app.deferred_win_ops_count;
-    var appended: usize = 0;
-    for (infos, 0..) |info, i| {
-        if (base + i >= App.MAX_DEFERRED_WIN_OPS) break;
-        app.deferred_win_ops[base + i] = .{
-            .hwnd = info.hwnd,
-            .x = info.rect.left,
-            .y = info.rect.top,
-            .w = avg_w,
-            .h = avg_h,
-            .flags = c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-        };
-        appended = i + 1;
-    }
-    app.deferred_win_ops_count = base + appended;
-    app.mu.unlock(core.clock.io());
-
-    if (hwnd) |h| {
-        if (c.PostMessageW(h, app_mod.WM_APP_DEFERRED_WIN_POS, 0, 0) == 0) {
-            if (applog.isEnabled()) applog.appLog("[win] on_win_resize_equal: PostMessageW failed\n", .{});
-            // Remove only what this call appended. If a drain already
-            // consumed it (count < appended), there is nothing to remove.
-            app.mu.lockUncancelable(core.clock.io());
-            if (app.deferred_win_ops_count >= appended) app.deferred_win_ops_count -= appended;
-            app.mu.unlock(core.clock.io());
-        }
-    }
+    planAndQueueWindowLayout(app, .resize_equal, 0, 0, null, "on_win_resize_equal");
 }
 
 pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c) i64 {
@@ -4085,24 +3940,32 @@ pub fn onWinMoveCursor(ctx: ?*anyopaque, direction: i32, count: i32) callconv(.c
     if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: direction={d} count={d}\n", .{ direction, count });
 
     app.mu.lockUncancelable(core.clock.io());
-    const cursor_grid = app.last_cursor_grid;
-    const coll = collectWindowInfos(app, true);
     const corep = app.corep;
+    app.mu.unlock(core.clock.io());
+    const cp = corep orelse return 0;
+
+    // Outside app.mu: these take grid_mu, which the core takes before app.mu.
+    // The cursor's grid is the core's; app.last_cursor_grid also records
+    // special windows the cursor never enters.
+    const cursor_grid = app_mod.zonvie_core_get_cursor_position(cp, null, null);
+    var grids: [64]app_mod.GridInfo = undefined;
+    const grid_count = app_mod.zonvie_core_get_visible_grids(cp, &grids, grids.len);
+    const main_target_grid = render_pipeline_helpers.mainMoveTargetGrid(app_mod.GridInfo, grids[0..grid_count]);
+
+    app.mu.lockUncancelable(core.clock.io());
+    const current_id = showingSurfaceIdLocked(app, cursor_grid);
+    const coll = collectWindowInfos(app, true);
     app.mu.unlock(core.clock.io());
 
     const infos = coll.infos[0..coll.count];
-    if (findInDirection(infos, cursor_grid, direction, count)) |target| {
-        // collectWindowInfos sets win_id=0 for grid 2 (main window) to avoid
-        // calling zonvie_core_get_win_id while grid_mu might be held.
-        // Resolve it here where app.mu is released and grid_mu is not held.
-        var win_id = target.win_id;
-        if (win_id == 0 and target.grid_id == 2) {
-            if (corep) |cp| {
-                win_id = app_mod.zonvie_core_get_win_id(cp, 2);
-            }
-        }
-        if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
-        return win_id;
-    }
-    return 0;
+    var frame_buf: [MAX_WIN_INFOS]win_layout.Frame = undefined;
+    const frames = layoutFrames(infos, &frame_buf);
+    const current_index = infoIndex(infos, current_id) orelse return 0;
+    const target_index = win_layout.findInDirection(frames, @intCast(current_index), @enumFromInt(direction), count) orelse return 0;
+    const target = infos[target_index];
+    // collectWindowInfos leaves the main window's win_id 0: it may run with
+    // grid_mu held. Resolved here, where it is not.
+    const win_id = if (target.grid_id == 1) app_mod.zonvie_core_get_win_id(cp, main_target_grid) else target.win_id;
+    if (applog.isEnabled()) applog.appLog("[win] on_win_move_cursor: -> win_id={d}\n", .{win_id});
+    return win_id;
 }

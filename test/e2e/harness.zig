@@ -36,6 +36,20 @@ pub const WaitError = error{ Timeout, NvimExited };
 
 pub const AgentEvent = struct { tab: i64, state: u8, title: []u8 };
 
+/// Per-grid on_grid_row_scroll tally. The core fires that callback only for a
+/// grid whose whole batch of scrolls can be republished as ONE row shift, so a
+/// nonzero `calls` is itself the observation that the row-shift fast path was
+/// taken for that grid.
+pub const RowScrollRecord = struct {
+    grid_id: i64 = 0,
+    calls: u32 = 0,
+    last_rows_delta: i32 = 0,
+};
+
+/// A scenario asks about a handful of window grids, never an unbounded set, so
+/// the tally lives in a fixed table rather than a growing list.
+const max_row_scroll_grids = 16;
+
 /// One recorded on_msg_show callback. `view` is the routed view type; the
 /// core has already decided it, so scenarios assert on routing outcomes
 /// without reimplementing the route table.
@@ -140,6 +154,13 @@ pub const Harness = struct {
     /// cannot tell an abort that took effect from a write that did nothing.
     flush_aborts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
+    // grid_row_scroll recording, tallied per grid id. Two grids scrolling in
+    // one batch are two separate callbacks, so a single counter could not tell
+    // "every grid took the fast path" from "one grid took it twice".
+    row_scroll_mu: std.Io.Mutex = .init,
+    row_scrolls: [max_row_scroll_grids]RowScrollRecord = [_]RowScrollRecord{.{}} ** max_row_scroll_grids,
+    row_scroll_count: usize = 0,
+
     pub fn init(alloc: std.mem.Allocator, opts: Options) !*Harness {
         const nvim_path = try resolveNvim(alloc);
         defer alloc.free(nvim_path);
@@ -177,6 +198,7 @@ pub const Harness = struct {
             .on_external_window_close = onExternalWindowClose,
             .on_agent_status = onAgentStatus,
             .on_grid_scroll = onGridScroll,
+            .on_grid_row_scroll = onGridRowScroll,
             .on_msg_show = if (opts.ext_messages) onMsgShow else null,
             .on_msg_showmode = if (opts.ext_messages) onMsgShowmode else null,
             .on_msg_clear = if (opts.ext_messages) onMsgClear else null,
@@ -261,6 +283,45 @@ pub const Harness = struct {
             // Same effect as zonvie_core_abort_flush from the frontend.
             h.core.flush_aborted = true;
         }
+    }
+
+    /// Row-shift fast path notification. Fires on the RPC thread inside the
+    /// flush bracket (flush.zig dispatches it before vertex generation), so it
+    /// is observable with no vertex callbacks installed. Guarded by its own
+    /// mutex; grid_mu is already held here and must not be taken.
+    fn onGridRowScroll(
+        ctx: ?*anyopaque,
+        grid_id: i64,
+        row_start: u32,
+        row_end: u32,
+        col_start: u32,
+        col_end: u32,
+        rows_delta: i32,
+        total_rows: u32,
+        total_cols: u32,
+    ) callconv(.c) void {
+        _ = row_start;
+        _ = row_end;
+        _ = col_start;
+        _ = col_end;
+        _ = total_rows;
+        _ = total_cols;
+        const h: *Harness = @ptrCast(@alignCast(ctx.?));
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |*rec| {
+            if (rec.grid_id != grid_id) continue;
+            rec.calls += 1;
+            rec.last_rows_delta = rows_delta;
+            return;
+        }
+        if (h.row_scroll_count == h.row_scrolls.len) return; // table full: drop
+        h.row_scrolls[h.row_scroll_count] = .{
+            .grid_id = grid_id,
+            .calls = 1,
+            .last_rows_delta = rows_delta,
+        };
+        h.row_scroll_count += 1;
     }
 
     fn onLog(_: ?*anyopaque, p: [*]const u8, n: usize) callconv(.c) void {
@@ -549,6 +610,63 @@ pub const Harness = struct {
         }
     }
 
+    // ── grid_row_scroll readback ───────────────────────────────────────
+
+    /// on_grid_row_scroll callbacks recorded for `grid_id` since the last
+    /// `resetRowScrolls`. Nonzero means the core published that grid's scroll
+    /// as a row shift instead of regenerating the scrolled band.
+    pub fn rowScrollCalls(h: *Harness, grid_id: i64) u32 {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |rec| {
+            if (rec.grid_id == grid_id) return rec.calls;
+        }
+        return 0;
+    }
+
+    /// `rows_delta` of the most recent on_grid_row_scroll for `grid_id`, 0 when
+    /// none was recorded. Positive means content moved up.
+    pub fn rowScrollDelta(h: *Harness, grid_id: i64) i32 {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        for (h.row_scrolls[0..h.row_scroll_count]) |rec| {
+            if (rec.grid_id == grid_id) return rec.last_rows_delta;
+        }
+        return 0;
+    }
+
+    /// Forget every recorded row scroll, so a scenario can attribute what
+    /// follows to one gesture rather than to window setup.
+    pub fn resetRowScrolls(h: *Harness) void {
+        h.row_scroll_mu.lockUncancelable(zc.clock.io());
+        defer h.row_scroll_mu.unlock(zc.clock.io());
+        h.row_scroll_count = 0;
+    }
+
+    // ── Dirty-row readback ─────────────────────────────────────────────
+    //
+    // The dirty set is what a frontend would be asked to repaint. This harness
+    // leaves `on_vertices_row` null, so flush never reaches `clearDirty()` and
+    // the set only accumulates; a scenario therefore clears it itself to make
+    // the rows one gesture dirtied readable.
+
+    /// True when `grid_id` currently has row `row` marked for repaint.
+    pub fn isRowDirty(h: *Harness, grid_id: i64, row: u32) bool {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return false;
+        return buf.isRowDirty(row);
+    }
+
+    /// Drop `grid_id`'s accumulated dirty rows, so what follows can be
+    /// attributed to one gesture. Scroll provenance is left alone.
+    pub fn clearDirtyRows(h: *Harness, grid_id: i64) void {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const buf = h.core.grid.bufFor(grid_id) orelse return;
+        buf.clearDirtyContent();
+    }
+
     // ── Neovim window observation ──────────────────────────────────────
 
     /// Number of positioned, non-external Neovim windows, derived from
@@ -738,6 +856,18 @@ pub const Harness = struct {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.external_grids.contains(grid_id);
+    }
+
+    /// Where an external grid sat on the main surface before it was detached,
+    /// or -1 when it never was. Both paths that composite an anchored float
+    /// into an external grid's rows — `Grid.dirtyCompositedRow` and
+    /// `buildExternalFloatRowIndexWithLimits` — return early on a negative
+    /// `start_row`, so this is what says whether compositing is live at all.
+    pub fn externalGridStartRow(h: *Harness, grid_id: i64) i32 {
+        h.core.grid_mu.lockUncancelable(zc.clock.io());
+        defer h.core.grid_mu.unlock(zc.clock.io());
+        const info = h.core.grid.external_grids.get(grid_id) orelse return -1;
+        return info.start_row;
     }
 
     /// Snapshot of all external grid ids. Caller owns slice.

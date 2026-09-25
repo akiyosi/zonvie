@@ -1,0 +1,10 @@
+# Blur on at full opacity: the core takes its blur paths (a surface root with
+# layers drops its default-background runs) while every pixel stays opaque, so
+# a captured colour means the same thing it does without blur.
+[window]
+blur = true
+opacity = 1.0
+
+[log]
+enabled = true
+verbose = true

@@ -8,13 +8,14 @@ final class ZonvieConfig {
     var backgroundAlpha: Float = 1.0
 }
 
-final class MetalTerminalRenderer {
+final class GridSurfaceRenderer {
     struct ScrollOffset {
         var grid_id: Int32
         var offset_y: Float
         var content_top_y: Float
         var content_bottom_y: Float
         var move_all: Int32 = 0
+        var pin_edges: Int32 = 1
     }
 
     struct FixedFloatRect: Equatable {
@@ -414,8 +415,8 @@ private enum SurfaceRowProvisionTests {
     // fine here): true when (x, y) lies inside a mask segment whose z is
     // strictly greater than scrollZ.
     private static func maskCoversAbove(
-        bands: [MetalTerminalRenderer.FixedFloatBand],
-        intervals: [MetalTerminalRenderer.FixedFloatInterval],
+        bands: [GridSurfaceRenderer.FixedFloatBand],
+        intervals: [GridSurfaceRenderer.FixedFloatInterval],
         x: Float,
         y: Float,
         scrollZ: Float
@@ -432,13 +433,13 @@ private enum SurfaceRowProvisionTests {
     }
 
     private static func buildMask(
-        _ rects: [MetalTerminalRenderer.FixedFloatRect]
-    ) -> (bands: [MetalTerminalRenderer.FixedFloatBand], intervals: [MetalTerminalRenderer.FixedFloatInterval]) {
-        var bands: [MetalTerminalRenderer.FixedFloatBand] = []
-        var intervals: [MetalTerminalRenderer.FixedFloatInterval] = []
+        _ rects: [GridSurfaceRenderer.FixedFloatRect]
+    ) -> (bands: [GridSurfaceRenderer.FixedFloatBand], intervals: [GridSurfaceRenderer.FixedFloatInterval]) {
+        var bands: [GridSurfaceRenderer.FixedFloatBand] = []
+        var intervals: [GridSurfaceRenderer.FixedFloatInterval] = []
         var yEdges: [Float] = []
         var xEdges: [Float] = []
-        var covering: [MetalTerminalRenderer.FixedFloatRect] = []
+        var covering: [GridSurfaceRenderer.FixedFloatRect] = []
         buildSurfaceFixedFloatMask(
             rects: rects,
             bands: &bands,
@@ -452,8 +453,8 @@ private enum SurfaceRowProvisionTests {
 
     private static func verifyFixedFloatMaskZOrder() {
         // Lazy layout: full-screen backdrop (z49) under an inner float (z50).
-        let backdrop = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
-        let lazy = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
+        let backdrop = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
+        let lazy = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 800, top: 100, bottom: 500, zindex: 50)
         let (bands, intervals) = buildMask([backdrop, lazy])
 
         require(bands.count == 3, "lazy mask should split into 3 bands, got \(bands.count)")
@@ -479,7 +480,7 @@ private enum SurfaceRowProvisionTests {
                 "the scrolled float must not be masked over the backdrop alone")
 
         // A higher-z fixed float stacked over the scrolled one must win.
-        let popup = MetalTerminalRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
+        let popup = GridSurfaceRenderer.FixedFloatRect(x0: 300, x1: 600, top: 200, bottom: 400, zindex: 60)
         let stacked = buildMask([backdrop, lazy, popup])
         require(maskCoversAbove(bands: stacked.bands, intervals: stacked.intervals, x: 400, y: 300, scrollZ: 50),
                 "a z50 scrolled float must be masked under a z60 fixed float")
@@ -489,29 +490,29 @@ private enum SurfaceRowProvisionTests {
                 "the z60 popup must not mask the scrolled float outside its own rect")
 
         // Contiguous equal-z rects merge into one interval; differing z stays split.
-        let leftSame = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let rightSame = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
+        let leftSame = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let rightSame = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 50)
         let mergedMask = buildMask([leftSame, rightSame])
         require(mergedMask.bands.count == 1 && mergedMask.intervals.count == 1,
                 "touching equal-z rects must merge into one interval")
         require(mergedMask.intervals[0].x0 == 0 && mergedMask.intervals[0].x1 == 200,
                 "merged interval must span both rects")
-        let rightHigher = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
+        let rightHigher = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 200, top: 0, bottom: 100, zindex: 60)
         let splitMask = buildMask([leftSame, rightHigher])
         require(splitMask.intervals.count == 2, "touching rects with differing z must stay split")
         require(splitMask.intervals[0].z == 50 && splitMask.intervals[1].z == 60,
                 "split segments must keep their own z")
 
         // Vertically disjoint rects: no band is emitted for the gap between them.
-        let upper = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
-        let lower = MetalTerminalRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
+        let upper = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let lower = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 100, top: 300, bottom: 400, zindex: 51)
         let disjoint = buildMask([upper, lower])
         require(disjoint.bands.count == 2, "vertically disjoint rects must produce exactly 2 bands")
         require(!maskCoversAbove(bands: disjoint.bands, intervals: disjoint.intervals, x: 50, y: 200, scrollZ: 0),
                 "the vertical gap between rects must not be masked")
 
         // Degenerate rects are ignored; an empty input clears the outputs.
-        let degenerate = MetalTerminalRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
+        let degenerate = GridSurfaceRenderer.FixedFloatRect(x0: 100, x1: 100, top: 0, bottom: 100, zindex: 50)
         let degenerateMask = buildMask([degenerate])
         require(degenerateMask.bands.isEmpty && degenerateMask.intervals.isEmpty,
                 "a zero-width rect must produce an empty mask")
@@ -616,14 +617,133 @@ private enum SurfaceRowProvisionTests {
         )
     }
 
+    private static func verifyLayerGrowthWithoutRetry(device: MTLDevice) {
+        let registry = GridBufferRegistry()
+        let vertex = Vertex(position: .zero, texCoord: .zero, color: .zero,
+            grid_id: 7, deco_flags: 0, deco_phase: 0)
+        let vertices = Array(repeating: vertex, count: 1024)
+        // New grids and changing content sizes must succeed in the submitting
+        // flush, without an asynchronous provision/retry round trip.
+        for gridId in [Int64(7), 8, 9] {
+            let sets = registry.sets(for: gridId)
+            var source = 0
+            for count in [6, 48, 282, 1024, 6, 282] {
+                let target = (source + 1) % 3
+                copySurfaceBufferSetRowState(from: sets[source], to: sets[target])
+                for row in 0..<4 {
+                    let accepted = vertices.withUnsafeBufferPointer { buffer in
+                        submitSurfaceRowVertices(target: sets[target], sourceSet: sets[source],
+                            device: device, rowStart: row, ptr: UnsafeRawPointer(buffer.baseAddress!),
+                            count: count, maxRowBuffers: 16, totalRows: 4, totalCols: 80)
+                    }
+                    require(accepted, "ordinary layer growth must not require a retry")
+                }
+                source = target
+            }
+        }
+    }
+
+    /// The row-capacity gate is one rule both surfaces ask, so the physical-row
+    /// mapping has to be an argument rather than a second implementation. The
+    /// main surface can be asked about a row that is already physical; an
+    /// external one never is, and passes `rowIsPhysical: false`.
+    private static func verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: MTLDevice) {
+        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
+
+        // Nothing is provisioned yet, so a legal row owes provisioning, and the
+        // ledger values it names are what both callers fold in.
+        let needs = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 3,
+            vertexCount: 120,
+            totalRows: 8,
+            maxRowBuffers: 16,
+            mappingSetIndex: -1,
+            rowIsPhysical: true
+        )
+        guard case .needsProvisioning(let capacityRow, let requiredRows, let vc) = needs else {
+            require(false, "unprovisioned row did not ask for provisioning")
+            return
+        }
+        require(capacityRow == 3, "physical row was remapped when it should not be")
+        require(requiredRows == 8, "required rows must cover the whole grid")
+        require(vc == 120, "vertex demand was not carried to the ledger")
+
+        // A row past the buffer ceiling is an argument error, never a
+        // provisioning request: latching a hard failure on it would stop the
+        // surface presenting forever.
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 99,
+                vertexCount: 1,
+                totalRows: 8,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range row was not rejected as invalid"
+        )
+        require(
+            surfaceRowCapacityVerdict(
+                bufferSets: sets,
+                row: 0,
+                vertexCount: 1,
+                totalRows: 99,
+                maxRowBuffers: 16,
+                mappingSetIndex: -1,
+                rowIsPhysical: true
+            ) == .invalid,
+            "out-of-range total rows was not rejected as invalid"
+        )
+
+        // The logical row is mapped through the naming set's slot table, which
+        // is what makes a scrolled row ask about the slot it actually occupies.
+        sets[0].rowLogicalToSlot = [4, 5, 6, 7]
+        let mapped = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: false
+        )
+        guard case .needsProvisioning(let mappedRow, let mappedRequired, _) = mapped else {
+            require(false, "mapped row did not ask for provisioning")
+            return
+        }
+        require(mappedRow == 5, "logical row was not mapped through the slot table")
+        require(mappedRequired == 6, "required rows must reach past the mapped slot")
+
+        // Same row, declared physical: the mapping is skipped.
+        guard case .needsProvisioning(let unmappedRow, _, _) = surfaceRowCapacityVerdict(
+            bufferSets: sets,
+            row: 1,
+            vertexCount: 8,
+            totalRows: 4,
+            maxRowBuffers: 16,
+            mappingSetIndex: 0,
+            rowIsPhysical: true
+        ) else {
+            require(false, "physical row did not ask for provisioning")
+            return
+        }
+        require(unmappedRow == 1, "physical row must skip the slot mapping")
+
+        _ = device
+    }
+
     static func main() {
         guard let device = MTLCreateSystemDefaultDevice() else {
             FileHandle.standardError.write(Data("FAIL: no Metal device\n".utf8))
             exit(1)
         }
 
+        verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
+        verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: device)
 
         // Both production owners call the same durable state transition from
         // commit and from every GPU completion path.

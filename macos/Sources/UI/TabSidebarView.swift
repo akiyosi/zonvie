@@ -188,7 +188,6 @@ final class TabSidebarView: NSView {
             self.layer?.backgroundColor = NSColor.clear.cgColor
         }
         setupTrackingArea()
-        observeColorschemeChanges()
     }
 
     override func viewDidMoveToWindow() {
@@ -208,10 +207,15 @@ final class TabSidebarView: NSView {
         agentIndicator.stop()
     }
 
-    private func observeColorschemeChanges() {
+    /// Follow `core`'s colorscheme only: every session posts the same name,
+    /// and observing them all recoloured this sidebar from another session.
+    func observeColorschemeChanges(of core: ZonvieCore) {
+        if let observer = colorschemeObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
         colorschemeObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.colorschemeDidChangeNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
             guard let self = self else { return }

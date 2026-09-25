@@ -1,0 +1,11 @@
+# config_decorated_alpha plus a passthrough custom shader, so the decorated
+# surface's back texture is consumed by the shader chain instead of being
+# composited. The chain compiles with preserve_alpha OFF for decorated
+# surfaces, which is what makes the two consumers disagree.
+[window]
+blur = true
+opacity = 1.0
+
+[shaders]
+enabled = true
+paths = ["test/gui/fixtures/shaders/static_probe.glsl"]

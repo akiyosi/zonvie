@@ -74,8 +74,8 @@ final class ViewController: NSViewController {
 
         case .menu:
             // Menu mode: no tab UI in the window, full-size terminal.
-            // Notification observers are set up for currentTabs tracking.
-            setupTablineNotificationObservers()
+            // Notification observers (set up below, once the core exists)
+            // keep currentTabs tracking.
             NSLayoutConstraint.activate([
                 terminalView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
                 terminalView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
@@ -95,6 +95,14 @@ final class ViewController: NSViewController {
 
         // Create core (init takes no args)
         core = ZonvieCore()
+
+        // Observers filter on this session's core, so they register only
+        // once it exists: registered earlier, `object: core` was nil and
+        // every session's tabline reached this window.
+        if tablineStyle != nil {
+            setupTablineNotificationObservers()
+        }
+        sidebarView?.observeColorschemeChanges(of: core)
 
         // Wire both directions
         core.terminalView = terminalView
@@ -299,24 +307,20 @@ final class ViewController: NSViewController {
         // tab-based ViewController swapping, or view detachment, a new
         // explicit stop point (e.g. windowWillClose or a dedicated cleanup
         // method) must be added for the detached ViewController's core.
+        //
+        // Observers stay registered: this also runs on minimize, and the
+        // tabline and agent notifications are sent only on change, so one
+        // posted while minimized was lost for good.
+    }
 
-        // Remove notification observers and nil tokens so viewDidAppear can re-register
-        if let observer = tablineUpdateObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineUpdateObserver = nil
-        }
-        if let observer = tablineHideObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineHideObserver = nil
+    deinit {
+        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver] {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
-        if tablineUpdateObserver == nil {
-            setupTablineNotificationObservers()
-        }
         // Present the `--dialog` dialog once, after the window exists so it can
         // host the sheet.
         if pendingConnectDialog && !connectDialogShown {
@@ -328,13 +332,14 @@ final class ViewController: NSViewController {
     // MARK: - Tabline Notification Observers (shared across modes)
 
     private func setupTablineNotificationObservers() {
+        // Only this session's core: every session posts the same names.
         tablineUpdateObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineUpdateNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.TablineUpdateInfo else {
-                ZonvieCore.appLog("[Tabline] WARNING: notification object cast failed: \(String(describing: notification.object))")
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.TablineUpdateInfo else {
+                ZonvieCore.appLog("[Tabline] WARNING: notification payload cast failed: \(String(describing: notification.userInfo))")
                 return
             }
             self?.handleTablineUpdate(tabs: info.tabs, currentTab: info.currentTab)
@@ -342,7 +347,7 @@ final class ViewController: NSViewController {
 
         tablineHideObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.tablineHideNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] _ in
             self?.handleTablineHide()
@@ -350,10 +355,10 @@ final class ViewController: NSViewController {
 
         agentStatusObserver = NotificationCenter.default.addObserver(
             forName: ZonvieCore.agentStatusNotification,
-            object: nil,
+            object: core,
             queue: .main
         ) { [weak self] notification in
-            guard let info = notification.object as? ZonvieCore.AgentStatusInfo else { return }
+            guard let info = notification.userInfo?[ZonvieCore.notificationInfoKey] as? ZonvieCore.AgentStatusInfo else { return }
             self?.tabBarView?.setAgentState(handle: info.tabHandle, state: info.state)
             self?.sidebarView?.setAgentState(handle: info.tabHandle, state: info.state)
         }
@@ -408,8 +413,6 @@ final class ViewController: NSViewController {
         }
 
         self.tabBarView = tabBar
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Sidebar (sidebar mode)
@@ -465,8 +468,6 @@ final class ViewController: NSViewController {
                 terminalView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
             ])
         }
-
-        setupTablineNotificationObservers()
     }
 
     // MARK: - Public Tab Bar Control

@@ -250,12 +250,6 @@ final class TabBarView: NSView {
 
         guard !tabs.isEmpty else { return }
 
-        // Calculate tab width
-        let availableWidth = bounds.width - windowControlsWidth - 40  // 40 for new tab button
-        let tabCount = CGFloat(tabs.count)
-        let idealTabWidth = (availableWidth - tabSpacing * (tabCount - 1)) / tabCount
-        let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
-
         let isDragging = draggingTabIndex != nil
         var x = windowControlsWidth
 
@@ -277,7 +271,7 @@ final class TabBarView: NSView {
         if isDragging, let targetIdx = dropTargetIndex, let dragIdx = draggingTabIndex {
             // Only show indicator if target is different from current position
             if targetIdx != dragIdx && targetIdx != dragIdx + 1 {
-                let indicatorX = windowControlsWidth + CGFloat(targetIdx) * (tabWidth + tabSpacing)
+                let indicatorX = tabX(targetIdx)
                 NSColor.controlAccentColor.setFill()
                 NSRect(x: indicatorX - 1, y: 4, width: 2, height: tabHeight - 6).fill()
             }
@@ -441,15 +435,25 @@ final class TabBarView: NSView {
         path.stroke()
     }
 
+    /// Width of one tab, and the left edge of the tab at `index`. Every drawing
+    /// and hit-testing path has to agree on these; they used to be spelled out
+    /// at each of five sites, one of which named its own local `tabCountF`.
+    private var tabWidth: CGFloat {
+        guard !tabs.isEmpty else { return tabMaxWidth }
+        let availableWidth = bounds.width - windowControlsWidth - 40  // 40 for the new tab button
+        let tabCount = CGFloat(tabs.count)
+        let idealTabWidth = (availableWidth - tabSpacing * (tabCount - 1)) / tabCount
+        return min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
+    }
+
+    private func tabX(_ index: Int) -> CGFloat {
+        windowControlsWidth + CGFloat(index) * (tabWidth + tabSpacing)
+    }
+
     // MARK: - Hit Testing
 
     private func tabIndex(at point: NSPoint) -> Int? {
         guard !tabs.isEmpty else { return nil }
-
-        let availableWidth = bounds.width - windowControlsWidth - 40
-        let tabCount = CGFloat(tabs.count)
-        let idealTabWidth = (availableWidth - tabSpacing * (tabCount - 1)) / tabCount
-        let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
 
         var x = windowControlsWidth
 
@@ -472,13 +476,7 @@ final class TabBarView: NSView {
     private func isCloseButton(at point: NSPoint, tabIndex: Int) -> Bool {
         guard tabIndex < tabs.count else { return false }
 
-        let availableWidth = bounds.width - windowControlsWidth - 40
-        let tabCount = CGFloat(tabs.count)
-        let idealTabWidth = (availableWidth - tabSpacing * (tabCount - 1)) / tabCount
-        let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
-
-        let tabX = windowControlsWidth + CGFloat(tabIndex) * (tabWidth + tabSpacing)
-        let tabRect = NSRect(x: tabX, y: 6, width: tabWidth, height: tabHeight - 6)
+        let tabRect = NSRect(x: tabX(tabIndex), y: 6, width: tabWidth, height: tabHeight - 6)
 
         let closeRect = NSRect(
             x: tabRect.maxX - tabCloseButtonSize - 8,
@@ -491,12 +489,7 @@ final class TabBarView: NSView {
     }
 
     private func isNewTabButton(at point: NSPoint) -> Bool {
-        let availableWidth = bounds.width - windowControlsWidth - 40
-        let tabCount = CGFloat(tabs.count)
-        let idealTabWidth = (availableWidth - tabSpacing * (tabCount - 1)) / tabCount
-        let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
-
-        let x = windowControlsWidth + CGFloat(tabs.count) * (tabWidth + tabSpacing) + 8
+        let x = tabX(tabs.count) + 8
         let rect = NSRect(x: x, y: 10, width: 20, height: 20)
 
         return rect.contains(point)
@@ -513,20 +506,14 @@ final class TabBarView: NSView {
                 trackCloseButtonClick(initialEvent: event, tabIndex: index)
             } else {
                 // Start tab drag - use event tracking loop to prevent window drag
-                let availableWidth = bounds.width - windowControlsWidth - 40
-                let tabCountF = CGFloat(tabs.count)
-                let idealTabWidth = (availableWidth - tabSpacing * (tabCountF - 1)) / tabCountF
-                let tabWidth = min(tabMaxWidth, max(tabMinWidth, idealTabWidth))
-                let tabX = windowControlsWidth + CGFloat(index) * (tabWidth + tabSpacing)
-
                 draggingTabIndex = index
                 dragStartX = location.x
-                dragOffsetX = location.x - tabX
+                dragOffsetX = location.x - tabX(index)
                 dragCurrentX = location.x
                 dropTargetIndex = index
 
                 // Event tracking loop - handle drag ourselves
-                trackTabDrag(initialEvent: event, tabIndex: index, tabWidth: tabWidth)
+                trackTabDrag(initialEvent: event, tabIndex: index)
             }
         } else if isNewTabButton(at: location) {
             // New tab button pressed - track until mouse up
@@ -545,7 +532,7 @@ final class TabBarView: NSView {
     }
 
     /// Track tab drag using event loop to prevent window dragging
-    private func trackTabDrag(initialEvent: NSEvent, tabIndex: Int, tabWidth: CGFloat) {
+    private func trackTabDrag(initialEvent: NSEvent, tabIndex: Int) {
         ZonvieCore.appLog("[TAB-DRAG] trackTabDrag started for tab \(tabIndex)")
         guard let window = self.window else {
             ZonvieCore.appLog("[TAB-DRAG] window is nil, aborting")
@@ -595,15 +582,12 @@ final class TabBarView: NSView {
 
                     // Calculate drop target
                     var targetIdx = 0
-                    var tabX = windowControlsWidth
                     for i in 0..<tabs.count {
-                        let tabCenter = tabX + tabWidth / 2
-                        if location.x < tabCenter {
+                        if location.x < tabX(i) + tabWidth / 2 {
                             targetIdx = i
                             break
                         }
                         targetIdx = i + 1
-                        tabX += tabWidth + tabSpacing
                     }
                     dropTargetIndex = min(targetIdx, tabs.count)
                 }

@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 /// Fixed-capacity binary ring tracer for frame-timing investigation.
 ///
@@ -24,6 +25,12 @@ enum FrameTraceTag: UInt32 {
     case drawSkipNoDrawable = 9
     case drawSkipRowCapacity = 10
     case commitFlush = 11
+    /// a = key code. The main view emits one per input it actually sends,
+    /// seq 0. An external grid view emits one per keyDown it RECEIVES, seq =
+    /// grid id, which includes the OS repeats synthesis then swallows and
+    /// never sends: b bit 0 is "OS calls it a repeat", bit 1 "swallowed,
+    /// nothing sent". So the two streams describe different things and must
+    /// not be summed.
     case inputSend = 12
     case encodeEnd = 13
     case gpuSubmit = 14
@@ -122,6 +129,22 @@ enum FrameTracer {
         writeIndex &+= 1
         os_unfair_lock_unlock(&indexLock)
         buf[Int(i & mask)] = FrameTraceEvent(tNs: t, a: a, b: b, tag: tag.rawValue, seq: seq)
+    }
+
+    /// Record when `drawable` reaches the glass. presentedTime shares
+    /// CACurrentMediaTime's base, the same clock as nowNs (CLOCK_UPTIME_RAW),
+    /// so the on-glass timestamp lines up with the CPU-side events.
+    /// a = presentedTime in ns (0 when the frame never reached the display),
+    /// b = the submit-side timestamp of this frame. Allocates the handler only
+    /// while tracing.
+    static func tracePresented(_ drawable: MTLDrawable, seq: UInt32 = 0) {
+        guard enabled else { return }
+        let submitNs = nowNs()
+        drawable.addPresentedHandler { d in
+            let t = d.presentedTime
+            let presentedNs = t > 0 ? UInt64(t * 1_000_000_000.0) : 0
+            trace(.presented, a: presentedNs, b: submitNs, seq: seq)
+        }
     }
 
     /// Install the SIGUSR1 dump handler. Called once during view setup.

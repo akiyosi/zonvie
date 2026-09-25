@@ -1,4 +1,5 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 const helpers = @import("render_pipeline_helpers.zig");
 
 test "retry delay doubles and saturates" {
@@ -539,6 +540,45 @@ test "single sorted row insertion reports OOM without consuming scroll damage" {
     try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, success_rows.items);
 }
 
+test "a surface owes a full atlas upload whenever the generation moved" {
+    var ledger: helpers.AtlasUploadLedger = .{};
+    // Never uploaded: owes one whatever the generation is, zero included.
+    try std.testing.expect(ledger.needsFull(0));
+    ledger.fullUploaded(0);
+    try std.testing.expect(!ledger.needsFull(0));
+    try std.testing.expect(ledger.needsFull(1));
+    // A failure owes one even at the generation it last uploaded.
+    ledger.fullUploaded(7);
+    ledger.forceFull();
+    try std.testing.expect(ledger.needsFull(7));
+    // The generation wraps; a ledger that compared with `<` stopped asking.
+    ledger.fullUploaded(std.math.maxInt(u64));
+    try std.testing.expect(ledger.needsFull(0));
+}
+
+test "an atlas upload owes a full paint only when no root row was redrawn" {
+    try std.testing.expect(helpers.atlasUploadOwesFullPaint(true, false));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(true, true));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(false, false));
+    try std.testing.expect(!helpers.atlasUploadOwesFullPaint(false, true));
+}
+
+test "cursor erase rows are claimed only for a root cursor and only in range" {
+    var rows: std.ArrayListUnmanaged(u32) = .empty;
+    defer rows.deinit(std.testing.allocator);
+    try rows.append(std.testing.allocator, 5);
+
+    // A layer's cursor claims nothing from the root.
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 1, 2 }, 10, false);
+    try std.testing.expectEqualSlices(u32, &.{5}, rows.items);
+
+    // A root cursor claims where it was and where it lands, in order, and a
+    // row past the limit or absent is skipped.
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 7, null }, 10, true);
+    helpers.insertCursorEraseRows(std.testing.allocator, &rows, .{ 2, 10 }, 10, true);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 5, 7 }, rows.items);
+}
+
 test "cursor replacement dirties old and new rows" {
     var storage: [2]usize = undefined;
     try std.testing.expectEqualSlices(
@@ -591,6 +631,278 @@ test "slot backing is retained until the layout has produced a row" {
     try std.testing.expect(!helpers.shouldRetireSlotBacking(0, 0));
     try std.testing.expect(!helpers.shouldRetireSlotBacking(4096, 0));
     try std.testing.expect(!helpers.shouldRetireSlotBacking(std.math.maxInt(usize), 0));
+}
+
+test "paint policy keeps the previous frame only when nothing forces a redraw" {
+    const quiet = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = true,
+    };
+    const p = helpers.paintPolicy(quiet);
+    try std.testing.expect(!p.force_full_rows);
+    try std.testing.expect(p.preserve_back);
+}
+
+test "paint policy forces a full redraw on each of its four terms" {
+    const base = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = true,
+    };
+    var a = base;
+    a.force_full = true;
+    var b = base;
+    b.cursor_grid_changed = true;
+    var c2 = base;
+    c2.glow_enabled = true;
+    var d = base;
+    d.opacity = 0.9;
+    for ([_]helpers.PaintPolicyInputs{ a, b, c2, d }) |in| {
+        const p = helpers.paintPolicy(in);
+        try std.testing.expect(p.force_full_rows);
+        // A forced full redraw never preserves the back buffer.
+        try std.testing.expect(!p.preserve_back);
+    }
+}
+
+/// The main driver's present decision as window.zig wrote it before
+/// `presentGate`, kept verbatim as the oracle.
+fn mainPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
+    const s = in.seed.?;
+    const effective_rows = in.rows;
+    const allow_present = blk: {
+        if (!in.layout_ok) break :blk false;
+        if (!in.metrics_ok) break :blk false;
+        if (in.frame_incomplete) break :blk false;
+        if (s.clear) break :blk true;
+        if (s.pending and !in.preserve_back) break :blk true;
+        if (effective_rows == 0) break :blk false;
+        if (s.pending) {
+            if (s.back_tex_valid) {
+                if (s.rows_mismatch) {
+                    if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
+                    break :blk false;
+                }
+                break :blk true;
+            }
+            if (s.rows_mismatch) {
+                if (in.rows_to_draw != 0 and in.skipped_empty == 0) break :blk true;
+                break :blk false;
+            }
+            if (s.row_valid_count == effective_rows) {
+                if (in.skipped_empty != 0) break :blk false;
+                if (in.rows_to_draw != effective_rows) break :blk false;
+                break :blk true;
+            }
+            break :blk false;
+        }
+        if (in.force_full_rows and in.skipped_empty != 0) break :blk false;
+        if (in.force_full_rows and in.rows_to_draw != effective_rows) break :blk false;
+        break :blk true;
+    };
+    const full = in.force_full_rows or
+        (s.pending and !s.back_tex_valid and !s.rows_mismatch) or
+        s.clear or
+        in.present_rects_overflowed or
+        in.custom_shader;
+    const rendered_complete_frame = effective_rows != 0 and
+        in.skipped_empty == 0 and
+        in.rows_to_draw == effective_rows;
+    return .{
+        .verdict = if (allow_present) .present else .refuse,
+        .full = full,
+        .back_tex_valid = (s.back_tex_valid and in.preserve_back) or rendered_complete_frame,
+    };
+}
+
+/// The external driver's, from external_windows.zig: an incomplete frame and
+/// stale metrics requeue, no damage skips, and back_tex is always valid.
+fn externalPresentOracle(in: helpers.PresentGateInputs) helpers.PresentGate {
+    const full = in.force_full_rows or in.custom_shader;
+    const verdict: helpers.PresentVerdict = if (in.frame_incomplete or !in.metrics_ok)
+        .refuse
+    else if (!full and in.present_rects == 0)
+        .skip
+    else
+        .present;
+    return .{ .verdict = verdict, .full = full, .back_tex_valid = true };
+}
+
+fn expectSameGate(want: helpers.PresentGate, got: helpers.PresentGate) !void {
+    try std.testing.expectEqual(want.verdict, got.verdict);
+    // Fullness and validity only mean anything for a frame that presents.
+    if (want.verdict != .present) return;
+    try std.testing.expectEqual(want.full, got.full);
+    try std.testing.expectEqual(want.back_tex_valid, got.back_tex_valid);
+}
+
+test "the present gate answers what the main driver answered, for every input" {
+    var n: u32 = 0;
+    var bits: u32 = 0;
+    while (bits < (1 << 12)) : (bits += 1) {
+        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
+            for ([_]u32{ 0, 1 }) |skipped_empty| {
+                for ([_]usize{ 0, 4 }) |rows| {
+                    for ([_]usize{ 0, 4 }) |row_valid_count| {
+                        const bit = struct {
+                            fn at(v: u32, i: u5) bool {
+                                return (v >> i) & 1 != 0;
+                            }
+                        }.at;
+                        const in = helpers.PresentGateInputs{
+                            .layout_ok = bit(bits, 0),
+                            .metrics_ok = bit(bits, 1),
+                            .frame_incomplete = bit(bits, 2),
+                            .force_full_rows = bit(bits, 3),
+                            .preserve_back = bit(bits, 4),
+                            .custom_shader = bit(bits, 5),
+                            .present_rects_overflowed = bit(bits, 6),
+                            .present_rects = if (bit(bits, 7)) 2 else 0,
+                            .rows = rows,
+                            .rows_to_draw = rows_to_draw,
+                            .skipped_empty = skipped_empty,
+                            .empty_damage_presents_all = true,
+                            .seed = .{
+                                .pending = bit(bits, 8),
+                                .clear = bit(bits, 9),
+                                .back_tex_valid = bit(bits, 10),
+                                .rows_mismatch = bit(bits, 11),
+                                .row_valid_count = row_valid_count,
+                            },
+                        };
+                        try expectSameGate(mainPresentOracle(in), helpers.presentGate(in));
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expect(n > 10_000);
+}
+
+test "the present gate answers what the external driver answered, for every input" {
+    var bits: u32 = 0;
+    while (bits < (1 << 6)) : (bits += 1) {
+        for ([_]usize{ 0, 3, 4 }) |rows_to_draw| {
+            for ([_]u32{ 0, 1 }) |skipped_empty| {
+                const in = helpers.PresentGateInputs{
+                    .metrics_ok = bits & 1 != 0,
+                    .frame_incomplete = bits & 2 != 0,
+                    .force_full_rows = bits & 4 != 0,
+                    .preserve_back = bits & 8 != 0,
+                    .custom_shader = bits & 16 != 0,
+                    .present_rects = if (bits & 32 != 0) 2 else 0,
+                    .rows = 4,
+                    .rows_to_draw = rows_to_draw,
+                    .skipped_empty = skipped_empty,
+                };
+                try expectSameGate(externalPresentOracle(in), helpers.presentGate(in));
+            }
+        }
+    }
+}
+
+test "a surface whose chrome draws without damage never skips an empty present" {
+    const in = helpers.PresentGateInputs{
+        .force_full_rows = false,
+        .preserve_back = true,
+        .rows = 4,
+        .rows_to_draw = 0,
+        .skipped_empty = 0,
+        .present_rects = 0,
+        .empty_damage_presents_all = true,
+    };
+    try std.testing.expectEqual(helpers.PresentVerdict.present, helpers.presentGate(in).verdict);
+}
+
+test "paint policy refuses to preserve a back buffer that is not valid" {
+    const in = helpers.PaintPolicyInputs{
+        .force_full = false,
+        .cursor_grid_changed = false,
+        .glow_enabled = false,
+        .opacity = 1.0,
+        .back_tex_valid = false,
+    };
+    const p = helpers.paintPolicy(in);
+    try std.testing.expect(!p.force_full_rows);
+    try std.testing.expect(!p.preserve_back);
+}
+
+test "present rect clamping drops rects that clamp away and keeps the rest" {
+    var rects = [_]Rect{
+        .{ .left = -5, .top = -5, .right = 40, .bottom = 40 },
+        .{ .left = 200, .top = 10, .right = 300, .bottom = 20 },
+        .{ .left = 10, .top = 10, .right = 30, .bottom = 30 },
+    };
+
+    const len = helpers.clampPresentRects(Rect, &rects, 100, 100);
+    try std.testing.expectEqual(@as(usize, 2), len);
+    // The out-of-bounds rect is gone; the survivors are clamped in place.
+    var saw_clamped = false;
+    var saw_interior = false;
+    for (rects[0..len]) |r| {
+        if (std.meta.eql(r, Rect{ .left = 0, .top = 0, .right = 40, .bottom = 40 })) saw_clamped = true;
+        if (std.meta.eql(r, Rect{ .left = 10, .top = 10, .right = 30, .bottom = 30 })) saw_interior = true;
+    }
+    try std.testing.expect(saw_clamped);
+    try std.testing.expect(saw_interior);
+}
+
+test "present rect clamping trims a rect that overhangs the target" {
+    var rects = [_]Rect{
+        .{ .left = 80, .top = 80, .right = 500, .bottom = 500 },
+    };
+
+    const len = helpers.clampPresentRects(Rect, &rects, 100, 100);
+    try std.testing.expectEqual(@as(usize, 1), len);
+    try std.testing.expectEqual(Rect{ .left = 80, .top = 80, .right = 100, .bottom = 100 }, rects[0]);
+}
+
+test "a grid's layer origin: zero for the root, the layer's for a hosted grid, zero when missing" {
+    const L = struct { grid_id: i64, x_px: i32, y_px: i32 };
+    const layers = [_]L{
+        .{ .grid_id = 4, .x_px = 0, .y_px = 0 },
+        .{ .grid_id = 7, .x_px = 30, .y_px = 60 },
+    };
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &layers, 4, 4));
+    try std.testing.expectEqual([2]i32{ 30, 60 }, helpers.layerOriginPx(L, &layers, 7, 4));
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &layers, 9, 4));
+    // The root answers zero even if the list carried an offset for it: its
+    // layer IS the surface.
+    const moved_root = [_]L{.{ .grid_id = 1, .x_px = 5, .y_px = 5 }};
+    try std.testing.expectEqual([2]i32{ 0, 0 }, helpers.layerOriginPx(L, &moved_root, 1, 1));
+}
+
+test "a move into the main window lands on the top-left split it still shows" {
+    const G = struct { grid_id: i64, zindex: i64, start_row: i32, start_col: i32, placed_by_surface: i64 };
+    // Grid 2 is externalized (placed by itself); the main window keeps 5 and
+    // 6 side by side, with a float over them and the global grid behind.
+    const grids = [_]G{
+        .{ .grid_id = 1, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+        .{ .grid_id = 2, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 2 },
+        .{ .grid_id = 6, .zindex = 0, .start_row = 0, .start_col = 40, .placed_by_surface = 1 },
+        .{ .grid_id = 5, .zindex = 0, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+        .{ .grid_id = 9, .zindex = 50, .start_row = 0, .start_col = 0, .placed_by_surface = 1 },
+    };
+    try std.testing.expectEqual(@as(i64, 5), helpers.mainMoveTargetGrid(G, &grids));
+    // Nothing split in the main window: grid 2, as before.
+    try std.testing.expectEqual(@as(i64, 2), helpers.mainMoveTargetGrid(G, grids[0..2]));
+}
+
+test "dirty rows become one full-width rect per run of adjacent rows" {
+    var out: [6]Rect = undefined;
+    const rows = [_]u32{ 1, 2, 3, 7, 9, 10 };
+    const n = helpers.rowSpanRects(Rect, &rows, 24, 640, 10, &out);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 34, .right = 640, .bottom = 64 }, out[0]);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 94, .right = 640, .bottom = 104 }, out[1]);
+    try std.testing.expectEqual(Rect{ .left = 0, .top = 114, .right = 640, .bottom = 134 }, out[2]);
+    try std.testing.expectEqual(@as(usize, 0), helpers.rowSpanRects(Rect, &.{}, 0, 640, 10, &out));
 }
 
 test "damage compaction merges row spans and contained cursor damage" {
@@ -690,4 +1002,338 @@ test "cluster inversion: a variation-selector emoji mid-run" {
         2,
         &.{ 0, 1 },
     );
+}
+
+// --- Row-scroll blit plan -------------------------------------------------
+// The arithmetic itself is the core's now, and so are its tests
+// (src/core/row_scroll.zig). What stays here is the Windows-only damage this
+// frontend derives from a plan.
+
+const row_h_px: i32 = 20;
+
+test "the root repaints the rows its scroll copy dragged a layer onto" {
+    // row_h_px is 20 here, so a float at y=200 covers rows 10..14.
+    // A one-row scroll can carry its pixels to row 9 (up) or row 15 (down),
+    // and the root owns both: the layer only repaints rows 10..14.
+    try std.testing.expectEqual(
+        [2]u32{ 9, 16 },
+        helpers.rootRowsLayerScrollReached(200, 5, 1, row_h_px, 40).?,
+    );
+    // A three-row scroll reaches three rows either side.
+    try std.testing.expectEqual(
+        [2]u32{ 7, 18 },
+        helpers.rootRowsLayerScrollReached(200, 5, 3, row_h_px, 40).?,
+    );
+    // No scroll: the layer's own band, which the layer repaints anyway. Marking
+    // it costs a redraw, never a ghost.
+    try std.testing.expectEqual(
+        [2]u32{ 10, 15 },
+        helpers.rootRowsLayerScrollReached(200, 5, 0, row_h_px, 40).?,
+    );
+    // Clamped at both edges of the surface rather than wrapping or going
+    // negative: a float at the very top scrolled up reaches no further.
+    try std.testing.expectEqual(
+        [2]u32{ 0, 4 },
+        helpers.rootRowsLayerScrollReached(0, 2, 2, row_h_px, 40).?,
+    );
+    try std.testing.expectEqual(
+        [2]u32{ 36, 40 },
+        helpers.rootRowsLayerScrollReached(760, 2, 2, row_h_px, 40).?,
+    );
+    // A layer with no rows owns nothing, and neither does a zero-row surface.
+    try std.testing.expect(helpers.rootRowsLayerScrollReached(200, 0, 1, row_h_px, 40) == null);
+    try std.testing.expect(helpers.rootRowsLayerScrollReached(200, 5, 1, row_h_px, 0) == null);
+}
+
+test "layer scrolls in one flush accumulate per region and saturate" {
+    const first: helpers.LayerScroll =
+        .{ .row_start = 2, .row_end = 20, .rows_delta = 3, .total_rows = 20, .total_cols = 80 };
+    switch (helpers.mergeLayerScroll(null, first)) {
+        .accumulate => |m| try std.testing.expectEqual(first, m),
+        .conflict => return error.TestUnexpectedResult,
+    }
+
+    var second = first;
+    second.rows_delta = -5;
+    second.total_cols = 90;
+    switch (helpers.mergeLayerScroll(first, second)) {
+        .accumulate => |m| {
+            try std.testing.expectEqual(@as(i32, -2), m.rows_delta);
+            try std.testing.expectEqual(@as(u32, 90), m.total_cols);
+        },
+        .conflict => return error.TestUnexpectedResult,
+    }
+
+    var huge = first;
+    huge.rows_delta = 1_000_000;
+    switch (helpers.mergeLayerScroll(huge, huge)) {
+        .accumulate => |m| try std.testing.expectEqual(@as(i32, 1_000_000), m.rows_delta),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    huge.rows_delta = -1_000_000;
+    switch (helpers.mergeLayerScroll(huge, huge)) {
+        .accumulate => |m| try std.testing.expectEqual(@as(i32, -1_000_000), m.rows_delta),
+        .conflict => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(i32, 1_000_000), helpers.clampRowsDelta(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(i32, -1_000_000), helpers.clampRowsDelta(std.math.minInt(i32)));
+}
+
+test "layer scrolls of different regions report both regions" {
+    const first: helpers.LayerScroll =
+        .{ .row_start = 2, .row_end = 20, .rows_delta = 3, .total_rows = 20, .total_cols = 80 };
+    var other = first;
+    other.row_start = 5;
+    other.rows_delta = -1;
+    switch (helpers.mergeLayerScroll(first, other)) {
+        .accumulate => return error.TestUnexpectedResult,
+        .conflict => |m| {
+            try std.testing.expectEqual(first, m.old);
+            try std.testing.expectEqual(other, m.new);
+        },
+    }
+
+    var shorter = first;
+    shorter.row_end = 19;
+    switch (helpers.mergeLayerScroll(first, shorter)) {
+        .accumulate => return error.TestUnexpectedResult,
+        .conflict => |m| try std.testing.expectEqual(shorter, m.new),
+    }
+}
+
+test "blit rectangle stays inside the layer it scrolls" {
+    const cell_w_px: i32 = 9;
+    const tex_w: i32 = 1600;
+    const tex_h: i32 = 900;
+    const origins = [_][2]i32{ .{ 0, 0 }, .{ 90, 40 }, .{ 720, 300 }, .{ 1200, 860 } };
+    const deltas = [_]i32{ -7, -3, -1, 1, 3, 7 };
+    const cols: u32 = 40;
+    const rows: u32 = 24;
+
+    for (origins) |o| {
+        for (deltas) |d| {
+            var row_start: u32 = 0;
+            while (row_start < 6) : (row_start += 1) {
+                const p = core.row_scroll.make(
+                    row_start,
+                    rows,
+                    d,
+                    o[0],
+                    o[1],
+                    @as(i32, @intCast(cols)) * cell_w_px,
+                    tex_w,
+                    tex_h,
+                    row_h_px,
+                ) orelse continue;
+                const r = core.row_scroll.blitRect(p);
+                try std.testing.expect(r.left >= o[0]);
+                try std.testing.expect(r.right <= o[0] + @as(i32, @intCast(cols)) * cell_w_px);
+                try std.testing.expect(r.right <= tex_w);
+                try std.testing.expect(r.top >= o[1] + @as(i32, @intCast(row_start)) * row_h_px);
+                try std.testing.expect(r.bottom <= o[1] + @as(i32, @intCast(p.clamped_row_end)) * row_h_px);
+                try std.testing.expect(r.bottom <= tex_h);
+                try std.testing.expect(r.bottom > r.top and r.right > r.left);
+            }
+        }
+    }
+}
+
+test "accepted blit rectangles only refuse layers that share pixels" {
+    const accepted: helpers.BlitRectPx = .{ .left = 100, .top = 200, .right = 400, .bottom = 500 };
+    // Touching edges are outside a half-open rectangle.
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 400, .top = 200, .right = 700, .bottom = 500 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 100, .top = 500, .right = 400, .bottom = 800 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 0, .top = 200, .right = 100, .bottom = 500 },
+        accepted,
+    ));
+    try std.testing.expect(!helpers.blitRectsIntersect(
+        .{ .left = 100, .top = 0, .right = 400, .bottom = 200 },
+        accepted,
+    ));
+    // One pixel of overlap is an overlap, in either argument order.
+    const nudged: helpers.BlitRectPx = .{ .left = 399, .top = 499, .right = 700, .bottom = 800 };
+    try std.testing.expect(helpers.blitRectsIntersect(nudged, accepted));
+    try std.testing.expect(helpers.blitRectsIntersect(accepted, nudged));
+    // Contained on both axes.
+    try std.testing.expect(helpers.blitRectsIntersect(
+        .{ .left = 150, .top = 250, .right = 200, .bottom = 300 },
+        accepted,
+    ));
+}
+
+fn bitsFrom(alloc: std.mem.Allocator, len: usize, set: []const usize) !std.DynamicBitSetUnmanaged {
+    var bits = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
+    for (set) |i| bits.set(i);
+    return bits;
+}
+
+fn expectBits(bits: *const std.DynamicBitSetUnmanaged, expected: []const usize) !void {
+    var i: usize = 0;
+    while (i < bits.bit_length) : (i += 1) {
+        const want = std.mem.indexOfScalar(usize, expected, i) != null;
+        if (bits.isSet(i) != want) {
+            std.debug.print("bit {d}: got {}, want {}\n", .{ i, bits.isSet(i), want });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a row bit follows its rows up a scroll region" {
+    const alloc = std.testing.allocator;
+    // grid_line marked row 5, then a second grid_scroll(+3) landed in the same
+    // flush: the vertices are at row 2 now, so the bit has to be.
+    var bits = try bitsFrom(alloc, 10, &.{5});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, 3);
+    try expectBits(&bits, &.{ 2, 7, 8, 9 });
+}
+
+test "a row bit follows its rows down a scroll region" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{2});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, -3);
+    try expectBits(&bits, &.{ 0, 1, 2, 5 });
+}
+
+test "row bits outside the scroll region stay where they are" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 12, &.{ 1, 8, 11 });
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 4, 10, 2);
+    // 8 -> 6; the region vacated [8,10); 1 and 11 are untouched.
+    try expectBits(&bits, &.{ 1, 6, 8, 9, 11 });
+}
+
+test "a shift the row storage refuses leaves the row bits alone" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{5});
+    defer bits.deinit(alloc);
+    // Same guards shiftRows applies before it touches rows_buf.
+    helpers.shiftRowBits(&bits, 0, 10, 0);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 10, 4, 3);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 0, 10, 10);
+    try expectBits(&bits, &.{5});
+    helpers.shiftRowBits(&bits, 0, 11, 3);
+    try expectBits(&bits, &.{5});
+}
+
+test "two shifts in one flush compose" {
+    const alloc = std.testing.allocator;
+    var bits = try bitsFrom(alloc, 10, &.{6});
+    defer bits.deinit(alloc);
+    helpers.shiftRowBits(&bits, 0, 10, 2);
+    // 6 -> 4, vacated [8,10).
+    try expectBits(&bits, &.{ 4, 8, 9 });
+    helpers.shiftRowBits(&bits, 0, 10, 2);
+    // 4 -> 2, 8 -> 6, 9 -> 7, vacated [8,10) again.
+    try expectBits(&bits, &.{ 2, 6, 7, 8, 9 });
+}
+
+// A hit test has to reach surface space before it can compare a point against
+// `zonvie_layer.x_px`, which is surface-local, and must not pay the offset a
+// second time on the way to the core. Getting either wrong moves every click by
+// a fixed number of cells and fails silently, so the offset itself is pinned
+// here rather than left to a hand test on Windows hardware.
+
+test "a non-main window's surface starts at its client origin" {
+    // An external window draws no chrome inside its own client rect, which is
+    // why it can hand client pixels to a layer test unchanged.
+    const o = helpers.surfaceOriginPx(.{
+        .is_main_window = false,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+        .style_is_titlebar = true,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), o.x);
+    try std.testing.expectEqual(@as(i32, 0), o.y);
+}
+
+test "no tabline means no offset at all" {
+    const o = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = false,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 0), o.x);
+    try std.testing.expectEqual(@as(i32, 0), o.y);
+}
+
+test "a left sidebar shifts the surface right; a right one does not" {
+    const left = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_on_right = false,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 120), left.x);
+    try std.testing.expectEqual(@as(i32, 0), left.y);
+
+    // A sidebar on the right takes no leading columns.
+    const right = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_on_right = true,
+        .sidebar_width_px = 120,
+    });
+    try std.testing.expectEqual(@as(i32, 0), right.x);
+    try std.testing.expectEqual(@as(i32, 0), right.y);
+}
+
+test "a titlebar tabline shifts the surface down, unless a child hwnd hosts it" {
+    const inline_bar = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_titlebar = true,
+        .has_content_hwnd = false,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), inline_bar.x);
+    try std.testing.expectEqual(@as(i32, 30), inline_bar.y);
+
+    // With a separate content HWND the tab bar is outside this client area.
+    const child_hosted = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_titlebar = true,
+        .has_content_hwnd = true,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 0), child_hosted.y);
+}
+
+test "the two styles are exclusive, so only one axis ever shifts" {
+    // tabline_style is one enum: sidebar and titlebar cannot both hold. The
+    // predicate is written per-axis, so this pins that a future third style
+    // cannot silently start shifting both.
+    const sidebar = helpers.surfaceOriginPx(.{
+        .is_main_window = true,
+        .ext_tabline_enabled = true,
+        .style_is_sidebar = true,
+        .sidebar_width_px = 120,
+        .tab_bar_height_px = 30,
+    });
+    try std.testing.expectEqual(@as(i32, 120), sidebar.x);
+    try std.testing.expectEqual(@as(i32, 0), sidebar.y);
+}
+
+test "a blink-off frame draws no cursor vertices" {
+    const V = struct { x: f32 };
+    const cursor = [_]V{ .{ .x = 1 }, .{ .x = 2 } };
+    try std.testing.expectEqual(@as(usize, 2), helpers.cursorVertsForFrame(V, &cursor, true).len);
+    try std.testing.expectEqual(@as(usize, 0), helpers.cursorVertsForFrame(V, &cursor, false).len);
 }

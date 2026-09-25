@@ -147,10 +147,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const moved = try waitCursorRect(alloc, t1, 10_000);
     std.debug.print("[gui] cursor shader rect after move:  ({d:.0},{d:.0})\n", .{ moved.x, moved.y });
 
-    // Backing scale from the app's own log rather than assuming Retina:
-    // the rect is in drawable pixels, the move was in points.
+    // Backing scale from the app's own log rather than assuming Retina: the
+    // rect is in drawable pixels, the move was in points. It rides on the rect's
+    // own line because that is the space it describes; `resizeExternalWindows`
+    // stopped carrying a shared scale when each window began converting with
+    // its own.
     const scale = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[resizeExternalWindows]", 0)) orelse
+        const line = (try app_log.lastLineSince(alloc, log_path, marker, 0)) orelse
             return error.BackingScaleUnknown;
         defer alloc.free(line);
         break :blk app_log.field(line, "scale") orelse return error.BackingScaleUnknown;
@@ -163,6 +166,36 @@ pub fn run(alloc: std.mem.Allocator) !void {
         "[gui] rect delta: got ({d:.0},{d:.0}) expected ({d:.0},{d:.0})\n",
         .{ got_dx, got_dy, expect_dx, expect_dy },
     );
+
+    // The delta alone passed while the absolute position was thousands of
+    // pixels off screen: the projection fed grid-local PIXELS into an NDC
+    // formula, and a translation survives that. A cursor shader draws from
+    // iPreviousCursor to iCurrentCursor, so an off-screen endpoint is what
+    // the user sees as a wild trail. Both rects must sit inside the main
+    // window's drawable.
+    const main_win = blk: {
+        var buf: [max_windows]platform.MainWindow = undefined;
+        const wins = buf[0..platform.windowsForPid(g.app_pid, &buf)];
+        for (wins) |wnd| {
+            if (wnd.number != float_win.number) break :blk wnd;
+        }
+        return error.MainWindowNotFound;
+    };
+    const main_w_px = main_win.bounds.w * scale;
+    const main_h_px = main_win.bounds.h * scale;
+    for ([_]struct { label: []const u8, x: f64, y: f64 }{
+        .{ .label = "before move", .x = first.x, .y = first.y },
+        .{ .label = "after move", .x = moved.x, .y = moved.y },
+    }) |r| {
+        if (r.x < 0 or r.y < 0 or r.x > main_w_px or r.y > main_h_px) {
+            std.debug.print(
+                "[gui] cursor shader rect {s} is outside the main drawable: " ++
+                    "({d:.0},{d:.0}) not in 0..{d:.0} x 0..{d:.0}\n",
+                .{ r.label, r.x, r.y, main_w_px, main_h_px },
+            );
+            return error.CursorShaderRectOffScreen;
+        }
+    }
 
     if (@abs(got_dx - expect_dx) > tolerance_px or @abs(got_dy - expect_dy) > tolerance_px) {
         std.debug.print(

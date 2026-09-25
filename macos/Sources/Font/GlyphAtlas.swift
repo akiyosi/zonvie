@@ -521,7 +521,7 @@ final class GlyphAtlas {
     // the sole writer increments it while beginAtlasWrite() holds that gate.
     private var blitGeneration: UInt64 = 0
 
-    /// Called by the writer (MetalTerminalRenderer.beginFlush's blit path)
+    /// Called by the writer (GridSurfaceRenderer.beginFlush's blit path)
     /// on the SAME command buffer as encodeBackTextureBlit, right before
     /// cmd.commit(). Must be called while still holding the write critical
     /// section (i.e. before endAtlasWrite()). Returns the generation encoded,
@@ -640,40 +640,17 @@ final class GlyphAtlas {
     }
 
     /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
+    /// The core's reading of a feature list (zonvie_core_parse_font_features),
+    /// shared with Windows.
     private static func parseFontFeatures(_ s: String) -> [zonvie_font_feature] {
         guard !s.isEmpty else { return [] }
-        return s.split(separator: ",").compactMap { token in
-            let t = token.trimmingCharacters(in: .whitespaces)
-            var tag: String
-            var value: Int32
-
-            if t.contains("=") {
-                let kv = t.split(separator: "=", maxSplits: 1)
-                guard kv.count == 2, kv[0].count == 4, let val = Int32(kv[1]) else { return nil }
-                tag = String(kv[0])
-                value = val
-            } else if t.hasPrefix("+") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 1
-            } else if t.hasPrefix("-") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 0
-            } else {
-                guard t.count == 4 else { return nil }
-                tag = t
-                value = 1
+        var out = [zonvie_font_feature](repeating: zonvie_font_feature(), count: Int(ZONVIE_MAX_FONT_FEATURES))
+        let n = s.withCString { cs in
+            out.withUnsafeMutableBufferPointer { buf in
+                zonvie_core_parse_font_features(cs, s.utf8.count, buf.baseAddress, buf.count)
             }
-
-            let bytes = Array(tag.utf8)
-            guard bytes.count == 4 else { return nil }
-            var feature = zonvie_font_feature()
-            feature.tag = (Int8(bitPattern: bytes[0]), Int8(bitPattern: bytes[1]),
-                           Int8(bitPattern: bytes[2]), Int8(bitPattern: bytes[3]))
-            feature.value = value
-            return feature
         }
+        return Array(out.prefix(n))
     }
     
     func setBackingScale(_ s: CGFloat) {
@@ -846,6 +823,17 @@ final class GlyphAtlas {
         }
     }
 
+    /// Pack an axis for zonvie_ft_hb_font_set_variation_axes, which keeps a
+    /// fractional design coordinate (Skia's wght runs 0.48-3.2).
+    private static func fontAxis(_ axis: FontInstanceAxes.Axis) -> zonvie_font_axis {
+        let t = axis.tag
+        return zonvie_font_axis(
+            tag: (CChar(bitPattern: UInt8(t >> 24 & 0xFF)), CChar(bitPattern: UInt8(t >> 16 & 0xFF)),
+                  CChar(bitPattern: UInt8(t >> 8 & 0xFF)), CChar(bitPattern: UInt8(t & 0xFF))),
+            value: Float(axis.value)
+        )
+    }
+
     /// Use kCTFontVariationAttribute to nudge CoreText into selecting the variable
     /// font file.  Always returns the varied CTFont — for static fonts the
     /// variation dictionary is silently ignored and createHbFtFont_locked will
@@ -929,9 +917,11 @@ final class GlyphAtlas {
         // the generation-checked publication below.
         os_unfair_lock_unlock(&mu)
         var newBase: LoadedHbFtFont?
+        var baseSource = baseFont
         if let hint {
             let baseFaceIdx = ctFontFaceIndex(hint) & 0xFFFF
             newBase = createHbFtFontBorrowed(for: hint, px: px, faceIndex: baseFaceIdx)
+            if newBase != nil { baseSource = hint }
         }
         if newBase == nil {
             newBase = createHbFtFontBorrowed(for: baseFont, px: px)
@@ -940,11 +930,26 @@ final class GlyphAtlas {
         let newItalic = italic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
         let newBoldItalic = boldItalic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
 
-        for loaded in [newBase, newBold, newItalic, newBoldItalic] {
-            guard let loaded, !features.isEmpty else { continue }
-            features.withUnsafeBufferPointer { buf in
-                zonvie_ft_hb_font_set_variations(loaded.handle, buf.baseAddress, buf.count)
-                zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+        let userAxes = Self.extractVariationAxes(from: features).map {
+            FontInstanceAxes.Axis(tag: $0.tag, value: Double($0.value))
+        }
+        let faces: [(LoadedHbFtFont?, CTFont?)] = [
+            (newBase, baseSource), (newBold, bold), (newItalic, italic), (newBoldItalic, boldItalic),
+        ]
+        for case let (loaded?, ctFont?) in faces {
+            // A trait face of a variable font is an instance of the same
+            // file; FreeType needs its coordinates (see FontInstanceAxes).
+            let axes = FontInstanceAxes.merged(instance: FontInstanceAxes.coordinates(of: ctFont), user: userAxes)
+            if !axes.isEmpty {
+                let variations = axes.map(Self.fontAxis)
+                variations.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_variation_axes(loaded.handle, buf.baseAddress, buf.count)
+                }
+            }
+            if !features.isEmpty {
+                features.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+                }
             }
         }
         os_unfair_lock_lock(&mu)
@@ -2260,7 +2265,7 @@ final class GlyphAtlas {
         // blocks the core thread. That automatic
         // ordering is scoped to the main renderer's OWN MTLCommandQueue --
         // it does not cover ExternalGridView's reads, each of which runs on
-        // its own separate MTLCommandQueue. The caller (MetalTerminalRenderer's
+        // its own separate MTLCommandQueue. The caller (GridSurfaceRenderer's
         // beginFlush, right before committing this blit's command buffer)
         // calls beginAtlasWrite()/endAtlasWrite() to close that gap explicitly instead
         // of relying solely on the append-only/byte-identical/fresh-texture

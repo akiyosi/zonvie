@@ -1,4 +1,7 @@
 const std = @import("std");
+const pointer_target = @import("pointer_target.zig");
+const scrollbar_metrics = @import("scrollbar_metrics.zig");
+const popup_placement = @import("popup_placement.zig");
 const build_options = @import("build_options");
 const core = @import("nvim_core.zig");
 pub const config = @import("config.zig");
@@ -15,6 +18,12 @@ pub const clock = @import("clock.zig");
 pub const nvim_core = core;
 pub const grid_mod = @import("grid.zig");
 pub const flush_mod = @import("flush.zig");
+pub const render_layout = @import("render_layout.zig");
+pub const row_scroll = @import("row_scroll.zig");
+pub const cursor_rect = @import("cursor_rect.zig");
+pub const win_layout = @import("win_layout.zig");
+const msg_stack = @import("msg_stack.zig");
+pub const glow_chain = @import("glow_chain.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -56,6 +65,31 @@ pub const DECO_COLOR_EMOJI: u32 = 1 << 10; // Color glyph (emoji): sample RGBA, 
 // geometrically rather than rasterized. Tells the frontend not to treat them
 // as background, which would fade them under a translucent/blurred window.
 pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
+
+/// One grid placed on one surface. Mirrors `zonvie_layer` in
+/// include/zonvie_core.h.
+pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
+pub const LAYER_MOUSE_ENABLED: u32 = 1 << 1;
+
+pub const Layer = extern struct {
+    grid_id: i64,
+    /// Grid this float is anchored to; == surface_id for the root layer.
+    anchor_grid: i64,
+    /// Surface-local, top-left origin.
+    x_px: i32,
+    y_px: i32,
+    rows: u32,
+    cols: u32,
+    /// Back-to-front index; 0 == root grid.
+    z: i32,
+    flags: u32,
+
+    comptime {
+        if (@sizeOf(Layer) != 40) {
+            @compileError("Layer struct size mismatch! Expected 40 bytes.");
+        }
+    }
+};
 
 pub const Vertex = extern struct {
     position: [2]f32,
@@ -247,6 +281,21 @@ pub const GridInfo = extern struct {
     // 1 if this grid is an external (separate top-level) window. Such grids are
     // reported with start (0,0) and must be excluded from main-window hit-testing.
     is_external: i32,
+    // win_float_pos' mouse_enabled: 0 for a float that refuses the mouse.
+    // A hit test MUST skip such a grid — Neovim rejects an event addressed to
+    // it without re-resolving, so naming it swallows the event.
+    mouse_enabled: i32,
+    // Which surface composites this grid: 1 for the main window, its own id
+    // for an external window, and the HOST's id for a float anchored inside
+    // one. A grid placed by another surface reports start_row/start_col in
+    // that surface's space, so a frontend must not hit-test it as its own.
+    placed_by_surface: i64,
+    // Neovim's composition index, and the core's tie-breaker after it. With
+    // zindex and grid_id these are the order a surface's layers are drawn in,
+    // back to front, so a frontend can say which of two grids is on top
+    // without inventing an order of its own.
+    compindex: i64,
+    draw_order: u64,
 };
 
 /// Viewport info for scrollbar rendering
@@ -312,8 +361,89 @@ pub const PopupmenuColors = extern struct {
     pmenu_sel_fg: u32,
 };
 
+/// Layout version of Callbacks, mirroring ZONVIE_CALLBACKS_ABI_VERSION in
+/// include/zonvie_core.h. Bump it whenever a field is removed, reordered, or
+/// has its signature changed. Appending a new callback at the end stays
+/// backward compatible through callbacks_size and must NOT bump it.
+pub const CALLBACKS_ABI_VERSION: u32 = 1;
+
+/// Every field of Callbacks and the byte offset it must keep. Bump
+/// CALLBACKS_ABI_VERSION and update this table together: removing, reordering
+/// or retyping a field moves every offset after it while @sizeOf(Callbacks)
+/// can stay the same, so callbacks_size cannot see it. Appending a callback
+/// only adds a row here and keeps the version.
+const callbacks_layout = [_]struct { []const u8, usize }{
+    .{ "abi_version", 0 },
+    .{ "on_vertices_row", 8 },
+    .{ "on_atlas_ensure_glyph", 16 },
+    .{ "on_atlas_ensure_glyph_styled", 24 },
+    .{ "on_log", 32 },
+    .{ "on_guifont", 40 },
+    .{ "on_linespace", 48 },
+    .{ "on_exit", 56 },
+    .{ "on_set_title", 64 },
+    .{ "on_external_window", 72 },
+    .{ "on_external_window_close", 80 },
+    .{ "on_cursor_grid_changed", 88 },
+    .{ "on_cmdline_show", 96 },
+    .{ "on_cmdline_hide", 104 },
+    .{ "on_cmdline_pos", 112 },
+    .{ "on_cmdline_special_char", 120 },
+    .{ "on_cmdline_block_show", 128 },
+    .{ "on_cmdline_block_append", 136 },
+    .{ "on_cmdline_block_hide", 144 },
+    .{ "on_popupmenu_show", 152 },
+    .{ "on_popupmenu_hide", 160 },
+    .{ "on_popupmenu_select", 168 },
+    .{ "on_msg_show", 176 },
+    .{ "on_msg_clear", 184 },
+    .{ "on_msg_showmode", 192 },
+    .{ "on_msg_showcmd", 200 },
+    .{ "on_msg_ruler", 208 },
+    .{ "on_msg_history_show", 216 },
+    .{ "on_clipboard_get", 224 },
+    .{ "on_clipboard_set", 232 },
+    .{ "on_ssh_auth_prompt", 240 },
+    .{ "on_tabline_update", 248 },
+    .{ "on_tabline_hide", 256 },
+    .{ "on_grid_scroll", 264 },
+    .{ "on_ime_off", 272 },
+    .{ "on_quit_requested", 280 },
+    .{ "on_rasterize_glyph", 288 },
+    .{ "on_atlas_upload", 296 },
+    .{ "on_atlas_create", 304 },
+    .{ "on_flush_begin", 312 },
+    .{ "on_flush_end", 320 },
+    .{ "on_default_colors_set", 328 },
+    .{ "on_win_move", 336 },
+    .{ "on_win_exchange", 344 },
+    .{ "on_win_rotate", 352 },
+    .{ "on_win_resize_equal", 360 },
+    .{ "on_win_move_cursor", 368 },
+    .{ "on_shape_text_run", 376 },
+    .{ "on_rasterize_glyph_by_id", 384 },
+    .{ "on_get_ascii_table", 392 },
+    .{ "on_grid_row_scroll", 400 },
+    .{ "on_restart", 408 },
+    .{ "on_connect", 416 },
+    .{ "on_agent_status", 424 },
+    .{ "on_main_grid_size", 432 },
+    .{ "on_surface_layout", 440 },
+    .{ "on_grid_destroy", 448 },
+};
+
 pub const Callbacks = extern struct {
-    on_vertices_partial: ?OnVerticesPartialFn = null,
+    /// Must equal CALLBACKS_ABI_VERSION; zonvie_core_create returns null
+    /// otherwise. callbacks_size can only report that the struct's LENGTH
+    /// changed, never that its LAYOUT did: commit 935bdc0 removed two
+    /// callbacks and appended two, so a consumer built before it passes a
+    /// callbacks_size equal to the current @sizeOf while every pointer from
+    /// on_vertices_row onward sits at the wrong offset. The field is first on
+    /// purpose -- a stale build has a function pointer at that offset and
+    /// cannot match the version by accident. It defaults to the current
+    /// version because any Zig caller is compiled against this very layout.
+    abi_version: u32 = CALLBACKS_ABI_VERSION,
+
     on_vertices_row: ?OnVerticesRowFn = null,
 
     on_atlas_ensure_glyph: ?AtlasEnsureGlyphFn = null,
@@ -502,16 +632,6 @@ pub const Callbacks = extern struct {
     on_get_ascii_table: ?GetAsciiTableFn = null,
 
     // Main row-buffer scroll fast path notification (optional)
-    on_main_row_scroll: ?*const fn (
-        ctx: ?*anyopaque,
-        row_start: u32,
-        row_end: u32,
-        col_start: u32,
-        col_end: u32,
-        rows_delta: i32,
-        total_rows: u32,
-        total_cols: u32,
-    ) callconv(.c) void = null,
 
     // External grid (sub-grid) row-buffer scroll fast path notification (optional)
     on_grid_row_scroll: ?*const fn (
@@ -549,6 +669,43 @@ pub const Callbacks = extern struct {
     // Neovim-initiated main grid resize (`:set columns=` / `:set lines=`).
     // Appended at the end for ABI compat (see on_restart note).
     on_main_grid_size: ?*const fn (ctx: ?*anyopaque, rows: u32, cols: u32) callconv(.c) void = null,
+
+    // Per-surface layer placement, and grid buffer lifetime.
+    // Appended at the end for ABI compat.
+    on_surface_layout: ?*const fn (
+        ctx: ?*anyopaque,
+        surface_id: i64,
+        layers: [*]const Layer,
+        count: usize,
+        surface_rows: u32,
+        surface_cols: u32,
+    ) callconv(.c) void = null,
+    on_grid_destroy: ?*const fn (ctx: ?*anyopaque, grid_id: i64) callconv(.c) void = null,
+
+    // No total-size assertion: appending a callback is a legal, ABI-compatible
+    // change. What must hold is that the version stays readable at offset 0 by
+    // any caller, whatever the rest of the struct grows into.
+    comptime {
+        if (@offsetOf(Callbacks, "abi_version") != 0) {
+            @compileError("Callbacks.abi_version offset mismatch! Expected 0.");
+        }
+        if (@sizeOf(@FieldType(Callbacks, "abi_version")) != 4) {
+            @compileError("Callbacks.abi_version size mismatch! Expected 4 bytes.");
+        }
+        @setEvalBranchQuota(20000);
+        const fields = @typeInfo(Callbacks).@"struct".fields;
+        for (fields[0..@min(fields.len, callbacks_layout.len)], 0..) |f, i| {
+            if (!std.mem.eql(u8, f.name, callbacks_layout[i][0]) or
+                @offsetOf(Callbacks, f.name) != callbacks_layout[i][1])
+            {
+                @compileError("Callbacks layout changed at field '" ++ f.name ++
+                    "': bump CALLBACKS_ABI_VERSION (and ZONVIE_CALLBACKS_ABI_VERSION in include/zonvie_core.h) and update callbacks_layout together.");
+            }
+        }
+        if (fields.len != callbacks_layout.len) {
+            @compileError("Callbacks field count changed: add each appended callback to callbacks_layout; a removal must also bump CALLBACKS_ABI_VERSION.");
+        }
+    }
 };
 
 pub const zonvie_core = opaque {};
@@ -578,6 +735,18 @@ fn asBox(p: *zonvie_core) *CoreBox {
 }
 
 pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, ctx: ?*anyopaque) ?*zonvie_core {
+    // Refuse a consumer built against a different callbacks layout before
+    // anything else is read from it. Only abi_version is touched here: every
+    // other field, on_log included, may sit at the wrong offset, so the
+    // refusal cannot be logged. A zero callbacks_size still means "install no
+    // callbacks at all", so nothing can be mis-wired and no version is read.
+    if (cb) |p| {
+        if (callbacks_size != 0) {
+            if (callbacks_size < @sizeOf(u32)) return null;
+            if (p.abi_version != CALLBACKS_ABI_VERSION) return null;
+        }
+    }
+
     // Eagerly initialize the shared Io before any worker threads spawn.
     clock.init();
 
@@ -610,7 +779,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
 
     // Build core.Callbacks from the C-facing callback struct.
     const cb_core: core.Callbacks = .{
-        .on_vertices_partial = box.cb.on_vertices_partial,
         .on_vertices_row = box.cb.on_vertices_row,
 
         .on_atlas_ensure_glyph = box.cb.on_atlas_ensure_glyph,
@@ -668,6 +836,10 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         // Neovim-initiated main grid resize
         .on_main_grid_size = box.cb.on_main_grid_size,
 
+        // Per-surface layer placement and grid buffer lifetime
+        .on_surface_layout = box.cb.on_surface_layout,
+        .on_grid_destroy = box.cb.on_grid_destroy,
+
         // Grid scroll notification
         .on_grid_scroll = box.cb.on_grid_scroll,
 
@@ -704,7 +876,6 @@ pub export fn zonvie_core_create(cb: ?*const Callbacks, callbacks_size: usize, c
         .on_get_ascii_table = box.cb.on_get_ascii_table,
 
         // Main row-buffer scroll fast path notification
-        .on_main_row_scroll = box.cb.on_main_row_scroll,
 
         // External grid row-buffer scroll fast path notification
         .on_grid_row_scroll = box.cb.on_grid_row_scroll,
@@ -793,6 +964,21 @@ test "retry entry points reject work after stop is requested" {
     zonvie_core_retry_flush(p);
     zonvie_core_retry_flush_locked(p);
     try std.testing.expectEqual(@as(u32, 0), state.callback_count);
+}
+
+test "core creation refuses a callbacks struct from a different ABI version" {
+    // A stale consumer can pass a callbacks_size equal to the current
+    // @sizeOf while its layout differs, so the size check alone lets it
+    // through; only abi_version can reject it.
+    var stale: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION + 1 };
+    try std.testing.expect(zonvie_core_create(&stale, @sizeOf(Callbacks), null) == null);
+
+    var zeroed: Callbacks = .{ .abi_version = 0 };
+    try std.testing.expect(zonvie_core_create(&zeroed, @sizeOf(Callbacks), null) == null);
+
+    var current: Callbacks = .{ .abi_version = CALLBACKS_ABI_VERSION };
+    const p = zonvie_core_create(&current, @sizeOf(Callbacks), null) orelse return error.OutOfMemory;
+    zonvie_core_destroy(p);
 }
 
 test "grid text extraction trims blanks and reports the size a short buffer needs" {
@@ -909,6 +1095,211 @@ pub export fn zonvie_core_perf_now_ns() callconv(.c) i64 {
     return @intCast(clock.nowNs());
 }
 
+/// Row-scroll blit arithmetic. Stateless, so no core handle: the answer
+/// depends only on the geometry passed in. The Windows frontend calls
+/// `row_scroll` directly as Zig; these exist for the macOS side.
+pub export fn zonvie_core_row_scroll_plan_make(
+    row_start: u32,
+    row_end: u32,
+    rows_delta: i32,
+    origin_x_px: i32,
+    origin_y_px: i32,
+    width_px: i32,
+    texture_width_px: i32,
+    texture_height_px: i32,
+    row_height_px: i32,
+    out: ?*row_scroll.Plan,
+) callconv(.c) bool {
+    const dst = out orelse return false;
+    const plan = row_scroll.make(
+        row_start,
+        row_end,
+        rows_delta,
+        origin_x_px,
+        origin_y_px,
+        width_px,
+        texture_width_px,
+        texture_height_px,
+        row_height_px,
+    ) orelse return false;
+    dst.* = plan;
+    return true;
+}
+
+pub export fn zonvie_core_row_scroll_dirty_rows_without_blit(
+    row_start: u32,
+    row_end: u32,
+    origin_y_px: i32,
+    texture_height_px: i32,
+    row_height_px: i32,
+    out_row_start: ?*u32,
+    out_row_end: ?*u32,
+) callconv(.c) bool {
+    const s = out_row_start orelse return false;
+    const e = out_row_end orelse return false;
+    const rows = row_scroll.dirtyRowsWithoutBlit(
+        row_start,
+        row_end,
+        origin_y_px,
+        texture_height_px,
+        row_height_px,
+    ) orelse return false;
+    s.* = rows[0];
+    e.* = rows[1];
+    return true;
+}
+
+pub export fn zonvie_core_band_layer_rows(
+    band_top_px: i32,
+    band_bottom_px: i32,
+    origin_y_px: i32,
+    layer_rows: u32,
+    row_height_px: i32,
+    out_first_row: ?*u32,
+    out_last_row: ?*u32,
+) callconv(.c) bool {
+    const f = out_first_row orelse return false;
+    const l = out_last_row orelse return false;
+    const rows = row_scroll.bandLayerRows(
+        band_top_px,
+        band_bottom_px,
+        origin_y_px,
+        layer_rows,
+        row_height_px,
+    ) orelse return false;
+    f.* = rows[0];
+    l.* = rows[1];
+    return true;
+}
+
+/// Layout must match `zonvie_row_scroll_merge` in include/zonvie_core.h.
+pub const RowScrollMergeC = extern struct {
+    staged: row_scroll.Staged,
+    superseded: row_scroll.Staged,
+    has_superseded: u32,
+    _pad: u32 = 0,
+};
+
+comptime {
+    if (@sizeOf(row_scroll.Staged) != 7 * 4) @compileError("zonvie_row_scroll layout drifted from the header");
+    if (@offsetOf(RowScrollMergeC, "has_superseded") != 14 * 4) @compileError("field order drifted from the header");
+}
+
+comptime {
+    if (@sizeOf(cursor_rect.Rect) != 4 * 4) @compileError("zonvie_cursor_rect layout drifted from the header");
+    if (@sizeOf(cursor_rect.IntRect) != 4 * 4) @compileError("zonvie_cursor_irect layout drifted from the header");
+    if (@sizeOf(win_layout.Frame) != 8 + 4 * 8) @compileError("zonvie_win_frame layout drifted from the header");
+}
+
+/// The cursor's bounds on a surface: the vertex box moved to the origin that
+/// places its grid. False, leaving *out untouched, for no vertices.
+pub export fn zonvie_core_cursor_rect(
+    verts: ?[*]const Vertex,
+    count: usize,
+    origin_x_px: f32,
+    origin_y_px: f32,
+    out: ?*cursor_rect.Rect,
+) callconv(.c) bool {
+    const dst = out orelse return false;
+    const v = verts orelse return false;
+    dst.* = cursor_rect.bounds(Vertex, v[0..count], origin_x_px, origin_y_px) orelse return false;
+    return true;
+}
+
+/// The whole pixels a cursor rectangle touches, clipped to the surface. False
+/// when nothing is left inside it.
+pub export fn zonvie_core_cursor_rect_inflate_clip(
+    rect: ?*const cursor_rect.Rect,
+    clip_w_px: i32,
+    clip_h_px: i32,
+    out: ?*cursor_rect.IntRect,
+) callconv(.c) bool {
+    const r = rect orelse return false;
+    const dst = out orelse return false;
+    dst.* = cursor_rect.inflateClip(r.*, clip_w_px, clip_h_px) orelse return false;
+    return true;
+}
+
+/// Fold a row scroll into whatever is staged for the same grid. `existing` is
+/// null when nothing is staged.
+pub export fn zonvie_core_row_scroll_merge(
+    existing: ?*const row_scroll.Staged,
+    incoming: ?*const row_scroll.Staged,
+    out: ?*RowScrollMergeC,
+) callconv(.c) bool {
+    const inc = incoming orelse return false;
+    const dst = out orelse return false;
+    const merged = row_scroll.mergeStaged(
+        if (existing) |e| e.* else null,
+        inc.*,
+    );
+    dst.staged = merged.staged;
+    if (merged.superseded) |sup| {
+        dst.superseded = sup;
+        dst.has_superseded = 1;
+    } else {
+        dst.superseded = std.mem.zeroes(row_scroll.Staged);
+        dst.has_superseded = 0;
+    }
+    return true;
+}
+
+/// Layout must match `zonvie_over_blit_rows` in include/zonvie_core.h. The
+/// core answers in Zig optionals; C gets a flag beside each range.
+pub const OverBlitRowsC = extern struct {
+    above_first: u32,
+    above_last: u32,
+    under_first: u32,
+    under_last: u32,
+    shifted_first: u32,
+    shifted_last: u32,
+    has_above: u32,
+    has_under: u32,
+    has_shifted: u32,
+};
+
+comptime {
+    if (@sizeOf(OverBlitRowsC) != 9 * 4) @compileError("zonvie_over_blit_rows layout drifted from the header");
+    if (@offsetOf(OverBlitRowsC, "has_above") != 6 * 4) @compileError("field order drifted from the header");
+}
+
+pub export fn zonvie_core_row_scroll_over_blit_rows(
+    plan: ?*const row_scroll.Plan,
+    rows_delta: i32,
+    above_left_px: i32,
+    above_top_px: i32,
+    above_rows: u32,
+    above_cols: u32,
+    cell_width_px: i32,
+    row_height_px: i32,
+    out: ?*OverBlitRowsC,
+) callconv(.c) bool {
+    const p = plan orelse return false;
+    const dst = out orelse return false;
+    const over = row_scroll.overBlitRows(
+        p.*,
+        rows_delta,
+        above_left_px,
+        above_top_px,
+        above_rows,
+        above_cols,
+        cell_width_px,
+        row_height_px,
+    ) orelse return false;
+    dst.* = .{
+        .above_first = if (over.above) |a| a[0] else 0,
+        .above_last = if (over.above) |a| a[1] else 0,
+        .under_first = if (over.under) |u| u[0] else 0,
+        .under_last = if (over.under) |u| u[1] else 0,
+        .shifted_first = if (over.shifted) |s| s[0] else 0,
+        .shifted_last = if (over.shifted) |s| s[1] else 0,
+        .has_above = @intFromBool(over.above != null),
+        .has_under = @intFromBool(over.under != null),
+        .has_shifted = @intFromBool(over.shifted != null),
+    };
+    return true;
+}
+
 // Build-time version string from `git describe`, null-terminated for C.
 const version_cstr: [*:0]const u8 = std.fmt.comptimePrint("{s}", .{build_options.version});
 
@@ -955,10 +1346,37 @@ pub export fn zonvie_core_set_option_value(
 }
 
 /// Send a Neovim command (via nvim_command API, does not show in cmdline)
+/// Ask Neovim to close the window shown in `grid_id` (a user closing an
+/// external OS window). Returns 1 when a request was sent, 0 when the grid
+/// has no Neovim window or the request could not be queued.
+pub export fn zonvie_core_request_win_close(p: ?*zonvie_core, grid_id: i64) callconv(.c) c_int {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    const sent = box.core.requestWinClose(grid_id) catch return 0;
+    return @intFromBool(sent);
+}
+
 pub export fn zonvie_core_send_command(p: ?*zonvie_core, cmd: [*]const u8, len: usize) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
     box.core.requestCommand(cmd[0..len]) catch {};
+}
+
+/// Open `count` UTF-8 paths with `:drop` (all in one command) or, with
+/// `tab_per_file`, one `:tab drop` each. Escaped server-side by fnameescape.
+pub export fn zonvie_core_drop_paths(
+    p: ?*zonvie_core,
+    paths: [*]const [*]const u8,
+    lens: [*]const usize,
+    count: usize,
+    tab_per_file: c_int,
+) callconv(.c) void {
+    if (p == null or count == 0) return;
+    const box = asBox(p.?);
+    const slices = box.core.alloc.alloc([]const u8, count) catch return;
+    defer box.core.alloc.free(slices);
+    for (slices, 0..) |*s, i| s.* = paths[i][0..lens[i]];
+    box.core.requestDropPaths(slices, tab_per_file != 0) catch {};
 }
 
 /// Set/update IME preedit (composition) text.
@@ -1379,6 +1797,262 @@ pub export fn zonvie_core_set_background_opacity(p: ?*zonvie_core, opacity: f32)
 
 /// Get list of visible grids for hit-testing.
 /// Returns number of grids written (up to max_count).
+/// Where a pointer landed. `row`/`col` are the named grid's own cells.
+pub const zonvie_pointer_hit = pointer_target.Hit;
+
+/// Which grid a pointer at (`row`, `col`) of `surface_id` names, out of the
+/// grids the caller already has.
+///
+/// Pure: no core pointer, no lock, no allocation. The frontends call it from
+/// the input path with the snapshot they already hold, which is why it takes
+/// the array rather than reaching for one — the non-blocking cached query is
+/// what keeps that path off `grid_mu`.
+///
+/// Returns 1 and fills `out` on a hit, 0 when nothing matches. On 0 the caller
+/// keeps its own surface's grid and the unshifted position, which is what both
+/// frontends did with their own loops.
+pub export fn zonvie_core_resolve_pointer_grid(
+    grids: ?[*]const GridInfo,
+    count: usize,
+    surface_id: i64,
+    row: i32,
+    col: i32,
+    require_scrollable: c_int,
+    out: ?*pointer_target.Hit,
+) callconv(.c) c_int {
+    if (grids == null or out == null) return 0;
+    const hit = pointer_target.resolve(
+        GridInfo,
+        grids.?[0..count],
+        surface_id,
+        row,
+        col,
+        require_scrollable != 0,
+    ) orelse return 0;
+    out.?.* = hit;
+    return 1;
+}
+
+/// Whether a float can scroll its own content: it holds more buffer lines than
+/// its content area shows, margins excluded. A float that already shows every
+/// line is transparent to a wheel event.
+///
+/// `pointer_target.resolve` applies this itself; this is for a frontend that
+/// resolves a pointer against its own DRAWN geometry rather than the cell
+/// positions the rule reads — the external surface on macOS — and so needs the
+/// predicate without the rest. Scalars rather than the struct, so the caller
+/// passes what it has.
+pub export fn zonvie_core_captures_scroll(
+    rows: i32,
+    margin_top: i32,
+    margin_bottom: i32,
+    line_count: i64,
+) callconv(.c) c_int {
+    return @intFromBool(pointer_target.capturesScroll(.{
+        .rows = rows,
+        .margin_top = margin_top,
+        .margin_bottom = margin_bottom,
+        .line_count = line_count,
+    }));
+}
+
+pub const zonvie_scrollbar_metrics = scrollbar_metrics.Metrics;
+
+/// Whether a viewport needs a scrollbar, and where its knob sits on the track.
+///
+/// Pure: no core pointer, no lock, no allocation. Takes the three numbers a
+/// frontend already has from `zonvie_core_get_viewport*`, because both had
+/// written this arithmetic out and their answers differed at three corners --
+/// a zero-row viewport, a window showing its whole buffer, and a window
+/// scrolled past the last line.
+///
+/// Track rectangles and a minimum knob height are chrome and stay with the
+/// caller: this says how far down and how tall, in fractions.
+pub export fn zonvie_core_scrollbar_metrics(
+    topline: i64,
+    botline: i64,
+    line_count: i64,
+    out: ?*scrollbar_metrics.Metrics,
+) callconv(.c) void {
+    if (out) |o| o.* = scrollbar_metrics.compute(topline, botline, line_count);
+}
+
+pub const zonvie_scrollbar_drag_target = scrollbar_metrics.DragTarget;
+
+/// The top edge of an external popupmenu window: below the anchor cell when
+/// it fits above the reference window's bottom, else above when it fits
+/// under the screen top, else below. Y grows downward.
+pub export fn zonvie_core_popupmenu_top(
+    anchor_top: i32,
+    anchor_height: i32,
+    popup_height: i32,
+    ref_bottom: i32,
+    screen_top: i32,
+) callconv(.c) i32 {
+    return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
+}
+
+/// One OpenType feature in the layout of zonvie_font_feature (zonvie_hbft.h).
+pub const FontFeatureC = extern struct { tag: [4]u8, value: i32 };
+
+/// Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+/// into `out`, at most `cap` entries; returns how many. Tokens that are not a
+/// feature are skipped. The frontends each carried a parser of their own, and
+/// they disagreed on whitespace, `h14`-shaped tags and negative values. Pure.
+pub export fn zonvie_core_parse_font_features(
+    list: ?[*]const u8,
+    len: usize,
+    out: ?[*]FontFeatureC,
+    cap: usize,
+) callconv(.c) usize {
+    const text = (list orelse return 0)[0..len];
+    const dst = out orelse return 0;
+    var parsed: [32]redraw_handler.FontFeature = undefined;
+    const n = redraw_handler.parseFontFeatureList(text, parsed[0..@min(cap, parsed.len)]);
+    for (parsed[0..n], 0..) |f, i| dst[i] = .{ .tag = f.tag, .value = f.value };
+    return n;
+}
+
+/// One `<name>\t<size>[\t<features>]` candidate line, read as
+/// config.parseFontCandidateLine reads it: the name is `line[0..name_len]`,
+/// the feature list `line[features_offset..][0..features_len]`. False for a
+/// line with no name or no size field. Pure.
+pub export fn zonvie_core_parse_font_candidate(
+    line: ?[*]const u8,
+    len: usize,
+    default_pt: f32,
+    size_explicit: bool,
+    out_name_len: ?*usize,
+    out_point_size: ?*f32,
+    out_features_offset: ?*usize,
+    out_features_len: ?*usize,
+) callconv(.c) bool {
+    const text = (line orelse return false)[0..len];
+    const cand = config.parseFontCandidateLine(text, default_pt, size_explicit) orelse return false;
+    if (out_name_len) |p| p.* = cand.name.len;
+    if (out_point_size) |p| p.* = cand.point_size;
+    if (out_features_offset) |p| p.* = if (cand.features.len == 0) len else @intFromPtr(cand.features.ptr) - @intFromPtr(text.ptr);
+    if (out_features_len) |p| p.* = cand.features.len;
+    return true;
+}
+
+/// A saved window origin clamped into an area: each axis to [min, max - size].
+/// Direction-free, so the same call serves Y-up and Y-down. Pure.
+pub export fn zonvie_core_clamp_window_origin(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    area_min_x: i32,
+    area_min_y: i32,
+    area_max_x: i32,
+    area_max_y: i32,
+    out_x: ?*i32,
+    out_y: ?*i32,
+) callconv(.c) void {
+    const o = popup_placement.clampOrigin(x, y, w, h, area_min_x, area_min_y, area_max_x, area_max_y);
+    if (out_x) |p| p.* = o[0];
+    if (out_y) |p| p.* = o[1];
+}
+
+/// The left edge of an external popupmenu window: `anchor_left - text_inset`,
+/// shifted left to end at `screen_right` if it would run past it, never left
+/// of `screen_left`. Pure.
+pub export fn zonvie_core_popupmenu_left(
+    anchor_left: i32,
+    popup_width: i32,
+    text_inset: i32,
+    screen_left: i32,
+    screen_right: i32,
+) callconv(.c) i32 {
+    return popup_placement.left(anchor_left, popup_width, text_inset, screen_left, screen_right);
+}
+
+/// How one msg_show changes the frontend's message stack of `stack_len`
+/// entries: returns 0 push, 1 replace the last entry, 2 append to the last
+/// entry, and writes the count of oldest entries to drop afterwards. Pure.
+/// See msg_stack.zig.
+pub export fn zonvie_core_msg_stack_plan(
+    stack_len: usize,
+    replace_last: c_int,
+    append: c_int,
+    out_evict_oldest: ?*usize,
+) callconv(.c) c_int {
+    const p = msg_stack.plan(stack_len, replace_last != 0, append != 0);
+    if (out_evict_oldest) |out| out.* = p.evict_oldest;
+    return @intFromEnum(p.action);
+}
+
+/// The top edge of the cmdline completion popup: `gap` above the cmdline
+/// window while it clears `screen_top`, else `gap` below. Y grows downward.
+pub export fn zonvie_core_cmdline_popupmenu_top(
+    cmdline_top: i32,
+    cmdline_bottom: i32,
+    popup_height: i32,
+    gap: i32,
+    screen_top: i32,
+) callconv(.c) i32 {
+    return popup_placement.cmdlineTop(cmdline_top, cmdline_bottom, popup_height, gap, screen_top);
+}
+
+/// Plan a window-layout operation (win_move / win_exchange / win_rotate /
+/// win_resize_equal) over the frames the frontend collected, in place. Pure --
+/// no core pointer, no lock -- so a frontend may call it from the callback that
+/// delivered the event, grid_mu held or not. See win_layout.zig.
+pub export fn zonvie_core_win_layout_plan(
+    op: i32,
+    arg: i32,
+    count: i32,
+    source_id: i64,
+    row_band: f64,
+    frames: ?[*]win_layout.Frame,
+    frame_count: usize,
+) callconv(.c) bool {
+    const ptr = frames orelse return false;
+    return win_layout.plan(@enumFromInt(op), arg, count, source_id, row_band, ptr[0..frame_count]);
+}
+
+/// The index of the window `win_move_cursor` lands on, or -1. Pure.
+pub export fn zonvie_core_win_layout_find(
+    source_id: i64,
+    direction: i32,
+    count: i32,
+    frames: ?[*]const win_layout.Frame,
+    frame_count: usize,
+) callconv(.c) i64 {
+    const ptr = frames orelse return -1;
+    const index = win_layout.findInDirection(ptr[0..frame_count], source_id, @enumFromInt(direction), count) orelse return -1;
+    return @intCast(index);
+}
+
+/// Where a knob dragged to `ratio` of its travel asks the window to scroll.
+/// The track and knob geometry that produce `ratio` are chrome and stay with
+/// the caller.
+pub export fn zonvie_core_scrollbar_drag_target(
+    ratio: f64,
+    topline: i64,
+    botline: i64,
+    line_count: i64,
+    out: ?*scrollbar_metrics.DragTarget,
+) callconv(.c) void {
+    if (out) |o| o.* = scrollbar_metrics.dragTarget(ratio, topline, botline, line_count);
+}
+
+/// The grid a surface's scrollbar should show. `surface_id` is 1 for the main
+/// window and the grid id of an external window for its own. Returns 1 and
+/// fills `out_grid` on success, 0 when grid_mu was held — on 0 the caller
+/// leaves its knob where it is.
+pub export fn zonvie_core_try_scrollbar_grid(
+    p: ?*zonvie_core,
+    surface_id: i64,
+    out_grid: ?*i64,
+) callconv(.c) c_int {
+    if (p == null or out_grid == null) return 0;
+    const g = asBox(p.?).core.tryScrollbarGridForSurface(surface_id) orelse return 0;
+    out_grid.?.* = g;
+    return 1;
+}
+
 pub export fn zonvie_core_get_visible_grids(
     p: ?*zonvie_core,
     out_grids: ?[*]GridInfo,
@@ -1577,6 +2251,14 @@ pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32
     return box.core.mousescroll_ver.load(.acquire);
 }
 
+/// Columns one horizontal wheel event scrolls: the 'hor' component of
+/// 'mousescroll', from the same reporter. Lock-free atomic read.
+pub export fn zonvie_core_get_mousescroll_hor(p: ?*zonvie_core) callconv(.c) u32 {
+    if (p == null) return 0;
+    const box = asBox(p.?);
+    return box.core.mousescroll_hor.load(.acquire);
+}
+
 /// Set option_as_meta initial value from config (0=both, 1=none, 2=only_left, 3=only_right).
 pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callconv(.c) void {
     if (p == null) return;
@@ -1689,12 +2371,13 @@ pub export fn zonvie_core_send_mouse_scroll(
 /// If use_bottom is true, positions line at screen bottom (zb), otherwise at top (zt).
 pub export fn zonvie_core_scroll_to_line(
     p: ?*zonvie_core,
+    grid_id: i64,
     line: i64,
     use_bottom: bool,
 ) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
-    box.core.scrollToLine(line, use_bottom);
+    box.core.scrollToLine(grid_id, line, use_bottom);
 }
 
 /// Scroll a window by one page (Neovim's <C-f>/<C-b>).
@@ -1861,6 +2544,25 @@ pub export fn zonvie_core_get_glow_intensity(p: ?*zonvie_core) callconv(.c) f32 
     if (p == null) return 0.0;
     const box = asBox(p.?);
     return box.core.getGlowIntensity();
+}
+
+pub export fn zonvie_core_get_glow_radius_scale(p: ?*zonvie_core) callconv(.c) f32 {
+    if (p == null) return 1.0;
+    const box = asBox(p.?);
+    return box.core.getGlowRadiusScale();
+}
+
+/// Bloom chain geometry. Stateless, like the row-scroll plan: it depends only
+/// on the surface size. The Windows frontend calls `glow_chain` directly as
+/// Zig; this exists for the macOS side.
+pub export fn zonvie_core_glow_chain_plan(
+    surface_w_px: u32,
+    surface_h_px: u32,
+    radius_scale: f32,
+    out: ?*glow_chain.Chain,
+) callconv(.c) void {
+    const dst = out orelse return;
+    dst.* = glow_chain.plan(surface_w_px, surface_h_px, radius_scale);
 }
 
 /// Read the current drawable/cell layout stored in core.
@@ -2411,21 +3113,15 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     if (box.core.isPhase2Atlas()) {
         box.core.resetCoreAtlas();
     }
-    // Scroll cache stores vertices with atlas UVs; invalidate after atlas reset.
-    box.core.invalidateScrollCache();
-    box.core.grid.markAllDirty();
+    // The mirrored frame holds atlas UVs; invalidate after atlas reset.
+    box.core.invalidateMirroredFrameState();
+    // Every grid's cached row vertices hold stale atlas UVs / font metrics.
+    // dirty alone is not enough: the per-row emit path checks dirty_rows,
+    // and markAllDirty sets both.
+    box.core.grid.markEverySurfaceDirty();
     // Bump content_rev so the flush's need_main check passes even when
     // Neovim has not changed any cells (e.g. backing-scale change only).
     box.core.grid.content_rev +%= 1;
-    // Every sub_grid's cached row vertices hold stale atlas UVs / font
-    // metrics too. sg.dirty alone is not enough: the per-row emit path
-    // checks dirty_rows to decide which rows to regenerate, so with no
-    // bits set every row is skipped and dirty gets cleared at flush end
-    // with nothing ever actually resent — markAllDirty() sets both.
-    var sg_it = box.core.grid.sub_grids.valueIterator();
-    while (sg_it.next()) |sg| {
-        sg.markAllDirty();
-    }
     // The main cursor's own regen check is gated on cursor_rev alone (not
     // content_rev/dirty_all), and an external grid's cursor is a separate
     // vertex consumer again — neither is covered by the dirtying above, so
@@ -2465,11 +3161,10 @@ pub export fn zonvie_core_fail_render_budget(p: ?*zonvie_core) callconv(.c) void
 // cursor_col), so one cursor_rev bump covers whichever grid currently
 // owns it, main or external.
 fn forceResendAll(cp: *core.Core) void {
-    cp.grid.markAllDirty();
-    var sub_it = cp.grid.sub_grids.iterator();
-    while (sub_it.next()) |entry| {
-        entry.value_ptr.markAllDirty();
-    }
+    // A newly registered surface needs placement as well as retained rows.
+    var layout_it = cp.last_surface_layout.valueIterator();
+    while (layout_it.next()) |layout| layout.valid = false;
+    cp.grid.markEverySurfaceDirty();
     cp.grid.cursor_rev +%= 1;
     // A prior failed flush may have moved the cursor between external
     // grids without the old grid ever actually receiving its empty-cursor
@@ -2569,9 +3264,8 @@ pub export fn zonvie_core_flush_is_retryable(p: ?*zonvie_core) callconv(.c) bool
 // Calls onFlush() UNCONDITIONALLY rather than gating on a "something is
 // pending" check. An earlier version only checked main content_rev/
 // dirty_all, which silently dropped retries for cursor-only updates
-// (cursor_rev vs last_sent_cursor_rev is a separate predicate — and the
-// row-mode cursor path syncs last_sent_cursor_rev before any abort check
-// can run) and external/subgrid-only updates (each sub_grid tracks its own
+// (the cursor's revision is a separate predicate, synced before any abort
+// check can run) and external/subgrid-only updates (each sub_grid tracks its own
 // dirty flag, not reflected in the main grid's content_rev at all). Rather
 // than growing this into a predicate that has to enumerate every kind of
 // pending state (main/cursor/subgrid/external — and stay in sync with

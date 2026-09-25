@@ -21,13 +21,15 @@ const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
-/// single-instance forwarding and the WM_COPYDATA handler below). 'ZONV'.
-pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E56;
+/// single-instance forwarding and the WM_COPYDATA handler below). 'ZONP': the
+/// payload is a tab-per-file byte ('0'/'1') then NUL-separated raw paths. The
+/// old 'ZONV' carried a client-escaped Ex command; a mismatched pair ignores
+/// the other's message rather than running it.
+pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E50;
 
 /// Neovim command-line escape for a single byte of a file path. Returns the
-/// escaped multi-byte sequence, or null if the byte needs no escaping. Shared
-/// by the WM_DROPFILES handler and the single-instance forwarding path
-/// (main.zig) so both escape identically; the set matches the macOS
+/// escaped multi-byte sequence, or null if the byte needs no escaping. Used for
+/// a drop inserted into the command line; the set matches the macOS
 /// `escapePathForNeovim`. `$` and `` ` `` are included so Neovim does not
 /// perform environment-variable / backtick expansion on a literal path.
 pub fn escapeNeovimByte(ch: u8) ?[]const u8 {
@@ -112,18 +114,19 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
     const file_count = c.DragQueryFileW(hDrop, 0xFFFFFFFF, null, 0);
     if (file_count == 0) return;
 
-    // Build a single command buffer: "drop path1 path2 ..."
-    // or just "path1 path2 ..." for cmdline insertion.
+    // Cmdline insertion types "path1 path2 ..." escaped here. Opening goes
+    // through the core with the paths as they are: the server escapes them
+    // with its own fnameescape (this table missed `*`, and a `\` in a
+    // Windows path is a separator to a Windows server, not an escape).
     var cmd_buf: [32768]u8 = undefined;
     var pos: usize = 0;
+    var open_paths: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (open_paths.items) |p| app.alloc.free(p);
+        open_paths.deinit(app.alloc);
+    }
 
     const is_cmdline = dropInsertsPath(app, force_cmdline);
-
-    if (!is_cmdline) {
-        const prefix = "drop ";
-        @memcpy(cmd_buf[pos..][0..prefix.len], prefix);
-        pos += prefix.len;
-    }
 
     var i: c.UINT = 0;
     while (i < file_count) : (i += 1) {
@@ -156,8 +159,17 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
         const utf8_len = std.unicode.utf16LeToUtf8(utf8_dest, wide_slice) catch continue;
         const utf8_path = utf8_dest[0..utf8_len];
 
+        if (!is_cmdline) {
+            const owned = app.alloc.dupe(u8, utf8_path) catch continue;
+            open_paths.append(app.alloc, owned) catch {
+                app.alloc.free(owned);
+                continue;
+            };
+            continue;
+        }
+
         // Add space separator between paths
-        if (i > 0 or (!is_cmdline and pos > 5)) {
+        if (pos > 0) {
             if (pos < cmd_buf.len) {
                 cmd_buf[pos] = ' ';
                 pos += 1;
@@ -179,22 +191,48 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
         }
     }
 
-    if (pos == 0) return;
-    if (is_cmdline) {
-        // Insert paths at the cursor position.
-        app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
-    } else {
-        // Normal/insert/visual mode: execute :drop immediately.
-        app_mod.zonvie_core_send_command(corep, &cmd_buf, pos);
+    if (!is_cmdline) {
+        // Normal/insert/visual mode: `:drop` them all.
+        if (open_paths.items.len == 0) return;
+        const ptrs = app.alloc.alloc([*]const u8, open_paths.items.len) catch return;
+        defer app.alloc.free(ptrs);
+        const lens = app.alloc.alloc(usize, open_paths.items.len) catch return;
+        defer app.alloc.free(lens);
+        for (open_paths.items, 0..) |p, k| {
+            ptrs[k] = p.ptr;
+            lens[k] = p.len;
+        }
+        app_mod.zonvie_core_drop_paths(corep, ptrs.ptr, lens.ptr, open_paths.items.len, 0);
+        return;
     }
+    if (pos == 0) return;
+    // Insert paths at the cursor position.
+    app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
+}
+
+/// Open the paths a second instance forwarded: `payload[0]` is the tab-per-file
+/// flag, the rest NUL-separated paths.
+fn forwardedDropPaths(app: *App, corep: *app_mod.zonvie_core, payload: []const u8) void {
+    const paths = payload[1..];
+    const count = std.mem.count(u8, paths, "\x00") + 1;
+    const ptrs = app.alloc.alloc([*]const u8, count) catch return;
+    defer app.alloc.free(ptrs);
+    const lens = app.alloc.alloc(usize, count) catch return;
+    defer app.alloc.free(lens);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, paths, 0);
+    while (it.next()) |p| {
+        if (p.len == 0) continue;
+        ptrs[n] = p.ptr;
+        lens[n] = p.len;
+        n += 1;
+    }
+    if (n == 0) return;
+    app_mod.zonvie_core_drop_paths(corep, ptrs.ptr, lens.ptr, n, @intFromBool(payload[0] == '1'));
 }
 
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
-fn loadSystemCursor(id: usize) c.HCURSOR {
-    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
-    const load_fn: RawLoadCursorFn = @ptrCast(&c.LoadCursorW);
-    return @ptrCast(@alignCast(load_fn(null, id)));
-}
+const loadSystemCursor = input.loadSystemCursor;
 
 fn messageTimerMilliseconds(timeout_sec: f32) c.UINT {
     if (!std.math.isFinite(timeout_sec) or timeout_sec <= 0) return 0;
@@ -960,9 +998,9 @@ pub fn serviceDeferredUiRetries(hwnd: c.HWND, app: *App) void {
     if (app.pending_destroy_after_active_operation) return;
     external_windows.serviceDeferredRetries(app, now_ms);
     if (app.pending_destroy_after_active_operation) return;
-    if (app.main_paint_retry_deadline_ms != 0 and app.main_paint_retry_deadline_ms <= now_ms) {
-        app.main_paint_retry_deadline_ms = 0;
-        _ = app.paint_retry.timerFired(app.paint_retry.generation);
+    if (app.surf.paint_retry_deadline_ms != 0 and app.surf.paint_retry_deadline_ms <= now_ms) {
+        app.surf.paint_retry_deadline_ms = 0;
+        _ = app.surf.paint_retry.timerFired(app.surf.paint_retry.generation);
         _ = c.InvalidateRect(hwnd, null, c.FALSE);
     }
     if (app.flush_retry_deadline_ms != 0 and app.flush_retry_deadline_ms <= now_ms) {
@@ -985,7 +1023,7 @@ pub fn nextDeferredUiRetryTimeoutMs(app: *App) c.DWORD {
     var timeout_ms: c.DWORD = c.INFINITE;
     includeDeadline(app.device_lost_retry_deadline_ms, now_ms, &timeout_ms);
     includeDeadline(app.flush_retry_deadline_ms, now_ms, &timeout_ms);
-    includeDeadline(app.main_paint_retry_deadline_ms, now_ms, &timeout_ms);
+    includeDeadline(app.surf.paint_retry_deadline_ms, now_ms, &timeout_ms);
     includeDeadline(app.external_create_retry_deadline_ms, now_ms, &timeout_ms);
     includeDeadline(external_windows.nextPaintRetryDeadlineMs(app), now_ms, &timeout_ms);
     return timeout_ms;
@@ -1054,13 +1092,7 @@ fn armFlushRetryWake(hwnd: c.HWND, app: *App) void {
 /// deadline in serviceDeferredUiRetries runs with that flag set, and it is the
 /// path that picks the retry back up after this returns true.
 fn flushRetryReentrancyBlocked(app: *const App) bool {
-    return app.wm_paint_in_progress or
-        app.in_present_shader_animation_frame or
-        app.glow_prepare_in_progress or
-        app.device_lost_recovering or
-        app.external_window_create_in_progress or
-        app.main_resize_in_progress or
-        app.main_dpi_change_in_progress;
+    return app.paintReentrancyBlocked() or app.external_window_create_in_progress;
 }
 
 fn consumeFlushRetryWake(hwnd: c.HWND, app: *App) void {
@@ -1130,38 +1162,26 @@ fn scheduleMainSizeReplay(hwnd: c.HWND, app: *App) void {
     }
 }
 
-fn scheduleMainPaintRetry(hwnd: c.HWND, app: *App) void {
-    const ticket = app.paint_retry.fail() orelse return;
-    app.main_paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
+fn armMainPaintRetry(hwnd: c.HWND, app: *App, ticket: app_mod.PaintRetryState.Ticket) void {
+    app.surf.paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
     if (!scheduleReliableWindowMessage(
         hwnd,
         app_mod.WM_APP_PAINT_RETRY_FALLBACK,
         ticket.generation,
         @bitCast(app.window_wake_cookie),
         ticket.delay_ms,
-    )) _ = app.paint_retry.timerArmFailed(ticket.generation);
+    )) _ = app.surf.paint_retry.timerArmFailed(ticket.generation);
 }
 
 fn recoverMainPaintFailure(hwnd: c.HWND, app: *App) void {
-    app.mu.lockUncancelable(core.clock.io());
-    app.surface.paint_full = true;
-    app.mu.unlock(core.clock.io());
-    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-    app.tbs.pending_paint_full = true;
-    app.tbs.rotation_mu.unlock(core.clock.io());
-
     var device_lost = false;
     if (app.renderer) |*renderer| device_lost = renderer.device_lost;
+    const ticket = app_mod.failSurfacePaint(app, &app.surf, device_lost);
     if (device_lost) {
         postDeviceLostRecovery(hwnd, app);
-    } else {
-        scheduleMainPaintRetry(hwnd, app);
+    } else if (ticket) |t| {
+        armMainPaintRetry(hwnd, app, t);
     }
-}
-
-fn completeMainPaintRetry(app: *App) void {
-    app.main_paint_retry_deadline_ms = 0;
-    _ = app.paint_retry.succeeded();
 }
 
 fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
@@ -1290,87 +1310,43 @@ const TIMER_REPOSITION_FLOATS = app_mod.TIMER_REPOSITION_FLOATS;
 const TIMER_TRAY_INIT = app_mod.TIMER_TRAY_INIT;
 
 /// Device-loss teardown detaches under app.mu and calls COM only after the
-/// lock is dropped. A Release may synchronously dispatch a nested message.
-fn releaseMainRecoveryBuffers(app: *App) void {
+/// lock is dropped. A Release may synchronously dispatch a nested message,
+/// which can close an external window: `grid_id` names the one `ws` belongs
+/// to and is re-checked on every pass. False when it closed.
+fn releaseSurfaceRecoveryBuffers(app: *App, ws: *app_mod.WindowSurface, grid_id: ?i64) bool {
     while (true) {
         app.mu.lockUncancelable(core.clock.io());
-        var vb = app_mod.detachOneSurfaceGpuVB(&app.surface);
-        var row_vb_bytes: usize = 0;
-        if (vb == null) {
-            if (app_mod.detachOneRowVB(app.row_vbs.items)) |detached| {
-                vb = detached.buffer;
-                row_vb_bytes = detached.bytes;
+        if (grid_id) |gid| {
+            const live = app.external_windows.get(gid);
+            if (live == null or &live.?.surf != ws) {
+                app.mu.unlock(core.clock.io());
+                return false;
             }
         }
-        if (vb == null) {
-            vb = app.cursor_vb;
-            app.cursor_vb = null;
-            app.cursor_vb_bytes = 0;
-        }
-        if (vb == null) {
-            vb = app.scrollbar_vb;
-            app.scrollbar_vb = null;
-            app.scrollbar_vb_bytes = 0;
-        }
+        const detached = ws.detachOneRecoveryVB();
         app.mu.unlock(core.clock.io());
-        if (vb) |buffer| {
-            _ = buffer.lpVtbl.*.Release.?(buffer);
-            if (row_vb_bytes != 0) {
-                app.row_vb_budget.release(
-                    &app.row_vb_retained_bytes,
-                    row_vb_bytes,
-                );
-            }
-        } else {
-            break;
+        const d = detached orelse return true;
+        _ = d.buffer.lpVtbl.*.Release.?(d.buffer);
+        if (d.row_bytes != 0) {
+            app.row_vb_budget.release(&ws.paint.row_vb_retained_bytes, d.row_bytes);
         }
     }
 }
 
-fn releaseExternalRecoveryBuffers(app: *App, grid_id: i64, ext_win: *app_mod.ExternalWindow) bool {
+/// Layer-grid row buffers belong to no surface; see detachOneLayerGridVB.
+fn releaseLayerGridRecoveryBuffers(app: *App) void {
     while (true) {
         app.mu.lockUncancelable(core.clock.io());
-        if (app.external_windows.get(grid_id) != ext_win) {
-            app.mu.unlock(core.clock.io());
-            return false;
-        }
-        var vb = app_mod.detachOneSurfaceGpuVB(&ext_win.surface);
-        var row_vb_bytes: usize = 0;
-        if (vb == null) {
-            if (app_mod.detachOneRowVB(ext_win.row_vbs.items)) |detached| {
-                vb = detached.buffer;
-                row_vb_bytes = detached.bytes;
-            }
-        }
-        if (vb == null) {
-            vb = ext_win.vb;
-            ext_win.vb = null;
-            ext_win.vb_bytes = 0;
-        }
-        if (vb == null) {
-            vb = ext_win.cursor_vb;
-            ext_win.cursor_vb = null;
-            ext_win.cursor_vb_bytes = 0;
-        }
-        if (vb == null) {
-            vb = ext_win.scrollbar_vb;
-            ext_win.scrollbar_vb = null;
-            ext_win.scrollbar_vb_bytes = 0;
-        }
+        const vb = app_mod.detachOneLayerGridVB(&app.layer_grids);
         app.mu.unlock(core.clock.io());
         if (vb) |buffer| {
             _ = buffer.lpVtbl.*.Release.?(buffer);
-            if (row_vb_bytes != 0) {
-                app.row_vb_budget.release(
-                    &ext_win.row_vb_retained_bytes,
-                    row_vb_bytes,
-                );
-            }
         } else {
-            return true;
+            return;
         }
     }
 }
+
 const TRAY_INIT_DELAY_MS = app_mod.TRAY_INIT_DELAY_MS;
 const QUIT_TIMEOUT_MS = app_mod.QUIT_TIMEOUT_MS;
 const SCROLLBAR_FADE_INTERVAL = app_mod.SCROLLBAR_FADE_INTERVAL;
@@ -1378,7 +1354,7 @@ const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
 const SCROLLBAR_REPEAT_INTERVAL = app_mod.SCROLLBAR_REPEAT_INTERVAL;
 
 // Win32 DPI API (Windows 10 v1607+)
-extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
+pub extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
 
 // Grid ID constants
 const CMDLINE_GRID_ID = app_mod.CMDLINE_GRID_ID;
@@ -1396,10 +1372,9 @@ const CMDLINE_CORNER_RADIUS = app_mod.CMDLINE_CORNER_RADIUS;
 const MSG_PADDING = app_mod.MSG_PADDING;
 
 // Layout helpers are in app_mod (getEffectiveContentWidth, updateLayoutToCore,
-// rowHeightPxFromClient, updateRowsColsFromClientForce).
+// updateRowsColsFromClientForce).
 const getEffectiveContentWidth = app_mod.getEffectiveContentWidth;
 const updateLayoutToCore = app_mod.updateLayoutToCore;
-const rowHeightPxFromClient = app_mod.rowHeightPxFromClient;
 const updateRowsColsFromClientForce = app_mod.updateRowsColsFromClientForce;
 
 fn applyMainDpiState(app: *App, new_dpi: u32) void {
@@ -1436,12 +1411,21 @@ fn applyMainDpiState(app: *App, new_dpi: u32) void {
     if (app.row_valid.bit_length != 0) app.row_valid.unsetAll();
     app.back_tex_valid = false;
     app.last_cursor_rect_px = null;
+    // Every surface draws from the one atlas, so a DPI change re-rasterizes at
+    // the new cell size for external windows too — but only the main window's
+    // pixel geometry was re-derived above, leaving each external HWND at its
+    // old size with larger (or smaller) cells drawn into it until something
+    // else resized it. The guifont and linespace paths already fan the new
+    // metrics out to every surface; this one owed the same.
+    if (metrics != null) {
+        callbacks.queueExternalWindowResizes(app, app.hwnd, app.cell_w_px, app.rowHeightPx(), "applyMainDpiState");
+    }
     app.mu.unlock(core.clock.io());
 }
 
 fn updateRowsColsFromClient(hwnd: c.HWND, app: *App) void {
     // Only use client-derived rows/cols as a bootstrap before core provides them.
-    if (app.surface.rows != 0 or app.surface.cols != 0) {
+    if (app.surf.surface.rows != 0 or app.surf.surface.cols != 0) {
         return;
     }
     updateRowsColsFromClientForce(hwnd, app);
@@ -1468,7 +1452,10 @@ fn setLogEnabledViaCore(app: *App, enabled: bool) void {
 // =========================================================================
 fn makeCoreCbs() core.Callbacks {
     return .{
-        .on_vertices_partial = callbacks.onVerticesPartial,
+        // Declares the callbacks layout this frontend was built against; the
+        // core refuses a mismatch. Set explicitly to document the contract,
+        // even though the Zig struct already defaults to it.
+        .abi_version = core.CALLBACKS_ABI_VERSION,
         .on_vertices_row = callbacks.onVerticesRow,
         // on_atlas_ensure_glyph / on_atlas_ensure_glyph_styled stay null on
         // purpose. They are the Phase 1 (frontend-managed atlas) entry points,
@@ -1518,8 +1505,9 @@ fn makeCoreCbs() core.Callbacks {
         .on_flush_begin = callbacks.onFlushBegin,
         .on_flush_end = callbacks.onFlushEnd,
         .on_main_grid_size = callbacks.onMainGridSize,
-        .on_main_row_scroll = callbacks.onMainRowScroll,
         .on_grid_row_scroll = callbacks.onGridRowScroll,
+        .on_surface_layout = callbacks.onSurfaceLayout,
+        .on_grid_destroy = callbacks.onGridDestroy,
     };
 }
 
@@ -1606,7 +1594,7 @@ fn loadConfigAndApplyCoreOptions(app: *App) void {
         }
     } else |_| {}
 
-    setLogEnabledViaCore(app, app.config.log.enabled);
+    setLogEnabledViaCore(app, app.config.log.enabled or applog.isForced());
     if (app.ext_cmdline_enabled) core.zonvie_core_set_ext_cmdline(app.corep, 1);
     if (app.config.popup.external) core.zonvie_core_set_ext_popupmenu(app.corep, 1);
     if (app.ext_messages_enabled) core.zonvie_core_set_ext_messages(app.corep, 1);
@@ -1676,8 +1664,8 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
     //    startup ourselves instead of leaving a zombie window with no
     //    backing nvim.
     const start_rc: i32 = if (app.connect_addr) |addr| blk: {
-        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: connect mode addr={s} rows={d} cols={d}\n", .{ addr, app.surface.rows, app.surface.cols });
-        break :blk core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surface.rows, app.surface.cols);
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: connect mode addr={s} rows={d} cols={d}\n", .{ addr, app.surf.surface.rows, app.surf.surface.cols });
+        break :blk core.zonvie_core_start_connect(app.corep, addr.ptr, addr.len, app.surf.surface.rows, app.surf.surface.cols);
     } else blk: {
         var nvim_cmd_buf: [1024]u8 = undefined;
         const nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
@@ -1685,8 +1673,8 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         defer if (nvim_path_z) |p| app.alloc.free(p);
         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
 
-        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: spawning nvim rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
-        break :blk core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+        if (log_enabled) applog.appLog("[win] doEarlyCoreInit: spawning nvim rows={d} cols={d}\n", .{ app.surf.surface.rows, app.surf.surface.cols });
+        break :blk core.zonvie_core_start(app.corep, nvim_path_ptr, app.surf.surface.rows, app.surf.surface.cols);
     };
 
     if (start_rc != 0) {
@@ -1715,7 +1703,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
         if (log_enabled) applog.appLog("[win] WM_CREATE: SWP_FRAMECHANGED applied (overlaps nvim spawn ~50ms)\n", .{});
     }
 
-    if (log_enabled) applog.appLog("[win] WM_CREATE: early core init done, nvim spawn started rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+    if (log_enabled) applog.appLog("[win] WM_CREATE: early core init done, nvim spawn started rows={d} cols={d}\n", .{ app.surf.surface.rows, app.surf.surface.cols });
 }
 
 pub export fn WndProc(
@@ -1831,41 +1819,15 @@ pub export fn WndProc(
                         const client_x = x - window_rect.left;
                         const client_width = window_rect.right - window_rect.left;
 
-                        // Check window control buttons (min/max/close) on the right
-                        const btn_start_x = client_width - app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-                        if (client_x >= btn_start_x) {
-                            // On window buttons - return HTCLIENT so our click handler works
-                            return c.HTCLIENT;
-                        }
-
-                        // Check if clicking on a tab or + button
+                        // Window buttons, tabs and the + button take the click;
+                        // the empty rest of the bar drags the window.
                         app.mu.lockUncancelable(core.clock.io());
                         const tab_count = app.tabline_state.tab_count;
                         app.mu.unlock(core.clock.io());
-
-                        if (tab_count > 0) {
-                            // Same geometry the tabline draws and hit-tests with.
-                            const tab_count_i: i32 = @intCast(tab_count);
-                            const tab_width = tabline_mod.tabWidthPx(app, client_width, tab_count_i);
-
-                            var tab_x: i32 = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-                            for (0..tab_count) |_| {
-                                if (client_x >= tab_x and client_x < tab_x + tab_width) {
-                                    // On a tab - return HTCLIENT so clicks go to the app
-                                    return c.HTCLIENT;
-                                }
-                                tab_x += tab_width + 1;
-                            }
-
-                            const plus_x = tabline_mod.plusButtonXPx(app, tab_count_i, tab_width);
-                            const plus_size = tabline_mod.plusButtonSizePx(app);
-                            if (client_x >= plus_x and client_x < plus_x + plus_size) {
-                                return c.HTCLIENT;
-                            }
-                        }
-
-                        // Empty area in tabbar - allow dragging
-                        return c.HTCAPTION;
+                        return switch (tabline_mod.tablineHitTest(app, client_width, tab_count, client_x, y - window_rect.top)) {
+                            .none => c.HTCAPTION,
+                            else => c.HTCLIENT,
+                        };
                     }
 
                     // Below tabbar - normal client area
@@ -1952,7 +1914,7 @@ pub export fn WndProc(
                 // when it does not, so drops keep working either way.
                 c.DragAcceptFiles(hwnd, 1);
                 _ = c.OleInitialize(null);
-                app.main_drop_target = drop_target.register(app, hwnd, false);
+                app.surf.drop_target = drop_target.register(app, hwnd, false);
 
                 // Add "About zonvie" to the window's system menu (title-bar
                 // right-click / Alt+Space). Handled in WM_SYSCOMMAND below.
@@ -2001,8 +1963,8 @@ pub export fn WndProc(
             if (log_enabled) applog.appLog("WM_PAINT tid={d}", .{c.GetCurrentThreadId()});
 
             if (getApp(hwnd)) |app| {
-                app.main_paint_retry_deadline_ms = 0;
-                app.paint_retry.paintStarted();
+                app.surf.paint_retry_deadline_ms = 0;
+                app.surf.paint_retry.paintStarted();
                 // Reentrant relative to either: another WM_PAINT already
                 // rendering on this thread (g.lockContext() below is a
                 // non-recursive std.Io.Mutex), or the TIMER_CUSTOM_SHADER_ANIM
@@ -2010,19 +1972,8 @@ pub export fn WndProc(
                 // same D3D immediate context — either one's DXGI Present()
                 // can pump the Win32 message queue and deliver this WM_PAINT
                 // reentrantly on the same thread.
-                if (app.wm_paint_in_progress or app.in_present_shader_animation_frame or app.glow_prepare_in_progress or app.device_lost_recovering or app.main_resize_in_progress or app.main_dpi_change_in_progress) {
-                    // Still consume BeginPaint/EndPaint so Windows stops
-                    // re-issuing WM_PAINT, but skip rendering entirely and
-                    // ask for a follow-up paint once the outer call finishes
-                    // instead of self-deadlocking / corrupting immediate
-                    // context state. device_lost_recovering: device/D2D/
-                    // swapchain creation in WM_APP_DEVICE_LOST_RECOVER can
-                    // pump messages and reenter WM_PAINT on this same UI
-                    // thread while that handler still holds app.mu.
-                    var ps_reentrant: c.PAINTSTRUCT = undefined;
-                    _ = c.BeginPaint(hwnd, &ps_reentrant);
-                    _ = c.EndPaint(hwnd, &ps_reentrant);
-                    app.wm_paint_reinvalidate_all = true;
+                if (app.paintReentrancyBlocked()) {
+                    app.consumeReentrantPaint(hwnd);
                     return 0;
                 }
                 // Also completes closes whose PostMessageW failed because the
@@ -2036,8 +1987,22 @@ pub export fn WndProc(
                 }
 
                 var ps: c.PAINTSTRUCT = undefined;
-                _ = c.BeginPaint(hwnd, &ps);
+                const begin_hdc = c.BeginPaint(hwnd, &ps);
                 defer _ = c.EndPaint(hwnd, &ps);
+                if (log_enabled) {
+                    applog.appLog(
+                        "[win] BeginPaint hdc={d} rcPaint=({d},{d},{d},{d}) erase={d} reinval_all={d}\n",
+                        .{
+                            @intFromBool(begin_hdc != null),
+                            ps.rcPaint.left,
+                            ps.rcPaint.top,
+                            ps.rcPaint.right,
+                            ps.rcPaint.bottom,
+                            @intFromBool(ps.fErase != 0),
+                            @intFromBool(app.wm_paint_reinvalidate_all),
+                        },
+                    );
+                }
 
                 // While minimized, GetClientRect returns the iconic size
                 // (e.g. 160x28); letting drawEx → resize run would shrink
@@ -2118,7 +2083,7 @@ pub export fn WndProc(
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     {
                         app.mu.lockUncancelable(core.clock.io());
-                        app.surface.paint_full = true;
+                        app.surf.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
                         app.mu.unlock(core.clock.io());
                     }
@@ -2137,50 +2102,50 @@ pub export fn WndProc(
                     t_snapshot_start_ns = core.clock.nowNs();
                 }
 
-                // Read core-owned render settings before entering the atlas
-                // reader transaction. Keep the transaction free of core
-                // callbacks so atlas reset admission remains one-way and does
-                // not acquire grid_mu from the UI paint path.
-                const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
-                const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
+                const glow = app_mod.glowPaintSettings(app);
+                const glow_enabled = glow.enabled;
+                const glow_intensity = glow.intensity;
+                const glow_radius_scale = glow.radius_scale;
 
                 // The atlas transaction must cover the TBS and atlas snapshots,
                 // not only the eventual draw. Otherwise a reset can commit
                 // between acquireForPaint() and a later admission check, leaving
                 // this paint with old UVs and the newly uploaded atlas.
-                if (!app.beginAtlasPaint()) {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
-                    return 0;
-                }
+                if (!app.beginAtlasPaintOrRequestFull(&app.surf.tbs)) return 0;
                 defer app.endAtlasPaint();
 
                 // Step 1: TBS acquire (rotation_mu short lock).
                 // Captures committed_index, paint_full, and copies pending_dirty → paint_dirty_snapshot.
-                const tbs_snapshot = app.tbs.acquireForPaint(app.alloc);
-                defer {
-                    const needs_reinvalidate = app.tbs.releaseFromPaint(tbs_snapshot.committed_index, tbs_snapshot.cursor_index);
-                    if (app.paint_retry.shouldInvalidateAfterRelease(needs_reinvalidate)) {
-                        // A successful atlas-reset transaction repaints every
-                        // surface. Avoid a WM_PAINT loop while a failed reset
-                        // intentionally keeps the previous frame frozen.
-                        if (!app.atlas_reset_active.load(.seq_cst)) {
-                            _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                        }
-                    }
-                }
-                const committed = &app.tbs.sets[tbs_snapshot.committed_index];
-                const committed_cursor = &app.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
+                const tbs_snapshot = app.surf.tbs.acquireForPaint(app.alloc);
+                defer if (app_mod.releasePaintSnapshot(
+                    &app.surf.tbs,
+                    tbs_snapshot,
+                    &app.surf.paint_retry,
+                    app.atlas_reset_active.load(.seq_cst),
+                )) {
+                    _ = c.InvalidateRect(hwnd, null, c.FALSE);
+                };
+                const committed = &app.surf.tbs.sets[tbs_snapshot.committed_index];
+                const committed_cursor = &app.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
 
                 // Step 2: UI metadata snapshot (app.mu short lock).
                 app.mu.lockUncancelable(core.clock.io());
-                if (app.surface.rows == 0) {
+                if (app.surf.surface.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
                 }
 
                 // Read vertex-related state from TBS committed set (refcount-protected, lock-free).
                 const row_mode = committed.row_mode;
+                // The generation this committed set's vertices were generated
+                // against. `row_layout_gen` and `shared_metrics_gen` are bumped
+                // together, but the only gate below compares `row_layout_gen`
+                // to THIS paint's snapshot — i.e. the already-new value — so a
+                // paint landing after a guifont/linespace/DPI change and before
+                // the core's re-flush passed it and drew the old set against the
+                // new row height. Rows and columns need not have changed, so the
+                // rows_mismatch test does not catch it either. The external
+                // driver has always refused such a set.
+                const committed_metrics_gen = committed.metrics_gen;
                 const rows_snapshot: u32 = committed.rows;
                 const row_verts_len: u32 = @intCast(committed.row_map.items.len);
                 const main_verts_len_snapshot: u32 = @intCast(committed.flat_verts.items.len);
@@ -2189,11 +2154,18 @@ pub export fn WndProc(
                 const seed_pending_snapshot = app.seed_pending;
                 const seed_clear_pending_snapshot = app.seed_clear_pending;
                 const back_tex_valid_snapshot = app.back_tex_valid;
+                // The surface's own "repaint everything" request, consumed the
+                // way the external driver consumes its copy. Every setter also
+                // raised a seed flag or the TBS one, so this driver never read
+                // it; a setter that raises only this one now reaches a paint.
+                const surface_paint_full_snapshot = app.surf.surface.paint_full;
+                app.surf.surface.paint_full = false;
                 const row_valid_count_snapshot = app.row_valid_count;
                 const row_layout_gen_snapshot: u64 = app.row_layout_gen;
+                const shared_metrics_gen_snapshot: u64 = app.shared_metrics_gen;
                 const row_mode_max_row_end_snapshot: u32 = app.row_mode_max_row_end;
                 const row_h_px_snapshot: u32 = app.rowHeightPx();
-                const scrollbar_alpha_snapshot = app.scrollbar_alpha;
+                const scrollbar_alpha_snapshot = app.surf.scrollbar.alpha;
 
                 // IMPORTANT: do NOT copy renderer/atlas structs here.
                 // Take pointers to the option payloads instead.
@@ -2201,63 +2173,47 @@ pub export fn WndProc(
                 var gpu_ptr: ?*d3d11.Renderer = null;
                 if (app.atlas) |*a| atlas_ptr = a;
                 if (app.renderer) |*g| gpu_ptr = g;
-                var atlas_recreate_needed = false;
-                var atlas_recreate_w: u32 = 0;
-                var atlas_recreate_h: u32 = 0;
+                // Pulled every paint, as the external driver does: a push from
+                // default_colors_set missed a renderer created later (deferred
+                // init, device-lost recovery), which then cleared black.
+                if (gpu_ptr) |g| {
+                    if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
+                }
+                var atlas_reset_consumed = false;
+                var atlas_generation: u64 = 0;
 
                 // If the glyph atlas was reset, all cached row vertex UVs are stale.
                 // Request a full re-seed so the core regenerates every row.
                 // Guard with renderer mutex (recreateAtlasTexture sets the flag
                 // under a.mu).
                 if (atlas_ptr) |a| {
-                    var reset_pending = false;
-                    var cur_atlas_w: u32 = 0;
-                    var cur_atlas_h: u32 = 0;
-                    {
-                        a.mu.lockUncancelable(core.clock.io());
-                        defer a.mu.unlock(core.clock.io());
-                        reset_pending = a.atlas_reset_pending;
-                        if (reset_pending) a.atlas_reset_pending = false;
-                        cur_atlas_w = a.atlas_w;
-                        cur_atlas_h = a.atlas_h;
-                    }
-                    if (reset_pending) {
-                        // D3D creation/Release can pump messages. Capture the
-                        // request here and perform it after releasing app.mu.
-                        atlas_recreate_needed = true;
-                        atlas_recreate_w = cur_atlas_w;
-                        atlas_recreate_h = cur_atlas_h;
+                    const gen = app_mod.atlasPaintGeneration(a, true);
+                    atlas_generation = gen.generation;
+                    if (gen.reset) {
+                        // The texture itself is resized by syncSharedAtlas
+                        // below, after app.mu is released (D3D creation can
+                        // pump messages).
+                        atlas_reset_consumed = true;
                         app.need_full_seed.store(true, .seq_cst);
-                        app.surface.paint_full = true;
+                        app.surf.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
-                        // After atlas reset, external window paints may consume
-                        // shared pending_uploads before the main window sees them.
-                        // Schedule a full atlas upload to ensure all glyph data is present.
-                        app.atlas_full_upload_needed.store(true, .release);
+                        // The full atlas upload a reset owes is asked below of
+                        // the generation the reset bumped.
                     }
                 }
 
                 // Build dirty row keys from TBS paint_dirty_snapshot (captured by acquireForPaint).
                 // The bitset iterator yields sorted, unique row indices — no dedup needed.
-                const dirty_row_keys = &app.wm_paint_dirty_row_keys;
+                const dirty_row_keys = &app.surf.paint.dirty_row_keys;
                 dirty_row_keys.clearRetainingCapacity();
                 var paint_snapshot_ok = true;
 
                 if (row_mode) {
-                    const dirty_count = app.tbs.paint_dirty_snapshot.count();
-                    dirty_row_keys.ensureTotalCapacity(app.alloc, dirty_count) catch {
-                        paint_snapshot_ok = false;
-                    };
-                    if (paint_snapshot_ok) {
-                        var dit = app.tbs.paint_dirty_snapshot.iterator(.{});
-                        while (dit.next()) |row_idx| {
-                            dirty_row_keys.appendAssumeCapacity(@intCast(row_idx));
-                        }
-                    }
+                    paint_snapshot_ok = app.surf.tbs.snapshotDirtyRowKeys(app.alloc, dirty_row_keys);
                 }
 
                 // Use committed.rows (content rows from core) as the baseline,
-                // not app.surface.rows (global grid rows) which includes
+                // not app.surf.surface.rows (global grid rows) which includes
                 // tabline/statusline rows that never receive vertex data.
                 var effective_rows: u32 = committed.rows;
                 var rows_mismatch: bool = false;
@@ -2282,36 +2238,21 @@ pub export fn WndProc(
 
                 app.mu.unlock(core.clock.io());
 
-                if (atlas_recreate_needed) {
-                    var recreate_ok = false;
-                    if (gpu_ptr) |g| {
-                        g.lockContext();
-                        g.recreateAtlasTextureIfNeeded(atlas_recreate_w, atlas_recreate_h) catch |e| {
-                            if (log_enabled) applog.appLog("[win] D3D atlas texture recreation failed, retrying: {any}\n", .{e});
-                        };
-                        recreate_ok = (g.atlas_w == atlas_recreate_w and g.atlas_h == atlas_recreate_h);
-                        g.unlockContext();
-                    }
-                    if (!recreate_ok) {
-                        if (atlas_ptr) |a| {
-                            a.mu.lockUncancelable(core.clock.io());
-                            a.atlas_reset_pending = true;
-                            a.mu.unlock(core.clock.io());
-                        }
-                        app.atlas_full_upload_needed.store(true, .release);
-                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                        app.tbs.pending_paint_full = true;
-                        app.tbs.rotation_mu.unlock(core.clock.io());
-                        scheduleMainPaintRetry(hwnd, app);
-                        return 0;
-                    }
+                if (!paint_snapshot_ok) {
+                    recoverMainPaintFailure(hwnd, app);
+                    return 0;
                 }
 
-                if (!paint_snapshot_ok) {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
-                    scheduleMainPaintRetry(hwnd, app);
+                // A set generated against metrics this paint no longer has is
+                // refused before anything is drawn, as the external driver
+                // refuses it: drawn first, its rows reached back_tex at the old
+                // row height and only the present was refused. The present-time
+                // check below stays for a change landing during the draw. After
+                // the atlas recreate above, which this paint has already
+                // consumed the request for (the texture follows the atlas's
+                // size at every sync, so nothing is lost).
+                if (row_mode and committed_metrics_gen != shared_metrics_gen_snapshot) {
+                    recoverMainPaintFailure(hwnd, app);
                     return 0;
                 }
 
@@ -2336,39 +2277,28 @@ pub export fn WndProc(
                     }
                 }
 
-                // Flush atlas uploads (may be triggered by core updates).
-                // Uses since-based cursor so multiple windows can independently
-                // consume the same append-only pending_uploads queue.
+                // The shared atlas texture: resized, then the uploads it is
+                // owed, whichever window's paint comes first.
                 var atlas_uploaded = false;
                 if (atlas_ptr) |a| {
                     if (gpu_ptr) |g| {
                         g.lockContext();
                         defer g.unlockContext();
-                        // Atomic read-then-clear: a plain load followed by a
-                        // separate store would let a NEW true set by the
-                        // core/RPC thread between them get silently
-                        // overwritten back to false, losing that signal.
-                        const need_full = app.atlas_full_upload_needed.swap(false, .acq_rel);
-                        if (need_full) {
-                            if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
-                        }
-                        const upload = app_mod.flushAtlasUploads(a, g, app.atlas_upload_cursor, need_full);
-                        if (upload.success) {
-                            if (upload.cursor != app.atlas_upload_cursor) atlas_uploaded = true;
-                            app.atlas_upload_cursor = upload.cursor;
-                        } else {
-                            // Keep the cursor unchanged and promote every
-                            // failure (including incremental upload) to a full
-                            // retry. Do not draw this frame against a texture
-                            // missing pixels referenced by committed UVs.
-                            app.atlas_full_upload_needed.store(true, .release);
-                            app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                            app.tbs.pending_paint_full = true;
-                            app.tbs.rotation_mu.unlock(core.clock.io());
-                            scheduleMainPaintRetry(hwnd, app);
-                            if (log_enabled) applog.appLog("[win] atlas upload failed; requeued full paint\n", .{});
+                        const sync = app_mod.syncSharedAtlas(app, a, g, atlas_generation, &app.surf.atlas_seen_upload_seq);
+                        if (!sync.ok) {
+                            // Do not draw against a texture missing pixels
+                            // committed UVs reference. A consumed reset stays
+                            // owed, for the re-seed it drives.
+                            if (atlas_reset_consumed) {
+                                a.mu.lockUncancelable(core.clock.io());
+                                a.atlas_reset_pending = true;
+                                a.mu.unlock(core.clock.io());
+                            }
+                            recoverMainPaintFailure(hwnd, app);
+                            if (log_enabled) applog.appLog("[win] atlas sync failed; requeued full paint\n", .{});
                             return 0;
                         }
+                        atlas_uploaded = sync.uploaded;
                     }
                 }
                 if (log_enabled and atlas_uploaded) {
@@ -2383,6 +2313,16 @@ pub export fn WndProc(
                     // Lock D3D context for thread-safe rendering
                     g.lockContext();
                     defer g.unlockContext();
+
+                    // The resize the external driver does before drawing. A
+                    // WM_SIZE deferred while an external window was being
+                    // created left the swapchain at the old size; drawEx then
+                    // recreated back_tex mid-paint and kept only the dirty rows
+                    // of the new one while still reporting it valid.
+                    const resized_before_draw = app_mod.resizeSurfaceIfNeeded(g, false) catch |e| blk: {
+                        if (applog.isEnabled()) applog.appLog("[win] WM_PAINT pre-draw resize failed: {any}\n", .{e});
+                        break :blk false;
+                    };
 
                     // Calculate content width for "always" scrollbar mode
                     // When content_hwnd exists, use its size (D3D11 is bound to content_hwnd)
@@ -2466,9 +2406,9 @@ pub export fn WndProc(
                         // buffers retained by a previous row-mode frame.
                         _ = app_mod.resizeRowVBsForPaint(
                             app.alloc,
-                            &app.row_vbs,
+                            &app.surf.paint.row_vbs,
                             &app.row_vb_budget,
-                            &app.row_vb_retained_bytes,
+                            &app.surf.paint.row_vb_retained_bytes,
                             0,
                         );
 
@@ -2501,7 +2441,7 @@ pub export fn WndProc(
                             if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
                         }
                         if (non_row_draw) {
-                            const cursor_items: []const core.Vertex = if (app.cursor_blink_state) committed_cursor.verts.items else &.{};
+                            const cursor_items = render_helpers.cursorVertsForFrame(core.Vertex, committed_cursor.verts.items, app.cursor_blink_state);
                             if (g.drawEx(committed.flat_verts.items, cursor_items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                                 // Non-row-mode equivalent of row-mode's
@@ -2541,7 +2481,7 @@ pub export fn WndProc(
                         }
 
                         // Build sorted, deduplicated list of rows to draw.
-                        const rows_to_draw = &app.wm_paint_rows_to_draw;
+                        const rows_to_draw = &app.surf.paint.rows_to_draw;
 
                         // Transparency mode (opacity<1.0) must force full rows too:
                         // preserve_back=false clears back_tex entirely in drawEx, so if only
@@ -2565,14 +2505,59 @@ pub export fn WndProc(
                         // relying on those flags alone leaves a window where back_tex is
                         // cleared but only dirty rows are drawn — non-dirty rows show the
                         // clear color until Neovim re-sends grid_line.
-                        const force_full_rows =
-                            did_need_seed or
-                            (dirty == null) or
-                            paint_full_snapshot or
-                            seed_clear_pending_snapshot or
-                            (seed_pending_snapshot and !back_tex_valid_snapshot) or
-                            glow_enabled or
-                            (g.opacity < 1.0);
+                        //
+                        // An empty ps.rcPaint is not a redraw-all request. Every
+                        // Zonvie HWND carries WS_EX_NOREDIRECTIONBITMAP, so the
+                        // paint DC has no visible region and BeginPaint clips
+                        // rcPaint to nothing on every paint. The app's own damage
+                        // (tbs.pending_dirty -> dirty_row_keys, plus
+                        // paint_full_snapshot) is what computeRowsToDraw reads.
+                        // A cursor that moved to another grid forces one too.
+                        // cursor_erase_rows below carries the row the LAST paint
+                        // drew the cursor on, and that row belongs to whichever
+                        // grid held the cursor then; everything that places it
+                        // — the rows_to_draw insert, markLayerCursorRow — uses
+                        // the grid holding it now. Under ext_multigrid every
+                        // window is a layer, so a cursor leaving one would have
+                        // its old row repainted in the wrong window and the old
+                        // block would stay. A window switch is a user action and
+                        // already repaints most of the surface. Same reasoning,
+                        // and the same fix, as drawNormalExternalSurfaceRowMode.
+                        const cursor_grid_changed =
+                            tbs_snapshot.cursor_layer_grid_id != app.surf.paint.last_painted_cursor_grid;
+                        // Everything seed-shaped is this driver's own
+                        // "repaint everything" request; the terms both drivers
+                        // share live in render_helpers.paintPolicy.
+                        const paint_policy = render_helpers.paintPolicy(.{
+                            .force_full =
+                                resized_before_draw or
+                                did_need_seed or
+                                paint_full_snapshot or
+                                surface_paint_full_snapshot or
+                                seed_clear_pending_snapshot or
+                                (seed_pending_snapshot and !back_tex_valid_snapshot),
+                            .cursor_grid_changed = cursor_grid_changed,
+                            .glow_enabled = glow_enabled,
+                            .opacity = g.opacity,
+                            .back_tex_valid = back_tex_valid_snapshot,
+                        });
+                        const force_full_rows = paint_policy.force_full_rows;
+
+                        if (log_enabled) {
+                            applog.appLog(
+                                "[win] force_full_rows={d} seed={d} nodirty={d} paintfull={d} seedclear={d} seedpend_notex={d} glow={d} opacity={d}\n",
+                                .{
+                                    @intFromBool(force_full_rows),
+                                    @intFromBool(did_need_seed),
+                                    @intFromBool(dirty == null),
+                                    @intFromBool(paint_full_snapshot),
+                                    @intFromBool(seed_clear_pending_snapshot),
+                                    @intFromBool(seed_pending_snapshot and !back_tex_valid_snapshot),
+                                    @intFromBool(glow_enabled),
+                                    @intFromBool(g.opacity < 1.0),
+                                },
+                            );
+                        }
 
                         const total_rows_for_enum: u32 = if (effective_rows != 0) effective_rows else row_verts_len;
                         const max_valid_row: u32 = @min(row_verts_len, rows_snapshot);
@@ -2585,25 +2570,18 @@ pub export fn WndProc(
                             total_rows_for_enum,
                             max_valid_row,
                         )) {
-                            app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                            app.tbs.pending_paint_full = true;
-                            app.tbs.rotation_mu.unlock(core.clock.io());
-                            scheduleMainPaintRetry(hwnd, app);
+                            recoverMainPaintFailure(hwnd, app);
                             return 0;
                         }
 
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
-                        if (atlas_uploaded and rows_to_draw.items.len == 0) {
+                        if (render_helpers.atlasUploadOwesFullPaint(atlas_uploaded, rows_to_draw.items.len != 0)) {
                             app.mu.lockUncancelable(core.clock.io());
-                            app.surface.paint_full = true;
+                            app.surf.surface.paint_full = true;
                             app.paint_rects.clearRetainingCapacity();
                             app.mu.unlock(core.clock.io());
-                            {
-                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                app.tbs.pending_paint_full = true;
-                                app.tbs.rotation_mu.unlock(core.clock.io());
-                            }
+                            app.surf.tbs.requestFullPaint();
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
 
@@ -2648,134 +2626,104 @@ pub export fn WndProc(
 
                         // Compute cursor rect directly from NDC vertices using viewport
                         // dimensions (content_height etc.) to match the D3D11 viewport's
-                        // NDC-to-pixel mapping. Using the client rect (as rectFromCursorVerts
+                        // NDC-to-pixel mapping. Using the client rect (as rectFromVerts
                         // does) causes cumulative position drift because the viewport is
                         // snapped to cell boundaries, which is smaller than the client area.
-                        const cursor_rc_opt: ?c.RECT = if (cursor_verts_snapshot.len != 0) blk: {
-                            var minx: f32 = cursor_verts_snapshot[0].position[0];
-                            var maxx: f32 = minx;
-                            var miny: f32 = cursor_verts_snapshot[0].position[1];
-                            var maxy: f32 = miny;
-                            for (cursor_verts_snapshot) |v| {
-                                if (v.position[0] < minx) minx = v.position[0];
-                                if (v.position[0] > maxx) maxx = v.position[0];
-                                if (v.position[1] < miny) miny = v.position[1];
-                                if (v.position[1] > maxy) maxy = v.position[1];
-                            }
-                            // Mirror the D3D11 viewport calculation from drawEx:
-                            //   viewport = (x_offset, y_offset, viewport_width, content_height)
-                            const vp_x: u32 = content_x_offset orelse 0;
-                            const vp_y: u32 = content_y_offset orelse 0;
-                            const base_w: u32 = content_width orelse @intCast(@max(1, client.right));
-                            const sidebar_w: u32 = sidebar_right_width orelse 0;
-                            const vp_w: u32 = if (base_w > vp_x + sidebar_w) base_w - vp_x - sidebar_w else 1;
-                            const vp_h: u32 = content_height;
+                        // Core vertices are grid-local pixels. The root grid's
+                        // layer sits at the surface origin, but a cursor in
+                        // any other grid the surface draws as a layer needs
+                        // that layer's origin added before its position means
+                        // anything in screen space.
+                        // Keyed on the grid the snapshot says holds the cursor,
+                        // the same transaction as the vertices.
+                        const cursor_layer_origin_px = render_helpers.layerOriginPx(
+                            app_mod.SurfaceLayer,
+                            tbs_snapshot.layers.slice(),
+                            tbs_snapshot.cursor_layer_grid_id,
+                            1,
+                        );
+                        const cursor_layer_x_px: f32 = @floatFromInt(cursor_layer_origin_px[0]);
+                        const cursor_layer_y_px: f32 = @floatFromInt(cursor_layer_origin_px[1]);
 
-                            const w_f: f32 = @floatFromInt(vp_w);
-                            const h_f: f32 = @floatFromInt(vp_h);
-                            const x_off_f: f32 = @floatFromInt(vp_x);
-                            const y_off_f: f32 = @floatFromInt(vp_y);
-
-                            const l_f = x_off_f + (minx + 1.0) * 0.5 * w_f;
-                            const r_f = x_off_f + (maxx + 1.0) * 0.5 * w_f;
-                            const t_f = y_off_f + (1.0 - maxy) * 0.5 * h_f;
-                            const b_f = y_off_f + (1.0 - miny) * 0.5 * h_f;
-
-                            var l: i32 = @intFromFloat(@floor(l_f));
-                            var r: i32 = @intFromFloat(@ceil(r_f));
-                            var t: i32 = @intFromFloat(@floor(t_f));
-                            var b: i32 = @intFromFloat(@ceil(b_f));
-
-                            if (l < 0) l = 0;
-                            if (t < 0) t = 0;
-                            if (r > client.right) r = client.right;
-                            if (b > client.bottom) b = client.bottom;
-
-                            if (r <= l or b <= t) break :blk null;
-                            break :blk .{ .left = l, .top = t, .right = r, .bottom = b };
+                        // Where the cursor's grid sits on the surface: its
+                        // layer's origin plus the content viewport's, the same
+                        // translation the row pass draws it with. One bounds
+                        // serves both the damage rectangle and the shader
+                        // uniform; they used to be two loops over the same
+                        // vertices, one integer and one float.
+                        const cursor_origin_x: f32 = @as(f32, @floatFromInt(content_x_offset orelse 0)) + cursor_layer_x_px;
+                        const cursor_origin_y: f32 = @as(f32, @floatFromInt(content_y_offset orelse 0)) + cursor_layer_y_px;
+                        const cursor_bounds = core.cursor_rect.bounds(
+                            core.Vertex,
+                            cursor_verts_snapshot,
+                            cursor_origin_x,
+                            cursor_origin_y,
+                        );
+                        // The damage consumer needs whole pixels, clipped to
+                        // the client; an empty result is dropped rather than
+                        // handed on.
+                        const cursor_rc_opt: ?c.RECT = if (cursor_bounds) |cb| blk: {
+                            const ir = core.cursor_rect.inflateClip(cb, client.right, client.bottom) orelse break :blk null;
+                            break :blk .{ .left = ir.left, .top = ir.top, .right = ir.right, .bottom = ir.bottom };
                         } else null;
 
-                        // Feed cursor state into the custom shader
-                        // uniforms (Ghostty 1.1+ iCurrentCursor /
-                        // iPreviousCursor / iTimeCursorChange etc.). No-op
-                        // when the rect + color match the last call.
-                        // Recompute the rect in floating point to avoid
-                        // the 1-pixel inflation that cursor_rc_opt picks
-                        // up from its floor/ceil integer rounding (the
-                        // dirty-rect consumer needs that, the shader
-                        // doesn't).
-                        if (cursor_verts_snapshot.len != 0) {
+                        // Feed cursor state into the custom shader uniforms
+                        // (Ghostty 1.1+ iCurrentCursor / iPreviousCursor /
+                        // iTimeCursorChange etc.). No-op when the rect + color
+                        // match the last call. Ghostty's cursor shaders read
+                        // the y component as the BOTTOM edge of the rect
+                        // (center is `y - h/2`, rect spans `y-h..y`).
+                        if (cursor_bounds) |cb| {
                             if (app.renderer) |*r_sh| {
-                                var minx_sh: f32 = cursor_verts_snapshot[0].position[0];
-                                var maxx_sh: f32 = minx_sh;
-                                var miny_sh: f32 = cursor_verts_snapshot[0].position[1];
-                                var maxy_sh: f32 = miny_sh;
-                                for (cursor_verts_snapshot) |v| {
-                                    if (v.position[0] < minx_sh) minx_sh = v.position[0];
-                                    if (v.position[0] > maxx_sh) maxx_sh = v.position[0];
-                                    if (v.position[1] < miny_sh) miny_sh = v.position[1];
-                                    if (v.position[1] > maxy_sh) maxy_sh = v.position[1];
-                                }
-                                const vp_x_sh: u32 = content_x_offset orelse 0;
-                                const vp_y_sh: u32 = content_y_offset orelse 0;
-                                const base_w_sh: u32 = content_width orelse @intCast(@max(1, client.right));
-                                const sidebar_w_sh: u32 = sidebar_right_width orelse 0;
-                                const vp_w_sh: u32 =
-                                    if (base_w_sh > vp_x_sh + sidebar_w_sh)
-                                        base_w_sh - vp_x_sh - sidebar_w_sh
-                                    else
-                                        1;
-                                const vp_h_sh: u32 = content_height;
-                                const wf_sh: f32 = @floatFromInt(vp_w_sh);
-                                const hf_sh: f32 = @floatFromInt(vp_h_sh);
-                                const xo_sh: f32 = @floatFromInt(vp_x_sh);
-                                const yo_sh: f32 = @floatFromInt(vp_y_sh);
-                                const left_sh = xo_sh + (minx_sh + 1.0) * 0.5 * wf_sh;
-                                const right_sh = xo_sh + (maxx_sh + 1.0) * 0.5 * wf_sh;
-                                const top_sh = yo_sh + (1.0 - maxy_sh) * 0.5 * hf_sh;
-                                const bottom_sh = yo_sh + (1.0 - miny_sh) * 0.5 * hf_sh;
-                                // Ghostty's cursor shaders interpret the y
-                                // component as the BOTTOM edge of the
-                                // cursor rect (center is computed as
-                                // `y - h/2`, rect spans `y-h..y`). Pass
-                                // the bottom-edge so the shader renders
-                                // over the actual cursor, not one row
-                                // above it.
-                                const v0 = cursor_verts_snapshot[0];
                                 r_sh.setCursorShaderState(
-                                    .{ left_sh, bottom_sh, right_sh - left_sh, bottom_sh - top_sh },
-                                    v0.color,
+                                    .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                                    cursor_verts_snapshot[0].color,
                                 );
                             }
                         }
 
-                        const fallback_row_h: u32 = row_h_px_snapshot;
-                        const rows_for_layout: u32 = if (rows_mismatch) 0 else if (rows_snapshot != 0) rows_snapshot else row_verts_len;
-                        const row_h_px_u32 = if (rows_mismatch)
-                            fallback_row_h
-                        else
-                            rowHeightPxFromClient(hwnd, rows_for_layout, fallback_row_h);
-                        const row_h_px: i32 = @intCast(@as(i32, @intCast(row_h_px_u32)));
-                        if (log_enabled and (row_h_px_u32 != fallback_row_h or rows_mismatch)) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) row_h_px adjust rows={d} client_h={d} fallback={d} row_h={d}\n",
-                                .{ rows_for_layout, client.bottom, fallback_row_h, row_h_px_u32 },
-                            );
-                        }
+                        // cell_h + linespace, as the external driver reads it.
+                        const row_h_px_u32: u32 = row_h_px_snapshot;
+                        const row_h_px: i32 = @intCast(row_h_px_u32);
 
-                        // Use persistent buffer to avoid per-frame alloc/free.
-                        const present_rects = &app.wm_paint_present_rects;
-                        present_rects.clearRetainingCapacity();
-                        var present_rects_fallback_full = false;
-                        // Reserve every possible rect before construction:
-                        // one span per dirty row, copied cursor/paint damage,
-                        // gutter, and scroll damage. If reservation fails we
-                        // still draw, but force a full back-buffer present so
-                        // a truncated rect list cannot consume TBS dirty state.
-                        const present_rect_capacity = rows_to_draw.items.len + paint_rects_snapshot.items.len + 6;
-                        present_rects.ensureTotalCapacity(app.alloc, present_rect_capacity) catch {
-                            present_rects_fallback_full = true;
+                        // Where the cursor's own layer sits, so the overlay is
+                        // placed with that layer's transform rather than the
+                        // root grid's. The grid id comes from the same
+                        // transaction as the cursor vertices.
+                        const cursor_grid = tbs_snapshot.cursor_layer_grid_id;
+                        const cursor_layer_origin: [2]f32 = .{ cursor_layer_x_px, cursor_layer_y_px };
+
+                        // The rows the cursor overlay would otherwise erase:
+                        // where the previous cursor was baked into back_tex,
+                        // and where this one lands. Both are grid-local rows of
+                        // the cursor's own grid. Repainting them from that
+                        // grid's vertices is what removes the previous cursor,
+                        // so the overlay's blink-off clear — a full-content-
+                        // width band it can only refill from one grid — never
+                        // has to run.
+                        const cursor_erase_rows: [2]?u32 = .{
+                            app.surf.paint.last_painted_cursor_row,
+                            committed_cursor.last_cursor_row,
                         };
+                        render_helpers.insertCursorEraseRows(
+                            app.alloc,
+                            rows_to_draw,
+                            cursor_erase_rows,
+                            max_valid_row,
+                            cursor_grid == 1,
+                        );
+
+                        // Reserve every rect this paint can add: one span per
+                        // dirty row, the copied paint damage, one per layer,
+                        // and nine singletons — restored and captured
+                        // scrollbar, rcPaint, gutter, cursor, three chrome
+                        // strips, scroll damage.
+                        var present = app_mod.PresentRectBuilder.begin(
+                            &app.surf.paint.present_rects,
+                            app.alloc,
+                            rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 9,
+                        );
+                        const present_rects = present.list;
 
                         // The scrollbar is alpha-blended into retained back_tex.
                         // Restore only its narrow saved underlay before applying
@@ -2787,126 +2735,99 @@ pub export fn WndProc(
                             recoverMainPaintFailure(hwnd, app);
                             return 0;
                         };
-                        if (restored_scrollbar_rect) |restored_rect| {
-                            present_rects.append(app.alloc, restored_rect) catch {
-                                present_rects_fallback_full = true;
-                            };
-                        }
+                        present.addOpt(restored_scrollbar_rect);
 
                         // Build full-width present_rects initially.
                         // After the row drawing loop, we may replace with cursor rects if no content changed.
                         // Add content_y_offset for ext_tabline (present_rects are in screen coords)
                         const present_y_offset: i32 = if (content_y_offset) |off| @intCast(off) else 0;
                         if (rows_to_draw.items.len != 0) {
-                            // Build full-width row rects.
-                            // rows_to_draw is already sorted+deduplicated from the normalize step above.
-                            // The external windows build the same spans in
-                            // external_windows.zig and are NOT shared with this:
-                            // they reserve exactly rows + 5 and append
-                            // infallibly, while this path appends fallibly and
-                            // swallows the error, covered by the force-full-
-                            // present fallback above. It also adds
-                            // present_y_offset for the ext_tabline strip, which
-                            // external windows have no equivalent of. Reviewed
-                            // under the 2026-08-25 audit, observation 1,
-                            // finding 332; left duplicated on purpose.
-                            var span_start: u32 = rows_to_draw.items[0];
-                            var span_end: u32 = span_start + 1;
-
-                            var ispan: usize = 1;
-                            while (ispan < rows_to_draw.items.len) : (ispan += 1) {
-                                const r = rows_to_draw.items[ispan];
-                                if (r == span_end) {
-                                    span_end += 1;
-                                } else {
-                                    const top0: i32 = present_y_offset + @as(i32, @intCast(span_start)) * row_h_px;
-                                    const bot0: i32 = present_y_offset + @as(i32, @intCast(span_end)) * row_h_px;
-
-                                    const rc0: c.RECT = .{
-                                        .left = 0,
-                                        .top = top0,
-                                        .right = client.right,
-                                        .bottom = bot0,
-                                    };
-                                    present_rects.append(app.alloc, rc0) catch {};
-
-                                    span_start = r;
-                                    span_end = r + 1;
-                                }
-                            }
-
-                            // last span
-                            {
-                                const top0: i32 = present_y_offset + @as(i32, @intCast(span_start)) * row_h_px;
-                                const bot0: i32 = present_y_offset + @as(i32, @intCast(span_end)) * row_h_px;
-
-                                const rc0: c.RECT = .{
-                                    .left = 0,
-                                    .top = top0,
-                                    .right = client.right,
-                                    .bottom = bot0,
-                                };
-                                present_rects.append(app.alloc, rc0) catch {};
-                            }
-                        } else if (dirty != null) {
-                            present_rects.append(app.alloc, dirty.?) catch {};
+                            present.addRowSpans(rows_to_draw.items, present_y_offset, client.right, row_h_px);
+                        } else {
+                            present.addOpt(dirty);
                         }
 
                         // Add bottom gutter rect if client area extends beyond the grid area.
                         // This ensures the gutter is properly cleared in all swapchain buffers
                         // during partial present, preventing ghost artifacts from stale content.
-                        // Use the actual maximum y coordinate from present_rects to handle cases
-                        // where app.surface.rows is stale (e.g., after font/linespace changes).
+                        // The gutter starts at the snapped grid bottom (content_height, derived
+                        // from the client and row height, so never stale). It used to start at the
+                        // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
+                        // present of rows 5 to the bottom of the window.
                         if (present_rects.items.len != 0) {
-                            var max_y: i32 = 0;
-                            for (present_rects.items) |r| {
-                                if (r.bottom > max_y) max_y = r.bottom;
-                            }
-                            if (max_y > 0 and max_y < client.bottom) {
+                            const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
+                            if (grid_bottom > 0 and grid_bottom < client.bottom) {
                                 const gutter_rc: c.RECT = .{
                                     .left = 0,
-                                    .top = max_y,
+                                    .top = grid_bottom,
                                     .right = client.right,
                                     .bottom = client.bottom,
                                 };
-                                present_rects.append(app.alloc, gutter_rc) catch {};
+                                present.add(gutter_rc);
                             }
                         }
 
                         // Always include explicit paint rects (cursor damage) in present set.
-                        if (paint_rects_snapshot.items.len != 0) {
-                            present_rects.appendSlice(app.alloc, paint_rects_snapshot.items) catch {};
+                        for (paint_rects_snapshot.items) |r| present.add(r);
+                        present.addOpt(cursor_rc_opt);
+
+                        // Track in each grid whether this paint built a present rect.
+                        // The core thread can make a layer dirty after the loop
+                        // below has run; that layer's band is drawn but not
+                        // presented, so only the layers recorded here may have
+                        // their dirty flag consumed.
+
+                        // Layers paint whole; present each one that changed.
+                        // Their rows are not in rows_to_draw, which only
+                        // covers the root grid's own dirty rows. Added before
+                        // the chrome test below, which widens only a list that
+                        // already has content: a paint whose only damage was a
+                        // layer used to present it without the chrome bands.
+                        if (tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            defer app.mu.unlock(core.clock.io());
+                            app_mod.appendLayerPresentRects(
+                                app,
+                                tbs_snapshot.layers.slice(),
+                                content_x_offset_i32,
+                                content_y_offset_i32,
+                                client.right,
+                                client.bottom,
+                                row_h_px,
+                                present_rects,
+                            );
                         }
 
-                        if (cursor_rc_opt) |cr| {
-                            present_rects.append(app.alloc, cr) catch {};
-                        }
-
-                        // Clamp first, then compact in place with O(n log n)
-                        // sorting plus a linear safe-union pass. The previous
-                        // all-pairs containment scan reached O(rows^2) for
-                        // alternating dirty rows on the accepted 20,000-row
-                        // boundary.
+                        // The chrome outside the content area — the tabline with
+                        // its close and new-tab buttons, the caption buttons, the
+                        // sidebar — is redrawn into back_tex on EVERY paint, from
+                        // hover state that produces no row damage and no paint
+                        // rect. Nothing above ever added its band here, so it
+                        // reached the screen only on a frame that happened to
+                        // present in full: the moment anything else put a rect in
+                        // this list (a blinking cursor is enough), the present
+                        // went partial and the newly drawn hover was left in
+                        // back_tex. Only widen a list that already has content —
+                        // an empty list still means "present everything", which
+                        // covers the chrome anyway.
                         if (present_rects.items.len != 0) {
-                            const max_r: i32 = client.right;
-                            const max_b: i32 = client.bottom;
-                            var i: usize = 0;
-                            while (i < present_rects.items.len) {
-                                var r = present_rects.items[i];
-                                if (r.left < 0) r.left = 0;
-                                if (r.top < 0) r.top = 0;
-                                if (r.right > max_r) r.right = max_r;
-                                if (r.bottom > max_b) r.bottom = max_b;
-                                if (r.right <= r.left or r.bottom <= r.top) {
-                                    present_rects.items[i] = present_rects.items[present_rects.items.len - 1];
-                                    present_rects.items.len -= 1;
-                                    continue;
-                                }
-                                present_rects.items[i] = r;
-                                i += 1;
+                            if (content_y_offset_i32 > 0) {
+                                present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
                             }
-                            present_rects.items.len = render_helpers.compactDamageRects(c.RECT, present_rects.items);
+                            if (content_x_offset_i32 > 0) {
+                                present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
+                            }
+                            if (sidebar_right_width) |rw| {
+                                const right_strip_left: i32 =
+                                    client.right - @as(i32, @intCast(rw));
+                                if (rw > 0 and right_strip_left > 0) {
+                                    present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
+                                }
+                            }
                         }
+
+                        // The client rect can be a resize ahead of the buffer.
+                        present.finish(g.width, g.height);
 
                         // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
                         if (applog.isEnabled()) {
@@ -2992,10 +2913,13 @@ pub export fn WndProc(
                         // alpha blending accumulates on retained back_tex, producing faint ghost
                         // text on rows that are drawn over without an intervening clear (matches
                         // external window logic in drawNormalExtRowMode).
-                        const preserve_back = !seed_clear and
-                            back_tex_valid_snapshot and
-                            !glow_enabled and
-                            g.opacity >= 1.0;
+                        // From the shared policy above. It is stricter than the
+                        // terms spelled out here used to be — it also refuses on
+                        // paint_full and on a cursor that changed grid — but every
+                        // case it newly refuses is one where force_full_rows is
+                        // true and every row redraws anyway, and the chrome is
+                        // regenerated each paint regardless.
+                        const preserve_back = paint_policy.preserve_back;
                         if (log_enabled) applog.appLog(
                             "[win] WM_PAINT(row) setup preserve_back={d} did_need_seed={d} seed_pending={d} seed_clear={d}\n",
                             .{
@@ -3018,92 +2942,68 @@ pub export fn WndProc(
                             // a previously-painted frame). Only the fresh-from-scratch
                             // seed path (back_tex_valid=false) keeps the full-area scissor.
                             .use_row_scissor = !seed_pending_snapshot or back_tex_valid_snapshot,
+                            .root_rows_may_be_empty = tbs_snapshot.layers.len > 1,
                             .content_width = content_width,
                             .content_y_offset = content_y_offset,
                             .content_x_offset = content_x_offset,
                             .sidebar_right_width = sidebar_right_width,
                             .tabbar_bg_color = tabbar_bg_color,
+                            // The root layer drives the pixel space core
+                            // vertices arrive in. It sits at the surface origin
+                            // today; an anchored float will carry its own
+                            // offset once the core emits multi-layer layouts.
+                            .layer_origin_x_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.x_px) else 0,
+                            .layer_origin_y_px = if (tbs_snapshot.layers.root()) |l| @floatFromInt(l.y_px) else 0,
+                            // Under ext_multigrid the root grid carries only
+                            // chrome, so the glow pass has to extract the
+                            // layers as well or the buffer text never lights.
+                            .bloom_layers = if (tbs_snapshot.layers.len > 1)
+                                app_mod.BloomLayerSource{ .app = app, .layers = tbs_snapshot.layers.slice() }
+                            else
+                                null,
                         };
 
-                        // Ensure row_vbs array covers committed set's row count.
-                        {
-                            const need_len = committed.row_map.items.len;
-                            if (!app_mod.resizeRowVBsForPaint(
-                                app.alloc,
-                                &app.row_vbs,
-                                &app.row_vb_budget,
-                                &app.row_vb_retained_bytes,
-                                need_len,
-                            )) {
-                                app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                app.tbs.pending_paint_full = true;
-                                app.tbs.rotation_mu.unlock(core.clock.io());
-                                scheduleMainPaintRetry(hwnd, app);
-                                return 0;
-                            }
-                        }
-
-                        // Apply scroll pixel shift (row_vbs shift + cursor ghost + back_tex shift).
-                        // Scroll state is bundled in PaintSnapshot, atomically consistent with committed set.
-                        var scroll_shift_result = app_mod.ScrollShiftResult{};
-                        if (preserve_back) {
-                            if (tbs_snapshot.scroll_rect) |sr| {
-                                scroll_shift_result = app_mod.applyScrollShift(
-                                    g,
-                                    app.alloc,
-                                    app.row_vbs.items,
-                                    &app.row_vbs_shift_scratch,
-                                    rows_to_draw,
-                                    &app.scroll_rows_merge_scratch,
-                                    sr,
-                                    tbs_snapshot.scroll_dy_px,
-                                    tbs_snapshot.vb_shift,
-                                    tbs_snapshot.scroll_row_start,
-                                    tbs_snapshot.scroll_row_end,
-                                    &app.last_painted_cursor_row,
-                                    row_h_px,
-                                    effective_rows,
-                                    content_y_offset_i32,
-                                );
-                                if (!scroll_shift_result.rows_complete) {
-                                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                    app.tbs.pending_paint_full = true;
-                                    app.tbs.rotation_mu.unlock(core.clock.io());
-                                    scheduleMainPaintRetry(hwnd, app);
-                                    return 0;
-                                }
-                            }
-                        } else {
-                            // No scroll shift, but still apply pending vb shift to scroll region.
-                            if (tbs_snapshot.vb_shift != 0 and tbs_snapshot.scroll_row_end > tbs_snapshot.scroll_row_start) {
-                                const abs_shift: u32 = @intCast(if (tbs_snapshot.vb_shift < 0) -tbs_snapshot.vb_shift else tbs_snapshot.vb_shift);
-                                app_mod.ensureShiftScratch(app.alloc, &app.row_vbs_shift_scratch, abs_shift);
-                                app_mod.shiftRowVBs(app.row_vbs.items, tbs_snapshot.vb_shift, tbs_snapshot.scroll_row_start, tbs_snapshot.scroll_row_end, app.row_vbs_shift_scratch.items);
-                            }
-                        }
-
-                        // TBS lock-free draw: committed set is protected by refcount,
-                        // no app.mu needed during VB upload + draw.
-                        var row_vb_budget_exceeded = false;
-                        const row_draw_result = app_mod.drawRowModeSetupAndRowsFromSlots(
-                            g,
-                            &app.row_vb_budget,
-                            &app.row_vb_retained_bytes,
-                            committed.row_map.items,
-                            &app.tbs.pool,
-                            app.row_vbs.items,
-                            rows_to_draw.items,
-                            row_draw_params,
-                        ) catch |e| blk: {
-                            row_vb_budget_exceeded = e == error.RowVBPhysicalBudgetExceeded;
-                            if (log_enabled) applog.appLog("drawRowModeSetupAndRowsFromSlots failed: {any}\n", .{e});
-                            var failed_result = app_mod.RowModeDrawResult{};
-                            failed_result.metrics.failed_rows = 1;
-                            break :blk failed_result;
+                        // Shared with the external driver: row VBs, the scroll
+                        // pixel shift, the layer plan under app.mu (after the
+                        // renderer context, the order the layer draw uses), then
+                        // the row frame. Layer present rects were added above.
+                        const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.surf), .{
+                            .snapshot = tbs_snapshot,
+                            .rows_to_draw = rows_to_draw,
+                            .row_vb_len = committed.row_map.items.len,
+                            .total_rows = effective_rows,
+                            .preserve_back = preserve_back,
+                            .layer_paint_full = paint_full_snapshot,
+                            .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                            .frame = .{
+                                .root_grid_id = 1,
+                                .layers = &.{},
+                                .row_map = committed.row_map.items,
+                                .rows_to_draw = &.{},
+                                .cursor_verts = cursor_verts_snapshot,
+                                .cursor_row = committed_cursor.last_cursor_row,
+                                .cursor_grid = cursor_grid,
+                                .cursor_erase_rows = cursor_erase_rows,
+                                .cursor_layer_origin = cursor_layer_origin,
+                                .blink_visible = app.cursor_blink_state,
+                                .force_full_rows = force_full_rows,
+                                .layer_layout_stale = false,
+                                .layer_commit_stale = false,
+                                .glow = if (glow_enabled) app_mod.RowFrameGlow{
+                                    .intensity = glow_intensity,
+                                    .radius_scale = glow_radius_scale,
+                                    .cursor_visible = app.cursor_blink_state,
+                                } else null,
+                                .draw_params = row_draw_params,
+                                .log_enabled = log_enabled,
+                            },
+                        }) catch {
+                            recoverMainPaintFailure(hwnd, app);
+                            return 0;
                         };
-                        if (row_vb_budget_exceeded) {
-                            app.row_vb_budget_failed = true;
-                            if (app.corep) |corep| core.zonvie_core_fail_render_budget(corep);
+                        const row_frame = pass.frame;
+                        if (row_frame.row_vb_budget_exceeded) {
+                            app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
                             return 0;
                         }
 
@@ -3112,6 +3012,7 @@ pub export fn WndProc(
                             .{ rows_snapshot, row_valid_count_snapshot, rows_to_draw.items.len, row_verts_len, committed.rows, committed.cols, committed.row_map.items.len },
                         );
 
+                        const row_draw_result = row_frame.rows;
                         const drawn_rows = row_draw_result.metrics.drawn_rows;
                         const skipped_empty = row_draw_result.metrics.skipped_empty;
                         const failed_rows = row_draw_result.metrics.failed_rows;
@@ -3120,8 +3021,6 @@ pub export fn WndProc(
                         const log_vb_upload_rows_bytes = row_draw_result.metrics.vb_upload_rows_bytes;
                         const log_vb_upload_ns = row_draw_result.metrics.vb_upload_ns;
                         const log_draw_vb_ns = row_draw_result.metrics.draw_vb_ns;
-                        const ctx_ptr = row_draw_result.ctx_ptr;
-                        const rs_set_sc_fn = row_draw_result.rs_set_sc_fn;
 
                         if (log_enabled) {
                             applog.appLog(
@@ -3134,48 +3033,6 @@ pub export fn WndProc(
                                     .{ erow, rows_snapshot, row_verts_len },
                                 );
                             }
-                        }
-
-                        // Cursor overlay — shared helper handles upload, scissor, draw/blink-off, and tracking.
-                        var cursor_overlay_failed = false;
-                        app_mod.drawCursorOverlay(g, .{
-                            .cursor_verts = cursor_verts_snapshot,
-                            .cursor_row = committed_cursor.last_cursor_row,
-                            .cursor_vb = &app.cursor_vb,
-                            .cursor_vb_bytes = &app.cursor_vb_bytes,
-                            .row_vbs = app.row_vbs.items,
-                            .row_map = committed.row_map.items,
-                            .pool = &app.tbs.pool,
-                            .blink_visible = app.cursor_blink_state,
-                            .x_offset = content_x_offset_i32,
-                            .y_offset = content_y_offset_i32,
-                            .content_right = content_right_i32,
-                            .content_height = content_height,
-                            .row_h_px = row_h_px,
-                            .ctx_ptr = ctx_ptr,
-                            .rs_set_sc_fn = rs_set_sc_fn,
-                            .last_painted_cursor_row = &app.last_painted_cursor_row,
-                            .row_already_redrawn = force_full_rows,
-                        }) catch |e| {
-                            cursor_overlay_failed = true;
-                            if (log_enabled) applog.appLog("drawCursorOverlay failed: {any}\n", .{e});
-                        };
-
-                        // Post-process bloom (neon glow) for row-mode
-                        if (glow_enabled) {
-                            const bloom_cursor = if (app.cursor_blink_state)
-                                cursor_verts_snapshot
-                            else
-                                &[_]core.Vertex{};
-                            app_mod.drawBloomRowsOverlay(
-                                g,
-                                committed.row_map.items,
-                                &app.tbs.pool,
-                                app.row_vbs.items,
-                                bloom_cursor,
-                                glow_intensity,
-                                row_draw_params,
-                            );
                         }
 
                         if (log_enabled and force_full_rows and skipped_empty != 0) {
@@ -3222,88 +3079,74 @@ pub export fn WndProc(
                         }
 
                         var layout_ok: bool = true;
-                        var rows_current: u32 = 0;
+                        var metrics_ok: bool = true;
                         app.mu.lockUncancelable(core.clock.io());
                         layout_ok = app.row_layout_gen == row_layout_gen_snapshot;
-                        rows_current = committed.rows;
+                        metrics_ok = row_mode and committed_metrics_gen == app.shared_metrics_gen;
                         app.mu.unlock(core.clock.io());
 
-                        const allow_present = blk: {
-                            // Never publish vertices against a newer layout,
-                            // even for a seed-clear frame. A metric change can
-                            // keep rows/cols unchanged while invalidating the
-                            // NDC and row-height snapshot used above. The
-                            // render-failure path requeues a full paint at the
-                            // new generation.
-                            if (!layout_ok) break :blk false;
-                            if (rows_current != rows_snapshot) break :blk false;
-                            // A failed VB create/upload/draw means one or more
-                            // rows from this paint snapshot never reached
-                            // back_tex. Treat the whole paint as failed so the
-                            // common recovery path requeues a full redraw.
-                            if (failed_rows != 0) break :blk false;
-                            if (cursor_overlay_failed) break :blk false;
-
-                            // When seed_clear is true, we must present to sync the cleared back buffer
-                            // to all swapchain buffers. Skip other checks - the cleared state must be
-                            // presented to prevent ghost artifacts in gutter areas.
-                            if (seed_clear) break :blk true;
-
-                            // During seed mode with preserve_back=false, we MUST present to ensure
-                            // all swapchain buffers get the cleared state. Without this, some buffers
-                            // may retain stale gutter content causing ghost artifacts.
-                            if (seed_pending_snapshot and !preserve_back) break :blk true;
-
-                            // Never present until core has provided a stable row count.
-                            if (effective_rows == 0) break :blk false;
-
-                            if (seed_pending_snapshot) {
-                                // back_tex_valid_snapshot is the source-of-truth gate
-                                // (same flag preserve_back uses). When it is true,
-                                // back_tex already holds a fully-painted frame at the
-                                // current dimensions/metrics, so an incomplete row_valid
-                                // bitset does not block presenting scroll/dirty updates
-                                // — the rows we have not yet re-validated stay sourced
-                                // from the preserved back_tex content. Without this,
-                                // a WM_SIZE on minimize/restore that resets row_valid,
-                                // combined with grid_scroll propagating zero validity
-                                // bits via swapAndShiftRows, would freeze present while
-                                // preserve_back=true masked the gray-rectangle symptom.
-                                if (back_tex_valid_snapshot) {
-                                    if (rows_mismatch) {
-                                        if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
-                                        break :blk false;
-                                    }
-                                    break :blk true;
-                                }
-
-                                if (rows_mismatch) {
-                                    if (rows_to_draw.items.len != 0 and skipped_empty == 0) break :blk true;
-                                    break :blk false;
-                                }
-                                // No back_tex yet: require a complete seed so the first
-                                // present covers every row.
-                                if (effective_row_valid_count == effective_rows) {
-                                    if (skipped_empty != 0) break :blk false;
-                                    if (rows_to_draw.items.len != effective_rows) break :blk false;
-                                    break :blk true;
-                                }
-
-                                break :blk false;
-                            }
-
-                            if (force_full_rows and skipped_empty != 0) break :blk false;
-                            if (force_full_rows and rows_to_draw.items.len != effective_rows) break :blk false;
-                            break :blk true;
+                        // Shared with the external driver (render_helpers.presentGate);
+                        // the seed and chrome terms are this surface's own.
+                        // A paint against a newer layout or metrics, or with
+                        // rows that never reached back_tex, is refused and the
+                        // common recovery path requeues a full redraw.
+                        var present_in = render_helpers.PresentGateInputs{
+                            .layout_ok = layout_ok,
+                            .metrics_ok = !row_mode or metrics_ok,
+                            .frame_incomplete = row_frame.incomplete(),
+                            .force_full_rows = force_full_rows,
+                            .preserve_back = preserve_back,
+                            .rows = effective_rows,
+                            .rows_to_draw = rows_to_draw.items.len,
+                            .skipped_empty = skipped_empty,
+                            .custom_shader = g.custom_shader_pipelines.items.len != 0,
+                            .present_rects = present_rects.items.len,
+                            .present_rects_overflowed = present.full,
+                            .seed = .{
+                                .pending = seed_pending_snapshot,
+                                .clear = seed_clear,
+                                .back_tex_valid = back_tex_valid_snapshot,
+                                .rows_mismatch = rows_mismatch,
+                                .row_valid_count = effective_row_valid_count,
+                            },
+                            .empty_damage_presents_all = true,
                         };
+                        const allow_present = render_helpers.presentGate(present_in).verdict == .present;
 
                         // When scrollBackTex shifted back_tex content, the entire scroll
                         // region changed in back_tex. Add it to present_rects so the
                         // CopySubresourceRegion in present copies the shifted pixels
                         // to all swapchain buffers.
-                        if (scroll_shift_result.scroll_rect) |sr| {
-                            present_rects.append(app.alloc, sr) catch {};
-                        }
+                        // Only into a list that already names rects: an empty
+                        // one means "present everything" (chrome included),
+                        // which covers this region, and adding the region
+                        // would narrow it to a partial present without the
+                        // chrome bands.
+                        if (pass.scroll_damage) |sr| if (present_rects.items.len != 0) {
+                            present.add(sr);
+                            // applyScrollShift clips this rect to the renderer
+                            // width but not to the client height.
+                            present.clamp(g.width, g.height);
+                        };
+
+                        if (log_enabled) applog.appLog(
+                            "[win] allow_present={} seed_pending={} preserve_back={} back_tex_valid={} rows_mismatch={} effective_rows={d} row_valid={d} skipped_empty={d} failed_rows={d} empty_rows={d} rows_to_draw={d} force_full_rows={} layers={d}\n",
+                            .{
+                                allow_present,
+                                seed_pending_snapshot,
+                                preserve_back,
+                                back_tex_valid_snapshot,
+                                rows_mismatch,
+                                effective_rows,
+                                effective_row_valid_count,
+                                skipped_empty,
+                                failed_rows,
+                                row_draw_result.metrics.empty_rows,
+                                rows_to_draw.items.len,
+                                force_full_rows,
+                                tbs_snapshot.layers.len,
+                            },
+                        );
 
                         if (allow_present) {
                             present_frame: {
@@ -3311,32 +3154,22 @@ pub export fn WndProc(
                                 // alpha-blended overlay. The next fade/update paint
                                 // restores this clean copy instead of clearing and
                                 // regenerating the entire row set.
-                                if (app.config.scrollbar.enabled and scrollbar_alpha_snapshot > 0.001) {
-                                    var scrollbar_verts: [12]core.Vertex = undefined;
-                                    const scrollbar_vert_count = scrollbar.generateScrollbarVertices(app, client.right, client.bottom, &scrollbar_verts);
-                                    if (scrollbar_vert_count != 0) {
-                                        if (scrollbar.getScrollbarTrackRect(app, client.right, client.bottom)) |track_rect| {
-                                            const captured_scrollbar_rect = g.captureScrollbarUnderlay(track_rect) catch |e| {
-                                                if (log_enabled) applog.appLog("captureScrollbarUnderlay failed: {any}\n", .{e});
-                                                break :present_frame;
-                                            };
-                                            if (captured_scrollbar_rect) |captured_rect| {
-                                                present_rects.append(app.alloc, captured_rect) catch {
-                                                    present_rects_fallback_full = true;
-                                                };
-                                                app_mod.drawScrollbarOverlay(
-                                                    g,
-                                                    &app.scrollbar_vb,
-                                                    &app.scrollbar_vb_bytes,
-                                                    scrollbar_verts[0..scrollbar_vert_count],
-                                                ) catch |e| {
-                                                    if (log_enabled) applog.appLog("drawScrollbarOverlay failed: {any}\n", .{e});
-                                                    break :present_frame;
-                                                };
-                                            }
-                                        }
-                                    }
-                                }
+                                const captured_scrollbar_rect = scrollbar.drawOverlay(
+                                    app,
+                                    g,
+                                    scrollbar.mainSurface(hwnd, app),
+                                    scrollbar_alpha_snapshot,
+                                    client.right,
+                                    client.bottom,
+                                    &app.surf.paint.scrollbar_vb,
+                                    &app.surf.paint.scrollbar_vb_bytes,
+                                ) catch |e| {
+                                    if (log_enabled) applog.appLog("scrollbar overlay failed: {any}\n", .{e});
+                                    break :present_frame;
+                                };
+                                // Same rule as the scroll rect: an empty list
+                                // already presents it.
+                                if (present_rects.items.len != 0) present.addOpt(captured_scrollbar_rect);
 
                                 // When seed_clear is true, the back buffer was just cleared.
                                 // We must do a full present to sync the cleared state to all swapchain buffers,
@@ -3345,12 +3178,33 @@ pub export fn WndProc(
                                 // back_tex_valid_snapshot is true the swapchain has already been
                                 // synced to a complete frame, and partial present rects keep
                                 // DXGI from copying unchanged regions every paint.
-                                const force_full_present = force_full_rows or
-                                    (seed_pending_snapshot and !back_tex_valid_snapshot and !rows_mismatch) or
-                                    seed_clear or
-                                    present_rects_fallback_full;
+                                // A custom shader writes the complete current
+                                // swapchain buffer from inside the present
+                                // (drawCustomShaderPass), while the other
+                                // rotating buffers record only this frame's
+                                // partial damage. Mark them all full so
+                                // disabling the shader cannot expose stale
+                                // shader pixels outside the dirty rectangles.
+                                // The external driver has carried this term
+                                // since its present grew the shader pass.
+                                // Re-asked: the scrollbar overlay above can have
+                                // overflowed the rect list since the gate ran.
+                                present_in.present_rects_overflowed = present.full;
+                                const present_gate = render_helpers.presentGate(present_in);
+                                const force_full_present = present_gate.full;
                                 const present_rects_slice: []const c.RECT =
                                     if (force_full_present) &[_]c.RECT{} else present_rects.items;
+
+                                // NOTE: an empty rect list here is read by the
+                                // renderer as whole-surface damage, so this
+                                // paint costs a full CopyResource + Present1.
+                                // Skipping it instead is WRONG: main's damage
+                                // bookkeeping covers grid rows and the cursor
+                                // only, while the tabline, its close/new-tab
+                                // buttons and the caption buttons are redrawn
+                                // into back_tex from hover state that produces
+                                // no rect at all. Skipping left every one of
+                                // those hovers invisible.
 
                                 // Present1 scroll params: disabled for now.
                                 // back_tex pixel shift (scrollBackTex) already handles the retained
@@ -3359,9 +3213,6 @@ pub export fn WndProc(
 
                                 if (g.presentFromBackRectsWithCursorNoResize(
                                     present_rects_slice,
-                                    app.cursor_vb,
-                                    cursor_verts_snapshot.len,
-                                    cursor_rc_opt,
                                     force_full_present,
                                     null,
                                     null,
@@ -3393,15 +3244,8 @@ pub export fn WndProc(
                                     // allow_present and presents anyway, so without an explicit
                                     // false-assignment a stale snapshot value would survive a
                                     // paint that wiped back_tex.
-                                    const rendered_complete_frame =
-                                        effective_rows != 0 and
-                                        skipped_empty == 0 and
-                                        rows_to_draw.items.len == effective_rows;
-                                    const new_back_tex_valid =
-                                        (back_tex_valid_snapshot and preserve_back) or
-                                        rendered_complete_frame;
                                     app.mu.lockUncancelable(core.clock.io());
-                                    app.back_tex_valid = new_back_tex_valid;
+                                    app.back_tex_valid = present_gate.back_tex_valid;
                                     app.mu.unlock(core.clock.io());
                                     // last_painted_cursor_row is tracked by drawCursorOverlay above.
                                 } else |e| {
@@ -3411,16 +3255,12 @@ pub export fn WndProc(
                                 if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
                                     app.mu.lockUncancelable(core.clock.io());
                                     app.seed_pending = false;
-                                    app.surface.paint_full = true;
+                                    app.surf.surface.paint_full = true;
                                     app.paint_rects.clearRetainingCapacity();
                                     app.seed_clear_pending = true;
                                     app.mu.unlock(core.clock.io());
                                     // Also set TBS pending_paint_full for next paint cycle.
-                                    {
-                                        app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                                        app.tbs.pending_paint_full = true;
-                                        app.tbs.rotation_mu.unlock(core.clock.io());
-                                    }
+                                    app.surf.tbs.requestFullPaint();
                                     if (log_enabled) applog.appLog(
                                         "[win] WM_PAINT(row) seed_complete rows={d} row_valid={d} -> request repaint\n",
                                         .{ effective_rows, effective_row_valid_count },
@@ -3445,7 +3285,7 @@ pub export fn WndProc(
                                 .{
                                     @as(u32, @intFromBool(seed_pending_snapshot)),
                                     effective_rows,
-                                    rows_current,
+                                    rows_snapshot,
                                     effective_row_valid_count,
                                     rows_to_draw.items.len,
                                     skipped_empty,
@@ -3457,6 +3297,18 @@ pub export fn WndProc(
                                     resize_age_ms,
                                 },
                             );
+                        }
+
+                        // Nothing was submitted (the present failed, or
+                        // allow_present refused this frame), so the dirty
+                        // state consumed with the layer draw was never paid
+                        // for: put it back. recoverMainPaintFailure re-arms a
+                        // full paint below on the failure path, and this keeps
+                        // the layer present rects on whichever paint runs next.
+                        if (!render_ok and tbs_snapshot.layers.len > 1) {
+                            app.mu.lockUncancelable(core.clock.io());
+                            app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
+                            app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled) {
@@ -3476,12 +3328,25 @@ pub export fn WndProc(
                     }
                 }
 
+                // A Present that failed with a device-removed code sets
+                // `device_lost` on the renderer and still returns normally, so a
+                // paint can report success on a device that is already gone. The
+                // external driver tests this right after its own present; main
+                // did not, and left recovery to whatever woke the next WM_PAINT.
+                // With no external window and a cursor that does not blink,
+                // nothing does until Neovim redraws, so the window sat frozen.
+                if (render_ok) {
+                    if (app.renderer) |*r| {
+                        if (r.device_lost) render_ok = false;
+                    }
+                }
+
                 // Recover dirty state if rendering failed, so the next
                 // WM_PAINT will retry a full redraw instead of showing stale content.
                 if (!render_ok) {
                     recoverMainPaintFailure(hwnd, app);
                 } else {
-                    completeMainPaintRetry(app);
+                    app.surf.completePaintRetry();
                 }
 
                 // Update IME preedit overlay (separate popup window)
@@ -3624,20 +3489,16 @@ pub export fn WndProc(
             if (wParam == SIZE_MINIMIZED) return 0;
 
             if (getApp(hwnd)) |app| {
+                // Boxes anchored to the bottom-right follow a resize from the
+                // right or bottom edge, which sends no WM_MOVE.
+                app_mod.scheduleFloatReposition(app);
                 // Device/D2D/swapchain creation in WM_APP_DEVICE_LOST_RECOVER
                 // can pump messages and reenter WM_SIZE on this same UI
                 // thread while that handler still holds app.mu — blocking
                 // here would self-deadlock. Replay the complete WM_SIZE path
                 // after recovery: rebuilding the swapchain from GetClientRect
                 // fixes GPU size, but does not resend rows/cols to Neovim.
-                if (app.device_lost_recovering or
-                    app.main_resize_in_progress or
-                    app.main_dpi_change_in_progress or
-                    app.wm_paint_in_progress or
-                    app.in_present_shader_animation_frame or
-                    app.glow_prepare_in_progress or
-                    app.external_window_create_in_progress)
-                {
+                if (app.paintReentrancyBlocked() or app.external_window_create_in_progress) {
                     app.main_size_replay_needed = true;
                     if (app.device_lost_recovering) scheduleMainSizeReplay(hwnd, app);
                     return 0;
@@ -3702,8 +3563,8 @@ pub export fn WndProc(
                 // dimensions before the window is shown.
                 if (app.early_core_init_done and app.nvim_spawned and !shown and app.atlas != null) {
                     if (app.corep) |corep| {
-                        if (app.surface.rows > 0 and app.surface.cols > 0) {
-                            core.zonvie_core_notify_layout_ready(corep, app.surface.rows, app.surface.cols);
+                        if (app.surf.surface.rows > 0 and app.surf.surface.cols > 0) {
+                            core.zonvie_core_notify_layout_ready(corep, app.surf.surface.rows, app.surf.surface.cols);
                         }
                     }
                 }
@@ -3750,7 +3611,7 @@ pub export fn WndProc(
                 }
                 {
                     app.mu.lockUncancelable(core.clock.io());
-                    app.surface.paint_full = true;
+                    app.surf.surface.paint_full = true;
                     app.paint_rects.clearRetainingCapacity();
                     app.mu.unlock(core.clock.io());
                 }
@@ -3762,10 +3623,7 @@ pub export fn WndProc(
         },
 
         c.WM_MOVE => {
-            // Reposition ext-float and mini windows when main window moves.
-            // Use a coalescing timer to avoid flooding the message queue
-            // during window drag (SetTimer resets if the same ID is pending).
-            _ = c.SetTimer(hwnd, TIMER_REPOSITION_FLOATS, 15, null);
+            if (getApp(hwnd)) |app| app_mod.scheduleFloatReposition(app);
             return 0;
         },
 
@@ -3923,8 +3781,13 @@ pub export fn WndProc(
                 // ext_hwnd here. The core fires this callback only when the
                 // cursor grid actually changes, so no is_grid_change guard
                 // is needed in the UI handler.
+                // The flush routing's answer, staged layout included: the core
+                // fires this mid-flush, before the layout that places a newly
+                // opened float commits, and a committed-only scan found no host,
+                // brought the MAIN window in front of the external one the cursor
+                // had just entered. macOS reads its staged map for the same case.
                 app.mu.lockUncancelable(core.clock.io());
-                const ext_hwnd = if (app.external_windows.get(grid_id)) |ext_win| ext_win.hwnd else null;
+                const ext_hwnd = if (callbacks.externalWindowShowingGridLocked(app, grid_id)) |shown| shown.win.hwnd else null;
                 app.mu.unlock(core.clock.io());
 
                 if (ext_hwnd) |eh| {
@@ -3943,7 +3806,7 @@ pub export fn WndProc(
                 } else {
                     // Cursor moved to global grid - activate main window
                     _ = c.SetForegroundWindow(hwnd);
-                    // Only invalidate if no paint is already pending from on_vertices_row/partial.
+                    // Only invalidate if no paint is already pending from on_vertices_row.
                     // When dirty_rows, paint_full, or paint_rects is set, the pending WM_PAINT
                     // will handle cursor rendering as part of the normal draw.
                     app.mu.lockUncancelable(core.clock.io());
@@ -3996,7 +3859,7 @@ pub export fn WndProc(
                         .mini => {
                             // Show in mini window
                             const text = dm.text[0..dm.text_len];
-                            messages.updateMiniText(app, .showmode, text);
+                            messages.updateMiniText(app, .custom, text);
                             messages.updateMiniWindows(app);
 
                             // Set auto-hide timer based on timeout (use separate timer for mini)
@@ -4020,26 +3883,38 @@ pub export fn WndProc(
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
                         .ext_float => {
-                            // Floating window: add to display stack
-                            if (req.replace_last != 0) {
-                                app.display_messages.clearRetainingCapacity();
-                            }
-                            if (req.append != 0 and app.display_messages.items.len > 0) {
-                                var last = &app.display_messages.items[app.display_messages.items.len - 1];
-                                const append_len = @min(req.text_len, last.text.len - last.text_len);
-                                @memcpy(last.text[last.text_len..][0..append_len], req.text[0..append_len]);
-                                last.text_len += append_len;
-                                messages.showMessageWindowOnUIThread(app, dm, false);
-                            } else {
-                                var append_failed = false;
-                                app.display_messages.append(app.alloc, dm) catch {
+                            // Floating window: the display stack. The rule is
+                            // the core's, shared with macOS; replace_last
+                            // replaces only the last message, as the UI spec
+                            // says, where this cleared the whole stack.
+                            var evict: usize = 0;
+                            const stack_len = app.display_messages.items.len;
+                            const action = app_mod.zonvie_core_msg_stack_plan(
+                                stack_len,
+                                @intCast(req.replace_last),
+                                @intCast(req.append),
+                                &evict,
+                            );
+                            var append_failed = false;
+                            switch (action) {
+                                app_mod.ZONVIE_MSG_STACK_REPLACE_LAST => app.display_messages.items[stack_len - 1] = dm,
+                                app_mod.ZONVIE_MSG_STACK_APPEND_TO_LAST => {
+                                    var last = &app.display_messages.items[stack_len - 1];
+                                    const append_len = @min(req.text_len, last.text.len - last.text_len);
+                                    @memcpy(last.text[last.text_len..][0..append_len], req.text[0..append_len]);
+                                    last.text_len += append_len;
+                                },
+                                else => app.display_messages.append(app.alloc, dm) catch {
                                     append_failed = true;
-                                };
-                                if (app.display_messages.items.len > 5) {
-                                    _ = app.display_messages.orderedRemove(0);
-                                }
-                                messages.showMessageWindowOnUIThread(app, dm, append_failed);
+                                },
                             }
+                            // The eviction counted the push; a push that failed
+                            // made no room to take back.
+                            const drop = if (append_failed) 0 else evict;
+                            for (0..@min(drop, app.display_messages.items.len)) |_| {
+                                _ = app.display_messages.orderedRemove(0);
+                            }
+                            messages.showMessageWindowOnUIThread(app, dm, append_failed);
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                             const timeout_ms = messageTimerMilliseconds(dm.timeout);
                             if (timeout_ms > 0) {
@@ -4476,30 +4351,14 @@ pub export fn WndProc(
                 // Kill the timer and hide mini window (showmode slot)
                 _ = c.KillTimer(hwnd, TIMER_MINI_AUTOHIDE);
                 if (getApp(hwnd)) |app| {
-                    messages.updateMiniText(app, .showmode, "");
+                    messages.updateMiniText(app, .custom, "");
                     messages.updateMiniWindows(app);
                 }
-            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE) {
-                // Start fade-out animation after timeout
-                _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_AUTOHIDE);
+            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE or wParam == TIMER_SCROLLBAR_FADE or wParam == TIMER_SCROLLBAR_REPEAT) {
                 if (getApp(hwnd)) |app| {
-                    app.scrollbar_hide_timer = 0;
-                    scrollbar.hideScrollbar(hwnd, app);
-                }
-            } else if (wParam == TIMER_SCROLLBAR_FADE) {
-                // Update scrollbar fade animation
-                if (getApp(hwnd)) |app| {
-                    scrollbar.updateScrollbarFade(hwnd, app);
-                }
-            } else if (wParam == TIMER_SCROLLBAR_REPEAT) {
-                // Continuous page scroll while holding mouse on track
-                if (getApp(hwnd)) |app| {
-                    if (app.scrollbar_repeat_dir != 0) {
-                        scrollbar.scrollbarPageScroll(app, app.scrollbar_repeat_dir);
-                        // After first delay, switch to faster interval
-                        _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
-                        app.scrollbar_repeat_timer = c.SetTimer(hwnd, TIMER_SCROLLBAR_REPEAT, SCROLLBAR_REPEAT_INTERVAL, null);
-                    }
+                    _ = scrollbar.onTimer(app, scrollbar.mainSurface(hwnd, app), wParam);
+                } else {
+                    _ = c.KillTimer(hwnd, wParam);
                 }
             } else if (wParam == TIMER_CURSOR_BLINK) {
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: cursor blink\n", .{});
@@ -4627,8 +4486,11 @@ pub export fn WndProc(
                             app.in_present_shader_animation_frame = false;
                             _ = app.finishActiveOperation();
                         }
-                        if (app.renderer) |*r| {
-                            r.presentShaderAnimationFrame();
+                        // Not while minimized: nothing shows the frame, and
+                        // WM_PAINT returns early for an iconic window too. The
+                        // external windows below keep animating.
+                        if (c.IsIconic(hwnd) == 0) {
+                            if (app.renderer) |*r| r.presentShaderAnimationFrame();
                         }
                         // Iterating external_windows under app.mu while
                         // calling Present on each renderer would self-
@@ -4667,6 +4529,7 @@ pub export fn WndProc(
                         var i: usize = 0;
                         while (i < app.shader_anim_external_renderers.items.len) : (i += 1) {
                             const renderer = app.shader_anim_external_renderers.items[i];
+                            external_windows.syncExternalShaderFrame(app, renderer.hwnd, renderer, null);
                             renderer.presentShaderAnimationFrame();
                             anim_dev_lost = anim_dev_lost or renderer.device_lost;
                         }
@@ -4718,7 +4581,7 @@ pub export fn WndProc(
                                 if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
 
                                 // Renderer is already initialized at this point; notify with correct rows/cols.
-                                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
+                                core.zonvie_core_notify_layout_ready(app.corep, app.surf.surface.rows, app.surf.surface.cols);
 
                                 app.devcontainer_up_pending = false;
                                 app.devcontainer_nvim_started = true;
@@ -4835,9 +4698,9 @@ pub export fn WndProc(
         app_mod.WM_APP_PAINT_RETRY_FALLBACK => {
             if (getApp(hwnd)) |app| {
                 if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie and
-                    app.paint_retry.timerFired(@intCast(wParam)))
+                    app.surf.paint_retry.timerFired(@intCast(wParam)))
                 {
-                    app.main_paint_retry_deadline_ms = 0;
+                    app.surf.paint_retry_deadline_ms = 0;
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
                 }
             }
@@ -5011,12 +4874,12 @@ pub export fn WndProc(
 
                     // Detach singleton objects only. Row buffers are detached
                     // one at a time below so no COM Release runs under app.mu.
-                    old_cursor_vb = app.cursor_vb;
-                    app.cursor_vb = null;
-                    app.cursor_vb_bytes = 0;
-                    old_scrollbar_vb = app.scrollbar_vb;
-                    app.scrollbar_vb = null;
-                    app.scrollbar_vb_bytes = 0;
+                    old_cursor_vb = app.surf.paint.cursor_vb;
+                    app.surf.paint.cursor_vb = null;
+                    app.surf.paint.cursor_vb_bytes = 0;
+                    old_scrollbar_vb = app.surf.paint.scrollbar_vb;
+                    app.surf.paint.scrollbar_vb = null;
+                    app.surf.paint.scrollbar_vb_bytes = 0;
                     old_main_renderer = app.renderer;
                     app.renderer = null;
 
@@ -5025,7 +4888,8 @@ pub export fn WndProc(
                     old_d3d_device = app.d3d_device;
                     app.d3d_device = null;
                 }
-                releaseMainRecoveryBuffers(app);
+                _ = releaseSurfaceRecoveryBuffers(app, &app.surf, null);
+                releaseLayerGridRecoveryBuffers(app);
                 if (old_cursor_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
                 if (old_scrollbar_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
                 // releaseD2DDeviceObjects drops its own mutex before COM;
@@ -5074,9 +4938,9 @@ pub export fn WndProc(
                     hwnd;
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, new_d3d_device.?, new_d3d_ctx.?) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity) catch null;
+                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
                 if (recovered_gpu) |*r| {
                     // Complete the generation before publication: shader
@@ -5147,18 +5011,16 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
-                app.atlas_full_upload_needed.store(true, .release);
+                app.atlas_upload.forceFull();
                 app.tabline_render_sig = 0;
                 app.mu.lockUncancelable(core.clock.io());
-                app.surface.paint_full = true;
+                app.surf.surface.paint_full = true;
                 app.mu.unlock(core.clock.io());
                 {
-                    app.tbs.rotation_mu.lockUncancelable(core.clock.io());
-                    app.tbs.pending_paint_full = true;
-                    app.tbs.rotation_mu.unlock(core.clock.io());
+                    app.surf.tbs.requestFullPaint();
                 }
 
-                // 5. External windows own independent (equally lost) devices.
+                // 5. External windows share the App device rebuilt above.
                 // Snapshot grid_ids and pin each via paint_ref_count under
                 // app.mu first — mirroring presentShaderAnimationFrame's
                 // pattern above. d3d11.Renderer.init below runs unlocked
@@ -5220,7 +5082,19 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = d3d11.Renderer.init(app.alloc, ext_win.hwnd, app.config.window.opacity) catch {
+                    var new_renderer = blk_ext: {
+                        const device = app.d3d_device orelse break :blk_ext null;
+                        const device_ctx = app.d3d_ctx orelse break :blk_ext null;
+                        break :blk_ext d3d11.Renderer.initWithDevice(
+                            app.alloc,
+                            ext_win.hwnd,
+                            app.config.window.opacity,
+                            app.config.window.blur,
+                            device,
+                            device_ctx,
+                            false,
+                        ) catch null;
+                    } orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
@@ -5238,20 +5112,9 @@ pub export fn WndProc(
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
-                    if (app.atlas) |*a| {
-                        a.mu.lockUncancelable(core.clock.io());
-                        const atlas_w = a.atlas_w;
-                        const atlas_h = a.atlas_h;
-                        a.mu.unlock(core.clock.io());
-                        new_renderer.recreateAtlasTextureIfNeeded(atlas_w, atlas_h) catch {
-                            new_renderer.deinit();
-                            any_ext_failed = true;
-                            external_windows.finishExternalWindowPaint(app, grid_id);
-                            continue;
-                        };
-                    }
                     // Replay any WM_SIZE delivered while the unlocked device
-                    // and atlas creation calls pumped the message queue.
+                    // creation calls pumped the message queue. The atlas is
+                    // the main renderer's, borrowed at its first paint.
                     new_renderer.resize() catch {
                         new_renderer.deinit();
                         any_ext_failed = true;
@@ -5264,7 +5127,7 @@ pub export fn WndProc(
                         return 0;
                     }
                     const ext_dpi = GetDpiForWindow(ext_win.hwnd);
-                    if (!releaseExternalRecoveryBuffers(app, grid_id, ext_win)) {
+                    if (!releaseSurfaceRecoveryBuffers(app, &ext_win.surf, grid_id)) {
                         new_renderer.deinit();
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
@@ -5290,12 +5153,10 @@ pub export fn WndProc(
                     }
                     var old_renderer = ext_win.renderer;
                     ext_win.renderer = new_renderer;
-                    // Force full atlas + content reseed on the fresh device.
+                    // Force full content reseed on the fresh device.
                     ext_win.atlas_version = 0;
-                    ext_win.atlas_upload_cursor = 0;
-                    ext_win.atlas_reset_generation = 0;
                     ext_win.dpi_scale = @as(f32, @floatFromInt(ext_dpi)) / 96.0;
-                    ext_win.surface.paint_full = true;
+                    ext_win.surf.surface.paint_full = true;
                     ext_win.needs_redraw = true;
                     app.mu.unlock(core.clock.io());
                     // The old renderer's COM objects are solely owned by this
@@ -5509,7 +5370,7 @@ pub export fn WndProc(
                         const nvim_path_z = app.alloc.dupeZ(u8, nvim_cmd_slice) catch null;
                         defer if (nvim_path_z) |p| app.alloc.free(p);
                         const nvim_path_ptr: ?[*:0]const u8 = if (nvim_path_z) |p| p.ptr else null;
-                        const start_rc = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surface.rows, app.surface.cols);
+                        const start_rc = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surf.surface.rows, app.surf.surface.cols);
                         if (start_rc != 0) {
                             if (applog.isEnabled()) applog.appLog("[win] devcontainer-up: core start failed rc={d}; aborting\n", .{start_rc});
                             app.neovim_exited.store(true, .release);
@@ -5548,8 +5409,8 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
 
                 // Notify layout ready BEFORE renderer setup (atlas is ready, unblock RPC thread)
-                core.zonvie_core_notify_layout_ready(app.corep, app.surface.rows, app.surface.cols);
-                if (deferred_log_enabled) applog.appLog("[win] notified layout ready: rows={d} cols={d}\n", .{ app.surface.rows, app.surface.cols });
+                core.zonvie_core_notify_layout_ready(app.corep, app.surf.surface.rows, app.surf.surface.cols);
+                if (deferred_log_enabled) applog.appLog("[win] notified layout ready: rows={d} cols={d}\n", .{ app.surf.surface.rows, app.surf.surface.cols });
 
                 // Complete DWrite/D2D: create D2D device context from D3D11 device.
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
@@ -5611,16 +5472,29 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity) catch |e| {
+                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
                         if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
                         return 0;
                     };
                 };
+                // External windows only open on the App device, so publish
+                // the fallback renderer's own device rather than leave them
+                // retrying forever. App.deinit releases this reference.
+                if (app.d3d_device == null) {
+                    if (gpu.device) |dev| {
+                        if (gpu.ctx) |ctx| {
+                            _ = dev.lpVtbl.*.AddRef.?(dev);
+                            _ = ctx.lpVtbl.*.AddRef.?(ctx);
+                            app.d3d_device = dev;
+                            app.d3d_ctx = ctx;
+                        }
+                    }
+                }
                 if (deferred_log_enabled) {
                     _ = c.QueryPerformanceCounter(&t2);
                     const d3d_ms = @divTrunc((t2.QuadPart - t1.QuadPart) * 1000, freq.QuadPart);
@@ -5742,127 +5616,20 @@ pub export fn WndProc(
 
         c.WM_KEYDOWN, c.WM_SYSKEYDOWN => {
             if (getApp(hwnd)) |app| {
-                const vk: u32 = @intCast(wParam);
-                const mods = input.queryMods();
-
-                // Windows keycode is passed as 0x10000|VK so Zig core can distinguish.
-                const keycode: u32 = input.KEYCODE_WINVK_FLAG | vk;
-
-                // scancode is in bits 16..23 of lParam
-                const scancode: u32 = @intCast((@as(u32, @intCast(lParam)) >> 16) & 0xFF);
-
-                const has_ctrl_alt = (mods & (input.MOD_CTRL | input.MOD_ALT)) != 0;
-
-                // Check if IME is composing
-                app.mu.lockUncancelable(core.clock.io());
-                const ime_composing = app.ime_composing;
-                app.mu.unlock(core.clock.io());
-
-                // 1) Special keys always go through send_key_event (chars=nil)
-                //    BUT skip VK_RETURN and VK_BACK when IME is composing to avoid double-input
-                if (input.isSpecialVk(vk)) {
-                    if (ime_composing and (vk == c.VK_RETURN or vk == c.VK_BACK)) {
-                        // Let IME handle Enter/Backspace - committed text comes via WM_IME_CHAR,
-                        // then the key comes via WM_CHAR after WM_IME_ENDCOMPOSITION.
-                        // Return 0 to prevent DefWindowProcW from also translating.
-                        return 0;
-                    } else {
-                        input.sendKeyEventToCore(app, keycode, mods, null, null);
-                        return 0;
-                    }
-                }
-
-                // 2) Ctrl/Alt combos: also go through send_key_event, and try to provide chars/ign.
-                //    (Let Zig decide <C-x> etc.)
-                if (has_ctrl_alt) {
-                    var tmp_chars: [16]u16 = undefined;
-                    var tmp_ign: [16]u16 = undefined;
-                    var out_chars: [8]u8 = undefined;
-                    var out_ign: [8]u8 = undefined;
-
-                    const pair = input.toUnicodePairUtf8(
-                        vk,
-                        scancode,
-                        &tmp_chars,
-                        &tmp_ign,
-                        &out_chars,
-                        &out_ign,
-                    );
-
-                    input.sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
-                    return 0;
-                }
-
-                // 3) Otherwise (normal text, Shift-only, IME): let WM_CHAR handle.
-                // Do not consume here.
+                if (input.handleKeyDownMessage(app, wParam, lParam)) return 0;
             }
         },
 
         c.WM_CHAR, c.WM_SYSCHAR => {
             if (getApp(hwnd)) |app| {
-                const mods = input.queryMods();
-
-                // If Ctrl/Alt are down, WM_CHAR often becomes ASCII control => ignore
-                // (WM_KEYDOWN path handled Ctrl/Alt combos).
-                if ((mods & (input.MOD_CTRL | input.MOD_ALT)) != 0) {
-                    return 0;
-                }
-
-                var ch0: u16 = @as(u16, @intCast(wParam));
-
-                // Skip control characters that are already handled by WM_KEYDOWN as special keys.
-                // This prevents double-input of Enter, Backspace, Tab, Escape.
-                // 0x08 = Backspace, 0x09 = Tab, 0x0D = Enter (CR), 0x1B = Escape
-                if (ch0 == 0x08 or ch0 == 0x09 or ch0 == 0x0D or ch0 == 0x1B) {
-                    app.pending_high_surrogate_char = 0;
-                    return 0;
-                }
-
-                // `:` <-> `;` swap (config-gated) for single keypresses. Paste
-                // arrives via a separate clipboard path, so it is unaffected.
-                if (app.config.input.swap_colon_semicolon) {
-                    if (ch0 == 0x3A) {
-                        ch0 = 0x3B; // ':' -> ';'
-                    } else if (ch0 == 0x3B) {
-                        ch0 = 0x3A; // ';' -> ':'
-                    }
-                }
-
-                // Non-BMP characters (e.g. emoji) arrive as two WM_CHARs: high
-                // surrogate first, then low surrogate. Buffer the high one and
-                // combine it with the next low one before sending to core.
-                var out: [8]u8 = undefined;
-                var s: ?[]const u8 = null;
-                if (ch0 >= 0xD800 and ch0 <= 0xDBFF) {
-                    app.pending_high_surrogate_char = ch0;
-                    return 0;
-                } else if (ch0 >= 0xDC00 and ch0 <= 0xDFFF) {
-                    const hi = app.pending_high_surrogate_char;
-                    app.pending_high_surrogate_char = 0;
-                    if (hi == 0) return 0; // stray low surrogate
-                    s = input.utf16UnitsToUtf8(&out, hi, ch0);
-                } else {
-                    app.pending_high_surrogate_char = 0;
-                    s = input.utf16UnitsToUtf8(&out, ch0, null);
-                }
-
-                const text = s orelse return 0;
-                // keycode=0 means "text input" (Zig will take chars path).
-                input.sendKeyEventToCore(app, 0, mods, text, text);
+                input.handleCharMessage(app, wParam);
                 return 0;
             }
         },
 
         // --- IME message handling ---
-        c.WM_IME_STARTCOMPOSITION => {
-            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION\n", .{});
-            if (getApp(hwnd)) |app| {
-                input.resetImeComposition(app, false);
-
-                // Position IME candidate window at cursor
-                input.positionImeCandidateWindow(hwnd, app);
-            }
-            return 0;
+        c.WM_IME_STARTCOMPOSITION, c.WM_IME_ENDCOMPOSITION, c.WM_IME_CHAR => {
+            if (input.imeEdgeMessage(getApp(hwnd), hwnd, msg, wParam, false)) |r| return r;
         },
 
         c.WM_IME_COMPOSITION => {
@@ -5874,24 +5641,6 @@ pub export fn WndProc(
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
-        c.WM_IME_ENDCOMPOSITION => {
-            if (getApp(hwnd)) |app| {
-                input.resetImeComposition(app, true);
-
-                // Clear any inline preedit extmark and hide the overlay.
-                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
-                input.hideImePreeditOverlay(app);
-            }
-            return 0;
-        },
-
-        c.WM_IME_CHAR => {
-            // IME committed character - send to Neovim.
-            if (getApp(hwnd)) |app| {
-                input.handleImeChar(app, @intCast(wParam));
-                return 0;
-            }
-        },
 
         c.WM_MOUSEWHEEL => {
             if (getApp(hwnd)) |app| {
@@ -5919,18 +5668,26 @@ pub export fn WndProc(
         },
 
         // Mouse button events
-        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN => {
+        c.WM_LBUTTONDOWN, c.WM_RBUTTONDOWN, c.WM_MBUTTONDOWN, c.WM_XBUTTONDOWN => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
-                // Check tabline/sidebar area first (when ext_tabline enabled)
+                // Check tabline/sidebar area first (when ext_tabline enabled).
+                // X buttons too: they had a handler of their own that skipped
+                // the chrome and the scrollbar and reached Neovim at a clamped
+                // cell under the tab bar.
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
-                        if (msg == c.WM_LBUTTONDOWN and y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                            tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
-                            return 0;
+                        // Every button, as the sidebar does: a right press on
+                        // a tab reached Neovim as a click on row 0.
+                        if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            if (msg == c.WM_LBUTTONDOWN) {
+                                tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            }
+                            return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
                         var client_rect_sb: c.RECT = undefined;
@@ -5946,83 +5703,63 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONDOWN) {
                                 tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     }
                 }
 
                 // Check scrollbar hit first (left button only)
                 if (msg == c.WM_LBUTTONDOWN) {
-                    if (scrollbar.scrollbarMouseDown(hwnd, app, @as(i32, x), @as(i32, y))) {
+                    if (scrollbar.mouseDown(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
                         return 0; // Handled by scrollbar
                     }
                 }
 
-                // Capture mouse to receive WM_MOUSEMOVE outside window
-                _ = c.SetCapture(hwnd);
-
-                // Determine button name
-                const button: [*:0]const u8 = switch (msg) {
-                    c.WM_LBUTTONDOWN => blk: {
-                        app.mouse_button_held = 1;
-                        break :blk "left";
-                    },
-                    c.WM_RBUTTONDOWN => blk: {
-                        app.mouse_button_held = 2;
-                        break :blk "right";
-                    },
-                    c.WM_MBUTTONDOWN => blk: {
-                        app.mouse_button_held = 3;
-                        break :blk "middle";
-                    },
-                    else => "left",
-                };
-
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                // Track mouse grid for mini window positioning (main window = grid 1)
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
-
-                return 0;
+                // A float composited into this window is one of its layers,
+                // not a window of its own, so the press has to say which grid
+                // it landed on: Neovim trusts the id it is given and resolves
+                // grid 1 through the frame tree, which holds splits only. This
+                // is the follow-up 5e7e9cb deferred when it fixed the external
+                // path -- and it measured the cost on 0.12.2, a middle press
+                // over a float pasting destructively into the buffer behind it.
+                const target = input.resolveMainWindowTarget(app, @as(i32, x), @as(i32, y));
+                input.pressEditorButton(app, hwnd, msg, wParam, target);
+                return input.mouseButtonResult(msg);
             }
         },
 
-        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP => {
+        c.WM_LBUTTONUP, c.WM_RBUTTONUP, c.WM_MBUTTONUP, c.WM_XBUTTONUP => {
             if (getApp(hwnd)) |app| {
+                const rel = input.takeButtonRelease(app, msg);
+                // A press the editor received is released to it, wherever the
+                // pointer is now: the chrome branches below kept the release
+                // (and, for right and middle, the capture) from a drag that
+                // ended over the tab bar or sidebar.
+                const press_reached_editor = rel.press_grid != 0;
+
                 // Extract position from lParam (needed for tabline check)
-                const x_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y_up: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos_x_up = input.mousePosFromLParam(lParam);
+                const x_up = pos_x_up.x;
+                const y_up = pos_x_up.y;
+
+                // The scrollbar first: its press never reached the editor, so a
+                // knob dragged up past the tab bar or across a sidebar was
+                // released into the chrome branches below, which returned
+                // before ending the drag -- capture stayed, and every later
+                // move scrolled the buffer.
+                if (msg == c.WM_LBUTTONUP and (app.surf.scrollbar.dragging or app.surf.scrollbar.repeat_timer != 0)) {
+                    scrollbar.mouseUp(app, scrollbar.mainSurface(hwnd, app));
+                    return 0;
+                }
 
                 // Check tabline/sidebar drag end or area click
-                if (app.ext_tabline_enabled) {
+                if (app.ext_tabline_enabled and !press_reached_editor) {
                     if (app.tabline_style == .titlebar) {
-                        if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
-                            tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
-                            return 0;
+                        if (app.tabline_state.dragging_tab != null or y_up < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                            if (msg == c.WM_LBUTTONUP) {
+                                tabline_mod.handleTablineMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
+                            }
+                            return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
                         if (msg == c.WM_LBUTTONUP and (app.tabline_state.dragging_tab != null or
@@ -6044,176 +5781,29 @@ pub export fn WndProc(
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
-                            return 0;
+                            return input.mouseButtonResult(msg);
                         }
                     }
                 }
 
-                // Check if we were interacting with scrollbar (left button only)
-                if (msg == c.WM_LBUTTONUP and (app.scrollbar_dragging or app.scrollbar_repeat_timer != 0)) {
-                    scrollbar.scrollbarMouseUp(hwnd, app);
-                    return 0;
-                }
-
                 // Release mouse capture
-                _ = c.ReleaseCapture();
+                if (!rel.left_drag_continues) _ = c.ReleaseCapture();
 
-                // Determine button name
-                const button: [*:0]const u8 = switch (msg) {
-                    c.WM_LBUTTONUP => "left",
-                    c.WM_RBUTTONUP => "right",
-                    c.WM_MBUTTONUP => "middle",
-                    else => "left",
-                };
-
-                app.mouse_button_held = 0;
-
-                // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
-
-                return 0;
-            }
-        },
-
-        c.WM_XBUTTONDOWN => {
-            if (getApp(hwnd)) |app| {
-                _ = c.SetCapture(hwnd);
-
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-
-                // HIWORD(wParam) contains XBUTTON1 (1) or XBUTTON2 (2)
-                const x_button: u16 = @truncate(wParam >> 16);
-                const button: [*:0]const u8 = if (x_button == 1) blk: {
-                    app.mouse_button_held = 4;
-                    break :blk "x1";
-                } else blk: {
-                    app.mouse_button_held = 5;
-                    break :blk "x2";
-                };
-
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                app.last_mouse_grid_id = 1;
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "press",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
-
-                // WM_XBUTTONDOWN requires returning TRUE
-                return 1;
-            }
-        },
-
-        c.WM_XBUTTONUP => {
-            if (getApp(hwnd)) |app| {
-                _ = c.ReleaseCapture();
-
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
-
-                const x_button: u16 = @truncate(wParam >> 16);
-                const button: [*:0]const u8 = if (x_button == 1) "x1" else "x2";
-
-                app.mouse_button_held = 0;
-
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "release",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1,
-                    @max(0, row),
-                    @max(0, col),
-                );
-
-                // WM_XBUTTONUP requires returning TRUE
-                return 1;
+                // Pinned to the grid the press chose, at that layer's CURRENT
+                // origin: re-resolving here would move the release into another
+                // window the moment the pointer left the float, and Neovim
+                // would place the selection's end there. A press the chrome
+                // swallowed gets no release.
+                const up_target = input.rebaseMainWindowTarget(app, rel.press_grid, @as(i32, x_up), @as(i32, y_up));
+                input.releaseEditorButton(app, msg, wParam, rel, up_target);
+                return input.mouseButtonResult(msg);
             }
         },
 
         c.WM_NCMOUSEMOVE => {
             // Handle non-client mouse move (e.g., in HTCAPTION area of tabline)
-            if (getApp(hwnd)) |app| {
-                if (app.ext_tabline_enabled and app.tabline_style == .titlebar) {
-                    // Clear tabline hover states when mouse moves into NC area (empty tabline region)
-                    if (app.tabline_state.hovered_tab != null or
-                        app.tabline_state.hovered_close != null or
-                        app.tabline_state.hovered_window_btn != null or
-                        app.tabline_state.hovered_new_tab_btn)
-                    {
-                        app.tabline_state.hovered_tab = null;
-                        app.tabline_state.hovered_close = null;
-                        app.tabline_state.hovered_window_btn = null;
-                        app.tabline_state.hovered_new_tab_btn = false;
-                        // Invalidate tabline region to redraw without hover
-                        var tabline_rect: c.RECT = .{
-                            .left = 0,
-                            .top = 0,
-                            .right = 4096,
-                            .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                        };
-                        _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
-                    }
-                }
-            }
+            // Into the NC area (empty tabline region): the tabs are left.
+            if (getApp(hwnd)) |app| tabline_mod.clearTablineHover(app, hwnd);
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
         },
 
@@ -6221,69 +5811,14 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 const hit_test: u16 = @truncate(@as(usize, @bitCast(lParam)));
                 if (hit_test == c.HTCLIENT) {
-                    // Perform URL hit-test here (WM_SETCURSOR fires before WM_MOUSEMOVE)
-                    var cursor_pt: c.POINT = undefined;
-                    _ = c.GetCursorPos(&cursor_pt);
-                    _ = c.ScreenToClient(hwnd, &cursor_pt);
-                    const mx: i16 = @intCast(cursor_pt.x);
-                    const my: i16 = @intCast(cursor_pt.y);
-
-                    app.mu.lockUncancelable(core.clock.io());
-                    const sc_cell_w = app.cell_w_px;
-                    const sc_row_h = app.rowHeightPx();
-                    app.mu.unlock(core.clock.io());
-
-                    const sc_cx: i32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                        @as(i32, mx) - @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
+                    // WM_SETCURSOR fires before WM_MOUSEMOVE, so the URL test
+                    // runs here.
+                    const p = input.cursorClientPos(hwnd);
+                    const target: ?input.MouseTarget = if (input.pointInMainChrome(app, hwnd, p.x, p.y))
+                        null
                     else
-                        @as(i32, mx);
-                    const sc_cy: i32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                        @as(i32, my) - @as(i32, app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                    else
-                        @as(i32, my);
-
-                    if (sc_cx < 0 or sc_cy < 0) {
-                        app.cursor_is_hand = false;
-                    } else if (app.corep) |corep| {
-                        const global_col: i32 = if (sc_cell_w > 0) @divTrunc(sc_cx, @as(i32, @intCast(sc_cell_w))) else 0;
-                        const global_row: i32 = if (sc_row_h > 0) @divTrunc(sc_cy, @as(i32, @intCast(sc_row_h))) else 0;
-
-                        // Hit-test visible grids to find the correct grid and local coordinates
-                        const vg = app.getVisibleGridsCached(corep);
-                        var best_grid_id: i64 = 1;
-                        var local_row: i32 = global_row;
-                        var local_col: i32 = global_col;
-                        var best_zindex: i64 = -1;
-                        for (vg) |g| {
-                            if (global_row >= g.start_row and global_row < g.start_row + g.rows and
-                                global_col >= g.start_col and global_col < g.start_col + g.cols and
-                                g.zindex > best_zindex)
-                            {
-                                best_zindex = g.zindex;
-                                best_grid_id = g.grid_id;
-                                local_row = global_row - g.start_row;
-                                local_col = global_col - g.start_col;
-                            }
-                        }
-
-                        const result = core.zonvie_core_try_cell_has_url(corep, best_grid_id, local_row, local_col);
-                        if (result >= 0) {
-                            app.cursor_is_hand = (result == 1);
-                            app.url_cache_grid = best_grid_id;
-                            app.url_cache_row = local_row;
-                            app.url_cache_col = local_col;
-                        } else {
-                            // Lock unavailable: use cached value only for same cell, else reset
-                            if (app.url_cache_grid != best_grid_id or app.url_cache_row != local_row or app.url_cache_col != local_col) {
-                                app.cursor_is_hand = false;
-                            }
-                        }
-                    }
-
-                    if (app.cursor_is_hand) {
-                        _ = c.SetCursor(loadSystemCursor(32649)); // IDC_HAND
-                        return 1;
-                    }
+                        input.resolveMainWindowTarget(app, p.x, p.y);
+                    if (input.showUrlCursor(app, target)) return 1;
                 }
             }
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -6292,33 +5827,24 @@ pub export fn WndProc(
         c.WM_MOUSEMOVE => {
             if (getApp(hwnd)) |app| {
                 // Extract position from lParam
-                const x: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)))));
-                const y: i16 = @bitCast(@as(u16, @truncate(@as(usize, @bitCast(lParam)) >> 16)));
+                const pos = input.mousePosFromLParam(lParam);
+                const x = pos.x;
+                const y = pos.y;
 
-                // Handle tabline/sidebar drag or hover (when ext_tabline enabled)
+                // Handle tabline/sidebar drag or hover (when ext_tabline enabled).
+                // An editor or scrollbar-knob drag keeps going over the chrome,
+                // as its release does (press_reached_editor, and the scrollbar
+                // release ahead of the chrome branches): the chrome neither
+                // consumes the move nor lights a hover under it.
+                const editor_drag = app.surf.scrollbar.dragging or
+                    (app.mouse_button_held != 0 and app.mouse_press_grid_id != 0);
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
-                        if (app.tabline_state.dragging_tab != null or y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                        if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
                             tabline_mod.handleTablineMouseMoveInChild(app, hwnd, @as(c_int, x), @as(c_int, y));
                             if (app.tabline_state.dragging_tab != null) return 0;
                         } else {
-                            if (app.tabline_state.hovered_tab != null or
-                                app.tabline_state.hovered_close != null or
-                                app.tabline_state.hovered_window_btn != null or
-                                app.tabline_state.hovered_new_tab_btn)
-                            {
-                                app.tabline_state.hovered_tab = null;
-                                app.tabline_state.hovered_close = null;
-                                app.tabline_state.hovered_window_btn = null;
-                                app.tabline_state.hovered_new_tab_btn = false;
-                                var tabline_rect: c.RECT = .{
-                                    .left = 0,
-                                    .top = 0,
-                                    .right = 4096,
-                                    .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                                };
-                                _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
-                            }
+                            tabline_mod.clearTablineHover(app, hwnd);
                         }
                     } else if (app.tabline_style == .sidebar) {
                         var client_rect_sb3: c.RECT = undefined;
@@ -6329,7 +5855,14 @@ pub export fn WndProc(
                         else
                             x < @as(i16, @intCast(sb_w3));
 
-                        if (app.tabline_state.dragging_tab != null or in_sb3) {
+                        // A pressed close/new-tab button keeps getting moves
+                        // wherever the pointer goes: its "left the button,
+                        // cancel" check lives there, and the release fires
+                        // the button unconditionally. Gated on the sidebar,
+                        // a press dragged into the editor still ran tabnew.
+                        const sidebar_button_pressed = app.tabline_state.close_button_pressed != null or
+                            app.tabline_state.new_tab_button_pressed;
+                        if (app.tabline_state.dragging_tab != null or sidebar_button_pressed or (!editor_drag and in_sb3)) {
                             tabline_mod.handleSidebarMouseMove(app, hwnd, @as(c_int, x), @as(c_int, y));
                             // Consume event: sidebar area is UI, not Neovim editor input
                             return 0;
@@ -6348,66 +5881,24 @@ pub export fn WndProc(
                 }
 
                 // Handle scrollbar dragging
-                if (app.scrollbar_dragging) {
-                    scrollbar.scrollbarMouseMove(hwnd, app, @as(i32, y));
+                if (app.surf.scrollbar.dragging) {
+                    scrollbar.mouseMove(app, scrollbar.mainSurface(hwnd, app), @as(i32, y));
                     return 0;
                 }
 
-                // Check hover mode scrollbar
-                if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
-                    var client: c.RECT = undefined;
-                    _ = c.GetClientRect(hwnd, &client);
-                    const hit = scrollbar.scrollbarHitTest(app, client.right, client.bottom, @as(i32, x), @as(i32, y));
-                    const in_scrollbar = hit != .none;
-
-                    if (in_scrollbar and !app.scrollbar_hover) {
-                        app.scrollbar_hover = true;
-                        scrollbar.showScrollbar(hwnd, app);
-                    } else if (!in_scrollbar and app.scrollbar_hover) {
-                        app.scrollbar_hover = false;
-                        if (!app.config.scrollbar.isAlways() and !app.config.scrollbar.isScroll()) {
-                            scrollbar.hideScrollbar(hwnd, app);
-                        }
-                    }
+                if (scrollbar.hover(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
+                    // A pointer leaving through the right edge sends no
+                    // further WM_MOUSEMOVE: ask for WM_MOUSELEAVE, as the
+                    // external window does, or the bar stays up.
+                    input.trackMouseLeave(hwnd);
                 }
 
                 // Only send drag events if a button is held
-                if (app.mouse_button_held == 0) return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+                const button = input.heldMouseButtonName(app.mouse_button_held) orelse
+                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 
-                const button: [*:0]const u8 = switch (app.mouse_button_held) {
-                    1 => "left",
-                    2 => "right",
-                    3 => "middle",
-                    4 => "x1",
-                    5 => "x2",
-                    else => return c.DefWindowProcW(hwnd, msg, wParam, lParam),
-                };
-
-                // Get cell dimensions
-                app.mu.lockUncancelable(core.clock.io());
-                const cell_w = app.cell_w_px;
-                const row_h = app.rowHeightPx();
-                app.mu.unlock(core.clock.io());
-
-                // When ext_tabline sidebar is enabled, subtract sidebar width to get content-relative X coordinate
-                // This procedure only ever serves the main window, so the
-                // content offsets always apply.
-                const cell = input.clientPxToCell(app, true, @as(i32, x), @as(i32, y), cell_w, row_h);
-                const col = cell.col;
-                const row = cell.row;
-
-                // Build modifier string
-                const mod_buf = input.buildMouseModifiers(wParam);
-
-                core.zonvie_core_send_mouse_input(
-                    app.corep,
-                    button,
-                    "drag",
-                    @as([*:0]const u8, @ptrCast(&mod_buf)),
-                    1, // grid_id
-                    @max(0, row),
-                    @max(0, col),
-                );
+                const drag_target = input.rebaseMainWindowTarget(app, app.mouse_press_grid_id, @as(i32, x), @as(i32, y));
+                input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
 
                 return 0;
             }
@@ -6422,10 +5913,9 @@ pub export fn WndProc(
 
         c.WM_COPYDATA => {
             // Single-instance file open: a second `zonvie <file>` process found
-            // this running instance and forwarded a pre-built Ex command (e.g.
-            // "tab drop /abs/path"). See main.zig's forwarding path. The payload
-            // is the bare command bytes (no leading ':'); an empty payload means
-            // "just bring me to the front".
+            // this running instance and forwarded its paths (see main.zig). The
+            // server escapes them (zonvie_core_drop_paths), as for a drop; an
+            // empty payload means "just bring me to the front".
             const cds: *const c.COPYDATASTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
             if (cds.dwData != ZONVIE_COPYDATA_MAGIC) {
                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -6436,10 +5926,10 @@ pub export fn WndProc(
                 if (app.hwnd) |main_hwnd| {
                     restoreFromTray(main_hwnd);
                 }
-                if (cds.cbData > 0 and cds.lpData != null) {
+                if (cds.cbData > 1 and cds.lpData != null) {
                     if (app.corep) |corep| {
                         const bytes: [*]const u8 = @ptrCast(cds.lpData.?);
-                        app_mod.zonvie_core_send_command(corep, bytes, @intCast(cds.cbData));
+                        forwardedDropPaths(app, corep, bytes[0..cds.cbData]);
                     }
                 }
             }
@@ -6543,9 +6033,9 @@ pub export fn WndProc(
                     tray.remove();
                 }
                 // Revoke before the HWND dies; OLE holds a reference until then.
-                if (app.main_drop_target) |target| {
+                if (app.surf.drop_target) |target| {
                     drop_target.revoke(hwnd, @ptrCast(@alignCast(target)));
-                    app.main_drop_target = null;
+                    app.surf.drop_target = null;
                 }
             }
             // Nvy style: PostQuitMessage(0). The actual exit code is
@@ -6560,14 +6050,7 @@ pub export fn WndProc(
         // window as active so the backdrop stays blurred after focus is lost
         // (Win11 renders inactive backdrops without the blur). Gated on blur
         // alone so it matches the backdrop application and the external windows.
-        c.WM_NCACTIVATE => {
-            if (getApp(hwnd)) |app| {
-                if (app.config.window.blur) {
-                    return c.DefWindowProcW(hwnd, msg, 1, lParam);
-                }
-            }
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
+        c.WM_NCACTIVATE => return input.ncActivate(getApp(hwnd), hwnd, msg, wParam, lParam),
 
         // Restore the drop shadow / backdrop on activation. Modes:
         //   - blur on  -> acrylic system backdrop (sheet-of-glass frame); DWM
@@ -6600,8 +6083,10 @@ pub export fn WndProc(
                     core.zonvie_core_set_focus(corep, is_activating);
                 }
                 if (!is_activating) {
+                    // The blink timer stops with the app, as on macOS.
+                    input.pauseCursorBlinking(hwnd, app);
                     // App is being deactivated - hide mini and message windows
-                    inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler }) |id| {
+                    inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
                         const idx = @intFromEnum(id);
                         if (app.mini_windows[idx].hwnd) |mini_hwnd| {
                             _ = c.ShowWindow(mini_hwnd, c.SW_HIDE);
@@ -6632,6 +6117,8 @@ pub export fn WndProc(
                         }
                     }
                 } else {
+                    // Re-arm through the gate; a stopped timer restarts there.
+                    _ = c.PostMessageW(hwnd, WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
                     // App is being activated - disable IME if configured
                     if (app.config.input.ime_disable_on_activate) {
                         input.setIMEOff(hwnd);
@@ -6658,8 +6145,13 @@ pub export fn WndProc(
         },
 
         c.WM_MOUSELEAVE => {
-            // Mouse left the client area - clear sidebar hover states
+            // Mouse left the client area - clear tab bar and sidebar hover
+            // states. The tab bar's was cleared only by a later move inside
+            // the window, so leaving fast (or onto a window over it) left the
+            // tab and its close button lit.
             if (getApp(hwnd)) |app| {
+                scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
+                tabline_mod.clearTablineHover(app, hwnd);
                 if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
                     if (app.tabline_state.hovered_tab != null or
                         app.tabline_state.hovered_close != null or
@@ -6688,22 +6180,13 @@ pub export fn WndProc(
         c.WM_CAPTURECHANGED => {
             // Mouse capture lost - cancel any tabline/sidebar drag or button press
             if (getApp(hwnd)) |app| {
-                // Scrollbar drag and track-repeat are both armed on button-down
-                // and cleared only in scrollbarMouseUp. With capture stolen,
-                // WM_LBUTTONUP never arrives here: the repeat timer would keep
-                // issuing page scrolls, and scrollbar_dragging would leave every
-                // later button-up-less WM_MOUSEMOVE scrolling the buffer. The
-                // drag is cancelled rather than committed — its pending line was
-                // never confirmed by a mouse-up.
-                if (app.scrollbar_dragging) {
-                    app.scrollbar_dragging = false;
-                    app.scrollbar_pending_line = -1;
-                }
-                if (app.scrollbar_repeat_timer != 0 or app.scrollbar_repeat_dir != 0) {
-                    _ = c.KillTimer(hwnd, TIMER_SCROLLBAR_REPEAT);
-                    app.scrollbar_repeat_timer = 0;
-                    app.scrollbar_repeat_dir = 0;
-                }
+                // WM_LBUTTONUP never arrives once capture is stolen, and it is
+                // the only place the editor drag ends: a held button left set
+                // here turns every later hover into a drag. ExternalWndProc has
+                // cleared both for the same reason since 5e7e9cb.
+                input.cancelMouseButtons(app);
+                // The scrollbar's drag and track-repeat end the same way.
+                scrollbar.cancelPointer(scrollbar.mainSurface(hwnd, app));
                 if (app.ext_tabline_enabled) {
                     const had_state = app.tabline_state.dragging_tab != null or
                         app.tabline_state.close_button_pressed != null or

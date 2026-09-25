@@ -73,3 +73,54 @@ test "nvim DFLT_GFN Windows default" {
         out,
     );
 }
+
+// ============================================================================
+// config.parseFontCandidateLine: what a frontend loads from one line. The
+// Windows guifont and config paths and every macOS path read lines this way,
+// so a [font] family entry's size and features reach the font loader intact.
+// ============================================================================
+
+test "candidate line: config features reach the loader" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const lines = try fmt(arena.allocator(), "JetBrains Mono:h14:-liga:-calt, Consolas", 12.0, "Consolas");
+    var it = std.mem.splitScalar(u8, lines, '\n');
+    const first = config.parseFontCandidateLine(it.next().?, 12.0, false).?;
+    try std.testing.expectEqualStrings("JetBrains Mono", first.name);
+    try std.testing.expectEqual(@as(f32, 14.0), first.point_size);
+    try std.testing.expectEqualStrings("-liga,-calt", first.features);
+    // A bare entry inherits [font] size and carries no features.
+    const second = config.parseFontCandidateLine(it.next().?, 12.0, false).?;
+    try std.testing.expectEqualStrings("Consolas", second.name);
+    try std.testing.expectEqual(@as(f32, 12.0), second.point_size);
+    try std.testing.expectEqualStrings("", second.features);
+}
+
+test "candidate line: explicit [font] size wins over the line's" {
+    const c = config.parseFontCandidateLine("Cascadia Code\t14\t+ss01", 18.0, true).?;
+    try std.testing.expectEqual(@as(f32, 18.0), c.point_size);
+    try std.testing.expectEqualStrings("+ss01", c.features);
+}
+
+test "candidate line: a zero or unreadable size falls back to the default" {
+    try std.testing.expectEqual(@as(f32, 13.0), config.parseFontCandidateLine("Menlo\t0", 13.0, false).?.point_size);
+    try std.testing.expectEqual(@as(f32, 13.0), config.parseFontCandidateLine("Menlo\tbig", 13.0, false).?.point_size);
+}
+
+test "candidate line: no name or no size field is not a candidate" {
+    try std.testing.expect(config.parseFontCandidateLine("\t14", 13.0, false) == null);
+    try std.testing.expect(config.parseFontCandidateLine("Menlo", 13.0, false) == null);
+    try std.testing.expect(config.parseFontCandidateLine("", 13.0, false) == null);
+}
+
+test "candidate line: the C ABI reads it the same way" {
+    const line = "JetBrains Mono\t15\t-liga,-calt";
+    var name_len: usize = 0;
+    var pt: f32 = 0;
+    var feat_off: usize = 0;
+    var feat_len: usize = 0;
+    try std.testing.expect(zonvie_core.zonvie_core_parse_font_candidate(line.ptr, line.len, 12.0, false, &name_len, &pt, &feat_off, &feat_len));
+    try std.testing.expectEqualStrings("JetBrains Mono", line[0..name_len]);
+    try std.testing.expectEqual(@as(f32, 15.0), pt);
+    try std.testing.expectEqualStrings("-liga,-calt", line[feat_off..][0..feat_len]);
+}

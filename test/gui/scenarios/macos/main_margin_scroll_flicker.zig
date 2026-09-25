@@ -59,15 +59,27 @@ fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !Margin
     const margin_top = app_log.field(line, "marginTop") orelse return error.ScrollOffsetUnparsable;
     if (margin_top < 1) return error.NoMarginRow;
     if (vp_h <= 0) return error.ScrollOffsetUnparsable;
-    const chrome = @as(f64, @floatFromInt(capture_h)) - vp_h;
+    // Chrome must come from the REAL drawable height, not vpH: vpH is the
+    // grid-snapped height (rows * cellH) the NDC space is built on, while
+    // the drawable keeps the window's sub-cell remainder. Subtracting vpH
+    // put every band low by that remainder, and the first content pixel
+    // rows then landed inside the top band, where legitimate scrolling read
+    // as a margin row moving. The window is whatever frame the app restored
+    // from the last session, so whether the remainder is zero changes from
+    // run to run — which is what made this look flaky. Same correction the
+    // float scenario carries.
+    const dline = (try app_log.lastLineSince(alloc, log_path, "[perf] copy_opportunity", since_ms)) orelse
+        return error.NoDrawDebugLogged;
+    defer alloc.free(dline);
+    const drawable_h = app_log.field(dline, "drawable_h_px") orelse return error.DrawDebugUnparsable;
+    const chrome = @as(f64, @floatFromInt(capture_h)) - drawable_h;
     if (chrome < 0) return error.CaptureSmallerThanDrawable;
-    const grid_top_px = chrome + (1.0 - grid_top) / 2.0 * vp_h;
-    const content_top_px = chrome + (1.0 - top) / 2.0 * vp_h;
-    const content_bot_px = chrome + (1.0 - bot) / 2.0 * vp_h;
+    // Round, don't truncate: the logged NDC values carry float fuzz, and
+    // truncation pulls a boundary one pixel into the content side.
     return .{
-        .start = @intFromFloat(grid_top_px),
-        .end = @intFromFloat(content_top_px),
-        .bottom_start = @intFromFloat(content_bot_px),
+        .start = @intFromFloat(@round(chrome + (1.0 - grid_top) / 2.0 * vp_h)),
+        .end = @intFromFloat(@round(chrome + (1.0 - top) / 2.0 * vp_h)),
+        .bottom_start = @intFromFloat(@round(chrome + (1.0 - bot) / 2.0 * vp_h)),
         .drawable_end = capture_h,
     };
 }

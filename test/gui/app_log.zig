@@ -24,7 +24,7 @@ const max_log_bytes = 256 * 1024 * 1024;
 
 /// Parse the app clock (in milliseconds) out of one log line.
 /// Lines look like `[zonvie] [ 1234.567ms] rest…`; anything else -> null.
-fn lineTimestampMs(line: []const u8) ?f64 {
+pub fn lineTimestampMs(line: []const u8) ?f64 {
     const prefix = "[zonvie] [";
     if (!std.mem.startsWith(u8, line, prefix)) return null;
     const rest = line[prefix.len..];
@@ -139,6 +139,24 @@ pub fn lastLineSince(alloc: std.mem.Allocator, path: []const u8, marker: []const
     }
     const line = found orelse return null;
     return try alloc.dupe(u8, line);
+}
+
+/// How many lines containing `marker` are stamped at or after `since_ms`.
+/// Used to assert that a code path ran a given number of times, where the
+/// screen alone cannot distinguish it from a slower path with the same result.
+pub fn countLinesSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, since_ms: f64) !usize {
+    const data = try std.Io.Dir.cwd().readFileAlloc(gui_io.io(), path, alloc, .limited(max_log_bytes));
+    defer alloc.free(data);
+
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        if (std.mem.indexOf(u8, line, marker) == null) continue;
+        const ts = lineTimestampMs(line) orelse continue;
+        if (ts < since_ms) continue;
+        n += 1;
+    }
+    return n;
 }
 
 /// Parse `<name>=<float>` out of a log line. Null when absent or malformed,

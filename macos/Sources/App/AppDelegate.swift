@@ -39,16 +39,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             forName: ZonvieCore.neovimReadyNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
             ZonvieCore.appLog("zonvie: received neovimReadyNotification")
-            // Show window if it was hidden (SSH/devcontainer mode)
-            if let win = self?.window, !win.isVisible {
+            // Show the window of the session that became ready if it was hidden
+            // (SSH/devcontainer mode). `window` is whichever session was key
+            // last, which a New Session opened meanwhile has taken over.
+            let sender = notification.object as? ZonvieCore
+            let readyWindow = SessionManager.shared.sessions
+                .first { sender != nil && $0.viewController?.core === sender }?.window ?? self?.window
+            if let win = readyWindow, !win.isVisible {
                 win.makeKeyAndOrderFront(nil)
                 NSApp.activate(ignoringOtherApps: true)
                 ZonvieCore.appLog("zonvie: window shown after auth")
             }
             self?.processPendingFiles()
         }
+
+        keyWindowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] notification in self?.sessionWindowDidBecomeKey(notification) }
 
         NSApp.setActivationPolicy(.regular)
 
@@ -122,10 +131,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var deferredTabMenu: NSMenu?
 
     private func finalizeTabMenuSetup() {
-        guard let vc = window?.contentViewController as? ViewController else { return }
+        guard window?.contentViewController is ViewController else { return }
 
         guard let tabMenu = deferredTabMenu else { return }
-        tabMenuManager = TabMenuManager(menu: tabMenu, viewController: vc)
+        tabMenuManager = TabMenuManager(menu: tabMenu) { [weak self] in
+            self?.window?.contentViewController as? ViewController
+        }
         deferredTabMenu = nil
     }
 
@@ -223,12 +234,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vc.forceConnectDialog = forceDialog
         win.contentViewController = vc
 
-        // Persist/restore window geometry (AppKit feature).
-        win.setFrameAutosaveName(windowFrameAutosaveName)
-
-        // If there is a saved frame from the last session, use it.
-        // Otherwise keep the computed default rect (centered 800x600-ish).
-        if !win.setFrameUsingName(windowFrameAutosaveName) {
+        // Persist/restore window geometry (AppKit feature). One window at a
+        // time can hold the name: a second session opened on top of the first
+        // and its frame was never saved. It cascades from the key session.
+        if win.setFrameAutosaveName(windowFrameAutosaveName) {
+            // If there is a saved frame from the last session, use it.
+            // Otherwise keep the computed default rect (centered 800x600-ish).
+            if !win.setFrameUsingName(windowFrameAutosaveName) {
+                win.center()
+            }
+        } else if let previous = window {
+            win.setFrame(previous.frame, display: false)
+            // From the zero point the window stays put and the next cascade
+            // position comes back.
+            win.setFrameTopLeftPoint(win.cascadeTopLeft(from: .zero))
+        } else {
             win.center()
         }
 
@@ -260,7 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Apply blur using private API if blur is enabled
         if config.blurEnabled {
             applyWindowBlur(window: win, radius: config.window.blurRadius)
-            // Shadow invalidation is now handled in MetalTerminalRenderer after first present
+            // Shadow invalidation is now handled in GridSurfaceRenderer after first present
         }
 
         return win
@@ -312,23 +332,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard let win = notification.object as? NSWindow else { return }
         SessionManager.shared.unregister(window: win)
+        // A closed session must not stay the one menus, activation and file
+        // opens act on.
+        if window === win { window = nil }
+        if focusedSessionWindow === win { focusedSessionWindow = nil }
     }
 
-    func windowDidBecomeKey(_ notification: Notification) {
+    /// The session window whose nvim was last told FocusGained. Tracked apart
+    /// from `window`, which a new session sets before it becomes key.
+    private weak var focusedSessionWindow: NSWindow?
+
+    /// Every key change, not only the session windows this delegates for: an
+    /// external window becoming key moves focus to its session too.
+    private var keyWindowObserver: Any?
+
+    private func sessionWindowDidBecomeKey(_ notification: Notification) {
         // Track the frontmost session window so single-window-oriented code
         // (and the menu bar's active marking) follows focus across sessions.
-        if let win = notification.object as? NSWindow, win.contentViewController is ViewController {
+        if let key = notification.object as? NSWindow,
+           let win = SessionManager.shared.noteKeyWindow(key)?.window {
             self.window = win
+            // App activation reports focus to the key session only, so a
+            // switch between sessions has to hand it over itself: without
+            // this neither nvim saw FocusLost/FocusGained (no checktime).
+            if focusedSessionWindow !== win, NSApp.isActive {
+                (focusedSessionWindow?.contentViewController as? ViewController)?.core?.setFocus(false)
+                (win.contentViewController as? ViewController)?.core?.setFocus(true)
+                focusedSessionWindow = win
+            }
+            tabMenuManager?.activeSessionChanged()
         }
     }
 
     func windowDidMiniaturize(_ notification: Notification) {
-        // Stop the msg throttle timer while in the Dock: a timer that fires here
-        // would query the Zig core's grid state, which must not happen while the
-        // window is minimized.
+        // Re-evaluate the msg throttle timer: it stops once every window of
+        // the session is in the Dock, and keeps running for messages shown in
+        // an external window that is still up.
         let win = notification.object as? NSWindow ?? window
         if let vc = win?.contentViewController as? ViewController {
-            vc.core?.terminalView?.cancelMsgTimer()
+            vc.core?.scheduleMsgTimer()
         }
     }
 
@@ -340,7 +382,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             // Re-arm the msg throttle timer explicitly rather than relying on a
             // flush to do it: a pending auto-hide deadline armed before minimize
             // must resume firing on restore.
-            vc.core?.terminalView?.scheduleMsgTimer()
+            vc.core?.scheduleMsgTimer()
         }
     }
 
@@ -355,8 +397,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(true)
+            focusedSessionWindow = window
             // Resume cursor blinking now that we are frontmost.
             vc.core?.resetCursorBlink()
+        }
+        // Every visible session blinks while the app is frontmost, as every
+        // session's timer is stopped when it is not.
+        for session in SessionManager.shared.sessions where session.window !== window {
+            session.viewController?.core?.refreshCursorBlinkGate()
         }
         setCmdlineWindowActiveForAllSessions(true)
     }
@@ -373,11 +421,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationWillResignActive(_ notification: Notification) {
+        focusedSessionWindow = nil
         if let vc = window?.contentViewController as? ViewController {
             vc.core?.setFocus(false)
-            // Stop the recursive blink timer while in the background so it does
-            // not wake the CPU to redraw a window the user isn't looking at.
-            vc.core?.stopCursorBlinking()
+        }
+        // Stop every session's recursive blink timer while in the background
+        // so none wakes the CPU to redraw a window the user isn't looking at;
+        // stopping only the key session's left the others blinking.
+        for session in SessionManager.shared.sessions {
+            session.viewController?.core?.stopCursorBlinking()
         }
         setCmdlineWindowActiveForAllSessions(false)
     }
@@ -385,16 +437,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowDidChangeOcclusionState(_ notification: Notification) {
         let win = notification.object as? NSWindow ?? window
         guard let vc = win?.contentViewController as? ViewController else { return }
-        // Pause blinking when the window is fully occluded; resume only when it
-        // is visible and the app is frontmost (focus gating handled separately).
-        if win?.occlusionState.contains(.visible) == true && NSApp.isActive {
-            vc.core?.resetCursorBlink()
-        } else {
-            vc.core?.stopCursorBlinking()
-        }
+        // Pause blinking when the window showing the cursor is occluded; the
+        // core's gate decides, since the cursor may be in an external window
+        // this one's occlusion says nothing about.
+        vc.core?.refreshCursorBlinkGate()
 
         // Repaint on the way back, for the same reason windowDidDeminiaturize
-        // does: MetalTerminalRenderer.draw skips every frame while the window
+        // does: GridSurfaceRenderer.draw skips every frame while the window
         // is invisible (currentDrawable blocks the main thread there), and it
         // still clears redrawPending on the way out. A redraw that arrived
         // while covered is therefore dropped, and with an idle Neovim behind
@@ -466,15 +515,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // tab via `:tab drop`). Multiple files always open as new tabs. Using
         // `:drop`/`:tab drop` (rather than `:edit`/`:tabe`) jumps to a window
         // already showing the file instead of opening a duplicate.
+        // Through the core, not typed keys: `<Esc>:` typed into a terminal
+        // buffer went to the job, and a remapped `:` broke it.
         let useCurrent = pendingFilesToOpen.count == 1
             && ZonvieConfig.shared.server.openMode == "current"
-        let cmd = useCurrent ? "drop" : "tab drop"
-        for filename in pendingFilesToOpen {
-            let escapedPath = escapePathForNeovim(filename)
-            let input = "\u{1b}:\(cmd) \(escapedPath)\r"
-            core.sendInput(input)
-            ZonvieCore.appLog("zonvie: sent :\(cmd) \(escapedPath)")
-        }
+        core.dropPaths(pendingFilesToOpen, tabPerFile: !useCurrent)
 
         pendingFilesToOpen = []
 
