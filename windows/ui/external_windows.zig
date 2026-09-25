@@ -1463,10 +1463,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         break :blk null;
     } else null;
     const main_hwnd = app.hwnd;
-    const main_y_offset: c_int = if (anchor_hwnd == null and app.ext_tabline_enabled and app.content_hwnd == null)
-        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
-    else
-        0;
+    // Relative to the main window, cells start at its surface origin, as on
+    // creation; an anchor external window has none.
+    const surface_origin = input.surfaceOriginPx(app, anchor_hwnd == null);
     app.mu.unlock(core.clock.io());
     const hwnd = target_hwnd orelse return false;
 
@@ -1478,8 +1477,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         if (origin_hwnd) |origin| {
             var client_origin: c.POINT = .{ .x = 0, .y = 0 };
             if (c.ClientToScreen(origin, &client_origin) != 0) {
-                x = client_origin.x + @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
-                const anchor_y = client_origin.y + main_y_offset + @as(c_int, @intCast(req.start_row)) * @as(c_int, @intCast(cell_h));
+                const anchor_x = client_origin.x + surface_origin.x + @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w));
+                const anchor_y = client_origin.y + surface_origin.y + @as(c_int, @intCast(req.start_row)) * @as(c_int, @intCast(cell_h));
+                x = if (is_popupmenu) popupmenuPositionX(anchor_x, window_w, origin) else anchor_x;
                 y = if (is_popupmenu) popupmenuPositionY(anchor_y, @intCast(cell_h), window_h, origin) else anchor_y;
             } else {
                 flags |= c.SWP_NOMOVE;
@@ -1806,6 +1806,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             app.config.window.blur,
             device,
             device_ctx,
+            false,
         ) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
             break :blk null;
@@ -1914,6 +1915,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         .renderer = renderer,
         .surface = .{ .rows = req.rows, .cols = req.cols },
         .is_float_external = is_float,
+        // WM_DPICHANGED only reports a later move; the scrollbar strip and
+        // resize insets read this from the first resize on.
+        .dpi_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd.?))) / 96.0,
     };
     if (!window_mod.installWindowWakeCookie(hwnd.?, ext_window_ptr.window_wake_cookie)) {
         app.mu.unlock(core.clock.io());
@@ -3647,7 +3651,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         current_atlas_reset_generation = a.atlas_reset_generation;
         a.mu.unlock(core.clock.io());
     }
-    const need_full_atlas_upload = ext_win.atlas_upload.needsFull(current_atlas_reset_generation);
 
     // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
 
@@ -3672,30 +3675,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (gpu_ptr) |g| {
         g.lockContext();
         defer g.unlockContext();
-
-        // Resize this external window's own D3D atlas texture to match the
-        // shared/configured atlas_size (mirrors the main window's WM_PAINT
-        // handling at window.zig:1320-1336). Without this, external windows'
-        // GPU atlas textures stay frozen at the d3d11.Renderer default
-        // (2048x2048) forever, causing silently-dropped UpdateSubresource
-        // uploads or wrong-denominator UVs whenever atlas_size != 2048.
-        // recreateAtlasTextureIfNeeded no-ops cheaply when size is unchanged
-        // (see d3d11_renderer.zig:4103), so this is safe to call every paint.
-        if (atlas_ptr) |a| {
-            var cur_atlas_w: u32 = 0;
-            var cur_atlas_h: u32 = 0;
-            {
-                a.mu.lockUncancelable(core.clock.io());
-                defer a.mu.unlock(core.clock.io());
-                cur_atlas_w = a.atlas_w;
-                cur_atlas_h = a.atlas_h;
-            }
-            g.recreateAtlasTextureIfNeeded(cur_atlas_w, cur_atlas_h) catch |e| {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: D3D atlas texture recreation failed: {any}\n", .{e});
-                requeueExternalFullPaint(app, grid_id, hwnd);
-                return;
-            };
-        }
 
         // Perform deferred renderer resize (outside app.mu lock to avoid deadlock)
         // WARNING: D3D/DXGI operations can pump Win32 messages internally.
@@ -3735,34 +3714,18 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
         if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow drawing vert_count={d}\n", .{vert_count});
 
-        // Upload atlas to external window's D3D context.
-        // Uses since-based cursor so each window independently tracks its
-        // position in the append-only pending_uploads queue.
+        // The shared atlas texture (the main renderer's), brought up to
+        // date and borrowed. Refused -- a failed upload, or a renderer still
+        // on a device recovery has replaced -- it is not drawn against.
         var ext_atlas_uploaded = false;
         if (atlas_ptr) |a| {
-            if (need_full_atlas_upload) {
-                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow uploading full atlas\n", .{});
-            }
-            const upload = app_mod.flushAtlasUploads(a, g, ext_win.atlas_upload_cursor, need_full_atlas_upload);
-            if (upload.success) {
-                if (upload.cursor != ext_win.atlas_upload_cursor) ext_atlas_uploaded = true;
-                ext_win.atlas_upload_cursor = upload.cursor;
-                if (need_full_atlas_upload) {
-                    ext_win.atlas_upload.fullUploaded(current_atlas_reset_generation);
-                }
-            } else {
-                // A full PAINT is not a full UPLOAD. flushAtlasUploads refuses
-                // a cursor below `pending_upload_base_seq`, and
-                // `snapshotAtlasPixels` advances that without bumping
-                // `atlas_reset_generation` — the only thing that makes this
-                // window ask for a full upload. Without forcing one here the
-                // next paint retried the identical incremental upload and this
-                // window stopped updating its pixels for good. The main driver
-                // promotes the same failure the same way.
-                ext_win.atlas_upload.forceFull();
+            const sync = app_mod.syncSharedAtlas(app, a, g, current_atlas_reset_generation, &ext_win.atlas_seen_upload_seq);
+            if (!sync.ok) {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: shared atlas sync failed\n", .{});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             }
+            ext_atlas_uploaded = sync.uploaded;
         }
 
         // Set clear color from cached highlight group bg colors (no grid_mu acquisition).

@@ -442,7 +442,9 @@ pub const Renderer = struct {
     }
 
     /// Initialize with a pre-created D3D11 device (from createDeviceOnly).
-    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext) !Renderer {
+    /// `create_atlas`: only the main renderer owns a glyph atlas texture; an
+    /// external one borrows it (borrowAtlas) on every paint.
+    pub fn initWithDevice(alloc: std.mem.Allocator, hwnd: c.HWND, opacity: f32, blur: bool, device: *c.ID3D11Device, device_ctx: *c.ID3D11DeviceContext, create_atlas: bool) !Renderer {
         // Take our own COM reference on the App-owned device/context so this
         // renderer's deinit() can Release() without over-releasing the App's
         // reference. App creates this device via createDeviceOnly() and
@@ -496,10 +498,12 @@ pub const Renderer = struct {
         _ = c.QueryPerformanceCounter(&t1);
         dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
-        _ = c.QueryPerformanceCounter(&t0);
-        try self.createAtlasTexture(self.atlas_w, self.atlas_h);
-        _ = c.QueryPerformanceCounter(&t1);
-        dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        if (create_atlas) {
+            _ = c.QueryPerformanceCounter(&t0);
+            try self.createAtlasTexture(self.atlas_w, self.atlas_h);
+            _ = c.QueryPerformanceCounter(&t1);
+            dbgLog("[d3d] [TIMING] createAtlasTexture: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
 
         return self;
     }
@@ -4332,6 +4336,30 @@ pub const Renderer = struct {
         const built = try self.buildAtlasTexture(w, h);
         self.atlas_tex = built.tex;
         self.atlas_srv = built.srv;
+    }
+
+    /// Sample `owner`'s atlas texture: one texture for every window on the
+    /// device, uploaded once. Held with this renderer's own reference, so an
+    /// owner that recreates it cannot free what this renderer binds (a
+    /// present between paints included). False, holding nothing, when the
+    /// devices differ -- device-lost recovery rebuilds the owner first.
+    pub fn borrowAtlas(self: *Renderer, owner: *const Renderer) bool {
+        if (self.device != owner.device or owner.atlas_tex == null or owner.atlas_srv == null) {
+            safeRelease(&self.atlas_srv);
+            safeRelease(&self.atlas_tex);
+            return false;
+        }
+        if (self.atlas_tex != owner.atlas_tex) {
+            safeRelease(&self.atlas_srv);
+            safeRelease(&self.atlas_tex);
+            addRef(owner.atlas_tex.?);
+            addRef(owner.atlas_srv.?);
+            self.atlas_tex = owner.atlas_tex;
+            self.atlas_srv = owner.atlas_srv;
+        }
+        self.atlas_w = owner.atlas_w;
+        self.atlas_h = owner.atlas_h;
+        return true;
     }
 
     /// Recreate atlas texture if dimensions changed. No-op for same-size resets.

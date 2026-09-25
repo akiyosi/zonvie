@@ -307,30 +307,20 @@ final class ViewController: NSViewController {
         // tab-based ViewController swapping, or view detachment, a new
         // explicit stop point (e.g. windowWillClose or a dedicated cleanup
         // method) must be added for the detached ViewController's core.
+        //
+        // Observers stay registered: this also runs on minimize, and the
+        // tabline and agent notifications are sent only on change, so one
+        // posted while minimized was lost for good.
+    }
 
-        // Remove notification observers and nil tokens so viewDidAppear can re-register
-        if let observer = tablineUpdateObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineUpdateObserver = nil
-        }
-        if let observer = tablineHideObserver {
-            NotificationCenter.default.removeObserver(observer)
-            tablineHideObserver = nil
-        }
-        // Registered with the other two and re-registered with them, so it
-        // is removed with them too; it used to stack one per restore.
-        if let observer = agentStatusObserver {
-            NotificationCenter.default.removeObserver(observer)
-            agentStatusObserver = nil
+    deinit {
+        for observer in [tablineUpdateObserver, tablineHideObserver, agentStatusObserver] {
+            if let observer { NotificationCenter.default.removeObserver(observer) }
         }
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // Re-register observers that were removed in viewWillDisappear (e.g., after minimize/restore)
-        if tablineUpdateObserver == nil && ZonvieConfig.shared.effectiveTablineStyle != nil {
-            setupTablineNotificationObservers()
-        }
         // Present the `--dialog` dialog once, after the window exists so it can
         // host the sheet.
         if pendingConnectDialog && !connectDialogShown {

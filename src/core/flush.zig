@@ -940,11 +940,6 @@ pub const FlushCache = struct {
         self.perf_glyph_nonascii_hits = 0;
         self.perf_glyph_nonascii_misses = 0;
     }
-
-    pub fn reset(self: *FlushCache) void {
-        @memset(self.hl_valid_buf, false);
-        self.resetCounters();
-    }
 };
 
 // ---------------------------------------------------------------
@@ -2962,7 +2957,6 @@ pub const FlushCtx = struct {
         // Before the dirty snapshot, so an aborted attempt still owes them.
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
         const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
-        const last_sent_cursor_rev_before = ctx.core.last_sent_cursor_rev;
         // Remember what this attempt is about to consume. A frontend that
         // later refuses to publish owes exactly this much on the retry, not a
         // full-viewport resend (see the abort branch below).
@@ -3174,7 +3168,6 @@ pub const FlushCtx = struct {
                         ctx.core.grid.markEverySurfaceDirty();
                     }
                     ctx.core.last_sent_content_rev = last_sent_content_rev_before;
-                    ctx.core.last_sent_cursor_rev = last_sent_cursor_rev_before;
                     ctx.core.force_ext_cursor_recheck = true;
                     // notifySurfaceLayouts runs before on_flush_end, so a late
                     // abort cancels the transaction that carried the layout
@@ -3210,6 +3203,7 @@ pub const FlushCtx = struct {
 
         // Ensure on_flush_end is called on all exit paths (atomic commit point)
         defer {
+            ctx.core.hl_valid_cleared_in_flush = false;
             if (ctx.core.cb.on_flush_end) |cb| {
                 const t_cb_end: i128 = if (perf_enabled) clock.nowNs() else 0;
                 cb(ctx.core.ctx);
@@ -3422,8 +3416,6 @@ pub const FlushCtx = struct {
                 ctx.core.grid.content_rev != ctx.core.last_sent_content_rev or
                 ctx.core.grid.main_buf.dirty_all or
                 ctx.core.grid.main_buf.surface_vertex_count != 0;
-            const need_cursor =
-                ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev or need_main;
 
             if (ctx.core.cb.on_vertices_row) |row_cb| {
                 if (need_main) {
@@ -3439,8 +3431,7 @@ pub const FlushCtx = struct {
                         cols,
                     );
                     if (ctx.core.flush_aborted) return;
-                }
-                if (need_cursor) {
+                    // A grid with no cells draws no cursor.
                     row_cb(
                         ctx.core.ctx,
                         1,
@@ -3453,113 +3444,30 @@ pub const FlushCtx = struct {
                         cols,
                     );
                     if (ctx.core.flush_aborted) return;
-                }
-                if (need_main) {
                     ctx.core.invalidateMirroredFrameState();
                     ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     ctx.core.grid.clearDirty();
-                }
-                if (need_cursor) {
-                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
                 }
             }
             return;
         }
 
-        var cursor_out: c_api.Cursor = .{
-            .enabled = 0,
-            .row = 0,
-            .col = 0,
-            .shape = .block,
-            .cell_percentage = 100,
-            .fgRGB = 0,
-            .bgRGB = 0,
-            .blink_wait_ms = 0,
-            .blink_on_ms = 0,
-            .blink_off_ms = 0,
-        };
-
-        // Cursor row/col are relative to cursor_grid; win_pos converts them to
-        // grid 1 coordinates.
-        if (ctx.core.grid.cursor_valid and ctx.core.grid.cursor_visible) {
-            var cr: i64 = @as(i64, ctx.core.grid.cursor_row);
-            var cc: i64 = @as(i64, ctx.core.grid.cursor_col);
-
-            if (ctx.core.grid.cursor_grid != 1) {
-                if (ctx.core.grid.win_pos.get(ctx.core.grid.cursor_grid)) |p| {
-                    cr += @as(i64, p.row);
-                    cc += @as(i64, p.col);
-                } else {
-                    cr = -1;
-                    cc = -1;
-                }
-            }
-
-            if (cr >= 0 and cc >= 0 and cr < @as(i64, rows) and cc < @as(i64, cols)) {
-                const row: u32 = @intCast(cr);
-                const col: u32 = @intCast(cc);
-
-                cursor_out.enabled = 1;
-                cursor_out.row = row;
-                cursor_out.col = col;
-                cursor_out.shape = switch (ctx.core.grid.cursor_shape) {
-                    .block => .block,
-                    .vertical => .vertical,
-                    .horizontal => .horizontal,
-                };
-                cursor_out.cell_percentage = ctx.core.grid.cursor_cell_percentage;
-
-                cursor_out.blink_wait_ms = ctx.core.grid.cursor_blink_wait_ms;
-                cursor_out.blink_on_ms = ctx.core.grid.cursor_blink_on_ms;
-                cursor_out.blink_off_ms = ctx.core.grid.cursor_blink_off_ms;
-
-                if (ctx.core.grid.cursor_attr_id != 0) {
-                    const attr = ctx.core.hl.get(ctx.core.grid.cursor_attr_id);
-                    cursor_out.fgRGB = attr.fg;
-                    cursor_out.bgRGB = attr.bg;
-                } else {
-                    // attr_id == 0: swap default colors (per Nvim spec)
-                    cursor_out.fgRGB = ctx.core.hl.default_bg;
-                    cursor_out.bgRGB = ctx.core.hl.default_fg;
-                }
-
-                if (ctx.core.log.cb != null) {
-                    ctx.core.log.write("cursor_out: shape={d} cell_pct={d} blink=({d},{d},{d}) row={d} col={d}\n", .{
-                        @intFromEnum(cursor_out.shape),
-                        cursor_out.cell_percentage,
-                        cursor_out.blink_wait_ms,
-                        cursor_out.blink_on_ms,
-                        cursor_out.blink_off_ms,
-                        cursor_out.row,
-                        cursor_out.col,
-                    });
-                }
-            }
-        }
-
         if (ctx.core.cb.on_vertices_row != null) {
 
-            // dirty_all must force a rebuild even when content_rev is already
-            // synced: the atlas-reset/glyph-miss recovery paths call
-            // markAllDirty() AFTER last_sent_content_rev was synced for this
-            // flush. Without this OR, the early return below would clearDirty()
-            // the pending recovery and the screen would stay stale.
-            const need_main: bool = (ctx.core.grid.content_rev != ctx.core.last_sent_content_rev) or ctx.core.grid.main_buf.dirty_all;
-            const need_cursor: bool = (ctx.core.grid.cursor_rev != ctx.core.last_sent_cursor_rev);
-            var cursor_retry_required = false;
+            // Grid 1 owes rows exactly when a row is dirty, the rule every
+            // other grid's pass uses (sg.dirty). content_rev was the gate here,
+            // and it also advanced for edits it owed nothing for -- a line in
+            // any main-surface split -- so each ran this pass over no rows.
+            // Grid 1's cursor is not this pass's: sendExternalGridVertices
+            // emits every grid's, grid 1's included, by one rule.
+            const need_main: bool = ctx.core.grid.main_buf.anyDirty();
 
             // If nothing changed, avoid doing any work.
-            if (!need_main and !need_cursor) {
+            if (!need_main) {
                 ctx.core.grid.clearDirty();
+                ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                 return;
             }
-
-            var cursor = &ctx.core.cursor_verts;
-
-            const cellW: f32 = @floatFromInt(ctx.core.cell_w_px);
-            const cellH: f32 = @floatFromInt(ctx.core.cell_h_px);
-
-            const topPad: f32 = @floatFromInt(rowTopPadPx(ctx.core.linespace_px));
 
 
             var sent_main_by_rows: bool = false;
@@ -3690,8 +3598,7 @@ pub const FlushCtx = struct {
                     // Direct-index O(1) lookup into NvimCore-owned buffers
                     // (sized by the hl_cache_size config).
                     const hl_cache: []highlight.ResolvedAttrWithStyles = ctx.core.hl_cache_buf orelse &.{};
-                    const hl_valid: []bool = ctx.core.hl_valid_buf orelse &.{};
-                    @memset(hl_valid, false);
+                    const hl_valid: []bool = ctx.core.hlValidForFlush();
                     // The glyph cache is persistent across flushes and reset only
                     // on font change (onGuifont). Do NOT call
                     // resetGlyphCacheFlags() here: with the core-managed atlas
@@ -4082,79 +3989,6 @@ pub const FlushCtx = struct {
                 }
             }
 
-            if (need_cursor) {
-                cursor.clearRetainingCapacity();
-
-                const cursor_grid = ctx.core.grid.cursor_grid;
-                // Every grid is its own layer, so the cursor is emitted on the
-                // grid it is actually on.
-                const cursor_embedded_in_main = (cursor_grid == 1);
-
-                if (cursor_embedded_in_main) {
-                    try cursor.ensureTotalCapacity(ctx.core.alloc, 64);
-                }
-
-                if (cursor_embedded_in_main and cursor_out.enabled != 0) {
-                    const cur_row = cursor_out.row;
-                    const cur_col = cursor_out.col;
-                    if (cur_row < rows and cur_col < cols) {
-                        const x0 = @as(f32, @floatFromInt(cur_col)) * cellW;
-                        const y0 = @as(f32, @floatFromInt(cur_row)) * cellH;
-
-                        const cursor_grid_id = ctx.core.grid.cursor_grid;
-                        const grid_cursor_row = ctx.core.grid.cursor_row;
-                        const grid_cursor_col = ctx.core.grid.cursor_col;
-                        const cursor_cell = ctx.core.grid.getCellGrid(cursor_grid_id, grid_cursor_row, grid_cursor_col);
-
-                        // A next cell with cp == 0 is a wide char's continuation cell.
-                        var is_double_width = false;
-                        if (cursor_grid_id == 1) {
-                            if (grid_cursor_col + 1 < ctx.core.grid.cols) {
-                                const next_cell = ctx.core.grid.getCell(grid_cursor_row, grid_cursor_col + 1);
-                                if (next_cell.cp == 0) {
-                                    is_double_width = true;
-                                }
-                            }
-                        } else {
-                            if (ctx.core.grid.sub_grids.getPtr(cursor_grid_id)) |sg| {
-                                if (grid_cursor_col + 1 < sg.cols) {
-                                    const next_idx: usize = @as(usize, grid_cursor_row) * @as(usize, sg.cols) + @as(usize, grid_cursor_col + 1);
-                                    if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
-                                        is_double_width = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        const cursor_width: f32 = if (is_double_width) cellW * 2 else cellW;
-
-                        switch (try emitCursorQuads(ctx.core, cursor, .{
-                            .grid_id = cursor_grid_id,
-                            .row = grid_cursor_row,
-                            .col = grid_cursor_col,
-                            .x0 = x0,
-                            .y0 = y0,
-                            .cell_w = cellW,
-                            .cell_h = cellH,
-                            .top_pad = topPad,
-                            .width = cursor_width,
-                            .shape = @intCast(@intFromEnum(cursor_out.shape)),
-                            .pct = cursor_out.cell_percentage,
-                            .bg_rgb = cursor_out.bgRGB,
-                            .fg_rgb = cursor_out.fgRGB,
-                            .cell = cursor_cell,
-                        })) {
-                            .ok => {},
-                            // Do not consume cursor_rev on a transient
-                            // rasterizer miss: the next flush retries the
-                            // same cursor without cancelling this transaction.
-                            .retry => cursor_retry_required = true,
-                            .aborted => return,
-                        }
-                    }
-                }
-            }
-
             // Vertices emitted before an atlas reset carry stale UVs and would
             // sample unrelated contents for one frame. Preserve dirty state so
             // the next flush regenerates against the fresh atlas.
@@ -4170,28 +4004,6 @@ pub const FlushCtx = struct {
                 return;
             }
 
-            // Row-only ABI consumer. Main rows were sent individually above;
-            // use the same callback's CURSOR flag for the separate cursor
-            // layer, including an empty slice when the cursor left grid 1.
-            const row_cb = ctx.core.cb.on_vertices_row.?;
-            if (need_cursor) {
-                const cursor_ptr: ?[*]const c_api.Vertex = if (cursor.items.len != 0) cursor.items.ptr else null;
-                row_cb(
-                    ctx.core.ctx,
-                    1,
-                    cursor_out.row,
-                    1,
-                    cursor_ptr,
-                    cursor.items.len,
-                    c_api.VERT_UPDATE_CURSOR,
-                    rows,
-                    cols,
-                );
-                if (ctx.core.flush_aborted) return;
-                if (!cursor_retry_required) {
-                    ctx.core.last_sent_cursor_rev = ctx.core.grid.cursor_rev;
-                }
-            }
             if (!main_retry_required) ctx.core.grid.clearDirty();
             return;
         }
@@ -4394,23 +4206,16 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
         return &.{};
     };
 
-    // Origin of the surface root in global grid cells. Grid 1 is the origin;
-    // an external grid carries its own global position.
-    var root_row: i64 = 0;
-    var root_col: i64 = 0;
-    if (surface_id != 1) {
-        const ext = self.grid.external_grids.get(surface_id) orelse return self.layout_scratch.items;
-        root_row = grid_mod.externalCompositeOriginRow(ext);
-        root_col = grid_mod.externalCompositeOriginCol(ext);
-    }
+    if (surface_id != 1 and !self.grid.external_grids.contains(surface_id)) return self.layout_scratch.items;
 
     const entries = collectSurfaceLayerEntries(self, surface_id);
 
     for (entries) |ent| {
         const pos = self.grid.win_pos.get(ent.grid_id) orelse continue;
         const sg = self.grid.sub_grids.get(ent.grid_id) orelse continue;
-        const dx: i64 = (@as(i64, pos.col) - root_col) * cell_w;
-        const dy: i64 = (@as(i64, pos.row) - root_row) * cell_h;
+        const placed = self.grid.surfacePlacement(pos) orelse continue;
+        const dx: i64 = placed.col * cell_w;
+        const dy: i64 = placed.row * cell_h;
         self.layout_scratch.append(self.alloc, &self.layout_budget, .{
             .grid_id = ent.grid_id,
             .anchor_grid = pos.anchor_grid,
@@ -4885,6 +4690,127 @@ fn cursorGlyphDecoFlags(bytes_per_pixel: u32) u32 {
         (if (bytes_per_pixel >= 4) c_api.DECO_COLOR_EMOJI else 0);
 }
 
+/// One grid's cursor layer: a separate on_vertices_row with the CURSOR flag,
+/// which keeps the cursor out of the row buffers so a GPU scroll copy cannot
+/// ghost it. The cursor where it is on this grid, an empty set where it left
+/// or cannot be drawn. Grid 1 and every other grid take this one rule; grid 1
+/// used to have a second state machine in its own pass. Returns false when
+/// the flush was aborted and the caller must stop.
+fn sendGridCursor(
+    self: *Core,
+    row_cb: anytype,
+    grid_id: i64,
+    buf: *const grid_mod.GridBuf,
+    cursor_on_this_grid: bool,
+    cursor_was_on_this_grid: bool,
+    retry_required: *bool,
+    saw_atlas_reset: *bool,
+) bool {
+    const out = &self.row_verts;
+    const cellW: f32 = @floatFromInt(self.cell_w_px);
+    const cellH: f32 = @floatFromInt(self.cell_h_px);
+    const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
+    const cursor_col = self.grid.cursor_col;
+    if (cursor_on_this_grid) {
+        const cur_row = self.grid.cursor_row;
+        if (cur_row < buf.rows and cursor_col < buf.cols) {
+            out.clearRetainingCapacity();
+            // Estimate: 6 cursor bg + 6 cursor text + block element quads
+            out.ensureTotalCapacity(self.alloc, 48) catch {
+                self.flush_aborted = true;
+                return false;
+            };
+
+            var is_double_width = false;
+            if (cursor_col + 1 < buf.cols) {
+                const next_idx: usize = @as(usize, cur_row) * @as(usize, buf.cols) + @as(usize, cursor_col + 1);
+                if (next_idx < buf.cells.len and buf.cells[next_idx].cp == 0) {
+                    is_double_width = true;
+                }
+            }
+            const cell_idx: usize = @as(usize, cur_row) * @as(usize, buf.cols) + @as(usize, cursor_col);
+            const cursor_cell: grid_mod.Cell = if (cell_idx < buf.cells.len) buf.cells[cell_idx] else .{ .cp = 0, .hl = 0 };
+            const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
+
+            self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
+                @tagName(self.grid.cursor_shape), @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100)), self.grid.cursor_style_enabled,
+            });
+
+            const emitted = emitCursorQuads(self, out, .{
+                .grid_id = grid_id,
+                .row = cur_row,
+                .col = cursor_col,
+                .x0 = @as(f32, @floatFromInt(cursor_col)) * cellW,
+                .y0 = @as(f32, @floatFromInt(cur_row)) * cellH,
+                .cell_w = cellW,
+                .cell_h = cellH,
+                .top_pad = topPad,
+                .width = if (is_double_width) cellW * 2 else cellW,
+                .shape = @intFromEnum(self.grid.cursor_shape),
+                .pct = self.grid.cursor_cell_percentage,
+                // attr_id 0 swaps the default colours (per the Nvim spec).
+                .bg_rgb = if (attr) |a| a.bg else self.hl.default_fg,
+                .fg_rgb = if (attr) |a| a.fg else self.hl.default_bg,
+                .cell = cursor_cell,
+            }) catch blk: {
+                self.flush_aborted = true;
+                break :blk CursorEmitResult.aborted;
+            };
+            switch (emitted) {
+                .ok => {},
+                // Not consumed on a transient rasterizer miss: the next flush
+                // retries the same cursor without cancelling this one.
+                .retry => retry_required.* = true,
+                .aborted => return false,
+            }
+
+            // The cursor glyph ensure above can trigger an atlas reset no
+            // later code re-checks; handle it here rather than leak the flag
+            // to the next grid. The commit is cancelled, so nothing is sent.
+            if (self.atlas_reset_during_flush) {
+                saw_atlas_reset.* = true;
+                self.atlas_reset_during_flush = false;
+                self.grid.markAllDirty();
+                self.invalidateMirroredFrameState();
+                return true;
+            }
+
+            if (self.flush_aborted) return false;
+
+            // The frontend keeps drawing this cursor from its own copy for as
+            // long as the cursor does not move, so the atlas collector has to
+            // see its glyph across later flushes. A cursor-only glyph (a
+            // styled variant, or the standalone glyph a ligature cell resolves
+            // to under the block) sits in a shelf the row mirror never
+            // recorded; cursor_verts is the buffer the collector scans.
+            self.cursor_verts.clearRetainingCapacity();
+            self.cursor_verts.appendSlice(self.alloc, out.items) catch {
+                self.flush_aborted = true;
+                return false;
+            };
+
+            traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, out.items.len });
+            row_cb(self.ctx, grid_id, cur_row, 1, out.items.ptr, out.items.len, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+            self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, out.items.len });
+        } else {
+            // Outside a grid that shrank under it: Neovim moves the cursor in
+            // a later batch, and until then the one this grid drew must go.
+            traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
+            row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+        }
+    } else if (cursor_was_on_this_grid or self.force_ext_cursor_recheck) {
+        // Cursor left this grid, or was hidden on it: send an empty cursor to
+        // clear the previous one. Under force_ext_cursor_recheck,
+        // last_ext_cursor_grid cannot be trusted after a prior failed flush,
+        // so clearing every OTHER grid is a harmless no-op for clean grids and
+        // closes the gap for the misnamed one.
+        traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
+        row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, buf.rows, buf.cols);
+        self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
+    }
+    return true;
+}
+
 /// Generate and send vertices for external grids.
 /// force_render: if true, render regardless of dirty flags
 /// only_grid_id: if non-null, only update this specific grid (for scroll optimization)
@@ -4983,6 +4909,9 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     }
 
     const row_cb = self.cb.on_vertices_row orelse return;
+    // The collector keeps the glyph of the cursor being drawn; whichever grid
+    // draws it now refills this below.
+    if (cursor_changed or self.force_ext_cursor_recheck) self.cursor_verts.clearRetainingCapacity();
     const owns_vertex_budget_transaction = !self.vertex_budget_transaction_active;
     if (owns_vertex_budget_transaction) {
         beginVertexBudgetTransaction(self) catch |err| {
@@ -5006,13 +4935,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // Reuse row_verts buffer for external grid vertices (per-row)
     var ext_verts = &self.row_verts;
 
-    const cellW: f32 = @floatFromInt(self.cell_w_px);
-    const cellH: f32 = @floatFromInt(self.cell_h_px);
-
-    const topPad: f32 = @floatFromInt(rowTopPadPx(self.linespace_px));
-
-
-
     self.initHlCache() catch {
         self.log.write("[ext_grid] Failed to initialize hl cache\n", .{});
     };
@@ -5022,15 +4944,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
     var cache = FlushCache{
         .hl_cache_buf = self.hl_cache_buf orelse &.{},
-        .hl_valid_buf = self.hl_valid_buf orelse &.{},
+        // Once per flush, not once per pass or grid: the bits are indexed by
+        // Neovim's global hl_id, so a resolution grid 1 or another grid paid
+        // for is good for every grid in the same flush.
+        .hl_valid_buf = self.hlValidForFlush(),
     };
-    // Once for this pass, not once per grid. The validity bits are indexed by
-    // Neovim's global hl_id, so a resolution one grid paid for is good for
-    // every other grid in the same flush; clearing them per grid both memset
-    // the whole table (up to the configured hl_cache_size) N times and threw
-    // away every cross-grid hit. The main pass already clears them once for
-    // itself, on the same reasoning.
-    cache.reset();
     // Glyph cache is persistent across flushes (same as row_mode path).
 
     // If any grid triggers an atlas reset, already-sent grids have stale UVs.
@@ -5041,12 +4959,23 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
     // layer of the surface that places them. The set is built from
     // external_grids rather than known_external_grids, so a newly added grid
     // (e.g. a popupmenu) still gets vertices inside this flush bracket.
+    //
+    // Grid 1's rows are the main pass's; its cursor is decided here, by the
+    // rule every other grid's is.
+    if (only_grid_id == null or only_grid_id.? == 1) {
+        const on = externalCursorVisibleOnGrid(&self.grid, 1);
+        const was = self.last_ext_cursor_grid == 1;
+        if ((cursor_changed and (on or was)) or self.force_ext_cursor_recheck) {
+            if (!sendGridCursor(self, row_cb, 1, &self.grid.main_buf, on, was, &ext_cursor_retry_required, &ext_saw_atlas_reset_any)) return;
+        }
+    }
     collectEmitGrids(self);
     for (self.emit_grid_ids.items) |grid_id_value| {
         const grid_id_ptr = &grid_id_value;
-        // A prior grid in this loop may have aborted the flush; the frontend
-        // cancels the whole bracket, so composing more would be discarded work.
-        if (self.flush_aborted) break;
+        // A prior grid in this loop may have aborted the flush, and the
+        // frontend cancels the whole bracket; after an atlas reset the commit
+        // is cancelled below. Composing more would be discarded work.
+        if (self.flush_aborted or ext_saw_atlas_reset_any) break;
 
         const grid_id = grid_id_ptr.*;
 
@@ -5084,11 +5013,6 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
 
         const viewport_cols = sg.cols;
         const viewport_rows = sg.rows;
-        const cursor_row: ?u32 = if (externalCursorVisibleOnGrid(&self.grid, grid_id))
-            self.grid.cursor_row
-        else
-            null;
-        const cursor_col = self.grid.cursor_col;
         var ext_saw_atlas_reset: bool = false;
         var ext_had_row_error: bool = false;
         var ext_had_glyph_miss: bool = false;
@@ -5233,107 +5157,11 @@ pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_gr
             }
         }
 
-        // Cursor layer: a separate on_vertices_row with the CURSOR flag, which
-        // keeps the cursor out of the row buffers so a GPU scroll copy cannot
-        // ghost it. Skipped on abort, and after an atlas reset that cancels
-        // the commit — either way it would be discarded work.
+        // Skipped on abort, and after an atlas reset that cancels the commit
+        // -- either way it would be discarded work.
         if (!self.flush_aborted and !ext_saw_atlas_reset_any) {
-            if (cursor_row) |cur_row| {
-                if (cur_row < sg.rows and cursor_col < sg.cols) {
-                    ext_verts.clearRetainingCapacity();
-                    // Estimate: 6 cursor bg + 6 cursor text + block element quads
-                    ext_verts.ensureTotalCapacity(self.alloc, 48) catch {
-                        self.flush_aborted = true;
-                        return;
-                    };
-
-                    var is_double_width = false;
-                    if (cursor_col + 1 < sg.cols) {
-                        const next_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col + 1);
-                        if (next_idx < sg.cells.len and sg.cells[next_idx].cp == 0) {
-                            is_double_width = true;
-                        }
-                    }
-                    const cell_idx: usize = @as(usize, cur_row) * @as(usize, sg.cols) + @as(usize, cursor_col);
-                    const cursor_cell: grid_mod.Cell = if (cell_idx < sg.cells.len) sg.cells[cell_idx] else .{ .cp = 0, .hl = 0 };
-                    const attr = if (self.grid.cursor_attr_id != 0) self.hl.get(self.grid.cursor_attr_id) else null;
-
-                    self.log.write("[ext_cursor] shape={s} pct={d} cursor_style_enabled={}\n", .{
-                        @tagName(self.grid.cursor_shape), @max(@as(u32, 1), @min(self.grid.cursor_cell_percentage, 100)), self.grid.cursor_style_enabled,
-                    });
-
-                    const emitted = emitCursorQuads(self, ext_verts, .{
-                        .grid_id = grid_id,
-                        .row = cur_row,
-                        .col = cursor_col,
-                        .x0 = @as(f32, @floatFromInt(cursor_col)) * cellW,
-                        .y0 = @as(f32, @floatFromInt(cur_row)) * cellH,
-                        .cell_w = cellW,
-                        .cell_h = cellH,
-                        .top_pad = topPad,
-                        .width = if (is_double_width) cellW * 2 else cellW,
-                        .shape = @intFromEnum(self.grid.cursor_shape),
-                        .pct = self.grid.cursor_cell_percentage,
-                        .bg_rgb = if (attr) |a| a.bg else self.hl.default_fg,
-                        .fg_rgb = if (attr) |a| a.fg else self.hl.default_bg,
-                        .cell = cursor_cell,
-                    }) catch blk: {
-                        self.flush_aborted = true;
-                        break :blk CursorEmitResult.aborted;
-                    };
-                    switch (emitted) {
-                        .ok => {},
-                        .retry => ext_cursor_retry_required = true,
-                        .aborted => return,
-                    }
-
-                    // The cursor glyph ensure above can trigger an atlas reset
-                    // no later code re-checks; handle it here rather than leak
-                    // the flag to the next grid.
-                    if (self.atlas_reset_during_flush) {
-                        ext_saw_atlas_reset = true;
-                        ext_saw_atlas_reset_any = true;
-                        self.atlas_reset_during_flush = false;
-                        self.grid.markAllDirty();
-                        self.invalidateMirroredFrameState();
-                    }
-
-                    if (self.flush_aborted) return;
-
-                    // The frontend keeps drawing this cursor from its own copy
-                    // for as long as the cursor does not move, so the atlas
-                    // collector has to see its glyph across later flushes. A
-                    // cursor-only glyph (a styled variant, or the standalone
-                    // glyph a ligature cell resolves to under the block) sits
-                    // in a shelf the row mirror never recorded. cursor_verts is
-                    // the buffer the collector already scans, and the main path
-                    // leaves it empty whenever the cursor is not on grid 1.
-                    self.cursor_verts.clearRetainingCapacity();
-                    self.cursor_verts.appendSlice(self.alloc, ext_verts.items) catch {
-                        self.flush_aborted = true;
-                        return;
-                    };
-
-                    traceRender(self, "event=cursor_send grid={d} row={d} vertices={d}\n", .{ grid_id, cur_row, ext_verts.items.len });
-                    row_cb(self.ctx, grid_id, cur_row, 1, ext_verts.items.ptr, ext_verts.items.len, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
-                    self.log.write("[ext_cursor_layer] grid_id={d} cursor_row={d} cursor_col={d} cursor_verts={d}\n", .{ grid_id, cur_row, cursor_col, ext_verts.items.len });
-                } else {
-                    // Outside a grid that shrank under it: Neovim moves the
-                    // cursor in a later batch, and until then the one this grid
-                    // drew must go, as the main surface's does.
-                    traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
-                    row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
-                }
-            } else if ((cursor_was_on_this_grid or self.force_ext_cursor_recheck) and !cursor_on_this_grid) {
-                // Cursor left this grid: send an empty cursor to clear the
-                // previous one. Under force_ext_cursor_recheck,
-                // last_ext_cursor_grid cannot be trusted after a prior failed
-                // flush, so clearing every OTHER external grid is a harmless
-                // no-op for clean grids and closes the gap for the misnamed one.
-                traceRender(self, "event=cursor_send grid={d} row=0 vertices=0\n", .{grid_id});
-                row_cb(self.ctx, grid_id, 0, 1, null, 0, c_api.VERT_UPDATE_CURSOR, viewport_rows, viewport_cols);
-                self.log.write("[ext_cursor_layer] grid_id={d} cursor_left, clearing cursor\n", .{grid_id});
-            }
+            if (!sendGridCursor(self, row_cb, grid_id, sg, cursor_on_this_grid, cursor_was_on_this_grid, &ext_cursor_retry_required, &ext_saw_atlas_reset)) return;
+            if (ext_saw_atlas_reset) ext_saw_atlas_reset_any = true;
         }
 
         // scroll_fast_path: the frontend got this scroll as a row shift and
@@ -6224,17 +6052,16 @@ pub fn popupmenuAnchorPlacement(g: *const grid_mod.Grid, anchor_grid: i64, ancho
         return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
     }
     const pos = g.win_pos.get(anchor_grid) orelse return .{ .win = anchor_grid, .row = anchor_row, .col = anchor_col };
-    const row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row);
-    const col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col);
-    const surface = g.surfaceForGrid(anchor_grid) orelse return .{ .win = anchor_grid, .row = row, .col = col };
-    if (g.external_grids.get(surface)) |ext| {
-        return .{
-            .win = surface,
-            .row = row -| grid_mod.externalCompositeOriginRow(ext),
-            .col = col -| grid_mod.externalCompositeOriginCol(ext),
-        };
-    }
-    return .{ .win = anchor_grid, .row = row, .col = col };
+    const placed = g.surfacePlacement(pos) orelse return .{
+        .win = anchor_grid,
+        .row = anchor_row +| grid_mod.saturatingI32FromU32(pos.row),
+        .col = anchor_col +| grid_mod.saturatingI32FromU32(pos.col),
+    };
+    return .{
+        .win = if (placed.surface == 1) anchor_grid else placed.surface,
+        .row = anchor_row +| std.math.lossyCast(i32, placed.row),
+        .col = anchor_col +| std.math.lossyCast(i32, placed.col),
+    };
 }
 
 pub fn sendPopupmenuShow(self: *Core) bool {
@@ -10844,7 +10671,7 @@ test "cursor atlas reset cancels current flush before partial commit" {
     core.cell_h_px = 1;
     core.last_sent_content_rev = core.grid.content_rev;
     core.grid.clearDirty();
-    core.last_sent_cursor_rev = core.grid.cursor_rev -% 1;
+    core.last_ext_cursor_rev = core.grid.cursor_rev -% 1;
     core.atlas_w = config.atlas_size_max;
     core.atlas_h = config.atlas_size_max;
     core.atlas_packer = shelf_packer.ShelfPacker.init(core.atlas_w, core.atlas_h);
@@ -11526,9 +11353,9 @@ test "atlas create abort does not leak reset edge into next flush" {
     try std.testing.expect(!core.atlas_reset_during_flush);
     try std.testing.expectEqual(@as(u32, 1), state.create_calls);
     try std.testing.expectEqual(@as(u32, 0), state.upload_calls);
-    // Rows publish incrementally, so the row before the abort was already
-    // handed over; the aborted bracket is what stops it being committed.
-    try std.testing.expectEqual(@as(u32, 1), state.partial_calls);
+    // The row aborted before it was sent, and nothing follows an abort: grid
+    // 1's cursor layer used to be sent after it anyway.
+    try std.testing.expectEqual(@as(u32, 0), state.partial_calls);
 
     state.abort_create = false;
     try flush_ctx.onFlush(1, 1);
@@ -11538,8 +11365,8 @@ test "atlas create abort does not leak reset edge into next flush" {
     try std.testing.expect(!core.grid.main_buf.dirty_all);
     try std.testing.expectEqual(@as(u32, 2), state.create_calls);
     try std.testing.expectEqual(@as(u32, 1), state.upload_calls);
-    // The aborted flush's one row plus this flush's row and cursor layer.
-    try std.testing.expectEqual(@as(u32, 3), state.partial_calls);
+    // This flush's row and cursor layer.
+    try std.testing.expectEqual(@as(u32, 2), state.partial_calls);
 }
 
 test "atlas reset in the cursor glyph lookup followed by an abort is not a frontend refusal" {
@@ -14870,6 +14697,102 @@ test "a row shift waits for the external window that hosts the scrolling float" 
     try std.testing.expect(dispatchGridRowScroll(&core, State.onRowScroll, 3));
     try std.testing.expectEqual(@as(u32, 1), state.calls);
     try std.testing.expectEqual(@as(i64, 3), state.last_grid);
+}
+
+test "a line in a main-surface split does not run grid 1's pass" {
+    // Grid 1 owes rows only when one is dirty, as every other grid does. Its
+    // pass was gated on content_rev, which a split's grid_line advanced
+    // although grid 1 holds none of the split's cells.
+    const State = struct {
+        root_pass_runs: u32 = 0,
+        split_rows: u32 = 0,
+        fn onLog(ctx: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (std.mem.startsWith(u8, ptr[0..len], "[perf] pre_row")) self.root_pass_runs += 1;
+        }
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, _: usize, flags: u32, _: u32, _: u32) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 2 and flags & c_api.VERT_UPDATE_MAIN != 0) self.split_rows += 1;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    try core.grid.resize(10, 40);
+    core.grid.cursor_visible = false;
+    try core.grid.resizeGrid(2, 10, 40);
+    try core.grid.setWinPos(2, 101, 0, 0);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    core.log.cb = State.onLog;
+    core.log.ctx = &state;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 40);
+    state = .{};
+
+    core.grid.noteGridLine(2, 7);
+    core.grid.putCellGrid(2, 3, 0, 'x', 0);
+    try flush_ctx.onFlush(10, 40);
+
+    try std.testing.expectEqual(@as(u32, 1), state.split_rows);
+    try std.testing.expectEqual(@as(u32, 0), state.root_pass_runs);
+}
+
+test "grid 1's cursor layer follows the rule every grid's does" {
+    // Grid 1 had a cursor state machine of its own, which sent it an empty
+    // cursor on every move anywhere. It now gets one when the cursor leaves
+    // it, as a split does, and nothing while the cursor moves elsewhere.
+    const State = struct {
+        root_set: u32 = 0,
+        root_clear: u32 = 0,
+        split_set: u32 = 0,
+        split_clear: u32 = 0,
+        fn onRow(ctx: ?*anyopaque, grid_id: i64, _: u32, _: u32, _: ?[*]const c_api.Vertex, count: usize, flags: u32, _: u32, _: u32) callconv(.c) void {
+            if (flags & c_api.VERT_UPDATE_CURSOR == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (grid_id == 1) {
+                if (count == 0) self.root_clear += 1 else self.root_set += 1;
+            } else if (grid_id == 2) {
+                if (count == 0) self.split_clear += 1 else self.split_set += 1;
+            }
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.cell_w_px = 1;
+    core.cell_h_px = 1;
+    try core.grid.resize(10, 40);
+    try core.grid.resizeGrid(2, 10, 20);
+    try core.grid.setWinPos(2, 101, 0, 0);
+    core.grid.setCursor(1, 0, 30);
+
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_vertices_row = State.onRow;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 1), state.root_set);
+
+    state = .{};
+    core.grid.setCursor(2, 1, 1);
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 1), state.root_clear);
+    try std.testing.expectEqual(@as(u32, 1), state.split_set);
+
+    state = .{};
+    core.grid.setCursor(2, 2, 2);
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 0), state.root_clear + state.root_set);
+    try std.testing.expectEqual(@as(u32, 1), state.split_set);
+
+    state = .{};
+    core.grid.setCursor(1, 0, 30);
+    try flush_ctx.onFlush(10, 40);
+    try std.testing.expectEqual(@as(u32, 1), state.root_set);
+    try std.testing.expectEqual(@as(u32, 1), state.split_clear);
 }
 
 test "a vertical split's scroll publishes a shift instead of regenerating the band" {

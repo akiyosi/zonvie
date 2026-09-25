@@ -3688,6 +3688,10 @@ final class SurfaceGlowTextures {
     var mipTextures: [MTLTexture?] = [nil, nil, nil]
     var texSize: CGSize = .zero
     var intensityBuffer: MTLBuffer?
+    /// The last chain and what it was planned for: planning builds arrays,
+    /// and the inputs change only on resize or a radius change.
+    var chain: SurfaceGlowChain?
+    var chainKey = (widthPx: 0, heightPx: 0, radiusScale: Float(0))
 
     /// Ensure the glow textures exist at the sizes `chain` gives. The chain is
     /// sized from the drawable, not the grid viewport, so blur can bleed into

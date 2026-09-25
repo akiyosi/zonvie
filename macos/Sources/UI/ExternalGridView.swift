@@ -1383,8 +1383,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate, SurfaceDrawLoopHos
             // for why draw(in:) must read both from one consistent
             // generation instead of independently re-fetching the atlas at
             // a later point. Safe to call here: ZonvieCore's on_flush_end
-            // always commits the main renderer (which commits the atlas)
-            // before calling this function, both on the core/RPC thread.
+            // closes the flush's atlas transaction before any surface
+            // commits, both on the core/RPC thread.
             //
             // A cursor-only commit rotates no set, so it refreshes the standing
             // one. Always: it waited for no frame to be in flight, and a cursor

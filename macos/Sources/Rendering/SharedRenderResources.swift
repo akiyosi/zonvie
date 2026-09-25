@@ -27,9 +27,8 @@ import QuartzCore
 /// value, and a shared queue would serialise submission across surfaces.
 ///
 /// The atlas upload transaction lives here too: `beginFlushTransaction` and
-/// `endFlushTransaction`. A surface's `beginFlush`/`commitFlush` still call
-/// them, so a flush is still gated on the main window committing first —
-/// moving that gate to `ZonvieCore.on_flush_end` is its own step.
+/// `endFlushTransaction`, opened and closed once per flush by
+/// `ZonvieCore.on_flush_begin`/`on_flush_end`, whichever surfaces join it.
 ///
 /// **Threading.** The pipelines are written once by whichever surface builds
 /// them, on the thread that draws, and read by every surface's draw; every
@@ -576,9 +575,9 @@ final class SurfaceShaderCursor {
     /// NEXT flush's cursor position into the uniforms while the screen still
     /// showed the previous one — a row apart mid-scroll, which is a cursor
     /// shader firing off the cursor for that frame. Only the staging surface's
-    /// own commit publishes it: the main surface commits first at every flush
-    /// end, and publishing an external window's cursor there paired it with
-    /// that window's previous rows for any frame drawn before its commit.
+    /// own commit publishes it: the main surface commits first when it joins
+    /// a flush, and publishing an external window's cursor there paired it
+    /// with that window's previous rows for any frame drawn before its commit.
     private var staged = SurfaceCommitStaged<(rect: Rect, color: Color, gridId: Int64)>()
 
     init(timeBase: SurfaceShaderTiming) {

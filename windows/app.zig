@@ -2379,8 +2379,8 @@ pub const ExternalWindow = struct {
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
     atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
-    atlas_upload: render_pipeline_helpers.AtlasUploadLedger = .{},
-    atlas_upload_cursor: u64 = 0, // Per-window cursor into renderer's pending_uploads queue
+    // The App's atlas_upload_seq this window's last paint saw (syncSharedAtlas).
+    atlas_seen_upload_seq: u64 = 0,
     // DPI scale of the monitor this external window is currently on (may
     // differ from app.dpi_scale on a mixed-DPI multi-monitor setup). Used
     // ONLY for this window's own scrollbar hit-test geometry — NOT for font
@@ -3427,6 +3427,58 @@ pub fn flushAtlasUploads(
     }
     const pending = atlas.flushPendingAtlasUploadsSinceToD3D(gpu, upload_cursor);
     return .{ .cursor = pending.cursor, .success = pending.success };
+}
+
+pub const SharedAtlasSync = struct {
+    ok: bool,
+    /// New pixels reached the texture since this window's last paint.
+    uploaded: bool,
+};
+
+/// Bring the one atlas texture every window samples up to date and bind it to
+/// `g`: resized to the atlas, then the uploads it is owed. It is the main
+/// renderer's; an external renderer borrows it. Each window used to hold and
+/// upload its own copy of the same pixels. `seen_seq` is the calling window's
+/// record of the uploads it has seen, so it can tell a paint that drew no
+/// root row that glyphs arrived (atlasUploadOwesFullPaint) whichever window
+/// uploaded them. A failure owes a full upload and leaves `g` unbound; the
+/// caller must not draw. UI thread, caller holds g's context lock.
+pub fn syncSharedAtlas(
+    app: *App,
+    atlas: *dwrite_d2d.Renderer,
+    g: *d3d11.Renderer,
+    generation: u64,
+    seen_seq: *u64,
+) SharedAtlasSync {
+    const failed: SharedAtlasSync = .{ .ok = false, .uploaded = false };
+    const owner: *d3d11.Renderer = if (app.renderer) |*r| r else return failed;
+    var w: u32 = 0;
+    var h: u32 = 0;
+    {
+        atlas.mu.lockUncancelable(core.clock.io());
+        defer atlas.mu.unlock(core.clock.io());
+        w = atlas.atlas_w;
+        h = atlas.atlas_h;
+    }
+    owner.recreateAtlasTextureIfNeeded(w, h) catch {
+        app.atlas_upload.forceFull();
+        return failed;
+    };
+    if (g != owner and !g.borrowAtlas(owner)) return failed;
+    const need_full = app.atlas_upload.needsFull(generation);
+    const upload = flushAtlasUploads(atlas, g, app.atlas_upload_cursor, need_full);
+    if (!upload.success) {
+        // A failed incremental upload is promoted to a full one: the cursor
+        // it would retry can lie below what the atlas still queues.
+        app.atlas_upload.forceFull();
+        return failed;
+    }
+    if (need_full or upload.cursor != app.atlas_upload_cursor) app.atlas_upload_seq +%= 1;
+    app.atlas_upload_cursor = upload.cursor;
+    if (need_full) app.atlas_upload.fullUploaded(generation);
+    const uploaded = seen_seq.* != app.atlas_upload_seq;
+    seen_seq.* = app.atlas_upload_seq;
+    return .{ .ok = true, .uploaded = uploaded };
 }
 
 /// Snap client height to cell grid boundaries (at least 1 row).
@@ -5498,12 +5550,16 @@ pub const App = struct {
     // in the fix-plan doc for why the call cannot be made directly from the
     // wndproc.
     pending_core_glyph_invalidate: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // After atlas reset, external window paints may consume shared pending_uploads.
-    // This flag ensures the main window uploads the full atlas to cover any missed regions.
-    // What the main surface's texture last received in full. UI thread only:
-    // the core thread signals by bumping the atlas's generation under its
-    // `mu`, which the paint reads.
+    // The one glyph atlas texture every window samples is the main
+    // renderer's (syncSharedAtlas). What it last received in full, its cursor
+    // into the atlas's pending_uploads, and a count of the uploads that
+    // changed it. UI thread only: the core thread signals by bumping the
+    // atlas's generation under its `mu`, which the paint reads.
     atlas_upload: render_pipeline_helpers.AtlasUploadLedger = .{},
+    atlas_upload_cursor: u64 = 0,
+    atlas_upload_seq: u64 = 0,
+    // The atlas_upload_seq the main window's last paint saw.
+    main_atlas_seen_upload_seq: u64 = 0,
 
     // Device-loss recovery state (WM_APP_DEVICE_LOST_RECOVER). `posted`
     // dedupes the paint-side trigger. Failed attempts drive a bounded
@@ -5558,8 +5614,6 @@ pub const App = struct {
     // gate). 0 forces a re-render — reset when the renderer/texture is
     // recreated (device-loss recovery).
     tabline_render_sig: u64 = 0,
-    // Main window cursor into renderer's pending_uploads queue (since-based upload).
-    atlas_upload_cursor: u64 = 0,
     // Row-mode seed tracking: require a full set of rows before presenting.
     seed_pending: bool = true,
     seed_clear_pending: bool = true,

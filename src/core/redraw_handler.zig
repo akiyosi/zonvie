@@ -1809,11 +1809,10 @@ pub fn handleRedraw(
                                 base_row = @as(i64, p.row);
                                 base_col = @as(i64, p.col);
                             } else if (grid.external_grids.get(anchor_grid)) |ext| {
-                                // anchor_grid is an external window - use its stored position
-                                if (ext.start_row >= 0 and ext.start_col >= 0) {
-                                    base_row = @as(i64, ext.start_row);
-                                    base_col = @as(i64, ext.start_col);
-                                }
+                                // anchor_grid is an external window: its origin,
+                                // the one Grid.surfacePlacement takes back out.
+                                base_row = grid_mod.externalCompositeOriginRow(ext);
+                                base_col = grid_mod.externalCompositeOriginCol(ext);
                             }
                         }
 

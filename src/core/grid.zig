@@ -1193,6 +1193,8 @@ pub fn externalCompositeOriginCol(info: ExternalGridInfo) i32 {
     return if (info.start_col < 0) 0 else info.start_col;
 }
 
+pub const SurfacePlacement = struct { surface: i64, row: i64, col: i64 };
+
 /// Pending grid resize request from ext_windows win_resize event.
 pub const PendingGridResize = struct {
     grid_id: i64,
@@ -2337,6 +2339,22 @@ pub const Grid = struct {
         return null;
     }
 
+    /// Where a placed grid sits on the surface that composites it, in that
+    /// surface's cells. win_pos holds a float inside an external window in
+    /// global units (redraw_handler adds the window's origin before storing
+    /// it); this is the one place that takes it back out. Null when the
+    /// anchor chain does not resolve.
+    pub fn surfacePlacement(self: *const Grid, p: GridPos) ?SurfacePlacement {
+        const surface = self.surfaceForGrid(p.anchor_grid) orelse return null;
+        var row: i64 = p.row;
+        var col: i64 = p.col;
+        if (self.external_grids.get(surface)) |ext| {
+            row -= externalCompositeOriginRow(ext);
+            col -= externalCompositeOriginCol(ext);
+        }
+        return .{ .surface = surface, .row = row, .col = col };
+    }
+
     /// Rows a placed grid covers: its buffer's, or one for a grid with none.
     fn layerRows(self: *const Grid, grid_id: i64) u32 {
         return if (self.sub_grids.getPtr(grid_id)) |sg| sg.rows else 1;
@@ -2360,19 +2378,12 @@ pub const Grid = struct {
     /// Dirty the owning root's old pixel coverage, not an intermediate float
     /// or an unrelated main-surface row. Grid-local contents remain separate.
     fn dirtyCompositedRow(self: *Grid, p: GridPos, row: u32) void {
-        const surface = self.surfaceForGrid(p.anchor_grid) orelse return;
-        if (self.external_grids.get(surface)) |ext| {
-            // win_pos.row for ext-anchored floats is stored in GLOBAL grid
-            // units (redraw_handler adds ext start_row before setWinFloatPos),
-            // while the root's damage uses surface-local rows. Translate
-            // here: marking the global row would dirty rows
-            // offset by start_row (or nothing at all) and leave the truly
-            // composited rows stale. An anchor with no position of its own
-            // had that base of 0 applied at the write site too.
-            const origin_row = externalCompositeOriginRow(ext);
-            if (self.sub_grids.getPtr(surface)) |asg| {
+        const placed = self.surfacePlacement(p) orelse return;
+        if (placed.surface != 1) {
+            // The root's damage is in its own rows (surfacePlacement).
+            if (self.sub_grids.getPtr(placed.surface)) |asg| {
                 asg.dirty = true;
-                const local: i64 = @as(i64, p.row) + @as(i64, row) - @as(i64, origin_row);
+                const local: i64 = placed.row + @as(i64, row);
                 if (local >= 0 and local < @as(i64, @intCast(asg.dirty_rows.bit_length))) {
                     asg.dirty_rows.set(@intCast(local));
                 }
@@ -2391,18 +2402,6 @@ pub const Grid = struct {
         const tr = p.row +| row;
         self.markDirtyRow(tr);
         self.recordScrollTouchedRow(tr);
-    }
-
-    /// A layer's cell changed. A main-surface layer repaints its own band on
-    /// both frontends and grid 1 holds none of its cells, so the root row under
-    /// it owes nothing: dirtying it regenerated that row, and every layer
-    /// crossing it, on each keystroke in any split. Shrink, clear and close
-    /// dirty the band themselves. A float an external window hosts still
-    /// dirties its host's row.
-    fn dirtyHostRowForCellChange(self: *Grid, p: GridPos, row: u32) void {
-        const surface = self.surfaceForGrid(p.anchor_grid) orelse return;
-        if (surface == 1) return;
-        self.dirtyCompositedRow(p, row);
     }
 
     /// Force-mark a cell's row dirty (for overflow-only changes where putCellGrid
@@ -2427,9 +2426,9 @@ pub const Grid = struct {
             if (sg.dirty_rows.bit_length > row) {
                 sg.dirty_rows.set(row);
             }
-            if (self.win_pos.get(grid_id)) |p| {
-                self.dirtyHostRowForCellChange(p, row);
-            }
+            // A layer repaints its own band on both frontends and its root
+            // holds none of its cells, so a cell change dirties nothing under
+            // it; shrink, clear and close dirty the band themselves.
             if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
                 self.cursor_rev +%= 1;
             }
@@ -2453,11 +2452,7 @@ pub const Grid = struct {
             if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
                 self.glyph_working_set_rev +%= 1;
             }
-            if (self.win_pos.get(grid_id)) |p| {
-                self.dirtyHostRowForCellChange(p, row);
-            }
-            // External grids (not in win_pos) do not affect global grid
-            // content_rev or dirty state.
+            // A layer's root holds none of its cells (see markDirtyCellGrid).
 
             // Advance cursor_rev if cursor is on this cell (to update cursor text)
             if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
@@ -2657,27 +2652,9 @@ pub const Grid = struct {
                     .cols = cols,
                 };
             }
-            if (self.win_pos.get(grid_id)) |p| {
-                if (self.surfaceForGrid(p.anchor_grid) != 1) {
-                    // Float anchored to an EXTERNAL grid: it composites into
-                    // that grid's own window, not the main grid. Dirty the
-                    // scrolled region on the anchor (anchor-local rows via
-                    // dirtyCompositedRow) instead of spuriously rebuilding
-                    // the main grid at mistranslated rows and installing a
-                    // main-grid pending_scroll for a float it never draws.
-                    var r: u32 = top;
-                    while (r < bot) : (r += 1) {
-                        self.dirtyCompositedRow(p, r);
-                    }
-                    self.recordScrolledGrid(grid_id, rows);
-                    return;
-                }
-                // A window grid on the main surface is its own layer: grid 1's
-                // cells under it are untouched, so nothing on the root is
-                // dirtied or scheduled for a shift here.
-            }
-            // External grids (not in win_pos) do not affect global grid
-            // content_rev, dirty state, or pending_scroll.
+            // A window grid is its own layer on either surface: its root's
+            // cells under it are untouched, so nothing on the root is dirtied
+            // or scheduled for a shift here.
 
             // A float anchored to an EXTERNAL grid lives in that grid's own
             // rows, and sg.scroll just moved this grid's dirty marks with the
@@ -5166,6 +5143,31 @@ test "typing in a main-surface split leaves the root rows alone" {
     const sg = grid.sub_grids.get(2).?;
     try std.testing.expect(sg.isRowDirty(3));
     try std.testing.expect(sg.isRowDirty(4));
+}
+
+test "typing or scrolling in a float an external window hosts leaves its root rows alone" {
+    // The external root is a surface like grid 1: the float is its own layer
+    // there too, so its edits and scrolls owe the root's rows nothing.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(20, 40);
+    try grid.resizeGrid(3, 10, 40);
+    try std.testing.expect(try grid.setWinExternalPos(3, 43));
+    try grid.resizeGrid(4, 3, 10);
+    try grid.setWinFloatPos(4, 44, 2, 1, 50, 0, 3, true);
+    const ext = grid.sub_grids.getPtr(3).?;
+    ext.dirty = false;
+    ext.dirty_all = false;
+    ext.dirty_rows.unsetAll();
+
+    grid.putCellGrid(4, 1, 2, 'x', 0);
+    grid.markDirtyCellGrid(4, 2, 2);
+    grid.scrollGrid(4, 0, 3, 0, 10, 1, 0);
+
+    try std.testing.expect(!ext.dirty);
+    var r: u32 = 0;
+    while (r < 10) : (r += 1) try std.testing.expect(!ext.isRowDirty(r));
+    try std.testing.expect(grid.sub_grids.get(4).?.isRowDirty(1));
 }
 
 test "closing or resizing a main-surface layer repaints its band, not the viewport" {

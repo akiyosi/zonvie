@@ -751,7 +751,7 @@ final class ZonvieCore {
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(surfaceId) grid=\(gridId) reason=host_not_registered")
 
                 case .mainRoot:
-                    guard let view = core.terminalView else { return }
+                    guard let view = core.terminalView, core.beginMainFlushIfNeeded() else { return }
                     view.submitVerticesRowRaw(
                         rowStart: rs,
                         rowCount: rc,
@@ -770,7 +770,7 @@ final class ZonvieCore {
                     // renderer here and the view there, but the two arms ask it
                     // the same two questions with the same argument types.
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=row_route surface=1 grid=\(gridId) row=\(rs) vertices=\(vertCount) flags=\(fl)")
-                    guard let renderer = core.terminalView?.renderer else { return }
+                    guard let renderer = core.terminalView?.renderer, core.beginMainFlushIfNeeded() else { return }
                     if isCursorUpdate {
                         // The surface draws one cursor; remember which layer it
                         // belongs to so it is placed with that layer's transform.
@@ -1119,8 +1119,11 @@ final class ZonvieCore {
             },
             on_ime_off: { ctx in
                 guard let ctx else { return }
+                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 DispatchQueue.main.async {
-                    ZonvieCore.setIMEOff()
+                    // The input source is system-wide: only the session in
+                    // front switches it.
+                    if SessionManager.shared.isFront(me) { ZonvieCore.setIMEOff() }
                 }
             },
             on_quit_requested: { ctx, hasUnsaved in
@@ -1158,7 +1161,10 @@ final class ZonvieCore {
                 // staged, and the main one returned early at its capacity gate
                 // before reaching the drop.
                 me.terminalView?.renderer.shared.shaderCursor.dropStaged()
-                let result = me.terminalView?.renderer.beginFlush() ?? .dropped
+                // The atlas transaction is the flush's, opened once here before
+                // any surface joins -- on the main surface's queue, which is
+                // what orders its blit before the main surface samples.
+                let atlasBegin = me.terminalView?.renderer.beginAtlasTransaction() ?? .drop("no main surface")
                 guard let corePtr = me.core else { return }
                 me.extViewsScratch.removeAll(keepingCapacity: true)
                 me.externalFlushAborted = false
@@ -1168,16 +1174,16 @@ final class ZonvieCore {
                 me.pendingGridSurfaceOwners = nil
                 me.externalGridViewsLock.unlock()
 
-                switch result {
-                case .dropped:
+                switch atlasBegin {
+                case .drop(let reason):
                     // Frontend cannot accept this flush — tell core to skip vertex/atlas work.
+                    ZonvieCore.appLog("[WARNING] flush begin: \(reason)")
                     zonvie_core_abort_flush(corePtr)
                     me.externalFlushAborted = true
-                    // Backpressure (no free buffer set): retry once a GPU
-                    // frame likely completed, or this content stays unflushed
-                    // forever if Neovim sends no further redraw.
+                    // Retry once a GPU frame likely completed, or this content
+                    // stays unflushed forever if Neovim sends no further redraw.
                     me.scheduleFlushRetry()
-                case .proceedWithInvalidation:
+                case .opened(let opened) where opened.needsCoreInvalidation:
                     // Scale change detected — invalidate core glyph cache.
                     // This triggers resetCoreAtlas → on_atlas_create → recreateTexture.
                     zonvie_core_invalidate_glyph_cache(corePtr)
@@ -1188,20 +1194,19 @@ final class ZonvieCore {
                     // atlasModified is true which would also trigger abort.
                     if let renderer = me.terminalView?.renderer,
                        renderer.glyphAtlas.needsAtlasRebuildPending {
-                        renderer.abortFlush()
                         me.sharedResources?.abortFlushTransaction()
                         zonvie_core_abort_flush(corePtr)
                         me.externalFlushAborted = true
                         me.scheduleFlushRetry()
                     }
-                case .proceed:
+                case .opened:
                     break
                 }
 
-                // External brackets are opened lazily by the first row/scroll
-                // callback for each grid. Most flushes touch only the main grid;
-                // eagerly copying every external surface here made every window
-                // pay COW/cursor-copy work and participate in backpressure.
+                // Every surface's bracket, the main one's included, opens
+                // lazily on the first callback that writes to it (the begin*
+                // FlushIfNeeded pair). Most flushes touch one surface; opening
+                // every one here made each pay its copy work and backpressure.
             },
             on_flush_end: { ctx in
                 guard let ctx else { return }
@@ -1323,24 +1328,18 @@ final class ZonvieCore {
                 // Neovim's default background, for the viewport-edge clear
                 // colour, published by the commit it came with.
                 let defaultBg = me.core.map { zonvie_core_get_default_bg($0) } ?? 0
-                let mainCommitted = me.terminalView?.renderer.commitFlush(
-                    drawableW: dw, drawableH: dh,
-                    publishedAtlasTexture: publishedAtlasTexture,
-                    defaultBgRGB: defaultBg
-                ) ?? false
-                if !mainCommitted {
-                    // The main surface's own bracket was not open (dropped or
-                    // already aborted). Its layers' sets would be published
-                    // against vertices that never landed.
-                    for gridView in me.extViewsScratch {
-                        gridView.cancelFlush()
-                    }
-                    me.extViewsScratch.removeAll(keepingCapacity: true)
-                    if let corePtr = me.core {
-                        zonvie_core_abort_flush(corePtr)
-                    }
-                    me.scheduleFlushRetry()
-                    return
+                // Only a surface that joined commits, the main one as an
+                // external one; the one that did not still draws from the
+                // texture this flush published.
+                let mainJoined = me.terminalView?.renderer.isFlushOpen ?? false
+                if mainJoined {
+                    me.terminalView?.renderer.commitFlush(
+                        drawableW: dw, drawableH: dh,
+                        publishedAtlasTexture: publishedAtlasTexture,
+                        defaultBgRGB: defaultBg
+                    )
+                } else {
+                    me.terminalView?.renderer.adoptPublishedAtlas(publishedAtlasTexture)
                 }
                 if ZonvieCore.appLogEnabled {
                     let snap = me.currentInputTraceSnapshot()
@@ -1359,18 +1358,20 @@ final class ZonvieCore {
                 // but the main-queue hop per flush is not free during scroll
                 // storms. Safe to read here: ZonvieConfig.shared is written
                 // only at startup.
-                if ZonvieConfig.shared.scrollbar.enabled {
-                    DispatchQueue.main.async {
-                        me.terminalView?.updateScrollbarIfNeeded()
+                if mainJoined {
+                    if ZonvieConfig.shared.scrollbar.enabled {
+                        DispatchQueue.main.async {
+                            me.terminalView?.updateScrollbarIfNeeded()
+                        }
                     }
+                    // Activate continuous draw loop so the new commit gets rendered
+                    // at display refresh rate without async dispatch latency.
+                    me.terminalView?.activateSurfaceDrawLoop()
+                    // requestRedraw as fallback: triggers setNeedsDisplay for the
+                    // first frame when still in paused mode.  No-op in active mode
+                    // (enableSetNeedsDisplay=false).
+                    me.terminalView?.requestRedraw()
                 }
-                // Activate continuous draw loop so the new commit gets rendered
-                // at display refresh rate without async dispatch latency.
-                me.terminalView?.activateSurfaceDrawLoop()
-                // requestRedraw as fallback: triggers setNeedsDisplay for the
-                // first frame when still in paused mode.  No-op in active mode
-                // (enableSetNeedsDisplay=false).
-                me.terminalView?.requestRedraw()
                 // Re-evaluate the msg throttle/auto-hide deadline after this
                 // flush armed/cleared it.  Dispatched async so grid_mu (held
                 // here on the core thread) is released before scheduleMsgTimer
@@ -1504,6 +1505,7 @@ final class ZonvieCore {
                     // A grid the main surface places as a layer shifts its own
                     // row slots in that surface's renderer. The call ignores
                     // grid 1, which holds no layer sets.
+                    guard core.beginMainFlushIfNeeded() else { return }
                     core.terminalView?.renderer?.applyLayerRowScroll(
                         gridId: gid,
                         rowStart: Int(rowStart), rowEnd: Int(rowEnd),
@@ -1882,6 +1884,9 @@ final class ZonvieCore {
         // config.toml. The three modes are mutually exclusive, so selecting one
         // clears the others (guarding against any CLI/config-derived leftovers).
         if let cc = connectionConfig {
+            // The dialog offers no attach mode: `--connect-nvim` from the app's
+            // launch would otherwise re-attach every New Session to it.
+            connectAddr = nil
             if cc.isSSH {
                 sshHost = cc.sshHost
                 sshPort = Int(cc.sshPort)   // "" -> nil (default port)
@@ -3428,8 +3433,13 @@ final class ZonvieCore {
     func stopCursorBlinking() {
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
+        let wasHidden = !cursorBlinkState
         cursorBlinkState = true
         cursorBlinkPhase = 0
+        // The main view reads the state only when it draws; stopped in the
+        // off phase it would keep the cursor hidden until something else
+        // redraws it.
+        if wasHidden { requestRedraw() }
 
         for (_, gridView) in externalGridViews {
             gridView.cursorBlinkState = true
@@ -4222,6 +4232,12 @@ final class ZonvieCore {
     // MARK: - External Window Support
 
     private var externalWindows: [Int64: NSWindow] = [:]
+
+    /// Whether `window` is this session's: its main window or one of its
+    /// external windows. Main thread.
+    func owns(window: NSWindow) -> Bool {
+        terminalView?.window === window || externalWindows.values.contains { $0 === window }
+    }
     /// Tracks grid_id -> Neovim window handle for external windows
     private var externalWindowWinIds: [Int64: Int64] = [:]
     /// Main-thread-only token of the latest open applied to each installed
@@ -4260,6 +4276,28 @@ final class ZonvieCore {
     /// Core/RPC-thread transaction state. Contains only external surfaces that
     /// actually received content in the current flush.
     private var externalFlushAborted = false
+
+    /// The main surface joins a flush on its first write, as an external one
+    /// does below; a refusal cancels the whole flush the same way.
+    func beginMainFlushIfNeeded() -> Bool {
+        guard let renderer = terminalView?.renderer else { return false }
+        if renderer.isFlushOpen { return true }
+        if externalFlushAborted || !coreFlushActive { return false }
+        if renderer.beginFlush() { return true }
+        ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=surface_begin_failed surface=1")
+        externalFlushAborted = true
+        sharedResources?.abortFlushTransaction()
+        if let core {
+            zonvie_core_abort_flush(core)
+        }
+        for opened in extViewsScratch {
+            opened.cancelFlush()
+            _ = opened.consumeFlushFailed()
+        }
+        extViewsScratch.removeAll(keepingCapacity: true)
+        scheduleFlushRetry()
+        return false
+    }
 
     private func beginExternalFlushIfNeeded(_ gridView: ExternalGridView) -> Bool {
         if externalFlushAborted { return false }
@@ -7139,7 +7177,9 @@ final class ZonvieCore {
         for layer in layers { pendingGridSurfaceOwners![layer.gridId] = surfaceId }
         externalGridViewsLock.unlock()
         if surfaceId == 1 {
-            terminalView?.renderer?.setPendingSurfaceLayers(layers)
+            if beginMainFlushIfNeeded() {
+                terminalView?.renderer?.setPendingSurfaceLayers(layers)
+            }
             return
         }
         externalGridViewsLock.lock()
@@ -7193,6 +7233,12 @@ final class ZonvieCore {
             }
             // The blink gate follows the window showing the cursor.
             self.refreshCursorBlinkGate()
+            // A session in the background must not take the key window from
+            // the one the user is typing into.
+            guard SessionManager.shared.isFront(self) else {
+                ZonvieCore.appLog("[cursor_grid_changed] session not in front; no activation")
+                return
+            }
 
             // Staged first (showingSurfaceId). A float opened on an external
             // surface is placed by the layout of the flush that creates it,
@@ -9122,6 +9168,12 @@ final class ZonvieCore {
         // rendered, so the reduction and the vertices that moved the rows reach
         // the glass together instead of a frame apart.
         ZonvieCore.appLog("[on_grid_scroll] gridId=\(gridId) rowsDelta=\(rowsDelta)")
+        // A grid the main surface draws has its retained row captured and its
+        // distance released by that surface's bracket, so the scroll joins it.
+        switch resolveGridRoute(gridId: gridId) {
+        case .externalRoot, .externalLayer, .deferred: break
+        default: _ = beginMainFlushIfNeeded()
+        }
         terminalView?.clearScrollOffsetForGrid(gridId, rowsDelta: rowsDelta)
     }
 

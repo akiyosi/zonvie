@@ -18,6 +18,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("ui/external_windows.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
+const input = @import("input.zig");
 
 // ---- Logging globals for row vertex callbacks ----
 var log_row_no_glyphs_count: u32 = 0;
@@ -225,13 +226,9 @@ pub fn rectFromVerts(hwnd: c.HWND, verts: []const app_mod.Vertex) ?c.RECT {
 pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     const row_h: u32 = app.rowHeightPx();
 
-    // When ext_tabline is enabled (and content_hwnd is not used), the rect coordinates
-    // are in hwnd (main window) coordinate system which includes the tabbar.
-    // We need to subtract the tabbar height to get the correct row number.
-    const y_offset: i32 = if (app.ext_tabline_enabled and app.content_hwnd == null)
-        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
-    else
-        0;
+    // The rect is in client coordinates; rows start at the surface origin
+    // (below a titlebar tabline only -- a sidebar shifts x, not rows).
+    const y_offset: i32 = input.surfaceOriginPx(app, true).y;
 
     const top_u: u32 = @intCast(@max(0, rc.top - y_offset));
     const bot_u: u32 = @intCast(@max(0, rc.bottom - y_offset));
@@ -689,14 +686,9 @@ pub fn onVerticesPartial(
                 var rect_client: c.RECT = undefined;
                 _ = c.GetClientRect(rect_hwnd, &rect_client);
 
-                const vp_y: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                    @intCast(app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT))
-                else
-                    0;
-                const vp_x: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                    @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                else
-                    0;
+                const surface_origin = input.surfaceOriginPx(app, true);
+                const vp_y: u32 = @intCast(surface_origin.y);
+                const vp_x: u32 = @intCast(surface_origin.x);
                 const sidebar_r: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
                     @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
                 else
@@ -849,13 +841,9 @@ pub fn onVerticesRow(
         if (grid_id == 1) {
             if (vert_count == 0 and app.tbs.cursorLayerGridIdInFlush() != grid_id) {
                 traceRender(app, "event=cursor_ignore surface=1 grid={d} owner={d} reason=empty_nonowner\n", .{ grid_id, app.tbs.cursorLayerGridIdInFlush() });
-                // This empty callback carries the blink refresh: the core sends
-                // it on every cursor_rev bump (mode_change / mode_info_set)
-                // even when the cursor lives on another surface, and
-                // onVerticesPartial's post below the return is the only thing
-                // that asks the UI thread to re-read guicursor. Returning
-                // without it left blinkon/blinkoff stale for as long as the
-                // cursor stayed in an external window.
+                // Every cursor update re-reads guicursor's blink cadence,
+                // this one included (onVerticesPartial's post is skipped by
+                // the return).
                 const hwnd_for_blink = blk_hwnd: {
                     app.mu.lockUncancelable(core.clock.io());
                     defer app.mu.unlock(core.clock.io());
@@ -1116,6 +1104,12 @@ pub fn onVerticesRow(
                 ext_win.tbs.writeSet().metrics_gen = app.shared_metrics_gen;
             }
             if (is_cursor_update) {
+                // guicursor carries a blink cadence per mode, so every cursor
+                // update re-reads it, as on the main surface and on macOS.
+                // Grid 1 used to be sent an empty cursor on every move and
+                // that post covered this surface; it is sent one only when
+                // the cursor leaves it now.
+                if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
                 if (vert_count == 0 and ext_win.tbs.cursorLayerGridIdInFlush() != grid_id) {
                     traceRender(app, "event=cursor_ignore surface={d} grid={d} owner={d} reason=empty_nonowner\n", .{ traceExternalSurfaceId(ext_win, grid_id), grid_id, ext_win.tbs.cursorLayerGridIdInFlush() });
                     return;
