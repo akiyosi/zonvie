@@ -176,17 +176,3 @@ jobs:
           echo "and commit it, or push the branch directly (a push regenerates"
           echo "and commits automatically)."
           exit 1
-
-  test:
-    name: Run Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-
-      - name: Run Zig Tests
-        run: zig build test || echo "No tests defined"

@@ -19,6 +19,7 @@
 		AB9AE9BD2EF22AED0072639A /* GridSurfaceRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B82EF22AED0072639A /* GridSurfaceRenderer.swift */; };
 		AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */; };
 		AB9AE9D12EF5BE3A0072639A /* FontCellFit.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */; };
+		ACF001622F2000010072639A /* FontInstanceAxes.swift in Sources */ = {isa = PBXBuildFile; fileRef = ACF001612F2000010072639A /* FontInstanceAxes.swift */; };
 		AB9AE9C12EF22AED0072639A /* MetalTerminalView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */; };
 		AB9AE9C22EF22CF10072639A /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9BA2EF22AED0072639A /* Shaders.metal */; };
 		AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB9AE9C42EF236FC0072639A /* MetalTypes.swift */; };
@@ -59,6 +60,7 @@
 		AB9AE9B32EF1BBED0072639A /* libzonvie_core.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libzonvie_core.a; path = ../zig-out/lib/libzonvie_core.a; sourceTree = SOURCE_ROOT; };
 		AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlyphAtlas.swift; sourceTree = "<group>"; };
 		AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontCellFit.swift; sourceTree = "<group>"; };
+		ACF001612F2000010072639A /* FontInstanceAxes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FontInstanceAxes.swift; sourceTree = "<group>"; };
 		AB9AE9B82EF22AED0072639A /* GridSurfaceRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GridSurfaceRenderer.swift; sourceTree = "<group>"; };
 		AB9AE9B92EF22AED0072639A /* MetalTerminalView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetalTerminalView.swift; sourceTree = "<group>"; };
 		AB9AE9BA2EF22AED0072639A /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
@@ -161,6 +163,7 @@
 			children = (
 				AB9AE9B62EF22AED0072639A /* GlyphAtlas.swift */,
 				AB9AE9D02EF5BE3A0072639A /* FontCellFit.swift */,
+				ACF001612F2000010072639A /* FontInstanceAxes.swift */,
 				AB9AE9CB2EF5BE3A0072639A /* HBFTBridge.c */,
 			);
 			path = Font;
@@ -304,6 +307,7 @@
 				AB9AE9CC2EF5BE3A0072639A /* HBFTBridge.c in Sources */,
 				AB9AE9BE2EF22AED0072639A /* GlyphAtlas.swift in Sources */,
 				AB9AE9D12EF5BE3A0072639A /* FontCellFit.swift in Sources */,
+				ACF001622F2000010072639A /* FontInstanceAxes.swift in Sources */,
 				AB9AE9C62EF236FC0072639A /* MetalTypes.swift in Sources */,
 				ACF001012F2000010072639A /* ExternalFontResetState.swift in Sources */,
 				ACF001212F2000010072639A /* RowScrollBlitPlan.swift in Sources */,
