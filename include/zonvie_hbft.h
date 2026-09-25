@@ -34,11 +34,22 @@ void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feat
 // Apply font variation axes (wght, wdth, opsz, etc.) from the fvar table.
 // Each entry's tag is matched against the font's available axes; non-axis tags
 // are silently ignored. Values are interpreted as design-space coordinates
-// (e.g. wght=700, wdth=100, opsz=24).
-// Must be called BEFORE set_features (which rebuilds ASCII tables from the
-// current outline state). count=0 resets all axes to their default values.
+// (e.g. wght=700, wdth=100, opsz=24) and clamped to each axis's range.
+// Rebuilds the ASCII tables for the new instance with the current features.
+// count=0 resets all axes to their default values.
 // Safe to call on non-variable fonts (no-op if fvar is absent).
 void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* variations, size_t count);
+
+// A variation axis value that may be fractional: a CoreText instance's
+// coordinates (Skia's wght runs 0.48-3.2, Recursive's CASL 0-1) lose their
+// meaning when rounded to the integers zonvie_font_feature carries.
+typedef struct zonvie_font_axis {
+    char tag[4];
+    float value;
+} zonvie_font_axis;
+
+// zonvie_ft_hb_font_set_variations with fractional values.
+void zonvie_ft_hb_font_set_variation_axes(zonvie_ft_hb_font* f, const zonvie_font_axis* axes, size_t count);
 
 // Shape UTF-32 scalars.
 // Outputs are HarfBuzz position values in 26.6 fixed-point pixels (1px = 64).

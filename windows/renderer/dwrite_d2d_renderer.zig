@@ -22,9 +22,28 @@ const IID_IDWriteFactory_ZONVIE: GUID = .{
     .Data4 = .{ 0xA2, 0xE8, 0x1A, 0xDC, 0x7D, 0x93, 0xDB, 0x48 },
 };
 
+// IDWriteFontFace5 IID: {98EFF3A5-B667-479A-B145-E2FA5B9FDC29}
+const IID_IDWriteFontFace5_ZONVIE: GUID = .{
+    .Data1 = 0x98EFF3A5,
+    .Data2 = 0xB667,
+    .Data3 = 0x479A,
+    .Data4 = .{ 0xB1, 0x45, 0xE2, 0xFA, 0x5B, 0x9F, 0xDC, 0x29 },
+};
+
 // DWrite font feature struct for IDWriteTextAnalyzer::GetGlyphs.
 const DWriteFontFeature = extern struct { nameTag: u32, parameter: u32 };
 const MAX_FONT_FEATURES = 32;
+
+// GetGlyphs applies DirectWrite's default features only when it gets no
+// feature list; given one, it applies that list alone. Seeding the list with
+// HarfBuzz's horizontal defaults (what macOS shapes with) makes a [font]
+// family feature add to them, so `+liga` keeps the `calt` ligatures.
+const default_font_features = [_]u32{
+    packTag("abvm"), packTag("blwm"), packTag("ccmp"), packTag("locl"),
+    packTag("mark"), packTag("mkmk"), packTag("rlig"), packTag("calt"),
+    packTag("clig"), packTag("curs"), packTag("dist"), packTag("kern"),
+    packTag("liga"), packTag("rclt"),
+};
 
 // Styled glyph logging stats (global)
 var g_log_styled_hits: u64 = 0;
@@ -162,6 +181,13 @@ pub const Renderer = struct {
     // OpenType font features for DWrite shaping.
     font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
     font_feature_count: u32 = 0,
+    // Every [font] family entry as a variation axis value (wght=700,
+    // slnt=-12); withUserAxes applies the ones the face has an axis for.
+    font_axis_values: [MAX_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = undefined,
+    font_axis_count: u32 = 0,
+    // The regular face was recreated at those axis values, so the TextFormat
+    // (family name only) no longer measures it; see recomputeCellMetrics.
+    base_face_varied: bool = false,
     text_analyzer: ?*c.IDWriteTextAnalyzer = null,
 
     // GSUB ligature trigger cache (see GsubCacheEntry above).
@@ -2011,8 +2037,14 @@ pub const Renderer = struct {
 
         // Parse and store OpenType features
         self.font_feature_count = 0;
+        self.font_axis_count = 0;
         if (features_str.len > 0) {
             self.parseFontFeatures(features_str);
+        }
+        self.base_face_varied = false;
+        if (self.font_face) |face| {
+            self.font_face = self.withUserAxes(face);
+            self.base_face_varied = self.font_face != face;
         }
         // Ensure text analyzer is available when features are set
         if (self.font_feature_count > 0 and self.text_analyzer == null) {
@@ -2037,11 +2069,33 @@ pub const Renderer = struct {
 
     /// Parse comma-separated features string into font_features array.
     /// Format: "+liga,-dlig,ss01=2"
+    /// The list starts from default_font_features, and a user feature with
+    /// the same tag replaces its default in place.
     fn parseFontFeatures(self: *Renderer, features_str: []const u8) void {
+        for (default_font_features) |tag| {
+            self.font_features[self.font_feature_count] = .{ .nameTag = tag, .parameter = 1 };
+            self.font_feature_count += 1;
+        }
         var parsed: [MAX_FONT_FEATURES]core.redraw_handler.FontFeature = undefined;
-        const n = core.redraw_handler.parseFontFeatureList(features_str, parsed[0 .. MAX_FONT_FEATURES - self.font_feature_count]);
+        const n = core.redraw_handler.parseFontFeatureList(features_str, &parsed);
         for (parsed[0..n]) |f| {
+            const tag: u32 = @as(u32, f.tag[0]) | (@as(u32, f.tag[1]) << 8) |
+                (@as(u32, f.tag[2]) << 16) | (@as(u32, f.tag[3]) << 24);
+            self.font_axis_values[self.font_axis_count] = .{
+                .axisTag = @bitCast(tag),
+                .value = @floatFromInt(f.value),
+            };
+            self.font_axis_count += 1;
+        }
+        next: for (parsed[0..n]) |f| {
             const feat = dwriteFontFeature(f) orelse continue;
+            for (self.font_features[0..self.font_feature_count]) |*have| {
+                if (have.nameTag == feat.nameTag) {
+                    have.* = feat;
+                    continue :next;
+                }
+            }
+            if (self.font_feature_count == MAX_FONT_FEATURES) break;
             self.font_features[self.font_feature_count] = feat;
             self.font_feature_count += 1;
         }
@@ -2139,6 +2193,53 @@ pub const Renderer = struct {
         return glyph_indices[0];
     }
 
+    /// `face` at the [font] family entry's variation axis values, clamped to
+    /// each axis's range, or `face` itself when no entry names one of its
+    /// axes. Axes the entry leaves out keep the face's own values, so a Bold
+    /// named instance stays bold under `slnt=-12`. Takes over the reference
+    /// to `face`.
+    fn withUserAxes(self: *Renderer, face: *c.IDWriteFontFace) *c.IDWriteFontFace {
+        if (self.font_axis_count == 0) return face;
+        var face5: ?*c.IDWriteFontFace5 = null;
+        const qi = face.lpVtbl.*.QueryInterface orelse return face;
+        if (c.FAILED(qi(face, @ptrCast(&IID_IDWriteFontFace5_ZONVIE), @ptrCast(&face5))) or face5 == null) return face;
+        defer safeRelease(face5);
+        const f5 = face5.?;
+        const vt = f5.lpVtbl.*;
+        if ((vt.HasVariations orelse return face)(f5) == c.FALSE) return face;
+
+        var values: [16]c.DWRITE_FONT_AXIS_VALUE = undefined;
+        const n: u32 = @min((vt.GetFontAxisValueCount orelse return face)(f5), values.len);
+        if (c.FAILED((vt.GetFontAxisValues orelse return face)(f5, &values, n))) return face;
+
+        var resource: ?*c.IDWriteFontResource = null;
+        if (c.FAILED((vt.GetFontResource orelse return face)(f5, &resource)) or resource == null) return face;
+        defer safeRelease(resource);
+        const rvt = resource.?.lpVtbl.*;
+        var ranges: [16]c.DWRITE_FONT_AXIS_RANGE = undefined;
+        const range_count: u32 = @min((rvt.GetFontAxisCount orelse return face)(resource.?), ranges.len);
+        if (c.FAILED((rvt.GetFontAxisRanges orelse return face)(resource.?, &ranges, range_count))) return face;
+
+        var changed = false;
+        for (values[0..n]) |*v| {
+            for (self.font_axis_values[0..self.font_axis_count]) |u| {
+                if (u.axisTag != v.axisTag) continue;
+                v.value = u.value;
+                for (ranges[0..range_count]) |r| {
+                    if (r.axisTag == v.axisTag) v.value = std.math.clamp(v.value, r.minValue, r.maxValue);
+                }
+                changed = true;
+            }
+        }
+        if (!changed) return face;
+
+        const simulations = (face.lpVtbl.*.GetSimulations orelse return face)(face);
+        var varied: ?*c.IDWriteFontFace5 = null;
+        if (c.FAILED((rvt.CreateFontFace orelse return face)(resource.?, simulations, &values, n, &varied)) or varied == null) return face;
+        safeRelease(@as(?*c.IDWriteFontFace, face));
+        return @ptrCast(varied.?);
+    }
+
     // Lazy-load Bold/Italic/Bold+Italic font faces on first use.
     // This improves startup time by ~10ms since styled fonts are rarely used at launch.
     // Must be called with mu locked.
@@ -2188,7 +2289,7 @@ pub const Renderer = struct {
                     var new_bold_face: ?*c.IDWriteFontFace = null;
                     const hr_cf = make_face_fn(bold_font.?, &new_bold_face);
                     if (!c.FAILED(hr_cf)) {
-                        self.bold_font_face = new_bold_face;
+                        self.bold_font_face = if (new_bold_face) |bf| self.withUserAxes(bf) else null;
                         if (applog.isEnabled()) applog.appLog("[dwrite] Bold font face created (lazy)\n", .{});
                     }
                 }
@@ -2212,7 +2313,7 @@ pub const Renderer = struct {
                     var new_italic_face: ?*c.IDWriteFontFace = null;
                     const hr_cf = make_face_fn(italic_font.?, &new_italic_face);
                     if (!c.FAILED(hr_cf)) {
-                        self.italic_font_face = new_italic_face;
+                        self.italic_font_face = if (new_italic_face) |itf| self.withUserAxes(itf) else null;
                         if (applog.isEnabled()) applog.appLog("[dwrite] Italic font face created (lazy)\n", .{});
                     }
                 }
@@ -2236,7 +2337,7 @@ pub const Renderer = struct {
                     var new_bold_italic_face: ?*c.IDWriteFontFace = null;
                     const hr_cf = make_face_fn(bold_italic_font.?, &new_bold_italic_face);
                     if (!c.FAILED(hr_cf)) {
-                        self.bold_italic_font_face = new_bold_italic_face;
+                        self.bold_italic_font_face = if (new_bold_italic_face) |bif| self.withUserAxes(bif) else null;
                         if (applog.isEnabled()) applog.appLog("[dwrite] Bold+Italic font face created (lazy)\n", .{});
                     }
                 }
@@ -2277,8 +2378,32 @@ pub const Renderer = struct {
         if (hrm != 0) return error.DWriteGetMetricsFailed;
 
         // Round up for cell size
-        const cw: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.widthIncludingTrailingWhitespace)))));
+        var cw: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.widthIncludingTrailingWhitespace)))));
         const ch: u32 = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(m.height)))));
+
+        // An axis-varied face (wdth, MONO) is wider or narrower than the
+        // TextFormat's default instance: take the cell width and the
+        // ascent/descent from the face the glyphs are drawn with.
+        if (self.base_face_varied) if (self.font_face) |face| {
+            const fvtbl = face.lpVtbl.*;
+            var fm: c.DWRITE_FONT_METRICS = undefined;
+            (fvtbl.GetMetrics orelse return error.DWriteFontFaceMissingGetMetrics)(face, &fm);
+            const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
+            if (du_per_em > 0.0) {
+                const px_per_du = self.font_em_size / du_per_em;
+                self.ascent_px = px_per_du * @as(f32, @floatFromInt(fm.ascent));
+                self.descent_px = px_per_du * @as(f32, @floatFromInt(fm.descent));
+                var codepoint = [1]c.UINT32{'M'};
+                var gid: [1]c.UINT16 = undefined;
+                var gm: [1]c.DWRITE_GLYPH_METRICS = undefined;
+                const get_gid = fvtbl.GetGlyphIndicesW orelse return error.DWriteFontFaceMissingGetGlyphIndicesW;
+                const get_gm = fvtbl.GetDesignGlyphMetrics orelse return error.DWriteGetMetricsFailed;
+                if (!c.FAILED(get_gid(face, &codepoint, 1, &gid)) and !c.FAILED(get_gm(face, &gid, 1, &gm, c.FALSE))) {
+                    const advance_px = px_per_du * @as(f32, @floatFromInt(gm[0].advanceWidth));
+                    cw = @intCast(@max(1, @as(i32, @intFromFloat(std.math.ceil(advance_px)))));
+                }
+            }
+        };
 
         self.cell_w_px = cw;
         self.cell_h_px = ch;
@@ -3071,6 +3196,21 @@ fn processSubtable(
     collectCoverageGlyphs(tbl, cov_abs, ascii_gids, out_triggers);
 }
 
+// Lookup-index bitset capacity (fonts typically have < 500 lookups).
+const GSUB_MAX_LOOKUPS = 4096;
+
+/// Mark the lookups a Feature table lists: featureParams(2) + lookupCount(2)
+/// + lookupListIndices[lookupCount].
+fn markGsubFeatureLookups(tbl: []const u8, feat_abs: usize, lookup_active: *[GSUB_MAX_LOOKUPS / 8]u8) void {
+    const lk_count = readU16BE(tbl, feat_abs + 2) orelse return;
+    for (0..lk_count) |li| {
+        const lk_idx = readU16BE(tbl, feat_abs + 4 + li * 2) orelse continue;
+        if (lk_idx < GSUB_MAX_LOOKUPS) {
+            lookup_active[lk_idx / 8] |= @as(u8, 1) << @intCast(lk_idx % 8);
+        }
+    }
+}
+
 /// Detect ligature trigger characters by introspecting the font's GSUB table.
 /// Matches macOS behavior (HarfBuzz `hb_ot_layout_collect_lookups` + `hb_ot_layout_lookup_collect_glyphs`).
 ///
@@ -3126,23 +3266,22 @@ fn detectLigTriggersFromGSUB(
     const feature_count = readU16BE(tbl, fl_abs) orelse return;
 
     // Determine which features are active.
-    // Default-on features: liga, calt, rlig, locl, ccmp (mirrors HarfBuzz defaults
-    // and macOS HBFTBridge.c). locl and ccmp can substitute ASCII glyphs in some
-    // fonts (e.g. locale-specific bracket forms) so we must mark their input
-    // glyphs as triggers to avoid divergent rendering between the ASCII fast
-    // path and HarfBuzz output.
-    // Default-off features: clig, dlig, ss01-ss20, cv01-cv99, etc.
+    // Default-on features: default_font_features (what shapeTextRunDWrite
+    // hands GetGlyphs, HarfBuzz's defaults as on macOS), plus rvrn, which
+    // DirectWrite applies to a variable font whatever list it gets (Cascadia
+    // Code's bold `$`). Any of them can substitute an ASCII glyph, so their
+    // input glyphs must be triggers or the ASCII fast path draws the glyph
+    // the shaper would have replaced.
+    // Default-off features: dlig, ss01-ss20, cv01-cv99, etc.
     // User features can override defaults (enable or disable).
-    const ot_liga: u32 = 0x6C696761; // 'liga' big-endian
-    const ot_calt: u32 = 0x63616C74; // 'calt' big-endian
-    const ot_rlig: u32 = 0x726C6967; // 'rlig' big-endian
-    const ot_locl: u32 = 0x6C6F636C; // 'locl' big-endian
-    const ot_ccmp: u32 = 0x63636D70; // 'ccmp' big-endian
+    const ot_rvrn: u32 = 0x7276726E; // 'rvrn' big-endian
     // Collect lookup indices from active features
     // We use a bitset for lookup indices (max 65536 lookups, but typically <500)
     // Use a fixed-size array as a simple bitset (supports up to 4096 lookups)
-    const MAX_LOOKUPS = 4096;
-    var lookup_active = std.mem.zeroes([MAX_LOOKUPS / 8]u8);
+    var lookup_active = std.mem.zeroes([GSUB_MAX_LOOKUPS / 8]u8);
+    // Active features by FeatureList index, for FeatureVariations below.
+    const MAX_FEATURES = 1024;
+    var feature_active = std.mem.zeroes([MAX_FEATURES / 8]u8);
 
     for (0..feature_count) |fi| {
         const rec_off = fl_abs + 2 + fi * 6;
@@ -3152,11 +3291,10 @@ fn detectLigTriggersFromGSUB(
         // Determine if this feature is active
         var active = false;
 
-        // Check default-on features
-        if (tag_be == ot_liga or tag_be == ot_calt or tag_be == ot_rlig or
-            tag_be == ot_locl or tag_be == ot_ccmp)
-        {
-            active = true; // default on
+        // Check default-on features (default_font_features are little-endian)
+        if (tag_be == ot_rvrn) active = true;
+        for (default_font_features) |tag_le| {
+            if (@byteSwap(tag_le) == tag_be) active = true;
         }
 
         // Check user overrides: DWrite tags are little-endian, GSUB tags are big-endian
@@ -3171,16 +3309,34 @@ fn detectLigTriggersFromGSUB(
         }
 
         if (!active) continue;
+        if (fi < MAX_FEATURES) feature_active[fi / 8] |= @as(u8, 1) << @intCast(fi % 8);
+        markGsubFeatureLookups(tbl, fl_abs + @as(usize, feat_off_rel), &lookup_active);
+    }
 
-        // Read Feature table: featureParams(2) + lookupCount(2) + lookupListIndices[lookupCount]
-        const feat_abs = fl_abs + @as(usize, feat_off_rel);
-        // Skip featureParams (2 bytes)
-        const lk_count = readU16BE(tbl, feat_abs + 2) orelse continue;
-
-        for (0..lk_count) |li| {
-            const lk_idx = readU16BE(tbl, feat_abs + 4 + li * 2) orelse continue;
-            if (lk_idx < MAX_LOOKUPS) {
-                lookup_active[lk_idx / 8] |= @as(u8, 1) << @intCast(lk_idx % 8);
+    // GSUB 1.1 FeatureVariations swap an active feature for an alternate
+    // table under axis conditions (Cascadia Code's rvrn replaces `$` at heavy
+    // weights). Conditions are not evaluated: every alternate of an active
+    // feature counts, so no instance of a variable font misses a trigger.
+    if ((readU16BE(tbl, 2) orelse 0) >= 1) {
+        const fv_off = readU32BE(tbl, 10) orelse 0;
+        if (fv_off != 0) {
+            const fv_abs = @as(usize, fv_off);
+            // The count comes from the font: never walk past the table (a
+            // malformed u32 would otherwise loop billions of times under mu).
+            const rec_count = @min(readU32BE(tbl, fv_abs + 4) orelse 0, (tbl.len -| (fv_abs + 8)) / 8);
+            for (0..rec_count) |ri| {
+                const fts_off = readU32BE(tbl, fv_abs + 8 + ri * 8 + 4) orelse continue;
+                if (fts_off == 0) continue;
+                const fts_abs = fv_abs + @as(usize, fts_off);
+                const sub_count = readU16BE(tbl, fts_abs + 4) orelse continue;
+                for (0..sub_count) |si| {
+                    const rec = fts_abs + 6 + si * 6;
+                    const feat_idx = readU16BE(tbl, rec) orelse continue;
+                    if (feat_idx >= MAX_FEATURES) continue;
+                    if ((feature_active[feat_idx / 8] & (@as(u8, 1) << @intCast(feat_idx % 8))) == 0) continue;
+                    const alt_off = readU32BE(tbl, rec + 2) orelse continue;
+                    markGsubFeatureLookups(tbl, fts_abs + @as(usize, alt_off), &lookup_active);
+                }
             }
         }
     }
@@ -3191,13 +3347,13 @@ fn detectLigTriggersFromGSUB(
 
     // Count active lookups for logging
     var active_count: u32 = 0;
-    for (0..@min(lookup_count, MAX_LOOKUPS)) |li| {
+    for (0..@min(lookup_count, GSUB_MAX_LOOKUPS)) |li| {
         if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) != 0) active_count += 1;
     }
     if (applog.isEnabled()) applog.appLog("[gsub] feature_count={d} lookup_count={d} active_lookups={d} tbl_size={d}\n", .{ feature_count, lookup_count, active_count, table_size });
 
     for (0..lookup_count) |li| {
-        if (li >= MAX_LOOKUPS) break;
+        if (li >= GSUB_MAX_LOOKUPS) break;
         // Check if this lookup is in our active set
         if ((lookup_active[li / 8] & (@as(u8, 1) << @intCast(li % 8))) == 0) continue;
 
@@ -3258,14 +3414,74 @@ fn L(comptime s: []const u8) [*:0]const u16 {
 }
 
 fn shapeForTest(r: *Renderer, text: []const u8, out: *[16]u32) []const u32 {
+    return shapeStyledForTest(r, text, 0, out);
+}
+
+fn shapeStyledForTest(r: *Renderer, text: []const u8, style_flags: u32, out: *[16]u32) []const u32 {
     var scalars: [16]u32 = undefined;
     for (text, 0..) |ch, i| scalars[i] = ch;
     var clusters: [16]u32 = undefined;
     var xa: [16]i32 = undefined;
     var xo: [16]i32 = undefined;
     var yo: [16]i32 = undefined;
-    const n = r.shapeTextRunDWrite(&scalars, text.len, 0, out, &clusters, &xa, &xo, &yo, out.len);
+    const n = r.shapeTextRunDWrite(&scalars, text.len, style_flags, out, &clusters, &xa, &xo, &yo, out.len);
     return out[0..@min(n, out.len)];
+}
+
+/// Printable ASCII the core may send down the fast path, and the operator
+/// characters programming ligatures are built from.
+const fast_path_operator_chars = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~0xw";
+
+/// The core draws a run with no lig-trigger scalar straight from the ASCII
+/// table (flush.zig, ASCII fast path), so every such run must shape to exactly
+/// the table's glyphs. Checks every printable pair and every operator triple.
+fn expectFastPathMatchesShaping(r: *Renderer, style_flags: u32, label: []const u8) !void {
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(r.getAsciiTableDWrite(style_flags, &gids, &advances, &triggers));
+    // A table that marks everything a trigger would pass vacuously.
+    var fast_path_chars: usize = 0;
+    for (0x20..0x7F) |t| {
+        if (triggers[t] == 0) fast_path_chars += 1;
+    }
+    try std.testing.expect(fast_path_chars >= 26);
+
+    var buf: [3]u8 = undefined;
+    var a: u8 = 0x20;
+    while (a <= 0x7E) : (a += 1) {
+        var b: u8 = 0x20;
+        while (b <= 0x7E) : (b += 1) {
+            buf = .{ a, b, 0 };
+            try expectRunMatchesTable(r, style_flags, label, buf[0..2], &gids, &triggers);
+        }
+    }
+    // Operator triples reach the contextual (calt) rules pairs cannot; the
+    // style faces share those rules, so the regular face carries them.
+    if (style_flags != 0) return;
+    for (fast_path_operator_chars) |x| for (fast_path_operator_chars) |y| for (fast_path_operator_chars) |z| {
+        buf = .{ x, y, z };
+        try expectRunMatchesTable(r, style_flags, label, &buf, &gids, &triggers);
+    };
+}
+
+fn expectRunMatchesTable(
+    r: *Renderer,
+    style_flags: u32,
+    label: []const u8,
+    text: []const u8,
+    gids: *const [128]u32,
+    triggers: *const [128]u8,
+) !void {
+    for (text) |ch| if (triggers[ch] != 0) return;
+    var out: [16]u32 = undefined;
+    const shaped = shapeStyledForTest(r, text, style_flags, &out);
+    var expected: [16]u32 = undefined;
+    for (text, 0..) |ch, i| expected[i] = gids[ch];
+    if (!std.mem.eql(u32, shaped, expected[0..text.len])) {
+        std.debug.print("{s} style={d}: \"{s}\" takes the ASCII fast path as {any} but shapes to {any}\n", .{ label, style_flags, text, expected[0..text.len], shaped });
+        return error.TestExpectedEqual;
+    }
 }
 
 // A [font] family entry's features reach DirectWrite: the config string goes
@@ -3284,7 +3500,7 @@ test "[font] family features change what DirectWrite shapes" {
     var off = try Renderer.initMetrics(alloc, hwnd, family ++ ":h14:-liga:-calt", 14, false);
     defer off.deinit();
     try std.testing.expectEqualStrings(family, off.font_name_utf8[0..off.font_name_utf8_len]);
-    try std.testing.expectEqual(@as(u32, 2), off.font_feature_count);
+    try std.testing.expectEqual(@as(u32, default_font_features.len), off.font_feature_count);
 
     var changed: usize = 0;
     for ([_][]const u8{ "->", "==", "!=", "<=", "=>" }) |s| {
@@ -3293,4 +3509,477 @@ test "[font] family features change what DirectWrite shapes" {
         if (!std.mem.eql(u32, shapeForTest(&plain, s, &a), shapeForTest(&off, s, &b))) changed += 1;
     }
     try std.testing.expect(changed > 0);
+}
+
+// A [font] family feature adds to DirectWrite's default features, the way
+// HarfBuzz treats it on macOS. Passing only the user's list to GetGlyphs
+// dropped the defaults, so `+liga` turned off the `calt` ligatures that
+// Cascadia Code and Fira Code draw.
+test "a [font] family feature keeps DirectWrite's default ligatures" {
+    const alloc = std.testing.allocator;
+    const hwnd = c.GetDesktopWindow() orelse return error.SkipZigTest;
+    const family = "Cascadia Code";
+
+    var plain = Renderer.initMetrics(alloc, hwnd, family ++ ":h14", 14, false) catch return error.SkipZigTest;
+    defer plain.deinit();
+    if (!std.mem.eql(u8, plain.font_name_utf8[0..plain.font_name_utf8_len], family)) return error.SkipZigTest;
+
+    var liga = try Renderer.initMetrics(alloc, hwnd, family ++ ":h14:+liga", 14, false);
+    defer liga.deinit();
+
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>" }) |s| {
+        var a: [16]u32 = undefined;
+        var b: [16]u32 = undefined;
+        try std.testing.expectEqualSlices(u32, shapeForTest(&plain, s, &a), shapeForTest(&liga, s, &b));
+    }
+}
+
+/// Loads `spec` and returns null (the caller skips) when DirectWrite picked a
+/// different family, i.e. the font is not installed.
+fn initInstalledFontForTest(alloc: std.mem.Allocator, family: []const u8, spec: []const u8) !?Renderer {
+    const hwnd = c.GetDesktopWindow() orelse return null;
+    var r = Renderer.initMetrics(alloc, hwnd, spec, 14, false) catch return missingTestFont(family);
+    if (!std.mem.eql(u8, r.font_name_utf8[0..r.font_name_utf8_len], family)) {
+        r.deinit();
+        return missingTestFont(family);
+    }
+    return r;
+}
+
+/// Families CI installs at a pinned version (.github/workflows/test.yml).
+/// Their feature sets are known, so tests may require every feature to act.
+const pinned_test_families = [_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono" };
+
+fn isPinnedTestFamily(family: []const u8) bool {
+    for (pinned_test_families) |f| {
+        if (std.mem.eql(u8, f, family)) return true;
+    }
+    return false;
+}
+
+/// Null (the test skips), unless ZONVIE_REQUIRE_TEST_FONTS is set and the
+/// family is one CI installs: then a missing font is a broken CI setup,
+/// not a reason to pass without testing anything.
+fn missingTestFont(family: []const u8) !?Renderer {
+    const required = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "ZONVIE_REQUIRE_TEST_FONTS") catch return null;
+    std.testing.allocator.free(required);
+    if (!isPinnedTestFamily(family)) return null;
+    std.debug.print("{s} is not installed but ZONVIE_REQUIRE_TEST_FONTS is set\n", .{family});
+    return error.TestFontMissing;
+}
+
+// The lig-trigger table read from GSUB must name every ASCII character a
+// shaper would substitute, for every feature setting and every style face;
+// a missed one draws the unsubstituted glyph through the fast path.
+test "the ASCII fast path agrees with DirectWrite for every feature setting and style" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { family: []const u8, features: []const []const u8 }{
+        // Variable: wght=700 is where rvrn swaps `$` (GSUB FeatureVariations).
+        .{ .family = "Cascadia Code", .features = &.{ "", ":+liga", ":-calt", ":-liga:-calt", ":+zero", ":+ss02", ":+ss19", ":+ss20", ":+case", ":-rclt", ":wght=200", ":wght=700", ":wght=700:-calt" } },
+        .{ .family = "Fira Code", .features = &.{ "", ":+liga", ":-calt", ":+zero", ":+ss01", ":+ss05", ":+cv01", ":+cv14", ":+onum" } },
+        .{ .family = "JetBrains Mono", .features = &.{ "", ":-calt", ":+zero", ":+ss01", ":+cv01", ":+cv99" } },
+        .{ .family = "Consolas", .features = &.{ "", ":+dlig", ":+ss01", ":+onum", ":+salt" } },
+        .{ .family = "Bahnschrift", .features = &.{ "", ":wdth=75", ":wght=700" } },
+    };
+    var ran: usize = 0;
+    for (cases) |case| {
+        for (case.features) |feat| {
+            var spec_buf: [96]u8 = undefined;
+            const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14{s}", .{ case.family, feat });
+            var r = (try initInstalledFontForTest(alloc, case.family, spec)) orelse continue;
+            defer r.deinit();
+            // Every style face for the default and the ligature-off specs
+            // (Cascadia's bold `$` showed only under -calt); a feature spec
+            // exercises the same trigger code, so the regular face suffices.
+            const all_styles = [_]u32{ 0, Renderer.STYLE_BOLD, Renderer.STYLE_ITALIC, Renderer.STYLE_BOLD | Renderer.STYLE_ITALIC };
+            const styles: []const u32 = if (feat.len == 0 or std.mem.endsWith(u8, feat, "-calt")) &all_styles else all_styles[0..1];
+            for (styles) |style| {
+                try expectFastPathMatchesShaping(&r, style, spec);
+            }
+            ran += 1;
+        }
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+fn asciiGlyphIdsForTest(r: *Renderer, style_flags: u32) ![128]u32 {
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(r.getAsciiTableDWrite(style_flags, &gids, &advances, &triggers));
+    return gids;
+}
+
+/// What a glyph looks like on screen: its coverage (heavier outlines cover
+/// more) and a hash of the bitmap (a slanted or reshaped outline changes it).
+const GlyphLook = struct { ink: u64, hash: u64 };
+
+fn glyphLookForTest(r: *Renderer, ch: u8, style_flags: u32) !GlyphLook {
+    const gids = try asciiGlyphIdsForTest(r, style_flags);
+    var bmp = std.mem.zeroes(core.GlyphBitmap);
+    try r.rasterizeGlyphByIdDWrite(gids[ch], style_flags, &bmp);
+    const px = bmp.pixels orelse return .{ .ink = 0, .hash = 0 };
+    const stride: usize = @intCast(@abs(bmp.pitch));
+    const row_bytes: usize = @as(usize, bmp.width) * @max(bmp.bytes_per_pixel, 1);
+    var ink: u64 = 0;
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(std.mem.asBytes(&bmp.width));
+    hasher.update(std.mem.asBytes(&bmp.height));
+    for (0..bmp.height) |y| {
+        const row = px[y * stride ..][0..row_bytes];
+        for (row) |b| ink += b;
+        hasher.update(row);
+    }
+    return .{ .ink = ink, .hash = hasher.final() };
+}
+
+fn shapedAdvanceForTest(r: *Renderer, ch: u8) i32 {
+    var scalars = [1]u32{ch};
+    var gid: [4]u32 = undefined;
+    var clusters: [4]u32 = undefined;
+    var xa: [4]i32 = undefined;
+    var xo: [4]i32 = undefined;
+    var yo: [4]i32 = undefined;
+    _ = r.shapeTextRunDWrite(&scalars, 1, 0, &gid, &clusters, &xa, &xo, &yo, gid.len);
+    return xa[0];
+}
+
+// `wght=N` in a [font] family entry moves a variable font's outline: values
+// past the axis clamp to its limit, and a tag the font has no axis for (or a
+// plain feature) leaves the default instance alone.
+test "a wght axis value moves the DirectWrite outline and clamps to the axis range" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    const Look = struct {
+        fn of(spec: []const u8) !GlyphLook {
+            var r = (try initInstalledFontForTest(std.testing.allocator, family, spec)) orelse return error.SkipZigTest;
+            defer r.deinit();
+            return glyphLookForTest(&r, 'H', 0);
+        }
+    };
+    _ = alloc;
+    const default_look = try Look.of(family ++ ":h14");
+    const light = try Look.of(family ++ ":h14:wght=200");
+    const heavy = try Look.of(family ++ ":h14:wght=700");
+    try std.testing.expect(heavy.ink > default_look.ink);
+    try std.testing.expect(default_look.ink > light.ink);
+    try std.testing.expectEqual(heavy, try Look.of(family ++ ":h14:wght=100000"));
+    try std.testing.expectEqual(light, try Look.of(family ++ ":h14:wght=1"));
+    try std.testing.expectEqual(default_look, try Look.of(family ++ ":h14:ZZZZ=5:+liga"));
+}
+
+// The ASCII fast path draws with the advances in the ASCII table, so they
+// must be the varied instance's: Bahnschrift's wdth axis narrows its glyphs.
+test "the ASCII table's advances follow the variation instance" {
+    const alloc = std.testing.allocator;
+    const family = "Bahnschrift";
+    var wide = (try initInstalledFontForTest(alloc, family, family ++ ":h14")) orelse return error.SkipZigTest;
+    defer wide.deinit();
+    var narrow = (try initInstalledFontForTest(alloc, family, family ++ ":h14:wdth=75")) orelse return error.SkipZigTest;
+    defer narrow.deinit();
+
+    const narrow_shaped = shapedAdvanceForTest(&narrow, 'a');
+    try std.testing.expect(narrow_shaped < shapedAdvanceForTest(&wide, 'a'));
+    var gids: [128]u32 = undefined;
+    var advances: [128]i32 = undefined;
+    var triggers: [128]u8 = undefined;
+    try std.testing.expect(narrow.getAsciiTableDWrite(0, &gids, &advances, &triggers));
+    // The table and GetGlyphPlacements scale design units along different
+    // float paths; each truncates to 26.6, so allow one unit.
+    try std.testing.expect(@abs(narrow_shaped - advances['a']) <= 1);
+
+    // The grid cell is measured from the varied face too, or glyphs would
+    // overflow (wider instance) or leave gaps (narrower) in their cells.
+    try std.testing.expect(narrow.cellW() < wide.cellW());
+    const narrow_m: f32 = @as(f32, @floatFromInt(shapedAdvanceForTest(&narrow, 'M'))) / 64.0;
+    try std.testing.expectEqual(@as(u32, @intFromFloat(@ceil(narrow_m))), narrow.cellW());
+}
+
+// Bold, Italic and BoldItalic are distinct faces: a real file (Consolas,
+// JetBrains Mono), a named instance of a variable font (Cascadia Code) or a
+// DirectWrite simulation. A plain feature in the entry must not reset a
+// named instance to the default weight.
+test "bold, italic and bold-italic faces draw differently from the regular face" {
+    const alloc = std.testing.allocator;
+    const specs = [_]struct { family: []const u8, spec: []const u8 }{
+        .{ .family = "Cascadia Code", .spec = "Cascadia Code:h14" },
+        .{ .family = "Cascadia Code", .spec = "Cascadia Code:h14:+liga" },
+        .{ .family = "Consolas", .spec = "Consolas:h14" },
+        .{ .family = "JetBrains Mono", .spec = "JetBrains Mono:h14" },
+    };
+    var ran: usize = 0;
+    for (specs) |s| {
+        var r = (try initInstalledFontForTest(alloc, s.family, s.spec)) orelse continue;
+        defer r.deinit();
+        const regular = try glyphLookForTest(&r, 'H', 0);
+        const bold = try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD);
+        const italic = try glyphLookForTest(&r, 'H', Renderer.STYLE_ITALIC);
+        const bold_italic = try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD | Renderer.STYLE_ITALIC);
+        if (bold.ink <= regular.ink or italic.hash == regular.hash or bold_italic.hash == bold.hash or bold_italic.hash == italic.hash) {
+            std.debug.print("{s}: regular={any} bold={any} italic={any} bold_italic={any}\n", .{ s.spec, regular, bold, italic, bold_italic });
+            return error.TestExpectedEqual;
+        }
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+// An axis in the entry applies to every face, as macOS applies it: under
+// `wght=300` the Bold face is the same 300 instance as the regular one.
+test "a wght entry sets the weight of every style face" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    var r = (try initInstalledFontForTest(alloc, family, family ++ ":h14:wght=300")) orelse return error.SkipZigTest;
+    defer r.deinit();
+    try std.testing.expectEqual(try glyphLookForTest(&r, 'H', 0), try glyphLookForTest(&r, 'H', Renderer.STYLE_BOLD));
+}
+
+// With every ligature feature off, a run shapes to one cmap glyph per
+// character, the same glyphs the ASCII table holds.
+test "-liga:-calt shapes the ASCII table's glyphs one per character" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    var r = (try initInstalledFontForTest(alloc, family, family ++ ":h14:-liga:-calt")) orelse return error.SkipZigTest;
+    defer r.deinit();
+    const gids = try asciiGlyphIdsForTest(&r, 0);
+    for ([_][]const u8{ "->", "==", "!=", "<=", "=>", "===", "www" }) |s| {
+        var buf: [16]u32 = undefined;
+        const shaped = shapeForTest(&r, s, &buf);
+        try std.testing.expectEqual(s.len, shaped.len);
+        for (s, shaped) |ch, g| try std.testing.expectEqual(gids[ch], g);
+    }
+}
+
+// A feature's value is honored: `zero` swaps the digit zero for its
+// alternate, `zero=0` and `-zero` keep the default.
+test "zero picks the alternate zero and zero=0 keeps the default" {
+    const alloc = std.testing.allocator;
+    const family = "Cascadia Code";
+    const Zero = struct {
+        fn of(spec: []const u8) !u32 {
+            var r = (try initInstalledFontForTest(std.testing.allocator, family, spec)) orelse return error.SkipZigTest;
+            defer r.deinit();
+            var buf: [16]u32 = undefined;
+            return shapeForTest(&r, "0", &buf)[0];
+        }
+    };
+    _ = alloc;
+    const default_zero = try Zero.of(family ++ ":h14");
+    try std.testing.expect(try Zero.of(family ++ ":h14:+zero") != default_zero);
+    try std.testing.expectEqual(default_zero, try Zero.of(family ++ ":h14:zero=0"));
+    try std.testing.expectEqual(default_zero, try Zero.of(family ++ ":h14:-zero"));
+}
+
+/// Programming ligatures in monospace fonts: calt sequences and liga pairs.
+const ligature_samples = [_][]const u8{ "->", "==", "!=", "<=", "=>", "===", "!==", "<=>", "->>", "&&", "||", "::", "//", "/*", "www", "0xF" };
+
+// flush.zig maps each shaped glyph to a grid column through its cluster and
+// suppresses calt placeholders by position; both assume a monospace ligature
+// font keeps one glyph per character, in order, each one cell wide.
+test "a monospace ligature keeps one glyph per cell in cluster order" {
+    const alloc = std.testing.allocator;
+    var ran: usize = 0;
+    for ([_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono" }) |family| {
+        var spec_buf: [64]u8 = undefined;
+        const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14", .{family});
+        var r = (try initInstalledFontForTest(alloc, family, spec)) orelse continue;
+        defer r.deinit();
+        const cell_advance = shapedAdvanceForTest(&r, 'a');
+        const gids = try asciiGlyphIdsForTest(&r, 0);
+        var ligated: usize = 0;
+        for (ligature_samples) |s| {
+            var scalars: [16]u32 = undefined;
+            for (s, 0..) |ch, i| scalars[i] = ch;
+            var out: [16]u32 = undefined;
+            var clusters: [16]u32 = undefined;
+            var xa: [16]i32 = undefined;
+            var xo: [16]i32 = undefined;
+            var yo: [16]i32 = undefined;
+            const n = r.shapeTextRunDWrite(&scalars, s.len, 0, &out, &clusters, &xa, &xo, &yo, out.len);
+            try std.testing.expectEqual(s.len, n);
+            for (0..n) |i| {
+                try std.testing.expectEqual(@as(u32, @intCast(i)), clusters[i]);
+                try std.testing.expectEqual(cell_advance, xa[i]);
+                if (out[i] != gids[s[i]]) ligated += 1;
+            }
+        }
+        // The samples must actually ligate, or this proves nothing.
+        try std.testing.expect(ligated > 0);
+        ran += 1;
+    }
+    if (ran == 0) return error.SkipZigTest;
+}
+
+/// Whether a GSUB feature tag is one a user picks in a [font] family entry to
+/// change how characters look: stylistic sets, character variants and the
+/// common alternates.
+fn isCharacterFeatureForTest(tag: [4]u8) bool {
+    const digits = std.ascii.isDigit(tag[2]) and std.ascii.isDigit(tag[3]);
+    if (digits and std.mem.eql(u8, tag[0..2], "ss")) return true;
+    if (digits and std.mem.eql(u8, tag[0..2], "cv")) return true;
+    for ([_]*const [4]u8{ "zero", "onum", "case", "salt", "dlig" }) |t| {
+        if (std.mem.eql(u8, &tag, t)) return true;
+    }
+    return false;
+}
+
+/// The distinct character-feature tags in the regular face's GSUB FeatureList.
+fn characterFeaturesForTest(r: *Renderer, out: *[160][4]u8) !usize {
+    const face = r.font_face orelse return error.NoFont;
+    const fvtbl = face.lpVtbl.*;
+    var data: ?*const anyopaque = null;
+    var size: c.UINT32 = 0;
+    var ctx: ?*anyopaque = null;
+    var exists: c.BOOL = c.FALSE;
+    const hr = (fvtbl.TryGetFontTable orelse return error.NoGsub)(face, packTag("GSUB"), &data, &size, &ctx, &exists);
+    defer if (ctx != null) (fvtbl.ReleaseFontTable orelse unreachable)(face, ctx);
+    if (c.FAILED(hr) or exists == c.FALSE or data == null) return 0;
+    const tbl = @as([*]const u8, @ptrCast(data.?))[0..size];
+    const fl = @as(usize, readU16BE(tbl, 6) orelse return 0);
+    const count = readU16BE(tbl, fl) orelse return 0;
+    var n: usize = 0;
+    for (0..count) |i| {
+        const at = fl + 2 + i * 6;
+        if (at + 4 > tbl.len) break;
+        const tag = tbl[at..][0..4].*;
+        if (!isCharacterFeatureForTest(tag)) continue;
+        const seen = for (out[0..n]) |t| {
+            if (std.mem.eql(u8, &t, &tag)) break true;
+        } else false;
+        if (seen or n == out.len) continue;
+        out[n] = tag;
+        n += 1;
+    }
+    return n;
+}
+
+fn shapeScalarsForTest(r: *Renderer, scalars: []const u32, out: *[16]u32) []const u32 {
+    var clusters: [16]u32 = undefined;
+    var xa: [16]i32 = undefined;
+    var xo: [16]i32 = undefined;
+    var yo: [16]i32 = undefined;
+    const n = r.shapeTextRunDWrite(scalars.ptr, scalars.len, 0, out, &clusters, &xa, &xo, &yo, out.len);
+    return out[0..@min(n, out.len)];
+}
+
+/// Text a character feature may act on beyond ASCII pairs: ligatures,
+/// fractions, Latin-1 and Latin Extended-A (Consolas's ss01 Eng), combining
+/// accents (Cascadia's `case`), Greek and Cyrillic (JetBrains Mono's cv99)
+/// and the control pictures (Cascadia's ss20).
+fn characterFeatureCorpusForTest(buf: *[1024][4]u32) [][4]u32 {
+    var n: usize = 0;
+    for (ligature_samples ++ [_][]const u8{ "1/2", "10/31", "0x0", "#{", "{|", "[|", ".=", "..", "...", "~>", "<~", "%%" }) |s| {
+        buf[n] = .{ 0, 0, 0, 0 };
+        for (s[0..@min(s.len, 4)], 0..) |ch, i| buf[n][i] = ch;
+        n += 1;
+    }
+    var cp: u32 = 0xA1;
+    while (cp <= 0x17F) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x2400;
+    while (cp <= 0x2426) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x0300;
+    while (cp <= 0x030C) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    cp = 0x0391;
+    while (cp <= 0x045F) : (cp += 1) {
+        buf[n] = .{ cp, 0, 0, 0 };
+        n += 1;
+    }
+    return buf[0..n];
+}
+
+/// A shaped run kept for comparison: up to 16 glyph ids.
+const ShapedForTest = struct {
+    glyphs: [16]u32,
+    len: u8,
+
+    fn init(shaped: []const u32) ShapedForTest {
+        var s: ShapedForTest = .{ .glyphs = undefined, .len = @intCast(shaped.len) };
+        @memcpy(s.glyphs[0..shaped.len], shaped);
+        return s;
+    }
+
+    fn eql(self: *const ShapedForTest, shaped: []const u32) bool {
+        return std.mem.eql(u32, self.glyphs[0..self.len], shaped);
+    }
+};
+
+fn scalarsOf(entry: *const [4]u32) []const u32 {
+    const len = std.mem.indexOfScalar(u32, entry, 0) orelse 4;
+    return entry[0..len];
+}
+
+// Every stylistic set, character variant and alternate the font carries
+// (read from its GSUB, so none is left out) must reach DirectWrite, changing
+// how something shapes, and must keep the ASCII fast path in agreement: a
+// feature that substitutes a character the trigger table misses would draw
+// the default glyph through the fast path.
+test "every stylistic set and character variant changes shaping and keeps the fast path correct" {
+    const alloc = std.testing.allocator;
+    var ran: usize = 0;
+    for ([_][]const u8{ "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas" }) |family| {
+        var spec_buf: [96]u8 = undefined;
+        // `+liga` is a no-op feature that still makes GetGlyphs take the
+        // explicit default list, so base and feature differ in the tag alone.
+        var base = (try initInstalledFontForTest(alloc, family, try std.fmt.bufPrint(&spec_buf, "{s}:h14:+liga", .{family}))) orelse continue;
+        defer base.deinit();
+        var tags: [160][4]u8 = undefined;
+        const tag_count = try characterFeaturesForTest(&base, &tags);
+
+        var corpus_buf: [1024][4]u32 = undefined;
+        const corpus = characterFeatureCorpusForTest(&corpus_buf);
+
+        // The baseline never changes across tags: shape it once per family.
+        const pair_count = 95 * 95;
+        const base_shapes = try alloc.alloc(ShapedForTest, pair_count + corpus.len);
+        defer alloc.free(base_shapes);
+        for (0..pair_count) |i| {
+            const pair = [2]u8{ @intCast(0x20 + i / 95), @intCast(0x20 + i % 95) };
+            var out: [16]u32 = undefined;
+            base_shapes[i] = .init(shapeForTest(&base, &pair, &out));
+        }
+        for (corpus, 0..) |*entry, i| {
+            var out: [16]u32 = undefined;
+            base_shapes[pair_count + i] = .init(shapeScalarsForTest(&base, scalarsOf(entry), &out));
+        }
+
+        for (tags[0..tag_count]) |tag| {
+            const spec = try std.fmt.bufPrint(&spec_buf, "{s}:h14:+{s}", .{ family, &tag });
+            var r = (try initInstalledFontForTest(alloc, family, spec)) orelse return error.TestUnexpectedResult;
+            defer r.deinit();
+
+            var gids: [128]u32 = undefined;
+            var advances: [128]i32 = undefined;
+            var triggers: [128]u8 = undefined;
+            try std.testing.expect(r.getAsciiTableDWrite(0, &gids, &advances, &triggers));
+
+            var changed: usize = 0;
+            for (0..pair_count) |i| {
+                const pair = [2]u8{ @intCast(0x20 + i / 95), @intCast(0x20 + i % 95) };
+                var with: [16]u32 = undefined;
+                if (!base_shapes[i].eql(shapeForTest(&r, &pair, &with))) changed += 1;
+                try expectRunMatchesTable(&r, 0, spec, &pair, &gids, &triggers);
+            }
+            for (corpus, 0..) |*entry, i| {
+                var with: [16]u32 = undefined;
+                if (!base_shapes[pair_count + i].eql(shapeScalarsForTest(&r, scalarsOf(entry), &with))) changed += 1;
+            }
+            if (changed == 0) {
+                std.debug.print("{s}: enabling the feature changed nothing it shapes\n", .{spec});
+                // An OS font's version is not pinned; a feature acting only
+                // outside the corpus there is not a regression.
+                if (isPinnedTestFamily(family)) return error.TestExpectedEqual;
+            }
+            ran += 1;
+        }
+    }
+    if (ran == 0) return error.SkipZigTest;
 }

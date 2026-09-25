@@ -823,6 +823,17 @@ final class GlyphAtlas {
         }
     }
 
+    /// Pack an axis for zonvie_ft_hb_font_set_variation_axes, which keeps a
+    /// fractional design coordinate (Skia's wght runs 0.48-3.2).
+    private static func fontAxis(_ axis: FontInstanceAxes.Axis) -> zonvie_font_axis {
+        let t = axis.tag
+        return zonvie_font_axis(
+            tag: (CChar(bitPattern: UInt8(t >> 24 & 0xFF)), CChar(bitPattern: UInt8(t >> 16 & 0xFF)),
+                  CChar(bitPattern: UInt8(t >> 8 & 0xFF)), CChar(bitPattern: UInt8(t & 0xFF))),
+            value: Float(axis.value)
+        )
+    }
+
     /// Use kCTFontVariationAttribute to nudge CoreText into selecting the variable
     /// font file.  Always returns the varied CTFont — for static fonts the
     /// variation dictionary is silently ignored and createHbFtFont_locked will
@@ -906,9 +917,11 @@ final class GlyphAtlas {
         // the generation-checked publication below.
         os_unfair_lock_unlock(&mu)
         var newBase: LoadedHbFtFont?
+        var baseSource = baseFont
         if let hint {
             let baseFaceIdx = ctFontFaceIndex(hint) & 0xFFFF
             newBase = createHbFtFontBorrowed(for: hint, px: px, faceIndex: baseFaceIdx)
+            if newBase != nil { baseSource = hint }
         }
         if newBase == nil {
             newBase = createHbFtFontBorrowed(for: baseFont, px: px)
@@ -917,11 +930,26 @@ final class GlyphAtlas {
         let newItalic = italic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
         let newBoldItalic = boldItalic.flatMap { createHbFtFontBorrowed(for: $0, px: px) }
 
-        for loaded in [newBase, newBold, newItalic, newBoldItalic] {
-            guard let loaded, !features.isEmpty else { continue }
-            features.withUnsafeBufferPointer { buf in
-                zonvie_ft_hb_font_set_variations(loaded.handle, buf.baseAddress, buf.count)
-                zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+        let userAxes = Self.extractVariationAxes(from: features).map {
+            FontInstanceAxes.Axis(tag: $0.tag, value: Double($0.value))
+        }
+        let faces: [(LoadedHbFtFont?, CTFont?)] = [
+            (newBase, baseSource), (newBold, bold), (newItalic, italic), (newBoldItalic, boldItalic),
+        ]
+        for case let (loaded?, ctFont?) in faces {
+            // A trait face of a variable font is an instance of the same
+            // file; FreeType needs its coordinates (see FontInstanceAxes).
+            let axes = FontInstanceAxes.merged(instance: FontInstanceAxes.coordinates(of: ctFont), user: userAxes)
+            if !axes.isEmpty {
+                let variations = axes.map(Self.fontAxis)
+                variations.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_variation_axes(loaded.handle, buf.baseAddress, buf.count)
+                }
+            }
+            if !features.isEmpty {
+                features.withUnsafeBufferPointer { buf in
+                    zonvie_ft_hb_font_set_features(loaded.handle, buf.baseAddress, buf.count)
+                }
             }
         }
         os_unfair_lock_lock(&mu)
