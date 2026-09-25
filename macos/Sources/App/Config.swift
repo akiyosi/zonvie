@@ -346,19 +346,13 @@ struct ZonvieConfig {
 
     /// Parse the newline-separated font candidate list emitted by the
     /// core (zonvie_config_values.font_family). Each line is
-    /// `<name>\t<size>[\t<features>]`; missing or zero size falls back
-    /// to 14.0. Empty / malformed lines are skipped.
+    /// `<name>\t<size>[\t<features>]`, read by the core; missing or zero
+    /// size falls back to 14.0. Empty / malformed lines are skipped.
     static func parseFontFamilyList(_ raw: String) -> [FontCandidate] {
         var out: [FontCandidate] = []
         for line in raw.split(separator: "\n", omittingEmptySubsequences: true) {
-            let parts = line.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
-            guard parts.count >= 2 else { continue }
-            let name = String(parts[0])
-            if name.isEmpty { continue }
-            let parsedSize = Double(parts[1]) ?? 0
-            let size = parsedSize > 0 ? parsedSize : 14.0
-            let features = parts.count >= 3 ? String(parts[2]) : ""
-            out.append(FontCandidate(name: name, size: size, features: features))
+            guard let c = ZonvieCore.parseFontCandidate(String(line), defaultSize: 14.0, sizeExplicit: false) else { continue }
+            out.append(FontCandidate(name: c.name, size: c.size, features: c.features))
         }
         return out
     }

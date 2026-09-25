@@ -2581,29 +2581,11 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
             // Iterate newline-separated candidates
             var line_it = std.mem.splitScalar(u8, s, '\n');
             while (line_it.next()) |entry| {
-                if (entry.len == 0) continue;
-
-                var cand_name: []const u8 = "";
-                var cand_pt: f32 = config_pt;
-                var cand_features: []const u8 = "";
-
-                if (std.mem.indexOfScalar(u8, entry, '\t')) |tab1| {
-                    cand_name = entry[0..tab1];
-                    const after_name = entry[tab1 + 1 ..];
-                    if (std.mem.indexOfScalar(u8, after_name, '\t')) |tab2| {
-                        const size_str = after_name[0..tab2];
-                        cand_features = after_name[tab2 + 1 ..];
-                        const parsed_pt = std.fmt.parseFloat(f32, size_str) catch 0;
-                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
-                    } else {
-                        const parsed_pt = std.fmt.parseFloat(f32, after_name) catch 0;
-                        cand_pt = if (eff_size_explicit or parsed_pt <= 0) config_pt else parsed_pt;
-                    }
-                } else {
-                    continue; // no tab => skip invalid entry
-                }
-
-                if (cand_name.len == 0) continue;
+                // The core's reading of a candidate line, shared with macOS.
+                const cand = core.config.parseFontCandidateLine(entry, config_pt, eff_size_explicit) orelse continue;
+                const cand_name = cand.name;
+                const cand_pt = cand.point_size;
+                const cand_features = cand.features;
 
                 // Try loading this candidate (with the picked weight/slant when
                 // this payload came from the font picker).

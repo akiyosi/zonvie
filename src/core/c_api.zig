@@ -1892,6 +1892,50 @@ pub export fn zonvie_core_popupmenu_top(
     return popup_placement.top(anchor_top, anchor_height, popup_height, ref_bottom, screen_top);
 }
 
+/// One OpenType feature in the layout of zonvie_font_feature (zonvie_hbft.h).
+pub const FontFeatureC = extern struct { tag: [4]u8, value: i32 };
+
+/// Parse a comma-separated OpenType feature list ("+liga,-calt,ss01=2,zero")
+/// into `out`, at most `cap` entries; returns how many. Tokens that are not a
+/// feature are skipped. The frontends each carried a parser of their own, and
+/// they disagreed on whitespace, `h14`-shaped tags and negative values. Pure.
+pub export fn zonvie_core_parse_font_features(
+    list: ?[*]const u8,
+    len: usize,
+    out: ?[*]FontFeatureC,
+    cap: usize,
+) callconv(.c) usize {
+    const text = (list orelse return 0)[0..len];
+    const dst = out orelse return 0;
+    var parsed: [32]redraw_handler.FontFeature = undefined;
+    const n = redraw_handler.parseFontFeatureList(text, parsed[0..@min(cap, parsed.len)]);
+    for (parsed[0..n], 0..) |f, i| dst[i] = .{ .tag = f.tag, .value = f.value };
+    return n;
+}
+
+/// One `<name>\t<size>[\t<features>]` candidate line, read as
+/// config.parseFontCandidateLine reads it: the name is `line[0..name_len]`,
+/// the feature list `line[features_offset..][0..features_len]`. False for a
+/// line with no name or no size field. Pure.
+pub export fn zonvie_core_parse_font_candidate(
+    line: ?[*]const u8,
+    len: usize,
+    default_pt: f32,
+    size_explicit: bool,
+    out_name_len: ?*usize,
+    out_point_size: ?*f32,
+    out_features_offset: ?*usize,
+    out_features_len: ?*usize,
+) callconv(.c) bool {
+    const text = (line orelse return false)[0..len];
+    const cand = config.parseFontCandidateLine(text, default_pt, size_explicit) orelse return false;
+    if (out_name_len) |p| p.* = cand.name.len;
+    if (out_point_size) |p| p.* = cand.point_size;
+    if (out_features_offset) |p| p.* = if (cand.features.len == 0) len else @intFromPtr(cand.features.ptr) - @intFromPtr(text.ptr);
+    if (out_features_len) |p| p.* = cand.features.len;
+    return true;
+}
+
 /// A saved window origin clamped into an area: each axis to [min, max - size].
 /// Direction-free, so the same call serves Y-up and Y-down. Pure.
 pub export fn zonvie_core_clamp_window_origin(

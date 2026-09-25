@@ -7485,4 +7485,6 @@ test "a layer frame is refused once the core republishes the root rows beside it
 test {
     // input.zig's pure helpers (the colon/semicolon swap) run with this suite.
     _ = @import("input.zig");
+    // DirectWrite shaping with [font] family features (skips without the font).
+    _ = @import("renderer/dwrite_d2d_renderer.zig");
 }
