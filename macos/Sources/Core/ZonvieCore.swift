@@ -97,6 +97,17 @@ final class ZonvieCore {
     /// registered; see `terminalView`'s observer.
     private var sharedResources: SharedRenderResources?
 
+    /// The glyph atlas every surface of this session samples. The core's atlas
+    /// callbacks and the font setting use it directly: it used to be reached
+    /// through the main view's renderer, so it answered nothing without one.
+    var sharedAtlas: GlyphAtlas? { sharedResources?.atlas }
+
+    /// The scroll state every surface of this session scrolls through.
+    let scrollModel = SessionScrollModel()
+
+    /// The keyDown path and key-repeat synthesis every surface shares.
+    let keyInput = SessionKeyInput()
+
     static var appLogEnabled = false
     /// When true, only [perf...] tagged lines reach the on_log callback at the
     /// core boundary. Set from config.log.perfOnly during configureLogging.
@@ -704,6 +715,8 @@ final class ZonvieCore {
 
     init() {
         flushRetryQueue.setSpecific(key: flushRetryQueueKey, value: 1)
+        scrollModel.core = self
+        keyInput.core = self
         let unmanaged = Unmanaged.passUnretained(self)
         self.ctxPtr = unmanaged.toOpaque()
 
@@ -1192,8 +1205,7 @@ final class ZonvieCore {
                     // vertices with new UVs that don't match the old front atlas.
                     // Note: do NOT use hasAtlasStateRequiringAttention() here — on success,
                     // atlasModified is true which would also trigger abort.
-                    if let renderer = me.terminalView?.renderer,
-                       renderer.glyphAtlas.needsAtlasRebuildPending {
+                    if me.sharedAtlas?.needsAtlasRebuildPending == true {
                         me.sharedResources?.abortFlushTransaction()
                         zonvie_core_abort_flush(corePtr)
                         me.externalFlushAborted = true
@@ -1454,7 +1466,7 @@ final class ZonvieCore {
             on_shape_text_run: { ctx, scalars, scalarCount, styleFlags, outGlyphIDs, outClusters, outXAdvance, outXOffset, outYOffset, outCap in
                 guard let ctx else { return 0 }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                guard let atlas = me.sharedAtlas else { return 0 }
                 return atlas.shapeTextRun(
                     scalars: scalars!, scalarCount: scalarCount,
                     styleFlags: styleFlags,
@@ -1467,14 +1479,14 @@ final class ZonvieCore {
             on_rasterize_glyph_by_id: { ctx, glyphID, styleFlags, outBitmap in
                 guard let ctx else { return 0 }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                guard let atlas = me.sharedAtlas else { return 0 }
                 return atlas.rasterizeByGlyphID(glyphID: glyphID, styleFlags: styleFlags, outBitmap: outBitmap!) ? 1 : 0
             },
 
             on_get_ascii_table: { ctx, styleFlags, outGlyphIDs, outXAdvances, outLigTriggers in
                 guard let ctx else { return 0 }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                guard let atlas = me.terminalView?.renderer.glyphAtlas else { return 0 }
+                guard let atlas = me.sharedAtlas else { return 0 }
                 return atlas.getAsciiTable(
                     styleFlags: styleFlags,
                     outGlyphIDs: outGlyphIDs!, outXAdvances: outXAdvances!,
@@ -2566,8 +2578,7 @@ final class ZonvieCore {
     /// selection with the font currently rendered. Must run on the main thread.
     private func openFontPicker() {
         let current: NSFont
-        if let view = terminalView {
-            let atlas = view.renderer.glyphAtlas
+        if let atlas = sharedAtlas {
             current = NSFont(name: atlas.currentFontName, size: atlas.currentPointSize)
                 ?? NSFont.userFixedPitchFont(ofSize: atlas.currentPointSize)
                 ?? NSFont.systemFont(ofSize: atlas.currentPointSize)
@@ -2585,8 +2596,7 @@ final class ZonvieCore {
     /// Called whenever "*" is observed (picker request); picking a font later
     /// overwrites this value.
     private func resetGuifontToCurrent() {
-        guard let view = terminalView else { return }
-        let atlas = view.renderer.glyphAtlas
+        guard let atlas = sharedAtlas else { return }
         let name = atlas.currentFontName
         guard !name.isEmpty else { return }
         let size = Int(atlas.currentPointSize.rounded())
@@ -3852,8 +3862,9 @@ final class ZonvieCore {
 
         // atlas.setFont() is thread-safe (protected by os_unfair_lock) and
         // is safe to call regardless of who holds grid_mu.
-        view.renderer.glyphAtlas.setFont(name: name, pointSize: CGFloat(size), features: features)
-        let fontGeneration = view.renderer.glyphAtlas.fontGenerationSnapshot()
+        let atlas = view.renderer.shared.atlas
+        atlas.setFont(name: name, pointSize: CGFloat(size), features: features)
+        let fontGeneration = atlas.fontGenerationSnapshot()
 
         // Stage the generation synchronously, before this redraw bracket can
         // submit/commit external rows. The main-queue presentation callback
@@ -5087,6 +5098,7 @@ final class ZonvieCore {
             }
 
             gridView.mainTerminalView = mainView  // Enable key event forwarding
+            gridView.core = self
 
             self.attachExternalGridView(gridId: gridId, window: window, gridView: gridView, kind: specialKind, geometry: geometry)
 
@@ -9174,7 +9186,7 @@ final class ZonvieCore {
         case .externalRoot, .externalLayer, .deferred: break
         default: _ = beginMainFlushIfNeeded()
         }
-        terminalView?.clearScrollOffsetForGrid(gridId, rowsDelta: rowsDelta)
+        scrollModel.clearScrollOffsetForGrid(gridId, rowsDelta: rowsDelta)
     }
 
     // MARK: - IME Off

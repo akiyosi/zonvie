@@ -2348,6 +2348,79 @@ pub const PaintRowRange = struct {
 };
 
 /// External window state for win_external_pos grids
+/// The buffers one surface paints with: per-row GPU vertex buffers, the
+/// cursor and scrollbar overlays, the shift scratch, the per-paint lists, and
+/// where the cursor was last painted. The main window and every external
+/// window hold one; they used to be two sets of fields under two sets of
+/// names, and the shared row pass took them one pointer at a time.
+pub const SurfacePaintState = struct {
+    // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
+    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
+    row_vb_retained_bytes: usize = 0,
+    // Persistent scratch for shiftRowVBs, sized to abs(vb_shift) before each
+    // shift, so large scrolls never overflow a fixed stack array. Holds
+    // shallow copies: the GPU buffers belong to row_vbs.
+    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
+    // Persistent destination for linear dirty-row/range union during scroll.
+    scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
+    cursor_vb: ?*c.ID3D11Buffer = null,
+    cursor_vb_bytes: usize = 0,
+    scrollbar_vb: ?*c.ID3D11Buffer = null,
+    scrollbar_vb_bytes: usize = 0,
+    // Per-paint lists, reused so a paint does not allocate.
+    dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
+    rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
+    present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
+    // Row the cursor was last painted into back_tex, erased before a shift.
+    last_painted_cursor_row: ?u32 = null,
+    /// Which grid that row belongs to. A surface draws one cursor, but the
+    /// grid that owns it changes as the user moves between windows, and the
+    /// row is that grid's OWN row -- so a row remembered from the last paint
+    /// cannot be placed with the grid holding the cursor now.
+    last_painted_cursor_grid: i64 = 0,
+
+    pub fn deinit(self: *SurfacePaintState, alloc: std.mem.Allocator, row_vb_budget: *RowVBPhysicalBudget) void {
+        releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
+        self.row_vbs.deinit(alloc);
+        self.row_vbs_shift_scratch.deinit(alloc);
+        self.scroll_rows_merge_scratch.deinit(alloc);
+        self.dirty_row_keys.deinit(alloc);
+        self.rows_to_draw.deinit(alloc);
+        self.present_rects.deinit(alloc);
+        if (self.cursor_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        self.cursor_vb = null;
+        self.cursor_vb_bytes = 0;
+        if (self.scrollbar_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
+        self.scrollbar_vb = null;
+        self.scrollbar_vb_bytes = 0;
+    }
+};
+
+/// One surface's overlay scrollbar: fade, drag, track-repeat and the viewport
+/// it last showed. The main window and every external window hold one, and
+/// ui/scrollbar.zig drives them all; they used to be two sets of fields with
+/// two sets of functions, which had drifted (fade speed, pending-line test,
+/// capture order, which grid a drag read).
+pub const ScrollbarState = struct {
+    visible: bool = false,
+    alpha: f32 = 0.0,
+    target_alpha: f32 = 0.0,
+    hover: bool = false,
+    dragging: bool = false,
+    drag_start_y: i32 = 0,
+    drag_start_topline: i64 = 0,
+    repeat_dir: i8 = 0, // -1 = page up, 1 = page down, 0 = none
+    repeat_timer: c.UINT_PTR = 0,
+    hide_timer: c.UINT_PTR = 0,
+    last_scroll_time: i64 = 0, // ms, drag RPC throttle
+    pending_line: i64 = -1, // throttled drag target, -1 = none
+    pending_use_bottom: bool = false,
+    // Viewport last shown (-1 = never).
+    last_viewport_topline: i64 = -1,
+    last_viewport_line_count: i64 = -1,
+    last_viewport_botline: i64 = -1,
+};
+
 pub const ExternalWindow = struct {
     hwnd: c.HWND,
     window_wake_cookie: usize,
@@ -2392,19 +2465,7 @@ pub const ExternalWindow = struct {
     cursor_blink_state: bool = true, // Cursor blink state (true = visible)
     flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
-    // Per-window GPU vertex buffers for cursor and scrollbar overlays (row-mode rendering).
-    cursor_vb: ?*c.ID3D11Buffer = null,
-    cursor_vb_bytes: usize = 0,
-    // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
-    row_vb_retained_bytes: usize = 0,
-    // Persistent scratch buffer for shiftRowVBs; sized to abs(vb_shift) before each shift.
-    // Owned here (not on stack) so large scrolls never overflow a fixed stack array.
-    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
-    // Persistent destination for linear dirty-row/range union during scroll.
-    scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
-    scrollbar_vb: ?*c.ID3D11Buffer = null,
-    scrollbar_vb_bytes: usize = 0,
+    paint: SurfacePaintState = .{},
 
     // When true, suppress tryResizeGrid in WM_SIZE handler (programmatic resize from grid_resize).
     suppress_resize_callback: bool = false,
@@ -2421,14 +2482,6 @@ pub const ExternalWindow = struct {
     // This counter ensures ext_win isn't freed until all paint operations complete.
     paint_ref_count: u32 = 0,
 
-    // Scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
-    // See TripleBufferedSurface.
-    last_painted_cursor_row: ?u32 = null,
-    /// Which grid the row above belongs to. A surface draws one cursor, but the
-    /// grid that owns it changes as the user moves between windows, and the row
-    /// is that grid's OWN row — so a row remembered from the last paint cannot
-    /// be placed with the grid holding the cursor now.
-    last_painted_cursor_grid: i64 = 0,
     /// Whether this surface's committed cursor set holds any vertices, recorded
     /// at paint. The blink timer needs to know whether a toggle changes a pixel
     /// here, and `last_painted_cursor_row` cannot answer that: it is cleared on
@@ -2443,24 +2496,7 @@ pub const ExternalWindow = struct {
     /// keeps the unconditional behaviour rather than silently losing its blink.
     has_committed_cursor: bool = true,
 
-    // Scrollbar state for external windows
-    scrollbar_visible: bool = false,
-    scrollbar_alpha: f32 = 0.0,
-    scrollbar_target_alpha: f32 = 0.0,
-    scrollbar_dragging: bool = false,
-    scrollbar_drag_start_y: i32 = 0,
-    scrollbar_drag_start_topline: i64 = 0,
-    scrollbar_repeat_timer: usize = 0,
-    scrollbar_repeat_dir: i8 = 0,
-    scrollbar_pending_line: i64 = -1,
-    scrollbar_pending_use_bottom: bool = false,
-    scrollbar_hover: bool = false,
-    scrollbar_last_update: i64 = 0, // Timestamp for throttling
-    // Last viewport this window's scrollbar was updated for, as App keeps
-    // for the main window (-1 = never).
-    last_viewport_topline: i64 = -1,
-    last_viewport_line_count: i64 = -1,
-    last_viewport_botline: i64 = -1,
+    scrollbar: ScrollbarState = .{},
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
     // A copy just succeeded, so the button shows a checkmark instead of the
@@ -2505,35 +2541,15 @@ pub const ExternalWindow = struct {
         // Now safe to release D3D resources
         self.paint_scratch.deinit(alloc);
         self.paint_row_ranges.deinit(alloc);
-        self.paint_dirty_row_keys.deinit(alloc);
-        self.paint_rows_to_draw.deinit(alloc);
-        self.paint_present_rects.deinit(alloc);
         self.flat_draw_scratch.deinit(alloc);
         // Release GPU VBs from row_verts before deinitCpuState frees the list.
         for (self.surface.row_verts.items) |*rv| {
             if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
         }
         self.surface.deinitCpuState(alloc);
-        // Release GPU VBs from TBS row_vbs.
-        releaseRowVBs(
-            self.row_vbs.items,
-            row_vb_budget,
-            &self.row_vb_retained_bytes,
-        );
-        self.row_vbs.deinit(alloc);
-        // Scratch holds copies of RowVB entries during a shift; the GPU
-        // buffers are owned by row_vbs, never by the scratch, so just free
-        // the list backing without touching .vb pointers.
-        self.row_vbs_shift_scratch.deinit(alloc);
-        self.scroll_rows_merge_scratch.deinit(alloc);
+        self.paint.deinit(alloc, row_vb_budget);
         self.tbs.deinit(alloc); // Handles slot release + pool deinit
         if (self.vb) |vb| {
-            _ = vb.lpVtbl.*.Release.?(vb);
-        }
-        if (self.cursor_vb) |vb| {
-            _ = vb.lpVtbl.*.Release.?(vb);
-        }
-        if (self.scrollbar_vb) |vb| {
             _ = vb.lpVtbl.*.Release.?(vb);
         }
         self.renderer.deinit();
@@ -3427,6 +3443,32 @@ pub fn flushAtlasUploads(
     }
     const pending = atlas.flushPendingAtlasUploadsSinceToD3D(gpu, upload_cursor);
     return .{ .cursor = pending.cursor, .success = pending.success };
+}
+
+/// The core's glow settings, read once per paint before the atlas reader
+/// transaction: core calls stay outside it so atlas-reset admission never
+/// waits on grid_mu from the paint path.
+pub const GlowPaintSettings = struct { enabled: bool, intensity: f32, radius_scale: f32 };
+
+pub fn glowPaintSettings(app: *App) GlowPaintSettings {
+    const cp = app.corep orelse return .{ .enabled = false, .intensity = 0.8, .radius_scale = 1.0 };
+    return .{
+        .enabled = core.zonvie_core_get_glow_enabled(cp),
+        .intensity = core.zonvie_core_get_glow_intensity(cp),
+        .radius_scale = core.zonvie_core_get_glow_radius_scale(cp),
+    };
+}
+
+/// The atlas generation a paint uploads against, read under the atlas's own
+/// mutex (ensureGlyph bumps it from the core thread). `consume_reset` also
+/// takes the pending-reset request, which only the main paint acts on (the
+/// re-seed it drives is the main surface's).
+pub fn atlasPaintGeneration(atlas: *dwrite_d2d.Renderer, consume_reset: bool) struct { generation: u64, reset: bool } {
+    atlas.mu.lockUncancelable(core.clock.io());
+    defer atlas.mu.unlock(core.clock.io());
+    const reset = consume_reset and atlas.atlas_reset_pending;
+    if (reset) atlas.atlas_reset_pending = false;
+    return .{ .generation = atlas.atlas_reset_generation, .reset = reset };
 }
 
 pub const SharedAtlasSync = struct {
@@ -4532,6 +4574,64 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
 /// clearing and regenerating the row set. Returns the strip's rect for the
 /// present damage, or null when the track clamps away. Both drivers did the
 /// two steps in this order.
+/// A paint's retained-back damage, built the same way by both drivers:
+/// reserved up front, row runs as spans, then single rects, clamped to the
+/// back buffer and compacted. A rect that cannot be added makes the frame
+/// present in full (`full`) rather than let a truncated list consume dirty
+/// state. What an EMPTY list means is the present gate's question, not this.
+pub const PresentRectBuilder = struct {
+    list: *std.ArrayListUnmanaged(c.RECT),
+    alloc: std.mem.Allocator,
+    full: bool = false,
+
+    pub fn begin(list: *std.ArrayListUnmanaged(c.RECT), alloc: std.mem.Allocator, capacity: usize) PresentRectBuilder {
+        list.clearRetainingCapacity();
+        var b: PresentRectBuilder = .{ .list = list, .alloc = alloc };
+        list.ensureTotalCapacity(alloc, capacity) catch {
+            b.full = true;
+        };
+        return b;
+    }
+
+    pub fn add(self: *PresentRectBuilder, rect: c.RECT) void {
+        if (self.full) return;
+        self.list.append(self.alloc, rect) catch {
+            self.full = true;
+        };
+    }
+
+    pub fn addOpt(self: *PresentRectBuilder, rect: ?c.RECT) void {
+        if (rect) |r| self.add(r);
+    }
+
+    /// One span per run of consecutive rows (rowSpanRects).
+    pub fn addRowSpans(self: *PresentRectBuilder, rows: []const u32, y_offset: i32, right: i32, row_h_px: i32) void {
+        if (self.full or rows.len == 0) return;
+        self.list.ensureUnusedCapacity(self.alloc, rows.len) catch {
+            self.full = true;
+            return;
+        };
+        self.list.items.len += render_pipeline_helpers.rowSpanRects(c.RECT, rows, y_offset, right, row_h_px, self.list.unusedCapacitySlice());
+    }
+
+    /// Drop what lies past the back buffer: a rect that clamps to EMPTY inside
+    /// the presenter marks every swapchain buffer fully damaged
+    /// (clampBackDamageRect), and producers name rows past it after a shrink.
+    pub fn clamp(self: *PresentRectBuilder, width: u32, height: u32) void {
+        if (self.list.items.len == 0) return;
+        self.list.items.len = render_pipeline_helpers.clampPresentRects(c.RECT, self.list.items, @intCast(width), @intCast(height));
+    }
+
+    /// Clamp, then compact in place: O(n log n) sort plus a linear safe-union
+    /// pass (an all-pairs scan reached O(rows^2) for alternating dirty rows).
+    pub fn finish(self: *PresentRectBuilder, width: u32, height: u32) void {
+        self.clamp(width, height);
+        if (self.list.items.len > 1) {
+            self.list.items.len = render_pipeline_helpers.compactDamageRects(c.RECT, self.list.items);
+        }
+    }
+};
+
 pub fn drawScrollbarOverlayOverUnderlay(
     g: *d3d11.Renderer,
     vb_ptr: *?*c.ID3D11Buffer,
@@ -5011,6 +5111,20 @@ pub fn drawSurfaceRowFrame(
 /// What a surface owns across paints for its row pass: the row-frame state
 /// plus the growable row VB list and the scratch the scroll shift uses.
 pub const RowPassSurface = struct {
+    pub fn of(tbs: *TripleBufferedSurface, paint: *SurfacePaintState) RowPassSurface {
+        return .{
+            .tbs = tbs,
+            .row_vbs = &paint.row_vbs,
+            .row_vbs_shift_scratch = &paint.row_vbs_shift_scratch,
+            .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
+            .row_vb_retained_bytes = &paint.row_vb_retained_bytes,
+            .cursor_vb = &paint.cursor_vb,
+            .cursor_vb_bytes = &paint.cursor_vb_bytes,
+            .last_painted_cursor_row = &paint.last_painted_cursor_row,
+            .last_painted_cursor_grid = &paint.last_painted_cursor_grid,
+        };
+    }
+
     tbs: *TripleBufferedSurface,
     row_vbs: *std.ArrayListUnmanaged(RowVB),
     row_vbs_shift_scratch: *std.ArrayListUnmanaged(RowVB),
@@ -5441,39 +5555,23 @@ pub const App = struct {
     // captures record this when mutated so onFlushEnd can discard only data
     // produced by a failed transaction while preserving older valid seeds.
     core_flush_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    // GPU row vertex buffers (UI thread owned, corresponds to TBS committed set row_map slots).
-    row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
-    row_vb_retained_bytes: usize = 0,
+    // The main window's draw buffers; every external window holds its own.
+    paint: SurfacePaintState = .{},
+    // Shared by every surface's row buffers.
     row_vb_budget: RowVBPhysicalBudget = .{},
     row_vb_budget_failed: bool = false,
-    // Persistent scratch for shiftRowVBs; see ExternalWindow.row_vbs_shift_scratch.
-    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
-    // Persistent destination for linear dirty-row/range union during scroll.
-    scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
     // DXGI scroll state is now bundled in TBS (flush_scroll_* → pending_scroll_* → PaintSnapshot).
     // See TripleBufferedSurface.flush_scroll_rect / pending_scroll_rect / PaintSnapshot.scroll_rect.
     // Last cursor rectangle in client pixels (derived from cursor_verts).
     last_cursor_rect_px: ?c.RECT = null,
-    // Row index where cursor was last painted into back_tex.
-    // Used by scrollBackTex to erase cursor ghost before shifting.
-    last_painted_cursor_row: ?u32 = null,
-    /// Which grid the row above belongs to; see the same field on ExternalWindow.
-    last_painted_cursor_grid: i64 = 0,
 
     // Scratch buffer for WM_PAINT(row): per-row vertex copy.
     // Reused to avoid per-paint alloc/free.
     row_tmp_verts: std.ArrayListUnmanaged(Vertex) = .empty,
 
     // WM_PAINT(row) persistent buffers (avoid per-frame alloc/free)
-    wm_paint_dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
     wm_paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .empty,
-    wm_paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
-    wm_paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
     paint_retry: PaintRetryState = .{},
-
-    // Cursor overlay VB for row-mode (avoid extra g.drawEx per paint).
-    cursor_vb: ?*c.ID3D11Buffer = null,
-    cursor_vb_bytes: usize = 0,
 
     cursor: ?Cursor = null,
 
@@ -5670,15 +5768,8 @@ pub const App = struct {
     cursor_blink_on_ms: u32 = 0,
     cursor_blink_off_ms: u32 = 0,
 
-    // Scrollbar state (custom D3D11 overlay scrollbar)
-    scrollbar_visible: bool = false,
-    scrollbar_hide_timer: c.UINT_PTR = 0,
-    scrollbar_alpha: f32 = 0.0, // Current alpha (for fade animation)
-    scrollbar_target_alpha: f32 = 0.0, // Target alpha
-    scrollbar_dragging: bool = false, // Currently dragging knob
-    scrollbar_drag_start_y: i32 = 0, // Mouse Y at drag start
-    scrollbar_drag_start_topline: i64 = 0, // topline at drag start
-    scrollbar_hover: bool = false, // Mouse hovering over scrollbar area
+    // The main window's overlay scrollbar (ui/scrollbar.zig).
+    scrollbar: ScrollbarState = .{},
     cursor_is_hand: bool = false, // URL hover: hand cursor
     url_cache_grid: i64 = 0,
     url_cache_row: i32 = 0,
@@ -5691,17 +5782,8 @@ pub const App = struct {
     // Non-blocking cursor position cache (IME candidate-window positioning).
     // Single slot: IME only ever needs "the current cursor position".
     cursor_pos_cache: struct { grid_id: i64 = -1, row: i32 = -1, col: i32 = -1 } = .{},
-    scrollbar_repeat_dir: i8 = 0, // -1 = page up, 1 = page down, 0 = none
-    scrollbar_repeat_timer: c.UINT_PTR = 0, // Timer for repeat scroll
-    scrollbar_last_scroll_time: i64 = 0, // Last scroll time in ms (for throttling)
-    scrollbar_pending_line: i64 = -1, // Pending scroll line (throttled)
-    scrollbar_pending_use_bottom: bool = false, // Pending scroll uses bottom alignment
-    last_viewport_topline: i64 = -1,
-    last_viewport_line_count: i64 = -1,
-    last_viewport_botline: i64 = -1,
     // Scrollbar vertex buffer
-    scrollbar_vb: ?*c.ID3D11Buffer = null,
-    scrollbar_vb_bytes: usize = 0,
+
 
     // ext_cmdline: current firstc character (':', '/', '?', etc.)
     cmdline_firstc: u8 = 0,
@@ -6235,39 +6317,12 @@ pub const App = struct {
 
         // Triple-buffered surface cleanup (handles slot release + pool deinit)
         self.tbs.deinit(self.alloc);
-        // Release GPU VBs for TBS row_vbs
-        releaseRowVBs(
-            self.row_vbs.items,
-            &self.row_vb_budget,
-            &self.row_vb_retained_bytes,
-        );
-        self.row_vbs.deinit(self.alloc);
-        // Scratch holds shallow copies during a shift; GPU buffers belong to
-        // row_vbs, so only free the list storage.
-        self.row_vbs_shift_scratch.deinit(self.alloc);
-        self.scroll_rows_merge_scratch.deinit(self.alloc);
+        self.paint.deinit(self.alloc, &self.row_vb_budget);
 
         // WM_PAINT(row) scratch
         self.row_tmp_verts.deinit(self.alloc);
-        self.wm_paint_dirty_row_keys.deinit(self.alloc);
         self.wm_paint_rects_snapshot.deinit(self.alloc);
-        self.wm_paint_rows_to_draw.deinit(self.alloc);
-        self.wm_paint_present_rects.deinit(self.alloc);
         self.row_valid.deinit(self.alloc);
-
-        // Release cursor VB (row-mode overlay)
-        if (self.cursor_vb) |p| {
-            const rel = p.*.lpVtbl.*.Release orelse null;
-            if (rel) |f| _ = f(p);
-            self.cursor_vb = null;
-            self.cursor_vb_bytes = 0;
-        }
-
-        // Release scrollbar VB (main window)
-        if (self.scrollbar_vb) |vb| {
-            _ = vb.lpVtbl.*.Release.?(vb);
-            self.scrollbar_vb = null;
-        }
 
         // Free remaining ArrayListUnmanaged backing buffers
         self.paint_rects.deinit(self.alloc);

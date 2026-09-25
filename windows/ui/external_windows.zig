@@ -606,13 +606,12 @@ fn drawNormalExternalSurface(
     scrollbar_alpha: f32,
     dirty_row_keys: []u32,
     force_full: bool,
-    glow_enabled: bool,
-    glow_intensity: f32,
+    glow: app_mod.GlowPaintSettings,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
 ) !bool {
     const log_enabled = applog.isEnabled();
-    ext_win.paint_present_rects.clearRetainingCapacity();
+    ext_win.paint.present_rects.clearRetainingCapacity();
     // The flat path redraws every row; the row path narrows this.
     ext_win.paint_drew_root_rows = true;
 
@@ -633,8 +632,7 @@ fn drawNormalExternalSurface(
             scrollbar_alpha,
             dirty_row_keys,
             force_full,
-            glow_enabled,
-            glow_intensity,
+            glow,
             tbs_snap,
             row_h_px_snapshot,
             restored_scrollbar_rect,
@@ -644,9 +642,9 @@ fn drawNormalExternalSurface(
     // Flat-mode fallback: snapshot-based flat draw (decorated surfaces or non-row-mode).
     _ = app_mod.resizeRowVBsForPaint(
         app.alloc,
-        &ext_win.row_vbs,
+        &ext_win.paint.row_vbs,
         &app.row_vb_budget,
-        &ext_win.row_vb_retained_bytes,
+        &ext_win.paint.row_vb_retained_bytes,
         0,
     );
     if (log_enabled) applog.appLog("[win] drawNormalExternalSurface: flat mode grid_id={d}\n", .{grid_id});
@@ -659,35 +657,13 @@ fn drawNormalExternalSurface(
         vert_count,
         cursor_blink_visible,
         &[_]app_mod.Vertex{},
-        glow_enabled,
-        glow_intensity,
+        glow.enabled,
+        glow.intensity,
     );
 
     // Keep the alpha overlay out of the full-content draw so flat↔row mode
     // transitions use the same clean-underlay contract.
-    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
-        var scrollbar_verts: [12]app_mod.Vertex = undefined;
-        const scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
-            app,
-            scrollbar_alpha,
-            grid_id,
-            @intCast(g.width),
-            @intCast(g.height),
-            &scrollbar_verts,
-            ext_win.dpi_scale,
-        );
-        if (scrollbar_vert_count != 0) {
-            if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                _ = try app_mod.drawScrollbarOverlayOverUnderlay(
-                    g,
-                    &ext_win.scrollbar_vb,
-                    &ext_win.scrollbar_vb_bytes,
-                    scrollbar_verts[0..scrollbar_vert_count],
-                    track_rect,
-                );
-            }
-        }
-    }
+    _ = try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.paint.scrollbar_vb, &ext_win.paint.scrollbar_vb_bytes);
     // Flat drawEx redraws/clears the complete retained back texture.
     return true;
 }
@@ -706,8 +682,7 @@ fn drawNormalExternalSurfaceRowMode(
     scrollbar_alpha: f32,
     dirty_row_keys: []u32,
     force_full: bool,
-    glow_enabled: bool,
-    glow_intensity: f32,
+    glow: app_mod.GlowPaintSettings,
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
     restored_scrollbar_rect: ?c.RECT,
@@ -745,11 +720,11 @@ fn drawNormalExternalSurfaceRowMode(
     // costs little. Placing each remembered row with its own grid would be the
     // narrower fix; it needs the surface coordinates of a grid that may no
     // longer be placed, which is more machinery than the case is worth.
-    const cursor_grid_changed = tbs_snap.cursor_layer_grid_id != ext_win.last_painted_cursor_grid;
+    const cursor_grid_changed = tbs_snap.cursor_layer_grid_id != ext_win.paint.last_painted_cursor_grid;
     const paint_policy = render_pipeline_helpers.paintPolicy(.{
         .force_full = force_full,
         .cursor_grid_changed = cursor_grid_changed,
-        .glow_enabled = glow_enabled,
+        .glow_enabled = glow.enabled,
         .opacity = g.opacity,
         // An external window keeps no back-buffer validity flag of its own, so
         // it asserts one; that is exactly what its previous bare
@@ -759,7 +734,7 @@ fn drawNormalExternalSurfaceRowMode(
     const force_full_rows = paint_policy.force_full_rows;
 
     // Build sorted, deduplicated rows_to_draw list in per-window scratch.
-    const rows_to_draw = &ext_win.paint_rows_to_draw;
+    const rows_to_draw = &ext_win.paint.rows_to_draw;
 
     const ext_rows = tbs_committed.rows;
     if (!app_mod.computeRowsToDraw(
@@ -771,7 +746,7 @@ fn drawNormalExternalSurfaceRowMode(
         ext_rows, // max_valid_row = total rows (no row_verts_len / rows mismatch on ext)
     )) return error.OutOfMemory;
 
-    const cursor_row_before = ext_win.last_painted_cursor_row;
+    const cursor_row_before = ext_win.paint.last_painted_cursor_row;
 
     // The rows the cursor overlay would otherwise erase: where the previous
     // cursor was baked into back_tex, and where this one lands. Repainting
@@ -842,7 +817,7 @@ fn drawNormalExternalSurfaceRowMode(
         !has_scrollbar_work and !any_layer_dirty and !has_scroll_work)
     {
         if (log_enabled) applog.appLog("[win] drawNormalExtRowMode: no dirty rows and no cursor, skip grid_id={d}\n", .{grid_id});
-        ext_win.paint_present_rects.clearRetainingCapacity();
+        ext_win.paint.present_rects.clearRetainingCapacity();
         return false;
     }
 
@@ -862,26 +837,15 @@ fn drawNormalExternalSurfaceRowMode(
     // layer rectangles are appended by the row pass under the lock its plan
     // runs in, the spans after the draws. The pass can grow the redraw set
     // (scroll ghosts, rows a layer was dragged onto), never past the row count.
-    const present_rects = &ext_win.paint_present_rects;
-    present_rects.clearRetainingCapacity();
-    present_rects.ensureTotalCapacity(
+    var present = app_mod.PresentRectBuilder.begin(
+        &ext_win.paint.present_rects,
         app.alloc,
         @as(usize, @max(rows_to_draw.items.len, ext_rows)) + 5 + tbs_snap.layers.len,
-    ) catch return error.OutOfMemory;
+    );
 
     // Shared with the main window. An external window's back_tex is always
     // valid, so preserving it is exactly "not a full redraw".
-    const pass = try app_mod.drawSurfaceRowPass(g, app, .{
-        .tbs = &ext_win.tbs,
-        .row_vbs = &ext_win.row_vbs,
-        .row_vbs_shift_scratch = &ext_win.row_vbs_shift_scratch,
-        .scroll_rows_merge_scratch = &ext_win.scroll_rows_merge_scratch,
-        .row_vb_retained_bytes = &ext_win.row_vb_retained_bytes,
-        .cursor_vb = &ext_win.cursor_vb,
-        .cursor_vb_bytes = &ext_win.cursor_vb_bytes,
-        .last_painted_cursor_row = &ext_win.last_painted_cursor_row,
-        .last_painted_cursor_grid = &ext_win.last_painted_cursor_grid,
-    }, .{
+    const pass = try app_mod.drawSurfaceRowPass(g, app, .of(&ext_win.tbs, &ext_win.paint), .{
         .snapshot = tbs_snap,
         .rows_to_draw = rows_to_draw,
         .row_vb_len = @intCast(tbs_committed.rows),
@@ -890,7 +854,7 @@ fn drawNormalExternalSurfaceRowMode(
         .layer_paint_full = force_full_rows,
         .cell_w_px = @intCast(@max(1, app.cell_w_px)),
         .layer_present = .{
-            .rects = present_rects,
+            .rects = present.list,
             .right = @intCast(g.width),
             .bottom = @intCast(draw_params.content_height),
         },
@@ -908,9 +872,9 @@ fn drawNormalExternalSurfaceRowMode(
             .force_full_rows = force_full_rows,
             .layer_layout_stale = false,
             .layer_commit_stale = false,
-            .glow = if (glow_enabled) app_mod.RowFrameGlow{
-                .intensity = glow_intensity,
-                .radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else 1.0,
+            .glow = if (glow.enabled) app_mod.RowFrameGlow{
+                .intensity = glow.intensity,
+                .radius_scale = glow.radius_scale,
                 .cursor_visible = cursor_blink_visible,
             } else null,
             .draw_params = draw_params,
@@ -938,16 +902,9 @@ fn drawNormalExternalSurfaceRowMode(
     // The row-run spans the main driver builds too (rowSpanRects), written
     // into the rows + 5 slots reserved before the layer plan above, which
     // publishes each drawn layer's rectangle into the same list.
-    present_rects.items.len += render_pipeline_helpers.rowSpanRects(
-        c.RECT,
-        rows_to_draw.items,
-        0,
-        @intCast(g.width),
-        row_h_px,
-        present_rects.unusedCapacitySlice(),
-    );
-    if (scroll_damage) |rect| present_rects.appendAssumeCapacity(rect);
-    if (restored_scrollbar_rect) |rect| present_rects.appendAssumeCapacity(rect);
+    present.addRowSpans(rows_to_draw.items, 0, @intCast(g.width), row_h_px);
+    present.addOpt(scroll_damage);
+    present.addOpt(restored_scrollbar_rect);
 
     // Cursor shape/blink changes can clear/redraw a row even when no content
     // row was dirty. Include both the old and new overlay rows.
@@ -961,15 +918,15 @@ fn drawNormalExternalSurfaceRowMode(
     // origin; see window.zig's cursor_rc_opt.)
     const cursor_rect_top_px: i32 = cursor_layer_y_px;
     if (cursor_row_before) |row| {
-        present_rects.appendAssumeCapacity(.{
+        present.add(.{
             .left = 0,
             .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
             .bottom = cursor_rect_top_px + @as(i32, @intCast(row + 1)) * row_h_px,
         });
     }
-    if (ext_win.last_painted_cursor_row) |row| {
-        present_rects.appendAssumeCapacity(.{
+    if (ext_win.paint.last_painted_cursor_row) |row| {
+        present.add(.{
             .left = 0,
             .top = cursor_rect_top_px + @as(i32, @intCast(row)) * row_h_px,
             .right = @intCast(g.width),
@@ -980,55 +937,18 @@ fn drawNormalExternalSurfaceRowMode(
     // Scrollbar overlay. Capture the clean, fully-composited strip after
     // bloom so restoring it on the next fade tick does not punch a no-glow
     // seam through the right edge.
-    if (app.config.scrollbar.enabled and scrollbar_alpha > 0.001) {
-        var scrollbar_verts: [12]app_mod.Vertex = undefined;
-        const scrollbar_vert_count = scrollbar.generateScrollbarVerticesForExternal(
-            app,
-            scrollbar_alpha,
-            grid_id,
-            @intCast(g.width),
-            @intCast(g.height),
-            &scrollbar_verts,
-            ext_win.dpi_scale,
-        );
-        if (scrollbar_vert_count != 0) {
-            if (scrollbar.getScrollbarTrackRectForExternal(@intCast(g.width), @intCast(g.height), ext_win.dpi_scale)) |track_rect| {
-                if (try app_mod.drawScrollbarOverlayOverUnderlay(
-                    g,
-                    &ext_win.scrollbar_vb,
-                    &ext_win.scrollbar_vb_bytes,
-                    scrollbar_verts[0..scrollbar_vert_count],
-                    track_rect,
-                )) |captured_rect| {
-                    present_rects.appendAssumeCapacity(captured_rect);
-                }
-            }
-        }
-    }
+    present.addOpt(try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.paint.scrollbar_vb, &ext_win.paint.scrollbar_vb_bytes));
 
-    // Clamp before compacting, as the main paint does. The producers above can
-    // name rows past the surface — a stale `cursor_row_before` after a shrink,
-    // a scroll rect, a restored scrollbar rect — and `clampBackDamageRect`
-    // answers a rect that clamps to EMPTY by marking every swapchain buffer
-    // fully damaged for the whole frame. Dropping it here keeps the present
-    // partial.
-    if (present_rects.items.len != 0) {
-        present_rects.items.len = render_pipeline_helpers.clampPresentRects(
-            c.RECT,
-            present_rects.items,
-            @intCast(g.width),
-            @intCast(g.height),
-        );
-    }
-
-    if (present_rects.items.len > 1) {
-        present_rects.items.len = render_pipeline_helpers.compactDamageRects(c.RECT, present_rects.items);
-    }
+    // The producers above can name rows past the surface -- a stale
+    // `cursor_row_before` after a shrink, a scroll rect, a restored scrollbar
+    // rect.
+    present.finish(g.width, g.height);
 
     // A custom shader writes the complete current swapchain buffer. Mark all
     // rotating buffers full so disabling the shader cannot expose stale shader
-    // pixels outside this frame's terminal dirty rectangles.
-    return force_full_rows or g.custom_shader_pipelines.items.len != 0;
+    // pixels outside this frame's terminal dirty rectangles. A rect that could
+    // not be added presents in full too; this used to fail the paint.
+    return force_full_rows or present.full or g.custom_shader_pipelines.items.len != 0;
 }
 
 pub fn onExternalWindow(ctx: ?*anyopaque, grid_id: i64, win: i64, rows: u32, cols: u32, start_row: i32, start_col: i32) callconv(.c) void {
@@ -2601,10 +2521,7 @@ pub export fn ExternalWndProc(
 
                     // Show scrollbar on vertical scroll if in scroll mode
                     if (!horizontal and app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
-                        scrollbar.showScrollbarForExternal(hwnd, h.win);
-                        // Auto-hide after delay
-                        const delay_ms: c.UINT = @intFromFloat(app.config.scrollbar.delay * 1000.0);
-                        _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE, delay_ms, null);
+                        scrollbar.show(app, scrollbar.externalSurface(h.win, h.grid_id));
                     }
                 }
                 return 0;
@@ -2634,7 +2551,7 @@ pub export fn ExternalWndProc(
                     // no chrome meaning and go straight to the editor.
                     if (msg == c.WM_LBUTTONDOWN) {
                         if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) return 0;
-                        if (scrollbar.scrollbarMouseDownForExternal(hwnd, app, ext_window.?, grid_id.?, x, y)) {
+                        if (scrollbar.mouseDown(app, scrollbar.externalSurface(ext_window.?, grid_id.?), x, y)) {
                             return 0;
                         }
                     }
@@ -2653,41 +2570,8 @@ pub export fn ExternalWndProc(
                     // not a window of its own, so the press has to say which
                     // grid it landed on -- Neovim trusts the id it is given.
                     const target = input.resolveSurfaceTarget(app, &ext_window.?.tbs, grid_id.?, false, x, y);
-                    // Another button pressed mid left-drag leaves the drag to
-                    // the left button: taking over the held state lost the
-                    // left release once this button was let go.
-                    const left_drag = app.mouse_button_held == 1;
-                    if (!left_drag) app.mouse_press_grid_id = target.grid_id;
-
-                    // Capture so a drag that leaves the window keeps arriving.
-                    // Not again mid left-drag: whether re-capturing notifies
-                    // WM_CAPTURECHANGED is not worth depending on.
-                    if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
-                    const button: [*:0]const u8 = switch (msg) {
-                        c.WM_RBUTTONDOWN => blk: {
-                            if (!left_drag) app.mouse_button_held = 2;
-                            break :blk "right";
-                        },
-                        c.WM_MBUTTONDOWN => blk: {
-                            if (!left_drag) app.mouse_button_held = 3;
-                            break :blk "middle";
-                        },
-                        // HIWORD(wParam) is XBUTTON1 (1) or XBUTTON2 (2), and
-                        // the ids are the main window's. It had no X handler, so
-                        // <X1Mouse>/<X2Mouse> did nothing here.
-                        c.WM_XBUTTONDOWN => blk: {
-                            const x1 = @as(u16, @truncate(wParam >> 16)) == 1;
-                            if (!left_drag) app.mouse_button_held = if (x1) 4 else 5;
-                            break :blk if (x1) "x1" else "x2";
-                        },
-                        else => blk: {
-                            app.mouse_button_held = 1;
-                            break :blk "left";
-                        },
-                    };
-                    input.sendMouseButton(app, target.grid_id, button, .press, target.x, target.y, wParam);
-                    // An X button message wants TRUE back.
-                    return if (msg == c.WM_XBUTTONDOWN) 1 else 0;
+                    input.pressEditorButton(app, hwnd, msg, wParam, target);
+                    return input.mouseButtonResult(msg);
                 }
             }
         },
@@ -2699,26 +2583,13 @@ pub export fn ExternalWndProc(
             if (app_mod.getApp(hwnd)) |app| {
                 // Same reason the editor drag must end: a held button left set
                 // here turns every later hover into a drag.
-                app.mouse_button_held = 0;
-                app.mouse_press_grid_id = 0;
+                input.cancelMouseButtons(app);
                 app.mu.lockUncancelable(core.clock.io());
                 var it = app.external_windows.iterator();
                 while (it.next()) |entry| {
                     const ew = entry.value_ptr.*;
                     if (ew.hwnd != hwnd) continue;
-                    // The drag is cancelled rather than committed: its pending
-                    // line was never confirmed by a mouse-up. Leaving
-                    // scrollbar_dragging set would make every later
-                    // button-up-less WM_MOUSEMOVE scroll the buffer.
-                    if (ew.scrollbar_dragging) {
-                        ew.scrollbar_dragging = false;
-                        ew.scrollbar_pending_line = -1;
-                    }
-                    if (ew.scrollbar_repeat_timer != 0 or ew.scrollbar_repeat_dir != 0) {
-                        _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
-                        ew.scrollbar_repeat_timer = 0;
-                        ew.scrollbar_repeat_dir = 0;
-                    }
+                    scrollbar.cancelPointer(scrollbar.externalSurface(ew, entry.key_ptr.*));
                     break;
                 }
                 app.mu.unlock(core.clock.io());
@@ -2732,15 +2603,7 @@ pub export fn ExternalWndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                const held = app.mouse_button_held;
-                const press_grid = app.mouse_press_grid_id;
-                // Another button let go mid left-drag: the drag, its capture
-                // and its release still belong to the left button.
-                const left_drag_continues = held == 1 and msg != c.WM_LBUTTONUP;
-                if (!left_drag_continues) {
-                    app.mouse_button_held = 0;
-                    app.mouse_press_grid_id = 0;
-                }
+                const rel = input.takeButtonRelease(app, msg);
 
                 app.mu.lockUncancelable(core.clock.io());
                 var grid_id: ?i64 = null;
@@ -2756,7 +2619,7 @@ pub export fn ExternalWndProc(
                 // the pending line with it. Release only after the scrollbar
                 // has committed its final position below, or a drag ends where
                 // it started.
-                defer if (!left_drag_continues) {
+                defer if (!rel.left_drag_continues) {
                     _ = c.ReleaseCapture();
                 };
 
@@ -2767,17 +2630,10 @@ pub export fn ExternalWndProc(
                     // The press chose the grid; the release must not re-choose
                     // it, or letting go outside the float ends the selection in
                     // the window behind it.
-                    const up_target = input.rebaseSurfaceTarget(app, &ext_window.?.tbs, grid_id.?, false, press_grid, x, y);
+                    const up_target = input.rebaseSurfaceTarget(app, &ext_window.?.tbs, grid_id.?, false, rel.press_grid, x, y);
                     if (msg != c.WM_LBUTTONUP) {
-                        if (editor_target) {
-                            const button: [*:0]const u8 = switch (msg) {
-                                c.WM_RBUTTONUP => "right",
-                                c.WM_XBUTTONUP => if (@as(u16, @truncate(wParam >> 16)) == 1) "x1" else "x2",
-                                else => "middle",
-                            };
-                            input.sendMouseButton(app, up_target.grid_id, button, .release, up_target.x, up_target.y, wParam);
-                        }
-                        return if (msg == c.WM_XBUTTONUP) 1 else 0;
+                        if (editor_target) input.releaseEditorButton(app, msg, wParam, rel, up_target);
+                        return input.mouseButtonResult(msg);
                     }
                     if (hitTestCopyButton(hwnd, app, grid_id.?, x, y)) {
                         if (copyExternalSurfaceText(hwnd, app, grid_id.?)) {
@@ -2796,13 +2652,13 @@ pub export fn ExternalWndProc(
                         }
                         return 0;
                     }
-                    const was_dragging_scrollbar = ext_window.?.scrollbar_dragging;
-                    scrollbar.scrollbarMouseUpForExternal(hwnd, app, ext_window.?, grid_id.?);
+                    const was_dragging_scrollbar = ext_window.?.scrollbar.dragging;
+                    scrollbar.mouseUp(app, scrollbar.externalSurface(ext_window.?, grid_id.?));
                     // A press the scrollbar claimed never reached the editor,
                     // so its release must not either -- Neovim would see a
                     // release with no press and move the cursor there.
-                    if (editor_target and !was_dragging_scrollbar and held == 1) {
-                        input.sendMouseButton(app, up_target.grid_id, "left", .release, up_target.x, up_target.y, wParam);
+                    if (editor_target and !was_dragging_scrollbar) {
+                        input.releaseEditorButton(app, msg, wParam, rel, up_target);
                     }
                     return 0;
                 }
@@ -2828,8 +2684,8 @@ pub export fn ExternalWndProc(
                     const ext_win = ext_window.?;
 
                     // Handle scrollbar dragging
-                    if (ext_win.scrollbar_dragging) {
-                        scrollbar.scrollbarMouseMoveForExternal(hwnd, app, ext_win, grid_id.?, y);
+                    if (ext_win.scrollbar.dragging) {
+                        scrollbar.mouseMove(app, scrollbar.externalSurface(ext_win, grid_id.?), y);
                         return 0;
                     }
 
@@ -2845,23 +2701,8 @@ pub export fn ExternalWndProc(
                     // included — the message must not vanish under it.
                     setMsgHover(app, ext_win, grid_id.?, true);
 
-                    // Check for scrollbar hover
-                    if (app.config.scrollbar.enabled and app.config.scrollbar.isHover()) {
-                        var client: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client);
-                        const hit = scrollbar.scrollbarHitTestForExternal(app, grid_id.?, client.right, client.bottom, x, y, ext_win.dpi_scale);
-                        if (hit != .none) {
-                            if (!ext_win.scrollbar_hover) {
-                                ext_win.scrollbar_hover = true;
-                                scrollbar.showScrollbarForExternal(hwnd, ext_win);
-                            }
-                        } else {
-                            if (ext_win.scrollbar_hover) {
-                                ext_win.scrollbar_hover = false;
-                                scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
-                            }
-                        }
-                    }
+                    // WM_MOUSELEAVE is tracked below on every move.
+                    _ = scrollbar.hover(app, scrollbar.externalSurface(ext_win, grid_id.?), x, y);
 
                     // Track mouse for WM_MOUSELEAVE
                     var tme: c.TRACKMOUSEEVENT = .{
@@ -2912,8 +2753,7 @@ pub export fn ExternalWndProc(
                         ext_win.copy_button_hover = false;
                         _ = c.InvalidateRect(hwnd, null, c.FALSE);
                     }
-                    ext_win.scrollbar_hover = false;
-                    scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
+                    scrollbar.leave(app, scrollbar.externalSurface(ext_win, grid_id.?));
                 }
             }
         },
@@ -2980,18 +2820,7 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (ext_window) |ext_win| {
-                    if (timer_id == app_mod.TIMER_SCROLLBAR_FADE) {
-                        scrollbar.updateScrollbarFadeForExternal(hwnd, app, ext_win);
-                        return 0;
-                    } else if (timer_id == app_mod.TIMER_SCROLLBAR_REPEAT) {
-                        if (grid_id != null and ext_win.scrollbar_repeat_dir != 0) {
-                            // Change to faster interval after first fire
-                            if (ext_win.scrollbar_repeat_timer != 0) {
-                                _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
-                                ext_win.scrollbar_repeat_timer = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_INTERVAL, null);
-                            }
-                            scrollbar.scrollbarPageScrollForExternal(app, grid_id.?, ext_win.scrollbar_repeat_dir);
-                        }
+                    if (scrollbar.onTimer(app, scrollbar.externalSurface(ext_win, grid_id.?), timer_id)) {
                         return 0;
                     } else if (timer_id == app_mod.TIMER_COPY_BUTTON_REVERT) {
                         _ = c.KillTimer(hwnd, app_mod.TIMER_COPY_BUTTON_REVERT);
@@ -2999,11 +2828,6 @@ pub export fn ExternalWndProc(
                             ext_win.copy_button_copied = false;
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
-                        return 0;
-                    } else if (timer_id == app_mod.TIMER_SCROLLBAR_AUTOHIDE) {
-                        // Auto-hide scrollbar after scroll mode timeout
-                        _ = c.KillTimer(hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE);
-                        scrollbar.hideScrollbarForExternal(hwnd, app, ext_win);
                         return 0;
                     }
                 }
@@ -3356,6 +3180,84 @@ pub fn updateExternalWindowColors(app: *App) void {
 }
 
 /// Paint an external window (simpler rendering path than main window)
+pub const ShaderCursorForward = struct {
+    verts: []const app_mod.Vertex,
+    /// Where the grid's cells start inside a decorated surface (the
+    /// cmdline's past its icon strip and padding).
+    content_origin: DecoratedContentOrigin,
+    /// A cursor on a grid this surface draws as a LAYER is in that layer's
+    /// pixels, and the layer sits at its own origin inside the surface.
+    layer_origin: [2]i32,
+};
+
+/// Put this external renderer's custom shaders in the main window's shader
+/// universe: its screen size, this window's offset in it, its time origin and
+/// its cursor uniforms. Without it each window got its own compressed shader
+/// space (a star field squeezed into the cmdline bar) and saw no cursor.
+/// Called from paint, which also forwards a cursor this surface draws into
+/// the main renderer first, and from the shader animation tick, which
+/// presents without a paint and used to keep the offset and cursor of the
+/// window's last paint.
+pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, cursor: ?ShaderCursorForward) void {
+    if (g_sh.custom_shader_pipelines.items.len == 0) return;
+    var screen_w: u32 = g_sh.width;
+    var screen_h: u32 = g_sh.height;
+    var off_x: f32 = 0;
+    var off_y: f32 = 0;
+    if (app.hwnd) |main_hwnd| {
+        if (app.renderer) |*main_r| {
+            if (main_r.width != 0 and main_r.height != 0) {
+                screen_w = main_r.width;
+                screen_h = main_r.height;
+            }
+        }
+        // Client origins on both sides: GetWindowRect includes the frame and
+        // title bar of a WS_OVERLAPPEDWINDOW, which pushed the offset into
+        // the decoration strip. Shader pixels live in client coords.
+        var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+        var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
+        if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
+            off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
+            off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
+        }
+        if (cursor) |cur| if (cur.verts.len != 0) {
+            if (app.renderer) |*main_r2| {
+                // The cursor's own box, from the core's cursor_rect as the
+                // main driver takes it: a bar or underline stays one.
+                // Ghostty's cursor shaders treat iCurrentCursor.y as the
+                // BOTTOM edge of the cursor rect.
+                if (core.cursor_rect.bounds(
+                    core.Vertex,
+                    cur.verts,
+                    off_x + cur.content_origin.x + @as(f32, @floatFromInt(cur.layer_origin[0])),
+                    off_y + cur.content_origin.y + @as(f32, @floatFromInt(cur.layer_origin[1])),
+                )) |cb| {
+                    main_r2.setCursorShaderState(
+                        .{ cb.left, cb.bottom, cb.width(), cb.height() },
+                        cur.verts[0].color,
+                    );
+                }
+            }
+        };
+        if (app.renderer) |*main_r3| {
+            // Mirror cursor uniforms + iTime origin from main, or
+            // iTime - iTimeCursorChange is nonsense in this renderer.
+            if (main_r3.custom_shader_start_qpc != 0) {
+                g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
+            }
+            g_sh.shader_cursor_current = main_r3.shader_cursor_current;
+            g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
+            g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
+            g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
+            g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
+        }
+    }
+    g_sh.shader_screen_w = screen_w;
+    g_sh.shader_screen_h = screen_h;
+    g_sh.shader_window_offset_x = off_x;
+    g_sh.shader_window_offset_y = off_y;
+}
+
 pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow start hwnd={*}\n", .{hwnd});
     var ps: c.PAINTSTRUCT = undefined;
@@ -3374,12 +3276,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // protects the surface.
     if (c.IsIconic(hwnd) != 0) return;
 
-    // Read core-owned render settings before entering the atlas reader
-    // transaction. Keeping core calls outside minimizes reader lifetime and
-    // avoids needless non-blocking atlas-reset abort/retry cycles.
-    const glow_enabled = if (app.corep) |cp| core.zonvie_core_get_glow_enabled(cp) else false;
-    const glow_intensity = if (app.corep) |cp| core.zonvie_core_get_glow_intensity(cp) else @as(f32, 0.8);
-    const glow_radius_scale = if (app.corep) |cp| core.zonvie_core_get_glow_radius_scale(cp) else @as(f32, 1.0);
+    const glow = app_mod.glowPaintSettings(app);
+    const glow_enabled = glow.enabled;
+    const glow_intensity = glow.intensity;
+    const glow_radius_scale = glow.radius_scale;
 
     app.mu.lockUncancelable(core.clock.io());
 
@@ -3462,112 +3362,19 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
-    // Update custom-shader screen-space override so this HWND samples
-    // the main window's shader universe at its own offset/size. Without
-    // this, each ext window would get its own compressed shader space
-    // (a star field squeezed into the cmdline bar, etc.).
+    // A cursor on this surface is forwarded into the main renderer's shader
+    // cursor state (see syncExternalShaderFrame).
     if (gpu_ptr) |g_sh| {
-        if (g_sh.custom_shader_pipelines.items.len > 0) {
-            var screen_w: u32 = g_sh.width;
-            var screen_h: u32 = g_sh.height;
-            var off_x: f32 = 0;
-            var off_y: f32 = 0;
-            if (app.hwnd) |main_hwnd| {
-                if (app.renderer) |*main_r| {
-                    if (main_r.width != 0 and main_r.height != 0) {
-                        screen_w = main_r.width;
-                        screen_h = main_r.height;
-                    }
-                }
-                // Use each HWND's client-area origin rather than
-                // GetWindowRect. GetWindowRect includes any window
-                // frame / title bar (WS_OVERLAPPEDWINDOW on regular
-                // external windows), so subtracting it pushes the
-                // shader offset into the decoration strip — the
-                // rendered shader pixels in the client area end up
-                // shifted by the frame thickness. Shader pixels live
-                // in client coords, so use client origins on both
-                // sides.
-                var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
-                    off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
-                    off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
-                }
-                // If this ext surface holds the active cursor (cmdline
-                // / popupmenu / float window currently has focus),
-                // forward its rect into the main renderer's shader
-                // cursor state so cursor shaders track the visible
-                // cursor instead of the main grid's stale cursor. The
-                // ext verts are this grid's local pixels; translate
-                // to main-window drawable px using the offset above.
-                const ext_cursor_verts = tbs_cursor.verts.items;
-                if (ext_cursor_verts.len != 0) {
-                    if (app.renderer) |*main_r2| {
-                        // Core vertices are grid-local pixels, y down, and a
-                        // decorated surface does not draw them at its client
-                        // origin: the cmdline's grid starts past the icon strip
-                        // and its padding. off_x/off_y reach the window, this
-                        // reaches the content inside it.
-                        const content_origin = decoratedContentOriginPx(app, surface_kind);
-                        // A cursor on a grid this surface draws as a LAYER is
-                        // in that layer's pixels, and the layer sits at its own
-                        // origin inside the surface. The overlay draw above
-                        // already adds it; without the same term here the
-                        // shader burned at the window's top-left corner
-                        // whenever the cursor was inside a hosted float.
-                        const layer_origin = render_pipeline_helpers.layerOriginPx(
-                            app_mod.SurfaceLayer,
-                            tbs_snapshot.layers.slice(),
-                            tbs_snapshot.cursor_layer_grid_id,
-                            grid_id,
-                        );
-                        const layer_x: f32 = @floatFromInt(layer_origin[0]);
-                        const layer_y: f32 = @floatFromInt(layer_origin[1]);
-                        // The cursor's own box, from the core's cursor_rect as
-                        // the main driver takes it: a bar or underline stays a
-                        // bar or underline. This used to centre a whole-cell
-                        // box on the vertices, so a cursor shader saw a block
-                        // in an external window and a bar in the main one.
-                        // Ghostty's cursor shaders treat iCurrentCursor.y as
-                        // the BOTTOM edge of the cursor rect.
-                        if (core.cursor_rect.bounds(
-                            core.Vertex,
-                            ext_cursor_verts,
-                            off_x + content_origin.x + layer_x,
-                            off_y + content_origin.y + layer_y,
-                        )) |cb| {
-                            main_r2.setCursorShaderState(
-                                .{ cb.left, cb.bottom, cb.width(), cb.height() },
-                                ext_cursor_verts[0].color,
-                            );
-                        }
-                    }
-                }
-
-                if (app.renderer) |*main_r3| {
-                    // Mirror cursor uniforms + iTime origin from main
-                    // so cursor shaders work in cmdline / popupmenu /
-                    // float windows. Without this, ext renderers see
-                    // (0, 0, 0, 0) for iCurrentCursor and a separate
-                    // iTime origin, so iTime - iTimeCursorChange ends
-                    // up nonsense for shaders rendered through the ext
-                    // renderer's shader pass.
-                    if (main_r3.custom_shader_start_qpc != 0) {
-                        g_sh.custom_shader_start_qpc = main_r3.custom_shader_start_qpc;
-                    }
-                    g_sh.shader_cursor_current = main_r3.shader_cursor_current;
-                    g_sh.shader_cursor_previous = main_r3.shader_cursor_previous;
-                    g_sh.shader_cursor_current_color = main_r3.shader_cursor_current_color;
-                    g_sh.shader_cursor_previous_color = main_r3.shader_cursor_previous_color;
-                    g_sh.shader_cursor_change_time = main_r3.shader_cursor_change_time;
-                }
-            }
-            g_sh.shader_screen_w = screen_w;
-            g_sh.shader_screen_h = screen_h;
-            g_sh.shader_window_offset_x = off_x;
-            g_sh.shader_window_offset_y = off_y;
-        }
+        syncExternalShaderFrame(app, hwnd, g_sh, .{
+            .verts = tbs_cursor.verts.items,
+            .content_origin = decoratedContentOriginPx(app, surface_kind),
+            .layer_origin = render_pipeline_helpers.layerOriginPx(
+                app_mod.SurfaceLayer,
+                tbs_snapshot.layers.slice(),
+                tbs_snapshot.cursor_layer_grid_id,
+                grid_id,
+            ),
+        });
     }
 
     // Determine rendering mode from TBS committed set.
@@ -3614,7 +3421,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     ext_win.needs_redraw = false;
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
-    const dirty_row_keys = &ext_win.paint_dirty_row_keys;
+    const dirty_row_keys = &ext_win.paint.dirty_row_keys;
     dirty_row_keys.clearRetainingCapacity();
     var dirty_snapshot_ok = true;
     if (is_row_mode_normal) {
@@ -3638,19 +3445,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Copy scrollbar_alpha for later use (scrollbar rendering in normal external windows)
     // This avoids use-after-free if the window is closed while we're painting
-    const scrollbar_alpha = ext_win.scrollbar_alpha;
+    const scrollbar_alpha = ext_win.scrollbar.alpha;
 
-    // Check if we need to upload the full atlas (a TRUE reset happened since
-    // this window last fully re-uploaded — not just "some glyph was added").
-    // Guarded by a.mu: recreateAtlasTexture() bumps this field from
-    // ensureGlyph, which can run concurrently with this paint (same pattern as the
-    // atlas_reset_pending read elsewhere in this function).
-    var current_atlas_reset_generation: u64 = 0;
-    if (atlas_ptr) |a| {
-        a.mu.lockUncancelable(core.clock.io());
-        current_atlas_reset_generation = a.atlas_reset_generation;
-        a.mu.unlock(core.clock.io());
-    }
+    const current_atlas_reset_generation: u64 = if (atlas_ptr) |a| app_mod.atlasPaintGeneration(a, false).generation else 0;
 
     // Scroll state is now bundled in tbs_snap (atomically consistent with committed set).
 
@@ -3737,9 +3534,9 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // by an earlier normal row-mode incarnation of this window.
             _ = app_mod.resizeRowVBsForPaint(
                 app.alloc,
-                &ext_win.row_vbs,
+                &ext_win.paint.row_vbs,
                 &app.row_vb_budget,
-                &ext_win.row_vb_retained_bytes,
+                &ext_win.paint.row_vb_retained_bytes,
                 0,
             );
 
@@ -3798,8 +3595,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             scrollbar_alpha,
             dirty_row_keys.items,
             ext_paint_full,
-            glow_enabled,
-            glow_intensity,
+            glow,
             tbs_snapshot,
             row_h_px_snapshot,
         ) catch |e| {
@@ -3840,7 +3636,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             .rows = 0,
             .rows_to_draw = 0,
             .skipped_empty = 0,
-            .present_rects = ext_win.paint_present_rects.items.len,
+            .present_rects = ext_win.paint.present_rects.items.len,
         });
         if (present_gate.verdict == .skip) {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: no retained-back damage, skipping present\n", .{});
@@ -3849,7 +3645,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
 
         g.presentFromBackRectsWithCursorNoResize(
-            ext_win.paint_present_rects.items,
+            ext_win.paint.present_rects.items,
             force_full_present,
             null,
             null,
