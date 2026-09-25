@@ -412,11 +412,15 @@ func encodeSurfaceBloom(
           let compositePipe = shared.glowCompositePipeline,
           let copyVB = shared.copyVertexBuffer,
           let bilinSamp = shared.bilinearSampler else { return false }
-    let chain = surfaceGlowChain(
-        surfaceWidthPx: Int(drawableSize.width),
-        surfaceHeightPx: Int(drawableSize.height),
-        radiusScale: radiusScale
-    )
+    let key = (widthPx: Int(drawableSize.width), heightPx: Int(drawableSize.height), radiusScale: radiusScale)
+    let chain: SurfaceGlowChain
+    if let cached = glowTextures.chain, glowTextures.chainKey == key {
+        chain = cached
+    } else {
+        chain = surfaceGlowChain(surfaceWidthPx: key.widthPx, surfaceHeightPx: key.heightPx, radiusScale: radiusScale)
+        glowTextures.chain = chain
+        glowTextures.chainKey = key
+    }
     guard glowTextures.ensure(device: shared.device, chain: chain, pixelFormat: pixelFormat),
           glowTextures.ensureIntensityBuffer(device: shared.device) else { return false }
     return encodeSurfaceBloomPasses(
@@ -2076,9 +2080,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // MARK: - Triple Buffer Flush Bracket
 
-    /// Called from on_flush_begin callback (core thread).
-    /// Deep-copies committed data into write set so partial updates overwrite cleanly.
-    /// Picks a buffer set that is not committed and not GPU in-flight.
+    /// Called from ZonvieCore.beginMainFlushIfNeeded (core thread).
     ///
     /// The flush bracket, stage by stage, against `ExternalGridView`'s. The
     /// two are not one implementation on purpose: the shared parts
@@ -2100,18 +2102,18 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// in `prepareRowWriteState`, right before the sync overwrites the rows it
     /// copies from, and discards just ahead of that. A cursor-only bracket
     /// therefore discards here and not there.
-    enum BeginFlushResult {
-        case proceed                   // Normal flush, no special action needed
-        case proceedWithInvalidation   // Flush OK, but core glyph cache invalidation needed
-        case dropped                   // Flush aborted — core must skip vertex/shared.atlas generation
-    }
-
-    func beginFlush() -> BeginFlushResult {
+    ///
+    /// The bracket opens lazily, on the surface's first write of a flush, as
+    /// the external one does (`ZonvieCore.beginMainFlushIfNeeded`); a flush
+    /// that touches only external windows leaves this surface alone. The atlas
+    /// transaction is the flush's, opened by `beginAtlasTransaction` before
+    /// any surface joins. Returns false when the bracket is refused.
+    func beginFlush() -> Bool {
         lock.lock()
         if rowCapacity.blocksDraw {
             lock.unlock()
             ZonvieCore.appLog("[Renderer] beginFlush: waiting for row capacity provisioning")
-            return .dropped
+            return false
         }
         bracketOpen = true
         lock.unlock()
@@ -2135,19 +2137,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // a `lastCommitTime` it had not earned. ExternalGridView clears its
         // `flushHadContent` at begin for the same reason.
         flushHadLayerWork = false
-        let perfEnabled = ZonvieCore.appLogEnabled
-        if perfEnabled {
+        if ZonvieCore.appLogEnabled {
             perfRowSubmitNs = 0
             perfRowSubmitCalls = 0
             perfRowSubmitVerts = 0
         }
-        let tBeginFlushStart = perfEnabled ? CFAbsoluteTimeGetCurrent() : 0
-        var atlasPrepareUs: Double = 0
-        var atlasCommitUs: Double = 0
-        var atlasDidBlit = false
-        var atlasDidCpuSync = false
-        var atlasNeedsCoreInvalidation = false
-        var atlasSyncedWasRecreate = false
 
         // Snapshot the row source, but defer all O(rows) COW preparation until
         // the first main/row/scroll mutation. Cursor-only and no-op flushes do
@@ -2179,49 +2173,33 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             )
         }
 
-        // The atlas transaction belongs to the flush, not to this surface;
-        // SharedRenderResources owns it. What stays here is mapping a refusal
-        // onto this bracket's own teardown.
-        //
-        // OPENED here and CLOSED by ZonvieCore.on_flush_end, which is
-        // deliberate rather than an oversight. It opens late, after the guards
-        // above have accepted the flush: prepareBackTexture can encode a blit,
-        // and a flush this surface was going to drop for row capacity must not
-        // pay for one. It closes centrally because EVERY surface's publication
-        // depends on the swap, so no single surface may own that decision.
-        //
-        // The queue handed over is this surface's, and the main window's
-        // surface is the one whose bracket the core opens — see the doc comment
-        // on beginFlushTransaction for why the blit must ride the queue the
-        // main surface draws on.
-        var needsCoreInvalidation = false
-        switch shared.beginFlushTransaction(queue: queue, perfEnabled: perfEnabled) {
-        case .drop(let reason):
-            isInFlush = false
-            closeBracketFlag()
-            ZonvieCore.appLog("[WARNING] beginFlush: \(reason)")
-            return .dropped
-        case .opened(let opened):
-            needsCoreInvalidation = opened.needsCoreInvalidation
-            atlasNeedsCoreInvalidation = opened.needsCoreInvalidation
-            atlasDidCpuSync = opened.didCpuSync
-            atlasSyncedWasRecreate = opened.syncedWasRecreate
-            atlasDidBlit = opened.didBlit
-            atlasPrepareUs = opened.prepareUs
-            atlasCommitUs = opened.commitUs
-        }
+        return true
+    }
 
-        if perfEnabled {
-            let totalUs = (CFAbsoluteTimeGetCurrent() - tBeginFlushStart) * 1_000_000
-            let totalUsStr = String(format: "%.1f", totalUs)
-            let atlasPrepareUsStr = String(format: "%.1f", atlasPrepareUs)
-            let atlasCommitUsStr = String(format: "%.1f", atlasCommitUs)
+    /// Whether this surface joined the current flush.
+    var isFlushOpen: Bool { isInFlush }
+
+    /// Open the flush's atlas upload transaction, once per flush and before
+    /// any surface joins. It belongs to the flush, not to this surface, but
+    /// it must ride this surface's queue: see `beginFlushTransaction`.
+    func beginAtlasTransaction() -> SharedRenderResources.FlushTransactionBegin {
+        let perfEnabled = ZonvieCore.appLogEnabled
+        let result = shared.beginFlushTransaction(queue: queue, perfEnabled: perfEnabled)
+        if perfEnabled, case .opened(let opened) = result {
             ZonvieCore.appLogPerf(
-                "[perf] begin_flush_prepare lazyRows=true atlasDidBlit=\(atlasDidBlit) atlasDidCpuSync=\(atlasDidCpuSync) atlasNeedsCoreInvalidation=\(atlasNeedsCoreInvalidation) atlasSyncedWasRecreate=\(atlasSyncedWasRecreate) atlasPrepareUs=\(atlasPrepareUsStr) atlasCommitUs=\(atlasCommitUsStr) totalUs=\(totalUsStr)"
+                "[perf] begin_flush_prepare lazyRows=true atlasDidBlit=\(opened.didBlit) atlasDidCpuSync=\(opened.didCpuSync) atlasNeedsCoreInvalidation=\(opened.needsCoreInvalidation) atlasSyncedWasRecreate=\(opened.syncedWasRecreate) atlasPrepareUs=\(String(format: "%.1f", opened.prepareUs)) atlasCommitUs=\(String(format: "%.1f", opened.commitUs))"
             )
         }
+        return result
+    }
 
-        return needsCoreInvalidation ? .proceedWithInvalidation : .proceed
+    /// A flush this surface did not join still published the atlas texture:
+    /// draw from it, as a joined commit would. The texture swapped out becomes
+    /// the back one, which the next flush writes.
+    func adoptPublishedAtlas(_ texture: MTLTexture?) {
+        lock.lock()
+        committedAtlasTexture = texture
+        lock.unlock()
     }
 
     /// Lazily prepare the large row/main state on the first mutation in a
@@ -2300,14 +2278,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return true
     }
 
-    /// Called after beginFlush() returned .proceed/.proceedWithInvalidation but
-    /// the core later called zonvie_core_abort_flush (e.g. recreateTexture failure).
-    /// Clears isInFlush so commitFlush becomes a no-op, preventing stale vertices
-    /// from being published under the new layout dimensions.
+    /// Called when the flush this surface joined is cancelled. Clears
+    /// isInFlush so commitFlush becomes a no-op, preventing stale vertices
+    /// from being published. No-op for a surface that did not join.
     /// Put this surface's bracket back without publishing. The atlas
     /// transaction is NOT closed here: it belongs to the flush, not to a
     /// surface, and `ZonvieCore` closes it once for every surface.
     func abortFlush() {
+        guard isInFlush else { return }
         endBracketWithoutPublishing()
     }
 
@@ -2388,11 +2366,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // revision already spent.
         let bgChanged = surfaceBgRGB != defaultBgRGB
         surfaceBgRGB = defaultBgRGB
-        // The core opens this bracket on every flush, including one that only
-        // changed an external window. Nothing landed here then, and a new
-        // revision would still be a frame this surface cannot skip. An atlas
-        // swap is not a landing either: the new texture keeps every glyph the
-        // committed UVs name, and the next frame that has work reads it.
+        // A bracket that joined for a layout or scroll callback may still
+        // have landed nothing, and a new revision would be a frame this
+        // surface cannot skip. An atlas swap is not a landing either: the new
+        // texture keeps every glyph the committed UVs name, and the next frame
+        // that has work reads it.
         let bracketLanded = didMainWrite || didCursorWrite || flushHadLayerWork
             || pendingSurfaceLayers != nil
             || !flushDirtyRows.isEmpty || flushDirtyRectPx != nil

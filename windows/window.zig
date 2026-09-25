@@ -21,13 +21,15 @@ const drop_target = @import("ui/drop_target.zig");
 const render_helpers = @import("render_pipeline_helpers.zig");
 
 /// dwData tag identifying a single-instance file-open message (see main.zig's
-/// single-instance forwarding and the WM_COPYDATA handler below). 'ZONV'.
-pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E56;
+/// single-instance forwarding and the WM_COPYDATA handler below). 'ZONP': the
+/// payload is a tab-per-file byte ('0'/'1') then NUL-separated raw paths. The
+/// old 'ZONV' carried a client-escaped Ex command; a mismatched pair ignores
+/// the other's message rather than running it.
+pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E50;
 
 /// Neovim command-line escape for a single byte of a file path. Returns the
-/// escaped multi-byte sequence, or null if the byte needs no escaping. Shared
-/// by the WM_DROPFILES handler and the single-instance forwarding path
-/// (main.zig) so both escape identically; the set matches the macOS
+/// escaped multi-byte sequence, or null if the byte needs no escaping. Used for
+/// a drop inserted into the command line; the set matches the macOS
 /// `escapePathForNeovim`. `$` and `` ` `` are included so Neovim does not
 /// perform environment-variable / backtick expansion on a literal path.
 pub fn escapeNeovimByte(ch: u8) ?[]const u8 {
@@ -206,6 +208,27 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
     if (pos == 0) return;
     // Insert paths at the cursor position.
     app_mod.zonvie_core_send_input(corep, &cmd_buf, @intCast(pos));
+}
+
+/// Open the paths a second instance forwarded: `payload[0]` is the tab-per-file
+/// flag, the rest NUL-separated paths.
+fn forwardedDropPaths(app: *App, corep: *app_mod.zonvie_core, payload: []const u8) void {
+    const paths = payload[1..];
+    const count = std.mem.count(u8, paths, "\x00") + 1;
+    const ptrs = app.alloc.alloc([*]const u8, count) catch return;
+    defer app.alloc.free(ptrs);
+    const lens = app.alloc.alloc(usize, count) catch return;
+    defer app.alloc.free(lens);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, paths, 0);
+    while (it.next()) |p| {
+        if (p.len == 0) continue;
+        ptrs[n] = p.ptr;
+        lens[n] = p.len;
+        n += 1;
+    }
+    if (n == 0) return;
+    app_mod.zonvie_core_drop_paths(corep, ptrs.ptr, lens.ptr, n, @intFromBool(payload[0] == '1'));
 }
 
 // Load a system cursor by integer resource ID (avoids MAKEINTRESOURCE alignment issues with odd values)
@@ -1398,7 +1421,7 @@ const SCROLLBAR_REPEAT_DELAY = app_mod.SCROLLBAR_REPEAT_DELAY;
 const SCROLLBAR_REPEAT_INTERVAL = app_mod.SCROLLBAR_REPEAT_INTERVAL;
 
 // Win32 DPI API (Windows 10 v1607+)
-extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
+pub extern "user32" fn GetDpiForWindow(hwnd: c.HWND) callconv(.winapi) c.UINT;
 
 // Grid ID constants
 const CMDLINE_GRID_ID = app_mod.CMDLINE_GRID_ID;
@@ -2252,9 +2275,7 @@ pub export fn WndProc(
                 if (gpu_ptr) |g| {
                     if (app.colorscheme_bg != 0xFFFFFFFF) g.setDefaultBgColor(app.colorscheme_bg);
                 }
-                var atlas_recreate_needed = false;
-                var atlas_recreate_w: u32 = 0;
-                var atlas_recreate_h: u32 = 0;
+                var atlas_reset_consumed = false;
                 var atlas_generation: u64 = 0;
 
                 // If the glyph atlas was reset, all cached row vertex UVs are stale.
@@ -2263,23 +2284,18 @@ pub export fn WndProc(
                 // under a.mu).
                 if (atlas_ptr) |a| {
                     var reset_pending = false;
-                    var cur_atlas_w: u32 = 0;
-                    var cur_atlas_h: u32 = 0;
                     {
                         a.mu.lockUncancelable(core.clock.io());
                         defer a.mu.unlock(core.clock.io());
                         reset_pending = a.atlas_reset_pending;
                         if (reset_pending) a.atlas_reset_pending = false;
-                        cur_atlas_w = a.atlas_w;
-                        cur_atlas_h = a.atlas_h;
                         atlas_generation = a.atlas_reset_generation;
                     }
                     if (reset_pending) {
-                        // D3D creation/Release can pump messages. Capture the
-                        // request here and perform it after releasing app.mu.
-                        atlas_recreate_needed = true;
-                        atlas_recreate_w = cur_atlas_w;
-                        atlas_recreate_h = cur_atlas_h;
+                        // The texture itself is resized by syncSharedAtlas
+                        // below, after app.mu is released (D3D creation can
+                        // pump messages).
+                        atlas_reset_consumed = true;
                         app.need_full_seed.store(true, .seq_cst);
                         app.surface.paint_full = true;
                         app.paint_rects.clearRetainingCapacity();
@@ -2324,28 +2340,6 @@ pub export fn WndProc(
 
                 app.mu.unlock(core.clock.io());
 
-                if (atlas_recreate_needed) {
-                    var recreate_ok = false;
-                    if (gpu_ptr) |g| {
-                        g.lockContext();
-                        g.recreateAtlasTextureIfNeeded(atlas_recreate_w, atlas_recreate_h) catch |e| {
-                            if (log_enabled) applog.appLog("[win] D3D atlas texture recreation failed, retrying: {any}\n", .{e});
-                        };
-                        recreate_ok = (g.atlas_w == atlas_recreate_w and g.atlas_h == atlas_recreate_h);
-                        g.unlockContext();
-                    }
-                    if (!recreate_ok) {
-                        if (atlas_ptr) |a| {
-                            a.mu.lockUncancelable(core.clock.io());
-                            a.atlas_reset_pending = true;
-                            a.mu.unlock(core.clock.io());
-                        }
-                        app.atlas_upload.forceFull();
-                        recoverMainPaintFailure(hwnd, app);
-                        return 0;
-                    }
-                }
-
                 if (!paint_snapshot_ok) {
                     recoverMainPaintFailure(hwnd, app);
                     return 0;
@@ -2357,7 +2351,8 @@ pub export fn WndProc(
                 // row height and only the present was refused. The present-time
                 // check below stays for a change landing during the draw. After
                 // the atlas recreate above, which this paint has already
-                // consumed the request for.
+                // consumed the request for (the texture follows the atlas's
+                // size at every sync, so nothing is lost).
                 if (row_mode and committed_metrics_gen != shared_metrics_gen_snapshot) {
                     recoverMainPaintFailure(hwnd, app);
                     return 0;
@@ -2384,36 +2379,28 @@ pub export fn WndProc(
                     }
                 }
 
-                // Flush atlas uploads (may be triggered by core updates).
-                // Uses since-based cursor so multiple windows can independently
-                // consume the same append-only pending_uploads queue.
+                // The shared atlas texture: resized, then the uploads it is
+                // owed, whichever window's paint comes first.
                 var atlas_uploaded = false;
                 if (atlas_ptr) |a| {
                     if (gpu_ptr) |g| {
                         g.lockContext();
                         defer g.unlockContext();
-                        // Shared with the external driver: a full upload is
-                        // owed whenever the atlas generation moved since the
-                        // last one this surface made.
-                        const need_full = app.atlas_upload.needsFull(atlas_generation);
-                        if (need_full) {
-                            if (log_enabled) applog.appLog("[win] atlas full upload (post-reset sync)\n", .{});
-                        }
-                        const upload = app_mod.flushAtlasUploads(a, g, app.atlas_upload_cursor, need_full);
-                        if (upload.success) {
-                            if (upload.cursor != app.atlas_upload_cursor) atlas_uploaded = true;
-                            app.atlas_upload_cursor = upload.cursor;
-                            if (need_full) app.atlas_upload.fullUploaded(atlas_generation);
-                        } else {
-                            // Keep the cursor unchanged and promote every
-                            // failure (including incremental upload) to a full
-                            // retry. Do not draw this frame against a texture
-                            // missing pixels referenced by committed UVs.
-                            app.atlas_upload.forceFull();
+                        const sync = app_mod.syncSharedAtlas(app, a, g, atlas_generation, &app.main_atlas_seen_upload_seq);
+                        if (!sync.ok) {
+                            // Do not draw against a texture missing pixels
+                            // committed UVs reference. A consumed reset stays
+                            // owed, for the re-seed it drives.
+                            if (atlas_reset_consumed) {
+                                a.mu.lockUncancelable(core.clock.io());
+                                a.atlas_reset_pending = true;
+                                a.mu.unlock(core.clock.io());
+                            }
                             recoverMainPaintFailure(hwnd, app);
-                            if (log_enabled) applog.appLog("[win] atlas upload failed; requeued full paint\n", .{});
+                            if (log_enabled) applog.appLog("[win] atlas sync failed; requeued full paint\n", .{});
                             return 0;
                         }
+                        atlas_uploaded = sync.uploaded;
                     }
                 }
                 if (log_enabled and atlas_uploaded) {
@@ -5157,7 +5144,7 @@ pub export fn WndProc(
                     hwnd;
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
                     }
                     break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
@@ -5311,6 +5298,7 @@ pub export fn WndProc(
                             app.config.window.blur,
                             device,
                             device_ctx,
+                            false,
                         ) catch null;
                     } orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
@@ -5330,20 +5318,9 @@ pub export fn WndProc(
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
-                    if (app.atlas) |*a| {
-                        a.mu.lockUncancelable(core.clock.io());
-                        const atlas_w = a.atlas_w;
-                        const atlas_h = a.atlas_h;
-                        a.mu.unlock(core.clock.io());
-                        new_renderer.recreateAtlasTextureIfNeeded(atlas_w, atlas_h) catch {
-                            new_renderer.deinit();
-                            any_ext_failed = true;
-                            external_windows.finishExternalWindowPaint(app, grid_id);
-                            continue;
-                        };
-                    }
                     // Replay any WM_SIZE delivered while the unlocked device
-                    // and atlas creation calls pumped the message queue.
+                    // creation calls pumped the message queue. The atlas is
+                    // the main renderer's, borrowed at its first paint.
                     new_renderer.resize() catch {
                         new_renderer.deinit();
                         any_ext_failed = true;
@@ -5382,10 +5359,8 @@ pub export fn WndProc(
                     }
                     var old_renderer = ext_win.renderer;
                     ext_win.renderer = new_renderer;
-                    // Force full atlas + content reseed on the fresh device.
+                    // Force full content reseed on the fresh device.
                     ext_win.atlas_version = 0;
-                    ext_win.atlas_upload_cursor = 0;
-                    ext_win.atlas_upload.forceFull();
                     ext_win.dpi_scale = @as(f32, @floatFromInt(ext_dpi)) / 96.0;
                     ext_win.surface.paint_full = true;
                     ext_win.needs_redraw = true;
@@ -5703,7 +5678,7 @@ pub export fn WndProc(
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
@@ -6080,6 +6055,11 @@ pub export fn WndProc(
                 // Release mouse capture
                 if (!left_drag_continues) _ = c.ReleaseCapture();
 
+                // A press the chrome swallowed (a sidebar right-click, a
+                // button dragged off) has no release to send, as on external
+                // windows.
+                if (!press_reached_editor) return 0;
+
                 // Determine button name
                 const button: [*:0]const u8 = switch (msg) {
                     c.WM_LBUTTONUP => "left",
@@ -6360,10 +6340,9 @@ pub export fn WndProc(
 
         c.WM_COPYDATA => {
             // Single-instance file open: a second `zonvie <file>` process found
-            // this running instance and forwarded a pre-built Ex command (e.g.
-            // "tab drop /abs/path"). See main.zig's forwarding path. The payload
-            // is the bare command bytes (no leading ':'); an empty payload means
-            // "just bring me to the front".
+            // this running instance and forwarded its paths (see main.zig). The
+            // server escapes them (zonvie_core_drop_paths), as for a drop; an
+            // empty payload means "just bring me to the front".
             const cds: *const c.COPYDATASTRUCT = @ptrFromInt(@as(usize, @bitCast(lParam)));
             if (cds.dwData != ZONVIE_COPYDATA_MAGIC) {
                 return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -6374,10 +6353,10 @@ pub export fn WndProc(
                 if (app.hwnd) |main_hwnd| {
                     restoreFromTray(main_hwnd);
                 }
-                if (cds.cbData > 0 and cds.lpData != null) {
+                if (cds.cbData > 1 and cds.lpData != null) {
                     if (app.corep) |corep| {
                         const bytes: [*]const u8 = @ptrCast(cds.lpData.?);
-                        app_mod.zonvie_core_send_command(corep, bytes, @intCast(cds.cbData));
+                        forwardedDropPaths(app, corep, bytes[0..cds.cbData]);
                     }
                 }
             }
