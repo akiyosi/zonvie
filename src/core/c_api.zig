@@ -3220,9 +3220,8 @@ pub export fn zonvie_core_flush_is_retryable(p: ?*zonvie_core) callconv(.c) bool
 // Calls onFlush() UNCONDITIONALLY rather than gating on a "something is
 // pending" check. An earlier version only checked main content_rev/
 // dirty_all, which silently dropped retries for cursor-only updates
-// (cursor_rev vs last_sent_cursor_rev is a separate predicate — and the
-// row-mode cursor path syncs last_sent_cursor_rev before any abort check
-// can run) and external/subgrid-only updates (each sub_grid tracks its own
+// (the cursor's revision is a separate predicate, synced before any abort
+// check can run) and external/subgrid-only updates (each sub_grid tracks its own
 // dirty flag, not reflected in the main grid's content_rev at all). Rather
 // than growing this into a predicate that has to enumerate every kind of
 // pending state (main/cursor/subgrid/external — and stay in sync with

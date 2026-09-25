@@ -60,9 +60,33 @@ final class SessionManager {
         session.window?.performClose(nil)
     }
 
+    /// The session `window` belongs to: its main window or one of its
+    /// external windows.
+    func session(owning window: NSWindow) -> Session? {
+        sessions.first { $0.window === window || $0.viewController?.core?.owns(window: window) == true }
+    }
+
+    /// The session whose window was last key, external windows included.
+    private(set) weak var frontSession: Session?
+
+    /// Record a key window; returns its session.
+    func noteKeyWindow(_ window: NSWindow) -> Session? {
+        guard let s = session(owning: window) else { return nil }
+        frontSession = s
+        return s
+    }
+
+    /// Whether `core` may act on app-wide state -- take the key window, switch
+    /// the input source. Only the session in front may; before any window has
+    /// been key, every session may.
+    func isFront(_ core: ZonvieCore) -> Bool {
+        guard let s = frontSession else { return true }
+        return s.viewController?.core === core
+    }
+
     /// Index of the session whose window is currently key (for menu marking).
     var activeIndex: Int? {
-        guard let key = NSApp.keyWindow else { return nil }
-        return sessions.firstIndex { $0.window === key }
+        guard let key = NSApp.keyWindow, let s = session(owning: key) else { return nil }
+        return sessions.firstIndex { $0 === s }
     }
 }

@@ -501,7 +501,6 @@ pub const Core = struct {
     ctx: ?*anyopaque,
 
     last_sent_content_rev: u64 = 0,
-    last_sent_cursor_rev: u64 = 0,
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
     // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
@@ -960,6 +959,11 @@ pub const Core = struct {
     // Heap-allocated highlight cache buffers (sized by hl_cache_size, allocated on first flush)
     hl_cache_buf: ?[]highlight.ResolvedAttrWithStyles = null,
     hl_valid_buf: ?[]bool = null,
+    /// Whether this flush has cleared hl_valid_buf. Its bits are keyed by
+    /// Neovim's global hl_id and no hl_attr_define lands inside a flush, so
+    /// one clear serves every grid; the first pass to resolve a highlight
+    /// clears, and on_flush_end re-arms it.
+    hl_valid_cleared_in_flush: bool = false,
     hl_cache_initialized: bool = false,
 
     // Dynamic glyph caches (allocated on first use, reallocated if size changes)
@@ -1591,7 +1595,6 @@ pub const Core = struct {
         // runs under grid_mu (see handleRedraw); resetting them inside
         // this critical section keeps the flush invariants consistent.
         self.last_sent_content_rev = 0;
-        self.last_sent_cursor_rev = 0;
         self.last_ext_cursor_grid = 1;
         self.last_ext_cursor_rev = 0;
         self.pre_cmdline_cursor_grid = 1;
@@ -2197,6 +2200,16 @@ pub const Core = struct {
         self.hl_cache_buf = hl_buf;
         self.hl_valid_buf = valid_buf;
         self.hl_cache_initialized = true;
+    }
+
+    /// The highlight validity bits, cleared once per flush.
+    pub fn hlValidForFlush(self: *Core) []bool {
+        const valid = self.hl_valid_buf orelse return &.{};
+        if (!self.hl_valid_cleared_in_flush) {
+            @memset(valid, false);
+            self.hl_valid_cleared_in_flush = true;
+        }
+        return valid;
     }
 
     /// Free highlight cache buffers.
@@ -3467,6 +3480,10 @@ pub const Core = struct {
             const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
             if (written < out.len) {
+                // In the space of the surface that places it, as the header
+                // promises: a float an external window hosts is stored in
+                // global units.
+                const placed = self.grid.surfacePlacement(pos);
                 const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
                     .zindex = 0,
                     .compindex = 0,
@@ -3477,8 +3494,8 @@ pub const Core = struct {
                 out[written] = .{
                     .grid_id = gid,
                     .zindex = layer.zindex,
-                    .start_row = grid_mod.saturatingI32FromU32(pos.row),
-                    .start_col = grid_mod.saturatingI32FromU32(pos.col),
+                    .start_row = if (placed) |p| std.math.lossyCast(i32, p.row) else grid_mod.saturatingI32FromU32(pos.row),
+                    .start_col = if (placed) |p| std.math.lossyCast(i32, p.col) else grid_mod.saturatingI32FromU32(pos.col),
                     .rows = grid_mod.saturatingI32FromU32(sg.rows),
                     .cols = grid_mod.saturatingI32FromU32(sg.cols),
                     .margin_top = grid_mod.saturatingI32FromU32(margins.top),
@@ -7483,6 +7500,32 @@ test "complete visible-grid snapshot reports truncation from one lock state" {
     core.grid_mu.lockUncancelable(clock.io());
     defer core.grid_mu.unlock(clock.io());
     try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
+}
+
+test "a float an external window hosts is reported in that window's cells" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 20, 40);
+    // A detached split: external window 3 kept its main-grid origin (5, 7).
+    try core.grid.resizeGrid(3, 10, 30);
+    _ = try core.grid.setWinExternalPosAt(3, 43, 5, 7);
+    // Float 4 at (2, 1) inside it, stored the way redraw_handler stores it:
+    // with the window's origin added.
+    try core.grid.resizeGrid(4, 3, 10);
+    try core.grid.setWinFloatPos(4, 44, 5 + 2, 7 + 1, 50, 0, 3, true);
+
+    var out: [4]c_api.GridInfo = undefined;
+    const count = core.getVisibleGrids(&out);
+    var found = false;
+    for (out[0..count]) |g| {
+        if (g.grid_id != 4) continue;
+        found = true;
+        try std.testing.expectEqual(@as(i64, 3), g.placed_by_surface);
+        try std.testing.expectEqual(@as(i32, 2), g.start_row);
+        try std.testing.expectEqual(@as(i32, 1), g.start_col);
+    }
+    try std.testing.expect(found);
 }
 
 test "a grid no surface places reports no placing surface" {

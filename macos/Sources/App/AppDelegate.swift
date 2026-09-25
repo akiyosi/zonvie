@@ -55,6 +55,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self?.processPendingFiles()
         }
 
+        keyWindowObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main
+        ) { [weak self] notification in self?.sessionWindowDidBecomeKey(notification) }
+
         NSApp.setActivationPolicy(.regular)
 
         // macOS state restoration re-opens windows that were visible at quit.
@@ -230,12 +234,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         vc.forceConnectDialog = forceDialog
         win.contentViewController = vc
 
-        // Persist/restore window geometry (AppKit feature).
-        win.setFrameAutosaveName(windowFrameAutosaveName)
-
-        // If there is a saved frame from the last session, use it.
-        // Otherwise keep the computed default rect (centered 800x600-ish).
-        if !win.setFrameUsingName(windowFrameAutosaveName) {
+        // Persist/restore window geometry (AppKit feature). One window at a
+        // time can hold the name: a second session opened on top of the first
+        // and its frame was never saved. It cascades from the key session.
+        if win.setFrameAutosaveName(windowFrameAutosaveName) {
+            // If there is a saved frame from the last session, use it.
+            // Otherwise keep the computed default rect (centered 800x600-ish).
+            if !win.setFrameUsingName(windowFrameAutosaveName) {
+                win.center()
+            }
+        } else if let previous = window {
+            win.setFrame(previous.frame, display: false)
+            // From the zero point the window stays put and the next cascade
+            // position comes back.
+            win.setFrameTopLeftPoint(win.cascadeTopLeft(from: .zero))
+        } else {
             win.center()
         }
 
@@ -329,10 +342,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// from `window`, which a new session sets before it becomes key.
     private weak var focusedSessionWindow: NSWindow?
 
-    func windowDidBecomeKey(_ notification: Notification) {
+    /// Every key change, not only the session windows this delegates for: an
+    /// external window becoming key moves focus to its session too.
+    private var keyWindowObserver: Any?
+
+    private func sessionWindowDidBecomeKey(_ notification: Notification) {
         // Track the frontmost session window so single-window-oriented code
         // (and the menu bar's active marking) follows focus across sessions.
-        if let win = notification.object as? NSWindow, win.contentViewController is ViewController {
+        if let key = notification.object as? NSWindow,
+           let win = SessionManager.shared.noteKeyWindow(key)?.window {
             self.window = win
             // App activation reports focus to the key session only, so a
             // switch between sessions has to hand it over itself: without
