@@ -3714,19 +3714,35 @@ final class ZonvieCore {
         return matched != nil
     }
 
-    /// Parse a single guifont entry: "<name>\t<size>" or "<name>\t<size>\t<features>".
-    /// Returns (name, size, features) or nil if unparseable.
-    /// When `sizeExplicit` is true, the parsed size is ignored and `configSize`
-    /// is used so that config.toml [font] size wins over nvim's default guifont.
+    /// Read one font candidate line, "<name>\t<size>[\t<features>]" (the
+    /// guifont payload and the config's font_family list), the way the core
+    /// reads it for every frontend (zonvie_core_parse_font_candidate). The
+    /// size is the line's unless `sizeExplicit` ([font] size wins over
+    /// guifont) or the line has none, then `defaultSize`.
+    static func parseFontCandidate(_ line: String, defaultSize: Double, sizeExplicit: Bool) -> (name: String, size: Double, features: String)? {
+        let bytes = Array(line.utf8)
+        var nameLen = 0
+        var pointSize: Float = 0
+        var featuresOffset = 0
+        var featuresLen = 0
+        let ok = bytes.withUnsafeBufferPointer { buf -> Bool in
+            guard let base = buf.baseAddress else { return false }
+            return base.withMemoryRebound(to: CChar.self, capacity: buf.count) {
+                zonvie_core_parse_font_candidate($0, buf.count, Float(defaultSize), sizeExplicit,
+                                                 &nameLen, &pointSize, &featuresOffset, &featuresLen)
+            }
+        }
+        guard ok else { return nil }
+        let name = String(decoding: bytes[0..<nameLen], as: UTF8.self)
+        let features = featuresLen > 0
+            ? String(decoding: bytes[featuresOffset..<(featuresOffset + featuresLen)], as: UTF8.self)
+            : ""
+        return (name, Double(pointSize), features)
+    }
+
     private static func parseGuiFontEntry(_ entry: String, configSize: Double, sizeExplicit: Bool) -> (String, Double, String)? {
-        let parts = entry.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
-        guard parts.count >= 2 else { return nil }
-        let name = String(parts[0])
-        guard !name.isEmpty else { return nil }
-        let parsedSize = Double(parts[1]) ?? 0
-        let size = (sizeExplicit || parsedSize <= 0) ? configSize : parsedSize
-        let features = parts.count >= 3 ? String(parts[2]) : ""
-        return (name, size, features)
+        guard let c = parseFontCandidate(entry, defaultSize: configSize, sizeExplicit: sizeExplicit) else { return nil }
+        return (c.name, c.size, c.features)
     }
 
     private func onGuiFont(bytes: UnsafePointer<UInt8>, len: Int) {

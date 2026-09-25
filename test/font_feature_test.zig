@@ -161,3 +161,39 @@ test "guifont: wdth axis" {
     try std.testing.expectEqualSlices(u8, "wdth", &r.features[0].tag);
     try std.testing.expectEqual(@as(i32, 87), r.features[0].value);
 }
+
+// ============================================================================
+// parseFontFeatureList / zonvie_core_parse_font_features: a candidate line's
+// feature field as both frontends hand it to their shaper.
+// ============================================================================
+
+test "feature list: every token, whitespace ignored, junk skipped" {
+    var out: [8]redraw.FontFeature = undefined;
+    const n = redraw.parseFontFeatureList("-liga, -calt,ss01=2 ,zero,h14,x", &out);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualSlices(u8, "liga", &out[0].tag);
+    try std.testing.expectEqual(@as(i32, 0), out[0].value);
+    try std.testing.expectEqualSlices(u8, "calt", &out[1].tag);
+    try std.testing.expectEqual(@as(i32, 0), out[1].value);
+    try std.testing.expectEqualSlices(u8, "ss01", &out[2].tag);
+    try std.testing.expectEqual(@as(i32, 2), out[2].value);
+    try std.testing.expectEqualSlices(u8, "zero", &out[3].tag);
+    try std.testing.expectEqual(@as(i32, 1), out[3].value);
+}
+
+test "feature list: stops at the output's capacity" {
+    var out: [2]redraw.FontFeature = undefined;
+    try std.testing.expectEqual(@as(usize, 2), redraw.parseFontFeatureList("+liga,+calt,+ss01", &out));
+}
+
+test "feature list: the C ABI writes the zonvie_font_feature layout" {
+    var out: [4]zonvie_core.FontFeatureC = undefined;
+    const list = "-calt,cv02=3";
+    const n = zonvie_core.zonvie_core_parse_font_features(list.ptr, list.len, &out, out.len);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqualSlices(u8, "calt", &out[0].tag);
+    try std.testing.expectEqual(@as(i32, 0), out[0].value);
+    try std.testing.expectEqualSlices(u8, "cv02", &out[1].tag);
+    try std.testing.expectEqual(@as(i32, 3), out[1].value);
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(zonvie_core.FontFeatureC));
+}

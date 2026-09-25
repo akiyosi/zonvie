@@ -640,40 +640,17 @@ final class GlyphAtlas {
     }
 
     /// Parse comma-separated feature string: "+liga,-dlig,ss01=2"
+    /// The core's reading of a feature list (zonvie_core_parse_font_features),
+    /// shared with Windows.
     private static func parseFontFeatures(_ s: String) -> [zonvie_font_feature] {
         guard !s.isEmpty else { return [] }
-        return s.split(separator: ",").compactMap { token in
-            let t = token.trimmingCharacters(in: .whitespaces)
-            var tag: String
-            var value: Int32
-
-            if t.contains("=") {
-                let kv = t.split(separator: "=", maxSplits: 1)
-                guard kv.count == 2, kv[0].count == 4, let val = Int32(kv[1]) else { return nil }
-                tag = String(kv[0])
-                value = val
-            } else if t.hasPrefix("+") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 1
-            } else if t.hasPrefix("-") {
-                tag = String(t.dropFirst())
-                guard tag.count == 4 else { return nil }
-                value = 0
-            } else {
-                guard t.count == 4 else { return nil }
-                tag = t
-                value = 1
+        var out = [zonvie_font_feature](repeating: zonvie_font_feature(), count: Int(ZONVIE_MAX_FONT_FEATURES))
+        let n = s.withCString { cs in
+            out.withUnsafeMutableBufferPointer { buf in
+                zonvie_core_parse_font_features(cs, s.utf8.count, buf.baseAddress, buf.count)
             }
-
-            let bytes = Array(tag.utf8)
-            guard bytes.count == 4 else { return nil }
-            var feature = zonvie_font_feature()
-            feature.tag = (Int8(bitPattern: bytes[0]), Int8(bitPattern: bytes[1]),
-                           Int8(bitPattern: bytes[2]), Int8(bitPattern: bytes[3]))
-            feature.value = value
-            return feature
         }
+        return Array(out.prefix(n))
     }
     
     func setBackingScale(_ s: CGFloat) {

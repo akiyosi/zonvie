@@ -771,6 +771,34 @@ pub fn formatFontFamilyAsCandidateList(
     return combined.items;
 }
 
+/// One font a frontend should try, read from a candidate line.
+pub const FontCandidate = struct {
+    name: []const u8,
+    point_size: f32,
+    /// The comma-separated feature list, as `redraw_handler.parseFontFeatureList`
+    /// reads it. Empty for none.
+    features: []const u8,
+};
+
+/// Read one `<name>\t<size>[\t<features>]` line of a candidate list — the
+/// guifont payload, or `formatFontFamilyAsCandidateList`'s output — into the
+/// font a frontend should try. The size is the line's, unless `size_explicit`
+/// ([font] size is set and wins over guifont) or the line carries none, then
+/// `default_pt`. Null for a line with no name or no size field. Slices point
+/// into `line`.
+pub fn parseFontCandidateLine(line: []const u8, default_pt: f32, size_explicit: bool) ?FontCandidate {
+    var fields = std.mem.splitScalar(u8, line, '\t');
+    const name = fields.next() orelse return null;
+    if (name.len == 0) return null;
+    const size_field = fields.next() orelse return null;
+    const parsed_pt = std.fmt.parseFloat(f32, size_field) catch 0;
+    return .{
+        .name = name,
+        .point_size = if (size_explicit or parsed_pt <= 0) default_pt else parsed_pt,
+        .features = fields.rest(),
+    };
+}
+
 // TOML parsing structures (match config.toml format)
 const TomlConfig = struct {
     neovim: ?TomlNeovim = null,
