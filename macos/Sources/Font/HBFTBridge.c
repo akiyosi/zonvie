@@ -70,14 +70,18 @@ static void build_ascii_tables(zonvie_ft_hb_font* f) {
     HB_TAG('l','i','g','a'),  // Standard ligatures (default on)
     HB_TAG('c','a','l','t'),  // Contextual alternates (default on)
     HB_TAG('r','l','i','g'),  // Required ligatures (always on)
-    HB_TAG('c','l','i','g'),  // Contextual ligatures (default off)
+    HB_TAG('c','l','i','g'),  // Contextual ligatures (default on per HarfBuzz)
     HB_TAG('d','l','i','g'),  // Discretionary ligatures (default off)
     HB_TAG('l','o','c','l'),  // Localized forms (default on per HarfBuzz)
     HB_TAG('c','c','m','p'),  // Composition/decomposition (default on per HarfBuzz)
+    HB_TAG('r','c','l','t'),  // Required contextual alternates (default on per HarfBuzz)
+    HB_TAG('r','v','r','n'),  // Required variation alternates (always on; Cascadia Code's bold `$`)
   };
-  const int num_features = 7;
-  // Default activation matches HarfBuzz defaults; clig/dlig default off.
-  int feature_active[] = { 1, 1, 1, 0, 0, 1, 1 };
+  const int num_features = 9;
+  // Default activation matches HarfBuzz defaults; only dlig is default off.
+  // Lookups a variable font swaps in through FeatureVariations are included
+  // by hb_ot_layout_collect_lookups, so every instance's triggers count.
+  int feature_active[] = { 1, 1, 1, 1, 0, 1, 1, 1, 1 };
 
   // Override defaults based on user-set features (e.g. user passes liga=0 to
   // disable standard ligatures, or clig=1 to opt into contextual ligatures).
@@ -210,7 +214,10 @@ void zonvie_ft_hb_font_set_features(zonvie_ft_hb_font* f, const zonvie_font_feat
   build_ascii_tables(f);
 }
 
-void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* variations, size_t count) {
+// Shared by set_variations (integer values) and set_variation_axes (fractional
+// values): exactly one of `ints` / `floats` is non-NULL.
+static void apply_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* ints,
+                             const zonvie_font_axis* floats, size_t count) {
   if (!f || !f->ft_face || !f->hb_font) return;
 
   // Query available variation axes from the font's fvar table.
@@ -227,17 +234,19 @@ void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_fe
     coords[a] = mm_var->axis[a].def;
   }
 
-  // Override axes that match input tags.
-  size_t n = count < ZONVIE_MAX_FONT_FEATURES ? count : ZONVIE_MAX_FONT_FEATURES;
+  // Override axes that match input tags. The input is only indexed, so it has
+  // no length cap (a CoreText instance's axes plus the user's entries).
   int any_matched = 0;
-  for (size_t i = 0; i < n; i++) {
-    FT_ULong input_tag = FT_MAKE_TAG(variations[i].tag[0], variations[i].tag[1],
-                                      variations[i].tag[2], variations[i].tag[3]);
+  for (size_t i = 0; i < count; i++) {
+    const char* t = ints ? ints[i].tag : floats[i].tag;
+    FT_ULong input_tag = FT_MAKE_TAG(t[0], t[1], t[2], t[3]);
     for (FT_UInt a = 0; a < num_axes; a++) {
       if (mm_var->axis[a].tag == input_tag) {
         // Convert design coordinate to FT_Fixed 16.16 and clamp to axis range.
         // Use multiplication instead of left-shift to avoid UB on negative values.
-        FT_Fixed val = (FT_Fixed)((FT_Long)variations[i].value * 65536L);
+        FT_Fixed val = ints
+            ? (FT_Fixed)((FT_Long)ints[i].value * 65536L)
+            : (FT_Fixed)((double)floats[i].value * 65536.0);
         if (val < mm_var->axis[a].minimum) val = mm_var->axis[a].minimum;
         if (val > mm_var->axis[a].maximum) val = mm_var->axis[a].maximum;
         coords[a] = val;
@@ -260,9 +269,20 @@ void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_fe
     hb_font_set_scale(f->hb_font,
                       (int)(f->pixel_size * 64),
                       (int)(f->pixel_size * 64));
+
+    // Advances (e.g. under wdth) belong to the new instance.
+    build_ascii_tables(f);
   }
 
   FT_Done_MM_Var(f->ft_lib, mm_var);
+}
+
+void zonvie_ft_hb_font_set_variations(zonvie_ft_hb_font* f, const zonvie_font_feature* variations, size_t count) {
+  apply_variations(f, variations, NULL, count);
+}
+
+void zonvie_ft_hb_font_set_variation_axes(zonvie_ft_hb_font* f, const zonvie_font_axis* axes, size_t count) {
+  apply_variations(f, NULL, axes, count);
 }
 
 void zonvie_ft_hb_font_destroy(zonvie_ft_hb_font* f) {

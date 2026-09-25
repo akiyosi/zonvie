@@ -212,9 +212,12 @@ pub fn build(b: *std.Build) !void {
     const windows_step = b.step("windows", "Build Windows frontend");
     windows_step.dependOn(&install_win.step);
 
-    // Unit tests for the layer draw planner in windows/app.zig. It reaches
-    // Win32 through the renderer, so it builds only for a Windows target and
-    // runs only on a Windows host.
+    // Unit tests for windows/app.zig and what it imports: the layer draw
+    // planner, input, logging, and the DirectWrite renderer's shaping,
+    // GSUB-trigger, variation-axis and font-face tests against installed fonts.
+    // It reaches Win32 through the renderer, so it builds only for a Windows
+    // target and runs only on a Windows host (`zig build test` there).
+    var windows_app_tests: ?*std.Build.Step.Compile = null;
     if (target.result.os.tag == .windows) {
         const app_test_mod = b.createModule(.{
             .target = target,
@@ -236,7 +239,9 @@ pub fn build(b: *std.Build) !void {
         const app_tests = b.addTest(.{
             .name = "zonvie-app-test",
             .root_module = app_test_mod,
+            .filters = test_filters,
         });
+        windows_app_tests = app_tests;
         const app_test_step = b.step("windows-app-test", "Build the Windows app unit tests");
         app_test_step.dependOn(&b.addInstallArtifact(app_tests, .{
             .dest_dir = .{ .override = .{ .custom = "../windows/zig-out" } },
@@ -266,6 +271,9 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run unit tests");
     if (host_os == .windows and target.result.os.tag == .windows) {
         test_step.dependOn(&b.addRunArtifact(wake_state_tests).step);
+        // The DirectWrite shaping, GSUB trigger and font-face tests need a real
+        // Windows font stack, so they run here rather than on the CI Linux job.
+        if (windows_app_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
     // macOS external-grid font reset intersection test. It uses barriers to
@@ -317,6 +325,21 @@ pub fn build(b: *std.Build) !void {
         const run_font_cell_fit_test = b.addSystemCommand(&.{"/usr/bin/env"});
         run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
         test_step.dependOn(&run_font_cell_fit_test.step);
+
+        // A variable font's Bold/Italic faces are instances of one file:
+        // FreeType must be handed their coordinates, merged with the user's.
+        const compile_font_instance_axes_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+        compile_font_instance_axes_test.addArgs(&.{
+            "-module-cache-path",
+            "/tmp/zonvie-swift-module-cache",
+        });
+        compile_font_instance_axes_test.addFileArg(b.path("macos/Sources/Font/FontInstanceAxes.swift"));
+        compile_font_instance_axes_test.addFileArg(b.path("macos/Tests/FontInstanceAxesTests.swift"));
+        compile_font_instance_axes_test.addArg("-o");
+        const font_instance_axes_test_exe = compile_font_instance_axes_test.addOutputFileArg("font-instance-axes-tests");
+        const run_font_instance_axes_test = b.addSystemCommand(&.{"/usr/bin/env"});
+        run_font_instance_axes_test.addFileArg(font_instance_axes_test_exe);
+        test_step.dependOn(&run_font_instance_axes_test.step);
 
         // Which of an NSEvent's two character strings a modified key carries.
         // The rule lived inline in both keyDown handlers and drifted; it is a

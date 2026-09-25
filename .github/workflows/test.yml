@@ -48,3 +48,73 @@ jobs:
       - name: Unit Tests
         run: zig build test
         timeout-minutes: 20
+
+  # The font tests exercise each platform's real shaper: HarfBuzz/FreeType and
+  # the Swift font helpers on macOS, DirectWrite on Windows. The ligature
+  # fonts are installed at pinned versions, and ZONVIE_REQUIRE_TEST_FONTS turns
+  # a missing test font into a failure instead of a silent skip.
+  unit-tests-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Homebrew)
+        run: brew install freetype harfbuzz pkgconf
+      - name: Install test fonts
+        run: |
+          mkdir -p ~/Library/Fonts
+          cd "$RUNNER_TEMP"
+          curl -sSfLO https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip
+          curl -sSfLO https://github.com/tonsky/FiraCode/releases/download/6.2/Fira_Code_v6.2.zip
+          curl -sSfLO https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip
+          unzip -j -o CascadiaCode-2407.24.zip ttf/CascadiaCode.ttf ttf/CascadiaCodeItalic.ttf -d ~/Library/Fonts
+          unzip -j -o Fira_Code_v6.2.zip ttf/FiraCode-Regular.ttf ttf/FiraCode-Bold.ttf -d ~/Library/Fonts
+          unzip -j -o JetBrainsMono-2.304.zip fonts/ttf/JetBrainsMono-Regular.ttf fonts/ttf/JetBrainsMono-Bold.ttf fonts/ttf/JetBrainsMono-Italic.ttf -d ~/Library/Fonts
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Unit Tests
+        run: zig build test --summary all
+        env:
+          ZONVIE_REQUIRE_TEST_FONTS: "1"
+        timeout-minutes: 30
+
+  unit-tests-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test fonts
+        shell: pwsh
+        run: |
+          # Per-user fonts: DirectWrite's system collection lists the files
+          # registered under HKCU\...\Fonts.
+          $dir = "$env:LOCALAPPDATA\Microsoft\Windows\Fonts"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $sets = @(
+            @{ Url = "https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip"; Files = @("ttf/CascadiaCode.ttf", "ttf/CascadiaCodeItalic.ttf") },
+            @{ Url = "https://github.com/tonsky/FiraCode/releases/download/6.2/Fira_Code_v6.2.zip"; Files = @("ttf/FiraCode-Regular.ttf", "ttf/FiraCode-Bold.ttf") },
+            @{ Url = "https://github.com/JetBrains/JetBrainsMono/releases/download/v2.304/JetBrainsMono-2.304.zip"; Files = @("fonts/ttf/JetBrainsMono-Regular.ttf", "fonts/ttf/JetBrainsMono-Bold.ttf", "fonts/ttf/JetBrainsMono-Italic.ttf", "fonts/ttf/JetBrainsMono-BoldItalic.ttf") }
+          )
+          $reg = "HKCU:\Software\Microsoft\Windows NT\CurrentVersion\Fonts"
+          New-Item -Force $reg -ErrorAction SilentlyContinue | Out-Null
+          foreach ($set in $sets) {
+            $zip = Join-Path $env:RUNNER_TEMP (Split-Path $set.Url -Leaf)
+            Invoke-WebRequest $set.Url -OutFile $zip
+            $out = Join-Path $env:RUNNER_TEMP "fonts"
+            New-Item -ItemType Directory -Force $out | Out-Null
+            tar -xf $zip -C $out @($set.Files)
+            foreach ($f in $set.Files) {
+              $dst = Join-Path $dir (Split-Path $f -Leaf)
+              Copy-Item (Join-Path $out $f) $dst -Force
+              New-ItemProperty -Path $reg -Name "$([IO.Path]::GetFileNameWithoutExtension($dst)) (TrueType)" -Value $dst -PropertyType String -Force | Out-Null
+            }
+          }
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - name: Unit Tests
+        run: zig build test --summary all
+        env:
+          ZONVIE_REQUIRE_TEST_FONTS: "1"
+        timeout-minutes: 30
