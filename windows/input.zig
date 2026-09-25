@@ -31,7 +31,7 @@ fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
     const hwnd = shown.win.hwnd orelse return null;
     const origin = render_helpers.layerOriginPx(
         app_mod.SurfaceLayer,
-        shown.win.tbs.committed_layers.slice(),
+        shown.win.surf.tbs.committed_layers.slice(),
         grid_id,
         shown.root_grid_id,
     );
@@ -119,6 +119,17 @@ pub fn swapColonSemicolon(ch: u16, enabled: bool) u16 {
     };
 }
 
+test "AltGr composing a printable character is text, other Ctrl+Alt combos are keys" {
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, "@"));
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT | MOD_SHIFT, "{"));
+    // Nothing composed (US layout Ctrl+Alt+q) or a control character: a key.
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, null));
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, "\x11"));
+    // Ctrl or Alt alone is never AltGr.
+    try std.testing.expect(!isAltGrText(MOD_CTRL, "q"));
+    try std.testing.expect(!isAltGrText(MOD_ALT, "q"));
+}
+
 test "colon and semicolon swap only when enabled" {
     try std.testing.expectEqual(@as(u16, ';'), swapColonSemicolon(':', true));
     try std.testing.expectEqual(@as(u16, ':'), swapColonSemicolon(';', true));
@@ -159,10 +170,23 @@ pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool 
         var out_chars: [8]u8 = undefined;
         var out_ign: [8]u8 = undefined;
         const pair = toUnicodePairUtf8(vk, scancode, &tmp_chars, &tmp_ign, &out_chars, &out_ign);
+        // AltGr arrives as Left Ctrl + Right Alt, and Windows composes text
+        // for Ctrl+Alt the same way. A key that composes a printable
+        // character under it (German AltGr+Q is `@`) is typed text, left to
+        // WM_CHAR; it used to be sent as <C-M-q>, and `@ { [ ] } \ | ~` could
+        // not be typed on those layouts.
+        if (isAltGrText(mods, pair.chars)) return false;
         sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
         return true;
     }
     return false;
+}
+
+/// Ctrl and Alt both held (AltGr) and the key composed a printable character.
+fn isAltGrText(mods: u32, chars: ?[]const u8) bool {
+    if ((mods & MOD_CTRL) == 0 or (mods & MOD_ALT) == 0) return false;
+    const text = chars orelse return false;
+    return text.len != 0 and text[0] >= 0x20 and text[0] != 0x7F;
 }
 
 /// WM_CHAR / WM_SYSCHAR for any surface, main or external. The two WndProcs
@@ -170,8 +194,12 @@ pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool 
 pub fn handleCharMessage(app: *App, wParam: c.WPARAM) void {
     const mods = queryMods();
     // If Ctrl/Alt are down, WM_CHAR often becomes an ASCII control character;
-    // the WM_KEYDOWN path handled those combos.
-    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) return;
+    // the WM_KEYDOWN path handled those combos. Not AltGr text, which the
+    // WM_KEYDOWN path left here (isAltGrText).
+    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
+        const both = (mods & MOD_CTRL) != 0 and (mods & MOD_ALT) != 0;
+        if (!both or wParam < 0x20 or wParam == 0x7F) return;
+    }
 
     const ch0 = swapColonSemicolon(@as(u16, @intCast(wParam)), app.config.input.swap_colon_semicolon);
 
@@ -410,7 +438,7 @@ pub fn pointInMainChrome(app: *App, hwnd: c.HWND, px: i32, py: i32) bool {
 /// the way ExternalWndProc has resolved its own since 5e7e9cb. Takes app.mu,
 /// which is what the committed layer list is protected by.
 pub fn resolveMainWindowTarget(app: *App, x: i32, y: i32) MouseTarget {
-    return resolveSurfaceTarget(app, &app.tbs, 1, true, x, y);
+    return resolveSurfaceTarget(app, &app.surf.tbs, 1, true, x, y);
 }
 
 /// resolveMainWindowTarget for any surface: `tbs` and `root_grid_id` name the
@@ -435,7 +463,7 @@ pub fn resolveSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root
 /// hit-testing again, so a selection dragged out of a float does not retarget
 /// the moment the pointer leaves it.
 pub fn rebaseMainWindowTarget(app: *App, grid_id: i64, x: i32, y: i32) MouseTarget {
-    return rebaseSurfaceTarget(app, &app.tbs, 1, true, grid_id, x, y);
+    return rebaseSurfaceTarget(app, &app.surf.tbs, 1, true, grid_id, x, y);
 }
 
 pub fn rebaseSurfaceTarget(app: *App, tbs: *app_mod.TripleBufferedSurface, root_grid_id: i64, is_main_window: bool, grid_id: i64, x: i32, y: i32) MouseTarget {
@@ -696,6 +724,110 @@ pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
 /// Which grid a surface-local point belongs to, and the point rebased into it.
 pub const MouseTarget = struct { grid_id: i64, x: i32, y: i32 };
 
+pub fn loadSystemCursor(id: usize) c.HCURSOR {
+    const RawLoadCursorFn = *const fn (?*anyopaque, usize) callconv(.winapi) ?*anyopaque;
+    const load_fn: RawLoadCursorFn = @ptrCast(&c.LoadCursorW);
+    return @ptrCast(@alignCast(load_fn(null, id)));
+}
+
+/// The composition edges and the committed character, for both window
+/// procedures. `invalidate_on_edge` repaints `hwnd` when composition starts
+/// and ends: an external cmdline hides its cursor while composing, and the
+/// main window must not pay a full repaint for it. Null for any other message.
+pub fn imeEdgeMessage(app_opt: ?*App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, invalidate_on_edge: bool) ?c.LRESULT {
+    switch (msg) {
+        c.WM_IME_STARTCOMPOSITION => {
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_STARTCOMPOSITION hwnd={*}\n", .{hwnd});
+            if (app_opt) |app| {
+                resetImeComposition(app, false);
+                // Position the IME candidate window at the cursor.
+                positionImeCandidateWindow(hwnd, app);
+                if (invalidate_on_edge) _ = c.InvalidateRect(hwnd, null, 0);
+            }
+            return 0;
+        },
+        c.WM_IME_ENDCOMPOSITION => {
+            if (applog.isEnabled()) applog.appLog("[IME] WM_IME_ENDCOMPOSITION hwnd={*}\n", .{hwnd});
+            if (app_opt) |app| {
+                resetImeComposition(app, true);
+                // Clear any inline preedit extmark and hide the overlay.
+                if (app.corep) |corep| app_mod.zonvie_core_clear_preedit(corep);
+                hideImePreeditOverlay(app);
+                if (invalidate_on_edge) _ = c.InvalidateRect(hwnd, null, 0);
+            }
+            return 0;
+        },
+        c.WM_IME_CHAR => {
+            // IME committed character - send to Neovim.
+            const app = app_opt orelse return null;
+            handleImeChar(app, @intCast(wParam));
+            return 0;
+        },
+        else => return null,
+    }
+}
+
+/// Ask for WM_MOUSELEAVE on `hwnd`; every window proc tracked it with the
+/// same literal.
+pub fn trackMouseLeave(hwnd: c.HWND) void {
+    var tme: c.TRACKMOUSEEVENT = .{
+        .cbSize = @sizeOf(c.TRACKMOUSEEVENT),
+        .dwFlags = c.TME_LEAVE,
+        .hwndTrack = hwnd,
+        .dwHoverTime = 0,
+    };
+    _ = c.TrackMouseEvent(&tme);
+}
+
+/// Keep the caption drawn active under blur (DWM repaints an inactive frame
+/// over the backdrop). Both window procedures answer WM_NCACTIVATE with it.
+pub fn ncActivate(app: ?*App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) c.LRESULT {
+    if (app) |a| {
+        if (a.config.window.blur) return c.DefWindowProcW(hwnd, msg, 1, lParam);
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+/// The pointer's position in `hwnd`'s client space.
+pub fn cursorClientPos(hwnd: c.HWND) struct { x: i32, y: i32 } {
+    var pt: c.POINT = undefined;
+    _ = c.GetCursorPos(&pt);
+    _ = c.ScreenToClient(hwnd, &pt);
+    return .{ .x = pt.x, .y = pt.y };
+}
+
+/// Show the hand when the cell a click at `target` would name holds a URL;
+/// true when it did (the caller returns TRUE from WM_SETCURSOR). Both window
+/// procedures ask it: only the main window had it. `null` is a point no click
+/// reaches the editor from. A busy core answers from the last cell asked.
+pub fn showUrlCursor(app: *App, target: ?MouseTarget) bool {
+    const t = target orelse {
+        app.cursor_is_hand = false;
+        return false;
+    };
+    if (app.corep) |corep| {
+        app.mu.lockUncancelable(core.clock.io());
+        const cell_w = app.cell_w_px;
+        const row_h = app.rowHeightPx();
+        app.mu.unlock(core.clock.io());
+        const col: i32 = if (cell_w > 0) @divFloor(t.x, @as(i32, @intCast(cell_w))) else 0;
+        const row: i32 = if (row_h > 0) @divFloor(t.y, @as(i32, @intCast(row_h))) else 0;
+        const result = core.zonvie_core_try_cell_has_url(corep, t.grid_id, row, col);
+        if (result >= 0) {
+            app.cursor_is_hand = (result == 1);
+            app.url_cache_grid = t.grid_id;
+            app.url_cache_row = row;
+            app.url_cache_col = col;
+        } else if (app.url_cache_grid != t.grid_id or app.url_cache_row != row or app.url_cache_col != col) {
+            // Lock unavailable: the cached answer holds only for the same cell.
+            app.cursor_is_hand = false;
+        }
+    }
+    if (!app.cursor_is_hand) return false;
+    _ = c.SetCursor(loadSystemCursor(32649)); // IDC_HAND
+    return true;
+}
+
 /// The button a mouse message names, and its held-button code (the one
 /// heldMouseButtonName reads back): 1 left, 2 right, 3 middle, 4/5 X1/X2.
 pub fn mouseButton(msg: c.UINT, wParam: c.WPARAM) struct { name: [*:0]const u8, code: u8 } {
@@ -952,7 +1084,10 @@ pub fn handleMouseWheel(
             grid_id,
             row,
             col,
-            1, // a wheel event: a float showing all its content lets it through
+            // Vertical wheel only: a float showing all its lines lets it
+            // through. "Can scroll" is a line-count test, so a sideways wheel
+            // over a nowrap float must still reach the float (as on macOS).
+            if (horizontal) 0 else 1,
             &hit,
         ) != 0) {
             target_grid_id = hit.grid_id;

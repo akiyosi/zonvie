@@ -101,6 +101,34 @@ struct SurfaceIdleTerms {
             + " -> \(skipsFrame ? "skip" : "draw")"
     }
 
+    /// The blink phase flipped and nothing else that could owe pixels did.
+    /// The shader terms are left out: an animating shader still redraws a
+    /// blink-only frame in full, and the caller decides what to skip.
+    var isBlinkOnly: Bool {
+        blinkStateChanged
+            && hasPresentedOnce
+            && rowModeSatisfied
+            && !hasNewCommit
+            && !hasCursorUpdate
+            && !hasDirtyRows
+            && !hasDirtyRect
+            && !hasLayerWork
+            && !hasStagedScroll
+            && !scrollOffsetChanged
+            && !isSmoothScrolling
+            && !drawableSizeChanged
+    }
+
+    /// A blink toggle on a surface with no cursor vertices: invisible in
+    /// either phase, so the whole draw cycle — drawable acquire, copy pass,
+    /// present, next-vsync wake — buys nothing. Every term consumed under the
+    /// surface lock is in `isBlinkOnly`, so skipping loses no update. A moved
+    /// shader cursor still needs its frame: `shaderCursorMoved` is reported
+    /// once, and skipping it left the effect where it was.
+    func skipsBlinkWithNoCursor(cursorVertexCount: Int) -> Bool {
+        isBlinkOnly && cursorVertexCount == 0 && !shaderAnimates && !shaderCursorMoved
+    }
+
     /// True when nothing this surface tracks has changed, so no frame is
     /// encoded or presented.
     var skipsFrame: Bool {

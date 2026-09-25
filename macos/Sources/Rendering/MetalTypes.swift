@@ -1062,6 +1062,31 @@ final class SurfaceCursorSlot {
     var vertexBuffer: MTLBuffer? = nil
     var vertexBufferCap: Int = 0
     var vertexCount: Int = 0
+
+    /// Replace the cursor with `count` vertices from `ptr` (0 clears it),
+    /// growing the buffer when it is nil or too small. No COW detach: a cursor
+    /// callback replaces the cursor outright, so a slot never shares a buffer
+    /// with the committed one. False when the buffer cannot grow; the caller
+    /// fails its flush. Caller guarantees no GPU frame reads this slot.
+    func write(device: MTLDevice, ptr: UnsafeRawPointer?, count: Int) -> Bool {
+        guard count > 0, let ptr else {
+            vertexCount = 0
+            return true
+        }
+        vertexCount = 0
+        guard let needed = surfaceSafeNeededBytes(vertexCount: count) else { return false }
+        if vertexBuffer == nil || needed > vertexBufferCap {
+            guard let nextCap = surfaceGrowCapacity(current: vertexBufferCap, needed: max(1, needed)) else {
+                return false
+            }
+            vertexBuffer = device.makeBuffer(length: nextCap, options: .storageModeShared)
+            vertexBufferCap = vertexBuffer != nil ? nextCap : 0
+        }
+        guard let vertexBuffer else { return false }
+        memcpy(vertexBuffer.contents(), ptr, count * MemoryLayout<Vertex>.stride)
+        vertexCount = count
+        return true
+    }
 }
 
 /// Where the grid that owns the cursor sits on a surface, and how it moves.
@@ -1265,6 +1290,28 @@ final class SurfaceBufferSet {
 
 /// Index of a set that is neither `committedIndex` nor GPU in-flight, for a
 /// flush to write into; -1 when none is free.
+/// The buffers at physical `slot` of the sets a GPU frame is still reading,
+/// for the COW detach alias guard (ensureSurfaceRowBuffer). Buffer objects
+/// only alias across sets at the same slot index: shallow copies preserve
+/// array positions, and slot remaps permute the logical->slot mapping, not
+/// the buffers array. Two at most, one per frame in flight. Caller holds the
+/// surface lock that guards `gpuInFlightCount`.
+func surfaceInflightRowBuffers(
+    sets: [SurfaceBufferSet],
+    gpuInFlightCount: [Int],
+    slot: Int
+) -> (MTLBuffer?, MTLBuffer?) {
+    guard slot >= 0 else { return (nil, nil) }
+    var first: MTLBuffer?
+    var second: MTLBuffer?
+    for index in 0..<min(sets.count, gpuInFlightCount.count) where gpuInFlightCount[index] > 0 {
+        let buffers = sets[index].rowState.buffers
+        guard slot < buffers.count, let buffer = buffers[slot] else { continue }
+        if first == nil { first = buffer } else { second = buffer }
+    }
+    return (first, second)
+}
+
 func pickFreeBufferSetIndex(
     count: Int,
     committedIndex: Int,
@@ -2831,39 +2878,6 @@ func shiftSurfaceRowIndices(
     rows.insert(integersIn: vacatedStart..<(vacatedStart + shift))
 }
 
-/// Carry the marks a published row shift moved, for a surface whose in-bracket
-/// marks land in `pending` as well as in its own flush set.
-///
-/// A shift is published by the commit, not by the callback that staged it: a
-/// bracket that cancels leaves the committed rows where they were, so marks an
-/// earlier bracket left have to be shifted against the shift that actually
-/// reached the screen. But the core dispatches every row-shift hint before it
-/// generates any vertices for that flush (`dispatchGridRowScroll` in
-/// src/core/flush.zig runs ahead of the vertex passes), so marks this bracket
-/// made already name post-shift rows and must be left alone.
-///
-/// The two groups are told apart by `carried`, a snapshot of `pending` taken
-/// when the bracket opened — NOT by subtracting this bracket's marks. A row
-/// number can be in both groups at once and mean different rows: with one
-/// scroll between them, an old mark on row 7 describes content now at row 6
-/// while a new mark on row 7 describes what was just drawn there, and both
-/// rows have to be repainted. Deriving one group from the other collapses that
-/// pair into a single mark and leaves row 6 stale.
-func mergePublishedScrollDirtyRows(
-    pending: inout IndexSet,
-    carried: IndexSet,
-    rowStart: Int,
-    rowEnd: Int,
-    rowsDelta: Int
-) {
-    var shifted = carried
-    shiftSurfaceRowIndices(&shifted, rowStart: rowStart, rowEnd: rowEnd, rowsDelta: rowsDelta)
-    // The carried marks name pre-shift rows and are replaced by where their
-    // content went; anything else in `pending` is this bracket's and stays.
-    pending.subtract(carried)
-    pending.formUnion(shifted)
-}
-
 /// Copy buffer set state from source to destination for the start of a new flush.
 /// Before copying src's buffer references into dst's independently-owned Array,
 /// dst's own buffers are saved into the detach pool. On buffer detach, pool buffers
@@ -3234,9 +3248,10 @@ func scrollAdjustedLocalRow(
     scrollOffsetPx: CGFloat
 ) -> Int32 {
     guard cellHeightPx > 0 else { return 0 }
-    let drawnLocal = Int32(pointPxY / cellHeightPx) - band.startRow
+    // Floored: a point above the grid is a negative row, not row 0.
+    let drawnLocal = Int32((pointPxY / cellHeightPx).rounded(.down)) - band.startRow
     guard abs(scrollOffsetPx) > 0.001 else { return drawnLocal }
-    let adjustedLocal = Int32((pointPxY - scrollOffsetPx) / cellHeightPx) - band.startRow
+    let adjustedLocal = Int32(((pointPxY - scrollOffsetPx) / cellHeightPx).rounded(.down)) - band.startRow
     let contentTop = band.marginTop
     let contentBottom = band.rows - band.marginBottom
     guard drawnLocal >= contentTop, drawnLocal < contentBottom,
@@ -4069,6 +4084,51 @@ func bindSurfaceGlowExtractState(
     bindScrollOffsets(enc)
     var zeroTranslation: Float = 0
     enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+}
+
+/// One layer's glow: first attenuate what the layers below already extracted
+/// by this layer's background coverage (skipped without an occlusion
+/// pipeline), then add this layer's own light, over the same rows. Back to
+/// front over the layer list, which is the screen order the extract pass
+/// otherwise has no way to honour. Both surfaces run it per layer.
+func encodeSurfaceLayerGlowRows(
+    encoder enc: MTLRenderCommandEncoder,
+    rows: Range<Int>,
+    resolve: (Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)?,
+    occludePipeline: MTLRenderPipelineState?,
+    extractPipeline: MTLRenderPipelineState
+) {
+    if let occludePipeline {
+        enc.setRenderPipelineState(occludePipeline)
+        encodeSurfaceResolvedRows(encoder: enc, rows: rows, resolve: resolve)
+    }
+    enc.setRenderPipelineState(extractPipeline)
+    encodeSurfaceResolvedRows(encoder: enc, rows: rows, resolve: resolve)
+}
+
+/// The cursor's contribution to a glow extract, in its own layer's pixel
+/// space. `bindScrollOffsets` binds what displaces the cursor's grid; the
+/// extract pipeline is already bound. The last draw of the extract pass.
+func encodeSurfaceCursorGlowExtract(
+    encoder enc: MTLRenderCommandEncoder,
+    vertexBuffer: MTLBuffer,
+    vertexCount: Int,
+    layerOriginPx: simd_float2,
+    viewportMetrics: SurfaceViewportMetrics,
+    bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
+) {
+    bindLayerTransform(
+        encoder: enc,
+        LayerTransform(
+            originPx: layerOriginPx,
+            extentPx: simd_float2(viewportMetrics.fragmentWidth, viewportMetrics.fragmentHeight)
+        )
+    )
+    bindScrollOffsets(enc)
+    var zeroTranslation: Float = 0
+    enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
+    enc.setVertexBuffer(vertexBuffer, offset: 0, index: 0)
+    enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
 }
 
 /// Draw each resolved row with the pipeline already bound.
