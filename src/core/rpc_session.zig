@@ -3481,6 +3481,25 @@ test "child reaper does not wait for inherited stderr EOF" {
     reaper_joined = true;
 }
 
+extern "kernel32" fn CreatePipe(
+    read_pipe: *std.os.windows.HANDLE,
+    write_pipe: *std.os.windows.HANDLE,
+    attributes: ?*anyopaque,
+    size: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+
+/// Returns a blocking anonymous pipe as { read end, write end }. Windows has
+/// no POSIX pipe(), so it gets the kernel32 equivalent.
+fn testPipe() ![2]std.posix.fd_t {
+    var fds: [2]std.posix.fd_t = undefined;
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(CreatePipe(&fds[0], &fds[1], null, 0) != .FALSE);
+    } else {
+        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    }
+    return fds;
+}
+
 /// Drives the real handleClipboardSet over a real writer thread and pipe, so
 /// both the bytes handed to the frontend and the RPC response Neovim receives
 /// are observed rather than inferred.
@@ -3505,8 +3524,7 @@ const ClipboardSetProbe = struct {
         const alloc = std.testing.allocator;
         clock.init();
 
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
@@ -3689,8 +3707,7 @@ test "every RPC response carries the same four-element type-1 header" {
     };
 
     for (cases) |case| {
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
@@ -3862,8 +3879,7 @@ fn fetchClipboard(
 ) ![]u8 {
     clock.init();
 
-    var fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+    const fds = try testPipe();
     const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
     var core = Core.initForTest(alloc);
@@ -3980,8 +3996,7 @@ test "yank and put round-trip a register larger than the staging buffers" {
     {
         clock.init();
 
-        var fds: [2]std.posix.fd_t = undefined;
-        try std.testing.expectEqual(@as(c_int, 0), std.c.pipe(&fds));
+        const fds = try testPipe();
         const read_file = std.Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
 
         var core = Core.initForTest(alloc);
