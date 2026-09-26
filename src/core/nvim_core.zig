@@ -500,7 +500,6 @@ pub const Core = struct {
     cb: Callbacks,
     ctx: ?*anyopaque,
 
-    last_sent_content_rev: u64 = 0,
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
     // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
@@ -1594,7 +1593,6 @@ pub const Core = struct {
         // These fields are consulted from the flush path which already
         // runs under grid_mu (see handleRedraw); resetting them inside
         // this critical section keeps the flush invariants consistent.
-        self.last_sent_content_rev = 0;
         self.last_ext_cursor_grid = 1;
         self.last_ext_cursor_rev = 0;
         self.pre_cmdline_cursor_grid = 1;

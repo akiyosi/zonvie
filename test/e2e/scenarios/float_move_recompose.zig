@@ -1,7 +1,7 @@
 // float_move_recompose — regression test for cff54bb: a position-only
-// float move (win_float_pos with NO content change) must bump content_rev
-// so the next flush recomposes the overlay at its new position. Before the
-// fix the float stayed rendered at the stale row until an unrelated
+// float move (win_float_pos with NO content change) must dirty the main
+// surface rows it left and entered, so the next flush repaints them. Before
+// the fix the float stayed rendered at the stale row until an unrelated
 // content change forced a rebuild (visible as float lag during scrolling).
 
 const std = @import("std");
@@ -56,9 +56,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         }
     }.check, h.opts.timeout_ms);
 
-    // Snapshot the revision once the screen has settled, then move the
-    // float WITHOUT touching any content.
-    const rev_before_move = h.contentRev();
+    // Clear grid 1's rows once the screen has settled, then move the float
+    // WITHOUT touching any content.
+    h.clearDirtyRows(1);
     try h.command("lua vim.api.nvim_win_set_config(_G.e2e_win, {relative='editor', row=8, col=10})");
 
     try h.waitUntil(PosCtx{ .grid = float_grid, .row = 8 }, struct {
@@ -68,14 +68,15 @@ pub fn run(alloc: std.mem.Allocator) !void {
         }
     }.check, h.opts.timeout_ms);
 
-    // The fix under test: the position-only move must have bumped
-    // content_rev so the overlay recomposes at the new row.
-    const rev_after_move = h.contentRev();
-    if (rev_after_move == rev_before_move) {
-        std.debug.print(
-            "[e2e] float moved (row 5 -> 8) but content_rev stayed at {d} — overlay will not recompose\n",
-            .{rev_before_move},
-        );
-        return error.FloatMoveNotRecomposed;
+    // The fix under test: the position-only move owes the rows it left and
+    // the rows it entered.
+    for ([_]u32{ 5, 8 }) |row| {
+        if (!h.isRowDirty(1, row)) {
+            std.debug.print(
+                "[e2e] float moved (row 5 -> 8) but main row {d} is not dirty — overlay will not recompose\n",
+                .{row},
+            );
+            return error.FloatMoveNotRecomposed;
+        }
     }
 }

@@ -440,7 +440,7 @@ final class SessionKeyInput {
         if owner.consumeKeyDuringComposition(event) { return }
 
         // No marked text: special keys or Ctrl/Cmd go directly to Neovim.
-        let isSpecialKey = KeyCharacterSelection.isSpecialKeyCode(event.keyCode)
+        let isSpecialKey = zonvie_core_key_is_special(UInt32(event.keyCode))
 
         if hasControlOrCommand || isSpecialKey {
             let mods = KeyCharacterSelection.modifierMask(

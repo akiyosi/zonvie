@@ -8,9 +8,10 @@ const std = @import("std");
 pub const Rect = struct { left: i32, top: i32, right: i32, bottom: i32 };
 pub const Point = struct { x: i32, y: i32 };
 
-/// Inset from the target rect's right and top edges.
+/// Inset from the target rect's right and top edges, before DPI scaling.
 pub const margin_px: i32 = 10;
-/// Gap between msg_history and the msg_show float stacked below it.
+/// Gap between msg_history and the msg_show float stacked below it, before
+/// DPI scaling.
 pub const history_gap_px: i32 = 4;
 
 /// Top-right placement.
@@ -24,10 +25,13 @@ pub const history_gap_px: i32 = 4;
 ///
 /// `history_bottom` is the msg_history float's bottom edge in screen
 /// coordinates when msg_show must stack below it, and null otherwise (always
-/// null for msg_history itself).
-pub fn msgFloatTopRight(target: Rect, window_w: i32, history_bottom: ?i32) Point {
+/// null for msg_history itself). `margin` and `gap` are margin_px and
+/// history_gap_px scaled to the monitor's DPI: every placement site goes
+/// through here, and they disagreed on the scaling, so a message moved on the
+/// first window move after it opened.
+pub fn msgFloatTopRight(target: Rect, window_w: i32, history_bottom: ?i32, margin: i32, gap: i32) Point {
     return .{
-        .x = target.right - window_w - margin_px,
-        .y = if (history_bottom) |bottom| bottom + history_gap_px else target.top + margin_px,
+        .x = target.right - window_w - margin,
+        .y = if (history_bottom) |bottom| bottom + gap else target.top + margin,
     };
 }

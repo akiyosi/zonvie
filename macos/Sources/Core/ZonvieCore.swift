@@ -2097,7 +2097,9 @@ final class ZonvieCore {
             }
             if let identity = sshIdentity {
                 ZonvieCore.appLog("[start] SSH mode: public key auth (identity=\(identity))")
-                sshCmd += " -i \(identity)"
+                // The core splits the command on spaces; quoted, as Windows
+                // does, so a key path with a space survives.
+                sshCmd += identity.contains(" ") ? " -i \"\(identity)\"" : " -i \(identity)"
                 sshCmd += " -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no"
             } else {
                 ZonvieCore.appLog("[start] SSH mode: password auth")
@@ -2564,7 +2566,7 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[sendInput] failed to get base address")
                 return
             }
-            zonvie_core_send_input(core, base, Int32(data.count))
+            zonvie_core_send_input(core, base, data.count)
         }
     }
 
@@ -2678,6 +2680,18 @@ final class ZonvieCore {
             }
         }
         ZonvieCore.appLog("[dropPaths] count=\(paths.count) tabPerFile=\(tabPerFile)")
+    }
+
+    /// Move a dragged tab (the core's command, shared with Windows).
+    func moveTab(from fromIndex: Int, toDropIndex dropIndex: Int, tabCount: Int) {
+        guard let core, fromIndex >= 0, dropIndex >= 0 else { return }
+        _ = zonvie_core_tab_move(core, UInt32(fromIndex), UInt32(dropIndex), UInt32(tabCount))
+    }
+
+    /// Open tab `index`'s only window externally (the core's command).
+    func externalizeTab(index: Int) {
+        guard let core, index >= 0 else { return }
+        zonvie_core_externalize_tab(core, UInt32(index))
     }
 
     func sendCommand(_ cmd: String) {
@@ -3311,14 +3325,11 @@ final class ZonvieCore {
 
     /// Timer for cursor blinking
     private var cursorBlinkTimer: Timer?
+    /// The cadence and the last settings, the core's state machine (shared
+    /// with Windows); this class keeps the timer, the gate and the redraws.
+    private var blink = zonvie_blink(wait_ms: 0, on_ms: 0, off_ms: 0, phase: 0, visible: true)
     /// Current cursor blink state (true = visible, false = hidden)
-    private(set) var cursorBlinkState: Bool = true
-    /// Blink phase: 0 = waiting (blinkwait), 1 = cycling (blinkon/blinkoff)
-    private var cursorBlinkPhase: Int = 0
-    /// Last known blink parameters (for change detection)
-    private var lastBlinkWaitMs: UInt32 = 0
-    private var lastBlinkOnMs: UInt32 = 0
-    private var lastBlinkOffMs: UInt32 = 0
+    var cursorBlinkState: Bool { blink.visible }
 
     /// Single gate for whether the cursor blink timer may run: only while the
     /// app is frontmost and the window showing the cursor is visible.
@@ -3357,10 +3368,10 @@ final class ZonvieCore {
     /// added TIMER_CURSOR_BLINK_RETRY).
     func getCursorBlink(lockBusy: inout Bool) -> (waitMs: UInt32, onMs: UInt32, offMs: UInt32) {
         lockBusy = false
-        guard let core else { return (lastBlinkWaitMs, lastBlinkOnMs, lastBlinkOffMs) }
-        var waitMs: UInt32 = lastBlinkWaitMs
-        var onMs: UInt32 = lastBlinkOnMs
-        var offMs: UInt32 = lastBlinkOffMs
+        guard let core else { return (blink.wait_ms, blink.on_ms, blink.off_ms) }
+        var waitMs: UInt32 = blink.wait_ms
+        var onMs: UInt32 = blink.on_ms
+        var offMs: UInt32 = blink.off_ms
         lockBusy = !zonvie_core_try_get_cursor_blink(core, &waitMs, &onMs, &offMs)
         return (waitMs, onMs, offMs)
     }
@@ -3384,128 +3395,78 @@ final class ZonvieCore {
             }
         }
 
-        if waitMs == lastBlinkWaitMs && onMs == lastBlinkOnMs && offMs == lastBlinkOffMs {
+        if waitMs == blink.wait_ms && onMs == blink.on_ms && offMs == blink.off_ms {
             return // No change
         }
 
         ZonvieCore.appLog("[blink] blink params changed, starting blink timer")
-
-        lastBlinkWaitMs = waitMs
-        lastBlinkOnMs = onMs
-        lastBlinkOffMs = offMs
-
         startCursorBlinking(waitMs: waitMs, onMs: onMs, offMs: offMs)
     }
 
-    /// Start cursor blinking with given parameters
+    /// Start cursor blinking with given parameters. The settings are recorded
+    /// even when the timer may not run, so a later gate refresh restarts with
+    /// them.
     func startCursorBlinking(waitMs: UInt32, onMs: UInt32, offMs: UInt32) {
         ZonvieCore.appLog("[blink] startCursorBlinking: wait=\(waitMs) on=\(onMs) off=\(offMs)")
 
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
-        resetBlinkToVisible()
+        let wasHidden = !blink.visible
+        let delayMs = zonvie_blink_start(&blink, waitMs, onMs, offMs)
+        showBlinkPhase(changed: wasHidden)
 
         // Do not arm the timer while the window is not frontmost/visible.
-        // The cursor is left solid-visible (state reset above). The
-        // applicationDidBecomeActive / occlusion handlers re-arm via
-        // resetCursorBlink once the window is foregrounded again.
+        // The cursor is left solid-visible. The applicationDidBecomeActive /
+        // occlusion handlers re-arm via resetCursorBlink once the window is
+        // foregrounded again.
         if !cursorBlinkAllowed {
             ZonvieCore.appLog("[blink] window not frontmost/visible, not arming")
+            zonvie_blink_stop(&blink)
             return
         }
+        armBlinkTimer(delayMs)
+    }
 
-        if waitMs == 0 && onMs == 0 && offMs == 0 {
-            ZonvieCore.appLog("[blink] all blink values are 0, no blinking")
-            return
-        }
-
-        if onMs == 0 || offMs == 0 {
-            ZonvieCore.appLog("[blink] blinkon or blinkoff is 0, no blinking")
-            return
-        }
-
-        let waitInterval = TimeInterval(waitMs) / 1000.0
-        ZonvieCore.appLog("[blink] scheduling blinkwait timer: \(waitInterval)s")
-        if waitInterval > 0 {
-            cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: waitInterval, repeats: false) { [weak self] _ in
-                self?.enterBlinkCycle()
+    private func armBlinkTimer(_ delayMs: UInt32) {
+        guard delayMs > 0 else { return }
+        cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: TimeInterval(delayMs) / 1000.0, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            let wasVisible = self.blink.visible
+            let next = zonvie_blink_tick(&self.blink)
+            if self.blink.visible != wasVisible {
+                // gui-test counts this line to tell the timer ran.
+                ZonvieCore.appLog("[blink] blink toggled to \(self.blink.visible), calling requestRedraw")
             }
-        } else {
-            enterBlinkCycle()
+            self.showBlinkPhase(changed: self.blink.visible != wasVisible)
+            self.armBlinkTimer(next)
         }
     }
 
-    private func enterBlinkCycle() {
-        ZonvieCore.appLog("[blink] enterBlinkCycle")
-        cursorBlinkPhase = 1
-        cursorBlinkState = true
-
+    /// Hand the phase to every surface of this session and redraw the ones it
+    /// changes. The main view reads the state only when it draws: left in the
+    /// off phase it kept the cursor hidden until something else redrew it.
+    private func showBlinkPhase(changed: Bool) {
+        guard changed else { return }
+        let visible = blink.visible
         for (_, gridView) in externalGridViews {
-            gridView.cursorBlinkState = true
+            gridView.cursorBlinkState = visible
             gridView.setNeedsDisplay(gridView.bounds)
         }
-
         requestRedraw()
-        scheduleNextBlink(isCurrentlyOn: true)
-    }
-
-    /// Schedule the next blink state change
-    private func scheduleNextBlink(isCurrentlyOn: Bool) {
-        let interval: TimeInterval
-        if isCurrentlyOn {
-            interval = TimeInterval(lastBlinkOnMs) / 1000.0
-        } else {
-            interval = TimeInterval(lastBlinkOffMs) / 1000.0
-        }
-
-        if interval <= 0 {
-            ZonvieCore.appLog("[blink] interval <= 0, not scheduling")
-            return
-        }
-
-        ZonvieCore.appLog("[blink] scheduleNextBlink: isOn=\(isCurrentlyOn) interval=\(interval)s")
-        cursorBlinkTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            self.cursorBlinkState.toggle()
-            ZonvieCore.appLog("[blink] blink toggled to \(self.cursorBlinkState), calling requestRedraw")
-
-            for (_, gridView) in self.externalGridViews {
-                gridView.cursorBlinkState = self.cursorBlinkState
-                gridView.setNeedsDisplay(gridView.bounds)
-            }
-
-            self.requestRedraw()
-            ZonvieCore.appLog("[blink] requestRedraw called")
-            self.scheduleNextBlink(isCurrentlyOn: self.cursorBlinkState)
-        }
     }
 
     /// Stop cursor blinking (cursor becomes always visible)
     func stopCursorBlinking() {
         cursorBlinkTimer?.invalidate()
         cursorBlinkTimer = nil
-        resetBlinkToVisible()
-    }
-
-    /// Put every surface of this session in the visible blink phase, so none
-    /// stays stuck off after a mode transition. The main view reads the state
-    /// only when it draws: left in the off phase it kept the cursor hidden
-    /// until something else redrew it. Stopping the blink did this; starting
-    /// it redrew the external views only.
-    private func resetBlinkToVisible() {
-        let wasHidden = !cursorBlinkState
-        cursorBlinkState = true
-        cursorBlinkPhase = 0
-        if wasHidden { requestRedraw() }
-        for (_, gridView) in externalGridViews {
-            gridView.cursorBlinkState = true
-            gridView.setNeedsDisplay(gridView.bounds)
-        }
+        let wasHidden = !blink.visible
+        zonvie_blink_stop(&blink)
+        showBlinkPhase(changed: wasHidden)
     }
 
     /// Reset cursor blink timer (called on user input to restart blink cycle)
     func resetCursorBlink() {
-        startCursorBlinking(waitMs: lastBlinkWaitMs, onMs: lastBlinkOnMs, offMs: lastBlinkOffMs)
+        startCursorBlinking(waitMs: blink.wait_ms, onMs: blink.on_ms, offMs: blink.off_ms)
     }
 
     /// Request a redraw (to be set by the view)
@@ -4932,7 +4893,13 @@ final class ZonvieCore {
     /// Used as the container background for the popupmenu external grid view
     /// so that margin/padding areas always show the unselected (Pmenu) color.
     /// Updated on every popupmenu_show (including re-shows without hide).
-    private var popupmenuBgColor: NSColor? = nil
+    /// Written on the core thread, read on main as well, hence the lock.
+    private var popupmenuBgColor: NSColor? {
+        get { popupmenuBgColorLock.lock(); defer { popupmenuBgColorLock.unlock() }; return popupmenuBgColorStorage }
+        set { popupmenuBgColorLock.lock(); popupmenuBgColorStorage = newValue; popupmenuBgColorLock.unlock() }
+    }
+    private var popupmenuBgColorStorage: NSColor? = nil
+    private let popupmenuBgColorLock = NSLock()
 
     /// Track last cursor grid to detect transitions from external windows
     private var lastCursorGrid: Int64 = 1
@@ -6357,13 +6324,32 @@ final class ZonvieCore {
               let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
               msgShowWindow.isVisible else { return }
 
-        let targetFrame = getExtFloatTargetFrame()
-        let historyFrame = historyWindow.frame
-        let msgShowFrame = msgShowWindow.frame
-        let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-        let msgShowY = historyFrame.origin.y - msgShowFrame.height - 4
-        msgShowWindow.setFrame(NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height), display: false)
-        ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(msgShowX),\(msgShowY))")
+        let frame = messageFloatFrame(size: msgShowWindow.frame.size, below: historyWindow.frame)
+        msgShowWindow.setFrame(frame, display: false)
+        ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(frame.origin.x),\(frame.origin.y))")
+    }
+
+    /// Where msg_show or msg_history of `size` goes: the core's top-right rule
+    /// (shared with Windows) against getExtFloatTargetFrame, msg_show below a
+    /// visible msg_history. In AppKit's Y-up screen space, so Y is negated on
+    /// the way in and out, as the popupmenu rules do.
+    private func messageFloatFrame(size: NSSize, below history: NSRect?) -> NSRect {
+        let target = getExtFloatTargetFrame()
+        var x: Int32 = 0
+        var y: Int32 = 0
+        zonvie_core_msg_float_origin(
+            Int32(target.minX.rounded()), Int32((-target.maxY).rounded()),
+            Int32(target.maxX.rounded()), Int32((-target.minY).rounded()),
+            Int32(size.width.rounded()),
+            history != nil, Int32((-(history?.minY ?? 0)).rounded()),
+            10, 4, &x, &y)
+        return NSRect(x: CGFloat(x), y: -CGFloat(y) - size.height, width: size.width, height: size.height)
+    }
+
+    /// msg_history's frame when msg_show should stack below it.
+    private func visibleMessageHistoryFrame() -> NSRect? {
+        guard let window = self.externalWindows[ZonvieCore.msgHistoryGridId], window.isVisible else { return nil }
+        return window.frame
     }
 
     /// Place the cmdline-completion popupmenu against the cmdline window:
@@ -6393,13 +6379,15 @@ final class ZonvieCore {
     private func cmdlinePopupmenuPlacement(
         startCol: Int32,
         cellW: CGFloat,
-        scale: CGFloat,
         windowWidth: CGFloat,
         windowHeight: CGFloat
     ) -> (rect: NSRect, direction: String)? {
         guard let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] else {
             return nil
         }
+        // The column is in the cmdline window's pixels, as the grid anchor
+        // case uses its anchor window's scale; the main window's was used.
+        let scale = cmdlineWindow.backingScaleFactor
         let cmdlineFrame = cmdlineWindow.frame
         let cmdlineContentX = ZonvieConfig.cmdlinePadding + ZonvieConfig.cmdlineIconTotalWidth
         let x = Self.popupmenuLeft(
@@ -6486,7 +6474,7 @@ final class ZonvieCore {
             let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
             if isCmdlineCompletion {
                 if let placement = cmdlinePopupmenuPlacement(
-                    startCol: startCol, cellW: cellW, scale: scale,
+                    startCol: startCol, cellW: cellW,
                     windowWidth: windowWidth, windowHeight: windowHeight
                 ) {
                     ZonvieCore.appLog("[external_window] popupmenu positioned \(placement.direction) cmdline at (\(placement.rect.origin.x),\(placement.rect.origin.y))")
@@ -6546,25 +6534,12 @@ final class ZonvieCore {
 
             return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
 
-        case .msgHistory:
-            let targetFrame = getExtFloatTargetFrame()
-            let x = targetFrame.maxX - windowWidth - 10
-            let y = targetFrame.maxY - windowHeight - 10
-            ZonvieCore.appLog("[external_window] msg_history positioned at (\(x),\(y))")
-            return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-
-        case .msgShow:
-            let targetFrame = getExtFloatTargetFrame()
-            let x = targetFrame.maxX - windowWidth - 10
-            var y = targetFrame.maxY - windowHeight - 10
-            if let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId], msgHistoryWindow.isVisible {
-                let historyFrame = msgHistoryWindow.frame
-                y = historyFrame.origin.y - windowHeight - 4
-                ZonvieCore.appLog("[external_window] msg_show positioned below msg_history at (\(x),\(y))")
-            } else {
-                ZonvieCore.appLog("[external_window] msg_show positioned at (\(x),\(y))")
-            }
-            return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+        case .msgHistory, .msgShow:
+            let frame = messageFloatFrame(
+                size: NSSize(width: windowWidth, height: windowHeight),
+                below: kind == .msgShow ? visibleMessageHistoryFrame() : nil)
+            ZonvieCore.appLog("[external_window] \(externalGridKindLogLabel(kind)) positioned at (\(frame.origin.x),\(frame.origin.y))")
+            return frame
 
         case .normal:
             return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
@@ -6711,7 +6686,7 @@ final class ZonvieCore {
 
             if isCmdlineCompletion {
                 if let placement = cmdlinePopupmenuPlacement(
-                    startCol: startCol, cellW: cellW, scale: scale,
+                    startCol: startCol, cellW: cellW,
                     windowWidth: windowWidth, windowHeight: windowHeight
                 ) {
                     windowRect = placement.rect
@@ -7106,7 +7081,13 @@ final class ZonvieCore {
            let button = context.containerView.subviews.compactMap({ $0 as? CopyContentButton }).first {
             button.frame = copyButtonFrame
         }
+        // A cmdline re-centred as it grows is not a drag: saving that origin
+        // reopened the next, shorter cmdline off to the left.
+        let cmdlineWindow = context.window as? CmdlineWindow
+        let savedSuppress = cmdlineWindow?.suppressPositionSave ?? false
+        cmdlineWindow?.suppressPositionSave = true
         context.window.setFrame(layout.windowFrame, display: true)
+        cmdlineWindow?.suppressPositionSave = savedSuppress
         if let linkedMsgShowFrame = layout.linkedMsgShowFrame,
            let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
             msgShowWindow.setFrame(linkedMsgShowFrame, display: true)
@@ -7140,19 +7121,24 @@ final class ZonvieCore {
             height: ZonvieConfig.cmdlineIconSize
         )
 
+        // Keeps its centre, centred once 90% of the screen, kept on it: the
+        // core's rule, shared with Windows (Y negated for AppKit's Y-up).
         let oldFrame = context.window.frame
-        let oldCenterX = oldFrame.midX
-        let oldCenterY = oldFrame.midY
-        var newX = oldCenterX - containerWidth / 2
-        var newY = oldCenterY - containerHeight / 2
+        var newX = oldFrame.midX - containerWidth / 2
+        var newY = oldFrame.midY - containerHeight / 2
         if let screen = context.window.screen ?? NSScreen.main {
-            let screenFrame = screen.visibleFrame
-            if containerWidth >= screenFrame.width * 0.9 {
-                newX = screenFrame.minX + (screenFrame.width - containerWidth) / 2
-            } else {
-                newX = max(screenFrame.minX, min(newX, screenFrame.maxX - containerWidth))
-            }
-            newY = max(screenFrame.minY, min(newY, screenFrame.maxY - containerHeight))
+            let area = screen.visibleFrame
+            var x: Int32 = 0
+            var yDown: Int32 = 0
+            zonvie_core_cmdline_origin(
+                Int32(oldFrame.minX.rounded()), Int32((-oldFrame.maxY).rounded()),
+                Int32(oldFrame.maxX.rounded()), Int32((-oldFrame.minY).rounded()),
+                Int32(containerWidth.rounded()), Int32(containerHeight.rounded()),
+                Int32(area.minX.rounded()), Int32((-area.maxY).rounded()),
+                Int32(area.maxX.rounded()), Int32((-area.minY).rounded()),
+                &x, &yDown)
+            newX = CGFloat(x)
+            newY = -CGFloat(yDown) - containerHeight
         }
 
         return DecoratedExternalLayout(
@@ -7209,26 +7195,20 @@ final class ZonvieCore {
         let containerWidth = contentWidth + (msgPadding * 2) + copyButtonWidth
         let containerHeight = contentHeight + (msgPadding * 2)
 
-        let targetFrame = self.getExtFloatTargetFrame()
-        let newX = targetFrame.maxX - containerWidth - 10
-        var newY = targetFrame.maxY - containerHeight - 10
+        // The same history test as creation: only a visible msg_history
+        // pushes msg_show down (a hidden one used to, here only).
+        let windowFrame = messageFloatFrame(
+            size: NSSize(width: containerWidth, height: containerHeight),
+            below: kind == .msgShow ? visibleMessageHistoryFrame() : nil)
         var linkedMsgShowFrame: NSRect? = nil
-        if kind == .msgShow, let msgHistoryWindow = self.externalWindows[ZonvieCore.msgHistoryGridId] {
-            let historyFrame = msgHistoryWindow.frame
-            newY = historyFrame.origin.y - containerHeight - 4
-        }
-
         if kind == .msgHistory, let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
-            let msgShowFrame = msgShowWindow.frame
-            let msgShowX = targetFrame.maxX - msgShowFrame.width - 10
-            let msgShowY = newY - msgShowFrame.height - 4
-            linkedMsgShowFrame = NSRect(x: msgShowX, y: msgShowY, width: msgShowFrame.width, height: msgShowFrame.height)
+            linkedMsgShowFrame = messageFloatFrame(size: msgShowWindow.frame.size, below: windowFrame)
         }
 
         return DecoratedExternalLayout(
             containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
             gridFrame: NSRect(x: msgPadding, y: msgPadding, width: contentWidth, height: contentHeight),
-            windowFrame: NSRect(x: newX, y: newY, width: containerWidth, height: containerHeight),
+            windowFrame: windowFrame,
             iconFrame: nil,
             linkedMsgShowFrame: linkedMsgShowFrame,
             copyButtonFrame: copyButtonWidth > 0

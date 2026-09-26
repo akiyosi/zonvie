@@ -24,6 +24,7 @@ pub const cursor_rect = @import("cursor_rect.zig");
 pub const win_layout = @import("win_layout.zig");
 const msg_stack = @import("msg_stack.zig");
 pub const glow_chain = @import("glow_chain.zig");
+pub const frontend_rules = @import("frontend_rules.zig");
 pub const msgpack = @import("msgpack.zig");
 pub const rpc_encode = @import("rpc_encode.zig");
 pub const redraw_handler = @import("redraw_handler.zig");
@@ -1995,6 +1996,96 @@ pub export fn zonvie_core_cmdline_popupmenu_top(
     return popup_placement.cmdlineTop(cmdline_top, cmdline_bottom, popup_height, gap, screen_top);
 }
 
+pub export fn zonvie_core_cmdline_origin(
+    old_left: i32,
+    old_top: i32,
+    old_right: i32,
+    old_bottom: i32,
+    new_w: i32,
+    new_h: i32,
+    area_left: i32,
+    area_top: i32,
+    area_right: i32,
+    area_bottom: i32,
+    out_x: ?*i32,
+    out_y: ?*i32,
+) callconv(.c) void {
+    const o = frontend_rules.cmdlineOrigin(
+        .{ .left = old_left, .top = old_top, .right = old_right, .bottom = old_bottom },
+        new_w,
+        new_h,
+        .{ .left = area_left, .top = area_top, .right = area_right, .bottom = area_bottom },
+    );
+    if (out_x) |p| p.* = o.x;
+    if (out_y) |p| p.* = o.y;
+}
+
+pub export fn zonvie_core_msg_float_origin(
+    target_left: i32,
+    target_top: i32,
+    target_right: i32,
+    target_bottom: i32,
+    window_w: i32,
+    has_history: bool,
+    history_bottom: i32,
+    margin: i32,
+    gap: i32,
+    out_x: ?*i32,
+    out_y: ?*i32,
+) callconv(.c) void {
+    const o = frontend_rules.msgFloatTopRight(
+        .{ .left = target_left, .top = target_top, .right = target_right, .bottom = target_bottom },
+        window_w,
+        if (has_history) history_bottom else null,
+        margin,
+        gap,
+    );
+    if (out_x) |p| p.* = o.x;
+    if (out_y) |p| p.* = o.y;
+}
+
+pub export fn zonvie_core_key_is_special(keycode: u32) callconv(.c) bool {
+    const name = if (core.Core.isWinVkKeycode(keycode))
+        core.Core.winSpecialName(core.Core.winVk(keycode))
+    else
+        core.Core.macSpecialName(keycode);
+    return name != null;
+}
+
+pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
+    const s = source orelse return false;
+    return frontend_rules.shaderNeedsAnimation(s[0..len]);
+}
+
+pub export fn zonvie_core_tab_move(p: ?*zonvie_core, from_idx: u32, drop_idx: u32, tab_count: u32) callconv(.c) bool {
+    const box = asBox(p orelse return false);
+    var buf: [64]u8 = undefined;
+    const cmd = frontend_rules.tabMoveCommand(&buf, from_idx, drop_idx, tab_count) orelse return false;
+    box.core.requestCommand(cmd) catch return false;
+    return true;
+}
+
+pub export fn zonvie_core_externalize_tab(p: ?*zonvie_core, tab_idx: u32) callconv(.c) void {
+    const box = asBox(p orelse return);
+    var buf: [1024]u8 = undefined;
+    const cmd = frontend_rules.externalizeTabCommand(&buf, tab_idx) orelse return;
+    box.core.requestCommand(cmd) catch {};
+}
+
+pub const BlinkC = frontend_rules.Blink;
+
+pub export fn zonvie_blink_start(b: *BlinkC, wait_ms: u32, on_ms: u32, off_ms: u32) callconv(.c) u32 {
+    return b.start(wait_ms, on_ms, off_ms);
+}
+
+pub export fn zonvie_blink_tick(b: *BlinkC) callconv(.c) u32 {
+    return b.tick();
+}
+
+pub export fn zonvie_blink_stop(b: *BlinkC) callconv(.c) void {
+    b.stop();
+}
+
 /// Plan a window-layout operation (win_move / win_exchange / win_rotate /
 /// win_resize_equal) over the frames the frontend collected, in place. Pure --
 /// no core pointer, no lock -- so a frontend may call it from the callback that
@@ -3119,11 +3210,8 @@ pub export fn zonvie_core_invalidate_glyph_cache(p: ?*zonvie_core) callconv(.c) 
     // dirty alone is not enough: the per-row emit path checks dirty_rows,
     // and markAllDirty sets both.
     box.core.grid.markEverySurfaceDirty();
-    // Bump content_rev so the flush's need_main check passes even when
-    // Neovim has not changed any cells (e.g. backing-scale change only).
-    box.core.grid.content_rev +%= 1;
     // The main cursor's own regen check is gated on cursor_rev alone (not
-    // content_rev/dirty_all), and an external grid's cursor is a separate
+    // dirty_all), and an external grid's cursor is a separate
     // vertex consumer again — neither is covered by the dirtying above, so
     // both would keep rendering with the stale atlas UVs/font metrics this
     // call exists to invalidate.
@@ -3603,4 +3691,13 @@ test "the null-handle config values match what a default config would build" {
             else => try std.testing.expectEqual(built_v, declared_v),
         }
     }
+}
+
+test "special keys are the ones the core names, on either platform's key codes" {
+    try std.testing.expect(zonvie_core_key_is_special(0x7B)); // macOS Left
+    try std.testing.expect(zonvie_core_key_is_special(0x60)); // macOS F5
+    try std.testing.expect(!zonvie_core_key_is_special(0x00)); // macOS A
+    try std.testing.expect(zonvie_core_key_is_special(0x10000 | 0x25)); // VK_LEFT
+    try std.testing.expect(zonvie_core_key_is_special(0x10000 | 0x2D)); // VK_INSERT
+    try std.testing.expect(!zonvie_core_key_is_special(0x10000 | 0x41)); // 'A'
 }

@@ -803,14 +803,6 @@ pub const Harness = struct {
         return h.core.hl.getWithStyles(hl_id);
     }
 
-    /// Grid content revision counter (bumped on cell/layering/scroll changes).
-    /// Lets scenarios assert that an event triggered a recomposition.
-    pub fn contentRev(h: *Harness) u64 {
-        h.core.grid_mu.lockUncancelable(zc.clock.io());
-        defer h.core.grid_mu.unlock(zc.clock.io());
-        return h.core.grid.content_rev;
-    }
-
     /// Wait until the current mode name starts with `prefix`
     /// (e.g. "insert", "normal"; from mode_change events).
     pub fn waitMode(h: *Harness, prefix: []const u8, timeout_ms: u64) !void {

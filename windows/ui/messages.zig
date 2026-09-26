@@ -681,11 +681,7 @@ pub fn updateExtFloatPositions(app: *App) void {
 
     // Copy window info
     const msg_show_hwnd: ?c.HWND = if (msg_show_entry) |e| e.hwnd else null;
-    const msg_show_rows: u32 = if (msg_show_entry) |e| e.surf.surface.rows else 0;
-    const msg_show_cols: u32 = if (msg_show_entry) |e| e.surf.surface.cols else 0;
     const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
-    const msg_history_rows: u32 = if (msg_history_entry) |e| e.surf.surface.rows else 0;
-    const msg_history_cols: u32 = if (msg_history_entry) |e| e.surf.surface.cols else 0;
     // When using DWM custom titlebar, client area extends into the titlebar.
     // Compute offset to position floats below the custom titlebar area.
     const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
@@ -764,51 +760,33 @@ pub fn updateExtFloatPositions(app: *App) void {
         },
     }
 
-    // Update msg_history position first (if exists)
-    const float_margin = app.scalePx(10);
-    var history_bottom: c_int = target_rect.top + float_margin;
+    // msg_history first: msg_show stacks below it.
+    var history_bottom: ?i32 = null;
     if (msg_history_hwnd) |hwnd| {
-        const content_w: c_int = @intCast(msg_history_cols * cell_w);
-        const content_h: c_int = @intCast(msg_history_rows * cell_h);
-        const scaled_msg_padding = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
-        const client_w: c_int = content_w + scaled_msg_padding * 2;
-        const client_h: c_int = content_h + scaled_msg_padding * 2;
+        const size = windowSize(hwnd) orelse return;
+        const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, null);
+        history_bottom = pos.y + size.h;
 
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-        _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-        const window_w: c_int = rect.right - rect.left;
-        const window_h: c_int = rect.bottom - rect.top;
-
-        const pos_x = target_rect.right - window_w - float_margin;
-        const pos_y: c_int = target_rect.top + float_margin;
-        history_bottom = pos_y + window_h;
-
-        _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
-        _ = c.InvalidateRect(hwnd, null, 0);
-        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_history at ({d},{d}) size=({d},{d})\n", .{ pos_x, pos_y, window_w, window_h });
+        _ = c.SetWindowPos(hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
+        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_history at ({d},{d})\n", .{ pos.x, pos.y });
     }
 
-    // Update msg_show position (if exists)
     if (msg_show_hwnd) |hwnd| {
-        const content_w: c_int = @intCast(msg_show_cols * cell_w);
-        const content_h: c_int = @intCast(msg_show_rows * cell_h);
-        const scaled_msg_padding2 = app.scalePx(@as(c_int, app_mod.MSG_PADDING));
-        const client_w: c_int = content_w + scaled_msg_padding2 * 2;
-        const client_h: c_int = content_h + scaled_msg_padding2 * 2;
+        const size = windowSize(hwnd) orelse return;
+        const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, history_bottom);
 
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-        _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-        const window_w: c_int = rect.right - rect.left;
-        const window_h: c_int = rect.bottom - rect.top;
-
-        const pos_x = target_rect.right - window_w - float_margin;
-        // If msg_history exists, position below it; otherwise at top
-        const pos_y: c_int = if (msg_history_hwnd != null) history_bottom + app.scalePx(4) else target_rect.top + float_margin;
-
-        _ = c.SetWindowPos(hwnd, null, pos_x, pos_y, window_w, window_h, c.SWP_NOACTIVATE | c.SWP_NOZORDER);
-        _ = c.InvalidateRect(hwnd, null, 0);
-        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_show at ({d},{d}) size=({d},{d})\n", .{ pos_x, pos_y, window_w, window_h });
+        _ = c.SetWindowPos(hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
+        if (applog.isEnabled()) applog.appLog("[win] updateExtFloatPositions: msg_show at ({d},{d})\n", .{ pos.x, pos.y });
     }
+}
+
+/// Outer size of a window. Only moves are done from here: the size is the
+/// external-window sizing path's (externalSurfaceInsetsPx), which counts the
+/// copy button this path used to leave out, shrinking the box on every move.
+fn windowSize(hwnd: c.HWND) ?struct { w: c_int, h: c_int } {
+    var rect: c.RECT = undefined;
+    if (c.GetWindowRect(hwnd, &rect) == 0) return null;
+    return .{ .w = rect.right - rect.left, .h = rect.bottom - rect.top };
 }
 
 /// Update or create mini windows (showmode / showcmd / ruler)
