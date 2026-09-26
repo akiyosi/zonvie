@@ -503,22 +503,6 @@ pub const SurfaceState = struct {
     rows: u32 = 0,
     cols: u32 = 0,
     last_cursor_row: ?u32 = null,
-    // The shared metrics generation the vertices were last written against,
-    // as `VertexSet.metrics_gen` is for a TBS set. A decorated external
-    // surface paints from here, not from TBS, and had no such stamp.
-    metrics_gen: u64 = 0,
-
-    pub fn ensureRowStorage(self: *SurfaceState, alloc: std.mem.Allocator, row: u32) bool {
-        const need: usize = @intCast(row + 1);
-        if (self.row_verts.items.len >= need) return true;
-        const old_len = self.row_verts.items.len;
-        self.row_verts.resize(alloc, need) catch return false;
-        var i = old_len;
-        while (i < need) : (i += 1) {
-            self.row_verts.items[i] = .{};
-        }
-        return true;
-    }
 
     pub fn truncateRows(self: *SurfaceState, alloc: std.mem.Allocator, needed_rows: u32) usize {
         const start: usize = @intCast(needed_rows);
@@ -531,14 +515,6 @@ pub const SurfaceState = struct {
         }
         self.row_verts.shrinkAndFree(alloc, start);
         return removed;
-    }
-
-    pub fn recomputeVertCount(self: *const SurfaceState) usize {
-        var total: usize = 0;
-        for (self.row_verts.items) |rv| {
-            total += rv.verts.items.len;
-        }
-        return total;
     }
 
     /// Free CPU-side allocations only. GPU resources (VBs) are owned by the
@@ -894,6 +870,25 @@ pub const TripleBufferedSurface = struct {
         dst.verts.appendSliceAssumeCapacity(verts);
         dst.last_cursor_row = last_cursor_row;
         self.main_cursor_flush_new_row = last_cursor_row;
+        return true;
+    }
+
+    /// The cursor row this flush has staged, or the committed one when it has
+    /// staged none. Core thread only.
+    pub fn stagedCursorRow(self: *const TripleBufferedSurface) ?u32 {
+        const idx = if (self.main_cursor_in_flush) self.main_cursor_write_index else self.main_cursor_committed_index;
+        return self.main_cursor_sets[idx].last_cursor_row;
+    }
+
+    /// Whether every row of the write set holds content the core has sent,
+    /// so a row shift carries only rows that exist. A new row starts with no
+    /// slot; one a shift vacates keeps its slot until the core resends it.
+    pub fn writeSetRowsSeeded(self: *TripleBufferedSurface, total_rows: u32) bool {
+        const ws = self.writeSet();
+        if (!ws.row_mode or ws.row_map.items.len < total_rows) return false;
+        for (ws.row_map.items[0..total_rows]) |mapping| {
+            if (mapping.slot == SLOT_NONE) return false;
+        }
         return true;
     }
 
@@ -2515,10 +2510,6 @@ pub const ExternalWindow = struct {
 
     // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
 
-    // GPU vertex buffers (not in SurfaceState — ownership/deinit stays here).
-    vb: ?*c.ID3D11Buffer = null,
-    vb_bytes: usize = 0,
-    vert_count: usize = 0,
     needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
@@ -2592,10 +2583,6 @@ pub const ExternalWindow = struct {
     // Whether the last paint drew any root row, for atlasUploadOwesFullPaint.
     paint_drew_root_rows: bool = false,
 
-    pub fn recomputeVertCount(self: *ExternalWindow) void {
-        self.vert_count = self.surf.surface.recomputeVertCount();
-    }
-
     pub fn deinit(
         self: *ExternalWindow,
         alloc: std.mem.Allocator,
@@ -2618,9 +2605,6 @@ pub const ExternalWindow = struct {
         self.surf.surface.deinitCpuState(alloc);
         self.surf.paint.deinit(alloc, row_vb_budget);
         self.surf.tbs.deinit(alloc); // Handles slot release + pool deinit
-        if (self.vb) |vb| {
-            _ = vb.lpVtbl.*.Release.?(vb);
-        }
         self.renderer.deinit();
     }
 };
@@ -4812,6 +4796,9 @@ const BloomRowsContext = struct {
     /// Non-root layers extracted after the root rows. Null for a surface
     /// without layers.
     bloom_layers: ?BloomLayerSource = null,
+    /// Cursor vertices are grid-local; drawBloomPasses draws them right after
+    /// this callback with the transform it leaves bound.
+    cursor_layer_origin: [2]f32 = .{ 0, 0 },
 };
 
 fn drawBloomRowBuffers(
@@ -4904,11 +4891,12 @@ fn drawBloomRowBuffers(
                     }
                 }
             }
-            // Restore the surface's own pixel space for the cursor draw that
-            // drawBloomPasses runs after this callback.
-            g.setLayerTransform(0, 0, extent_w_px, extent_h_px);
         }
     }
+    // drawBloomPasses draws the cursor after this callback, in its layer's
+    // space as the main pass does; it used to be left at the surface origin,
+    // so a cursor in a split or float glowed away from where it was drawn.
+    g.setLayerTransform(ctx.cursor_layer_origin[0], ctx.cursor_layer_origin[1], extent_w_px, extent_h_px);
 }
 
 /// Release the snapshot a paint took with `acquireForPaint`, once, from the
@@ -5212,6 +5200,7 @@ pub fn drawSurfaceRowFrame(
             surface.row_vbs,
             bloom_cursor,
             glow.intensity,
+            in.cursor_layer_origin,
             in.draw_params,
         );
     }
@@ -5433,6 +5422,7 @@ pub fn drawBloomRowsOverlay(
     row_vbs: []const RowVB,
     cursor_verts: []const Vertex,
     glow_intensity: f32,
+    cursor_layer_origin: [2]f32,
     draw_params: RowModeDrawParams,
 ) void {
     // The extract pass reads live layer row storage, which the core thread
@@ -5474,6 +5464,7 @@ pub fn drawBloomRowsOverlay(
         .row_vbs = row_vbs,
         .row_h_px = draw_params.row_h_px,
         .bloom_layers = draw_params.bloom_layers,
+        .cursor_layer_origin = cursor_layer_origin,
     };
     const bvp = draw_params.bloomViewport(g.width);
     g.drawBloomFromRowBuffers(&rows_ctx, drawBloomRowBuffers, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
@@ -5710,8 +5701,6 @@ pub const App = struct {
     rasterize_max_ns: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     // ---- NEW: cursor VB upload generation (row-mode overlay) ----
-    cursor_gen: u64 = 0,
-    cursor_uploaded_gen: u64 = 0,
     // Cursor overlay mode: back buffer kept cursor-free, cursor drawn in present step.
     cursor_overlay_active: bool = false,
 
@@ -5854,16 +5843,14 @@ pub const App = struct {
 
     // Track last cursor grid to detect transitions from external windows
     last_cursor_grid: i64 = 1,
+    /// The grid on_cursor_grid_changed last named, for dropping its repeats.
+    core_reported_cursor_grid: i64 = 1,
     // Tick count when cursor left an external window (used to suppress main window activation briefly)
     last_ext_window_exit_tick: i64 = 0,
 
     // Cursor blink state
-    cursor_blink_state: bool = true, // true = visible, false = hidden
+    cursor_blink: core.frontend_rules.Blink = .{}, // .visible: the cursor is drawn
     cursor_blink_timer: c.UINT_PTR = 0, // Timer ID for blink
-    cursor_blink_phase: u8 = 0, // 0 = not blinking, 1 = blinking
-    cursor_blink_wait_ms: u32 = 0,
-    cursor_blink_on_ms: u32 = 0,
-    cursor_blink_off_ms: u32 = 0,
 
     cursor_is_hand: bool = false, // URL hover: hand cursor
     url_cache_grid: i64 = 0,

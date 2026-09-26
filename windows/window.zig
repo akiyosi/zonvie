@@ -1531,10 +1531,12 @@ fn d3dInitThreadFn(app: *App) void {
 // =========================================================================
 fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
     const effective_nvim = app.cli_nvim_path orelse app.config.neovim.path;
-    if (app.nvim_extra_args.items.len == 0) return effective_nvim;
+    // The core splits the command on spaces, so a path with one is quoted
+    // even with no extra args (`C:\Program Files\Neovim\bin\nvim.exe`).
+    const needs_quote = std.mem.indexOfScalar(u8, effective_nvim, ' ') != null;
+    if (app.nvim_extra_args.items.len == 0 and !needs_quote) return effective_nvim;
     var w = std.Io.Writer.fixed(buf);
     const writer = &w;
-    const needs_quote = std.mem.indexOfScalar(u8, effective_nvim, ' ') != null;
     if (needs_quote) writer.writeByte('\'') catch {};
     writer.writeAll(effective_nvim) catch {};
     if (needs_quote) writer.writeByte('\'') catch {};
@@ -2441,7 +2443,7 @@ pub export fn WndProc(
                             if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
                         }
                         if (non_row_draw) {
-                            const cursor_items = render_helpers.cursorVertsForFrame(core.Vertex, committed_cursor.verts.items, app.cursor_blink_state);
+                            const cursor_items = render_helpers.cursorVertsForFrame(core.Vertex, committed_cursor.verts.items, app.cursor_blink.visible);
                             if (g.drawEx(committed.flat_verts.items, cursor_items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
                                 render_ok = true;
                                 // Non-row-mode equivalent of row-mode's
@@ -2624,11 +2626,6 @@ pub export fn WndProc(
                         const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
                         _ = c.GetClientRect(client_hwnd, &client);
 
-                        // Compute cursor rect directly from NDC vertices using viewport
-                        // dimensions (content_height etc.) to match the D3D11 viewport's
-                        // NDC-to-pixel mapping. Using the client rect (as rectFromVerts
-                        // does) causes cumulative position drift because the viewport is
-                        // snapped to cell boundaries, which is smaller than the client area.
                         // Core vertices are grid-local pixels. The root grid's
                         // layer sits at the surface origin, but a cursor in
                         // any other grid the surface draws as a layer needs
@@ -2747,126 +2744,9 @@ pub export fn WndProc(
                             present.addOpt(dirty);
                         }
 
-                        // Add bottom gutter rect if client area extends beyond the grid area.
-                        // This ensures the gutter is properly cleared in all swapchain buffers
-                        // during partial present, preventing ghost artifacts from stale content.
-                        // The gutter starts at the snapped grid bottom (content_height, derived
-                        // from the client and row height, so never stale). It used to start at the
-                        // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
-                        // present of rows 5 to the bottom of the window.
-                        if (present_rects.items.len != 0) {
-                            const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
-                            if (grid_bottom > 0 and grid_bottom < client.bottom) {
-                                const gutter_rc: c.RECT = .{
-                                    .left = 0,
-                                    .top = grid_bottom,
-                                    .right = client.right,
-                                    .bottom = client.bottom,
-                                };
-                                present.add(gutter_rc);
-                            }
-                        }
-
                         // Always include explicit paint rects (cursor damage) in present set.
                         for (paint_rects_snapshot.items) |r| present.add(r);
                         present.addOpt(cursor_rc_opt);
-
-                        // Track in each grid whether this paint built a present rect.
-                        // The core thread can make a layer dirty after the loop
-                        // below has run; that layer's band is drawn but not
-                        // presented, so only the layers recorded here may have
-                        // their dirty flag consumed.
-
-                        // Layers paint whole; present each one that changed.
-                        // Their rows are not in rows_to_draw, which only
-                        // covers the root grid's own dirty rows. Added before
-                        // the chrome test below, which widens only a list that
-                        // already has content: a paint whose only damage was a
-                        // layer used to present it without the chrome bands.
-                        if (tbs_snapshot.layers.len > 1) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            defer app.mu.unlock(core.clock.io());
-                            app_mod.appendLayerPresentRects(
-                                app,
-                                tbs_snapshot.layers.slice(),
-                                content_x_offset_i32,
-                                content_y_offset_i32,
-                                client.right,
-                                client.bottom,
-                                row_h_px,
-                                present_rects,
-                            );
-                        }
-
-                        // The chrome outside the content area — the tabline with
-                        // its close and new-tab buttons, the caption buttons, the
-                        // sidebar — is redrawn into back_tex on EVERY paint, from
-                        // hover state that produces no row damage and no paint
-                        // rect. Nothing above ever added its band here, so it
-                        // reached the screen only on a frame that happened to
-                        // present in full: the moment anything else put a rect in
-                        // this list (a blinking cursor is enough), the present
-                        // went partial and the newly drawn hover was left in
-                        // back_tex. Only widen a list that already has content —
-                        // an empty list still means "present everything", which
-                        // covers the chrome anyway.
-                        if (present_rects.items.len != 0) {
-                            if (content_y_offset_i32 > 0) {
-                                present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
-                            }
-                            if (content_x_offset_i32 > 0) {
-                                present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
-                            }
-                            if (sidebar_right_width) |rw| {
-                                const right_strip_left: i32 =
-                                    client.right - @as(i32, @intCast(rw));
-                                if (rw > 0 and right_strip_left > 0) {
-                                    present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
-                                }
-                            }
-                        }
-
-                        // The client rect can be a resize ahead of the buffer.
-                        present.finish(g.width, g.height);
-
-                        // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
-                        if (applog.isEnabled()) {
-                            applog.appLog(
-                                "[win] WM_PAINT(row) present_rects={d} (rows_to_draw={d})\n",
-                                .{ present_rects.items.len, rows_to_draw.items.len },
-                            );
-
-                            if (present_rects.items.len != 0) {
-                                var u: c.RECT = present_rects.items[0];
-                                var j: usize = 1;
-                                while (j < present_rects.items.len) : (j += 1) {
-                                    u = callbacks.unionRect(u, present_rects.items[j]);
-                                }
-
-                                applog.appLog(
-                                    "[win]   present_union=({d},{d})-({d},{d})\n",
-                                    .{ u.left, u.top, u.right, u.bottom },
-                                );
-
-                                var k: usize = 0;
-                                while (k < present_rects.items.len) : (k += 1) {
-                                    const r = present_rects.items[k];
-                                    applog.appLog(
-                                        "[win]   present[{d}]=({d},{d})-({d},{d})\n",
-                                        .{ k, r.left, r.top, r.right, r.bottom },
-                                    );
-                                }
-                            } else {
-                                applog.appLog("[win]   present_rects is EMPTY\n", .{});
-                            }
-
-                            if (cursor_rc_opt) |cr| {
-                                applog.appLog(
-                                    "[win]   cursor_rc=({d},{d})-({d},{d})\n",
-                                    .{ cr.left, cr.top, cr.right, cr.bottom },
-                                );
-                            }
-                        }
 
                         // row-setup drawEx is the ONLY drawEx in row-mode WM_PAINT.
                         // When did_need_seed is true, we must NOT preserve old back buffer contents,
@@ -2966,7 +2846,10 @@ pub export fn WndProc(
                         // Shared with the external driver: row VBs, the scroll
                         // pixel shift, the layer plan under app.mu (after the
                         // renderer context, the order the layer draw uses), then
-                        // the row frame. Layer present rects were added above.
+                        // the row frame. Layer present rects are added in the
+                        // plan's own app.mu hold: added in a hold of their own
+                        // before it, a layer the core dirtied in between was
+                        // drawn but not presented until the next paint.
                         const pass = app_mod.drawSurfaceRowPass(g, app, .of(&app.surf), .{
                             .snapshot = tbs_snapshot,
                             .rows_to_draw = rows_to_draw,
@@ -2975,6 +2858,11 @@ pub export fn WndProc(
                             .preserve_back = preserve_back,
                             .layer_paint_full = paint_full_snapshot,
                             .cell_w_px = @intCast(@max(1, app.cell_w_px)),
+                            .layer_present = .{
+                                .rects = present_rects,
+                                .right = client.right,
+                                .bottom = client.bottom,
+                            },
                             .frame = .{
                                 .root_grid_id = 1,
                                 .layers = &.{},
@@ -2985,14 +2873,14 @@ pub export fn WndProc(
                                 .cursor_grid = cursor_grid,
                                 .cursor_erase_rows = cursor_erase_rows,
                                 .cursor_layer_origin = cursor_layer_origin,
-                                .blink_visible = app.cursor_blink_state,
+                                .blink_visible = app.cursor_blink.visible,
                                 .force_full_rows = force_full_rows,
                                 .layer_layout_stale = false,
                                 .layer_commit_stale = false,
                                 .glow = if (glow_enabled) app_mod.RowFrameGlow{
                                     .intensity = glow_intensity,
                                     .radius_scale = glow_radius_scale,
-                                    .cursor_visible = app.cursor_blink_state,
+                                    .cursor_visible = app.cursor_blink.visible,
                                 } else null,
                                 .draw_params = row_draw_params,
                                 .log_enabled = log_enabled,
@@ -3001,6 +2889,99 @@ pub export fn WndProc(
                             recoverMainPaintFailure(hwnd, app);
                             return 0;
                         };
+                        // Add bottom gutter rect if client area extends beyond the grid area.
+                        // This ensures the gutter is properly cleared in all swapchain buffers
+                        // during partial present, preventing ghost artifacts from stale content.
+                        // The gutter starts at the snapped grid bottom (content_height, derived
+                        // from the client and row height, so never stale). It used to start at the
+                        // lowest DIRTY row, which turned every cursor blink on row 5 of 50 into a
+                        // present of rows 5 to the bottom of the window.
+                        if (present_rects.items.len != 0) {
+                            const grid_bottom: i32 = content_y_offset_i32 + @as(i32, @intCast(content_height));
+                            if (grid_bottom > 0 and grid_bottom < client.bottom) {
+                                const gutter_rc: c.RECT = .{
+                                    .left = 0,
+                                    .top = grid_bottom,
+                                    .right = client.right,
+                                    .bottom = client.bottom,
+                                };
+                                present.add(gutter_rc);
+                            }
+                        }
+
+                        // The gutter and chrome bands widen only a list that
+                        // already has content, so they come after everything
+                        // that can make it non-empty, the layers included.
+                        // The chrome outside the content area — the tabline with
+                        // its close and new-tab buttons, the caption buttons, the
+                        // sidebar — is redrawn into back_tex on EVERY paint, from
+                        // hover state that produces no row damage and no paint
+                        // rect. Nothing above ever added its band here, so it
+                        // reached the screen only on a frame that happened to
+                        // present in full: the moment anything else put a rect in
+                        // this list (a blinking cursor is enough), the present
+                        // went partial and the newly drawn hover was left in
+                        // back_tex. Only widen a list that already has content —
+                        // an empty list still means "present everything", which
+                        // covers the chrome anyway.
+                        if (present_rects.items.len != 0) {
+                            if (content_y_offset_i32 > 0) {
+                                present.add(.{ .left = 0, .top = 0, .right = client.right, .bottom = content_y_offset_i32 });
+                            }
+                            if (content_x_offset_i32 > 0) {
+                                present.add(.{ .left = 0, .top = 0, .right = content_x_offset_i32, .bottom = client.bottom });
+                            }
+                            if (sidebar_right_width) |rw| {
+                                const right_strip_left: i32 =
+                                    client.right - @as(i32, @intCast(rw));
+                                if (rw > 0 and right_strip_left > 0) {
+                                    present.add(.{ .left = right_strip_left, .top = 0, .right = client.right, .bottom = client.bottom });
+                                }
+                            }
+                        }
+
+                        // The client rect can be a resize ahead of the buffer.
+                        present.finish(g.width, g.height);
+
+                        // --- DEBUG: show real present rects (rcPaint is NOT reliable in union cases) ---
+                        if (applog.isEnabled()) {
+                            applog.appLog(
+                                "[win] WM_PAINT(row) present_rects={d} (rows_to_draw={d})\n",
+                                .{ present_rects.items.len, rows_to_draw.items.len },
+                            );
+
+                            if (present_rects.items.len != 0) {
+                                var u: c.RECT = present_rects.items[0];
+                                var j: usize = 1;
+                                while (j < present_rects.items.len) : (j += 1) {
+                                    u = callbacks.unionRect(u, present_rects.items[j]);
+                                }
+
+                                applog.appLog(
+                                    "[win]   present_union=({d},{d})-({d},{d})\n",
+                                    .{ u.left, u.top, u.right, u.bottom },
+                                );
+
+                                var k: usize = 0;
+                                while (k < present_rects.items.len) : (k += 1) {
+                                    const r = present_rects.items[k];
+                                    applog.appLog(
+                                        "[win]   present[{d}]=({d},{d})-({d},{d})\n",
+                                        .{ k, r.left, r.top, r.right, r.bottom },
+                                    );
+                                }
+                            } else {
+                                applog.appLog("[win]   present_rects is EMPTY\n", .{});
+                            }
+
+                            if (cursor_rc_opt) |cr| {
+                                applog.appLog(
+                                    "[win]   cursor_rc=({d},{d})-({d},{d})\n",
+                                    .{ cr.left, cr.top, cr.right, cr.bottom },
+                                );
+                            }
+                        }
+
                         const row_frame = pass.frame;
                         if (row_frame.row_vb_budget_exceeded) {
                             app_mod.failRowVbBudget(app, tbs_snapshot.layers.slice());
@@ -3777,10 +3758,9 @@ pub export fn WndProc(
                 const grid_id: i64 = @bitCast(wParam);
 
                 // app.last_cursor_grid is already updated synchronously by
-                // onCursorGridChanged (the core callback), so we only fetch
-                // ext_hwnd here. The core fires this callback only when the
-                // cursor grid actually changes, so no is_grid_change guard
-                // is needed in the UI handler.
+                // onCursorGridChanged (the core callback), which also drops
+                // the core's repeats for the same grid, so we only fetch
+                // ext_hwnd here.
                 // The flush routing's answer, staged layout included: the core
                 // fires this mid-flush, before the layout that places a newly
                 // opened float commits, and a committed-only scan found no host,

@@ -1209,17 +1209,6 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     const pv = &app.pending_external_verts.items[idx];
     const row_count = pv.surface.row_verts.items.len;
 
-    // Reserve the legacy surface copy.
-    if (pv.surface.row_mode) {
-        if (row_count != 0 and !ext_win.surf.surface.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
-        for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            ext_win.surf.surface.row_verts.items[row_idx].verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
-        }
-    } else {
-        ext_win.surf.surface.verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch return false;
-    }
-    ext_win.surf.surface.cursor_verts.ensureTotalCapacity(app.alloc, pv.surface.cursor_verts.items.len) catch return false;
-
     // A window published during an active core flush joins that transaction.
     // Seed its write set so later row callbacks and onFlushEnd publish one
     // complete frame; outside a flush, initialize the committed set directly.
@@ -1250,34 +1239,12 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
 
     // All allocations succeeded. Publish the complete surface atomically
     // while app.mu still excludes core vertex callbacks.
-    ext_win.surf.surface.row_mode = pv.surface.row_mode;
     ext_win.surf.surface.rows = pv.surface.rows;
     ext_win.surf.surface.cols = pv.surface.cols;
-    ext_win.surf.surface.metrics_gen = pv.metrics_gen;
     ext_win.needs_redraw = true;
     // Joined the open flush above: onFlushEnd owes this window the
     // invalidate, and the paint that follows clears needs_redraw.
     if (ext_win.surf.tbs.is_in_flush) ext_win.surf.flush_needs_invalidate = true;
-
-    if (pv.surface.row_mode) {
-        ext_win.surf.surface.verts.clearRetainingCapacity();
-        for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            const dst_row = &ext_win.surf.surface.row_verts.items[row_idx];
-            dst_row.verts.clearRetainingCapacity();
-            dst_row.verts.appendSliceAssumeCapacity(src_row.verts.items);
-            dst_row.gen = src_row.gen;
-            dst_row.origin_row = src_row.origin_row;
-        }
-        _ = ext_win.surf.surface.truncateRows(app.alloc, pv.surface.rows);
-        ext_win.recomputeVertCount();
-    } else {
-        ext_win.surf.surface.verts.clearRetainingCapacity();
-        ext_win.surf.surface.verts.appendSliceAssumeCapacity(pv.surface.verts.items);
-        ext_win.vert_count = pv.surface.verts.items.len;
-    }
-    ext_win.surf.surface.cursor_verts.clearRetainingCapacity();
-    ext_win.surf.surface.cursor_verts.appendSliceAssumeCapacity(pv.surface.cursor_verts.items);
-    ext_win.surf.surface.last_cursor_row = pv.surface.last_cursor_row;
 
     cs.row_mode = pv.surface.row_mode;
     cs.rows = pv.surface.rows;
@@ -1348,12 +1315,18 @@ fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) msg_float_
         if (c.GetWindowRect(hwnd, &history_rect) != 0) history_bottom = history_rect.bottom;
     }
 
+    return msgFloatOrigin(app, target_rect, window_w, history_bottom);
+}
+
+/// msg_float_layout.msgFloatTopRight at this monitor's scale. `app.mu` held
+/// or not: it reads only the DPI scale.
+pub fn msgFloatOrigin(app: *App, target_rect: c.RECT, window_w: c_int, history_bottom: ?i32) msg_float_layout.Point {
     return msg_float_layout.msgFloatTopRight(.{
         .left = target_rect.left,
         .top = target_rect.top,
         .right = target_rect.right,
         .bottom = target_rect.bottom,
-    }, window_w, history_bottom);
+    }, window_w, history_bottom, app.scalePx(msg_float_layout.margin_px), app.scalePx(msg_float_layout.history_gap_px));
 }
 
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
@@ -1424,18 +1397,81 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
         x = pos.x;
         y = pos.y;
         if (applog.isEnabled()) applog.appLog("[win] msg float re-anchored top-right: ({d},{d}) w={d}\n", .{ x, y, window_w });
+    } else if (is_popupmenu) {
+        // Completion items change while the menu is up; it was placed only
+        // when created, so it grew down over the cmdline or kept its column.
+        if (cmdlinePopupmenuOrigin(app, req.start_col, window_w, window_h)) |pos| {
+            x = pos.x;
+            y = pos.y;
+        } else flags |= c.SWP_NOMOVE;
+    } else if (is_cmdline) {
+        // A cmdline growing as you type keeps its centre and its monitor
+        // (the core's rule, shared with macOS) instead of growing rightward
+        // from its top-left, past the monitor edge.
+        var old: c.RECT = undefined;
+        if (c.GetWindowRect(hwnd, &old) != 0) {
+            const work = app_mod.monitorWorkArea(hwnd);
+            const o = core.frontend_rules.cmdlineOrigin(
+                .{ .left = old.left, .top = old.top, .right = old.right, .bottom = old.bottom },
+                window_w,
+                window_h,
+                .{ .left = work.left, .top = work.top, .right = work.right, .bottom = work.bottom },
+            );
+            x = o.x;
+            y = o.y;
+        } else flags |= c.SWP_NOMOVE;
     } else {
         flags |= c.SWP_NOMOVE;
     }
 
+    var old_rect: c.RECT = undefined;
+    const had_old_rect = is_cmdline and c.GetWindowRect(hwnd, &old_rect) != 0;
     const updated = c.SetWindowPos(hwnd, null, x, y, window_w, window_h, flags) != 0;
     app.mu.lockUncancelable(core.clock.io());
     if (app.external_windows.get(req.grid_id)) |ext_win| {
         if (ext_win.hwnd == hwnd) ext_win.suppress_resize_callback = false;
     }
+    const pum_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.POPUPMENU_GRID_ID)) |pw| pw.hwnd else null;
     app.mu.unlock(core.clock.io());
+    // The completion menu is placed against the cmdline, which now moves as it
+    // grows: carry it along by the same distance.
+    if (updated and had_old_rect and (flags & c.SWP_NOMOVE) == 0) {
+        if (pum_hwnd) |ph| {
+            var pum_rect: c.RECT = undefined;
+            if ((x != old_rect.left or y != old_rect.top) and c.GetWindowRect(ph, &pum_rect) != 0) {
+                _ = c.SetWindowPos(ph, null, pum_rect.left + (x - old_rect.left), pum_rect.top + (y - old_rect.top), 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+            }
+        }
+    }
     if (updated) _ = c.InvalidateRect(hwnd, null, c.FALSE);
     return updated;
+}
+
+/// Where the cmdline completion popupmenu goes: its column under the
+/// cmdline's text, above the cmdline or below it by the core's rule (shared
+/// with macOS). Null without a cmdline window. `app.mu` not held.
+fn cmdlinePopupmenuOrigin(app: *App, start_col: i32, window_w: c_int, window_h: c_int) ?c.POINT {
+    app.mu.lockUncancelable(core.clock.io());
+    const cmdline_win = app.external_windows.get(app_mod.CMDLINE_GRID_ID);
+    const cell_w = app.cell_w_px;
+    app.mu.unlock(core.clock.io());
+    const cw = cmdline_win orelse return null;
+    var cmdline_rect: c.RECT = undefined;
+    if (c.GetWindowRect(cw.hwnd, &cmdline_rect) == 0) return null;
+    const cmdline_content_x: c_int =
+        @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
+        @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
+    // The popupmenu draws at its client origin (decoratedContentOriginPx), so
+    // its column lines up with no inset to subtract.
+    const x = popupmenuPositionX(cmdline_rect.left + cmdline_content_x +
+        @as(c_int, @intCast(@max(0, start_col))) * @as(c_int, @intCast(cell_w)), window_w, cw.hwnd);
+    var screen_top: c_int = std.math.minInt(c_int);
+    var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
+    monitor_info.cbSize = @sizeOf(c.MONITORINFO);
+    const monitor = c.MonitorFromWindow(cw.hwnd, c.MONITOR_DEFAULTTONEAREST);
+    if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
+    const y = app_mod.zonvie_core_cmdline_popupmenu_top(cmdline_rect.top, cmdline_rect.bottom, window_h, 4, screen_top);
+    return .{ .x = x, .y = y };
 }
 
 /// Actually create external window (must be called on UI thread).
@@ -1630,31 +1666,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             }
         }
     } else if (is_popupmenu and req.start_row == -1) {
-        // Popupmenu for cmdline completion: position above cmdline window
-        app.mu.lockUncancelable(core.clock.io());
-        const cmdline_win = app.external_windows.get(app_mod.CMDLINE_GRID_ID);
-        app.mu.unlock(core.clock.io());
-
-        if (cmdline_win) |cw| {
-            var cmdline_rect: c.RECT = undefined;
-            if (c.GetWindowRect(cw.hwnd, &cmdline_rect) != 0) {
-                const cmdline_content_x: c_int =
-                    @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
-                    @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
-                // Position above cmdline window with small gap. The popupmenu
-                // draws at its client origin (decoratedContentOriginPx), so
-                // its column lines up with no inset to subtract.
-                pos_x = popupmenuPositionX(cmdline_rect.left + cmdline_content_x +
-                    @as(c_int, @intCast(req.start_col)) * @as(c_int, @intCast(cell_w)), window_w, cw.hwnd);
-                // Above or below is the core's rule, shared with macOS.
-                var screen_top: c_int = std.math.minInt(c_int);
-                var monitor_info: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-                monitor_info.cbSize = @sizeOf(c.MONITORINFO);
-                const monitor = c.MonitorFromWindow(cw.hwnd, c.MONITOR_DEFAULTTONEAREST);
-                if (c.GetMonitorInfoW(monitor, &monitor_info) != 0) screen_top = monitor_info.rcWork.top;
-                pos_y = app_mod.zonvie_core_cmdline_popupmenu_top(cmdline_rect.top, cmdline_rect.bottom, window_h, 4, screen_top);
-                if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
-            }
+        if (cmdlinePopupmenuOrigin(app, req.start_col, window_w, window_h)) |pos| {
+            pos_x = pos.x;
+            pos_y = pos.y;
+            if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
         } else {
             // Fallback: center on the main window's monitor
             const work = app_mod.monitorWorkArea(app.hwnd);
@@ -1909,16 +1924,13 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             var history_rect: c.RECT = undefined;
             var msg_rect: c.RECT = undefined;
             if (c.GetWindowRect(hwnd, &history_rect) != 0 and c.GetWindowRect(msg_win.hwnd, &msg_rect) != 0) {
-                const msg_width = msg_rect.right - msg_rect.left;
-                const target_rect = app.getExtFloatTargetRect();
-                const new_x = target_rect.right - msg_width - 10;
-                const new_y = history_rect.bottom + 4;
+                const pos = msgFloatOrigin(app, app.getExtFloatTargetRect(), msg_rect.right - msg_rect.left, history_rect.bottom);
                 // Defer SetWindowPos to after lock release
                 deferred_setpos = .{
                     .hwnd = msg_win.hwnd,
                     .hwnd_insert_after = null,
-                    .x = new_x,
-                    .y = new_y,
+                    .x = pos.x,
+                    .y = pos.y,
                     .flags = c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
                 };
             }
@@ -2273,8 +2285,19 @@ pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     //   4. on_cursor_grid_changed fires -> posts WM_APP_CURSOR_GRID_CHANGED
     //   5. UI thread updates app.last_cursor_grid = 2 (too late)
     app.mu.lockUncancelable(core.clock.io());
+    // Compared with what the core last reported, not with last_cursor_grid,
+    // which window creation also writes for a window the cursor may not have
+    // entered.
+    const repeated = app.core_reported_cursor_grid == grid_id;
+    app.core_reported_cursor_grid = grid_id;
     app.last_cursor_grid = grid_id;
     app.mu.unlock(core.clock.io());
+
+    // The core repeats the callback for the same grid while that grid's
+    // window is not created yet and after an aborted flush; each repeat used
+    // to bring the main window to the front again. The window, once created,
+    // takes the foreground itself (cursor_may_enter).
+    if (repeated) return;
 
     // Post message to UI thread to handle window activation
     if (app.hwnd) |main_hwnd| {
@@ -2546,6 +2569,9 @@ pub export fn ExternalWndProc(
                 if (suppress) return 0;
 
                 if (grid_id) |gid| {
+                    // Cmdline, popupmenu and message surfaces are sized by
+                    // zonvie, not Neovim, which has no such grid to resize.
+                    if (classifyExternalSurface(gid) != .normal) return 0;
                     if (cell_w > 0 and cell_h > 0) {
                         const new_cols: u32 = content_w / cell_w;
                         const new_rows: u32 = client_h / cell_h;
@@ -2984,7 +3010,10 @@ pub export fn ExternalWndProc(
 
                 // Check if this is the cmdline window
                 if (app.external_windows.get(app_mod.CMDLINE_GRID_ID)) |cw| {
-                    if (cw.hwnd == hwnd) {
+                    // Only a user's drag: the geometry update re-centres a
+                    // growing cmdline under suppress_resize_callback, and
+                    // saving that reopened the next one off to the left.
+                    if (cw.hwnd == hwnd and !cw.suppress_resize_callback) {
                         // Get new window position
                         var rect: c.RECT = undefined;
                         if (c.GetWindowRect(hwnd, &rect) != 0) {
@@ -3341,8 +3370,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const surface_kind = classifyExternalSurface(grid_id);
 
     if (applog.isEnabled()) applog.appLog(
-        "[win] paintExternalWindow found ext_win vert_count={d} grid_id={d} kind={s}\n",
-        .{ ext_win.vert_count, grid_id, @tagName(surface_kind) },
+        "[win] paintExternalWindow found ext_win grid_id={d} kind={s}\n",
+        .{ grid_id, @tagName(surface_kind) },
     );
 
     // Skip painting if window is pending close (renderer may be freed soon)
@@ -3423,7 +3452,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
 
     // Snapshot vertex data. Row-mode normal surfaces draw the TBS committed
     // set in place; decorated and flat-mode surfaces draw it flattened.
-    var vert_count = ext_win.vert_count;
+    // Only the flattened (decorated and flat) paths draw a vertex count.
+    var vert_count: usize = 0;
     if (!is_row_mode_normal) {
         if (!app_mod.snapshotSetRows(
             app.alloc,

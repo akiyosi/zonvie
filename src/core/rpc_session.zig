@@ -709,7 +709,7 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
     }
 }
 
-/// Force full vertex regeneration (content_rev bump + dirty_all + onFlush).
+/// Force full vertex regeneration (dirty_all + onFlush).
 /// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
 fn forceGlowFlush(self: *Core) void {
     // Owner id is set/cleared strictly inside the locked section — see the
@@ -719,7 +719,6 @@ fn forceGlowFlush(self: *Core) void {
     // this id while this thread's critical section is still in progress).
     self.grid_mu.lockUncancelable(clock.io());
     self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
-    self.grid.content_rev +%= 1;
     self.grid.markEverySurfaceDirty();
     self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };

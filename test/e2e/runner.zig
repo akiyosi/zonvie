@@ -2,7 +2,8 @@
 //
 // Each scenario spawns its own `nvim --embed --clean` for isolation.
 // When no usable nvim binary is found, every test skips with a clear
-// message instead of failing (CI machines without nvim stay green).
+// message instead of failing, unless ZONVIE_REQUIRE_NVIM is set: CI sets it
+// so a runner without nvim fails instead of passing with nothing tested.
 
 const std = @import("std");
 const harness = @import("harness.zig");
@@ -11,6 +12,11 @@ const testing = std.testing;
 fn requireNvim() !void {
     const path = harness.resolveNvim(testing.allocator) catch |e| switch (e) {
         error.NvimNotFound => {
+            if (std.process.Environ.getAlloc(testing.environ, testing.allocator, "ZONVIE_REQUIRE_NVIM")) |required| {
+                testing.allocator.free(required);
+                std.debug.print("[e2e] nvim not found but ZONVIE_REQUIRE_NVIM is set\n", .{});
+                return error.NvimNotFound;
+            } else |_| {}
             std.debug.print("[e2e] skipped: nvim not found (set ZONVIE_TEST_NVIM)\n", .{});
             return error.SkipZigTest;
         },

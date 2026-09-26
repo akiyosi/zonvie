@@ -88,6 +88,51 @@ func recordCommittedRowMutation(
     }
 }
 
+/// A surface's three row sets each keep complete row metadata; a set that is
+/// not committed needs only the rows changed since it last was, which spares a
+/// one-row flush an O(totalRows) copy. Structural changes and a write set left
+/// half-written fall back to a full copy. Both surfaces kept this pair of
+/// arrays and the same three operations on it.
+///
+/// Prepared to the cap at construction. Growing on demand needed a main-queue
+/// worker and a refusal path that escalated into an app-wide abort_flush, so
+/// one external float's unprepared history stalled the main grid.
+final class SurfaceRowSyncLedger {
+    private let staleRows: [SparseRowSet] = (0..<3).map { _ in
+        SparseRowSet(rowLimit: surfaceMaxRowBuffers, preparedRows: surfaceMaxRowBuffers)
+    }
+    private var needsFullSync = [false, false, false]
+
+    /// Bring the write set `index` up to `src`.
+    func sync(from src: SurfaceBufferSet, to dst: SurfaceBufferSet, index: Int, maxRowBuffers: Int) -> (mode: String, syncedRows: Int) {
+        syncSurfaceWriteSetRowState(
+            from: src,
+            to: dst,
+            staleRows: staleRows[index].rows,
+            needsFullSync: needsFullSync[index],
+            maxRowBuffers: maxRowBuffers
+        )
+    }
+
+    /// The write set holds any prefix of an abandoned bracket: it cannot take
+    /// part in sparse catch-up until fully overwritten.
+    func abandon(_ index: Int) {
+        needsFullSync[index] = true
+        staleRows[index].removeAll()
+    }
+
+    /// Only a published write set advances the others' history.
+    func recordCommit(committedIndex: Int, rows: some Sequence<Int>, structural: Bool) {
+        recordCommittedRowMutation(
+            stale: staleRows,
+            needsFullSync: &needsFullSync,
+            committedIndex: committedIndex,
+            rows: rows,
+            structural: structural
+        )
+    }
+}
+
 /// The drawable no longer matches the back buffer this surface keeps across
 /// frames, so the frame it holds would be stretched. Nil when no back buffer
 /// exists yet: the first frame is forced whole by `hasPresentedOnce` instead,
@@ -1027,6 +1072,17 @@ final class GridBufferRegistry {
         out.removeAll(keepingCapacity: true)
         out.append(contentsOf: ids)
     }
+
+    /// Carry every grid but the surface's root from the committed set into a
+    /// bracket's write set. The write set is two rotations old, so a grid the
+    /// core does not resend this flush would otherwise publish stale rows.
+    func carryLayerRows(skipping rootGridId: Int64, from src: Int, to dst: Int, scratch: inout [Int64]) {
+        copyGridIds(into: &scratch)
+        for id in scratch where id != rootGridId {
+            let gridSets = sets(for: id)
+            copySurfaceBufferSetRowState(from: gridSets[src], to: gridSets[dst])
+        }
+    }
 }
 
 /// One grid placed on one surface, mirroring `zonvie_layer` in
@@ -1448,6 +1504,26 @@ func mergeCommittedSurfaceScroll(
     accum = ps
 }
 
+/// Publish the shift a committed write set staged: marks an earlier bracket
+/// left, that no draw has consumed, still name pre-shift rows (this bracket
+/// rotated the slots under them), so they move first; then the shift joins the
+/// one the draw has yet to blit, and leaves the set so no later frame applies
+/// it twice. Both surfaces call this under their lock, after the committed
+/// index moved, so a draw never sees a shift ahead of its vertices. Returns
+/// the published shift.
+@discardableResult
+func publishStagedSurfaceScroll(
+    _ set: SurfaceBufferSet,
+    into accum: inout SurfaceRowScroll?,
+    dirtyRows: inout IndexSet
+) -> SurfaceRowScroll? {
+    guard let ps = set.pendingScroll else { return nil }
+    shiftSurfaceRowIndices(&dirtyRows, rowStart: ps.rowStart, rowEnd: ps.rowEnd, rowsDelta: ps.rowsDelta)
+    mergeCommittedSurfaceScroll(into: &accum, ps, dirtyRows: &dirtyRows)
+    set.pendingScroll = nil
+    return ps
+}
+
 // MARK: - Surface Buffer Helpers
 
 /// Maximum vertex buffer capacity (256 MB), bounding a single row's vertex
@@ -1463,6 +1539,14 @@ func mergeCommittedSurfaceScroll(
 /// that is the limit the provisioning path actually enforces.
 // Not private: SurfaceRowProvisionTests pins the budget ceiling against it.
 let surfaceMaxVertexBufferCapacity: Int = 256 * 1024 * 1024
+
+/// Row buffers a surface keeps, bounding worst-case memory growth: row storage
+/// grows lazily per row and neither the C ABI nor Neovim's redraw protocol
+/// imposes a limit, so rows beyond the cap silently stop updating. 20000 rows
+/// is ~800KB of bookkeeping, a safety net against a corrupt row index rather
+/// than a content limit, and the same for every surface: an external window
+/// has no smaller row bound than the main one.
+let surfaceMaxRowBuffers = 20_000
 // Provisioning may hold two private row buffers in each of three sets. Bound
 // both the allocation peak and the IOAccelerator object count independently
 // from the core's logical vertex budget.

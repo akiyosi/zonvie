@@ -3629,7 +3629,7 @@ pub const Renderer = struct {
             .alloc = self.alloc,
             .source_path = path_copy,
             .pixel_shader = ps_out,
-            .needs_animation = CustomShaderPipeline.detectNeedsAnimation(glsl),
+            .needs_animation = core.frontend_rules.shaderNeedsAnimation(glsl),
         };
     }
 

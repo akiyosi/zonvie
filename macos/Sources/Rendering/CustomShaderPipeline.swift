@@ -28,14 +28,11 @@ final class CustomShaderPipeline {
         self.needsAnimation = needsAnimation
     }
 
-    /// Whole-word regex scan for animation-bearing Shadertoy uniforms.
-    /// Only lists uniforms whose values actually change per frame in
-    /// this build — iResolution / iSampleRate / iChannel0 are constant,
-    /// and iMouse is unimplemented (always zero) so referencing it
-    /// must not arm the continuous draw loop.
+    /// Whether the shader reads a per-frame uniform: the core's rule, shared
+    /// with Windows.
     static func detectNeedsAnimation(in source: String) -> Bool {
-        let pattern = #"\b(iTime|iTimeDelta|iFrame|iFrameRate|iDate)\b"#
-        return source.range(of: pattern, options: .regularExpression) != nil
+        var source = source
+        return source.withUTF8 { zonvie_core_shader_needs_animation($0.baseAddress, $0.count) }
     }
 
 

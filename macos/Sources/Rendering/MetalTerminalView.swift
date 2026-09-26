@@ -221,13 +221,24 @@ final class SurfaceScrollbarController {
     }
 }
 
-final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
+final class MetalTerminalView: GridInputView {
     var renderer: GridSurfaceRenderer!
+
+    override var sharedResources: SharedRenderResources { renderer.shared }
+
+    /// When the command line is a separate window this view is purely the
+    /// buffer, so a drop here opens: the command line has its own drop
+    /// target. Only when it is drawn in this window's bottom row
+    /// ([cmdline] external = false) does a drop while it is up insert.
+    override var dropInsertsPath: Bool {
+        guard let core, !core.hasExternalCmdlineWindow else { return false }
+        return core.getCurrentMode().hasPrefix("cmdline")
+    }
 
     /// Expose drawable size without requiring MetalKit import at call site.
     var currentDrawableSize: CGSize { drawableSize }
 
-    weak var core: ZonvieCore? {
+    override weak var core: ZonvieCore? {
         didSet {
             core?.requestRedraw = { [weak self] in
                 DispatchQueue.main.async {
@@ -237,16 +248,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         }
     }
 
-    // Coalesce setNeedsDisplay to at most once per runloop tick, and union dirty rects.
-    private let redrawScheduler = SurfaceRedrawScheduler()
-
     private static var dirtyLogEnabled: Bool { ZonvieCore.appLogEnabled }
-
-    override func viewDidEndLiveResize() {
-        super.viewDidEndLiveResize()
-        activateSurfaceDrawLoop()
-        requestRedraw(nil)
-    }
 
     // Persistent scratch buffers for updateScrollShaderOffset, reused via
     // removeAll(keepingCapacity: true) instead of building fresh arrays
@@ -265,8 +267,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     // "just went empty" transition call that clears the renderer's state.
     private var hadScrollOffsetsLastCall = false
 
-    override var scrollbarCore: ZonvieCore? { core }
-
     /// Upper bound on the total scroll-offset entry count (directly-scrolled
     /// windows + followed floats combined) passed to the renderer each
     /// frame. The vertex shader uses binary search, but CPU preparation and
@@ -278,17 +278,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     /// filled inside the hold that reads scrollOffsetPx.
     private var anchorLandedRowsUpScratch: [Int64: Int] = [:]
 
-    // --- Active draw loop (mirrors ExternalGridView.activateDrawLoop pattern) ---
-    // During rapid updates (scrolling, typing), switch MTKView to continuous
-    // vsync-driven rendering to eliminate the requestRedraw → setNeedsDisplay
-    // async dispatch latency.  Revert to on-demand mode after idle frames.
-    /// Shared with ExternalGridView: the counter is DrawLoopIdleCounter
-    /// (SurfaceDrawGate.swift) and the mode switching is SurfaceDrawLoopHost
-    /// (SurfaceDrawLoop.swift). The threshold is this surface's own — see
-    /// DrawLoopIdleCounter on why the two differ.
-    var drawLoopIdleCounter = DrawLoopIdleCounter()
-    let drawLoopTraceName = "main"
-
     private func dirtyLog(_ msg: @autoclosure () -> String) {
         if Self.dirtyLogEnabled {
             ZonvieCore.appLog(msg())
@@ -297,42 +286,12 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
     private var keyInput: SessionKeyInput? { core?.keyInput }
 
-    override func keyUp(with event: NSEvent) {
-        // The same call an external grid view makes; this surface open-coded
-        // the held-key test the API already performs.
-        keyInput?.disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
-        super.keyUp(with: event)
-    }
-
-    override func flagsChanged(with event: NSEvent) {
-        // Any modifier change invalidates the recorded input (e.g. j -> C-j),
-        // which is what a nil `ifHeld` means.
-        keyInput?.disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
-        super.flagsChanged(with: event)
-    }
-
     /// Called after actual drawing runs in MTKViewDelegate.draw(in:)
     func didDrawFrame() {
         redrawScheduler.didDrawFrame()
         dirtyLog("didDrawFrame: redrawPending reset to false")
     }
 
-    func requestRedraw(_ rect: NSRect? = nil) {
-        if ZonvieCore.appLogEnabled, let inputTrace = core?.currentInputTraceSnapshot(),
-           inputTrace.seq != 0, inputTrace.sentNs != 0,
-           inputTrace.lastRequestRedrawLoggedSeq != inputTrace.seq
-        {
-            let nowNs = zonvie_core_perf_now_ns()
-            let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
-            ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
-            core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
-        }
-        redrawScheduler.requestRedraw(rect: rect, bounds: bounds, window: window) { [weak self] redrawRect in
-            guard let self else { return }
-            dirtyLog("setNeedsDisplay(out): r=\(String(describing: redrawRect)) bounds=\(self.bounds) isFlipped=\(self.isFlipped) windowScale=\(self.window?.backingScaleFactor ?? -1)")
-            self.setNeedsDisplay(redrawRect)
-        }
-    }
 
     // MARK: - Active Draw Loop
 
@@ -466,8 +425,7 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
         installScrollbar()
 
-        // Accept file drops via drag & drop
-        registerForDraggedTypes([.fileURL])
+        registerFileDrops()
     }
 
     /// The layer's transparency, which follows the blur setting. Applied when
@@ -504,11 +462,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             applyLayerTransparency()
         } else {
             core?.cancelMsgTimer()
-            // The view is leaving its window (tab/window closed, possibly
-            // while a key is still held): disarm proactively so the
-            // repeat-pacing CVDisplayLink stops and releases its extra
-            // retain (see SessionKeyInput.startRepeatDisplayLink).
-            keyInput?.disarmIfHeld(by: self, reason: "view detached from window")
         }
     }
 
@@ -605,11 +558,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
         ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
         layoutScrollbar()
-    }
-
-    private func layoutScrollbar() {
-        layoutScrollbarFrame()
-
         // Update hover tracking area if hover mode is enabled
         let config = ZonvieConfig.shared.scrollbar
         if config.enabled && config.isHover {
@@ -618,42 +566,11 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     private var scrollbarTrackingArea: NSTrackingArea?
-    private var urlTrackingArea: NSTrackingArea?
-    private var lastUrlCursorIsHand = false
 
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-
-        if let existing = urlTrackingArea {
-            removeTrackingArea(existing)
-        }
-        // Entered/exited too: a hand set over a URL stayed when the pointer
-        // left for an external window, which sets no cursor of its own there.
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        urlTrackingArea = area
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        super.mouseMoved(with: event)
-        let location = convert(event.locationInWindow, from: nil)
-        // The cell a click here would name, ease undone: hovering read the
-        // drawn row, so mid-ease the hand showed over a row a click missed.
-        let (gridId, row, col) = hitTestGrid(at: location)
-        let hasUrl = core?.cellHasURL(gridId: gridId, row: row, col: col) ?? false
-        if hasUrl != lastUrlCursorIsHand {
-            lastUrlCursorIsHand = hasUrl
-            if hasUrl {
-                NSCursor.pointingHand.set()
-            } else {
-                NSCursor.arrow.set()
-            }
-        }
+    // The cell a click here would name, ease undone: hovering read the drawn
+    // row, so mid-ease the hand showed over a row a click missed.
+    override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
+        hitTestGrid(at: location)
     }
 
     private func setupScrollbarHoverTracking() {
@@ -691,10 +608,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
     }
 
     override func mouseExited(with event: NSEvent) {
-        if event.trackingArea === urlTrackingArea, lastUrlCursorIsHand {
-            lastUrlCursorIsHand = false
-            NSCursor.arrow.set()
-        }
         if let userInfo = event.trackingArea?.userInfo as? [String: Bool],
            userInfo["scrollbar"] == true {
             let config = ZonvieConfig.shared.scrollbar
@@ -703,12 +616,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
             }
         }
         super.mouseExited(with: event)
-    }
-
-    // MARK: - Scrollbar
-
-    func updateScrollbarIfNeeded() {
-        scrollbarController.update()
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -942,10 +849,6 @@ final class MetalTerminalView: GridInputView, SurfaceDrawLoopHost {
 
     
         requestRedrawDrawablePx(rectPx)
-    }
-
-    override func keyDown(with event: NSEvent) {
-        keyInput?.handleGridKeyDown(event, owner: self, traceSurface: 1)
     }
 
     // MARK: - Smooth Scrolling
@@ -1494,7 +1397,190 @@ struct ScrollTargetLock {
 /// and first-responder acceptance. It is a class, not a protocol extension,
 /// because the ObjC runtime never sees a Swift default implementation.
 /// Subclasses supply the view-specific half as an IMEPreeditHost.
-class GridInputView: MTKView, NSTextInputClient {
+class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
+    /// The session this surface serves: input, scrollbar and IME all route
+    /// through it. The views kept three names for it (core, scrollbarCore,
+    /// imeCore).
+    weak var core: ZonvieCore?
+
+    /// The surface this view draws: 1 for the main window, an external
+    /// window's root grid for its own. Scrollbar and key traces name it.
+    var surfaceId: Int64 { 1 }
+
+    var imeCore: ZonvieCore? { core }
+
+    /// The GPU objects and font every surface shares.
+    var sharedResources: SharedRenderResources {
+        preconditionFailure("GridInputView subclasses provide their shared resources")
+    }
+
+    var backingScale: CGFloat { window?.backingScaleFactor ?? surfaceFallbackBackingScale }
+
+    var imePreeditFont: NSFont {
+        let shared = sharedResources
+        return NSFont(name: shared.currentFontName, size: shared.currentPointSize)
+            ?? NSFont.monospacedSystemFont(ofSize: shared.currentPointSize, weight: .regular)
+    }
+
+    var imePreeditCellSize: CGSize {
+        let shared = sharedResources
+        let scale = backingScale
+        return CGSize(width: CGFloat(shared.cellWidthPx) / scale,
+                      height: CGFloat(shared.cellHeightPx) / scale)
+    }
+
+    var imePreeditContainer: NSView { self }
+
+    // MARK: - Redraw
+
+    /// DrawLoopIdleCounter counts idle frames, SurfaceDrawLoopHost switches
+    /// the mode; each surface decides when a frame was idle.
+    var drawLoopIdleCounter = DrawLoopIdleCounter()
+    var drawLoopTraceName: String { "main" }
+
+    /// Coalesces setNeedsDisplay to once per runloop tick, unioning rects.
+    let redrawScheduler = SurfaceRedrawScheduler()
+
+    func requestRedraw(_ rect: NSRect? = nil) {
+        // The input trace's request_redraw stage is the main window's (a
+        // one-shot per keystroke): an external view taking it misattributed
+        // the latency of every input the main window then drew.
+        if ZonvieCore.appLogEnabled, surfaceId == 1, let inputTrace = core?.currentInputTraceSnapshot(),
+           inputTrace.seq != 0, inputTrace.sentNs != 0,
+           inputTrace.lastRequestRedrawLoggedSeq != inputTrace.seq
+        {
+            let nowNs = zonvie_core_perf_now_ns()
+            let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
+            ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=request_redraw delta_us=\(deltaUs)")
+            core?.markInputTraceRequestRedrawLogged(seq: inputTrace.seq)
+        }
+        redrawScheduler.requestRedraw(rect: rect, bounds: bounds, window: window) { [weak self] redrawRect in
+            guard let self else { return }
+            if ZonvieCore.appLogEnabled {
+                ZonvieCore.appLog("setNeedsDisplay(out): surface=\(self.surfaceId) r=\(String(describing: redrawRect)) bounds=\(self.bounds)")
+            }
+            self.setNeedsDisplay(redrawRect)
+        }
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        activateSurfaceDrawLoop()
+        requestRedraw()
+    }
+
+    // A view leaving its window (tab or window closed, maybe with a key still
+    // held) stops the repeat-pacing display link, which releases its extra
+    // retain, and parks its draw loop; the main view used to leave the loop
+    // running.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        guard window == nil else { return }
+        deactivateSurfaceDrawLoop()
+        core?.keyInput.disarmIfHeld(by: self, reason: "view detached from window")
+    }
+
+    // MARK: - Pointer
+
+    /// An event's position in surface pixels from the top-left.
+    func surfacePointPx(_ event: NSEvent) -> CGPoint {
+        let location = convert(event.locationInWindow, from: nil)
+        let scale = backingScale
+        return CGPoint(x: location.x * scale, y: bounds.height * scale - location.y * scale)
+    }
+
+    /// The cell a click at `location` (view points) would name, or nil where
+    /// this surface shows no URL hover. Each surface resolves it its own way.
+    func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? { nil }
+
+    private var urlTrackingArea: NSTrackingArea?
+    private var lastUrlCursorIsHand = false
+
+    // Entered/exited too: a hand set over a URL stayed when the pointer left
+    // for another window, which sets no cursor of its own there.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let existing = urlTrackingArea { removeTrackingArea(existing) }
+        urlTrackingArea = nil
+        guard tracksURLHover else { return }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        urlTrackingArea = area
+    }
+
+    /// Whether this surface shows the hand over a URL.
+    var tracksURLHover: Bool { true }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        guard tracksURLHover, let core,
+              let cell = urlHoverCell(at: convert(event.locationInWindow, from: nil))
+        else { return }
+        let hasUrl = core.cellHasURL(gridId: cell.gridId, row: cell.row, col: cell.col)
+        guard hasUrl != lastUrlCursorIsHand else { return }
+        lastUrlCursorIsHand = hasUrl
+        (hasUrl ? NSCursor.pointingHand : NSCursor.arrow).set()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        if event.trackingArea === urlTrackingArea, lastUrlCursorIsHand {
+            lastUrlCursorIsHand = false
+            NSCursor.arrow.set()
+        }
+        super.mouseExited(with: event)
+    }
+
+    // MARK: - File drops
+
+    /// Whether this surface takes file drops at all.
+    var acceptsFileDrops: Bool { true }
+
+    /// Whether a drop inserts the paths at the cursor rather than opening
+    /// the files. Each surface decides; the rest of a drop is the same.
+    var dropInsertsPath: Bool { false }
+
+    func registerFileDrops() {
+        if acceptsFileDrops { registerForDraggedTypes([.fileURL]) }
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard acceptsFileDrops,
+              sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self],
+                                                      options: [.urlReadingFileURLsOnly: true])
+        else { return [] }
+        // The dragged item predicts what the drop does. Set on every entry,
+        // which also restores the file icon after the external cmdline window
+        // swapped the item to text on its way past.
+        if dropInsertsPath {
+            FileDragFeedback.showPathText(sender, in: self)
+        } else {
+            FileDragFeedback.showFileIcon(sender, in: self)
+        }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard acceptsFileDrops,
+              let urls = sender.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+              ) as? [URL],
+              !urls.isEmpty,
+              let core
+        else { return false }
+        if dropInsertsPath {
+            core.sendInput(urls.map { escapePathForNeovim($0.path) }.joined(separator: " "))
+        } else {
+            core.dropPaths(urls.map { $0.path }, tabPerFile: false)
+        }
+        return true
+    }
+
     private lazy var ime: IMEPreeditController = {
         guard let host = self as? IMEPreeditHost else {
             preconditionFailure("GridInputView subclasses must be IMEPreeditHosts")
@@ -1522,6 +1608,27 @@ class GridInputView: MTKView, NSTextInputClient {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         surfaceCycleInputContextForAppearance(_inputContext, hasMarkedText: hasMarkedText())
+    }
+
+    // MARK: - Keys
+
+    // The session's keyDown: keys reach Neovim through the shared repeat
+    // synthesis, with this view as the owner whose window and IME state
+    // decide when a repeat stops.
+    override func keyDown(with event: NSEvent) {
+        core?.keyInput.handleGridKeyDown(event, owner: self, traceSurface: surfaceId)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        core?.keyInput.disarmKeyRepeat(ifHeld: event.keyCode, reason: "keyUp")
+        super.keyUp(with: event)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        // Any modifier change invalidates the recorded input (e.g. j -> C-j),
+        // which is what a nil `ifHeld` means.
+        core?.keyInput.disarmKeyRepeat(ifHeld: nil, reason: "flagsChanged")
+        super.flagsChanged(with: event)
     }
 
     // MARK: - Mouse buttons
@@ -1624,10 +1731,6 @@ class GridInputView: MTKView, NSTextInputClient {
 
     // --- Scrollbar ---
 
-    /// The surface the scrollbar reads and acts on: 1 for the main window,
-    /// an external window's root grid for its own.
-    var scrollbarSurfaceId: Int64 { 1 }
-    var scrollbarCore: ZonvieCore? { nil }
 
     lazy var verticalScroller: NSScroller = {
         let scroller = NSScroller()
@@ -1646,7 +1749,7 @@ class GridInputView: MTKView, NSTextInputClient {
     var scrollbarController: SurfaceScrollbarController {
         if let controller = createdScrollbarController { return controller }
         let controller = SurfaceScrollbarController(
-            scroller: verticalScroller, surfaceId: scrollbarSurfaceId, core: { [weak self] in self?.scrollbarCore })
+            scroller: verticalScroller, surfaceId: surfaceId, core: { [weak self] in self?.core })
         createdScrollbarController = controller
         return controller
     }
@@ -1672,6 +1775,19 @@ class GridInputView: MTKView, NSTextInputClient {
         guard config.enabled, hostsScrollbar, config.isAlways else { return }
         verticalScroller.isHidden = false
         verticalScroller.alphaValue = CGFloat(config.opacity)
+    }
+
+    /// Lay the scroller out, only where there is one: the main surface used
+    /// to create and place it with the scrollbar turned off.
+    func layoutScrollbar() {
+        guard ZonvieConfig.shared.scrollbar.enabled, hostsScrollbar else { return }
+        layoutScrollbarFrame()
+    }
+
+    /// Move the knob after a drawn frame.
+    func updateScrollbarIfNeeded() {
+        guard hostsScrollbar else { return }
+        scrollbarController.update()
     }
 
     /// Pin the scroller to the right edge, full height.
@@ -1825,21 +1941,6 @@ final class IMEPreeditController {
 // MARK: - MetalTerminalView IME host
 
 extension MetalTerminalView: IMEPreeditHost {
-    var imeCore: ZonvieCore? { core }
-
-    var imePreeditFont: NSFont {
-        NSFont(name: renderer.currentFontName, size: renderer.currentPointSize)
-            ?? NSFont.monospacedSystemFont(ofSize: renderer.currentPointSize, weight: .regular)
-    }
-
-    var imePreeditCellSize: CGSize {
-        let scale = window?.backingScaleFactor ?? 2.0
-        return CGSize(width: CGFloat(renderer.cellWidthPx) / scale,
-                      height: CGFloat(renderer.cellHeightPx) / scale)
-    }
-
-    var imePreeditContainer: NSView { self }
-
     /// The cursor's cell in view points, or nil when this window does not
     /// draw it: another surface's start_row and start_col are in that
     /// surface's space. The overlay and the candidate window both come from
@@ -2081,59 +2182,6 @@ final class PreeditOverlayView: NSView {
         }
 
         return 1
-    }
-}
-
-// MARK: - Drag & Drop (file opening)
-extension MetalTerminalView {
-
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        guard sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self],
-                                                      options: [.urlReadingFileURLsOnly: true]) else {
-            return []
-        }
-        // The dragged item has to predict what the drop does, and both follow
-        // the same test (dropInsertsPath). Setting it on every entry also
-        // restores the file icon after the external cmdline window swapped the
-        // item to text on its way past.
-        if dropInsertsPath {
-            FileDragFeedback.showPathText(sender, in: self)
-        } else {
-            FileDragFeedback.showFileIcon(sender, in: self)
-        }
-        return .copy
-    }
-
-    /// Whether a drop on THIS view inserts a path rather than opening the file.
-    ///
-    /// The drop target decides. When the command line is a separate window this
-    /// view is purely the buffer, so a drop here always opens — the command
-    /// line has its own drop target. Only when the command line is drawn in
-    /// this window's own bottom row ([cmdline] external = false) does dropping
-    /// while it is up mean "put the path here".
-    private var dropInsertsPath: Bool {
-        guard let core, !core.hasExternalCmdlineWindow else { return false }
-        return core.getCurrentMode().hasPrefix("cmdline")
-    }
-
-    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        guard let urls = sender.draggingPasteboard.readObjects(
-            forClasses: [NSURL.self],
-            options: [.urlReadingFileURLsOnly: true]
-        ) as? [URL] else {
-            return false
-        }
-
-        guard !urls.isEmpty, let core = core else { return false }
-
-        if dropInsertsPath {
-            // Built-in command line is up: insert paths at the cursor.
-            core.sendInput(urls.map { escapePathForNeovim($0.path) }.joined(separator: " "))
-        } else {
-            // Buffer drop: open the files.
-            core.dropPaths(urls.map { $0.path }, tabPerFile: false)
-        }
-        return true
     }
 }
 
