@@ -189,17 +189,31 @@ fn isAltGrText(mods: u32, chars: ?[]const u8) bool {
     return text.len != 0 and text[0] >= 0x20 and text[0] != 0x7F;
 }
 
+/// The modifiers a WM_CHAR is sent with, or null when WM_KEYDOWN already sent
+/// the combo: with Ctrl or Alt down WM_CHAR is usually a control character.
+/// AltGr text (Ctrl+Alt, printable; see isAltGrText) is sent without Ctrl and
+/// Alt, which composed it: with them the core built `<C-M-@>` from AltGr+Q.
+fn charMessageMods(mods: u32, ch: usize) ?u32 {
+    if ((mods & (MOD_CTRL | MOD_ALT)) == 0) return mods;
+    const both = (mods & MOD_CTRL) != 0 and (mods & MOD_ALT) != 0;
+    if (!both or ch < 0x20 or ch == 0x7F) return null;
+    return mods & ~@as(u32, MOD_CTRL | MOD_ALT);
+}
+
+test "AltGr text reaches the core without the Ctrl and Alt that composed it" {
+    try std.testing.expectEqual(@as(?u32, 0), charMessageMods(MOD_CTRL | MOD_ALT, '@'));
+    try std.testing.expectEqual(@as(?u32, MOD_SHIFT), charMessageMods(MOD_CTRL | MOD_ALT | MOD_SHIFT, '{'));
+    try std.testing.expectEqual(@as(?u32, MOD_SHIFT), charMessageMods(MOD_SHIFT, 'A'));
+    // Ctrl or Alt alone, or a control character: WM_KEYDOWN sent it.
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_CTRL, 'q'));
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_ALT, 'q'));
+    try std.testing.expectEqual(@as(?u32, null), charMessageMods(MOD_CTRL | MOD_ALT, 0x11));
+}
+
 /// WM_CHAR / WM_SYSCHAR for any surface, main or external. The two WndProcs
 /// carried copies of this body and one had lost the colon/semicolon swap.
 pub fn handleCharMessage(app: *App, wParam: c.WPARAM) void {
-    const mods = queryMods();
-    // If Ctrl/Alt are down, WM_CHAR often becomes an ASCII control character;
-    // the WM_KEYDOWN path handled those combos. Not AltGr text, which the
-    // WM_KEYDOWN path left here (isAltGrText).
-    if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
-        const both = (mods & MOD_CTRL) != 0 and (mods & MOD_ALT) != 0;
-        if (!both or wParam < 0x20 or wParam == 0x7F) return;
-    }
+    const mods = charMessageMods(queryMods(), wParam) orelse return;
 
     const ch0 = swapColonSemicolon(@as(u16, @intCast(wParam)), app.config.input.swap_colon_semicolon);
 
@@ -317,37 +331,10 @@ pub fn toUnicodePairUtf8(
     return .{ .chars = chars, .ign = ign };
 }
 
+/// A key the core names (<Left>, <CR>, <F1>, ...): sent to the core as a key
+/// rather than left to WM_CHAR. The core's table, shared with macOS.
 pub fn isSpecialVk(vk: u32) bool {
-    return switch (vk) {
-        c.VK_LEFT,
-        c.VK_RIGHT,
-        c.VK_UP,
-        c.VK_DOWN,
-        c.VK_HOME,
-        c.VK_END,
-        c.VK_PRIOR,
-        c.VK_NEXT,
-        c.VK_INSERT,
-        c.VK_DELETE,
-        c.VK_BACK,
-        c.VK_TAB,
-        c.VK_RETURN,
-        c.VK_ESCAPE,
-        c.VK_F1,
-        c.VK_F2,
-        c.VK_F3,
-        c.VK_F4,
-        c.VK_F5,
-        c.VK_F6,
-        c.VK_F7,
-        c.VK_F8,
-        c.VK_F9,
-        c.VK_F10,
-        c.VK_F11,
-        c.VK_F12,
-        => true,
-        else => false,
-    };
+    return core.zonvie_core_key_is_special(KEYCODE_WINVK_FLAG | vk);
 }
 
 // =========================================================================
@@ -1662,55 +1649,41 @@ pub fn hideImePreeditOverlay(app: *App) void {
 // Cursor blink functions
 // =========================================================================
 
+// The cadence is the core's (frontend_rules.Blink, shared with macOS); this
+// file keeps the timer, the gate and the repaints.
+
+fn armBlinkTimer(hwnd: c.HWND, app: *App, delay_ms: u32) void {
+    if (delay_ms == 0) return;
+    app.cursor_blink_timer = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, delay_ms, null);
+}
+
+fn killBlinkTimer(hwnd: c.HWND, app: *App) void {
+    if (app.cursor_blink_timer != 0) {
+        _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
+        app.cursor_blink_timer = 0;
+    }
+}
+
+/// Repaint the main window's cursor, when it holds one. No rect means the
+/// cursor is in an external window, where a toggle changes no pixel here; a
+/// whole-window invalidate would present the full frame.
+fn invalidateMainCursor(hwnd: c.HWND, app: *App) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const cursor_rect = app.last_cursor_rect_px;
+    app.mu.unlock(core.clock.io());
+    if (cursor_rect) |rect| _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
+}
+
 pub fn startCursorBlinking(hwnd: c.HWND, app: *App, wait_ms: u32, on_ms: u32, off_ms: u32) void {
-    // Stop any existing timer
-    stopCursorBlinking(hwnd, app);
-
-    // Don't blink if on_ms is 0
-    if (on_ms == 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] on_ms=0, not blinking\n", .{});
-        return;
+    killBlinkTimer(hwnd, app);
+    const was_visible = app.cursor_blink.visible;
+    const delay_ms = app.cursor_blink.start(wait_ms, on_ms, off_ms);
+    if (applog.isEnabled()) applog.appLog("[blink] start wait={d} on={d} off={d} first_tick_ms={d}\n", .{ wait_ms, on_ms, off_ms, delay_ms });
+    armBlinkTimer(hwnd, app, delay_ms);
+    if (!was_visible) {
+        updateExternalWindowsBlinkState(app);
+        invalidateMainCursor(hwnd, app);
     }
-
-    app.cursor_blink_wait_ms = wait_ms;
-    app.cursor_blink_on_ms = on_ms;
-    app.cursor_blink_off_ms = off_ms;
-
-    // Start with wait phase if wait_ms > 0
-    if (wait_ms > 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] starting with wait_ms={d}\n", .{wait_ms});
-        app.cursor_blink_phase = 0;
-        app.cursor_blink_state = true;
-        const timer_result = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, wait_ms, null);
-        if (applog.isEnabled()) applog.appLog("[blink] SetTimer result={d}\n", .{timer_result});
-        app.cursor_blink_timer = timer_result;
-    } else {
-        // No wait, start blinking immediately
-        enterBlinkCycle(hwnd, app);
-    }
-}
-
-/// Enter the on/off blink cycle
-pub fn enterBlinkCycle(hwnd: c.HWND, app: *App) void {
-    if (applog.isEnabled()) applog.appLog("[blink] enterBlinkCycle\n", .{});
-    app.cursor_blink_phase = 1;
-    app.cursor_blink_state = true;
-    scheduleNextBlink(hwnd, app, true);
-    // Request repaint
-    _ = c.InvalidateRect(hwnd, null, c.FALSE);
-}
-
-/// Schedule the next blink state change
-pub fn scheduleNextBlink(hwnd: c.HWND, app: *App, is_currently_on: bool) void {
-    const interval = if (is_currently_on) app.cursor_blink_on_ms else app.cursor_blink_off_ms;
-
-    if (interval == 0) {
-        if (applog.isEnabled()) applog.appLog("[blink] interval=0, stopping\n", .{});
-        return;
-    }
-
-    if (applog.isEnabled()) applog.appLog("[blink] scheduleNextBlink: is_on={} interval={d}ms\n", .{ is_currently_on, interval });
-    app.cursor_blink_timer = c.SetTimer(hwnd, app_mod.TIMER_CURSOR_BLINK, interval, null);
 }
 
 /// Handle cursor blink timer event
@@ -1723,31 +1696,14 @@ pub fn handleCursorBlinkTimer(hwnd: c.HWND, app: *App) void {
         pauseCursorBlinking(hwnd, app);
         return;
     }
-
-    if (app.cursor_blink_phase == 0) {
-        // Wait phase complete, enter blink cycle
-        enterBlinkCycle(hwnd, app);
-    } else {
-        // Toggle blink state
-        app.cursor_blink_state = !app.cursor_blink_state;
-        if (applog.isEnabled()) applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink_state});
-
-        // Update external windows blink state
+    const was_visible = app.cursor_blink.visible;
+    const delay_ms = app.cursor_blink.tick();
+    if (app.cursor_blink.visible != was_visible) {
+        if (applog.isEnabled()) applog.appLog("[blink] toggled to {}\n", .{app.cursor_blink.visible});
         updateExternalWindowsBlinkState(app);
-
-        // Request repaint for cursor area. No rect means this window holds no
-        // cursor (it is in an external window), so a blink toggle changes no
-        // pixel here; a whole-window invalidate would present the full frame.
-        app.mu.lockUncancelable(core.clock.io());
-        const cursor_rect_snapshot = app.last_cursor_rect_px;
-        app.mu.unlock(core.clock.io());
-        if (cursor_rect_snapshot) |rect| {
-            _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
-        }
-
-        // Schedule next blink
-        scheduleNextBlink(hwnd, app, app.cursor_blink_state);
+        invalidateMainCursor(hwnd, app);
     }
+    armBlinkTimer(hwnd, app, delay_ms);
 }
 
 /// Whether the blink timer may run: this process is in front and the window
@@ -1772,24 +1728,15 @@ fn cursorBlinkAllowed(app: *App) bool {
 /// Stop the timer and leave the cursor drawn. Stopping in the off phase left
 /// the main window's cursor hidden until something else repainted it.
 pub fn pauseCursorBlinking(hwnd: c.HWND, app: *App) void {
-    const was_off = !app.cursor_blink_state;
+    const was_off = !app.cursor_blink.visible;
     stopCursorBlinking(hwnd, app);
-    if (!was_off) return;
-    app.mu.lockUncancelable(core.clock.io());
-    const cursor_rect = app.last_cursor_rect_px;
-    app.mu.unlock(core.clock.io());
-    if (cursor_rect) |rect| _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
+    if (was_off) invalidateMainCursor(hwnd, app);
 }
 
 /// Stop cursor blinking
 pub fn stopCursorBlinking(hwnd: c.HWND, app: *App) void {
-    if (app.cursor_blink_timer != 0) {
-        _ = c.KillTimer(hwnd, app_mod.TIMER_CURSOR_BLINK);
-        app.cursor_blink_timer = 0;
-    }
-    app.cursor_blink_phase = 0;
-    app.cursor_blink_state = true;
-
+    killBlinkTimer(hwnd, app);
+    app.cursor_blink.stop();
     // Update external windows blink state (cursor visible)
     updateExternalWindowsBlinkState(app);
 }
@@ -1799,9 +1746,9 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
     // Pre-seed with the last-known values: try_get_cursor_blink leaves its
     // out params untouched on lock contention, so a busy lock here
     // naturally reads back as "unchanged since last time" below.
-    var wait_ms: u32 = app.cursor_blink_wait_ms;
-    var on_ms: u32 = app.cursor_blink_on_ms;
-    var off_ms: u32 = app.cursor_blink_off_ms;
+    var wait_ms: u32 = app.cursor_blink.wait_ms;
+    var on_ms: u32 = app.cursor_blink.on_ms;
+    var off_ms: u32 = app.cursor_blink.off_ms;
 
     if (app.corep) |core_ptr| {
         if (!app_mod.zonvie_core_try_get_cursor_blink(core_ptr, &wait_ms, &on_ms, &off_ms)) {
@@ -1818,19 +1765,16 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
         }
     }
 
-    if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink_wait_ms, app.cursor_blink_on_ms, app.cursor_blink_off_ms });
+    if (applog.isEnabled()) applog.appLog("[blink] updateCursorBlinking: wait={d} on={d} off={d} (current: wait={d} on={d} off={d})\n", .{ wait_ms, on_ms, off_ms, app.cursor_blink.wait_ms, app.cursor_blink.on_ms, app.cursor_blink.off_ms });
 
-    // Check if blink settings changed
-    const settings_changed = wait_ms != app.cursor_blink_wait_ms or
-        on_ms != app.cursor_blink_on_ms or
-        off_ms != app.cursor_blink_off_ms;
+    const settings_changed = !app.cursor_blink.sameSettings(wait_ms, on_ms, off_ms);
 
     // Check if timer is currently stopped
     const timer_stopped = app.cursor_blink_timer == 0;
 
     if (applog.isEnabled()) applog.appLog("[blink] settings_changed={}, on_ms>0={}, off_ms>0={}, timer_stopped={}\n", .{ settings_changed, on_ms > 0, off_ms > 0, timer_stopped });
 
-    if (on_ms > 0 and off_ms > 0) {
+    if (core.frontend_rules.Blink.blinks(on_ms, off_ms)) {
         // Blink should be enabled -- where it can be seen. Gated here as well
         // as in the tick: a stopped timer reads as "restart" below, and every
         // cursor callback lands here.
@@ -1844,11 +1788,9 @@ pub fn updateCursorBlinking(hwnd: c.HWND, app: *App) void {
             startCursorBlinking(hwnd, app, wait_ms, on_ms, off_ms);
         }
     } else {
-        // Blink should be disabled
-        if (settings_changed) {
-            if (applog.isEnabled()) applog.appLog("[blink] calling stopCursorBlinking\n", .{});
-            stopCursorBlinking(hwnd, app);
-        }
+        // Blink should be disabled; start() records the settings and leaves
+        // the cursor shown with no timer.
+        if (settings_changed) startCursorBlinking(hwnd, app, wait_ms, on_ms, off_ms);
     }
 }
 
@@ -1859,7 +1801,7 @@ pub fn updateExternalWindowsBlinkState(app: *App) void {
         const ext_win = entry.value_ptr.*;
         // Every surface tracks the state, because the one that gains the cursor
         // next must draw it in the phase the rest are in.
-        ext_win.cursor_blink_state = app.cursor_blink_state;
+        ext_win.cursor_blink_state = app.cursor_blink.visible;
         // Only the surface that actually holds a cursor repaints. A toggle
         // changes no pixel on the others, and the whole-window invalidate cost
         // each of them a no-op WM_PAINT — app.mu, a layer scan and a snapshot

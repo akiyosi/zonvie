@@ -208,18 +208,6 @@ fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void
     _ = c.AlphaBlend(dst_hdc, x, y, px, px, mem, 0, 0, px, px, bf);
 }
 
-/// Calculate the Neovim :tabmove position from a drop target index.
-/// Returns the value N for `:tabmove N`.
-///
-/// `to_idx` is the insertion index in the tab list *before* the move, and
-/// `:tabmove N` moves the current tab to after tab page N counted in that same
-/// pre-move list (1-based, 0 = very front). The two are the same number, so
-/// this only clamps. Subtracting one landed every reorder a slot short, and
-/// turned a one-slot rightward drag into "move after myself" — a no-op.
-fn calculateTabMovePosition(to_idx: usize, tab_count: usize) i32 {
-    return @intCast(@min(to_idx, tab_count));
-}
-
 /// Calculate a drop target index from a mouse position along a uniform-sized item list.
 /// Works for both X-axis (titlebar) and Y-axis (sidebar) by passing the appropriate coordinate.
 fn calculateDropTarget(mouse_pos: c_int, item_count: usize, item_size: c_int) usize {
@@ -664,26 +652,12 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
             if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: from_idx={d} to_idx={d} tab_count={d}\n", .{ from_idx, to_idx, app.tabline_state.tab_count });
 
-            // Dropping onto your own slot, or just past it, inserts you where
-            // you already are.
-            if (to_idx != from_idx and to_idx != from_idx + 1) {
-                const new_pos = calculateTabMovePosition(to_idx, app.tabline_state.tab_count);
-
-                if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: calculated new_pos={d}\n", .{new_pos});
-
-                if (app.corep) |corep| {
-                    // Tab was already selected on mouseDown, just send :tabmove
-                    // Use nvim_command API so command doesn't show in cmdline
-                    var cmd_buf: [32]u8 = undefined;
-                    const cmd = std.fmt.bufPrint(&cmd_buf, "tabmove {d}", .{new_pos}) catch {
-                        _ = c.InvalidateRect(hwnd, null, 0);
-                        return;
-                    };
-                    if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: sending cmd len={d}\n", .{cmd.len});
-                    app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-                }
-            } else {
-                if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: no move needed (same position)\n", .{});
+            // The core's command selects the dragged tab and moves it in one
+            // go: the press selected it, but a tab switch landing before a
+            // bare `:tabmove` moved another tab. Nothing is sent for a drop
+            // onto its own slot.
+            if (app.corep) |corep| {
+                _ = core.zonvie_core_tab_move(corep, @intCast(from_idx), @intCast(to_idx), @intCast(app.tabline_state.tab_count));
             }
         }
         _ = c.InvalidateRect(hwnd, null, 0);
@@ -780,23 +754,7 @@ pub fn externalizeTab(app: *App, tab_idx: usize, screen_x: c_int, screen_y: c_in
     app.pending_external_window_position = .{ .x = screen_x, .y = screen_y };
     app.pending_external_window_position_time = @as(i64, @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms)));
 
-    // Execute single Lua script that does both tab switch and externalization atomically.
-    // Uses nvim_open_win to create a new external window instead of vnew + nvim_win_set_config.
-    // In ext_windows mode, vnew would trigger win_split which creates another external window.
-    // The Lua script:
-    // 1. Switch to the target tab
-    // 2. Check if tab has multiple windows (split) - abort if so
-    // 3. Get the window's buffer, cursor position, and dimensions
-    // 4. Create a new external window with nvim_open_win showing the same buffer
-    // 5. Replace the original window's buffer with a scratch buffer
-    const tab_number = tab_idx + 1;
-    var lua_buf: [768]u8 = undefined;
-    const lua_script = std.fmt.bufPrint(&lua_buf, "lua vim.cmd('{d}tabnext'); local tp=vim.api.nvim_get_current_tabpage(); local ws=vim.api.nvim_tabpage_list_wins(tp); if #ws>1 then vim.notify('Cannot externalize: split window',vim.log.levels.WARN); return end; local w=ws[1]; local buf=vim.api.nvim_win_get_buf(w); local cur=vim.api.nvim_win_get_cursor(w); local W=vim.api.nvim_win_get_width(w); local H=vim.api.nvim_win_get_height(w); local ew=vim.api.nvim_open_win(buf,true,{{external=true,width=W,height=H}}); vim.api.nvim_win_set_cursor(ew,cur); vim.api.nvim_win_set_buf(w,vim.api.nvim_create_buf(true,true))", .{tab_number}) catch {
-        if (applog.isEnabled()) applog.appLog("[tabline] externalizeTab: failed to format Lua script\n", .{});
-        return;
-    };
-    if (applog.isEnabled()) applog.appLog("[tabline] externalizeTab: sending Lua script via command\n", .{});
-    app_mod.zonvie_core_send_command(corep, lua_script.ptr, lua_script.len);
+    core.zonvie_core_externalize_tab(corep, @intCast(tab_idx));
 }
 
 // Drag preview window class
@@ -2152,17 +2110,8 @@ pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
             if (dy > drag_threshold) {
                 if (drop_target_opt) |to_idx| {
-                    if (to_idx != drag_idx and to_idx != drag_idx + 1) {
-                        const new_pos = calculateTabMovePosition(to_idx, app.tabline_state.tab_count);
-
-                        if (app.corep) |corep| {
-                            var cmd_buf: [32]u8 = undefined;
-                            const cmd = std.fmt.bufPrint(&cmd_buf, "tabmove {d}", .{new_pos}) catch {
-                                _ = c.InvalidateRect(hwnd, null, 0);
-                                return;
-                            };
-                            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-                        }
+                    if (app.corep) |corep| {
+                        _ = core.zonvie_core_tab_move(corep, @intCast(drag_idx), @intCast(to_idx), @intCast(app.tabline_state.tab_count));
                     }
                 }
             }

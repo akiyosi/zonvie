@@ -2956,7 +2956,6 @@ pub const FlushCtx = struct {
         try beginVertexBudgetTransaction(ctx.core);
         // Before the dirty snapshot, so an aborted attempt still owes them.
         regenerateRootsWhoseDefaultBgRuleFlipped(ctx.core);
-        const last_sent_content_rev_before = ctx.core.last_sent_content_rev;
         // Remember what this attempt is about to consume. A frontend that
         // later refuses to publish owes exactly this much on the retry, not a
         // full-viewport resend (see the abort branch below).
@@ -3048,8 +3047,8 @@ pub const FlushCtx = struct {
             var dr_iter = ctx.core.grid.main_buf.dirty_rows.iterator(.{});
             while (dr_iter.next()) |_| dirty_count += 1;
             ctx.core.log.write(
-                "[perf] flush_dirty rows={d} dirty_rows={d} dirty_all={d} content_rev={d}\n",
-                .{ rows, dirty_count, @intFromBool(ctx.core.grid.main_buf.dirty_all), ctx.core.grid.content_rev },
+                "[perf] flush_dirty rows={d} dirty_rows={d} dirty_all={d}\n",
+                .{ rows, dirty_count, @intFromBool(ctx.core.grid.main_buf.dirty_all) },
             );
         }
 
@@ -3064,8 +3063,8 @@ pub const FlushCtx = struct {
         const scrolled_count = ctx.core.grid.scrolled_grid_count;
         const scrolled_overflow = ctx.core.grid.scrolled_grid_overflow;
         if (perf_enabled and (scrolled_count > 0 or scrolled_overflow)) {
-            ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} overflow={any} content_rev={d} dirty_all={any}\n", .{
-                scrolled_count, scrolled_overflow, ctx.core.grid.content_rev, ctx.core.grid.main_buf.dirty_all,
+            ctx.core.log.write("[scroll_debug] flush_begin scrolled_grids={d} overflow={any} dirty_all={any}\n", .{
+                scrolled_count, scrolled_overflow, ctx.core.grid.main_buf.dirty_all,
             });
         }
         // Reset flush_aborted BEFORE calling on_flush_begin
@@ -3138,7 +3137,6 @@ pub const FlushCtx = struct {
                 ctx.core.grid.destroyed_pending.clearRetainingCapacity();
                 ctx.core.finishAtlasMaintenance();
                 ctx.core.grid.clearScrolledGrids();
-                ctx.core.grid.clearScrollState();
                 var sg_it = ctx.core.grid.sub_grids.valueIterator();
                 while (sg_it.next()) |sg| sg.clearScrollState();
             } else {
@@ -3167,7 +3165,6 @@ pub const FlushCtx = struct {
                     } else {
                         ctx.core.grid.markEverySurfaceDirty();
                     }
-                    ctx.core.last_sent_content_rev = last_sent_content_rev_before;
                     ctx.core.force_ext_cursor_recheck = true;
                     // notifySurfaceLayouts runs before on_flush_end, so a late
                     // abort cancels the transaction that carried the layout
@@ -3187,7 +3184,6 @@ pub const FlushCtx = struct {
                     ctx.core.rearmAtlasMaintenanceAfterAbort(retry_at);
                 }
                 if (!aborted_at_flush_begin) {
-                    ctx.core.grid.clearScrollState();
                     var sg_it = ctx.core.grid.sub_grids.valueIterator();
                     while (sg_it.next()) |sg| {
                         // The restored dirty set names only the rows the
@@ -3410,10 +3406,11 @@ pub const FlushCtx = struct {
         // A zero-cell main grid has no rows, but its layout still has to cross
         // the transaction boundary: publish a layout-only MAIN update through
         // the row ABI plus the independent empty cursor layer, consuming
-        // dirty/revision state only after both callbacks accept the bracket.
+        // dirty state only after both callbacks accept the bracket. A layout
+        // change always sets dirty_all (resize, session reset, markAllDirty);
+        // edits elsewhere owe a grid with no rows nothing.
         if (n_cells == 0) {
             const need_main =
-                ctx.core.grid.content_rev != ctx.core.last_sent_content_rev or
                 ctx.core.grid.main_buf.dirty_all or
                 ctx.core.grid.main_buf.surface_vertex_count != 0;
 
@@ -3445,7 +3442,6 @@ pub const FlushCtx = struct {
                     );
                     if (ctx.core.flush_aborted) return;
                     ctx.core.invalidateMirroredFrameState();
-                    ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     ctx.core.grid.clearDirty();
                 }
             }
@@ -3455,17 +3451,13 @@ pub const FlushCtx = struct {
         if (ctx.core.cb.on_vertices_row != null) {
 
             // Grid 1 owes rows exactly when a row is dirty, the rule every
-            // other grid's pass uses (sg.dirty). content_rev was the gate here,
-            // and it also advanced for edits it owed nothing for -- a line in
-            // any main-surface split -- so each ran this pass over no rows.
-            // Grid 1's cursor is not this pass's: sendExternalGridVertices
+            // other grid's pass uses (sg.dirty). Grid 1's cursor is not this pass's: sendExternalGridVertices
             // emits every grid's, grid 1's included, by one rule.
             const need_main: bool = ctx.core.grid.main_buf.anyDirty();
 
             // If nothing changed, avoid doing any work.
             if (!need_main) {
                 ctx.core.grid.clearDirty();
-                ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                 return;
             }
 
@@ -3513,27 +3505,6 @@ pub const FlushCtx = struct {
                             "[scroll_debug] flush_row_mode dirty_rows={d} rebuild_all={any} scrolled_count={d} scrolled_grid_ids[0]={d} subgrid_count={d} cursor_row={d} cursor_col={d}\n",
                             .{ log_dirty_rows, rebuild_all, scrolled_count, ctx.core.grid.scrolled_grid_ids[0], cached_sg_count, ctx.core.grid.cursor_row, ctx.core.grid.cursor_col },
                         );
-                        if (ctx.core.grid.pending_scroll) |ps| {
-                            ctx.core.log.write(
-                                "[scroll_debug] pending_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target={d}x{d} win_pos_row={d} prev_cursor_row={any}\n",
-                                .{ ps.grid_id, ps.top, ps.bot, ps.left, ps.right, ps.rows, ps.cols, ps.target_rows, ps.target_cols, ps.win_pos_row, ctx.core.grid.prev_cursor_row },
-                            );
-                            const tc = ctx.core.grid.scroll_touched_count;
-                            if (tc > 0) {
-                                const touched = ctx.core.grid.scroll_touched_rows[0..tc];
-                                if (tc >= 4) {
-                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d},{d},{d},...]\n", .{ tc, touched[0], touched[1], touched[2], touched[3] });
-                                } else if (tc == 3) {
-                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d},{d}]\n", .{ tc, touched[0], touched[1], touched[2] });
-                                } else if (tc == 2) {
-                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d},{d}]\n", .{ tc, touched[0], touched[1] });
-                                } else {
-                                    ctx.core.log.write("[scroll_debug] touched_rows count={d} rows=[{d}]\n", .{ tc, touched[0] });
-                                }
-                            } else {
-                                ctx.core.log.write("[scroll_debug] touched_rows count=0\n", .{});
-                            }
-                        }
                     }
 
                     var perf_hl_cache_hits: u32 = 0;
@@ -3873,8 +3844,7 @@ pub const FlushCtx = struct {
                     // A row_cb in the loop above may have aborted this flush
                     // (e.g. Windows row-buffer OOM), and the frontend cancels
                     // its whole triple-buffer bracket — nothing composed above
-                    // reached the screen. clearDirty() here plus the
-                    // last_sent_content_rev sync below would leave
+                    // reached the screen. clearDirty() here would leave
                     // zonvie_core_retry_flush's has_pending check seeing nothing
                     // pending, losing this content until an unrelated later edit
                     // happens to touch the same rows.
@@ -3912,8 +3882,6 @@ pub const FlushCtx = struct {
                     // rows other passes committed this flush point into the
                     // replaced atlas. An aborted flush runs no external pass.
                     if (!ctx.core.flush_aborted) ctx.core.atlas_reset_during_flush = false;
-                    // Skip on abort — see the clearDirty() guard above.
-                    if (!ctx.core.flush_aborted) ctx.core.last_sent_content_rev = ctx.core.grid.content_rev;
                     if (log_enabled) {
                         const t_rows_done_ns: i128 = clock.nowNs();
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
@@ -4273,9 +4241,6 @@ fn regenerateRootsWhoseDefaultBgRuleFlipped(self: *Core) void {
     if (main_skip != self.grid.main_buf.skip_default_bg_last) {
         self.grid.main_buf.skip_default_bg_last = main_skip;
         self.grid.markAllDirty();
-        // The main pass is gated on content_rev; a flip nothing else bumped
-        // it for (blur switched on) would otherwise leave the rows unsent.
-        self.grid.content_rev +%= 1;
     }
     var it = self.grid.external_grids.keyIterator();
     while (it.next()) |id| {
@@ -7675,6 +7640,7 @@ pub fn sendPendingMsgShowCallback(self: *Core, pm: *const grid_mod.PendingMessag
         if (pm.history) 1 else 0,
         if (pm.append) 1 else 0,
         pm.id,
+        messageTimeoutMs(route_result.timeout),
     );
 }
 
@@ -8419,7 +8385,6 @@ test "flush begin abort preserves undispatched scroll state" {
     var flush_ctx = FlushCtx{ .core = &core };
     try flush_ctx.onFlush(3, 3);
     try std.testing.expect(core.grid.main_scroll_notify_pending);
-    try std.testing.expect(core.grid.pending_scroll != null);
     try std.testing.expect(!core.grid.main_buf.dirty_all);
     try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
 
@@ -8427,7 +8392,6 @@ test "flush begin abort preserves undispatched scroll state" {
     try flush_ctx.onFlush(3, 3);
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
     try std.testing.expect(!core.grid.main_scroll_notify_pending);
-    try std.testing.expect(core.grid.pending_scroll == null);
 }
 
 test "zero-sized main still commits external grid transaction" {
@@ -8560,8 +8524,7 @@ test "zero-sized main still commits external grid transaction" {
 
     state.abort_main_layout = false;
     try flush_ctx.onFlush(2, 0);
-    try std.testing.expect(!core.grid.main_buf.dirty_all);
-    try std.testing.expectEqual(core.grid.content_rev, core.last_sent_content_rev);
+    try std.testing.expect(!core.grid.main_buf.anyDirty());
     try std.testing.expectEqual(@as(usize, 0), core.grid.main_buf.surface_vertex_count);
     try std.testing.expectEqual(@as(u32, 5), state.main_layout_calls);
     try std.testing.expectEqual(@as(u32, 4), state.main_cursor_clears);
@@ -8996,14 +8959,12 @@ test "flush transaction orders begin vertices end and restores state on every ab
 
         if (abort_at == .none) {
             try std.testing.expect(!core.flush_aborted);
-            try std.testing.expect(!core.grid.main_buf.dirty_all);
-            try std.testing.expectEqual(core.grid.content_rev, core.last_sent_content_rev);
+            try std.testing.expect(!core.grid.main_buf.anyDirty());
             try std.testing.expect(core.grid.main_buf.surface_vertex_count > 0);
         } else if (abort_at == .begin) {
             try std.testing.expect(core.flush_aborted);
             try std.testing.expect(!core.grid.main_buf.dirty_all);
             try std.testing.expect(core.grid.main_buf.dirty_rows.isSet(0));
-            try std.testing.expect(core.grid.content_rev != core.last_sent_content_rev);
             try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
             try std.testing.expectEqual(committed_vertex_count, core.grid.main_buf.surface_vertex_count);
         } else {
@@ -9014,7 +8975,6 @@ test "flush transaction orders begin vertices end and restores state on every ab
             try std.testing.expect(core.flush_aborted);
             try std.testing.expect(!core.grid.main_buf.dirty_all);
             try std.testing.expect(core.grid.main_buf.dirty_rows.isSet(0));
-            try std.testing.expect(core.grid.content_rev != core.last_sent_content_rev or abort_at == .end);
             try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
             try std.testing.expectEqual(committed_vertex_count, core.grid.main_buf.surface_vertex_count);
         }
@@ -10673,7 +10633,6 @@ test "cursor atlas reset cancels current flush before partial commit" {
     core.drawable_h_px = 1;
     core.cell_w_px = 1;
     core.cell_h_px = 1;
-    core.last_sent_content_rev = core.grid.content_rev;
     core.grid.clearDirty();
     core.last_ext_cursor_rev = core.grid.cursor_rev -% 1;
     core.atlas_w = config.atlas_size_max;
@@ -14466,9 +14425,7 @@ test "a float waits for its surface root layout without dirtying an unresolved m
     try core.grid.resizeGrid(3, 4, 8);
     try core.grid.setWinFloatPos(3, 30, 1, 1, 50, 0, 99, true);
     core.grid.main_buf.clearDirty();
-    const revision = core.grid.content_rev;
     core.grid.noteGridLine(3, 1);
-    try std.testing.expectEqual(revision, core.grid.content_rev);
     try std.testing.expect(!core.grid.main_buf.dirty);
 
     // Registration is allowed to precede grid_resize. Child rows must not
@@ -14704,9 +14661,8 @@ test "a row shift waits for the external window that hosts the scrolling float" 
 }
 
 test "a line in a main-surface split does not run grid 1's pass" {
-    // Grid 1 owes rows only when one is dirty, as every other grid does. Its
-    // pass was gated on content_rev, which a split's grid_line advanced
-    // although grid 1 holds none of the split's cells.
+    // Grid 1 owes rows only when one is dirty, as every other grid does,
+    // and holds none of a split's cells.
     const State = struct {
         root_pass_runs: u32 = 0,
         split_rows: u32 = 0,
@@ -16300,4 +16256,11 @@ test "the cursor's glyph quads come from one emitter and trim box drawing to the
     span = Span.ofGlyph(out.items);
     try std.testing.expectApproxEqAbs(@as(f32, 9), span[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 22), span[1], 0.001);
+}
+
+test "pending message senders compile against the on_msg_show signature" {
+    // Nothing calls these yet, so Zig never analysed them: one passed ten of
+    // the callback's eleven arguments. Referencing them keeps that checked.
+    _ = &sendPendingMsgShowAt;
+    _ = &sendPendingMsgShowCallback;
 }

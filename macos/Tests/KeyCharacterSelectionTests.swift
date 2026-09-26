@@ -86,23 +86,6 @@ private enum KeyCharacterSelectionTests {
         expectMeta(true, 0x20, 3, false, "only_right rejects the left Option bit")
         expectMeta(true, 0x20, 99, true, "an unknown setting falls back to both")
 
-        // Special key codes bypass the input context.
-        for code in [UInt16(0x35), 0x7B, 0x7C, 0x7D, 0x7E, 0x24, 0x30, 0x33,
-                     0x75, 0x73, 0x77, 0x74, 0x79, 0x7A, 0x6F] {
-            if !KeyCharacterSelection.isSpecialKeyCode(code) {
-                failures += 1
-                FileHandle.standardError.write(
-                    Data("FAIL: key code \(String(code, radix: 16)) should be special\n".utf8))
-            }
-        }
-        for code in [UInt16(0x00), 0x03, 0x31, 0x66, 0x68] {
-            if KeyCharacterSelection.isSpecialKeyCode(code) {
-                failures += 1
-                FileHandle.standardError.write(
-                    Data("FAIL: key code \(String(code, radix: 16)) should not be special\n".utf8))
-            }
-        }
-
         // modifierMask packs exactly the bits it is given, and reports Option
         // as Alt only when it is acting as Meta. Bit values mirror
         // include/zonvie_core.h: ctrl 1, alt 2, shift 4, super 8.

@@ -16,6 +16,7 @@ final class GridSurfaceRenderer {
         var content_bottom_y: Float
         var move_all: Int32 = 0
         var pin_edges: Int32 = 1
+        var zindex: Int32 = 0
     }
 
     struct FixedFloatRect: Equatable {

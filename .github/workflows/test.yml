@@ -6,22 +6,29 @@ env:
   ZIG_VERSION: "0.16.0"
 
 jobs:
+  # The e2e runner skips every scenario when it finds no nvim;
+  # ZONVIE_REQUIRE_NVIM turns that into a failure.
   e2e:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: goto-bus-stop/setup-zig@v2
+      - uses: actions/checkout@v4
+      - name: Install Neovim
+        run: brew install neovim
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: E2E Tests
         run: zig build e2e --summary all
+        env:
+          ZONVIE_REQUIRE_NVIM: "1"
         timeout-minutes: 30
       - name: Upload E2E Results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-results
-          path: zig-cache/
+          path: .zig-cache/
           retention-days: 7
 
   compile:

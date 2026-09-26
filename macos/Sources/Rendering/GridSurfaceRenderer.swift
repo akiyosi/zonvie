@@ -3,8 +3,6 @@ import Metal
 import MetalKit
 import simd
 
-private let metalTerminalMaxRowBuffers = 20_000
-
 // MARK: - Surface Render Helpers Shared With ExternalGridView
 //
 // File-scope because both surfaces call them and neither owns them. They live
@@ -198,6 +196,63 @@ func requireSurfaceRowCapacity(
         )
         return false
     }
+}
+
+/// One content row into a bracket's write set: the body both surfaces' row
+/// callbacks ran. Allocation is synchronous (an async pre-provisioning gate
+/// did not converge under sustained scroll). Nil when the row could not be
+/// written, with the capacity it owes recorded for the provisioner and the
+/// flush the caller's to fail; otherwise whether it changed the row structure
+/// (the first row-mode row, or a new grid size), which the sets' sparse
+/// history cannot carry.
+func submitSurfaceWriteSetRow(
+    bufferSets: [SurfaceBufferSet],
+    writeSetIndex: Int,
+    sourceSetIndex: Int,
+    device: MTLDevice,
+    ledger: SurfaceRowCapacityLedger,
+    lock: NSLock,
+    rowStart: Int,
+    ptr: UnsafeRawPointer?,
+    count: Int,
+    maxRowBuffers: Int,
+    totalRows: Int,
+    totalCols: Int,
+    logLabel: @autoclosure () -> String,
+    inflightRowBuffers: (Int) -> (MTLBuffer?, MTLBuffer?)
+) -> Bool? {
+    let sourceSet = bufferSets[sourceSetIndex]
+    let structural = !sourceSet.rowState.usingRowBuffers
+        || totalRows != sourceSet.knownTotalRows
+        || totalCols != sourceSet.knownTotalCols
+    if submitSurfaceRowVertices(
+        target: bufferSets[writeSetIndex],
+        sourceSet: sourceSet,
+        device: device,
+        rowStart: rowStart,
+        ptr: ptr,
+        count: count,
+        maxRowBuffers: maxRowBuffers,
+        totalRows: totalRows,
+        totalCols: totalCols,
+        inflightRowBuffers: inflightRowBuffers
+    ) {
+        return structural
+    }
+    _ = requireSurfaceRowCapacity(
+        bufferSets: bufferSets,
+        ledger: ledger,
+        lock: lock,
+        lockHeld: false,
+        row: rowStart,
+        vertexCount: count,
+        totalRows: totalRows,
+        maxRowBuffers: maxRowBuffers,
+        mappingSetIndex: writeSetIndex,
+        rowIsPhysical: false,
+        logLabel: logLabel()
+    )
+    return nil
 }
 
 /// Provision the row capacity `ledger` owes, outside any flush bracket.
@@ -1192,11 +1247,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     func prepareLayerGridsForWrite() {
         guard isInFlush, !layerGridsPreparedThisFlush else { return }
         layerGridsPreparedThisFlush = true
-        gridBuffers.copyGridIds(into: &layerGridIdScratch)
-        for gridId in layerGridIdScratch where gridId != 1 {
-            let sets = gridBuffers.sets(for: gridId)
-            copySurfaceBufferSetRowState(from: sets[flushSourceSetIndex], to: sets[writeSetIndex])
-        }
+        gridBuffers.carryLayerRows(skipping: 1, from: flushSourceSetIndex, to: writeSetIndex, scratch: &layerGridIdScratch)
     }
 
     /// Which layer the committed cursor belongs to. The surface draws one
@@ -1426,17 +1477,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     ]
     private var committedCursorSetIndex: Int = 0 // Protected by lock
     private var isInFlush: Bool = false       // Core thread only
-    // Complete row metadata is retained independently in all three sets. A
-    // non-committed set only needs rows changed since it last committed; this
-    // avoids O(totalRows) metadata copying for a one-row flush. Structural
-    // operations and aborted partial writes use the full-copy barrier.
-    private let staleMainRowsBySet: [SparseRowSet] = [
-        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
-        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
-        SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers),
-    ]
-    private let flushChangedMainRows = SparseRowSet(rowLimit: metalTerminalMaxRowBuffers, preparedRows: metalTerminalMaxRowBuffers)
-    private var mainRowStateNeedsFullSync = [false, false, false]
+    private let mainRowSync = SurfaceRowSyncLedger()
+    private let flushChangedMainRows = SparseRowSet(rowLimit: surfaceMaxRowBuffers, preparedRows: surfaceMaxRowBuffers)
     private var flushHasStructuralMainChange = false
     // Set (core thread) when a buffer allocation fails or a mandatory row shift
     // cannot be applied: an empty/undersized/unshifted set must not become the
@@ -1454,7 +1496,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // Fixed-size capacity ledger. Row callbacks only raise scalar entries;
     // the retry worker provisions Swift metadata and Metal buffers after the
     // flush bracket closes and before it reacquires the core grid lock.
-    private let rowCapacity = SurfaceRowCapacityLedger(maxRowBuffers: metalTerminalMaxRowBuffers)
+    private let rowCapacity = SurfaceRowCapacityLedger(maxRowBuffers: surfaceMaxRowBuffers)
     // True while a core-thread flush bracket is open on this surface. Unlike
     // `isInFlush` (core-thread-owned, unsafe to read from main), this is
     // written and read ONLY under `lock`, so the provisioning worker can
@@ -1814,12 +1856,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
 
-    /// Maximum row buffer count, bounding worst-case memory growth: row storage
-    /// grows lazily per row and neither the C ABI nor Neovim's redraw protocol
-    /// imposes a limit, so rows beyond the cap silently stop updating. 20000
-    /// rows is ~800KB of bookkeeping — a safety net against a corrupt row index,
-    /// not a practical content limit.
-    private let maxRowBuffers: Int = metalTerminalMaxRowBuffers
+    private let maxRowBuffers: Int = surfaceMaxRowBuffers
 
     // --- Dirty region tracking (drawable pixel coordinates) ---
     private var pendingDirtyRectPx: NSRect? = nil
@@ -2307,16 +2344,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         let started = ZonvieCore.appLogEnabled ? CFAbsoluteTimeGetCurrent() : 0
         let src = bufferSets[flushSourceSetIndex]
         let dst = bufferSets[picked]
-        let sync = syncSurfaceWriteSetRowState(
-            from: src,
-            to: dst,
-            staleRows: staleMainRowsBySet[picked].rows,
-            needsFullSync: mainRowStateNeedsFullSync[picked],
-            maxRowBuffers: maxRowBuffers
-        )
+        let sync = mainRowSync.sync(from: src, to: dst, index: picked, maxRowBuffers: maxRowBuffers)
 
         copySurfaceMainVertexState(from: src, to: dst)
-        dst.pendingScroll = nil
         mainWritePrepared = true
         // The write set is two rotations old for every grid, so carry each
         // layer's rows forward: a flush that rewrites only the root must not
@@ -2372,12 +2402,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// through `abortFlush`, which is also how `ZonvieCore` ends a bracket
     /// whose atlas transaction could not close.
     private func endBracketWithoutPublishing() {
-        if mainWritePrepared {
-            // The scratch set may contain any prefix of this flush. It cannot
-            // participate in sparse carry-forward until fully overwritten.
-            mainRowStateNeedsFullSync[writeSetIndex] = true
-            staleMainRowsBySet[writeSetIndex].removeAll()
-        }
+        if mainWritePrepared { mainRowSync.abandon(writeSetIndex) }
         flushChangedMainRows.removeAll()
         flushHasStructuralMainChange = false
         // Drop every layer's staged dirty marks: the core re-dirties the grid
@@ -2527,26 +2552,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // consumed pendingDirtyRows gets those rows back.
         for gridId in commitGridIdScratch where gridId != 1 {
             guard let state = layerDrawStates[gridId] else { continue }
-            if didMainWrite,
-               let sets = gridBuffers.existingSets(for: gridId),
-               let ps = sets[ws].pendingScroll {
-                // Marks an earlier bracket left, that no draw has consumed,
-                // still name pre-shift rows: this bracket rotated the slots
-                // under them. Before the branches below, which mark rows that
-                // already describe post-remap content, and before
-                // flushDirtyRows is merged in -- those were shifted as they
-                // were made.
-                shiftSurfaceRowIndices(
-                    &state.pendingDirtyRows,
-                    rowStart: ps.rowStart,
-                    rowEnd: ps.rowEnd,
-                    rowsDelta: ps.rowsDelta
-                )
-                mergeCommittedSurfaceScroll(into: &state.pendingScrollAccum, ps,
-                                            dirtyRows: &state.pendingDirtyRows)
-                // A committed set must not keep the staged shift, or a later
-                // frame would apply it a second time.
-                sets[ws].pendingScroll = nil
+            // Before flushDirtyRows is merged in: those were shifted as they
+            // were made.
+            if didMainWrite, let sets = gridBuffers.existingSets(for: gridId) {
+                publishStagedSurfaceScroll(sets[ws], into: &state.pendingScrollAccum,
+                                           dirtyRows: &state.pendingDirtyRows)
             }
             if !state.flushDirtyRows.isEmpty {
                 state.pendingDirtyRows.formUnion(state.flushDirtyRows)
@@ -2589,12 +2599,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         flushHadLayerWork = false
 
         if didMainWrite {
-            // Only a successful publication advances other sets' sparse
-            // history. Aborted scratch mutations are handled by abortFlush's
-            // full-sync barrier instead.
-            recordCommittedRowMutation(
-                stale: staleMainRowsBySet,
-                needsFullSync: &mainRowStateNeedsFullSync,
+            mainRowSync.recordCommit(
                 committedIndex: ws,
                 rows: flushChangedMainRows.rows.lazy.map(Int.init),
                 structural: flushHasStructuralMainChange || mainLayoutChanged
@@ -4756,6 +4761,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 lk.lock()
                 self?.completeSurfaceGpuReadLocked(csi)
                 self?.cursorGpuInFlightCount[cci] -= 1
+                // Before the signal: the next frame may start the moment it
+                // fires, and its ensureBackBuffer or bail resets the flag. A
+                // `true` written after that re-marked a fresh back texture as
+                // presented, and the frame after `.load`ed undefined contents.
+                let completedOk = completed.status == .completed
+                var wasFirstPresent = false
+                if let s = self {
+                    wasFirstPresent = completedOk && !s.hasPresentedOnce
+                    s.hasPresentedOnce = completedOk
+                }
                 lk.unlock()
                 sem.signal()
 
@@ -4851,21 +4866,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     }
                 }
 
-                guard let self = self else { return }
-                guard completed.status == .completed else {
-                    self.lock.lock()
-                    self.hasPresentedOnce = false
-                    self.lock.unlock()
+                guard self != nil else { return }
+                guard completedOk else {
                     ZonvieCore.appLog("[WARNING] Metal command failed (status=\(completed.status.rawValue)); forcing full redraw")
                     DispatchQueue.main.async { [weak view] in
                         (view as? MetalTerminalView)?.requestRedraw()
                     }
                     return
                 }
-                self.lock.lock()
-                let wasFirstPresent = !self.hasPresentedOnce
-                self.hasPresentedOnce = true
-                self.lock.unlock()
                 if ZonvieCore.appLogEnabled, wasFirstPresent {
                     ZonvieCore.appLog("[startup] first present completed (GPU done)")
                 }
@@ -4993,7 +5001,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     }
 
     private func captureRetainedRowForGridScroll(gridId: Int64, rowsDelta: Int, replaying: Bool) {
-        guard Self.smoothScrollEnabled, rowsDelta != 0, isInFlush else { return }
+        guard Self.smoothScrollEnabled, rowsDelta != 0 else { return }
 
         lock.lock()
         let bounds = gridScrollCaptureBounds[gridId]
@@ -5014,6 +5022,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     pendingRetentionReplay.count - Self.maxPendingRetentionReplay
                 )
             }
+        }
+        // Remembered before this test: a bracket beginFlush refused
+        // (onGridScroll joins without checking) still consumed the step.
+        // ExternalGridView's noteGridScroll accumulates unconditionally too.
+        guard isInFlush else {
+            lock.unlock()
+            return
         }
         // How far the source set is behind what this step describes. A replayed
         // step did not move the committed content, so a capture that follows it
@@ -5166,47 +5181,25 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
         let perfEnabled = ZonvieCore.appLogEnabled
         let t0 = perfEnabled ? zonvie_core_perf_now_ns() : 0
-        let sourceSet = bufferSets[flushSourceSetIndex]
-        let changesRowStructure = !sourceSet.rowState.usingRowBuffers
-            || totalRows != sourceSet.knownTotalRows
-            || totalCols != sourceSet.knownTotalCols
-        // Allocate synchronously: the async pre-provisioning gate this replaced
-        // does not converge under sustained scroll (same reasoning as
-        // ExternalGridView.applyRowScroll). requireSurfaceRowCapacity below
-        // only records a real allocation failure for the async recovery path.
-        let submitted = submitSurfaceRowVertices(
-            target: bufferSets[writeSetIndex],
-            sourceSet: sourceSet,
+        switch submitSurfaceWriteSetRow(
+            bufferSets: bufferSets,
+            writeSetIndex: writeSetIndex,
+            sourceSetIndex: flushSourceSetIndex,
             device: shared.device,
+            ledger: rowCapacity,
+            lock: lock,
             rowStart: rowStart,
             ptr: UnsafeRawPointer(ptr),
             count: count,
             maxRowBuffers: maxRowBuffers,
             totalRows: totalRows,
             totalCols: totalCols,
+            logLabel: "Renderer",
             inflightRowBuffers: { self.inflightRowBuffers(gridId: 1, atSlot: $0) }
-        )
-        if !submitted {
-            // Records the rows this surface still owes, for the provisioning
-            // pass the retry drives.
-            _ = requireSurfaceRowCapacity(
-                bufferSets: bufferSets,
-                ledger: rowCapacity,
-                lock: lock,
-                lockHeld: false,
-                row: rowStart,
-                vertexCount: count,
-                totalRows: totalRows,
-                maxRowBuffers: maxRowBuffers,
-                mappingSetIndex: writeSetIndex,
-                rowIsPhysical: false,
-                logLabel: "Renderer"
-            )
-            flushFailed = true
-        } else if changesRowStructure {
-            flushHasStructuralMainChange = true
-        } else {
-            flushChangedMainRows.insert(rowStart)
+        ) {
+        case nil: flushFailed = true
+        case true?: flushHasStructuralMainChange = true
+        case false?: flushChangedMainRows.insert(rowStart)
         }
         if perfEnabled {
             let dt = zonvie_core_perf_now_ns() - t0

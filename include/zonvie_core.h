@@ -758,7 +758,9 @@ typedef struct zonvie_callbacks {
 
     /* Called when cursor moves to a different grid.
        grid_id: the grid where cursor now resides (1 = global grid).
-       Frontend should activate the corresponding window. */
+       Frontend should activate the corresponding window. May repeat the
+       same grid_id (while its window is not created yet, and after an
+       aborted flush); frontends compare against the last one they saw. */
     void (*on_cursor_grid_changed)(void* ctx, int64_t grid_id);
 
     /* ext_cmdline callbacks */
@@ -1093,7 +1095,7 @@ void zonvie_core_update_layout_px_locked(
     unsigned cell_h_px
 );
 
-void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, int len);
+void zonvie_core_send_input(zonvie_core *core, const unsigned char *data, size_t len);
 
 /* Timestamp helper for perf-log correlation across frontend/core stages. */
 ZONVIE_API int64_t zonvie_core_perf_now_ns(void);
@@ -1706,6 +1708,72 @@ ZONVIE_API int32_t zonvie_core_cmdline_popupmenu_top(
     int32_t popup_height,
     int32_t gap,
     int32_t screen_top);
+
+/* Where an open cmdline window goes when its size changes, Y growing
+   downward: it keeps the centre of `old_*`, is centred in the area once it is
+   90% of the area's width, and stays inside the area.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_cmdline_origin(
+    int32_t old_left, int32_t old_top, int32_t old_right, int32_t old_bottom,
+    int32_t new_w, int32_t new_h,
+    int32_t area_left, int32_t area_top, int32_t area_right, int32_t area_bottom,
+    int32_t *out_x, int32_t *out_y);
+
+/* The top-left corner of msg_show / msg_history, Y growing downward: `margin`
+   in from the target rect's top-right corner, or, for msg_show while
+   msg_history is up (has_history), `gap` below history_bottom. Margins are in
+   the caller's (scaled) pixels.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_msg_float_origin(
+    int32_t target_left, int32_t target_top, int32_t target_right, int32_t target_bottom,
+    int32_t window_w, bool has_history, int32_t history_bottom,
+    int32_t margin, int32_t gap,
+    int32_t *out_x, int32_t *out_y);
+
+/* Whether a key code from send_key_event's encoding (a macOS virtual key
+   code, or 0x10000 | Windows VK) is a special key the core names (<Left>,
+   <CR>, <F1>, ...): such keys go straight to send_key_event rather than
+   through the platform's text input.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_key_is_special(uint32_t keycode);
+
+/* Whether a custom shader's source reads a uniform that changes every frame
+   (iTime, iTimeDelta, iFrame, iFrameRate, iDate), so its surface keeps
+   drawing while nothing else changes.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t len);
+
+/* Move the tab at from_idx (0-based) to the drop insertion index drop_idx of
+   the tab list before the move, as one command that also makes it current.
+   Returns false, sending nothing, when the drop leaves it where it is. */
+ZONVIE_API bool zonvie_core_tab_move(zonvie_core *core, uint32_t from_idx, uint32_t drop_idx, uint32_t tab_count);
+
+/* Move the only window of tab tab_idx (0-based) into an external window. A
+   tab with a split is refused with a warning from Neovim. */
+ZONVIE_API void zonvie_core_externalize_tab(zonvie_core *core, uint32_t tab_idx);
+
+/* A surface's cursor blink cadence from guicursor's blinkwait/blinkon/blinkoff.
+   Blinks when blinkon and blinkoff are both non-zero; a zero blinkwait (what
+   Neovim sends for an entry guicursor leaves out) starts the cycle at once.
+   Each call returns the delay in ms to the next zonvie_blink_tick, or 0 for no
+   timer. `visible` is whether the cursor is drawn. Initialise every field
+   to zero except visible = true (the cursor starts drawn).
+
+   Pure — no core pointer, no lock. */
+typedef struct {
+    uint32_t wait_ms;
+    uint32_t on_ms;
+    uint32_t off_ms;
+    uint8_t phase;
+    bool visible;
+} zonvie_blink;
+ZONVIE_API uint32_t zonvie_blink_start(zonvie_blink *blink, uint32_t wait_ms, uint32_t on_ms, uint32_t off_ms);
+ZONVIE_API uint32_t zonvie_blink_tick(zonvie_blink *blink);
+ZONVIE_API void zonvie_blink_stop(zonvie_blink *blink);
 
 /* The grid a surface's scrollbar should show: the cursor's grid when this
    surface composites it, and the surface's own root otherwise. `surface_id` is

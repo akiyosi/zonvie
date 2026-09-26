@@ -10,6 +10,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer h.deinit();
 
     const g = h.winGrid();
+    const flushes_before = h.flush_seq.load(.seq_cst);
 
     // Insert 10 lines of text. Each line generates a grid_line event.
     // All events must be processed atomically before flush-end.
@@ -35,7 +36,6 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Verify that all lines are present in a single consistent grid state.
     // This ensures events were not buffered or delayed (which would cause
     // intermediate states where only some lines are present).
-    const rev = h.contentRev();
     verify_line = 0;
     while (verify_line < 10) : (verify_line += 1) {
         const expected = try std.fmt.allocPrint(alloc, "line{d}", .{verify_line});
@@ -45,6 +45,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         try std.testing.expect(std.mem.eql(u8, text, expected));
     }
 
-    // Verify content revision changed (redraw was processed).
-    try std.testing.expect(rev > 0);
+    // The typed lines were flushed, not only the attach (Harness.init already
+    // waited for that one).
+    try std.testing.expect(h.flush_seq.load(.seq_cst) > flushes_before);
 }

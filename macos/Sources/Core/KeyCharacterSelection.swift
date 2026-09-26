@@ -52,25 +52,6 @@ enum KeyCharacterSelection {
         }
     }
 
-    /// Key codes that go straight to Neovim rather than through the input
-    /// context: Escape, the arrows, Return, Tab, both deletes, Home/End,
-    /// Page Up/Down and F1-F12.
-    static func isSpecialKeyCode(_ keyCode: UInt16) -> Bool {
-        switch keyCode {
-        case 0x35: return true  // Escape
-        case 0x7B, 0x7C, 0x7D, 0x7E: return true  // Arrow keys (left, right, down, up)
-        case 0x24: return true  // Return
-        case 0x30: return true  // Tab
-        case 0x33: return true  // Delete (Backspace)
-        case 0x75: return true  // Forward Delete
-        case 0x73, 0x77: return true  // Home, End
-        case 0x74, 0x79: return true  // Page Up, Page Down
-        case 0x7A, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64,
-             0x65, 0x6D, 0x67, 0x6F: return true  // F1-F12
-        default: return false
-        }
-    }
-
     /// Pack the four modifier bits Neovim is sent for a key event.
     ///
     /// The bit values are passed in rather than referenced here: this file is
