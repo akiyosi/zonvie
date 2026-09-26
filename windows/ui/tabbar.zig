@@ -49,6 +49,24 @@ fn agentSpinnerGlyph(state: u8, frame: u32) []const u8 {
     };
 }
 
+/// The AI-agent indicator for `a_state` in a fixed cell of `ind_px` at `x`,
+/// centred in [top, bottom); the colour 🤖 is placed at `emoji_y` (AlphaBlend,
+/// since GDI DrawTextW cannot render colour emoji).
+fn drawAgentIndicator(app: *App, hdc: c.HDC, a_state: u8, x: c_int, top: c_int, bottom: c_int, emoji_y: c_int, ind_px: c_int) void {
+    if (a_state == 1) {
+        if (if (ind_px > 0) ensureAgentEmoji(app, ind_px) else null) |hbm| {
+            blendAgentEmoji(hdc, hbm, x, emoji_y, ind_px);
+        } else {
+            drawIndicatorGlyph(hdc, "●", x, ind_px, top, bottom);
+        }
+    } else if (a_state == 4) {
+        // Waiting for user input -> pause glyph (two bars).
+        drawPauseGlyph(hdc, x, ind_px, top, bottom);
+    } else {
+        drawIndicatorGlyph(hdc, agentSpinnerGlyph(a_state, app.tabline_state.spinner_frame), x, ind_px, top, bottom);
+    }
+}
+
 /// Draw a single monochrome indicator glyph centered in a fixed-width cell
 /// [x, x+cell_w) so the title (drawn after the cell) never shifts per frame.
 fn drawIndicatorGlyph(hdc: c.HDC, glyph: []const u8, x: c_int, cell_w: c_int, top: c_int, bottom: c_int) void {
@@ -511,6 +529,7 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         .close => |i| {
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
             app.tabline_state.close_button_pressed = i;
+            app.tabline_state.close_button_pressed_handle = app.tabline_state.tabs[i].handle;
             _ = c.SetCapture(hwnd);
             _ = c.InvalidateRect(hwnd, null, 0); // Redraw for pressed state
         },
@@ -556,10 +575,10 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
         // Execute close action - mouse was still over button (otherwise mouseMove would have cancelled)
         if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: close button released on tab {d}, closing\n", .{pressed_tab_idx});
-        if (pressed_tab_idx < app.tabline_state.tab_count) {
+        if (app.tabline_state.indexOfHandle(app.tabline_state.close_button_pressed_handle)) |idx| {
             if (app.corep) |corep| {
                 var cmd_buf: [32]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{pressed_tab_idx + 1}) catch return;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{idx + 1}) catch return;
                 app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
             }
         }
@@ -845,8 +864,10 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                                 _ = c.SetBkMode(hdc, c.TRANSPARENT);
                                 _ = c.SetTextColor(hdc, preview_pal.text_selected);
 
-                                // Convert UTF-8 to UTF-16
-                                var wide_buf: [128]u16 = undefined;
+                                // Convert UTF-8 to UTF-16. A tab name is up to
+                                // 255 bytes, so up to 255 UTF-16 units: 128 was
+                                // written past on a long ASCII name.
+                                var wide_buf: [256]u16 = undefined;
                                 const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name) catch 0;
                                 if (wide_len > 0) {
                                     _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER | c.DT_END_ELLIPSIS);
@@ -922,18 +943,13 @@ fn tablineRenderSignature(app: *App, width: u32, height: u32) u64 {
 }
 
 /// Which offscreen strip renderOffscreenToD3D is drawing.
-const OffscreenSurface = enum { tabline, sidebar };
+const OffscreenSurface = app_mod.d3d11.Strip;
 
 /// Draw one offscreen strip into a 32-bit top-down DIB and upload it to its
 /// D3D texture. Returns true only when the upload succeeded.
 ///
 /// Both callers built the DIB identically and both must force the alpha
 /// channel opaque afterwards, because GDI leaves it untouched.
-///
-/// Dispatch is a switch rather than a pair of function pointers: the two
-/// content draws take different argument counts, and the two upload methods
-/// have independently inferred error sets, which a shared fn-pointer type
-/// would have to widen to anyerror on a WM_PAINT path.
 ///
 /// The caller keeps its own preconditions -- the tabline's tab_count and
 /// change gates have no sidebar counterpart.
@@ -981,16 +997,10 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
 
     const pixel_data = pixels[0 .. width * height * 4];
     const g = &(app.renderer.?);
-    switch (surface) {
-        .tabline => g.updateTablineTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[tabline] updateTablineTexture failed: {any}\n", .{e});
-            return false;
-        },
-        .sidebar => g.updateSidebarTexture(width, height, pixel_data) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[sidebar] updateSidebarTexture failed: {any}\n", .{e});
-            return false;
-        },
-    }
+    g.updateStripTexture(surface, width, height, pixel_data) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[{s}] updateStripTexture failed: {any}\n", .{ @tagName(surface), e });
+        return false;
+    };
     return true;
 }
 
@@ -1018,9 +1028,48 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     }
 }
 
-/// Render sidebar to D3D11 texture via offscreen GDI bitmap.
+/// Render sidebar to D3D11 texture via offscreen GDI bitmap, skipped when
+/// nothing drawSidebarContent reads has changed: it was re-rendered and fully
+/// re-uploaded on every WM_PAINT, cursor blinks included.
 pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
-    _ = renderOffscreenToD3D(app, .sidebar, width, height);
+    const sig = sidebarRenderSignature(app, width, height);
+    if (sig == app.sidebar_render_sig) return;
+    if (renderOffscreenToD3D(app, .sidebar, width, height)) {
+        app.sidebar_render_sig = sig;
+    }
+}
+
+/// Everything drawSidebarContent (and SidebarColors.compute) reads.
+fn sidebarRenderSignature(app: *App, width: u32, height: u32) u64 {
+    const ts = &app.tabline_state;
+    var h = std.hash.Wyhash.init(1);
+    h.update(std.mem.asBytes(&width));
+    h.update(std.mem.asBytes(&height));
+    h.update(std.mem.asBytes(&app.dpi_scale));
+    h.update(std.mem.asBytes(&app.colorscheme_bg));
+    h.update(std.mem.asBytes(&app.colorscheme_fg));
+    h.update(std.mem.asBytes(&app.sidebar_position_right));
+    h.update(std.mem.asBytes(&ts.tab_count));
+    h.update(std.mem.asBytes(&ts.current_tab));
+    for (ts.tabs[0..ts.tab_count]) |*tab| {
+        h.update(std.mem.asBytes(&tab.handle));
+        h.update(tab.name[0..tab.name_len]);
+    }
+    var opt_fields = [_]u64{
+        sigOptIdx(ts.hovered_tab),
+        sigOptIdx(ts.hovered_close),
+        @intFromBool(ts.hovered_new_tab_btn),
+        sigOptIdx(ts.dragging_tab),
+        @as(u64, @bitCast(@as(i64, ts.drag_current_y))),
+        sigOptIdx(ts.drop_target_index),
+        @intFromBool(ts.is_external_drag),
+        @as(u64, ts.spinner_frame),
+        @as(u64, ts.agent_count),
+    };
+    h.update(std.mem.sliceAsBytes(opt_fields[0..]));
+    h.update(std.mem.asBytes(&ts.agent_handles));
+    h.update(std.mem.asBytes(&ts.agent_states));
+    return h.final();
 }
 
 /// Draw tabline content (called from offscreen DC or child window WM_PAINT)
@@ -1219,20 +1268,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
             // Indicator cell sized near the text cap height, sitting inline.
             const ind_px = @divTrunc((bar_height - top_padding * 2) * 7, 10);
             const cell_w = ind_px + top_padding; // glyph box + gap, reserved
-            if (a_state == 1) {
-                if (if (ind_px > 0) ensureAgentEmoji(app, ind_px) else null) |hbm| {
-                    const ey = @divTrunc(bar_height - ind_px, 2);
-                    blendAgentEmoji(hdc, hbm, text_rect.left, ey, ind_px);
-                } else {
-                    drawIndicatorGlyph(hdc, "●", text_rect.left, ind_px, text_rect.top, text_rect.bottom);
-                }
-            } else if (a_state == 4) {
-                // Waiting for user input -> pause glyph (two bars).
-                drawPauseGlyph(hdc, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
-            } else {
-                const g = agentSpinnerGlyph(a_state, app.tabline_state.spinner_frame);
-                drawIndicatorGlyph(hdc, g, text_rect.left, ind_px, text_rect.top, text_rect.bottom);
-            }
+            drawAgentIndicator(app, hdc, a_state, text_rect.left, text_rect.top, text_rect.bottom, @divTrunc(bar_height - ind_px, 2), ind_px);
             text_rect.left += cell_w; // anchor the title past the fixed cell
         }
 
@@ -1504,11 +1540,9 @@ pub fn onTablineUpdate(
             const count = @min(tab_count, 32); // Max 32 tabs
             for (0..count) |i| {
                 app.tabline_state.tabs[i].handle = t[i].tab_handle;
-                const name_len = @min(t[i].name_len, 255);
-                if (name_len > 0) {
-                    @memcpy(app.tabline_state.tabs[i].name[0..name_len], t[i].name[0..name_len]);
-                }
-                app.tabline_state.tabs[i].name_len = name_len;
+                const name = app_mod.tabNameForStorage(if (t[i].name_len > 0) t[i].name[0..t[i].name_len] else "", 255);
+                @memcpy(app.tabline_state.tabs[i].name[0..name.len], name);
+                app.tabline_state.tabs[i].name_len = name.len;
             }
             app.tabline_state.tab_count = count;
         }
@@ -1822,6 +1856,14 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
             .right = width - sep_w - padding - close_space,
             .bottom = y + row_h,
         };
+        // The same agent indicator the titlebar tab draws, before the name.
+        const a_state = if (app.config.tabline.agent_indicator) app.tabline_state.agentState(tab.handle) else 0;
+        if (a_state != 0) {
+            const gap = app.scalePx(4);
+            const ind_px = @divTrunc((row_h - gap * 2) * 7, 10);
+            drawAgentIndicator(app, hdc, a_state, text_rect.left, text_rect.top, text_rect.bottom, y + @divTrunc(row_h - ind_px, 2), ind_px);
+            text_rect.left += ind_px + gap;
+        }
         _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
 
         // Close button (X) on selected or hovered tabs
@@ -1847,10 +1889,12 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
                 c.RGB(colors.close_r, colors.close_g, colors.close_b);
             const pen = c.CreatePen(c.PS_SOLID, 1, close_color);
             const old_pen = c.SelectObject(hdc, pen);
+            // LineTo leaves out its end pixel: extend each target one step,
+            // as the titlebar X does, or the bottom corners are clipped.
             _ = c.MoveToEx(hdc, close_x + close_inset, close_y_pos + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_size - close_inset, close_y_pos + close_size - close_inset);
+            _ = c.LineTo(hdc, close_x + close_size - close_inset + 1, close_y_pos + close_size - close_inset + 1);
             _ = c.MoveToEx(hdc, close_x + close_size - close_inset, close_y_pos + close_inset, null);
-            _ = c.LineTo(hdc, close_x + close_inset, close_y_pos + close_size - close_inset);
+            _ = c.LineTo(hdc, close_x + close_inset - 1, close_y_pos + close_size - close_inset + 1);
             _ = c.SelectObject(hdc, old_pen);
             _ = c.DeleteObject(pen);
         }
@@ -1877,15 +1921,17 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         const icon_y = btn_rect_top + @divTrunc(new_tab_h - icon_size, 2);
         const icon_inset = app.scalePx(3);
 
+        // Filled bars, as the titlebar draws its +: LineTo leaves out its end
+        // pixel, so the right and bottom arms came out a pixel short.
         const new_tab_color = c.RGB(colors.close_r, colors.close_g, colors.close_b);
-        const plus_pen = c.CreatePen(c.PS_SOLID, app.scalePx(1), new_tab_color);
-        const old_plus_pen = c.SelectObject(hdc, plus_pen);
-        _ = c.MoveToEx(hdc, icon_x + @divTrunc(icon_size, 2), icon_y + icon_inset, null);
-        _ = c.LineTo(hdc, icon_x + @divTrunc(icon_size, 2), icon_y + icon_size - icon_inset);
-        _ = c.MoveToEx(hdc, icon_x + icon_inset, icon_y + @divTrunc(icon_size, 2), null);
-        _ = c.LineTo(hdc, icon_x + icon_size - icon_inset, icon_y + @divTrunc(icon_size, 2));
-        _ = c.SelectObject(hdc, old_plus_pen);
-        _ = c.DeleteObject(plus_pen);
+        const bar_t = @max(1, app.scalePx(1));
+        const bar_lo = @divTrunc(icon_size, 2) - @divTrunc(bar_t, 2);
+        const plus_brush = c.CreateSolidBrush(new_tab_color);
+        var v_bar = c.RECT{ .left = icon_x + bar_lo, .top = icon_y + icon_inset, .right = icon_x + bar_lo + bar_t, .bottom = icon_y + icon_size - icon_inset + 1 };
+        var h_bar = c.RECT{ .left = icon_x + icon_inset, .top = icon_y + bar_lo, .right = icon_x + icon_size - icon_inset + 1, .bottom = icon_y + bar_lo + bar_t };
+        _ = c.FillRect(hdc, &v_bar, plus_brush);
+        _ = c.FillRect(hdc, &h_bar, plus_brush);
+        _ = c.DeleteObject(plus_brush);
 
         // "New Tab" text
         _ = c.SetTextColor(hdc, new_tab_color);
@@ -2032,6 +2078,7 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         y >= close_y_start and y < close_y_start + close_size)
     {
         app.tabline_state.close_button_pressed = tab_idx;
+        app.tabline_state.close_button_pressed_handle = app.tabline_state.tabs[tab_idx].handle;
         _ = c.SetCapture(hwnd);
         _ = c.InvalidateRect(hwnd, null, 0);
         return;
@@ -2057,14 +2104,14 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 /// Handle mouse up in sidebar area
 pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     // Handle close button release
-    if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
+    if (app.tabline_state.close_button_pressed != null) {
         app.tabline_state.close_button_pressed = null;
         _ = c.ReleaseCapture();
 
-        if (pressed_tab_idx < app.tabline_state.tab_count) {
+        if (app.tabline_state.indexOfHandle(app.tabline_state.close_button_pressed_handle)) |idx| {
             if (app.corep) |corep| {
                 var cmd_buf: [32]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{pressed_tab_idx + 1}) catch return;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{idx + 1}) catch return;
                 app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
             }
         }
@@ -2291,18 +2338,16 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     if (tab_idx < app.tabline_state.tab_count and !new_hovered_new_tab) {
         new_hovered_tab = tab_idx;
 
-        // Check close button hover
-        const tab = &app.tabline_state.tabs[tab_idx];
-        const is_selected = tab.handle == app.tabline_state.current_tab;
-        if (is_selected or app.tabline_state.hovered_tab == tab_idx) {
-            const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
-            const close_y_start = @as(c_int, @intCast(tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
+        // Close button hover. The row under the pointer is hovered as of this
+        // move, so it shows its X; testing the previous move's hovered_tab
+        // lit the X one move late.
+        const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
+        const close_y_start = @as(c_int, @intCast(tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
 
-            if (sb_local_x >= close_x_start and sb_local_x < close_x_start + close_size and
-                y >= close_y_start and y < close_y_start + close_size)
-            {
-                new_hovered_close = tab_idx;
-            }
+        if (sb_local_x >= close_x_start and sb_local_x < close_x_start + close_size and
+            y >= close_y_start and y < close_y_start + close_size)
+        {
+            new_hovered_close = tab_idx;
         }
     }
 

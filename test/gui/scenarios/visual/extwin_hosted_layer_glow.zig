@@ -81,55 +81,6 @@ const gap_rows: u32 = 4;
 const glyph_band_min = 0.02;
 const blank_band_max = 0.01;
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, tries: u32) !platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    var attempt: u32 = 0;
-    while (attempt < tries) : (attempt += 1) {
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        for (now) |w| {
-            var seen = false;
-            for (before) |b| {
-                if (b.number == w.number) seen = true;
-            }
-            if (!seen) return w;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-    platform.dumpWindowsForPid(pid);
-    return error.ExternalWindowNotFound;
-}
-
-/// captureStable for a window that is not the app's main one: retry until two
-/// consecutive captures are pixel-identical, so a frame caught mid-present is
-/// never what a comparison sees.
-fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
-    var timer = gui_io.Timer.start();
-    var prev: ?capture.Image = null;
-    defer if (prev) |*p| p.deinit(alloc);
-    while (true) {
-        gui_io.sleepNs(150 * std.time.ns_per_ms);
-        const cur = capture.captureWindow(alloc, window_number) catch |e| {
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-            continue;
-        };
-        if (prev) |*p| {
-            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                p.deinit(alloc);
-                prev = null;
-                return cur;
-            }
-            p.deinit(alloc);
-            prev = null;
-        }
-        prev = cur;
-        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-            const out = prev.?;
-            prev = null;
-            return out;
-        }
-    }
-}
-
 /// A band of the captured window covering `row0..row0+count` of the float,
 /// as a fraction of the capture. The float sits `float_row0` rows down the
 /// external grid, and the capture includes the title bar, so the row height
@@ -174,7 +125,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try waitNewWindow(g.app_pid, before_windows, 150);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 100);
 
     // The hosted layer: a float inside the external window whose first four
     // rows carry the glow group, then four blank rows, then four plain ones.
@@ -183,7 +134,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
     gui_io.sleepNs(1200 * std.time.ns_per_ms);
 
-    var glow_off = try captureWindowStable(alloc, ext_win.number, 8000);
+    var glow_off = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer glow_off.deinit(alloc);
 
     // Switch glow on. The core asks Neovim for the variable on a redraw while
@@ -212,7 +163,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
     gui_io.sleepNs(1200 * std.time.ns_per_ms);
 
-    var glow_on = try captureWindowStable(alloc, ext_win.number, 8000);
+    var glow_on = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer glow_on.deinit(alloc);
 
     if (glow_off.w != glow_on.w or glow_off.h != glow_on.h) return error.VisualSizeMismatch;

@@ -117,13 +117,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const still_win = try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_float).relative == \"win\") and 1 or 0')");
     const still_host = try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_float).win == _G.z_host) and 1 or 0')");
 
-    const ext_grid: i64 = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[external_window] open gridId=", t0)) orelse
-            return error.NoExternalWindowOpened;
-        defer alloc.free(line);
-        const v = app_log.field(line, "gridId") orelse return error.ExternalGridIdUnparsable;
-        break :blk @intFromFloat(v);
-    };
+    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, t0);
 
     const ext_layers = try waitLayerCount(alloc, ext_grid, "side=macos", t0, 10_000);
     const main_layers_after = try waitLayerCount(alloc, 1, "side=macos", t0, 10_000);

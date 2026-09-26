@@ -497,3 +497,78 @@ pub const Gui = struct {
         }
     }
 };
+
+// ── External windows (macOS only: built on platform.windowsForPid) ─────
+
+pub const max_windows = 16;
+
+/// The first window of `pid` absent from `before` whose sides are both at
+/// least `min_side` points. The size floor skips transient helper windows
+/// that would otherwise be taken for the one being waited on.
+pub fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
+    var buf: [max_windows]platform.MainWindow = undefined;
+    const now = buf[0..platform.windowsForPid(pid, &buf)];
+    outer: for (now) |w| {
+        for (before) |b| {
+            if (b.number == w.number) continue :outer;
+        }
+        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
+        return w;
+    }
+    return null;
+}
+
+/// Poll newWindow until it finds one; dumps the window list on timeout.
+pub fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
+    var timer = gui_io.Timer.start();
+    while (true) {
+        if (newWindow(pid, before, min_side)) |w| return w;
+        if (timer.read() / std.time.ns_per_ms >= 15_000) {
+            platform.dumpWindowsForPid(pid);
+            return error.ExternalWindowNotFound;
+        }
+        gui_io.sleepNs(100 * std.time.ns_per_ms);
+    }
+}
+
+/// The frontmost window of `pid` covering the point, which is the one a posted
+/// event will land on. windowsForPid returns the on-screen list front to back.
+pub fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
+    var buf: [max_windows]platform.MainWindow = undefined;
+    for (buf[0..platform.windowsForPid(pid, &buf)]) |w| {
+        if (x >= w.bounds.x and x < w.bounds.x + w.bounds.w and
+            y >= w.bounds.y and y < w.bounds.y + w.bounds.h) return w;
+    }
+    return null;
+}
+
+/// Gui.captureStable for a window that is not the app's main one: retry until
+/// two consecutive captures are pixel-identical, so a frame caught mid-present
+/// is never what a comparison sees.
+pub fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
+    var timer = gui_io.Timer.start();
+    var prev: ?capture.Image = null;
+    defer if (prev) |*p| p.deinit(alloc);
+    while (true) {
+        gui_io.sleepNs(150 * std.time.ns_per_ms);
+        const cur = capture.captureWindow(alloc, window_number) catch |e| {
+            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
+            continue;
+        };
+        if (prev) |*p| {
+            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
+                p.deinit(alloc);
+                prev = null;
+                return cur;
+            }
+            p.deinit(alloc);
+            prev = null;
+        }
+        prev = cur;
+        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
+            const out = prev.?;
+            prev = null;
+            return out; // last capture even if not fully settled
+        }
+    }
+}

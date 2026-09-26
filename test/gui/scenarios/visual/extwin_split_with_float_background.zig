@@ -31,24 +31,6 @@ const normal_bg = [3]u8{ 0x20, 0x60, 0xa0 };
 /// A channel may differ by this much (colour-space conversion in the capture).
 const tolerance: i32 = 24;
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, tries: u32) !platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    var attempt: u32 = 0;
-    while (attempt < tries) : (attempt += 1) {
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        for (now) |w| {
-            var seen = false;
-            for (before) |b| {
-                if (b.number == w.number) seen = true;
-            }
-            if (!seen and w.bounds.w >= 100 and w.bounds.h >= 100) return w;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-    platform.dumpWindowsForPid(pid);
-    return error.ExternalWindowNotFound;
-}
-
 /// Mean colour of the lower-right quarter of the capture. The buffer's text
 /// is at the left edge of each row and the float sits near the top-left, so
 /// this stretch shows only the window's background.
@@ -97,7 +79,7 @@ fn runWith(alloc: std.mem.Allocator, config_dir: []const u8, log_path: []const u
 
     // The user's repro: externalize the split that hosts the float.
     try g.remoteSend("<C-w>ge");
-    const ext = try waitNewWindow(g.app_pid, before, 150);
+    const ext = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
     var img = try capture.captureWindow(alloc, ext.number);

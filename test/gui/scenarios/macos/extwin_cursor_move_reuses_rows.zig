@@ -87,13 +87,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // window's own seeding (which legitimately redraws everything).
     gui_io.sleepNs(1200 * std.time.ns_per_ms);
 
-    const ext_grid: i64 = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[external_window] open gridId=", 0)) orelse
-            return error.NoExternalWindowOpened;
-        defer alloc.free(line);
-        const v = app_log.field(line, "gridId") orelse return error.ExternalGridIdUnparsable;
-        break :blk @intFromFloat(v);
-    };
+    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
 
     const t0 = try app_log.nowMs(alloc, log_path);
     const row_before = try g.evalInt("line('.')");

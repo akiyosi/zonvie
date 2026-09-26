@@ -3091,7 +3091,6 @@ test "a one-element content chunk is dropped by the cmdline sites and kept by th
     const messages = grid.message_state.messages.items;
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expectEqual(@as(usize, 0), messages[0].content.items.len);
-    try std.testing.expect(grid.message_state.visible);
     try std.testing.expect(grid.message_state.msg_dirty);
 
     // E: kept
@@ -3124,7 +3123,6 @@ test "a zero-element content chunk follows the same split" {
 
     try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, "msg_show", try testMsgShowTuple(arena, "echo", try testContent(arena, empty))));
     try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
-    try std.testing.expect(grid.message_state.visible);
 
     // B and C drop it too.
     {

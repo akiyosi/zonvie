@@ -120,14 +120,20 @@ pub fn swapColonSemicolon(ch: u16, enabled: bool) u16 {
 }
 
 test "AltGr composing a printable character is text, other Ctrl+Alt combos are keys" {
-    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, "@"));
-    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT | MOD_SHIFT, "{"));
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, "@", false));
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT | MOD_SHIFT, "{", false));
     // Nothing composed (US layout Ctrl+Alt+q) or a control character: a key.
-    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, null));
-    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, "\x11"));
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, null, false));
+    try std.testing.expect(!isAltGrText(MOD_CTRL | MOD_ALT, "\x11", false));
     // Ctrl or Alt alone is never AltGr.
-    try std.testing.expect(!isAltGrText(MOD_CTRL, "q"));
-    try std.testing.expect(!isAltGrText(MOD_ALT, "q"));
+    try std.testing.expect(!isAltGrText(MOD_CTRL, "q", false));
+    try std.testing.expect(!isAltGrText(MOD_ALT, "q", false));
+}
+
+test "an AltGr dead key is left to WM_DEADCHAR, not sent as <C-M-x>" {
+    try std.testing.expect(isAltGrText(MOD_CTRL | MOD_ALT, null, true));
+    // Alt alone with a dead key is still a key.
+    try std.testing.expect(!isAltGrText(MOD_ALT, null, true));
 }
 
 test "colon and semicolon swap only when enabled" {
@@ -175,16 +181,19 @@ pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool 
         // character under it (German AltGr+Q is `@`) is typed text, left to
         // WM_CHAR; it used to be sent as <C-M-q>, and `@ { [ ] } \ | ~` could
         // not be typed on those layouts.
-        if (isAltGrText(mods, pair.chars)) return false;
+        if (isAltGrText(mods, pair.chars, pair.dead)) return false;
         sendKeyEventToCore(app, keycode, mods, pair.chars, pair.ign);
         return true;
     }
     return false;
 }
 
-/// Ctrl and Alt both held (AltGr) and the key composed a printable character.
-fn isAltGrText(mods: u32, chars: ?[]const u8) bool {
+/// Ctrl and Alt both held (AltGr) and the key composed a printable character,
+/// or is a dead key (Czech AltGr+2, a caron) whose accent WM_DEADCHAR/WM_CHAR
+/// composes with the next key.
+fn isAltGrText(mods: u32, chars: ?[]const u8, dead: bool) bool {
     if ((mods & MOD_CTRL) == 0 or (mods & MOD_ALT) == 0) return false;
+    if (dead) return true;
     const text = chars orelse return false;
     return text.len != 0 and text[0] >= 0x20 and text[0] != 0x7F;
 }
@@ -270,6 +279,7 @@ pub fn utf16UnitsToUtf8(tmp: *[8]u8, unit0: u16, unit1_opt: ?u16) ?[]const u8 {
 /// Best-effort: use ToUnicodeEx to get chars and charsIgnoringModifiers for a VK.
 /// - chars: using current keyboard state
 /// - ign:   using state with Ctrl/Alt/Shift cleared (base letter for <C-x> etc)
+/// - dead:  the key is a dead key under the current state
 pub fn toUnicodePairUtf8(
     vk: u32,
     scancode: u32,
@@ -277,9 +287,14 @@ pub fn toUnicodePairUtf8(
     tmp_ign: *[16]u16,
     out_chars_utf8: *[8]u8,
     out_ign_utf8: *[8]u8,
-) struct { chars: ?[]const u8, ign: ?[]const u8 } {
+) struct { chars: ?[]const u8, ign: ?[]const u8, dead: bool } {
     var state: [256]u8 = undefined;
     _ = c.GetKeyboardState(&state);
+
+    // Flag bit 2 (Windows 10 1607+) leaves the kernel's dead-key buffer
+    // alone: these are lookups, and consuming a pending accent here broke
+    // the composition TranslateMessage had set up.
+    const no_state_change: c.UINT = 0x4;
 
     // Current chars
     const hkl = c.GetKeyboardLayout(0);
@@ -289,7 +304,7 @@ pub fn toUnicodePairUtf8(
         &state,
         @ptrCast(tmp_chars.ptr),
         @intCast(tmp_chars.len),
-        0,
+        no_state_change,
         hkl,
     );
 
@@ -315,7 +330,7 @@ pub fn toUnicodePairUtf8(
         &ign_state,
         @ptrCast(tmp_ign.ptr),
         @intCast(tmp_ign.len),
-        0,
+        no_state_change,
         hkl,
     );
 
@@ -328,7 +343,7 @@ pub fn toUnicodePairUtf8(
         ign = null;
     }
 
-    return .{ .chars = chars, .ign = ign };
+    return .{ .chars = chars, .ign = ign, .dead = n1 < 0 };
 }
 
 /// A key the core names (<Left>, <CR>, <F1>, ...): sent to the core as a key
@@ -490,9 +505,9 @@ pub fn resetImeComposition(app: *App, end: bool) void {
     app.mu.unlock(core.clock.io());
 }
 
-/// Whether the shared WM_IME_COMPOSITION body ran to completion. On
-/// `.alloc_failed` the caller must bail out of the message; the two window
-/// procedures return different values there, so the helper does not.
+/// Whether the shared WM_IME_COMPOSITION body ran to completion. Both window
+/// procedures pass the message on to DefWindowProc either way, so a
+/// GCS_RESULTSTR it carries is still committed after an allocation failure.
 pub const ImeCompositionOutcome = enum { done, alloc_failed };
 
 /// The whole WM_IME_COMPOSITION body: read the composition string, clause

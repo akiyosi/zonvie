@@ -30,9 +30,10 @@ const IID_IDWriteFontFace5_ZONVIE: GUID = .{
     .Data4 = .{ 0xB1, 0x45, 0xE2, 0xFA, 0x5B, 0x9F, 0xDC, 0x29 },
 };
 
-// DWrite font feature struct for IDWriteTextAnalyzer::GetGlyphs.
-const DWriteFontFeature = extern struct { nameTag: u32, parameter: u32 };
-const MAX_FONT_FEATURES = 32;
+// A [font] family entry holds at most this many features (the core parser's
+// cap); the defaults below take slots of their own on top.
+const MAX_USER_FONT_FEATURES = 32;
+const MAX_FONT_FEATURES = default_font_features.len + MAX_USER_FONT_FEATURES;
 
 // GetGlyphs applies DirectWrite's default features only when it gets no
 // feature list; given one, it applies that list alone. Seeding the list with
@@ -44,12 +45,6 @@ const default_font_features = [_]u32{
     packTag("clig"), packTag("curs"), packTag("dist"), packTag("kern"),
     packTag("liga"), packTag("rclt"),
 };
-
-// Styled glyph logging stats (global)
-var g_log_styled_hits: u64 = 0;
-var g_log_styled_misses: u64 = 0;
-var g_log_styled_fallbacks: u64 = 0;
-var g_log_styled_last_report_ns: i128 = 0;
 
 // GSUB ligature trigger cache entry, keyed by IDWriteFontFace pointer.
 const GsubCacheEntry = struct {
@@ -112,9 +107,6 @@ pub const Renderer = struct {
     cell_w_px: u32 = 9,
     cell_h_px: u32 = 18,
 
-    // atlas
-    atlas_bitmap: ?*c.ID2D1Bitmap = null,
-
     // Pipeline
     vs: ?*c.ID3D11VertexShader = null,
     ps: ?*c.ID3D11PixelShader = null,
@@ -140,23 +132,13 @@ pub const Renderer = struct {
     glyph_tmp: std.ArrayListUnmanaged(u8) = .empty,
 
     // Append-only queue of atlas dirty rects. Entries are appended when glyphs
-    // are rasterized and consumed independently by the D2D bitmap path (renderVertices)
-    // and each D3D window via per-consumer cursors. Only cleared on atlas reset.
+    // are rasterized and consumed independently by each D3D window via
+    // per-consumer cursors. Only cleared on atlas reset.
     pending_uploads: std.ArrayListUnmanaged(c.D2D1_RECT_U) = .empty,
     // Monotonic sequence number of the first entry in pending_uploads.
     // Advances only on atlas reset (when all entries become invalid).
     // head_seq = pending_upload_base_seq + pending_uploads.items.len.
     pending_upload_base_seq: u64 = 0,
-    // D2D bitmap consumer cursor (used by renderVertices / flushPendingAtlasUploadsLocked).
-    d2d_upload_cursor: u64 = 0,
-
-    // reusable brushes
-    solid_brush: ?*c.ID2D1SolidColorBrush = null,
-
-    // Off-screen render target for high-quality glyph rendering (created lazily)
-    glyph_rt: ?*c.ID2D1BitmapRenderTarget = null,
-    glyph_rt_size: u32 = 0, // current size (square)
-    glyph_rt_brush: ?*c.ID2D1SolidColorBrush = null,
 
     // Atlas version - incremented when new glyphs are added (for multi-context sync)
     atlas_version: u64 = 0,
@@ -169,9 +151,6 @@ pub const Renderer = struct {
     // of atlas_version (which bumps too often for that purpose — see
     // tmp/fixplan/06-windows-atlas.md finding 3).
     atlas_reset_generation: u64 = 0,
-    // Bumped for every atlas_cpu mutation. Resource rebuilds validate it
-    // after running D2D Create/Copy calls outside mu.
-    atlas_content_generation: u64 = 0,
 
     // Font change detection: track name + generation to skip redundant setFont calls
     font_name_utf8: [128]u8 = [_]u8{0} ** 128,
@@ -179,11 +158,11 @@ pub const Renderer = struct {
     font_generation: u32 = 0,
 
     // OpenType font features for DWrite shaping.
-    font_features: [MAX_FONT_FEATURES]DWriteFontFeature = [_]DWriteFontFeature{.{ .nameTag = 0, .parameter = 0 }} ** MAX_FONT_FEATURES,
+    font_features: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = std.mem.zeroes([MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE),
     font_feature_count: u32 = 0,
     // Every [font] family entry as a variation axis value (wght=700,
     // slnt=-12); withUserAxes applies the ones the face has an axis for.
-    font_axis_values: [MAX_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = undefined,
+    font_axis_values: [MAX_USER_FONT_FEATURES]c.DWRITE_FONT_AXIS_VALUE = undefined,
     font_axis_count: u32 = 0,
     // The regular face was recreated at those axis values, so the TextFormat
     // (family name only) no longer measures it; see recomputeCellMetrics.
@@ -355,102 +334,6 @@ pub const Renderer = struct {
         return .{ .device = d2d_device.?, .ctx = d2d_ctx.? };
     }
 
-    const AtlasBitmapAndBrush = struct {
-        bitmap: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-    };
-
-    const AtlasPixelSnapshot = struct {
-        pixels: []u8,
-        width: u32,
-        height: u32,
-        generation: u64,
-    };
-
-    fn snapshotAtlasPixels(self: *Renderer) !AtlasPixelSnapshot {
-        self.mu.lockUncancelable(core.clock.io());
-        defer self.mu.unlock(core.clock.io());
-
-        const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
-        if (self.atlas_cpu.items.len != total) {
-            try self.atlas_cpu.resize(self.alloc, total);
-            @memset(self.atlas_cpu.items, 0);
-            self.pending_upload_base_seq += self.pending_uploads.items.len;
-            self.pending_uploads.clearRetainingCapacity();
-            self.atlas_content_generation +%= 1;
-        }
-
-        const pixels = try self.alloc.alloc(u8, total);
-        @memcpy(pixels, self.atlas_cpu.items);
-        return .{
-            .pixels = pixels,
-            .width = self.atlas_w,
-            .height = self.atlas_h,
-            .generation = self.atlas_content_generation,
-        };
-    }
-
-    fn copyAtlasSnapshotUnlocked(bitmap: *c.ID2D1Bitmap, snapshot: AtlasPixelSnapshot) !void {
-        const copy_fn = bitmap.lpVtbl.*.CopyFromMemory orelse return error.BitmapMissingCopyFromMemory;
-        const rect = c.D2D1_RECT_U{
-            .left = 0,
-            .top = 0,
-            .right = snapshot.width,
-            .bottom = snapshot.height,
-        };
-        const hr = copy_fn(bitmap, &rect, snapshot.pixels.ptr, snapshot.width * 4);
-        if (c.FAILED(hr)) return error.ClearAtlasFailed;
-    }
-
-    /// Creates the atlas bitmap + solid brush on the given (not-yet-shared)
-    /// render target. Pure: touches no self fields, holds no lock — safe to
-    /// call on a freshly-created device context BEFORE it is published to
-    /// self.d2d_device_ctx, since nothing else can have a reference to it
-    /// yet. CreateBitmap/CreateSolidColorBrush are D2D resource-creation
-    /// calls that, per repeated review, can also pump window messages;
-    /// running them under self.mu risks the exact app.mu<->self.mu
-    /// lock-order inversion those reviews found (core-thread atlas
-    /// callbacks take app.mu then self.mu; a UI-thread caller holding
-    /// self.mu here that gets reentered into a handler needing app.mu would
-    /// deadlock against it).
-    fn createAtlasBitmapAndBrushUnlocked(rt_base: *c.ID2D1RenderTarget, atlas_w: u32, atlas_h: u32) !AtlasBitmapAndBrush {
-        const props = c.D2D1_BITMAP_PROPERTIES{
-            .pixelFormat = c.D2D1_PIXEL_FORMAT{
-                .format = c.DXGI_FORMAT_R8G8B8A8_UNORM,
-                .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
-            },
-            .dpiX = 96.0,
-            .dpiY = 96.0,
-        };
-        var bmp: ?*c.ID2D1Bitmap = null;
-        const sz = c.D2D1_SIZE_U{ .width = atlas_w, .height = atlas_h };
-        const vtbl = rt_base.lpVtbl.*;
-
-        const hr = if (vtbl.CreateBitmap) |create_bitmap_fn| blk: {
-            break :blk create_bitmap_fn(rt_base, sz, null, 0, &props, &bmp);
-        } else {
-            if (applog.isEnabled()) applog.appLog("[d2d] CreateBitmap missing on vtbl\n", .{});
-            return error.CreateAtlasFailed;
-        };
-        if (c.FAILED(hr) or bmp == null) {
-            if (applog.isEnabled()) {
-                const hr_u: u32 = @bitCast(hr);
-                applog.appLog("[d2d] CreateBitmap(A8) FAILED hr=0x{x} bmp={*}\n", .{ hr_u, bmp });
-            }
-            return error.CreateAtlasFailed;
-        }
-        errdefer safeRelease(bmp);
-
-        var br: ?*c.ID2D1SolidColorBrush = null;
-        const c0 = c.D2D1_COLOR_F{ .r = 1, .g = 1, .b = 1, .a = 1 };
-        const hr2 = if (vtbl.CreateSolidColorBrush) |create_brush_fn| blk: {
-            break :blk create_brush_fn(rt_base, &c0, null, &br);
-        } else return error.CreateBrushFailed;
-        if (c.FAILED(hr2) or br == null) return error.CreateBrushFailed;
-
-        return .{ .bitmap = bmp.?, .brush = br.? };
-    }
-
     /// Phase 2: Create D2D device context from a D3D11 device via DXGI.
     /// Falls back to legacy HwndRenderTarget if Factory1 is not available.
     pub fn initD2DDeviceContext(self: *Renderer, d3d_device: *c.ID3D11Device) !void {
@@ -477,77 +360,27 @@ pub const Renderer = struct {
 
         if (applog.isEnabled()) applog.appLog("[d2d] D2D device context created from D3D11 device\n", .{});
 
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(built.ctx);
-        var attempt: u8 = 0;
-        while (attempt < 3) : (attempt += 1) {
-            const snapshot = self.snapshotAtlasPixels() catch |err| {
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-            const atlas_res = createAtlasBitmapAndBrushUnlocked(rt_base, snapshot.width, snapshot.height) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-            copyAtlasSnapshotUnlocked(atlas_res.bitmap, snapshot) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                safeRelease(@as(?*c.ID2D1Bitmap, atlas_res.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas_res.brush));
-                safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-                safeRelease(@as(?*c.ID2D1Device, built.device));
-                return err;
-            };
-
-            var old_bitmap: ?*c.ID2D1Bitmap = null;
-            var old_brush: ?*c.ID2D1SolidColorBrush = null;
-            var old_ctx: ?*c.ID2D1DeviceContext = null;
-            var old_device: ?*c.ID2D1Device = null;
+        var old_ctx: ?*c.ID2D1DeviceContext = null;
+        var old_device: ?*c.ID2D1Device = null;
+        {
             self.mu.lockUncancelable(core.clock.io());
-            const snapshot_still_current = self.atlas_w == snapshot.width and
-                self.atlas_h == snapshot.height and
-                self.atlas_content_generation == snapshot.generation;
-            if (snapshot_still_current) {
-                old_bitmap = self.atlas_bitmap;
-                old_brush = self.solid_brush;
-                old_ctx = self.d2d_device_ctx;
-                old_device = self.d2d_device;
-                self.atlas_bitmap = atlas_res.bitmap;
-                self.solid_brush = atlas_res.brush;
-                self.d2d_device_ctx = built.ctx;
-                self.d2d_device = built.device;
-                self.d2d_upload_cursor = self.pending_upload_base_seq + self.pending_uploads.items.len;
-            }
-            self.mu.unlock(core.clock.io());
-            self.alloc.free(snapshot.pixels);
-
-            if (!snapshot_still_current) {
-                safeRelease(@as(?*c.ID2D1Bitmap, atlas_res.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas_res.brush));
-                continue;
-            }
-
-            safeRelease(old_bitmap);
-            safeRelease(old_brush);
-            safeRelease(old_ctx);
-            safeRelease(old_device);
-            if (applog.isEnabled()) {
-                _ = c.QueryPerformanceCounter(&t1);
-                applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
-            }
-            return;
+            defer self.mu.unlock(core.clock.io());
+            old_ctx = self.d2d_device_ctx;
+            old_device = self.d2d_device;
+            self.d2d_device_ctx = built.ctx;
+            self.d2d_device = built.device;
         }
-
-        safeRelease(@as(?*c.ID2D1DeviceContext, built.ctx));
-        safeRelease(@as(?*c.ID2D1Device, built.device));
-        return error.AtlasChangedDuringRebuild;
+        safeRelease(old_ctx);
+        safeRelease(old_device);
+        if (applog.isEnabled()) {
+            _ = c.QueryPerformanceCounter(&t1);
+            applog.appLog("[d2d] [TIMING] initD2DDeviceContext: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
+        }
     }
 
     /// Release device-bound D2D objects so initD2DDeviceContext can rebind to
     /// a fresh D3D device after device loss. CPU atlas pixels and glyph maps
-    /// are preserved (createAtlasResources keeps them when atlas_cpu is
-    /// already sized), so recovery is a full GPU re-upload, not a re-raster.
+    /// are preserved, so recovery is a full GPU re-upload, not a re-raster.
     ///
     /// Acquires self.mu only to detach the pointers (swap to null) — the
     /// actual COM Release() calls run AFTER unlocking. Even Release() is
@@ -557,29 +390,22 @@ pub const Renderer = struct {
     /// that under self.mu risks the same reentrant deadlock CreateDevice/
     /// CreateBitmap did before this file's other self.mu-scope fixes.
     pub fn releaseD2DDeviceObjects(self: *Renderer) void {
-        var old_bitmap: ?*c.ID2D1Bitmap = null;
-        var old_brush: ?*c.ID2D1SolidColorBrush = null;
         var old_ctx: ?*c.ID2D1DeviceContext = null;
         var old_device: ?*c.ID2D1Device = null;
         {
             self.mu.lockUncancelable(core.clock.io());
             defer self.mu.unlock(core.clock.io());
-            old_bitmap = self.atlas_bitmap;
-            self.atlas_bitmap = null;
-            old_brush = self.solid_brush;
-            self.solid_brush = null;
             old_ctx = self.d2d_device_ctx;
             self.d2d_device_ctx = null;
             old_device = self.d2d_device;
             self.d2d_device = null;
         }
-        safeRelease(old_bitmap);
-        safeRelease(old_brush);
         safeRelease(old_ctx);
         safeRelease(old_device);
     }
 
-    /// Legacy phase 2: creates the D2D HwndRenderTarget and atlas resources.
+    /// Legacy phase 2: creates the D2D HwndRenderTarget (nothing draws through
+    /// it; window.zig checks it as the "render path ready" gate).
     pub fn initRenderTarget(self: *Renderer) !void {
         var freq: c.LARGE_INTEGER = undefined;
         var t0: c.LARGE_INTEGER = undefined;
@@ -610,11 +436,6 @@ pub const Renderer = struct {
         safeRelease(self.blend);
         safeRelease(self.sampler);
 
-        safeRelease(self.solid_brush);
-        safeRelease(self.glyph_rt_brush);
-        safeRelease(self.glyph_rt);
-        safeRelease(self.atlas_bitmap);
-
         safeRelease(self.text_analyzer);
         safeRelease(self.text_format);
         safeRelease(self.font_face);
@@ -640,13 +461,7 @@ pub const Renderer = struct {
         bgRGB: u32,
     };
 
-    const LegacyRenderTargetResources = struct {
-        rt: *c.ID2D1HwndRenderTarget,
-        bitmap: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-    };
-
-    fn buildLegacyRenderTargetUnlocked(self: *Renderer, snapshot: AtlasPixelSnapshot) !LegacyRenderTargetResources {
+    fn buildLegacyRenderTargetUnlocked(self: *Renderer) !*c.ID2D1HwndRenderTarget {
         var rc: c.RECT = undefined;
         _ = c.GetClientRect(self.hwnd, &rc);
 
@@ -686,59 +501,20 @@ pub const Renderer = struct {
             &rt,
         );
         if (hr != 0 or rt == null) return error.D2DCreateHwndRenderTargetFailed;
-        errdefer safeRelease(rt);
-
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(rt.?);
-        const atlas = try createAtlasBitmapAndBrushUnlocked(rt_base, snapshot.width, snapshot.height);
-        errdefer {
-            safeRelease(@as(?*c.ID2D1Bitmap, atlas.bitmap));
-            safeRelease(@as(?*c.ID2D1SolidColorBrush, atlas.brush));
-        }
-        try copyAtlasSnapshotUnlocked(atlas.bitmap, snapshot);
-        return .{ .rt = rt.?, .bitmap = atlas.bitmap, .brush = atlas.brush };
+        return rt.?;
     }
 
     fn recreateRenderTarget(self: *Renderer) !void {
-        var attempt: u8 = 0;
-        while (attempt < 3) : (attempt += 1) {
-            const snapshot = try self.snapshotAtlasPixels();
-            const built = self.buildLegacyRenderTargetUnlocked(snapshot) catch |err| {
-                self.alloc.free(snapshot.pixels);
-                return err;
-            };
-
-            var old_rt: ?*c.ID2D1HwndRenderTarget = null;
-            var old_bitmap: ?*c.ID2D1Bitmap = null;
-            var old_brush: ?*c.ID2D1SolidColorBrush = null;
+        const built = try self.buildLegacyRenderTargetUnlocked();
+        var old_rt: ?*c.ID2D1HwndRenderTarget = null;
+        {
             self.mu.lockUncancelable(core.clock.io());
-            const snapshot_still_current = self.atlas_w == snapshot.width and
-                self.atlas_h == snapshot.height and
-                self.atlas_content_generation == snapshot.generation;
-            if (snapshot_still_current) {
-                old_rt = self.rt;
-                old_bitmap = self.atlas_bitmap;
-                old_brush = self.solid_brush;
-                self.rt = built.rt;
-                self.atlas_bitmap = built.bitmap;
-                self.solid_brush = built.brush;
-                self.d2d_upload_cursor = self.pending_upload_base_seq + self.pending_uploads.items.len;
-                self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
-            }
-            self.mu.unlock(core.clock.io());
-            self.alloc.free(snapshot.pixels);
-
-            if (!snapshot_still_current) {
-                safeRelease(@as(?*c.ID2D1Bitmap, built.bitmap));
-                safeRelease(@as(?*c.ID2D1SolidColorBrush, built.brush));
-                safeRelease(@as(?*c.ID2D1HwndRenderTarget, built.rt));
-                continue;
-            }
-            safeRelease(old_bitmap);
-            safeRelease(old_brush);
-            safeRelease(old_rt);
-            return;
+            defer self.mu.unlock(core.clock.io());
+            old_rt = self.rt;
+            self.rt = built;
+            self.gsub_cache = [_]GsubCacheEntry{.{}} ** 4;
         }
-        return error.AtlasChangedDuringRebuild;
+        safeRelease(old_rt);
     }
 
     // Style flags constants (match ZONVIE_STYLE_* in zonvie_core.h)
@@ -932,32 +708,10 @@ pub const Renderer = struct {
         const gdi_cl_ptr = core.zonvie_core_get_emoji_cluster(corep, &gdi_cl_len);
         var text_buf: [32]c.WCHAR = undefined; // max 16 scalars * 2 UTF-16 units
         var text_len: u32 = 0;
-        if (gdi_cl_len > 1 and gdi_cl_ptr != null) {
-            for (gdi_cl_ptr.?[0..gdi_cl_len]) |sc| {
-                if (sc <= 0xFFFF) {
-                    if (text_len < text_buf.len) {
-                        text_buf[text_len] = @intCast(sc);
-                        text_len += 1;
-                    }
-                } else {
-                    const v = sc - 0x10000;
-                    if (text_len + 1 < text_buf.len) {
-                        text_buf[text_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                        text_buf[text_len + 1] = @intCast(0xDC00 + (v & 0x3FF));
-                        text_len += 2;
-                    }
-                }
-            }
-        } else {
-            if (scalar <= 0xFFFF) {
-                text_buf[0] = @intCast(scalar);
-                text_len = 1;
-            } else {
-                const v = scalar - 0x10000;
-                text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
-                text_len = 2;
-            }
+        const text_scalars: []const u32 = if (gdi_cl_len > 1 and gdi_cl_ptr != null) gdi_cl_ptr.?[0..gdi_cl_len] else (&scalar)[0..1];
+        for (text_scalars) |sc| {
+            if (text_len + 2 > text_buf.len) break;
+            text_len += @intCast(encodeUtf16Scalar(sc, text_buf[text_len..][0..2]));
         }
 
         // Draw emoji using D2D DrawText (supports color emoji natively)
@@ -1227,32 +981,31 @@ pub const Renderer = struct {
         self.mu.lockUncancelable(core.clock.io());
         defer self.mu.unlock(core.clock.io());
 
-        const face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
+        var face: *c.IDWriteFontFace = self.selectFontFace(style_flags) orelse return error.NoFont;
 
         // scalar -> glyph_index (feature-aware via IDWriteTextAnalyzer when features set)
-        const glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
+        var glyph_index = self.getGlyphIndexForScalar(face, scalar) catch |err| {
             if (applog.isEnabled()) applog.appLog("[dwrite] getGlyphIndexForScalar failed in rasterizeGlyphOnly: {any}\n", .{err});
             return err;
         };
+        // A style face missing the glyph uses the regular face's before any
+        // system fallback, as macOS does.
+        if (glyph_index == 0) if (self.font_face) |base| if (base != face) {
+            const base_index = self.getGlyphIndexForScalar(base, scalar) catch 0;
+            if (base_index != 0) {
+                face = base;
+                glyph_index = base_index;
+            }
+        };
 
-        // Emoji codepoints: always prefer system color emoji (D2D + Segoe UI Emoji).
-        // Also check the cluster context: flush sets emoji_cluster_len > 0 for
-        // VS16-qualified and multi-scalar emoji clusters (e.g., ☀️ = U+2600 + FE0F).
+        // System color emoji (D2D + Segoe UI Emoji) first for emoji, for
+        // clusters flush marked as emoji (emoji_cluster_len > 0, e.g. ☀️ =
+        // U+2600 + FE0F) and for non-ASCII the font lacks (.notdef).
         var emoji_cl_len: u8 = 0;
         _ = core.zonvie_core_get_emoji_cluster(corep, &emoji_cl_len);
-        if (isEmojiPresentation(scalar) or emoji_cl_len > 0) {
-            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
-                return;
-            }
-        }
-
-        // .notdef (glyph_index==0): font doesn't have this glyph.
-        // Try GDI color emoji fallback for non-emoji non-ASCII scalars.
-        if (glyph_index == 0 and scalar > 0xFF) {
-            if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) {
-                return;
-            }
-        }
+        const non_ascii = scalar > 0x7F;
+        const gdi_first = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0 or (glyph_index == 0 and non_ascii);
+        if (gdi_first and self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
 
         // The by-scalar path always retries an empty ClearType bound as
         // aliased, then falls back to GDI colour emoji before giving up.
@@ -1260,7 +1013,7 @@ pub const Renderer = struct {
         if (outcome == .empty) {
             // DWrite produced an empty bitmap. For non-ASCII scalars this may
             // be a colour emoji that DWrite ClearType/aliased cannot render.
-            if (scalar > 0xFF) {
+            if (!gdi_first and non_ascii) {
                 if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
             }
             // Empty glyph (space etc.)
@@ -1359,8 +1112,6 @@ pub const Renderer = struct {
             }
         }
 
-        self.atlas_content_generation +%= 1;
-
         // Mark dirty rect for GPU upload
         try self.pending_uploads.append(self.alloc, c.D2D1_RECT_U{
             .left = dest_x,
@@ -1399,343 +1150,10 @@ pub const Renderer = struct {
         if (self.atlas_cpu.items.len > 0) {
             @memset(self.atlas_cpu.items, 0);
         }
-        self.atlas_content_generation +%= 1;
 
-        const rebuild_legacy = self.rt != null and self.d2d_device_ctx == null;
         self.atlas_reset_pending = true;
         self.atlas_reset_generation +%= 1;
         self.mu.unlock(core.clock.io());
-
-        if (rebuild_legacy) {
-            try self.recreateRenderTarget();
-        }
-    }
-
-    pub fn renderVertices(self: *Renderer, main: []const core.Vertex, cursor: []const core.Vertex) !void {
-        self.mu.lockUncancelable(core.clock.io());
-        const needs_target = self.rt == null;
-        self.mu.unlock(core.clock.io());
-        if (needs_target) {
-            try self.recreateRenderTarget();
-        }
-
-        self.mu.lockUncancelable(core.clock.io());
-        errdefer self.mu.unlock(core.clock.io());
-
-        // IMPORTANT: Upload pending atlas dirty rects BEFORE BeginDraw.
-        // NOTE: renderVertices already holds self.mu, so call the _Locked variant.
-        self.flushPendingAtlasUploadsLocked();
-
-        const rt_hwnd = self.rt orelse return error.NoRenderTarget;
-        const atlas = self.atlas_bitmap orelse return error.NoAtlas;
-        const brush = self.solid_brush orelse return error.NoBrush;
-
-        const rt_base: *c.ID2D1RenderTarget = @ptrCast(rt_hwnd);
-        const vtbl = rt_base.lpVtbl.*;
-
-        // BeginDraw
-        if (vtbl.BeginDraw) |begin_fn| begin_fn(rt_base);
-
-        // ★ FillOpacityMask requirement: AntialiasMode must be ALIASED
-        // Failure causes deferred draw command failure and EndDraw returns 0x88990001
-        if (vtbl.SetAntialiasMode) |set_aa_fn| {
-            set_aa_fn(rt_base, c.D2D1_ANTIALIAS_MODE_ALIASED);
-        }
-
-        // Client size
-        var rc: c.RECT = undefined;
-        _ = c.GetClientRect(self.hwnd, &rc);
-
-        const client_w: f32 = @floatFromInt(@max(1, rc.right - rc.left));
-        const client_h: f32 = @floatFromInt(@max(1, rc.bottom - rc.top));
-
-        // Optional clear
-        if (vtbl.Clear) |clear_fn| {
-            const c0 = c.D2D1_COLOR_F{ .r = 0, .g = 0, .b = 0, .a = 1 };
-            clear_fn(rt_base, &c0);
-        }
-
-        // Draw
-        try self.drawVertexList(rt_base, atlas, brush, client_w, client_h, main);
-        try self.drawVertexList(rt_base, atlas, brush, client_w, client_h, cursor);
-
-        // EndDraw
-        var tag1: u64 = 0;
-        var tag2: u64 = 0;
-        const hr = if (vtbl.EndDraw) |end_fn| end_fn(rt_base, &tag1, &tag2) else 0;
-
-        if (c.FAILED(hr)) {
-            const hr_u: u32 = @bitCast(hr);
-            if (applog.isEnabled()) applog.appLog("[d2d] EndDraw FAILED hr=0x{x} tags=({d},{d})\n", .{ hr_u, tag1, tag2 });
-
-            // D2DERR_RECREATE_TARGET (0x8899000C or 0x88990001)
-            if (hr_u == 0x8899000C or hr_u == 0x88990001) {
-                self.mu.unlock(core.clock.io());
-                _ = self.recreateRenderTarget() catch {};
-                return;
-            }
-            return error.D2DEndDrawFailed;
-        }
-
-        self.mu.unlock(core.clock.io());
-    }
-
-    fn drawVertexList(
-        self: *Renderer,
-        rt: *c.ID2D1RenderTarget,
-        atlas: *c.ID2D1Bitmap,
-        brush: *c.ID2D1SolidColorBrush,
-        client_w: f32,
-        client_h: f32,
-        verts: []const core.Vertex,
-    ) !void {
-        if (verts.len < 6) return;
-
-        const log_active = applog.isEnabled();
-
-        const rtv = rt.lpVtbl.*;
-
-        // Avoid GetSize (it can crash in some states); use caller-provided client size.
-        const w: f32 = client_w;
-        const h: f32 = client_h;
-
-        // IMPORTANT: Do NOT call atlas->GetPixelSize().
-        // Use instance atlas size fields to avoid COM/VTBL mismatch crashes.
-        const atlas_w: f32 = @floatFromInt(self.atlas_w);
-        const atlas_h: f32 = @floatFromInt(self.atlas_h);
-
-        var i: usize = 0;
-        while (i + 5 < verts.len) : (i += 6) {
-            const quad = verts[i .. i + 6];
-
-            // Compute bounds from all 6 vertices (do NOT assume ordering).
-            var min_x: f32 = quad[0].position[0];
-            var max_x: f32 = quad[0].position[0];
-            var min_y: f32 = quad[0].position[1];
-            var max_y: f32 = quad[0].position[1];
-
-            var min_u: f32 = quad[0].texCoord[0];
-            var max_u: f32 = quad[0].texCoord[0];
-            var min_v: f32 = quad[0].texCoord[1];
-            var max_v: f32 = quad[0].texCoord[1];
-
-            // BG marker: ONLY U < 0 means BG.
-            // V may legitimately be negative depending on UV conventions.
-            var any_bg_marker: bool = (min_u < 0.0);
-
-            for (quad[1..]) |vtx| {
-                min_x = @min(min_x, vtx.position[0]);
-                max_x = @max(max_x, vtx.position[0]);
-                min_y = @min(min_y, vtx.position[1]);
-                max_y = @max(max_y, vtx.position[1]);
-
-                min_u = @min(min_u, vtx.texCoord[0]);
-                max_u = @max(max_u, vtx.texCoord[0]);
-                min_v = @min(min_v, vtx.texCoord[1]);
-                max_v = @max(max_v, vtx.texCoord[1]);
-
-                if (vtx.texCoord[0] < 0.0) any_bg_marker = true;
-            }
-
-            // Reject NaNs/Infs early (D2D can crash on them).
-            if (!std.math.isFinite(min_x) or !std.math.isFinite(max_x) or
-                !std.math.isFinite(min_y) or !std.math.isFinite(max_y) or
-                !std.math.isFinite(min_u) or !std.math.isFinite(max_u) or
-                !std.math.isFinite(min_v) or !std.math.isFinite(max_v))
-            {
-                continue;
-            }
-
-            // NDC(-1..1) -> px; flip Y for top-left origin.
-            const x_left = (min_x * 0.5 + 0.5) * w;
-            const x_right = (max_x * 0.5 + 0.5) * w;
-            const y_top = (1.0 - (max_y * 0.5 + 0.5)) * h;
-            const y_bottom = (1.0 - (min_y * 0.5 + 0.5)) * h;
-
-            const left = @min(x_left, x_right);
-            const right = @max(x_left, x_right);
-            const top = @min(y_top, y_bottom);
-            const bottom = @max(y_top, y_bottom);
-
-            if (right <= left or bottom <= top) continue;
-
-            const dst = c.D2D1_RECT_F{ .left = left, .top = top, .right = right, .bottom = bottom };
-
-            // Color: use first vertex
-            const col = quad[0].color;
-            const a: f32 = std.math.clamp(col[3], 0.0, 1.0);
-            const r: f32 = std.math.clamp(col[0], 0.0, 1.0);
-            const g: f32 = std.math.clamp(col[1], 0.0, 1.0);
-            const b: f32 = std.math.clamp(col[2], 0.0, 1.0);
-
-            if (brush.lpVtbl.*.SetColor) |set_color_fn| {
-                set_color_fn(brush, &c.D2D1_COLOR_F{ .r = r, .g = g, .b = b, .a = a });
-            }
-
-            // ---- Debug for root-cause: first 4 quads ----
-            if (i < 24 and log_active) {
-                applog.appLog(
-                    "[d2d] quad{d} any_bg={any} uv(min/max)=({d},{d})..({d},{d})\n",
-                    .{ i / 6, any_bg_marker, min_u, min_v, max_u, max_v },
-                );
-            }
-
-            // BG quad: FillRectangle
-            if (any_bg_marker) {
-                if (i == 0 and log_active) {
-                    applog.appLog("[d2d] quad0 BG FillRectangle dst=({d},{d},{d},{d})\n", .{
-                        dst.left, dst.top, dst.right, dst.bottom,
-                    });
-                }
-                if (rtv.FillRectangle) |fill_rect_fn| {
-                    fill_rect_fn(rt, &dst, @as(*c.ID2D1Brush, @ptrCast(brush)));
-                }
-                continue;
-            }
-
-            // Glyph quad
-            const u_min = std.math.clamp(min_u, 0.0, 1.0);
-            const u_max = std.math.clamp(max_u, 0.0, 1.0);
-            const v_min = std.math.clamp(min_v, 0.0, 1.0);
-            const v_max = std.math.clamp(max_v, 0.0, 1.0);
-
-            if (u_max <= u_min or v_max <= v_min) {
-                if (i < 24 and log_active) {
-                    applog.appLog(
-                        "[d2d] quad{d} UV degenerate (clamped) u={d}..{d} v={d}..{d}\n",
-                        .{ i / 6, u_min, u_max, v_min, v_max },
-                    );
-                }
-                continue;
-            }
-
-            const src = c.D2D1_RECT_F{
-                .left = u_min * atlas_w,
-                .top = v_min * atlas_h,
-                .right = u_max * atlas_w,
-                .bottom = v_max * atlas_h,
-            };
-
-            const is_color_emoji = (quad[0].deco_flags & core.DECO_COLOR_EMOJI) != 0;
-
-            if (is_color_emoji) {
-                // Color emoji: use DrawBitmap to render RGBA directly from atlas
-                if (rtv.DrawBitmap) |draw_bmp_fn| {
-                    if (i < 24 and log_active) {
-                        applog.appLog(
-                            "[d2d] quad{d} COLOR_EMOJI DrawBitmap dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
-                            .{
-                                i / 6,
-                                dst.left,
-                                dst.top,
-                                dst.right,
-                                dst.bottom,
-                                src.left,
-                                src.top,
-                                src.right,
-                                src.bottom,
-                            },
-                        );
-                    }
-
-                    draw_bmp_fn(
-                        rt,
-                        atlas,
-                        &dst,
-                        1.0, // opacity
-                        c.D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                        &src,
-                    );
-                }
-            } else if (rtv.FillOpacityMask) |fill_mask_fn| {
-                // Regular glyph: FillOpacityMask (alpha-only rendering with brush color)
-                if (i < 24 and log_active) {
-                    applog.appLog(
-                        "[d2d] quad{d} GLYPH FillOpacityMask dst=({d},{d},{d},{d}) src=({d},{d},{d},{d})\n",
-                        .{
-                            i / 6,
-                            dst.left,
-                            dst.top,
-                            dst.right,
-                            dst.bottom,
-                            src.left,
-                            src.top,
-                            src.right,
-                            src.bottom,
-                        },
-                    );
-                }
-
-                fill_mask_fn(
-                    rt,
-                    atlas,
-                    @as(*c.ID2D1Brush, @ptrCast(brush)),
-                    c.D2D1_OPACITY_MASK_CONTENT_TEXT_GDI_COMPATIBLE,
-                    &dst,
-                    &src,
-                );
-
-                if (i < 24 and log_active) {
-                    applog.appLog("[d2d] quad{d} FillOpacityMask returned\n", .{i / 6});
-                }
-            }
-        }
-
-        if (log_active) {
-            // DEBUG: count glyph vertices inside THIS vertex list (texCoord >= 0)
-            var glyph_vtx: usize = 0;
-            for (verts) |v| {
-                if (v.texCoord[0] >= 0.0 and v.texCoord[1] >= 0.0) {
-                    glyph_vtx += 1;
-                }
-            }
-            applog.appLog("[d2d] drawVertexList: total_vtx={d} glyph_vtx={d}\n", .{ verts.len, glyph_vtx });
-        }
-    }
-
-    // Upload pending atlas rects to the D2D bitmap since the last D2D cursor.
-    // Does NOT drain the queue — other consumers (D3D windows) read independently.
-    fn flushPendingAtlasUploadsLocked(self: *Renderer) void {
-        const bmp = self.atlas_bitmap orelse return;
-        const head_seq = self.pending_upload_base_seq + self.pending_uploads.items.len;
-        if (self.d2d_upload_cursor >= head_seq) return;
-
-        const bvtbl = bmp.lpVtbl.*;
-        const copy_fn = bvtbl.CopyFromMemory orelse return;
-
-        // If cursor fell behind base (atlas reset), upload the full bitmap.
-        if (self.d2d_upload_cursor < self.pending_upload_base_seq) {
-            if (self.atlas_cpu.items.len > 0) {
-                const full_rect = c.D2D1_RECT_U{
-                    .left = 0,
-                    .top = 0,
-                    .right = self.atlas_w,
-                    .bottom = self.atlas_h,
-                };
-                const hr = copy_fn(
-                    bmp,
-                    &full_rect,
-                    self.atlas_cpu.items.ptr,
-                    self.atlas_w * 4,
-                );
-                if (hr != 0) return;
-            }
-            self.d2d_upload_cursor = head_seq;
-            return;
-        }
-
-        const start_idx = self.d2d_upload_cursor - self.pending_upload_base_seq;
-        for (self.pending_uploads.items[start_idx..]) |r| {
-            const src_off = (@as(usize, r.top) * @as(usize, self.atlas_w) + @as(usize, r.left)) * 4;
-            const hr = copy_fn(
-                bmp,
-                &r,
-                self.atlas_cpu.items.ptr + src_off,
-                self.atlas_w * 4,
-            );
-            if (hr != 0) return;
-            self.d2d_upload_cursor += 1;
-        }
     }
 
     /// Upload atlas dirty rects added since `since_seq` to the given D3D context.
@@ -1822,7 +1240,14 @@ pub const Renderer = struct {
     }
 
     fn uploadFullAtlasToD3DLocked(self: *Renderer, d3d: anytype) D3DUploadResult {
-        if (self.atlas_cpu.items.len == 0) return .{ .cursor = 0, .success = false };
+        // Before the core's first on_atlas_create nothing has sized the CPU
+        // atlas (the legacy D2D init used to), and a paint that could not
+        // upload drew nothing at all: upload the blank atlas instead, once.
+        if (self.atlas_cpu.items.len == 0) {
+            const total = @as(usize, self.atlas_w) * @as(usize, self.atlas_h) * 4;
+            self.atlas_cpu.resize(self.alloc, total) catch return .{ .cursor = 0, .success = false };
+            @memset(self.atlas_cpu.items, 0);
+        }
 
         if (applog.isEnabled()) applog.appLog(
             "[atlas] uploadFullAtlasToD3D: uploading full atlas {d}x{d}\n",
@@ -1842,34 +1267,6 @@ pub const Renderer = struct {
     }
     pub fn descentPx(self: *Renderer) f32 {
         return self.descent_px;
-    }
-
-    pub fn onResize(self: *Renderer) void {
-        self.mu.lockUncancelable(core.clock.io());
-        const rt = self.rt orelse {
-            self.mu.unlock(core.clock.io());
-            return;
-        };
-        self.mu.unlock(core.clock.io());
-
-        const hwnd: c.HWND = self.hwnd;
-        var rc: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &rc);
-
-        const size = c.D2D1_SIZE_U{
-            .width = @intCast(@max(1, rc.right - rc.left)),
-            .height = @intCast(@max(1, rc.bottom - rc.top)),
-        };
-        const vtbl = rt.lpVtbl.*;
-        if (vtbl.Resize) |resize_fn| {
-            const hr = resize_fn(rt, &size);
-
-            // D2DERR_RECREATE_TARGET (0x8899000C)
-            const hr_u: u32 = @bitCast(hr);
-            if (hr_u == 0x8899000C) {
-                _ = self.recreateRenderTarget() catch {};
-            }
-        }
     }
 
     pub fn setFontUtf8(self: *Renderer, name_utf8: []const u8, point_size: f32) !void {
@@ -2073,16 +1470,14 @@ pub const Renderer = struct {
     /// the same tag replaces its default in place.
     fn parseFontFeatures(self: *Renderer, features_str: []const u8) void {
         for (default_font_features) |tag| {
-            self.font_features[self.font_feature_count] = .{ .nameTag = tag, .parameter = 1 };
+            self.font_features[self.font_feature_count] = .{ .nameTag = @bitCast(tag), .parameter = 1 };
             self.font_feature_count += 1;
         }
-        var parsed: [MAX_FONT_FEATURES]core.redraw_handler.FontFeature = undefined;
+        var parsed: [MAX_USER_FONT_FEATURES]core.redraw_handler.FontFeature = undefined;
         const n = core.redraw_handler.parseFontFeatureList(features_str, &parsed);
         for (parsed[0..n]) |f| {
-            const tag: u32 = @as(u32, f.tag[0]) | (@as(u32, f.tag[1]) << 8) |
-                (@as(u32, f.tag[2]) << 16) | (@as(u32, f.tag[3]) << 24);
             self.font_axis_values[self.font_axis_count] = .{
-                .axisTag = @bitCast(tag),
+                .axisTag = @bitCast(packTag(&f.tag)),
                 .value = @floatFromInt(f.value),
             };
             self.font_axis_count += 1;
@@ -2095,7 +1490,6 @@ pub const Renderer = struct {
                     continue :next;
                 }
             }
-            if (self.font_feature_count == MAX_FONT_FEATURES) break;
             self.font_features[self.font_feature_count] = feat;
             self.font_feature_count += 1;
         }
@@ -2125,33 +1519,15 @@ pub const Renderer = struct {
         const analyzer = self.text_analyzer orelse return error.NoTextAnalyzer;
         const atbl = analyzer.lpVtbl.*;
 
-        // Convert scalar to UTF-16
         var text_buf: [2]c.WCHAR = undefined;
-        var text_len: u32 = 1;
-        if (scalar <= 0xFFFF) {
-            text_buf[0] = @intCast(scalar);
-        } else {
-            // Surrogate pair
-            const v = scalar - 0x10000;
-            text_buf[0] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-            text_buf[1] = @intCast(0xDC00 + (v & 0x3FF));
-            text_len = 2;
-        }
+        const text_len: u32 = @intCast(encodeUtf16Scalar(scalar, &text_buf));
 
         var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
         script_analysis.script = 0; // Default (Latin)
         script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
 
-        // Build DWRITE_TYPOGRAPHIC_FEATURES from stored features
-        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
-        for (0..self.font_feature_count) |fi| {
-            dw_features_arr[fi] = .{
-                .nameTag = @bitCast(self.font_features[fi].nameTag),
-                .parameter = self.font_features[fi].parameter,
-            };
-        }
         var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
-            .features = &dw_features_arr,
+            .features = &self.font_features,
             .featureCount = self.font_feature_count,
         };
         var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
@@ -2449,8 +1825,9 @@ pub const Renderer = struct {
                     factory,
                     @ptrCast(&self.font_name),
                     null,
-                    c.DWRITE_FONT_WEIGHT_NORMAL,
-                    c.DWRITE_FONT_STYLE_NORMAL,
+                    // The picked base style, as setFontUtf8WithStyle measures it.
+                    if (self.base_bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
+                    if (self.base_italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
                     c.DWRITE_FONT_STRETCH_NORMAL,
                     new_font_size,
                     @ptrCast(L("en-us")),
@@ -2567,47 +1944,20 @@ pub const Renderer = struct {
         var utf16_to_scalar_idx: [SHAPE_MAX_UTF16]u32 = undefined;
         var utf16_len: u32 = 0;
 
+        // scalar_count <= SHAPE_MAX_SCALARS, so two units per scalar always fit.
         for (0..scalar_count) |si| {
-            const s = scalars[si];
-            if (utf16_len >= SHAPE_MAX_UTF16) return 0;
-            if (s <= 0xFFFF) {
-                utf16_buf[utf16_len] = @intCast(if (s >= 0xD800 and s <= 0xDFFF) @as(u32, 0xFFFD) else s);
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            } else if (s <= 0x10FFFF) {
-                if (utf16_len + 1 >= SHAPE_MAX_UTF16) return 0;
-                const v = s - 0x10000;
-                utf16_buf[utf16_len] = @intCast(0xD800 + ((v >> 10) & 0x3FF));
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-                utf16_buf[utf16_len] = @intCast(0xDC00 + (v & 0x3FF));
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            } else {
-                // Invalid scalar → U+FFFD
-                utf16_buf[utf16_len] = 0xFFFD;
-                utf16_to_scalar_idx[utf16_len] = @intCast(si);
-                utf16_len += 1;
-            }
+            const n = encodeUtf16Scalar(scalars[si], utf16_buf[utf16_len..][0..2]);
+            @memset(utf16_to_scalar_idx[utf16_len..][0..n], @intCast(si));
+            utf16_len += @intCast(n);
         }
-
-        if (utf16_len == 0) return 0;
 
         // --- 2) Call GetGlyphs ---
         var script_analysis = std.mem.zeroes(c.DWRITE_SCRIPT_ANALYSIS);
         script_analysis.script = 0; // Default (Latin)
         script_analysis.shapes = c.DWRITE_SCRIPT_SHAPES_DEFAULT;
 
-        // Build features array
-        var dw_features_arr: [MAX_FONT_FEATURES]c.DWRITE_FONT_FEATURE = undefined;
-        for (0..self.font_feature_count) |fi| {
-            dw_features_arr[fi] = .{
-                .nameTag = @bitCast(self.font_features[fi].nameTag),
-                .parameter = self.font_features[fi].parameter,
-            };
-        }
         var typo_features = c.DWRITE_TYPOGRAPHIC_FEATURES{
-            .features = &dw_features_arr,
+            .features = &self.font_features,
             .featureCount = self.font_feature_count,
         };
         var feature_ptrs: [1]*c.DWRITE_TYPOGRAPHIC_FEATURES = .{&typo_features};
@@ -2955,118 +2305,16 @@ fn safeRelease(p: anytype) void {
     }
 }
 
-/// Check if a Unicode scalar has default emoji presentation (Emoji_Presentation=Yes).
-/// Based on Unicode 15.1 emoji-data.txt. Only includes codepoints that modern
-/// renderers display as color emoji without an explicit VS16 selector.
-fn isEmojiPresentation(scalar: u32) bool {
-    return switch (scalar) {
-        // BMP: Emoji_Presentation=Yes (Unicode 15.1)
-        0x231A...0x231B,
-        0x23E9...0x23F3,
-        0x23F8...0x23FA,
-        0x25FD...0x25FE,
-        0x2614...0x2615,
-        0x2648...0x2653,
-        0x267F,
-        0x2693,
-        0x26A1,
-        0x26AA...0x26AB,
-        0x26BD...0x26BE,
-        0x26C4...0x26C5,
-        0x26CE,
-        0x26D4,
-        0x26EA,
-        0x26F2...0x26F3,
-        0x26F5,
-        0x26FA,
-        0x26FD,
-        0x2705,
-        0x270A...0x270B,
-        0x2728,
-        0x274C,
-        0x274E,
-        0x2753...0x2755,
-        0x2757,
-        0x2795...0x2797,
-        0x27A1,
-        0x27B0,
-        0x27BF,
-        0x2934...0x2935,
-        0x2B05...0x2B07,
-        0x2B1B...0x2B1C,
-        0x2B50,
-        0x2B55,
-        0x3030,
-        0x303D,
-        0x3297,
-        0x3299,
-        // SMP: Emoji_Presentation=Yes (Unicode 15.1)
-        0x1F004,
-        0x1F0CF,
-        0x1F18E,
-        0x1F191...0x1F19A,
-        0x1F1E6...0x1F1FF,
-        0x1F201,
-        0x1F21A,
-        0x1F22F,
-        0x1F232...0x1F236,
-        0x1F238...0x1F23A,
-        0x1F250...0x1F251,
-        0x1F300...0x1F320,
-        0x1F32D...0x1F335,
-        0x1F337...0x1F37C,
-        0x1F37E...0x1F393,
-        0x1F3A0...0x1F3CA,
-        0x1F3CF...0x1F3D3,
-        0x1F3E0...0x1F3F0,
-        0x1F3F4,
-        0x1F3F8...0x1F43E,
-        0x1F440,
-        0x1F442...0x1F4FC,
-        0x1F4FF...0x1F53D,
-        0x1F54B...0x1F54E,
-        0x1F550...0x1F567,
-        0x1F57A,
-        0x1F595...0x1F596,
-        0x1F5A4,
-        0x1F5FB...0x1F64F,
-        0x1F680...0x1F6C5,
-        0x1F6CC,
-        0x1F6D0...0x1F6D2,
-        0x1F6D5...0x1F6D7,
-        0x1F6DC...0x1F6DF,
-        0x1F6EB...0x1F6EC,
-        0x1F6F4...0x1F6FC,
-        0x1F7E0...0x1F7EB,
-        0x1F7F0,
-        0x1F90C...0x1F93A,
-        0x1F93C...0x1F945,
-        0x1F947...0x1F9FF,
-        0x1FA70...0x1FA7C,
-        0x1FA80...0x1FA89,
-        0x1FA8F...0x1FAC6,
-        0x1FACE...0x1FADC,
-        0x1FADF...0x1FAE9,
-        0x1FAF0...0x1FAF8,
-        => true,
-        else => false,
-    };
-}
-
 /// A core feature as DirectWrite takes it: the tag packed little-endian
 /// (DWRITE_MAKE_OPENTYPE_TAG). A negative value (a variation axis such as
 /// slnt) has no DirectWrite feature parameter and is dropped.
-fn dwriteFontFeature(f: core.redraw_handler.FontFeature) ?DWriteFontFeature {
+fn dwriteFontFeature(f: core.redraw_handler.FontFeature) ?c.DWRITE_FONT_FEATURE {
     if (f.value < 0) return null;
-    const nameTag: u32 = @as(u32, f.tag[0]) |
-        (@as(u32, f.tag[1]) << 8) |
-        (@as(u32, f.tag[2]) << 16) |
-        (@as(u32, f.tag[3]) << 24);
-    return .{ .nameTag = nameTag, .parameter = @intCast(f.value) };
+    return .{ .nameTag = @bitCast(packTag(&f.tag)), .parameter = @intCast(f.value) };
 }
 
 /// Pack a 4-char OpenType tag into u32 (little-endian, matching DWRITE_FONT_FEATURE_TAG).
-fn packTag(comptime s: *const [4]u8) u32 {
+fn packTag(s: *const [4]u8) u32 {
     return @as(u32, s[0]) | (@as(u32, s[1]) << 8) | (@as(u32, s[2]) << 16) | (@as(u32, s[3]) << 24);
 }
 
@@ -3221,7 +2469,7 @@ fn markGsubFeatureLookups(tbl: []const u8, feat_abs: usize, lookup_active: *[GSU
 fn detectLigTriggersFromGSUB(
     face: *c.IDWriteFontFace,
     ascii_gids: []const c.UINT16,
-    user_features: []const DWriteFontFeature,
+    user_features: []const c.DWRITE_FONT_FEATURE,
     user_feature_count: u32,
     out_triggers: [*]u8,
 ) void {
@@ -3299,7 +2547,7 @@ fn detectLigTriggersFromGSUB(
 
         // Check user overrides: DWrite tags are little-endian, GSUB tags are big-endian
         for (0..user_feature_count) |ui| {
-            const user_tag_le = user_features[ui].nameTag;
+            const user_tag_le: u32 = @bitCast(user_features[ui].nameTag);
             // Convert LE→BE for comparison: swap bytes
             const user_tag_be = @byteSwap(user_tag_le);
             if (user_tag_be == tag_be) {
@@ -3532,6 +2780,22 @@ test "a [font] family feature keeps DirectWrite's default ligatures" {
         var b: [16]u32 = undefined;
         try std.testing.expectEqualSlices(u32, shapeForTest(&plain, s, &a), shapeForTest(&liga, s, &b));
     }
+}
+
+// The seeded defaults take slots of their own: an entry with as many features
+// as the core parser keeps passes every one to GetGlyphs, as macOS does.
+test "every [font] family feature is kept beside the default features" {
+    var r: Renderer = .{ .alloc = std.testing.allocator, .hwnd = null };
+    var spec_buf: [MAX_USER_FONT_FEATURES * 6]u8 = undefined;
+    var spec_len: usize = 0;
+    for (1..MAX_USER_FONT_FEATURES + 1) |i| {
+        spec_len += (try std.fmt.bufPrint(spec_buf[spec_len..], "+cv{d:0>2},", .{i})).len;
+    }
+    r.parseFontFeatures(spec_buf[0 .. spec_len - 1]);
+    try std.testing.expectEqual(@as(u32, default_font_features.len + MAX_USER_FONT_FEATURES), r.font_feature_count);
+    const last = r.font_features[r.font_feature_count - 1];
+    try std.testing.expectEqual(packTag("cv32"), @as(u32, @bitCast(last.nameTag)));
+    try std.testing.expectEqual(@as(u32, 1), last.parameter);
 }
 
 /// Loads `spec` and returns null (the caller skips) when DirectWrite picked a

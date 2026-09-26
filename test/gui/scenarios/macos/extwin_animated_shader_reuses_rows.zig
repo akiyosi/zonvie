@@ -25,17 +25,6 @@ const log_path = "tmp/gui_extwin_anim_reuse.log";
 const max_windows = 16;
 const idle_ms = 1500;
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow) !void {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        var buf: [max_windows]platform.MainWindow = undefined;
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        if (now.len > before.len) return;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) return error.ExternalWindowNotFound;
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 const Counts = struct { frames: usize, redrawn_idle: usize };
 
 fn externalLoadFrames(alloc: std.mem.Allocator, since_ms: f64) !Counts {
@@ -73,7 +62,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, {\"one\", \"two\", \"three\"}) " ++
             "vim.api.nvim_open_win(b, false, {external=true, width=40, height=12}) return 1 end)()')",
     );
-    try waitNewWindow(g.app_pid, before);
+    _ = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);

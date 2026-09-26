@@ -163,6 +163,93 @@ fn dumpBlobAsText(prefix: []const u8, b: ?*ID3DBlob) void {
     if (applog.isEnabled()) applog.appLog("{s}{s}\n", .{ prefix, bytes });
 }
 
+/// Which GDI-rendered chrome strip a texture holds.
+pub const Strip = enum { tabline, sidebar };
+
+/// A B8G8R8A8 texture the tabline or sidebar strip is uploaded into. The two
+/// had a copy each of this create/update code.
+const StripTexture = struct {
+    tex: ?*c.ID3D11Texture2D = null,
+    srv: ?*c.ID3D11ShaderResourceView = null,
+    width: u32 = 0,
+    height: u32 = 0,
+
+    fn release(self: *StripTexture) void {
+        safeRelease(&self.srv);
+        safeRelease(&self.tex);
+    }
+
+    fn update(self: *StripTexture, device: *c.ID3D11Device, ctx: *c.ID3D11DeviceContext, width: u32, height: u32, pixels: []const u8, tag: []const u8) !void {
+        if (width == 0 or height == 0) return;
+
+        if (self.tex != null and self.width == width and self.height == height) {
+            const ctx_vtbl = ctx.*.lpVtbl;
+            const update_subres = ctx_vtbl.*.UpdateSubresource orelse return error.NoUpdateSubresource;
+            // Defensive unbind: the SRV may still be bound at PS slot 0 from a
+            // draw earlier in the frame; UpdateSubresource on an active SRV is
+            // an undefined-per-spec hazard (theoretical — see LOW-6).
+            if (ctx_vtbl.*.PSSetShaderResources) |ps_set_srv| {
+                var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
+                ps_set_srv(ctx, 0, 1, @ptrCast(&null_srvs));
+            }
+            var box: c.D3D11_BOX = .{ .left = 0, .top = 0, .front = 0, .right = width, .bottom = height, .back = 1 };
+            update_subres(ctx, @ptrCast(self.tex), 0, &box, pixels.ptr, width * 4, 0);
+            return;
+        }
+
+        // A new size. The old resources are released only once both creates
+        // have succeeded (publish-after-create, as the vertex buffers do):
+        // releasing first left the strip blank for every frame after a
+        // transient allocation failure (the post-TDR window in particular).
+        var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
+        tex_desc.Width = width;
+        tex_desc.Height = height;
+        tex_desc.MipLevels = 1;
+        tex_desc.ArraySize = 1;
+        tex_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+        tex_desc.SampleDesc.Count = 1;
+        tex_desc.Usage = c.D3D11_USAGE_DEFAULT;
+        tex_desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
+
+        const vtbl = device.*.lpVtbl;
+        const create_tex = vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
+        var init_data: c.D3D11_SUBRESOURCE_DATA = std.mem.zeroes(c.D3D11_SUBRESOURCE_DATA);
+        init_data.pSysMem = pixels.ptr;
+        init_data.SysMemPitch = width * 4;
+
+        var tex: ?*c.ID3D11Texture2D = null;
+        var hr = create_tex(device, &tex_desc, &init_data, &tex);
+        if (c.FAILED(hr) or tex == null) {
+            if (applog.isEnabled()) applog.appLog("[d3d] {s} strip: CreateTexture2D failed hr=0x{x}\n", .{ tag, @as(u32, @bitCast(hr)) });
+            return error.CreateTexture2DFailed;
+        }
+
+        var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
+        srv_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
+        srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.unnamed_0.Texture2D.MostDetailedMip = 0;
+        srv_desc.unnamed_0.Texture2D.MipLevels = 1;
+        const create_srv = vtbl.*.CreateShaderResourceView orelse {
+            safeRelease(&tex);
+            return error.NoCreateSRV;
+        };
+        var srv: ?*c.ID3D11ShaderResourceView = null;
+        hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
+        if (c.FAILED(hr) or srv == null) {
+            if (applog.isEnabled()) applog.appLog("[d3d] {s} strip: CreateShaderResourceView failed hr=0x{x}\n", .{ tag, @as(u32, @bitCast(hr)) });
+            safeRelease(&tex);
+            return error.CreateSRVFailed;
+        }
+
+        self.release();
+        self.tex = tex;
+        self.srv = srv;
+        self.width = width;
+        self.height = height;
+        if (applog.isEnabled()) applog.appLog("[d3d] {s} strip: created texture {d}x{d}\n", .{ tag, width, height });
+    }
+};
+
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
@@ -234,17 +321,9 @@ pub const Renderer = struct {
     // D3D feature level (captured at device creation)
     feature_level: u32 = 0,
 
-    // Tabline texture (B8G8R8A8_UNORM) - rendered from GDI bitmap
-    tabline_tex: ?*c.ID3D11Texture2D = null,
-    tabline_srv: ?*c.ID3D11ShaderResourceView = null,
-    tabline_width: u32 = 0,
-    tabline_height: u32 = 0,
-
-    // Sidebar texture (GDI offscreen -> D3D11, for sidebar mode)
-    sidebar_tex: ?*c.ID3D11Texture2D = null,
-    sidebar_srv: ?*c.ID3D11ShaderResourceView = null,
-    sidebar_width_tex: u32 = 0,
-    sidebar_height_tex: u32 = 0,
+    // Tabline and sidebar strips, rendered from GDI bitmaps.
+    tabline_strip: StripTexture = .{},
+    sidebar_strip: StripTexture = .{},
 
     // Post-process bloom (neon glow, Dual Kawase)
     glow_extract_tex: ?*c.ID3D11Texture2D = null,
@@ -357,6 +436,9 @@ pub const Renderer = struct {
     shader_screen_h: u32 = 0,
     shader_window_offset_x: f32 = 0,
     shader_window_offset_y: f32 = 0,
+    /// External windows: the cursor rect this window last forwarded into the
+    /// main renderer, so a move of either window re-anchors it there.
+    shader_cursor_forwarded: ?[4]f32 = null,
 
     infoq: ?*c.ID3D11InfoQueue = null,
     dbg: ?*c.ID3D11Debug = null,
@@ -494,7 +576,7 @@ pub const Renderer = struct {
         dbgLog("[d3d] [TIMING] createPipeline (shader compile): {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
         _ = c.QueryPerformanceCounter(&t0);
-        try self.ensureVertexBuffer(1024 * @sizeOf(core.Vertex));
+        try self.ensureExternalVertexBuffer(&self.vb, &self.vb_bytes, 1024 * @sizeOf(core.Vertex));
         _ = c.QueryPerformanceCounter(&t1);
         dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
@@ -550,7 +632,7 @@ pub const Renderer = struct {
         dbgLog("[d3d] [TIMING] createPipeline (shader compile): {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
         _ = c.QueryPerformanceCounter(&t0);
-        try self.ensureVertexBuffer(1024 * @sizeOf(core.Vertex));
+        try self.ensureExternalVertexBuffer(&self.vb, &self.vb_bytes, 1024 * @sizeOf(core.Vertex));
         _ = c.QueryPerformanceCounter(&t1);
         dbgLog("[d3d] [TIMING] ensureVertexBuffer: {d}ms\n", .{@divTrunc((t1.QuadPart - t0.QuadPart) * 1000, freq.QuadPart)});
 
@@ -583,11 +665,8 @@ pub const Renderer = struct {
         safeRelease(&self.atlas_srv);
         safeRelease(&self.atlas_tex);
 
-        safeRelease(&self.tabline_srv);
-        safeRelease(&self.tabline_tex);
-
-        safeRelease(&self.sidebar_srv);
-        safeRelease(&self.sidebar_tex);
+        self.tabline_strip.release();
+        self.sidebar_strip.release();
 
         // Bloom resources
         safeRelease(&self.glow_extract_srv);
@@ -1224,7 +1303,7 @@ pub const Renderer = struct {
             };
             rs_set_sc(ctx, 1, &full_sr);
 
-            if (self.tabline_srv != null) {
+            if (self.tabline_strip.srv != null) {
                 // Draw tabline texture (rendered from GDI offscreen)
                 try self.drawTablineTexture();
             } else if (opts.tabbar_bg_color) |bg_color| {
@@ -1282,7 +1361,7 @@ pub const Renderer = struct {
 
         // ---- Sidebar (if content_x_offset or sidebar_right_width is set) ----
         if (opts.content_x_offset != null or opts.sidebar_right_width != null) {
-            if (self.sidebar_srv != null) {
+            if (self.sidebar_strip.srv != null) {
                 const rs_set_vp_sb = ctx_vtbl.*.RSSetViewports orelse return;
                 const rs_set_sc_sb = ctx_vtbl.*.RSSetScissorRects orelse return;
 
@@ -1756,300 +1835,63 @@ pub const Renderer = struct {
         try self.drawEx(main, cursor, dirty_rect, .{});
     }
 
-    /// Update tabline texture from BGRA pixel data (rendered by GDI offscreen).
-    /// This allows tabline to be composited via D3D11, avoiding DWM GDI/D3D mixing issues.
-    pub fn updateTablineTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {
-        if (width == 0 or height == 0) return;
-
+    /// Upload one chrome strip's BGRA pixels (rendered by GDI offscreen), so
+    /// it composites through D3D11 and avoids DWM GDI/D3D mixing issues.
+    pub fn updateStripTexture(self: *Renderer, strip: Strip, width: u32, height: u32, pixels: []const u8) !void {
         const device = self.device orelse return error.NoDevice;
         const ctx = self.ctx orelse return error.NoContext;
+        const st = switch (strip) {
+            .tabline => &self.tabline_strip,
+            .sidebar => &self.sidebar_strip,
+        };
+        try st.update(device, ctx, width, height, pixels, @tagName(strip));
+    }
 
-        // Recreate texture if size changed
-        if (self.tabline_tex == null or self.tabline_width != width or self.tabline_height != height) {
-            // The old resources are released only once both creates below have
-            // succeeded — publish-after-create, as the vertex buffers already
-            // do. Releasing first left the tabline blank for every frame after
-            // a transient allocation failure (the post-TDR window in
-            // particular), until an unrelated size change happened to succeed.
+    /// Draw one strip's texture over the NDC rect [left, right] x [bottom, top],
+    /// then rebind the atlas.
+    fn drawStripTexture(self: *Renderer, st: *const StripTexture, ndc_left: f32, ndc_right: f32, ndc_top: f32, ndc_bottom: f32) !void {
+        // Frontend-authored vertices are already in clip space.
+        self.setLayerTransform(0, 0, 0, 0);
+        const srv = st.srv orelse return;
+        const ctx = self.ctx orelse return error.NoContext;
 
-            // Create new texture
-            var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
-            tex_desc.Width = width;
-            tex_desc.Height = height;
-            tex_desc.MipLevels = 1;
-            tex_desc.ArraySize = 1;
-            tex_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
-            tex_desc.SampleDesc.Count = 1;
-            tex_desc.SampleDesc.Quality = 0;
-            tex_desc.Usage = c.D3D11_USAGE_DEFAULT;
-            tex_desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
-            tex_desc.CPUAccessFlags = 0;
-            tex_desc.MiscFlags = 0;
+        // Texture sampling marker: uv.x = -5.0, uv.y = U, deco_phase = V.
+        // White colour: the texture provides the actual colours.
+        const uv_marker: f32 = -5.0;
+        const color: [4]f32 = .{ 1, 1, 1, 1 };
+        const verts: [6]core.Vertex = .{
+            .{ .position = .{ ndc_left, ndc_top }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
+            .{ .position = .{ ndc_right, ndc_bottom }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
+        };
 
-            const vtbl = device.*.lpVtbl;
-            const create_tex = vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
-
-            var init_data: c.D3D11_SUBRESOURCE_DATA = std.mem.zeroes(c.D3D11_SUBRESOURCE_DATA);
-            init_data.pSysMem = pixels.ptr;
-            init_data.SysMemPitch = width * 4;
-
-            var tex: ?*c.ID3D11Texture2D = null;
-            var hr = create_tex(device, &tex_desc, &init_data, &tex);
-            if (c.FAILED(hr) or tex == null) {
-                if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
-                return error.CreateTexture2DFailed;
-            }
-
-            // Create SRV
-            var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
-            srv_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
-            srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv_desc.unnamed_0.Texture2D.MostDetailedMip = 0;
-            srv_desc.unnamed_0.Texture2D.MipLevels = 1;
-
-            const create_srv = vtbl.*.CreateShaderResourceView orelse {
-                safeRelease(&tex);
-                return error.NoCreateSRV;
-            };
-
-            var srv: ?*c.ID3D11ShaderResourceView = null;
-            hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
-            if (c.FAILED(hr) or srv == null) {
-                if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
-                safeRelease(&tex);
-                return error.CreateSRVFailed;
-            }
-
-            safeRelease(&self.tabline_srv);
-            safeRelease(&self.tabline_tex);
-            self.tabline_tex = tex;
-            self.tabline_srv = srv;
-            self.tabline_width = width;
-            self.tabline_height = height;
-
-            if (applog.isEnabled()) applog.appLog("[d3d] updateTablineTexture: created texture {d}x{d}\n", .{ width, height });
-        } else {
-            // Update existing texture
-            const tex = self.tabline_tex orelse return;
-            const ctx_vtbl = ctx.*.lpVtbl;
-            const update_subres = ctx_vtbl.*.UpdateSubresource orelse return error.NoUpdateSubresource;
-
-            // Defensive unbind: tabline_srv may still be bound at PS slot 0
-            // from a prior drawTablineTexture call within the same frame.
-            // UpdateSubresource on a texture that's an active SRV is an
-            // undefined-per-spec hazard (theoretical — see LOW-6).
-            if (ctx_vtbl.*.PSSetShaderResources) |ps_set_srv| {
-                var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-                ps_set_srv(ctx, 0, 1, @ptrCast(&null_srvs));
-            }
-
-            var box: c.D3D11_BOX = .{
-                .left = 0,
-                .top = 0,
-                .front = 0,
-                .right = width,
-                .bottom = height,
-                .back = 1,
-            };
-
-            update_subres(ctx, @ptrCast(tex), 0, &box, pixels.ptr, width * 4, 0);
-        }
+        const ps_set_srv = ctx.*.lpVtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
+        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+        try self.drawVertices(&verts);
+        srvs[0] = self.atlas_srv;
+        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
     }
 
     /// Draw tabline texture as a full-width quad at the top of the window.
     /// Call this after clearing but before drawing main content.
     pub fn drawTablineTexture(self: *Renderer) !void {
-        // Frontend-authored vertices are already in clip space.
-        self.setLayerTransform(0, 0, 0, 0);
-        const srv = self.tabline_srv orelse return;
-        const ctx = self.ctx orelse return error.NoContext;
-        const width = self.tabline_width;
-        const height = self.tabline_height;
-
-        if (width == 0 or height == 0 or self.width == 0 or self.height == 0) return;
-
-        // Convert pixel coordinates to NDC (-1 to 1)
-        // Top-left is (-1, 1), bottom-right is (1, -1) in NDC
-        const ndc_left: f32 = -1.0;
-        const ndc_right: f32 = 1.0;
-        const ndc_top: f32 = 1.0;
-        // Bottom of tabline in NDC: 1.0 - 2.0 * (height / window_height)
+        const height = self.tabline_strip.height;
+        if (self.tabline_strip.width == 0 or height == 0 or self.width == 0 or self.height == 0) return;
         const ndc_bottom: f32 = 1.0 - 2.0 * (@as(f32, @floatFromInt(height)) / @as(f32, @floatFromInt(self.height)));
-
-        // Special UV format for tabline texture sampling:
-        // uv.x = -5.0 (TABLINE_TEXTURE marker)
-        // uv.y = actual U coordinate (0-1)
-        // deco_phase = actual V coordinate (0-1)
-        const uv_marker: f32 = -5.0;
-
-        // White color (texture provides actual colors)
-        const color: [4]f32 = .{ 1, 1, 1, 1 };
-
-        // Two triangles (6 vertices) in NDC coordinates
-        // UV coords: (marker, U) with V in deco_phase
-        const verts: [6]core.Vertex = .{
-            // Triangle 1: top-left, top-right, bottom-left
-            .{ .position = .{ ndc_left, ndc_top }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-            // Triangle 2: top-right, bottom-right, bottom-left
-            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_right, ndc_bottom }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-        };
-
-        // Save current atlas SRV
-        const ctx_vtbl = ctx.*.lpVtbl;
-
-        // Bind tabline texture
-        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
-        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
-        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-
-        // Draw the quad
-        try self.drawVertices(&verts);
-
-        // Restore atlas texture
-        srvs[0] = self.atlas_srv;
-        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-    }
-
-    /// Update sidebar texture from BGRA pixel data (rendered by GDI offscreen).
-    pub fn updateSidebarTexture(self: *Renderer, width: u32, height: u32, pixels: []const u8) !void {
-        if (width == 0 or height == 0) return;
-
-        const device = self.device orelse return error.NoDevice;
-        const ctx = self.ctx orelse return error.NoContext;
-
-        if (self.sidebar_tex == null or self.sidebar_width_tex != width or self.sidebar_height_tex != height) {
-            // Publish-after-create: see updateTablineTexture.
-            var tex_desc: c.D3D11_TEXTURE2D_DESC = std.mem.zeroes(c.D3D11_TEXTURE2D_DESC);
-            tex_desc.Width = width;
-            tex_desc.Height = height;
-            tex_desc.MipLevels = 1;
-            tex_desc.ArraySize = 1;
-            tex_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
-            tex_desc.SampleDesc.Count = 1;
-            tex_desc.SampleDesc.Quality = 0;
-            tex_desc.Usage = c.D3D11_USAGE_DEFAULT;
-            tex_desc.BindFlags = c.D3D11_BIND_SHADER_RESOURCE;
-            tex_desc.CPUAccessFlags = 0;
-            tex_desc.MiscFlags = 0;
-
-            const vtbl = device.*.lpVtbl;
-            const create_tex = vtbl.*.CreateTexture2D orelse return error.NoCreateTexture2D;
-
-            var init_data: c.D3D11_SUBRESOURCE_DATA = std.mem.zeroes(c.D3D11_SUBRESOURCE_DATA);
-            init_data.pSysMem = pixels.ptr;
-            init_data.SysMemPitch = width * 4;
-
-            var tex: ?*c.ID3D11Texture2D = null;
-            var hr = create_tex(device, &tex_desc, &init_data, &tex);
-            if (c.FAILED(hr) or tex == null) {
-                if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: CreateTexture2D failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
-                return error.CreateTexture2DFailed;
-            }
-
-            var srv_desc: c.D3D11_SHADER_RESOURCE_VIEW_DESC = std.mem.zeroes(c.D3D11_SHADER_RESOURCE_VIEW_DESC);
-            srv_desc.Format = c.DXGI_FORMAT_B8G8R8A8_UNORM;
-            srv_desc.ViewDimension = c.D3D11_SRV_DIMENSION_TEXTURE2D;
-            srv_desc.unnamed_0.Texture2D.MostDetailedMip = 0;
-            srv_desc.unnamed_0.Texture2D.MipLevels = 1;
-
-            const create_srv = vtbl.*.CreateShaderResourceView orelse {
-                safeRelease(&tex);
-                return error.NoCreateSRV;
-            };
-
-            var srv: ?*c.ID3D11ShaderResourceView = null;
-            hr = create_srv(device, @ptrCast(tex), &srv_desc, &srv);
-            if (c.FAILED(hr) or srv == null) {
-                if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: CreateShaderResourceView failed hr=0x{x}\n", .{@as(u32, @bitCast(hr))});
-                safeRelease(&tex);
-                return error.CreateSRVFailed;
-            }
-
-            safeRelease(&self.sidebar_srv);
-            safeRelease(&self.sidebar_tex);
-            self.sidebar_tex = tex;
-            self.sidebar_srv = srv;
-            self.sidebar_width_tex = width;
-            self.sidebar_height_tex = height;
-
-            if (applog.isEnabled()) applog.appLog("[d3d] updateSidebarTexture: created texture {d}x{d}\n", .{ width, height });
-        } else {
-            const tex = self.sidebar_tex orelse return;
-            const ctx_vtbl = ctx.*.lpVtbl;
-            const update_subres = ctx_vtbl.*.UpdateSubresource orelse return error.NoUpdateSubresource;
-
-            // Defensive unbind: sidebar_srv may still be bound at PS slot 0
-            // from a prior drawSidebarTexture call within the same frame.
-            // UpdateSubresource on a texture that's an active SRV is an
-            // undefined-per-spec hazard (theoretical — see LOW-6).
-            if (ctx_vtbl.*.PSSetShaderResources) |ps_set_srv| {
-                var null_srvs: [1]?*c.ID3D11ShaderResourceView = .{null};
-                ps_set_srv(ctx, 0, 1, @ptrCast(&null_srvs));
-            }
-
-            var box: c.D3D11_BOX = .{
-                .left = 0,
-                .top = 0,
-                .front = 0,
-                .right = width,
-                .bottom = height,
-                .back = 1,
-            };
-
-            update_subres(ctx, @ptrCast(tex), 0, &box, pixels.ptr, width * 4, 0);
-        }
+        try self.drawStripTexture(&self.tabline_strip, -1.0, 1.0, 1.0, ndc_bottom);
     }
 
     /// Draw sidebar texture as a vertical strip at left or right of window.
     pub fn drawSidebarTexture(self: *Renderer, is_right: bool) !void {
-        // Frontend-authored vertices are already in clip space.
-        self.setLayerTransform(0, 0, 0, 0);
-        const srv = self.sidebar_srv orelse return;
-        const ctx = self.ctx orelse return error.NoContext;
-        const sb_width = self.sidebar_width_tex;
-        const sb_height = self.sidebar_height_tex;
-
-        if (sb_width == 0 or sb_height == 0 or self.width == 0 or self.height == 0) return;
-
-        // NDC coordinates for sidebar strip
+        const sb_width = self.sidebar_strip.width;
+        if (sb_width == 0 or self.sidebar_strip.height == 0 or self.width == 0 or self.height == 0) return;
         const w_ratio: f32 = 2.0 * @as(f32, @floatFromInt(sb_width)) / @as(f32, @floatFromInt(self.width));
-        var ndc_left: f32 = undefined;
-        var ndc_right: f32 = undefined;
-        if (is_right) {
-            ndc_right = 1.0;
-            ndc_left = 1.0 - w_ratio;
-        } else {
-            ndc_left = -1.0;
-            ndc_right = -1.0 + w_ratio;
-        }
-        const ndc_top: f32 = 1.0;
-        const ndc_bottom: f32 = -1.0;
-
-        const uv_marker: f32 = -5.0;
-        const color: [4]f32 = .{ 1, 1, 1, 1 };
-
-        const verts: [6]core.Vertex = .{
-            .{ .position = .{ ndc_left, ndc_top }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-            .{ .position = .{ ndc_right, ndc_top }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 0 },
-            .{ .position = .{ ndc_right, ndc_bottom }, .texCoord = .{ uv_marker, 1 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-            .{ .position = .{ ndc_left, ndc_bottom }, .texCoord = .{ uv_marker, 0 }, .color = color, .grid_id = 0, .deco_flags = 0, .deco_phase = 1 },
-        };
-
-        const ctx_vtbl = ctx.*.lpVtbl;
-        const ps_set_srv = ctx_vtbl.*.PSSetShaderResources orelse return error.NoPSSetSRV;
-        var srvs: [1]?*c.ID3D11ShaderResourceView = .{srv};
-        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
-
-        try self.drawVertices(&verts);
-
-        srvs[0] = self.atlas_srv;
-        ps_set_srv(ctx, 0, 1, @ptrCast(&srvs));
+        const ndc_left: f32 = if (is_right) 1.0 - w_ratio else -1.0;
+        try self.drawStripTexture(&self.sidebar_strip, ndc_left, ndc_left + w_ratio, 1.0, -1.0);
     }
 
     fn dumpInfoQueue(self: *Renderer, tag: []const u8) void {
@@ -2140,96 +1982,15 @@ pub const Renderer = struct {
         UnmapFn(ctx, res, 0);
     }
 
+    /// Upload `verts` into the renderer's own scratch VB and draw them: the
+    /// external-VB helpers with self.vb, so it grows geometrically, keeps the
+    /// old buffer on a failed create and flags device loss.
     fn drawVertices(self: *Renderer, verts: []const core.Vertex) !void {
         if (verts.len == 0) return;
-
-        if (applog.isEnabled() and verts.len != 0) {
-            const v0 = verts[0];
-            applog.appLog(
-                "[d3d] drawVertices n={d} v0 pos=({d:.3},{d:.3}) uv=({d:.3},{d:.3}) col=({d:.2},{d:.2},{d:.2},{d:.2})\n",
-                .{
-                    verts.len,
-                    v0.position[0],
-                    v0.position[1],
-                    v0.texCoord[0],
-                    v0.texCoord[1],
-                    v0.color[0],
-                    v0.color[1],
-                    v0.color[2],
-                    v0.color[3],
-                },
-            );
-        }
-
-        const ctx = self.ctx orelse return error.NoContext;
-
-        const bytes: usize = verts.len * @sizeOf(core.Vertex);
-
-        // ensureVertexBuffer() may recreate VB, so always re-fetch VB pointer after ensure
-        try self.ensureVertexBuffer(bytes);
-
+        try self.ensureExternalVertexBuffer(&self.vb, &self.vb_bytes, verts.len * @sizeOf(core.Vertex));
         const vb = self.vb orelse return error.NoVB;
-
-        var mapped: c.D3D11_MAPPED_SUBRESOURCE = undefined;
-
-        // ID3D11Buffer inherits ID3D11Resource, so cast to Resource
-        const res: *c.ID3D11Resource = @ptrCast(vb);
-
-        // Performance: VB upload timing
-        var t_vb_start: i128 = 0;
-        if (applog.isEnabled()) t_vb_start = core.clock.nowNs();
-
-        const hr = mapDiscard(ctx, res, &mapped);
-        if (c.FAILED(hr)) return error.D3DMapFailed;
-
-        const dst_ptr: [*]u8 = @ptrCast(mapped.pData);
-        const dst: []u8 = dst_ptr[0..bytes];
-
-        const src: []const u8 = std.mem.sliceAsBytes(verts);
-
-        // Copy vertex data to VB (without this, nothing renders)
-        std.mem.copyForwards(u8, dst, src);
-
-        // D3D11: Unmap before issuing Draw
-        unmap0(ctx, res);
-
-        // Performance log: VB upload
-        if (applog.isEnabled() and t_vb_start != 0) {
-            const t_vb_end = core.clock.nowNs();
-            const vb_us = @divTrunc(@max(0, t_vb_end - t_vb_start), 1000);
-            applog.appLog("[perf] draw_vb_upload bytes={d} us={d}\n", .{ bytes, vb_us });
-        }
-
-        // ---- Bind VB + issue draw ----
-        const ctx_vtbl = ctx.*.lpVtbl;
-
-        // IA: vertex buffer
-        const ia_set_vb = ctx_vtbl.*.IASetVertexBuffers orelse return error.D3DIASetVertexBuffersMissing;
-        var stride: c.UINT = @sizeOf(core.Vertex);
-        var offset: c.UINT = 0;
-
-        var vbs: [1]?*c.ID3D11Buffer = .{vb};
-        const pp_vbs: [*c]?*c.ID3D11Buffer = @ptrCast(&vbs);
-        ia_set_vb(ctx, 0, 1, pp_vbs, &stride, &offset);
-
-        // IA: topology
-        const ia_set_top = ctx_vtbl.*.IASetPrimitiveTopology orelse return error.D3DIASetTopologyMissing;
-        ia_set_top(ctx, c.D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        // Performance: Draw call timing
-        var t_draw_start: i128 = 0;
-        if (applog.isEnabled()) t_draw_start = core.clock.nowNs();
-
-        // Draw
-        const draw_fn = ctx_vtbl.*.Draw orelse return error.D3DDrawMissing;
-        draw_fn(ctx, @intCast(verts.len), 0);
-
-        // Performance log: Draw call
-        if (applog.isEnabled() and t_draw_start != 0) {
-            const t_draw_end = core.clock.nowNs();
-            const draw_us = @divTrunc(@max(0, t_draw_end - t_draw_start), 1000);
-            applog.appLog("[perf] draw_call verts={d} us={d}\n", .{ verts.len, draw_us });
-        }
+        try self.uploadVertsToVB(vb, verts);
+        try self.drawVB(vb, verts.len);
     }
 
     pub fn ensureExternalVertexBuffer(
@@ -3672,6 +3433,17 @@ pub const Renderer = struct {
         }
     }
 
+    /// A window moved, not the cursor: carry both cursor rects by the move
+    /// without stamping iTimeCursorChange, or the next forward reads as a
+    /// jump and fires a trail from the old spot (macOS
+    /// SurfaceShaderCursor.reanchor).
+    pub fn reanchorCursorShader(self: *Renderer, dx: f32, dy: f32) void {
+        self.shader_cursor_current[0] += dx;
+        self.shader_cursor_current[1] += dy;
+        self.shader_cursor_previous[0] += dx;
+        self.shader_cursor_previous[1] += dy;
+    }
+
     /// Populate `custom_shader_uniforms_cb` with Shadertoy-style uniforms
     /// for the current frame. Safe to call every frame; lazily creates
     /// the constant buffer on first use.
@@ -4739,30 +4511,6 @@ pub const Renderer = struct {
         }
     }
 
-    fn ensureVertexBuffer(self: *Renderer, need_bytes: usize) !void {
-        if (self.vb != null and self.vb_bytes >= need_bytes) return;
-
-        safeRelease(&self.vb);
-
-        self.vb_bytes = @max(need_bytes, 1024 * @sizeOf(core.Vertex));
-
-        const dev = self.device.?;
-
-        var bd: c.D3D11_BUFFER_DESC = std.mem.zeroes(c.D3D11_BUFFER_DESC);
-        bd.ByteWidth = @intCast(self.vb_bytes);
-        bd.Usage = c.D3D11_USAGE_DYNAMIC;
-        bd.BindFlags = c.D3D11_BIND_VERTEX_BUFFER;
-        bd.CPUAccessFlags = c.D3D11_CPU_ACCESS_WRITE;
-
-        var vb: ?*c.ID3D11Buffer = null;
-        const dev_vtbl = dev.*.lpVtbl;
-        const create_buf = dev_vtbl.*.CreateBuffer orelse return error.D3DCreateVBFalied;
-
-        const hr_vb = create_buf(dev, &bd, null, @ptrCast(&vb));
-        if (c.FAILED(hr_vb) or vb == null) return error.D3DCreateVBFalied;
-
-        self.vb = vb;
-    }
 };
 
 /// Returns true if `hr` indicates the D3D device itself is gone (driver

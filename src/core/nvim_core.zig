@@ -486,6 +486,9 @@ pub const RedrawRecoveryState = enum {
 pub const SubGridLedgerSnapshot = struct {
     counts: std.ArrayListUnmanaged(usize) = .empty,
     surface_vertex_count: usize = 0,
+    /// An invalid ledger (a hidden grid, one just repositioned) is restored
+    /// invalid; `counts` is not recorded for it.
+    ledger_valid: bool = true,
     live: bool = false,
 };
 
@@ -501,14 +504,17 @@ pub const Core = struct {
     ctx: ?*anyopaque,
 
     last_ext_cursor_grid: i64 = 1, // Track which grid had cursor for external grid updates
+    /// The main window's scrollbar grid while the cursor is elsewhere (see
+    /// tryScrollbarGridForSurface). grid_mu.
+    main_scrollbar_grid: i64 = 1,
     last_ext_cursor_rev: u64 = 0, // Track cursor revision for external grid updates
     // Set by force resend (c_api.zig zonvie_core_force_resend/_locked): forces
-    // sendExternalGridVerticesFiltered to treat EVERY external grid as
+    // sendExternalGridVertices to treat EVERY external grid as
     // cursor_affected for one flush, regardless of last_ext_cursor_grid.
     // A failed flush can leave last_ext_cursor_grid pointing at the NEW
     // cursor grid even though the frontend never actually committed an empty
     // cursor for the OLD one (the two are tracked independently — see
-    // sendExternalGridVerticesFiltered's abort-skip defer) — force resend
+    // sendExternalGridVertices' abort-skip defer) — force resend
     // cannot know which specific grid that was, so instead of relying on
     // last_ext_cursor_grid it just re-checks every external grid once.
     force_ext_cursor_recheck: bool = false,
@@ -918,13 +924,11 @@ pub const Core = struct {
     // Cached line data for msg_show scrolling (avoids re-parsing on every scroll)
     msg_line_cache: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
     msg_line_cache_build: std.ArrayListUnmanaged(MsgCachedLine) = .empty,
-    msg_cache_valid: bool = false,
 
     // Track last executed command. Recorded but not yet consumed: the
     // split-view label it was collected for was never wired up.
     last_cmd_buf: [256]u8 = .{0} ** 256,
     last_cmd_len: usize = 0,
-    last_cmd_firstc: u8 = 0, // ':' or '!' etc.
     last_cmd_start_time: ?i128 = null, // nanos timestamp when command started
 
     // Message routing config (loaded from config.toml)
@@ -1046,10 +1050,6 @@ pub const Core = struct {
     is_ssh_mode: bool = false,
     ssh_auth_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     ssh_auth_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    // Popupmenu state (for tracking window)
-    popupmenu_win_id: ?i64 = null,
-    popupmenu_buf_id: ?i64 = null,
 
     // Option-as-Meta setting (0=both, 1=none, 2=only_left, 3=only_right).
     // Updated via RPC notification "zonvie_option_as_meta". Atomic for
@@ -1377,8 +1377,9 @@ pub const Core = struct {
     ///     stable in the gap (no flush runs between sessions).
     ///   - atlas / glyph caches / shape cache: keyed by content + style
     ///     + font_generation; valid as long as font is unchanged.
-    ///   - mode info / cursor shape / cursor_visible: replaced by the
-    ///     new session's mode_info_set + mode_change.
+    ///   - mode info / cursor shape: replaced by the new session's
+    ///     mode_info_set + mode_change. (cursor_visible is NOT: only
+    ///     busy_start/busy_stop write it, so Grid.resetForNewSession resets it.)
     ///   - layout dimensions (last_layout_rows/cols, init_rows/cols).
     ///
     /// EXCEPTION: external windows (multigrid windows mapped to OS-level
@@ -1594,6 +1595,7 @@ pub const Core = struct {
         // runs under grid_mu (see handleRedraw); resetting them inside
         // this critical section keeps the flush invariants consistent.
         self.last_ext_cursor_grid = 1;
+        self.main_scrollbar_grid = 1;
         self.last_ext_cursor_rev = 0;
         self.pre_cmdline_cursor_grid = 1;
         self.pre_cmdline_cursor_row = 0;
@@ -1604,8 +1606,6 @@ pub const Core = struct {
         self.vertex_budget_transaction_active = false;
         self.grid.main_buf.vertex_budget_touched = false;
         self.vertex_budget_touched_grid_head = null;
-        self.popupmenu_win_id = null;
-        self.popupmenu_buf_id = null;
 
         // ext_messages timing / scroll state was tied to the old session's
         // msg_show events; carrying it across would auto-hide the new
@@ -1622,7 +1622,6 @@ pub const Core = struct {
         self.msg_cached_max_width = 0;
         self.msg_scroll_pending = false;
         self.msg_scroll_last_send = 0;
-        self.msg_cache_valid = false;
         // MsgCachedLine has only fixed-size buffers (no heap-owned strings).
         self.msg_line_cache.clearRetainingCapacity();
         self.msg_line_cache_build.clearRetainingCapacity();
@@ -1631,7 +1630,6 @@ pub const Core = struct {
         // Last command tracking was a snapshot of the old session's
         // :commands.
         self.last_cmd_len = 0;
-        self.last_cmd_firstc = 0;
         self.last_cmd_start_time = null;
 
         self.log.write("resetProtocolState: cleared UI protocol state (transport_reset={any})\n", .{reset_transport});
@@ -3278,13 +3276,7 @@ pub const Core = struct {
         }
     }
 
-    pub fn noteInputTrace(self: *Core, seq: u64, sent_ns: i64) void {
-        self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-        self.noteInputTraceLocked(seq, sent_ns);
-    }
-
-    /// Non-blocking version of noteInputTrace. Drops the sample (this seq's
+    /// Record an input trace sample without blocking. Drops the sample (this seq's
     /// [perf_input] trace line simply won't appear) if grid_mu could not be
     /// acquired, rather than blocking the input-send path -- this trace
     /// exists only to measure input latency and must not itself add to it.
@@ -3381,10 +3373,9 @@ pub const Core = struct {
         };
     }
 
-    /// Get list of visible grids for hit-testing.
-    /// Returns number of grids written (up to out.len).
     /// The grid a surface's scrollbar should show: the cursor's grid when this
-    /// surface composites it, and the surface's own root otherwise.
+    /// surface composites it, and the surface's own root otherwise (for the
+    /// main window, the last of its window grids the cursor was in).
     ///
     /// Both frontends asked for grid -1 — the cursor's grid, wherever it is —
     /// on the MAIN window, so moving the cursor into an external window made
@@ -3399,21 +3390,32 @@ pub const Core = struct {
         defer self.grid_mu.unlock(clock.io());
         const cursor_grid = self.grid.cursor_grid;
         if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
-            if (owner == surface_id) return cursor_grid;
+            if (owner == surface_id) {
+                // Only a window's grid (one Neovim sent a viewport for): the
+                // cursor also visits the message grid for a ':' command, and
+                // remembering that left the bar with no knob afterwards.
+                if (surface_id == 1 and self.grid.getViewport(cursor_grid) != null) {
+                    self.main_scrollbar_grid = cursor_grid;
+                }
+                return cursor_grid;
+            }
+        }
+        // The main window's root, grid 1, has no viewport under multigrid, so
+        // with the cursor in another window its bar kept no knob at all: it
+        // stays on the grid the cursor last left there while that is still
+        // shown. An external root is its own window's grid and has one.
+        if (surface_id == 1 and self.main_scrollbar_grid != 1 and
+            self.grid.surfaceForGrid(self.main_scrollbar_grid) == 1)
+        {
+            return self.main_scrollbar_grid;
         }
         return surface_id;
     }
 
+    /// Get list of visible grids for hit-testing.
+    /// Returns number of grids written (up to out.len).
     pub fn getVisibleGrids(self: *Core, out: []c_api.GridInfo) usize {
         self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-        return self.getVisibleGridsSnapshotLocked(out, false).written;
-    }
-
-    /// Non-blocking version of getVisibleGrids.
-    /// Returns null if grid_mu could not be acquired (another thread holds it).
-    pub fn tryGetVisibleGrids(self: *Core, out: []c_api.GridInfo) ?usize {
-        if (!self.grid_mu.tryLock()) return null;
         defer self.grid_mu.unlock(clock.io());
         return self.getVisibleGridsSnapshotLocked(out, false).written;
     }
@@ -3925,6 +3927,20 @@ pub const Core = struct {
             0x79 => "F10",
             0x7A => "F11",
             0x7B => "F12",
+            // VK_F13..VK_F24: common remap targets on macro keyboards; no
+            // WM_CHAR follows them either.
+            0x7C => "F13",
+            0x7D => "F14",
+            0x7E => "F15",
+            0x7F => "F16",
+            0x80 => "F17",
+            0x81 => "F18",
+            0x82 => "F19",
+            0x83 => "F20",
+            0x84 => "F21",
+            0x85 => "F22",
+            0x86 => "F23",
+            0x87 => "F24",
             else => null,
         };
     }
@@ -3943,6 +3959,9 @@ pub const Core = struct {
             51 => "BS",
             117 => "Del",
             36 => "CR",
+            // kVK_ANSI_KeypadEnter (also Fn+Return). AppKit reports U+0003,
+            // which the text path turned into nothing; Windows sends <CR>.
+            76 => "CR",
             48 => "Tab",
             53 => "Esc",
             // NSF1FunctionKey..NSF12FunctionKey (U+F704..U+F70F). Each keycode
@@ -3963,6 +3982,16 @@ pub const Core = struct {
             109 => "F10",
             103 => "F11",
             111 => "F12",
+            // kVK_F13..kVK_F20 (Carbon Events.h), likewise non-contiguous.
+            // AppKit reports them as NSF13FunctionKey.. private-use characters.
+            105 => "F13",
+            107 => "F14",
+            113 => "F15",
+            106 => "F16",
+            64 => "F17",
+            79 => "F18",
+            80 => "F19",
+            90 => "F20",
             else => null,
         };
     }
@@ -5792,10 +5821,6 @@ pub const Core = struct {
         return flush.notifyExternalWindowChanges(self);
     }
 
-    pub fn sendExternalGridVerticesFiltered(self: *Core, force_render: bool, only_grid_id: ?i64) void {
-        flush.sendExternalGridVerticesFiltered(self, force_render, only_grid_id);
-    }
-
     pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         flush.sendExternalGridVertices(self, force_render);
     }
@@ -5833,78 +5858,12 @@ pub const Core = struct {
         flush.checkMsgAutoHideTimeout(self);
     }
 
-    pub fn notifyMessageChanges(self: *Core) void {
-        flush.notifyMessageChanges(self);
-    }
-
-    pub fn sendMsgShow(self: *Core) void {
-        flush.sendMsgShow(self);
-    }
-
-    pub fn buildMsgLineCache(self: *Core) void {
-        flush.buildMsgLineCache(self);
-    }
-
-    pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
-        return flush.renderMsgGridFromCache(self, scroll_offset);
-    }
-
     pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
         flush.handleMsgGridScroll(self, direction);
     }
 
     pub fn processPendingMsgScroll(self: *Core) void {
         flush.processPendingMsgScroll(self);
-    }
-
-    pub fn hideMsgShow(self: *Core) void {
-        flush.hideMsgShow(self);
-    }
-
-    pub fn sendMsgShowCallback(self: *Core, msg: anytype, chunks: anytype, view: config.MsgViewType, timeout_sec: f32) void {
-        flush.sendMsgShowCallback(self, msg, chunks, view, timeout_sec);
-    }
-
-    pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHistoryEntry, view: config.MsgViewType) void {
-        flush.sendMsgHistoryCallbackAll(self, entries, view);
-    }
-
-    pub fn sendPendingMsgShowAt(self: *Core, index: usize) void {
-        flush.sendPendingMsgShowAt(self, index);
-    }
-
-    pub fn sendPendingMsgShowCallback(self: *Core, pm: *const grid_mod.PendingMessage) void {
-        flush.sendPendingMsgShowCallback(self, pm);
-    }
-
-    pub fn sendMsgClear(self: *Core) void {
-        flush.sendMsgClear(self);
-    }
-
-    pub fn closeMessageSplit(self: *Core) void {
-        flush.closeMessageSplit(self);
-    }
-
-    pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
-        flush.sendMsgStatus(self, channel);
-    }
-
-    pub fn sendMsgHistoryShow(self: *Core) void {
-        _ = flush.sendMsgHistoryShow(self);
-    }
-
-    pub fn hideMsgHistory(self: *Core) void {
-        flush.hideMsgHistory(self);
-    }
-
-    // --- Utility forwarding stubs ---
-
-    pub fn isWideChar(cp: u32) bool {
-        return flush.isWideChar(cp);
-    }
-
-    pub fn countDisplayWidth(s: []const u8) u32 {
-        return flush.countDisplayWidth(s);
     }
 
     fn runLoop(self: *Core) void {

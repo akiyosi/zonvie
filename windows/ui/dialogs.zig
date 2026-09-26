@@ -1040,7 +1040,7 @@ fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.L
                     break :blk @ptrFromInt(@as(usize, @bitCast(v)));
                 };
                 if (app_opt) |app| {
-                    applyConnectionAndStart(app, owner);
+                    applyConnectionAndStart(app, owner, hwnd);
                     _ = c.DestroyWindow(hwnd);
                 } else if (applog.isEnabled()) {
                     applog.appLog("[win] connection dialog: GWLP_USERDATA missing, leaving dialog open\n", .{});
@@ -1094,10 +1094,24 @@ fn cancelConnectionDialog(hwnd: c.HWND) void {
 /// which builds the nvim command from ssh_mode/devcontainer_mode/ext_* and
 /// starts nvim. Dialog-provided strings are duped from app.alloc; they live
 /// for the process lifetime (single startup, freed on exit).
-fn applyConnectionAndStart(app: *App, owner: c.HWND) void {
+fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
     var nvim_buf: [512]u8 = undefined;
-    const nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
-    if (nvim_path.len != 0) {
+    var nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
+    // Explorer's "Copy as path" wraps the path in double quotes; one pair
+    // around the whole path is dropped. The spawn command's quoting cannot
+    // carry a quote inside a path (the --nvim rule in main.zig), so such a
+    // path is ignored, and said so.
+    if (nvim_path.len >= 2 and (nvim_path[0] == '"' or nvim_path[0] == '\'') and nvim_path[nvim_path.len - 1] == nvim_path[0]) {
+        nvim_path = nvim_path[1 .. nvim_path.len - 1];
+    }
+    const has_quote = std.mem.indexOfAny(u8, nvim_path, "'\"") != null;
+    if (has_quote) {
+        if (applog.isEnabled()) applog.appLog("[win] connection dialog: nvim path contains quote characters; ignoring it\n", .{});
+        // Owned by the dialog, which the box disables for its modal loop:
+        // owned by the main window, a second Connect click re-entered here.
+        _ = c.MessageBoxW(dialog, std.unicode.utf8ToUtf16LeStringLiteral("The Neovim path contains a quote character and was ignored."), std.unicode.utf8ToUtf16LeStringLiteral("Zonvie"), c.MB_OK | c.MB_ICONWARNING);
+    }
+    if (nvim_path.len != 0 and !has_quote) {
         if (app.alloc.dupe(u8, nvim_path)) |p| {
             app.cli_nvim_path = p;
         } else |_| {}

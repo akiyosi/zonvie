@@ -1,7 +1,8 @@
 //! OLE drop target for file drags.
 //!
-//! WM_DROPFILES cannot influence the drag cursor, so the main window and the
-//! external cmdline window register an IDropTarget as well. DragEnter/DragOver
+//! WM_DROPFILES cannot influence the drag cursor, so the main window, the
+//! external cmdline window and every external editor window register an
+//! IDropTarget as well. DragEnter/DragOver
 //! answer with the effect that matches what the drop will actually do —
 //! DROPEFFECT_LINK where the path is inserted as text, DROPEFFECT_COPY where
 //! the file is opened — which is the only per-target feedback Windows offers a

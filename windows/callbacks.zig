@@ -117,8 +117,6 @@ fn preparePendingAtlasCreate(app: *App) bool {
         return false;
     }
     if (!recreateAtlasCpu(a, atlas_w, atlas_h)) {
-        // recreateAtlasTexture can fail after committing a new CPU atlas
-        // generation (for example while rebuilding the legacy D2D target).
         // Keep paint admission closed until a retry commits matching UVs.
         abortAtlasFlush(app, "atlas recreation retry failed");
         return false;
@@ -159,201 +157,26 @@ pub fn markDirtyRowsByRect(app: *App, rc: c.RECT) void {
     }
 }
 
-/// Remove DECO_CURSOR vertices from a vertex list in-place.
-fn stripCursorVerts(verts: *std.ArrayListUnmanaged(app_mod.Vertex)) void {
-    var write: usize = 0;
-    for (verts.items) |v| {
-        if ((v.deco_flags & app_mod.DECO_CURSOR) == 0) {
-            verts.items[write] = v;
-            write += 1;
-        }
-    }
-    verts.items.len = write;
-}
-
-/// Swap and shift row vertex buffers for a scroll region.
-/// Shared between onGridRowScroll's external-window and pending-capture paths.
-/// Swaps RowVerts structs to follow scroll direction. Moved rows keep their
-/// existing VB data (origin_row tracks where vertices were generated; the draw
-/// path applies viewport Y translation). Only vacated rows are invalidated.
-/// When row_valid is non-null, updates the validity bitset (main window only).
-fn swapAndShiftRows(
-    row_verts: []app_mod.RowVerts,
-    row_start: u32,
-    row_end: u32,
-    rows_delta: i32,
-    row_valid: ?*std.DynamicBitSetUnmanaged,
-) void {
-    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
-    const start_idx: usize = @intCast(row_start);
-    const end_idx: usize = @intCast(row_end);
-    const shift: usize = @intCast(abs_rows);
-
-    if (rows_delta > 0) {
-        var dst: usize = start_idx;
-        while (dst + shift < end_idx) : (dst += 1) {
-            const src = dst + shift;
-            std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
-            // No vertex Y shift or gen increment — VB is reused via viewport Y offset.
-            if (row_valid) |rv| {
-                if (src < rv.bit_length and rv.isSet(src)) {
-                    rv.set(dst);
-                } else if (dst < rv.bit_length) {
-                    rv.unset(dst);
-                }
-            }
-        }
-        var vacated: usize = end_idx - shift;
-        while (vacated < end_idx) : (vacated += 1) {
-            row_verts[vacated].verts.clearRetainingCapacity();
-            row_verts[vacated].gen +%= 1;
-            if (row_valid) |rv| {
-                if (vacated < rv.bit_length) rv.unset(vacated);
-            }
-        }
-    } else {
-        var dst: usize = end_idx;
-        while (dst > start_idx + shift) {
-            dst -= 1;
-            const src = dst - shift;
-            std.mem.swap(app_mod.RowVerts, &row_verts[dst], &row_verts[src]);
-            // No vertex Y shift or gen increment — VB is reused via viewport Y offset.
-            if (row_valid) |rv| {
-                if (src < rv.bit_length and rv.isSet(src)) {
-                    rv.set(dst);
-                } else if (dst < rv.bit_length) {
-                    rv.unset(dst);
-                }
-            }
-        }
-        var vacated: usize = start_idx;
-        while (vacated < start_idx + shift) : (vacated += 1) {
-            row_verts[vacated].verts.clearRetainingCapacity();
-            row_verts[vacated].gen +%= 1;
-            if (row_valid) |rv| {
-                if (vacated < rv.bit_length) rv.unset(vacated);
-            }
-        }
+/// Shift a pending capture's rows for a scroll region. Moved rows keep their
+/// vertices (origin_row tracks where they were generated; the draw path
+/// applies the viewport Y translation). Only vacated rows are invalidated.
+fn swapAndShiftRows(row_verts: []app_mod.RowVerts, row_start: u32, row_end: u32, rows_delta: i32) void {
+    const band = render_helpers.rotateRegion(app_mod.RowVerts, row_verts, row_start, row_end, rows_delta);
+    for (row_verts[band.start..band.end]) |*rv| {
+        rv.verts.clearRetainingCapacity();
+        rv.gen +%= 1;
     }
 }
 
 /// Remap slot indices in row_map for a scroll region. Physical data does not move.
 /// macOS equivalent: remapMainRowSlots (GridSurfaceRenderer.swift).
-/// Vacated rows retain their old slot references (shared pool data is NOT modified
-/// to preserve COW safety with the committed set). The caller must ensure that
-/// vacated rows are regenerated via on_vertices_row → cowDetachRow before commit.
-/// ref_counts do not change (same VertexSet, just index rearrangement).
-fn remapRowSlots(
-    row_map: []app_mod.RowMapping,
-    pool: *app_mod.SlotPool,
-    alloc: std.mem.Allocator,
-    row_start: u32,
-    row_end: u32,
-    rows_delta: i32,
-) void {
-    const abs_rows: u32 = @intCast(if (rows_delta < 0) -rows_delta else rows_delta);
-    const start_idx: usize = @intCast(row_start);
-    const end_idx: usize = @intCast(row_end);
-    const shift: usize = @intCast(abs_rows);
-
-    if (rows_delta > 0) {
-        // Scroll up: save vacated slots from top of region
-        var saved: [4096]app_mod.RowMapping = undefined;
-        const save_count = @min(shift, 4096);
-        var si: usize = 0;
-        while (si < save_count) : (si += 1) {
-            saved[si] = row_map[start_idx + si];
-        }
-        // Mappings beyond the save buffer are about to be overwritten by the
-        // shift with no surviving copy — release their pool references now,
-        // or the slots (and their vertex capacity) leak forever
-        // (releaseAllSlots only walks live row_map entries).
-        var drop: usize = save_count;
-        while (drop < shift) : (drop += 1) {
-            const m = row_map[start_idx + drop];
-            if (m.slot != app_mod.SLOT_NONE) pool.release(alloc, m.slot);
-        }
-        // Shift mappings down
-        var dst: usize = start_idx;
-        while (dst + shift < end_idx) : (dst += 1) {
-            row_map[dst] = row_map[dst + shift];
-        }
-        // Place saved mappings in vacated region, clear their verts
-        var vacated: usize = end_idx - shift;
-        var vi: usize = 0;
-        while (vacated < end_idx) : ({
-            vacated += 1;
-            vi += 1;
-        }) {
-            if (vi < save_count) {
-                row_map[vacated] = saved[vi];
-            } else {
-                // Shift exceeded the save buffer: the original mapping is
-                // gone. Leave the entry unmapped rather than keeping the
-                // shift's leftover, which would DUPLICATE a mapping that
-                // also lives at its shifted position (two rows referencing
-                // one slot without a ref-count bump -> ownership corruption
-                // on release/reuse).
-                row_map[vacated] = .{ .slot = app_mod.SLOT_NONE };
-            }
-            // Do NOT modify the shared pool slot data here.
-            // The slot may be referenced by the committed set (ref_count > 1
-            // after shallowCopyVertexSet).  Clearing verts / bumping ver /
-            // changing origin_row would corrupt the committed set's view,
-            // causing empty or mispositioned rows when WM_PAINT reads the
-            // committed set during this flush.
-            // The subsequent on_vertices_row → cowDetachRow will allocate a
-            // fresh slot (ref_count > 1 triggers COW) and write the new
-            // vertex data there, so this clearing was always redundant.
-        }
-    } else {
-        // Scroll down: save vacated slots from bottom of region
-        var saved: [4096]app_mod.RowMapping = undefined;
-        const save_count = @min(shift, 4096);
-        var si: usize = 0;
-        while (si < save_count) : (si += 1) {
-            saved[si] = row_map[end_idx - shift + si];
-        }
-        // Release the unsaved tail (see the scroll-up branch): overwritten
-        // by the shift with no surviving copy — pool refs would leak.
-        var drop: usize = save_count;
-        while (drop < shift) : (drop += 1) {
-            const m = row_map[end_idx - shift + drop];
-            if (m.slot != app_mod.SLOT_NONE) pool.release(alloc, m.slot);
-        }
-        // Shift mappings up
-        var dst: usize = end_idx;
-        while (dst > start_idx + shift) {
-            dst -= 1;
-            row_map[dst] = row_map[dst - shift];
-        }
-        // Place saved mappings in vacated region, clear their verts
-        var vacated: usize = start_idx;
-        var vi: usize = 0;
-        while (vacated < start_idx + shift) : ({
-            vacated += 1;
-            vi += 1;
-        }) {
-            if (vi < save_count) {
-                row_map[vacated] = saved[vi];
-            } else {
-                // See the scroll-up branch: never leave a duplicated
-                // mapping when the shift exceeded the save buffer.
-                row_map[vacated] = .{ .slot = app_mod.SLOT_NONE };
-            }
-            // Do NOT modify the shared pool slot data here (same reason
-            // as the scroll-up branch above: COW safety).
-        }
-    }
-}
-
-fn recomputeRowValidCount(app: *App) void {
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < app.row_valid.bit_length) : (i += 1) {
-        if (app.row_valid.isSet(i)) count += 1;
-    }
-    app.row_valid_count = count;
+/// Vacated rows keep the slots scrolled off, so ref_counts do not change. The
+/// shared pool data is NOT modified: a slot may also be referenced by the
+/// committed set, which WM_PAINT reads during this flush. The caller must
+/// ensure that vacated rows are regenerated via on_vertices_row →
+/// cowDetachRow (which detaches a shared slot) before commit.
+fn remapRowSlots(row_map: []app_mod.RowMapping, row_start: u32, row_end: u32, rows_delta: i32) void {
+    _ = render_helpers.rotateRegion(app_mod.RowMapping, row_map, row_start, row_end, rows_delta);
 }
 
 fn ensureRowStorageGeneric(
@@ -395,93 +218,6 @@ fn storeSurfaceRowVerts(
     rv.gen +%= 1;
     rv.origin_row = row; // Vertices generated for this logical row position.
     return true;
-}
-
-pub fn appendRowsFromUpdateRegion(
-    hwnd: c.HWND,
-    app: *App,
-    rows_to_draw: *std.ArrayListUnmanaged(u32),
-    row_verts_len: u32,
-) void {
-    const log_enabled = applog.isEnabled();
-    const log_t0_ns: i128 = if (log_enabled) core.clock.nowNs() else 0;
-
-    // Pre-allocate capacity for worst case (all rows dirty)
-    rows_to_draw.ensureTotalCapacity(app.alloc, row_verts_len) catch {};
-
-    var log_rect_area_sum: u64 = 0;
-    var log_rows_appended: u32 = 0;
-
-    // Create an empty region to receive the update region.
-    const hrgn = c.CreateRectRgn(0, 0, 0, 0) orelse return;
-    defer _ = c.DeleteObject(hrgn);
-
-    // Populate hrgn with the window's update region (do not erase).
-    const rgn_type: c.INT = c.GetUpdateRgn(hwnd, hrgn, c.FALSE);
-    if (rgn_type == c.ERROR) return;
-
-    const need_bytes: c.DWORD = c.GetRegionData(hrgn, 0, null);
-    if (need_bytes == 0) return;
-
-    if (log_enabled) {
-        applog.appLog("[win] updateRgn need_bytes={d} rgn_type={d}\n", .{ need_bytes, rgn_type });
-    }
-
-    // RGNDATA needs alignment; use alignedAlloc.
-    const alignment: std.mem.Alignment =
-        @enumFromInt(@ctz(@as(usize, @alignOf(c.RGNDATA))));
-
-    const buf = app.alloc.alignedAlloc(u8, alignment, need_bytes) catch return;
-    defer app.alloc.free(buf);
-
-    const rgndata: *c.RGNDATA = @ptrCast(@alignCast(buf.ptr));
-    const got_bytes: c.DWORD = c.GetRegionData(hrgn, need_bytes, rgndata);
-    if (got_bytes == 0) return;
-
-    const row_h_px0: i32 = @intCast(app.rowHeightPx());
-
-    // RECT array starts at rgndata.Buffer (flexible array).
-    const rects_ptr_u8: [*]u8 = @ptrCast(&rgndata.Buffer);
-    const rects_ptr: [*]c.RECT = @ptrCast(@alignCast(rects_ptr_u8));
-
-    const n: usize = @intCast(rgndata.rdh.nCount);
-
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const dr = rects_ptr[i];
-
-        const top_px: i32 = @max(0, dr.top);
-        const bottom_px: i32 = @max(0, dr.bottom);
-
-        // area accumulation (clamp negatives)
-        const w_i32: i32 = dr.right - dr.left;
-        const h_i32: i32 = dr.bottom - dr.top;
-        if (w_i32 > 0 and h_i32 > 0) {
-            log_rect_area_sum += @as(u64, @intCast(w_i32)) * @as(u64, @intCast(h_i32));
-        }
-
-        // [top_row, bottom_row)
-        const top_row_i32: i32 = @divTrunc(top_px, row_h_px0);
-        const bottom_row_i32: i32 = @divTrunc(bottom_px + (row_h_px0 - 1), row_h_px0);
-
-        const top_row: u32 = @intCast(@max(0, top_row_i32));
-        const bottom_row: u32 = @intCast(@min(@as(i32, @intCast(row_verts_len)), bottom_row_i32));
-
-        var rr: u32 = top_row;
-        while (rr < bottom_row) : (rr += 1) {
-            rows_to_draw.appendAssumeCapacity(rr);
-            log_rows_appended += 1;
-        }
-    }
-
-    if (log_enabled) {
-        const log_t1_ns: i128 = core.clock.nowNs();
-        const log_dur_us: u64 = @intCast(@max(@as(i128, 0), log_t1_ns - log_t0_ns) / 1_000);
-        applog.appLog(
-            "[win] updateRgn rects={d} rows_appended={d} area_px={d} dur_us={d} got_bytes={d}\n",
-            .{ n, log_rows_appended, log_rect_area_sum, log_dur_us, got_bytes },
-        );
-    }
 }
 
 pub fn unionRect(a: c.RECT, b: c.RECT) c.RECT {
@@ -717,24 +453,13 @@ pub fn onVerticesRow(
     if (app.flush_failed) return;
 
     if (log_verbose) {
-        var cur_enabled: u32 = 0;
-        var cur_row: u32 = 0;
-        var cur_col: u32 = 0;
-        if (app.cursor) |cur| {
-            cur_enabled = cur.enabled;
-            cur_row = cur.row;
-            cur_col = cur.col;
-        }
         applog.appLog(
-            "[win] on_vertices_row row_start={d} row_count={d} vert_count={d} flags=0x{x} cursor_en={d} cursor_row={d} cursor_col={d} rows={d} row_valid={d}\n",
+            "[win] on_vertices_row row_start={d} row_count={d} vert_count={d} flags=0x{x} rows={d} row_valid={d}\n",
             .{
                 row_start,
                 row_count,
                 vert_count,
                 flags,
-                cur_enabled,
-                cur_row,
-                cur_col,
                 app.surf.surface.rows,
                 app.row_valid_count,
             },
@@ -1128,6 +853,9 @@ pub fn onVerticesRow(
             // cursor-only updates do not re-send the row's content, so the old
             // block kept being drawn under the new shape-aware overlay cursor.
             if (is_cursor_update) {
+                // Every cursor update re-reads the blink cadence (see the
+                // live external path above).
+                if (app.hwnd) |hwnd| _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CURSOR_BLINK, 0, 0);
                 if (found_idx) |idx| {
                     const pv = &app.pending_external_verts.items[idx];
                     if (verts_ptr != null and vert_count != 0) {
@@ -1496,7 +1224,12 @@ pub fn onGridRowScroll(
     const row_route = resolveGridRouteLocked(app, grid_id);
     const is_external_root = switch (row_route) {
         .external_root => true,
-        .main_root, .main_layer, .external_layer, .unplaced => false,
+        // A grid whose window is still queued has its rows captured in
+        // pending_external_verts (onVerticesRow), so its shift goes there too.
+        .unplaced => for (app.pending_external_verts.items) |pv| {
+            if (pv.grid_id == grid_id) break true;
+        } else false,
+        .main_root, .main_layer, .external_layer => false,
     };
     if (!is_external_root) {
         if (app.layer_grids.get(grid_id)) |state| {
@@ -1578,7 +1311,7 @@ pub fn onGridRowScroll(
         }
         pv.surface.rows = total_rows;
         pv.surface.cols = total_cols;
-        swapAndShiftRows(pv.surface.row_verts.items, row_start, row_end, rows_delta, null);
+        swapAndShiftRows(pv.surface.row_verts.items, row_start, row_end, rows_delta);
         if (pv.surface.last_cursor_row) |cr| {
             if (cr >= row_start and cr < row_end) {
                 pv.surface.cursor_verts.clearRetainingCapacity();
@@ -1666,7 +1399,7 @@ pub fn onGridRowScroll(
         {
             ws.rows = total_rows;
             ws.cols = total_cols;
-            remapRowSlots(ws.row_map.items, &ext_win.surf.tbs.pool, app.alloc, row_start, row_end, rows_delta);
+            remapRowSlots(ws.row_map.items, row_start, row_end, rows_delta);
             var changed_row = row_start;
             while (changed_row < row_end) : (changed_row += 1) {
                 if (!ext_win.surf.tbs.markFlushMappingChanged(changed_row)) {
@@ -1843,6 +1576,22 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
             traceRender(app, "event=surface_commit surface={d} layers={d}\n", .{ entry.key_ptr.*, entry.value_ptr.*.surf.tbs.committed_layers.len });
         }
         app.surf.tbs.commitFlush(app.alloc);
+        if (app.pending_colorscheme_bg != 0xFFFFFFFF or app.pending_colorscheme_fg != 0xFFFFFFFF) {
+            if (app.pending_colorscheme_bg != 0xFFFFFFFF) app.colorscheme_bg = app.pending_colorscheme_bg;
+            if (app.pending_colorscheme_fg != 0xFFFFFFFF) app.colorscheme_fg = app.pending_colorscheme_fg;
+            app.pending_colorscheme_bg = 0xFFFFFFFF;
+            app.pending_colorscheme_fg = 0xFFFFFFFF;
+            // The external clear colours fall back to it, and the GDI panels
+            // and chrome paint from the pair.
+            if (app.hwnd) |hwnd| {
+                _ = c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_CMDLINE_COLORS, 0, 0);
+                _ = c.PostMessageW(hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+            }
+            if (app.message_window) |mw| _ = c.InvalidateRect(mw.hwnd, null, c.FALSE);
+            for (app.mini_windows) |mini| {
+                if (mini.hwnd) |h| _ = c.InvalidateRect(h, null, c.FALSE);
+            }
+        }
         for (app.pending_grid_destroys.items) |grid_id| {
             traceRender(app, "event=destroy_release grid={d} storage_present={}\n", .{ grid_id, app.layer_grids.contains(grid_id) });
             if (app.layer_grids.fetchRemove(grid_id)) |kv| {
@@ -2091,9 +1840,9 @@ pub fn onAtlasCreate(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) 
         return;
     }
     if (!recreateAtlasCpu(a, atlas_w, atlas_h)) {
-        // The CPU atlas may already be a new generation even though the
-        // legacy render-target rebuild failed. Opening the gate here would
-        // pair old committed UVs with that new atlas.
+        // The CPU atlas keeps its old generation, but the core's flush
+        // already expects the new one: opening the gate here would pair the
+        // flush's UVs with the atlas they were not made for.
         abortAtlasFlush(app, "atlas recreation failed");
         return;
     }
@@ -2339,22 +2088,29 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
             }
         }
 
-        // If no candidate succeeded, fall back to config font -> OS default
+        // If no candidate succeeded, fall back to the config list (a
+        // guifont-syntax list, walked like initMetrics does) -> OS default.
+        if (!font_set and !skip_guifont) {
+            const config_lines = core.config.formatFontFamilyAsCandidateList(arena.allocator(), app.config.font.family, config_pt, config_font) catch "";
+            var config_it = std.mem.splitScalar(u8, config_lines, '\n');
+            while (config_it.next()) |entry| {
+                const cand = core.config.parseFontCandidateLine(entry, config_pt, size_explicit) orelse continue;
+                a.setFontUtf8WithFeatures(cand.name, cand.point_size, cand.features) catch continue;
+                applied_name = cand.name;
+                applied_pt = cand.point_size;
+                font_set = true;
+                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback config font '{s}' pt={d}", .{ cand.name, cand.point_size });
+                break;
+            }
+        }
         if (!font_set) {
-            const try_config = a.setFontUtf8WithFeatures(config_font, config_pt, "");
-            if (try_config) |_| {
-                applied_name = config_font;
+            const try_os = a.setFontUtf8WithFeatures(os_default_font, config_pt, "");
+            if (try_os) |_| {
+                applied_name = os_default_font;
                 applied_pt = config_pt;
-                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback config font '{s}' pt={d}", .{ config_font, config_pt });
-            } else |_| {
-                const try_os = a.setFontUtf8WithFeatures(os_default_font, config_pt, "");
-                if (try_os) |_| {
-                    applied_name = os_default_font;
-                    applied_pt = config_pt;
-                    if (applog.isEnabled()) applog.appLog("onGuiFont: fallback OS default '{s}' pt={d}", .{ os_default_font, config_pt });
-                } else |e3| {
-                    if (applog.isEnabled()) applog.appLog("onGuiFont: OS default failed: {any}", .{e3});
-                }
+                if (applog.isEnabled()) applog.appLog("onGuiFont: fallback OS default '{s}' pt={d}", .{ os_default_font, config_pt });
+            } else |e3| {
+                if (applog.isEnabled()) applog.appLog("onGuiFont: OS default failed: {any}", .{e3});
             }
         }
 
@@ -2575,10 +2331,14 @@ pub fn onDefaultColorsSet(ctx: ?*anyopaque, fg: u32, bg: u32) callconv(.c) void 
 
     // 0xFFFFFFFF means "not set" — only update the color that is valid
     app.mu.lockUncancelable(core.clock.io());
-    if (bg != 0xFFFFFFFF) app.colorscheme_bg = bg;
-    if (fg != 0xFFFFFFFF) app.colorscheme_fg = fg;
     // The renderers' clear colour (the remainder strip, and what shows under
-    // dropped default-bg runs) is pulled from colorscheme_bg by each paint.
+    // dropped default-bg runs) is pulled from colorscheme_bg by each paint,
+    // so it is published by onFlushEnd's commit with the cells.
+    // The fg waits with it: the GDI message and mini panels read the two
+    // as a pair, and a paint between here and the commit drew the new fg on
+    // the old bg.
+    if (bg != 0xFFFFFFFF) app.pending_colorscheme_bg = bg;
+    if (fg != 0xFFFFFFFF) app.pending_colorscheme_fg = fg;
     app.mu.unlock(core.clock.io());
 
     // Invalidate tabline/sidebar to repaint with new colors, and

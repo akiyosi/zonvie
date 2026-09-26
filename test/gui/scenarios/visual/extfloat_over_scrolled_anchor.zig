@@ -74,62 +74,6 @@ const scrollbar_exclude_px: f64 = 48;
 
 const max_windows = 16;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
-/// captureStable for a window that is not the app's main one: retry until two
-/// consecutive captures are pixel-identical, so a frame caught mid-present is
-/// never what a comparison sees.
-fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
-    var timer = gui_io.Timer.start();
-    var prev: ?capture.Image = null;
-    defer if (prev) |*p| p.deinit(alloc);
-    while (true) {
-        gui_io.sleepNs(150 * std.time.ns_per_ms);
-        const cur = capture.captureWindow(alloc, window_number) catch |e| {
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-            continue;
-        };
-        if (prev) |*p| {
-            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                p.deinit(alloc);
-                prev = null;
-                return cur;
-            }
-            p.deinit(alloc);
-            prev = null;
-        }
-        prev = cur;
-        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-            const out = prev.?;
-            prev = null;
-            return out; // last capture even if not fully settled
-        }
-    }
-}
-
 /// The window minus the scrollbar strip. Derived from the capture rather than
 /// hardcoded as a fraction, so it excludes the same pixels at any window size.
 fn bodyRegion(img: capture.Image) visual.Region {
@@ -207,10 +151,10 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try waitNewWindow(g.app_pid, before_windows, 150);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 150);
     try g.exec("execute('normal! 100Gzt0')");
 
-    var without_float = try captureWindowStable(alloc, ext_win.number, 8000);
+    var without_float = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer without_float.deinit(alloc);
 
     // A float anchored to the EXTERNAL window. style="minimal" keeps the
@@ -247,7 +191,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
         return error.FloatNotOverAnchor;
     }
 
-    var with_float = try captureWindowStable(alloc, ext_win.number, 8000);
+    var with_float = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer with_float.deinit(alloc);
     if (with_float.w != without_float.w or with_float.h != without_float.h) {
         return error.ExternalWindowResized;
@@ -276,7 +220,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     try g.remoteSend("3<C-y>");
     gui_io.sleepNs(step_settle_ms * std.time.ns_per_ms);
 
-    var start = try captureWindowStable(alloc, ext_win.number, 8000);
+    var start = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer start.deinit(alloc);
 
     // One step on its own first. The first shift after a settled frame is the
@@ -287,7 +231,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
         const t_one = try app_log.nowMs(alloc, log_path);
         try g.remoteSend("3<C-e>");
         gui_io.sleepNs(step_settle_ms * std.time.ns_per_ms);
-        var one_step = try captureWindowStable(alloc, ext_win.number, 8000);
+        var one_step = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer one_step.deinit(alloc);
 
         const one_fast = try fastPathFrames(alloc, t_one);
@@ -305,11 +249,11 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
 
         const one_topline = try g.evalInt("line('w0')");
         try g.exec("execute('normal! 1Gzt0')");
-        var one_settled = try captureWindowStable(alloc, ext_win.number, 8000);
+        var one_settled = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         one_settled.deinit(alloc);
         var one_buf: [64]u8 = undefined;
         try g.exec(try std.fmt.bufPrint(&one_buf, "execute('normal! {d}Gzt0')", .{one_topline}));
-        var one_jumped = try captureWindowStable(alloc, ext_win.number, 8000);
+        var one_jumped = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer one_jumped.deinit(alloc);
 
         try visual.assertRegionUnchanged(
@@ -323,7 +267,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
 
         // Back to the view `start` holds, for the multi-step measurement.
         try g.exec("execute('normal! 100Gzt0')");
-        var restored = try captureWindowStable(alloc, ext_win.number, 8000);
+        var restored = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         restored.deinit(alloc);
     }
 
@@ -333,7 +277,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
         try g.remoteSend("3<C-e>");
         gui_io.sleepNs(step_settle_ms * std.time.ns_per_ms);
     }
-    var incremental = try captureWindowStable(alloc, ext_win.number, 8000);
+    var incremental = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer incremental.deinit(alloc);
 
     // The comparison at the end passes just as well when the anchor
@@ -375,12 +319,12 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // region, which the fast path refuses, so every row is regenerated from
     // scratch and the float is composited back into all of them.
     try g.exec("execute('normal! 1Gzt0')");
-    var settled = try captureWindowStable(alloc, ext_win.number, 8000);
+    var settled = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     settled.deinit(alloc);
     var jump_buf: [64]u8 = undefined;
     const jump_cmd = try std.fmt.bufPrint(&jump_buf, "execute('normal! {d}Gzt0')", .{topline});
     try g.exec(jump_cmd);
-    var jumped = try captureWindowStable(alloc, ext_win.number, 8000);
+    var jumped = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer jumped.deinit(alloc);
 
     try visual.assertRegionUnchanged(
@@ -393,11 +337,11 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     );
     if (std.mem.endsWith(u8, config_dir, "config_hosted_opaque")) {
         try g.exec("luaeval('(function() vim.api.nvim_buf_set_lines(vim.api.nvim_win_get_buf(_G.z_float), 1, 2, false, {\"CHANGED HOSTED ROW\"}) return 1 end)()')");
-        var partial = try captureWindowStable(alloc, ext_win.number, 8000);
+        var partial = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer partial.deinit(alloc);
         if (visual.regionDiffRatio(jumped, partial, region, 6) <= 0.0002) return error.HostedRowDidNotChange;
         try g.exec("execute('redraw!')");
-        var full = try captureWindowStable(alloc, ext_win.number, 8000);
+        var full = try driver.captureWindowStable(alloc, ext_win.number, 8000);
         defer full.deinit(alloc);
         try visual.assertRegionUnchanged(alloc, "hosted_partial_matches_full", full, partial, region, .{});
         const partial_lines = try app_log.linesSince(alloc, log_path, "event=hosted_partial", 0);

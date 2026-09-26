@@ -28,6 +28,7 @@ const platform = driver.platform;
 const Gui = driver.Gui;
 const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
+const layer_draw = @import("layer_draw.zig");
 
 const log_path = "tmp/gui_extwin_float_stack.log";
 const draw_marker = "[ext_layer_draw]";
@@ -57,40 +58,6 @@ const step_interval_ms: u64 = 150;
 /// scenario: a frame can be missed or doubled by the capture clock.
 const jump_threshold: usize = 2;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    for (buf[0..platform.windowsForPid(pid, &buf)]) |w| {
-        if (x >= w.bounds.x and x < w.bounds.x + w.bounds.w and
-            y >= w.bounds.y and y < w.bounds.y + w.bounds.h) return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 /// Cell height in pixels, from the surface's own draw line: it reports the
 /// cell-snapped viewport and the rows it was snapped to, and their ratio is
 /// the cell height the layer geometry is built from. Read rather than assumed,
@@ -103,98 +70,6 @@ fn cellHeightPx(alloc: std.mem.Allocator, since_ms: f64) !f64 {
     const rows = app_log.field(line, "snapRows") orelse return error.CellHeightUnparsable;
     if (vp_h <= 0 or rows <= 0) return error.CellHeightUnparsable;
     return vp_h / rows;
-}
-
-const Tally = struct {
-    jumps: usize = 0,
-    displaced: usize = 0,
-    replacements: usize = 0,
-    grids: usize = 0,
-    worst: f64 = 0,
-    period_ms: f64 = 0,
-    late: usize = 0,
-};
-
-/// The median gap between consecutive drawn frames of ONE layer — every layer
-/// of a frame is logged microseconds after the one before it, so taking all
-/// the lines would put the median at zero.
-fn framePeriodMs(alloc: std.mem.Allocator, lines: []const u8) !f64 {
-    var gaps: std.ArrayList(f64) = .empty;
-    defer gaps.deinit(alloc);
-    var prev: ?f64 = null;
-    var only_grid: ?f64 = null;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        const grid = app_log.field(line, "gridId") orelse continue;
-        if (only_grid == null) only_grid = grid;
-        if (grid != only_grid.?) continue;
-        const ts = app_log.lineTimestampMs(line) orelse continue;
-        if (prev) |p| {
-            const gap = ts - p;
-            if (gap > 0) try gaps.append(alloc, gap);
-        }
-        prev = ts;
-    }
-    if (gaps.items.len == 0) return 0;
-    std.mem.sort(f64, gaps.items, {}, std.sort.asc(f64));
-    return gaps.items[gaps.items.len / 2];
-}
-
-/// Walk the `[ext_layer_draw]` series and fold it per grid. Every field is
-/// required: a silently skipped line would make the assertion vacuous.
-fn tally(alloc: std.mem.Allocator, since_ms: f64, cell_px: f64) !Tally {
-    const lines = try app_log.linesSince(alloc, log_path, draw_marker, since_ms);
-    defer alloc.free(lines);
-
-    var prev_draw = std.AutoHashMap(i64, f64).init(alloc);
-    defer prev_draw.deinit();
-    var prev_draw_ms = std.AutoHashMap(i64, f64).init(alloc);
-    defer prev_draw_ms.deinit();
-    var prev_committed = std.AutoHashMap(i64, f64).init(alloc);
-    defer prev_committed.deinit();
-    var seen = std.AutoHashMap(i64, void).init(alloc);
-    defer seen.deinit();
-
-    var t = Tally{};
-    t.period_ms = try framePeriodMs(alloc, lines);
-    if (t.period_ms <= 0) return t;
-
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        const grid_f = app_log.field(line, "gridId") orelse continue;
-        const now_ms = app_log.lineTimestampMs(line) orelse continue;
-        const moved = app_log.field(line, "moved") orelse continue;
-        const committed = app_log.field(line, "committedY") orelse continue;
-        const draw = app_log.field(line, "drawY") orelse continue;
-        const grid: i64 = @intFromFloat(grid_f);
-
-        if (prev_committed.get(grid)) |p| {
-            if (@abs(committed - p) >= cell_px / 2) t.replacements += 1;
-        }
-        try prev_committed.put(grid, committed);
-
-        if (moved < 0.5) {
-            _ = prev_draw.remove(grid);
-            _ = prev_draw_ms.remove(grid);
-            continue;
-        }
-        t.displaced += 1;
-        if (!seen.contains(grid)) {
-            try seen.put(grid, {});
-            t.grids += 1;
-        }
-        if (prev_draw.get(grid)) |p| {
-            const jump = @abs(draw - p);
-            if (jump > t.worst) t.worst = jump;
-            const elapsed = now_ms - (prev_draw_ms.get(grid) orelse now_ms);
-            const scale = @max(1.0, elapsed / t.period_ms);
-            if (elapsed > t.period_ms * 1.5) t.late += 1;
-            if (jump >= cell_px * scale) t.jumps += 1;
-        }
-        try prev_draw.put(grid, draw);
-        try prev_draw_ms.put(grid, now_ms);
-    }
-    return t;
 }
 
 /// No grid an external window composites may appear in the MAIN renderer's
@@ -294,7 +169,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ host_cols, host_rows },
     );
     try g.exec(open_host);
-    _ = try waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(700 * std.time.ns_per_ms);
 
     // A stack of bufpos-anchored floats over it, unfocused so the wheel
@@ -378,7 +253,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         gui_io.sleepNs(400 * std.time.ns_per_ms);
     }
 
-    const t = try tally(alloc, t1, cell_px);
+    const t = try layer_draw.tally(alloc, log_path, draw_marker, t1, cell_px);
     std.debug.print(
         "[gui] extwin float stack: cell={d:.1}px period={d:.1}ms displaced_frames={d} late={d} " ++
             "grids={d} replacements={d} jumps={d} worst={d:.1}px\n",

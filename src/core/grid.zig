@@ -8,9 +8,6 @@ pub const CMDLINE_GRID_ID: i64 = -100;
 /// Reserved grid ID for ext_popupmenu (displayed as external window).
 pub const POPUPMENU_GRID_ID: i64 = -101;
 
-/// Reserved grid ID for ext_tabline (displayed as Chrome-style tabs in titlebar).
-pub const TABLINE_GRID_ID: i64 = -104;
-
 pub const Cell = struct {
     cp: u32,
     hl: u32,
@@ -299,6 +296,17 @@ fn utf8TailStart(text: []const u8, requested_start: usize) usize {
     return start;
 }
 
+/// The longest prefix of `bytes` at most `max` long that does not end inside a
+/// UTF-8 sequence, for copies into fixed-size message buffers. A cut in the
+/// middle of a character left a truncated sequence that macOS decodes as an
+/// empty string.
+pub fn utf8PrefixLen(bytes: []const u8, max: usize) usize {
+    if (bytes.len <= max) return bytes.len;
+    var n = max;
+    while (n > 0 and (bytes[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
 fn collectMessageTailRef(
     refs_reversed: *[MAX_MESSAGE_CHUNKS]MessageTailRef,
     ref_count: *usize,
@@ -444,22 +452,8 @@ pub const Message = struct {
     }
 };
 
-/// State for ext_messages.
-/// Pending message snapshot for sending to frontend (survives msg_clear)
-pub const PendingMessage = struct {
-    kind: [32]u8 = undefined,
-    kind_len: usize = 0,
-    text: [4096]u8 = undefined,
-    text_len: usize = 0,
-    hl_id: u32 = 0,
-    replace_last: bool = false,
-    history: bool = false,
-    append: bool = false,
-    id: i64 = 0,
-};
-
 /// Singleton confirm message (noice.nvim pattern: confirm lifecycle = cmdline lifecycle).
-/// Zero-alloc: fixed-size buffers matching PendingMessage pattern.
+/// Zero-alloc: fixed-size buffers.
 pub const ConfirmMessage = struct {
     kind: [32]u8 = undefined,
     kind_len: usize = 0,
@@ -468,20 +462,25 @@ pub const ConfirmMessage = struct {
     hl_id: u32 = 0,
     id: i64 = 0,
     active: bool = false,
+    /// A character did not fit: later text must not land after the gap.
+    text_full: bool = false,
 
     pub fn clear(self: *ConfirmMessage) void {
         self.active = false;
         self.kind_len = 0;
         self.text_len = 0;
+        self.text_full = false;
         self.hl_id = 0;
         self.id = 0;
     }
 
     /// Append text to existing confirm message (for append semantics).
     pub fn appendText(self: *ConfirmMessage, text: []const u8) void {
-        const copy_len = @min(text.len, self.text.len - self.text_len);
+        if (self.text_full) return;
+        const copy_len = utf8PrefixLen(text, self.text.len - self.text_len);
         @memcpy(self.text[self.text_len..][0..copy_len], text[0..copy_len]);
         self.text_len += copy_len;
+        if (copy_len < text.len) self.text_full = true;
     }
 };
 
@@ -589,7 +588,6 @@ pub const MessageState = struct {
     messages: std.ArrayListUnmanaged(Message) = .empty,
     /// Indexed by StatusChannel.
     status_content: [StatusChannel.all.len]std.ArrayListUnmanaged(MsgChunk) = @splat(.empty),
-    visible: bool = false,
     /// Dirty flag for msg_show/msg_clear changes
     msg_dirty: bool = false,
     /// Singleton confirm message (separated from messages list per noice.nvim pattern)
@@ -602,10 +600,6 @@ pub const MessageState = struct {
     msg_cleared_in_batch: bool = false,
     /// Dirty flags for the status channels, indexed by StatusChannel.
     status_dirty: [StatusChannel.all.len]bool = @splat(false),
-    /// Pending msg_show events that need to be sent to frontend.
-    /// These survive msg_clear within the same redraw frame.
-    pending_messages: [8]PendingMessage = undefined,
-    pending_count: usize = 0,
 
     pub fn deinit(self: *MessageState, alloc: std.mem.Allocator) void {
         for (self.messages.items) |*msg| {
@@ -630,7 +624,6 @@ pub const MessageState = struct {
             msg.deinit(alloc);
         }
         self.messages.clearRetainingCapacity();
-        self.visible = false;
     }
 
     fn evictOldestMessages(self: *MessageState, alloc: std.mem.Allocator, requested: usize) void {
@@ -662,7 +655,6 @@ pub const MessageState = struct {
         }
 
         self.confirm_msg.clear();
-        self.visible = false;
         self.msg_dirty = false;
         self.status_dirty = @splat(false);
     }
@@ -891,9 +883,9 @@ pub const GridBuf = struct {
         // previous GridBuf in full.
         //
         // Note this leaves `bit_length` at 0 while `rows` is whatever was
-        // asked for, so `bit_length >= rows` is NOT an invariant here the way
-        // it is on Grid (see Grid.ensureDirtyCapacity). Anything reading
-        // `dirty_rows` off a GridBuf has to check `bit_length` first.
+        // asked for, so `bit_length >= rows` is NOT an invariant. Never index
+        // `dirty_rows` directly: isRowDirty / markDirtyRow / markDirtyRect
+        // bounds-check against `bit_length`.
         var new_dirty_rows: std.DynamicBitSetUnmanaged = .{};
         errdefer new_dirty_rows.deinit(alloc);
         if (new_len != 0) try new_dirty_rows.resize(alloc, rows, true);
@@ -1632,6 +1624,10 @@ pub const Grid = struct {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.cursor_valid = false;
+        // busy_start/busy_stop are its only writers, and a fresh attach
+        // never sends busy_stop: a busy_stop lost with the old session would
+        // hide the cursor until the next unrelated busy pair.
+        self.cursor_visible = true;
 
         // ext_cmdline: the new server has no notion of these levels.
         // Mark dirty so the next flush re-emits hide based on absence
@@ -1899,12 +1895,6 @@ pub const Grid = struct {
         return .{ .cell_w_px = 1, .cell_h_px = 1 };
     }
 
-    pub fn ensureGridMetricsPx(self: *Grid, grid_id: i64) !void {
-        if (self.grid_metrics.contains(grid_id)) return;
-        const base = self.getGridMetricsPx(1);
-        try self.grid_metrics.put(self.alloc, grid_id, base);
-    }
-
     pub fn getCellHL(self: *const Grid, row: u32, col: u32) u32 {
         return self.main_buf.getCell(row, col).hl;
     }
@@ -1922,16 +1912,6 @@ pub const Grid = struct {
     pub fn getCellGrid(self: *const Grid, grid_id: i64, row: u32, col: u32) Cell {
         const buf = self.bufForConst(grid_id) orelse return .{ .cp = 0, .hl = 0 };
         return buf.getCell(row, col);
-    }
-
-    /// Grow `dirty_rows` to cover `rows`, leaving new bits clean. Never index
-    /// `dirty_rows` directly: use isRowDirty / markDirtyRow / markDirtyRect,
-    /// which bounds-check against a bitset the zero-cell shape never allocates.
-    pub fn ensureDirtyCapacity(self: *Grid, rows: u32) !void {
-        // Grow only; a shrink leaves the bitset longer than `rows`.
-        const r: usize = @as(usize, rows);
-        if (self.main_buf.dirty_rows.bit_length >= r) return;
-        try self.main_buf.dirty_rows.resize(self.alloc, r, false);
     }
 
     pub fn isRowDirty(self: *const Grid, row: u32) bool {
@@ -2146,6 +2126,10 @@ pub const Grid = struct {
             const shape_changed = self.rows != rows or self.cols != cols;
             try self.resize(rows, cols);
             if (shape_changed) self.glyph_working_set_rev +%= 1;
+            // Grid 1's cursor layer is gated on cursor_rev alone (the main
+            // pass has already cleared the rows by then), so a shrink under
+            // the cursor must bump it to reach the out-of-grid empty set.
+            if (shape_changed and self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
             // Remove overflow entries that fall outside the new dimensions.
             // Entries within [0, rows) x [0, cols) are preserved (matching
             // the cell copy behavior of resize()).
@@ -2203,6 +2187,8 @@ pub const Grid = struct {
             self.clear();
             self.clearOverflowForGrid(1);
             self.markAllDirty();
+            // The cursor cell's glyph is gone; see resizeGrid.
+            if (self.cursor_grid == 1 and self.cursor_valid) self.cursor_rev +%= 1;
             return;
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
@@ -2898,7 +2884,10 @@ pub const Grid = struct {
 
         // If this grid was external, remove it from external_grids.
         // This allows a grid to transition from external back to float.
-        self.invalidateSubgridVertexSurface(grid_id);
+        // Only that transition drops the ledger: a float repositioned on its
+        // surface keeps its rows on the frontend, as a moved split does
+        // (setWinPos), and a surface change resends every row anyway.
+        if (was_external) self.invalidateSubgridVertexSurface(grid_id);
         _ = self.external_grids.remove(grid_id);
 
         // Sticky "buffer-tracking" flag: a float that is repositioned to a new
@@ -3435,14 +3424,6 @@ pub const Grid = struct {
         return self.cmdline_states.getPtr(level);
     }
 
-    /// Check if any cmdline is visible.
-    pub fn isCmdlineVisible(self: *const Grid) bool {
-        var it = self.cmdline_states.iterator();
-        while (it.next()) |e| {
-            if (e.value_ptr.visible) return true;
-        }
-        return false;
-    }
 
     pub fn clearCmdlineDirty(self: *Grid) void {
         self.cmdline_dirty = false;
@@ -3615,14 +3596,15 @@ pub const Grid = struct {
                 @memcpy(cm.kind[0..klen], kind[0..klen]);
                 cm.kind_len = klen;
                 // Copy text from chunks
-                if (replace_last) cm.text_len = 0; // Reset text for replace
+                if (replace_last) {
+                    cm.text_len = 0; // Reset text for replace
+                    cm.text_full = false;
+                }
                 var primary_hl: u32 = cm.hl_id;
                 for (content) |chunk| {
                     if (primary_hl == 0) primary_hl = chunk.hl_id;
-                    const clen = @min(chunk.text.len, cm.text.len - cm.text_len);
-                    @memcpy(cm.text[cm.text_len..][0..clen], chunk.text[0..clen]);
-                    cm.text_len += clen;
-                    if (cm.text_len >= cm.text.len) break;
+                    cm.appendText(chunk.text);
+                    if (cm.text_full) break;
                 }
                 cm.hl_id = primary_hl;
                 cm.id = msg_id;
@@ -3665,7 +3647,6 @@ pub const Grid = struct {
                 try setMessageContentBounded(msg, self.alloc, content, false);
                 msg.history = history;
                 msg.append = append;
-                self.message_state.visible = true;
                 self.message_state.msg_dirty = true;
                 return;
             }
@@ -3675,7 +3656,6 @@ pub const Grid = struct {
         if (append and self.message_state.messages.items.len > 0) {
             const last_msg = &self.message_state.messages.items[self.message_state.messages.items.len - 1];
             try setMessageContentBounded(last_msg, self.alloc, content, true);
-            self.message_state.visible = true;
             self.message_state.msg_dirty = true;
             return;
         }
@@ -3718,35 +3698,7 @@ pub const Grid = struct {
             self.message_state.evictOldestMessages(self.alloc, eviction_count);
         }
         self.message_state.messages.appendAssumeCapacity(new_msg);
-        self.message_state.visible = true;
         self.message_state.msg_dirty = true;
-
-        // Save snapshot for pending messages (survives msg_clear)
-        if (self.message_state.pending_count < self.message_state.pending_messages.len) {
-            var pm = &self.message_state.pending_messages[self.message_state.pending_count];
-            pm.* = .{}; // Reset
-            const kind_copy_len = @min(kind.len, pm.kind.len);
-            @memcpy(pm.kind[0..kind_copy_len], kind[0..kind_copy_len]);
-            pm.kind_len = kind_copy_len;
-
-            // Build text from chunks
-            var text_len: usize = 0;
-            var primary_hl_id: u32 = 0;
-            for (content) |chunk| {
-                if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-                const copy_len = @min(chunk.text.len, pm.text.len - text_len);
-                @memcpy(pm.text[text_len..][0..copy_len], chunk.text[0..copy_len]);
-                text_len += copy_len;
-                if (text_len >= pm.text.len) break;
-            }
-            pm.text_len = text_len;
-            pm.hl_id = primary_hl_id;
-            pm.replace_last = replace_last;
-            pm.history = history;
-            pm.append = append;
-            pm.id = msg_id;
-            self.message_state.pending_count += 1;
-        }
     }
 
     /// Handle msg_clear event.
@@ -3759,7 +3711,6 @@ pub const Grid = struct {
             self.message_state.confirm_msg.clear();
             self.message_state.confirm_dirty = true;
         }
-        // Note: Do NOT clear pending_show here - it should survive msg_clear
     }
 
     /// Replace a status channel's content. Showmode, showcmd and ruler are
@@ -3820,12 +3771,6 @@ pub const Grid = struct {
     pub fn setMsgHistoryClear(self: *Grid) void {
         self.msg_history_state.clear(self.alloc);
         self.msg_history_state.dirty = true; // Mark dirty so sendMsgHistoryShow gets called
-    }
-
-    pub fn clearMessageDirty(self: *Grid) void {
-        self.message_state.msg_dirty = false;
-        self.message_state.confirm_dirty = false;
-        self.message_state.status_dirty = @splat(false);
     }
 };
 
@@ -4061,7 +4006,6 @@ fn checkMessageSingletonReplacementAllocationFailure(alloc: std.mem.Allocator) !
     try grid.setMsgShow("echo", &initial, false, false, false, 11);
     grid.message_state.msg_dirty = false;
     const before = grid.message_state.messages.items[0].content.items[0];
-    const pending_count = grid.message_state.pending_count;
     const replacement = [_]MsgChunk{.{ .hl_id = 2, .text = "new-visible" }};
 
     grid.setMsgShow("echo", &replacement, false, false, false, 12) catch |err| {
@@ -4072,9 +4016,7 @@ fn checkMessageSingletonReplacementAllocationFailure(alloc: std.mem.Allocator) !
         try std.testing.expectEqual(@as(usize, 1), msg.content.items.len);
         try std.testing.expectEqual(before.text.ptr, msg.content.items[0].text.ptr);
         try std.testing.expectEqualSlices(u8, "old-visible", msg.content.items[0].text);
-        try std.testing.expect(grid.message_state.visible);
         try std.testing.expect(!grid.message_state.msg_dirty);
-        try std.testing.expectEqual(pending_count, grid.message_state.pending_count);
         return err;
     };
 
@@ -4099,14 +4041,12 @@ fn checkMessageEvictionAllocationFailure(alloc: std.mem.Allocator) !void {
     for (0..1000) |id| {
         grid.message_state.messages.appendAssumeCapacity(.{ .id = @intCast(id) });
     }
-    grid.message_state.visible = true;
     const incoming = [_]MsgChunk{.{ .hl_id = 3, .text = "new-tail" }};
 
     grid.setMsgShow("shell_out", &incoming, false, false, false, 1000) catch |err| {
         try std.testing.expectEqual(@as(usize, 1000), grid.message_state.messages.items.len);
         try std.testing.expectEqual(@as(i64, 0), grid.message_state.messages.items[0].id);
         try std.testing.expectEqual(@as(i64, 999), grid.message_state.messages.items[999].id);
-        try std.testing.expect(grid.message_state.visible);
         return err;
     };
 
@@ -4871,6 +4811,43 @@ test "a session reset drops the destroys owed to the old session" {
 
     grid.resetForNewSession();
     try std.testing.expectEqual(@as(usize, 0), grid.destroyed_pending.items.len);
+}
+
+test "repositioning a float keeps its vertex ledger; leaving an external window drops it" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(10, 8);
+    try grid.resizeGrid(2, 2, 4);
+    try grid.setWinFloatPos(2, 1002, 0, 0, 50, 0, 1, true);
+    const sg = grid.sub_grids.getPtr(2).?;
+    sg.vertex_row_ledger_valid = true;
+    sg.surface_vertex_count = 6;
+    grid.subgrid_surface_vertex_count = 6;
+
+    // Same surface: the frontend keeps the rows, so the ledger still counts them.
+    try grid.setWinFloatPos(2, 1002, 3, 2, 50, 0, 1, true);
+    try std.testing.expect(sg.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 6), sg.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 6), grid.subgrid_surface_vertex_count);
+
+    try grid.putSyntheticExternal(2, .{ .win = 1002, .start_row = 0, .start_col = 0 });
+    // As the external window's own rows would have re-validated it.
+    sg.vertex_row_ledger_valid = true;
+    sg.surface_vertex_count = 6;
+    grid.subgrid_surface_vertex_count = 6;
+    try grid.setWinFloatPos(2, 1002, 3, 2, 50, 0, 1, true);
+    try std.testing.expect(!sg.vertex_row_ledger_valid);
+    try std.testing.expectEqual(@as(usize, 0), grid.subgrid_surface_vertex_count);
+}
+
+test "a session reset shows a cursor the old session's busy_start hid" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    // What busy_start writes; its busy_stop was lost with the old session.
+    grid.cursor_visible = false;
+
+    grid.resetForNewSession();
+    try std.testing.expect(grid.cursor_visible);
 }
 
 test "destroying an external grid owes the main viewport no repaint" {
