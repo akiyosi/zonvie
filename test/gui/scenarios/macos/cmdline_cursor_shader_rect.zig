@@ -52,18 +52,6 @@ fn waitCursorRect(alloc: std.mem.Allocator, since_ms: f64, timeout_ms: u64) !Rec
     }
 }
 
-fn newWindow(pid: i32, before: []const platform.MainWindow) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        return w;
-    }
-    return null;
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
@@ -90,7 +78,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.remoteSend("echo");
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
-    const cmdline_win = newWindow(g.app_pid, main_wins) orelse return error.CmdlineWindowNotFound;
+    const cmdline_win = driver.newWindow(g.app_pid, main_wins, 0) orelse return error.CmdlineWindowNotFound;
     const rect = try waitCursorRect(alloc, t0, 10_000);
 
     // Scale comes off the rect's own line: it is the scale of the space the

@@ -175,14 +175,15 @@ final class SurfaceScrollbarController {
             core.pageScroll(gridId: target, forward: forward)
             // Move the knob to an estimate now; update() leaves it until the
             // viewport actually moves.
-            if let viewport {
-                let visible = viewport.botline - viewport.topline
-                let range = max(1, viewport.lineCount - visible)
+            // The topline is 0-based and the knob position is the core's
+            // (scrollbar_metrics), so the estimate lands where update() will.
+            if var estimate = viewport {
+                let visible = estimate.botline - estimate.topline
                 let step = max(1, visible - 2)
-                let newTopline = forward
-                    ? min(viewport.lineCount - visible + 1, viewport.topline + step)
-                    : max(1, viewport.topline - step)
-                sender.doubleValue = min(1.0, max(0, Double(newTopline - 1) / Double(range)))
+                let top = estimate.topline + (forward ? step : -step)
+                estimate.topline = max(0, min(estimate.lineCount - visible, top))
+                estimate.botline = estimate.topline + visible
+                sender.doubleValue = estimate.scrollbarMetrics.scroll_position
             }
 
         case .knob, .knobSlot:
@@ -295,22 +296,8 @@ final class MetalTerminalView: GridInputView {
 
     // MARK: - Active Draw Loop
 
-    /// Called from draw() early-return paths when no rendering was needed.
-    func notifyDrawIdle() {
-        // `heldActive`: while a synthesized key repeat is armed, the draw loop
-        // is its clock and must never stop, even on frames with nothing to
-        // render (holding j at the end of the buffer).
-        if drawLoopIdleCounter.noteIdle(
-            hadRecentCommit: renderer?.hadRecentCommit(withinNs: 50_000_000) == true,
-            heldActive: keyInput?.synthesisHeld(by: self) == true
-        ) {
-            deactivateSurfaceDrawLoop()
-        }
-    }
-
-    /// Called from draw() when actual rendering proceeds.
-    func notifyDrawActive() {
-        drawLoopIdleCounter.noteActive()
+    override func hadRecentCommit(withinNs: UInt64) -> Bool {
+        renderer?.hadRecentCommit(withinNs: withinNs) == true
     }
 
     private func drawablePxRectToViewRect(_ rectPxTopOrigin: NSRect) -> NSRect {
@@ -478,7 +465,7 @@ final class MetalTerminalView: GridInputView {
         /// drag undoing an ease on margin rows that never took one.
         var band: GridRowBand
     }
-    private var dragGridCache: DragGridCache? = nil
+    private var dragGridCache = SurfacePressPin<DragGridCache>()
 
     /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
 
@@ -488,20 +475,25 @@ final class MetalTerminalView: GridInputView {
         let location = convert(event.locationInWindow, from: nil)
         let modifier = neovimModifierString(event.modifierFlags)
 
-        // The press claims its grid for every button, and the drag and release
-        // that follow stay on it: Neovim keeps a drag on the window the press
-        // chose, and a release re-resolved under the pointer ended a selection
-        // dragged out of a float in the window behind it. The external surface
-        // and Windows pin the same way. The cache also keeps separator drags
-        // from oscillating as the grids resize.
+        // The press claims its grid, and the drag and release that follow
+        // stay on it: Neovim keeps a drag on the window the press chose, and a
+        // release re-resolved under the pointer ended a selection dragged out
+        // of a float in the window behind it. The external surface and Windows
+        // pin the same way. The cache also keeps separator drags from
+        // oscillating as the grids resize.
         if action == "press" {
-            let (gridId, _, _) = hitTestGrid(at: location)
-            dragGridCache = core.getVisibleGridsCached().first(where: { $0.gridId == gridId }).map {
-                DragGridCache(gridId: $0.gridId, startCol: $0.startCol, band: GridRowBand(of: $0))
+            let hit = hitTestGrid(at: location)
+            dragGridCache.press(button: button) {
+                core.getVisibleGridsCached().first(where: { $0.gridId == hit.gridId }).map {
+                    DragGridCache(gridId: $0.gridId, startCol: $0.startCol, band: GridRowBand(of: $0))
+                }
             }
+            core.sendMouseInput(button: button, action: action, modifier: modifier,
+                                gridId: hit.gridId, row: hit.row, col: hit.col)
+            return
         }
-        if action != "press", let cache = dragGridCache {
-            if action == "release" { dragGridCache = nil }
+        let pinned = action == "release" ? dragGridCache.release(button: button) : dragGridCache.pinned
+        if let cache = pinned {
             // The cached grid, but the CURRENT geometry: dragging a separator
             // resizes the grids, and the cache exists so the coordinates stay
             // in the grid the press chose, not so they freeze.
@@ -515,12 +507,15 @@ final class MetalTerminalView: GridInputView {
             // question part-way through, which is why the cache exists. A
             // follower moves bodily, band and all, so it is read where drawn.
             let localRow: Int32
+            var startCol = cache.startCol
             if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[cache.gridId], g.cellH > 0 {
                 // Against the float's placement NOW, not the press's: a
                 // follower is re-placed by Neovim as it scrolls, and the
-                // displacement is measured from the current placement.
-                let startRow = core.getVisibleGridsCached().first { $0.gridId == cache.gridId }?.startRow
-                    ?? cache.band.startRow
+                // displacement is measured from the current placement --
+                // both axes of it.
+                let current = core.getVisibleGridsCached().first { $0.gridId == cache.gridId }
+                let startRow = current?.startRow ?? cache.band.startRow
+                startCol = current?.startCol ?? cache.startCol
                 localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - startRow
             } else {
                 localRow = scrollAdjustedLocalRow(
@@ -530,7 +525,7 @@ final class MetalTerminalView: GridInputView {
                     scrollOffsetPx: dragOffsetPx
                 )
             }
-            let localCol = globalCol - cache.startCol
+            let localCol = globalCol - startCol
 
             core.sendMouseInput(
                 button: button,
@@ -1437,6 +1432,27 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     /// the mode; each surface decides when a frame was idle.
     var drawLoopIdleCounter = DrawLoopIdleCounter()
     var drawLoopTraceName: String { "main" }
+
+    /// Whether this surface committed content within `withinNs`.
+    func hadRecentCommit(withinNs: UInt64) -> Bool { false }
+
+    /// Called from draw() early-return paths when no rendering was needed.
+    func notifyDrawIdle() {
+        // `heldActive`: while a synthesized key repeat is armed, the draw loop
+        // is its clock and must never stop, even on frames with nothing to
+        // render (holding j at the end of the buffer).
+        if drawLoopIdleCounter.noteIdle(
+            hadRecentCommit: hadRecentCommit(withinNs: 50_000_000),
+            heldActive: core?.keyInput.synthesisHeld(by: self) == true
+        ) {
+            deactivateSurfaceDrawLoop()
+        }
+    }
+
+    /// Called from draw() when actual rendering proceeds.
+    func notifyDrawActive() {
+        drawLoopIdleCounter.noteActive()
+    }
 
     /// Coalesces setNeedsDisplay to once per runloop tick, unioning rects.
     let redrawScheduler = SurfaceRedrawScheduler()

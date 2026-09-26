@@ -191,6 +191,16 @@ pub fn linesSince(alloc: std.mem.Allocator, path: []const u8, marker: []const u8
     return out.toOwnedSlice(alloc);
 }
 
+/// Grid id of the most recent external window the app opened at or after
+/// `since_ms`, from its `[external_window] open gridId=` line.
+pub fn externalWindowGrid(alloc: std.mem.Allocator, path: []const u8, since_ms: f64) !i64 {
+    const line = (try lastLineSince(alloc, path, "[external_window] open gridId=", since_ms)) orelse
+        return error.NoExternalWindowOpened;
+    defer alloc.free(line);
+    const v = field(line, "gridId") orelse return error.ExternalGridIdUnparsable;
+    return @intFromFloat(v);
+}
+
 /// Poll until `marker` shows up, so a scenario can wait for app-side
 /// state (e.g. "the custom shader finished loading") instead of sleeping.
 pub fn waitFor(alloc: std.mem.Allocator, path: []const u8, marker: []const u8, timeout_ms: u64) !void {

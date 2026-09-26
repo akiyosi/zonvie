@@ -20,7 +20,9 @@ fileprivate func screenSpaceParameters(
           let selfWin = selfView.window else {
         return (selfDrawable, .zero)
     }
-    let scale = selfWin.backingScaleFactor
+    // The main drawable's scale: the offset is in its pixel space, beside
+    // iResolution, even when this window sits on a display of another scale.
+    let scale = mainWin.backingScaleFactor
     // Convert each MTKView's local bounds -> screen coords (bottom-left
     // origin, in points).
     let selfInWindow = selfView.convert(selfView.bounds, to: nil)
@@ -161,8 +163,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// on_grid_scroll's rowsDelta. The float ledger's other half; the main
     /// renderer keeps the identical map for the layers IT places, and the debt
     /// it computes was simply absent for a float an external window hosts.
-    /// Written only under `lock` at commit; read by
-    /// copyPlacementRowsUp.
+    /// Written only under `lock` at commit; read by the draw's snapshot.
     private var layerPlacementRowsUp: [Int64: Int] = [:]
     /// The counter above as this frame's layer snapshot saw it, and the zero
     /// the ledger's two halves are compared against. Both are drawn-thread
@@ -186,14 +187,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         rowWritePrepared = false
         writeSetIndex = -1
         bracketOpen = false
-    }
-
-    /// Hand the float ledger this surface's half, merging into storage the
-    /// caller owns so the per-frame read costs one lock and no allocation.
-    func copyPlacementRowsUp(into out: inout [Int64: Int]) {
-        lock.lock()
-        defer { lock.unlock() }
-        for (gridId, rows) in layerPlacementRowsUp { out[gridId] = rows }
     }
 
     /// Rows of the anchor's compensation this hosted float is carrying that
@@ -332,13 +325,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     func submitLayerCursor(gridId id: Int64, ptr: UnsafePointer<zonvie_vertex>?, count: Int) {
         guard isInFlush else { return }
         // Clearing another grid must not erase this surface's current cursor.
-        guard count != 0 || cursorOwner.owns(id) else {
+        guard cursorOwner.admit(id, count: count) else {
             ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(id) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
             return
         }
         ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_route surface=\(gridId) grid=\(id) vertices=\(count)")
         writeBracketCursorVertices(ptr: ptr, count: count)
-        cursorOwner.stage(id)
         flushHadContent = true
         // The surface's own cursor path forwards its rect to the shared cursor
         // shader state; a layer's cursor is the same surface's one cursor and
@@ -350,7 +342,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         } else {
             // The cursor left this layer, so stop republishing its rect on
             // window moves — same reason as the root path.
-            lastForwardedCursorPx = nil
+            stagedForwardedCursor = ForwardedCursor()
         }
     }
 
@@ -487,20 +479,35 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     // found no set to write and aborted the whole transaction, main included.
     // Uses non-blocking tryWait since draw() runs on main thread.
     private let inflightSemaphore = DispatchSemaphore(value: 1)
+    /// Set by a GPU completion that failed, before it signals the semaphore;
+    /// read by the next draw. Protected by lock.
+    private var gpuFrameFailed = false
+    /// A wake is queued for a draw that found the pipeline not ready. Main
+    /// thread only.
+    private var pipelineRetryScheduled = false
     private let maxRowBuffers = surfaceMaxRowBuffers
 
     /// Occlusion and window-move observers; see viewDidMoveToWindow.
     private var occlusionObserver: NSObjectProtocol?
     private var moveObservers: [NSObjectProtocol] = []
 
-    /// Last cursor box this view forwarded to the shared shader cursor
-    /// state, in this grid's own local pixels, so a window move can
-    /// re-project it. Nil while the cursor is not on this view's grid.
-    private var lastForwardedCursorPx: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
-    private var lastForwardedCursorColor: (Float, Float, Float, Float)?
-    /// Which grid the forwarded cursor belongs to: this surface's root, or a
-    /// grid it draws as a layer. Its origin is resolved at projection time.
-    private var lastForwardedCursorGridId: Int64 = 0
+    /// A cursor box forwarded to the shared shader cursor state, in its
+    /// grid's own local pixels, so a window move can re-project it.
+    private struct ForwardedCursor {
+        /// Nil while the cursor is not on this view's grids.
+        var px: (minX: Float, maxX: Float, minY: Float, maxY: Float)?
+        var color: (Float, Float, Float, Float)?
+        /// This surface's root, or a grid it draws as a layer. Its origin is
+        /// resolved at projection time.
+        var gridId: Int64 = 0
+    }
+    /// The forward of the last committed bracket: what a window move
+    /// re-anchors. Under `lock`.
+    private var committedForwardedCursor = ForwardedCursor()
+    /// This bracket's forward, published by commitFlush and dropped by
+    /// cancelFlush, so a window move never re-anchors to a cursor the
+    /// committed vertices do not show. Core thread only.
+    private var stagedForwardedCursor: ForwardedCursor?
 
     override var drawLoopTraceName: String { "surface \(gridId)" }
 
@@ -732,6 +739,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     override var acceptsFileDrops: Bool { dropInsertsPath || !isDecoratedSurface }
     override var dropInsertsPath: Bool { gridId == ZonvieCore.cmdlineGridId }
     private var scrollbarTrackingArea: NSTrackingArea?
+    /// Whether the pointer was last seen over the scrollbar strip.
+    private var pointerOverScrollbarStrip = false
 
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
@@ -958,7 +967,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         glowTextures.intensityBuffer = nil
     }
 
-    private func hadRecentCommit(withinNs: UInt64) -> Bool {
+    override func hadRecentCommit(withinNs: UInt64) -> Bool {
         lock.lock()
         let t = lastCommitTime
         lock.unlock()
@@ -1162,6 +1171,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // follows: an abandoned bracket puts the owner back to what is on
         // screen, so the next bracket's clear from the true owner is accepted.
         cursorOwner.restoreStagedFromCommitted()
+        stagedForwardedCursor = nil
         // Only a bracket that acquired a row set left one half-written.
         if bracketOpen, rowWritePrepared, writeSetIndex >= 0 {
             rowSync.abandon(writeSetIndex)
@@ -1180,7 +1190,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     /// Commit flush — publish write set as the new committed state for draw().
     /// Called from core thread (thread-safe via lock).
-    func commitFlush() {
+    func commitFlush(publishedAtlasTexture: MTLTexture?) {
         guard isInFlush else { return }
         FrameTracer.trace(.commitFlush, seq: UInt32(truncatingIfNeeded: gridId))
         let hadContent = flushHadContent
@@ -1214,6 +1224,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             }
             committedExtent.commit(width: gridCols, height: gridRows)
             cursorOwner.commit()
+            if let forwarded = stagedForwardedCursor {
+                committedForwardedCursor = forwarded
+                stagedForwardedCursor = nil
+            }
             // Layers and the vertices they place become visible together.
             if let staged = pendingSurfaceLayers {
                 accumulateSurfaceLayerPlacementTravel(
@@ -1282,16 +1296,12 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // glyph new to this flush (one half of a ligature) then addressed a
             // texture the swap had made the back one. draw() takes the
             // reference under the lock with the set index.
-            // The texture this flush published, taken from the transaction
-            // that published it. This asked the MAIN renderer for its copy,
-            // which is the same object only because external surfaces commit
-            // after it; a full suite with the two compared under a
-            // precondition never saw them differ.
-            let committedAtlas = shared.committedAtlasTexture
+            // The texture this flush published, handed in by on_flush_end as
+            // the main surface's commit receives it.
             if publishedRows {
-                bufferSets[writeSetIndex].atlasTextureSnapshot = committedAtlas
+                bufferSets[writeSetIndex].atlasTextureSnapshot = publishedAtlasTexture
             } else {
-                bufferSets[committedSetIndex].atlasTextureSnapshot = committedAtlas
+                bufferSets[committedSetIndex].atlasTextureSnapshot = publishedAtlasTexture
             }
             // Merge the write set's staged scroll into the global accumulator.
             // Done here (under lock, after committedSetIndex update) so draw()
@@ -1440,18 +1450,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 sourceShift: 0,
                 retention: retention,
                 lock: lock,
-                bracketStagedGrids: &bracketStagedGrids
-            ) { cs, readRow, targetRow in
-                captureSurfaceRetainedRow(
-                    from: cs,
-                    gridId: id,
-                    readRow: readRow,
-                    targetRow: targetRow,
-                    cellHeightPx: capturedCellHeightPx,
-                    retention: retention,
-                    scrollableMask: ZONVIE_DECO_SCROLLABLE
-                )
-            }
+                bracketStagedGrids: &bracketStagedGrids,
+                cellHeightPx: capturedCellHeightPx
+            )
             // Seeding is decided by who compensates the scroll, not by which
             // path captured the rows: the root's capture here serves a
             // trackpad gesture (which compensates through the finger and owes
@@ -1483,7 +1484,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         rowsDelta: Int
     ) {
         guard GridSurfaceRenderer.smoothScrollEnabled else { return }
-        let capturedCellHeightPx = Float(shared.cellHeightPx)
         captureSurfaceLayerScrollStep(
             gridId: id,
             sets: sets,
@@ -1494,18 +1494,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             retention: retention,
             lock: lock,
             bracketStagedGrids: &bracketStagedGrids,
-            stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds
-        ) { cs, readRow, targetRow in
-            captureSurfaceRetainedRow(
-                from: cs,
-                gridId: id,
-                readRow: readRow,
-                targetRow: targetRow,
-                cellHeightPx: capturedCellHeightPx,
-                retention: retention,
-                scrollableMask: ZONVIE_DECO_SCROLLABLE
-            )
-        }
+            stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
+            cellHeightPx: Float(shared.cellHeightPx)
+        )
     }
 
 
@@ -1558,12 +1549,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             let steppedAtBracketOpen = bracketStagedGrids.contains(gridId)
             lock.unlock()
             if !steppedAtBracketOpen {
-                let rootId = gridId
-                let capturedCellHeightPx = Float(shared.cellHeightPx)
                 // The source set still holds the on-screen rows: this runs
                 // before the remap below.
                 captureSurfaceLayerScrollStep(
-                    gridId: rootId,
+                    gridId: gridId,
                     sets: bufferSets,
                     flushSourceSetIndex: flushSourceSetIndex,
                     rowStart: rowStart,
@@ -1572,18 +1561,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     retention: retention,
                     lock: lock,
                     bracketStagedGrids: &bracketStagedGrids,
-                    stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds
-                ) { cs, readRow, targetRow in
-                    captureSurfaceRetainedRow(
-                        from: cs,
-                        gridId: rootId,
-                        readRow: readRow,
-                        targetRow: targetRow,
-                        cellHeightPx: capturedCellHeightPx,
-                        retention: retention,
-                        scrollableMask: ZONVIE_DECO_SCROLLABLE
-                    )
-                }
+                    stagedSmoothScrollSeeds: &stagedSmoothScrollSeeds,
+                    cellHeightPx: Float(shared.cellHeightPx)
+                )
             }
         }
         flushHasStructuralRowChange = true
@@ -1722,11 +1702,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
         let isCursorUpdate = (flags & 2) != 0  // ZONVIE_VERT_UPDATE_CURSOR
         if isCursorUpdate {
-            if count == 0 && !cursorOwner.owns(gridId) {
+            guard cursorOwner.admit(gridId, count: count, rootRow: rowStart) else {
                 ZonvieCore.renderTrace("flush=\(renderTraceFlushId) event=cursor_ignore surface=\(gridId) grid=\(gridId) owner=\(cursorOwner.staged ?? 0) reason=empty_nonowner")
                 return
             }
-            cursorOwner.stage(gridId, rootRow: rowStart)
             lock.lock()
             cursorDirty = true
             lock.unlock()
@@ -1753,7 +1732,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // The cursor left this window: stop republishing its rect on
                 // window moves, or this view would keep overwriting whichever
                 // surface now owns the cursor.
-                lastForwardedCursorPx = nil
+                stagedForwardedCursor = ForwardedCursor()
             }
             return
         }
@@ -1898,10 +1877,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         var rect = zonvie_cursor_rect()
         guard zonvie_core_cursor_rect(ptr, count, 0, 0, &rect) else { return }
         let c = ptr[0].color
-        lastForwardedCursorPx = (minX: rect.left, maxX: rect.right, minY: rect.top, maxY: rect.bottom)
-        lastForwardedCursorColor = (c.0, c.1, c.2, c.3)
-        lastForwardedCursorGridId = cursorGridId
-        republishCursorShaderState()
+        let forwarded = ForwardedCursor(
+            px: (minX: rect.left, maxX: rect.right, minY: rect.top, maxY: rect.bottom),
+            color: (c.0, c.1, c.2, c.3),
+            gridId: cursorGridId
+        )
+        stagedForwardedCursor = forwarded
+        republishCursorShaderState(forwarded)
     }
 
     /// Project the last forwarded cursor box from this grid's local pixels
@@ -1914,9 +1896,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// either window changes that offset without producing a single new
     /// cursor vertex, which used to leave the cursor shader burning at the
     /// float's pre-move position until the next cursor update.
-    private func republishCursorShaderState(reanchor: Bool = false) {
-        guard let local = lastForwardedCursorPx,
-              let color = lastForwardedCursorColor else { return }
+    private func republishCursorShaderState(_ forwarded: ForwardedCursor? = nil, reanchor: Bool = false) {
+        let source: ForwardedCursor
+        if let forwarded {
+            source = forwarded
+        } else {
+            lock.lock()
+            source = committedForwardedCursor
+            lock.unlock()
+        }
+        guard let local = source.px, let color = source.color else { return }
         guard let mainView = mainTerminalView else { return }
         // Same screen-space parameters the shader uniforms use, so the
         // cursor rect lands in the same coordinate system the shader
@@ -1956,9 +1945,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // had of its own, the root layer's origin, is (0,0) by the core's
         // layout contract, which is what the resolve answers for the root.
         let cursorOrigin = resolveSurfaceCursorPlacement(
-            ownerGridId: lastForwardedCursorGridId,
+            ownerGridId: source.gridId,
             rootGridId: gridId,
-            layers: pendingSurfaceLayers ?? committedSurfaceLayers
+            layers: forwarded != nil ? (pendingSurfaceLayers ?? committedSurfaceLayers) : committedSurfaceLayers
         ).originPx
         lock.unlock()
         let leftPx = offX + vpOriginX + cursorOrigin.x + local.minX
@@ -1977,7 +1966,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // unset: the cursor shader state is shared with the main view (renderer
         // is mainView.renderer), so a default of "no grid" would switch the
         // main window's correction off too.
-        let owner = lastForwardedCursorGridId
+        let owner = source.gridId
         let rect = (leftPx, botPx, rightPx - leftPx, botPx - topPx)
         if reanchor {
             // Window move: no commit will come to publish a staged value, and
@@ -2002,12 +1991,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         drawableWidthPx: Int,
         rowHeightPx: Int,
         scroll: SurfaceRowScroll
-    ) -> (
-        clearTopPx: Int,
-        clearBottomPx: Int,
-        dirtyRows: Range<Int>,
-        clampedRowEnd: Int
-    )? {
+    ) -> RowScrollBlitPlan? {
         guard drawableWidthPx > 0, rowHeightPx > 0 else { return nil }
         guard let plan = RowScrollBlitPlan.make(
             rowStart: scroll.rowStart,
@@ -2036,35 +2020,45 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         }
         blit?.endEncoding()
 
-        return (plan.clearTopPx, plan.clearBottomPx, plan.dirtyRows, plan.clampedRowEnd)
+        return plan
     }
 
     /// The root rows a full-width scroll blit filled with hosted-layer pixels:
     /// every row a layer covers inside the scrolled region, and the rows those
-    /// pixels were dragged into. Grid-local rows, like the plan's own dirty
-    /// range. Appends without allocating while the caller's scratch keeps its
-    /// capacity; a surface holds a handful of layers at most.
+    /// pixels were dragged into. The core's rule (`overBlitRows`), which the
+    /// main surface's per-layer blit also asks; its `above` rows are not
+    /// needed, since `drawHostedLayers` redraws every layer row while a
+    /// scroll is pending. Appends without allocating while the caller's
+    /// scratch keeps its capacity; a surface holds a handful of layers at most.
     private func appendRowsDraggedByLayers(
         into rows: inout [Int],
-        regionStart: Int,
-        regionEnd: Int,
+        plan: RowScrollBlitPlan,
         rowsDelta: Int,
+        cellWidthPx: Int,
         rowHeightPx: Int
     ) {
-        guard rowHeightPx > 0, regionEnd > regionStart else { return }
+        guard rowHeightPx > 0 else { return }
+        var cPlan = plan.cValue
         for entry in layerSnapshot {
             let layer = entry.layer
             guard layer.rows > 0, layer.cols > 0 else { continue }
-            let topPx = Int(layer.originPx.y.rounded(.down))
-            let bottomPx = topPx + layer.rows * rowHeightPx
-            guard bottomPx > 0 else { continue }
-            let firstRow = max(regionStart, topPx / rowHeightPx)
-            let lastRow = min(regionEnd - 1, (bottomPx - 1) / rowHeightPx)
-            guard lastRow >= firstRow else { continue }
-            for row in firstRow...lastRow {
-                rows.append(row)
-                let dragged = row - rowsDelta
-                if dragged >= regionStart, dragged < regionEnd { rows.append(dragged) }
+            var over = zonvie_over_blit_rows()
+            guard zonvie_core_row_scroll_over_blit_rows(
+                &cPlan,
+                Int32(clamping: rowsDelta),
+                Int32(clamping: Int(layer.originPx.x.rounded(.down))),
+                Int32(clamping: Int(layer.originPx.y.rounded(.down))),
+                UInt32(clamping: layer.rows),
+                UInt32(clamping: layer.cols),
+                Int32(clamping: cellWidthPx),
+                Int32(clamping: rowHeightPx),
+                &over
+            ) else { continue }
+            if over.has_under != 0 {
+                rows.append(contentsOf: Int(over.under_first)...Int(over.under_last))
+            }
+            if over.has_shifted != 0 {
+                rows.append(contentsOf: Int(over.shifted_first)...Int(over.shifted_last))
             }
         }
     }
@@ -2103,6 +2097,19 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             guard shared.ensurePipelineReady(view: self),
                   let pipeline = shared.pipeline, let sampler = shared.sampler else {
                 ZonvieCore.appLog("[ExternalGridView] Pipeline not ready")
+                // Counted as idle, as on the main surface: a failed init
+                // otherwise keeps the loop waking every vsync. Once parked,
+                // only the surface that attempts the build is woken when it
+                // succeeds, so this one asks again on its own, one wake at a
+                // time.
+                notifyDrawIdle()
+                if !pipelineRetryScheduled {
+                    pipelineRetryScheduled = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        self?.pipelineRetryScheduled = false
+                        self?.requestRedraw()
+                    }
+                }
                 return
             }
 
@@ -2186,6 +2193,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 }
                 return
             }
+            // A frame the GPU failed left the back buffer undefined. Recorded
+            // before the semaphore was signalled, so the frame after it cannot
+            // get here first and `.load` it, as the main-queue hop allowed.
+            lock.lock()
+            let previousFrameFailed = gpuFrameFailed
+            gpuFrameFailed = false
+            lock.unlock()
+            if previousFrameFailed { hasPresentedOnce = false }
 
             // --- Snapshot committed state under lock (same pattern as GridSurfaceRenderer) ---
             let csi: Int
@@ -2249,14 +2264,18 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // Settled against THIS surface's commit, the way the main renderer
             // settles against its own; shared with it. Returns with `lock` held.
             var hasScrollOffset = false
-            // Before `lock`, for the shader cursor's debt below: a follower
-            // follows only the root (followsRootScroll).
-            let rootAnchorRowsUp = core?.scrollModel.anchorLandedRowsUpSnapshot(gridId) ?? 0
+            // For the shader cursor's debt below: a follower follows only the
+            // root (followsRootScroll). Read after serviceFrame, which lands a
+            // pending grid_scroll and bumps the count, so it pairs with the
+            // offset updateScrollShaderOffset publishes, as the body's
+            // hostedFloatDebtPx does.
+            var rootAnchorRowsUp = 0
             settleSurfaceAgainstOwnCommit(
                 lock: lock,
                 commitRevision: { self.commitRevision },
                 service: {
                     self.core?.scrollModel.serviceFrame()
+                    rootAnchorRowsUp = self.core?.scrollModel.anchorLandedRowsUpSnapshot(self.gridId) ?? 0
                     hasScrollOffset = self.updateScrollShaderOffset()
                 }
             )
@@ -2348,6 +2367,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // mask lets shifted content bleed through an omitted float, and
             // clearing the mask alone left every offset applied unmasked.
             let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(layers: committedSurfaceLayers, rootGridId: gridId)
+            drewWithoutScrollTransform = fixedFloatOverflow
             scrollOffsetSnapshot = scrollOffsetLatch.isActive && !fixedFloatOverflow ? scrollOffsetData : nil
             hostedScrollOffsetSnapshot = fixedFloatOverflow ? [] : hostedScrollOffsetData  // Value-type copy
             // And no retained rows: they are drawn only beside an offset that
@@ -2609,14 +2629,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             if idleGateSkips {
                 FrameTracer.trace(.drawSkipNoChange, a: 2, seq: UInt32(truncatingIfNeeded: gridId))
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) idle")
-                if drawLoopIdleCounter.noteIdle(
-                    hadRecentCommit: hadRecentCommit(withinNs: 50_000_000),
-                    heldActive: core?.keyInput.synthesisHeld(by: self) == true) {
-                    deactivateSurfaceDrawLoop()
-                }
+                notifyDrawIdle()
                 return
             }
-            drawLoopIdleCounter.noteActive()
+            notifyDrawActive()
 
             // The main surface's blink gate. Measured on two idle external
             // windows over 25 s with the cursor parked in the main window: 118
@@ -2636,11 +2652,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             if blinkOnlyWithNoCursor {
                 FrameTracer.trace(.drawSkipNoChange, a: 4, seq: UInt32(truncatingIfNeeded: gridId))
                 ZonvieCore.appLog("[ext_draw_early_exit] gridId=\(gridId) blink-no-cursor")
-                if drawLoopIdleCounter.noteIdle(
-                    hadRecentCommit: hadRecentCommit(withinNs: 50_000_000),
-                    heldActive: core?.keyInput.synthesisHeld(by: self) == true) {
-                    deactivateSurfaceDrawLoop()
-                }
+                notifyDrawIdle()
                 return
             }
 
@@ -2876,9 +2888,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     // every row of it while a scroll is pending.
                     appendRowsDraggedByLayers(
                         into: &dirtyRows,
-                        regionStart: scroll.rowStart,
-                        regionEnd: scrollCopy.clampedRowEnd,
+                        plan: scrollCopy,
                         rowsDelta: scroll.rowsDelta,
+                        cellWidthPx: Int(cellWi),
                         rowHeightPx: Int(cellHi)
                     )
                 } else {
@@ -3527,17 +3539,18 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // above, for the same reason: the signal has to fire even if the
             // view is deallocated before the GPU finishes.
             cmd.addCompletedHandler { [weak self] completed in
+                let failed = completed.status != .completed
                 tbLock.lock()
                 self?.completeSurfaceFrameReadLocked(rowSet: csi, cursorSlot: cci)
+                if failed { self?.gpuFrameFailed = true }
                 tbLock.unlock()
                 sem.signal()
                 // Paired with beginExternalRead() at atlas-bind time
                 // above. Uses the strongly-captured atlasReadRenderer, not
                 // [weak self] — see its declaration comment for why.
                 atlasReader.endExternalRead()
-                if completed.status != .completed {
+                if failed {
                     DispatchQueue.main.async { [weak self] in
-                        self?.hasPresentedOnce = false
                         self?.requestRedraw()
                     }
                 }
@@ -3553,7 +3566,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             // Only when there is a scrollbar, as the main surface's flush path
             // does: this hop ran on every presented frame of an animation.
-            if ZonvieConfig.shared.scrollbar.enabled {
+            if ZonvieConfig.shared.scrollbar.enabled && hostsScrollbar {
                 DispatchQueue.main.async { [weak self] in
                     self?.updateScrollbarIfNeeded()
                 }
@@ -3806,6 +3819,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     // MARK: - Mouse Input
 
+    /// Set by the last draw when more fixed floats than the mask holds made it
+    /// drop the scroll transform. Main thread only (draw and input).
+    private var drewWithoutScrollTransform = false
+
+    /// The ease offset the last frame drew `grid` with: none at all on a
+    /// frame that dropped the scroll transform.
+    private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat, scroll: SessionScrollModel) -> CGFloat {
+        drewWithoutScrollTransform ? 0 : scroll.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH)
+    }
+
     /// Which grid a pointer event at `pointPx` (surface content pixels,
     /// top-origin) targets, and the point in that grid's own cells. A float
     /// this surface hosts sits above the root, so it takes the event wherever
@@ -3832,7 +3855,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
 
         let grids = core?.getVisibleGridsCached() ?? []
-        let rootOffsetPx = scroll.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
+        let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
 
         lock.lock()
         let layers = committedSurfaceLayers
@@ -3883,7 +3906,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         cellH: CGFloat,
         scroll: SessionScrollModel
     ) -> (x: CGFloat, y: CGFloat, ownOffsetPx: CGFloat)? {
-        let ownOffsetPx = scroll.visualScrollOffsetPx(gridId: layer.gridId, cellHeightPx: cellH)
+        let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH, scroll: scroll)
         let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
                                              rootOffsetPx: rootOffsetPx, cellH: cellH)
         let x = pointPx.x - CGFloat(layer.originPx.x)
@@ -3913,7 +3936,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         rootOffsetPx: CGFloat,
         cellH: CGFloat
     ) -> CGFloat {
-        guard ownOffsetPx == 0, followsRootScroll(anchorGrid: layer.anchorGrid, followsScroll: layer.followsScroll) else {
+        guard !drewWithoutScrollTransform, ownOffsetPx == 0,
+              followsRootScroll(anchorGrid: layer.anchorGrid, followsScroll: layer.followsScroll) else {
             return CGFloat(layer.originPx.y)
         }
         let debtPx = hostedFloatDebtPx(
@@ -3958,7 +3982,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// selection by the float's placement; the release must not re-choose it
     /// either, or letting go outside the float ends the selection in the window
     /// behind it. Windows keeps the same pin (app.mouse_press_grid_id).
-    private var pressGridId: Int64?
+    private var pressGridId = SurfacePressPin<Int64>()
 
     /// Rebase a surface point into the grid a press already chose, using that
     /// layer's CURRENT drawn origin so a float that moves mid-drag keeps
@@ -3979,8 +4003,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         lock.unlock()
         guard let layer else { return resolveRootTarget(pointPx: pointPx) }
 
-        let rootOffsetPx = scroll.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
-        let ownOffsetPx = scroll.visualScrollOffsetPx(gridId: pressed, cellHeightPx: cellH)
+        let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
+        let ownOffsetPx = drawnScrollOffsetPx(pressed, cellH: cellH, scroll: scroll)
         let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
                                              rootOffsetPx: rootOffsetPx, cellH: cellH)
         let info = core?.getVisibleGridsCached().first { $0.gridId == pressed }
@@ -4002,7 +4026,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         let cellH = CGFloat(shared.cellHeightPx)
         guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
         let info = core?.getVisibleGridsCached().first { $0.gridId == gridId }
-        let offsetPx = scroll.visualScrollOffsetPx(gridId: gridId, cellHeightPx: cellH)
+        let offsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
         return (gridId, scrolledRow(pointPx.y, offsetPx: offsetPx, cellH: cellH, info: info),
                 Int32((pointPx.x / cellW).rounded(.down)))
     }
@@ -4016,12 +4040,13 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // window underneath instead. The drag and release that follow stay on
         // the grid the press chose -- see pressGridId.
         let target: (gridId: Int64, row: Int32, col: Int32)
+        let pressed = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
         if action == "press" {
-            target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
-            pressGridId = target.gridId
-        } else if let pressed = pressGridId {
+            let hit = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
+            target = hit
+            pressGridId.press(button: button) { hit.gridId }
+        } else if let pressed {
             target = rebaseToPressGrid(pointPx: pointPx, pressed: pressed)
-            if action == "release" { pressGridId = nil }
         } else {
             target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
         }
@@ -4236,11 +4261,28 @@ extension ExternalGridView {
 
     override func mouseEntered(with event: NSEvent) {
         if hoverScrollbarEnabled {
-            if pointerIsOverScrollbarStrip(event) {
-                showScrollbar()
-            }
+            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
         }
         super.mouseEntered(with: event)
+    }
+
+    /// Show and hide only on the pointer crossing the strip, and never hide a
+    /// bar "scroll" mode showed: its own delay hides it. Windows'
+    /// scrollbar.hover/leave rule; hiding on every move off the strip faded a
+    /// scroll-shown bar at the first nudge of the mouse.
+    private func updateScrollbarHover(overStrip: Bool) {
+        // Every move over the strip re-shows: a "scroll" mode delay started by
+        // show() would otherwise fade the bar under a pointer resting on it.
+        if overStrip {
+            pointerOverScrollbarStrip = true
+            showScrollbar()
+            return
+        }
+        guard pointerOverScrollbarStrip else { return }
+        pointerOverScrollbarStrip = false
+        if !ZonvieConfig.shared.scrollbar.isScroll {
+            hideScrollbar()
+        }
     }
 
     /// Whether this surface shows its scrollbar on hover. Three pointer
@@ -4260,18 +4302,14 @@ extension ExternalGridView {
 
     override func mouseExited(with event: NSEvent) {
         if hoverScrollbarEnabled {
-            hideScrollbar()
+            updateScrollbarHover(overStrip: false)
         }
         super.mouseExited(with: event)
     }
 
     override func mouseMoved(with event: NSEvent) {
         if hoverScrollbarEnabled {
-            if pointerIsOverScrollbarStrip(event) {
-                showScrollbar()
-            } else {
-                hideScrollbar()
-            }
+            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
         }
         super.mouseMoved(with: event)
     }

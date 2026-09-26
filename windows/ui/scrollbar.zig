@@ -5,7 +5,6 @@ const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const input = @import("../input.zig");
-const callbacks = @import("../callbacks.zig");
 
 pub const ViewportRead = enum { fresh, cached, none };
 
@@ -135,7 +134,7 @@ fn repaintTrack(app: *App, sf: Surface) void {
 }
 
 pub fn geometry(app: *App, sf: Surface, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
-    return scrollbarGeometryFor(app, scrollbarGrid(app, sf.root_grid), client_width, client_height, sf.dpi_scale, sf.top_offset_px);
+    return scrollbarGeometryFor(app, scrollbarGrid(app, sf), client_width, client_height, sf.dpi_scale, sf.top_offset_px);
 }
 
 /// The track and knob quads at `alpha` (a paint passes the alpha it
@@ -241,12 +240,14 @@ fn scrollbarGeometryFor(
 /// otherwise — because both frontends were asking for -1 on the main window
 /// and following a scroll in a window they do not draw.
 ///
-/// Falls back to the surface's own root when the core's grid lock is held,
-/// which is the same grid the knob is already showing.
-fn scrollbarGrid(app: *App, surface_id: i64) i64 {
-    const corep = app.corep orelse return surface_id;
-    var grid: i64 = surface_id;
-    if (app_mod.zonvie_core_try_scrollbar_grid(corep, surface_id, &grid) == 0) return surface_id;
+/// Keeps the grid it last answered while the core's grid lock is held (as
+/// macOS does): the main root, grid 1, has no viewport of its own.
+fn scrollbarGrid(app: *App, sf: Surface) i64 {
+    const fallback = if (sf.state.last_grid != 0) sf.state.last_grid else sf.root_grid;
+    const corep = app.corep orelse return fallback;
+    var grid: i64 = sf.root_grid;
+    if (app_mod.zonvie_core_try_scrollbar_grid(corep, sf.root_grid, &grid) == 0) return fallback;
+    sf.state.last_grid = grid;
     return grid;
 }
 
@@ -365,7 +366,7 @@ pub fn hitTest(app: *App, sf: Surface, client_width: i32, client_height: i32, mo
 /// surface hosts pages too; grid -1 would be the cursor's window.
 pub fn pageScroll(app: *App, sf: Surface, direction: i8) void {
     const corep = app.corep orelse return;
-    app_mod.zonvie_core_page_scroll(corep, scrollbarGrid(app, sf.root_grid), direction > 0);
+    app_mod.zonvie_core_page_scroll(corep, scrollbarGrid(app, sf), direction > 0);
 }
 
 pub fn mouseDown(app: *App, sf: Surface, mouse_x: i32, mouse_y: i32) bool {
@@ -414,7 +415,7 @@ pub fn mouseMove(app: *App, sf: Surface, mouse_y: i32) void {
     const geom = geometry(app, sf, client.right, client.bottom);
     if (!geom.is_scrollable) return;
 
-    const grid = scrollbarGrid(app, sf.root_grid);
+    const grid = scrollbarGrid(app, sf);
     var vp: app_mod.ViewportInfo = undefined;
     if (getViewportNonBlocking(app, grid, &vp) == .none) return;
     if (vp.botline - vp.topline <= 0) return;
@@ -436,9 +437,26 @@ pub fn mouseMove(app: *App, sf: Surface, mouse_y: i32) void {
     st.pending_use_bottom = drag.use_bottom != 0;
 
     const now: i64 = @intCast(c.GetTickCount64());
-    if (now - st.last_scroll_time < app_mod.SCROLLBAR_THROTTLE_MS) return;
+    const wait_ms = app_mod.SCROLLBAR_THROTTLE_MS - (now - st.last_scroll_time);
+    if (wait_ms > 0) {
+        // Trailing send, so a pause mid-drag still lands where the knob is.
+        _ = c.SetTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_DRAG_FLUSH, @intCast(wait_ms), null);
+        return;
+    }
     st.last_scroll_time = now;
     app_mod.zonvie_core_scroll_to_line(corep, grid, st.pending_line, st.pending_use_bottom);
+    st.pending_line = -1;
+}
+
+/// Send the drag position the throttle held back, if any.
+fn flushPendingDrag(app: *App, sf: Surface) void {
+    const st = sf.state;
+    _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_DRAG_FLUSH);
+    if (st.pending_line < 0) return;
+    if (app.corep) |corep| {
+        app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, sf), st.pending_line, st.pending_use_bottom);
+        st.last_scroll_time = @intCast(c.GetTickCount64());
+    }
     st.pending_line = -1;
 }
 
@@ -446,12 +464,7 @@ pub fn mouseUp(app: *App, sf: Surface) void {
     const st = sf.state;
     if (st.dragging) {
         // Send the position the throttle held back before releasing.
-        if (st.pending_line >= 0) {
-            if (app.corep) |corep| {
-                app_mod.zonvie_core_scroll_to_line(corep, scrollbarGrid(app, sf.root_grid), st.pending_line, st.pending_use_bottom);
-            }
-            st.pending_line = -1;
-        }
+        flushPendingDrag(app, sf);
         st.dragging = false;
         _ = c.ReleaseCapture();
     }
@@ -471,6 +484,7 @@ pub fn cancelPointer(sf: Surface) void {
     if (st.dragging) {
         st.dragging = false;
         st.pending_line = -1;
+        _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_DRAG_FLUSH);
     }
     if (st.repeat_timer != 0 or st.repeat_dir != 0) {
         _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
@@ -567,6 +581,8 @@ pub fn onTimer(app: *App, sf: Surface, timer_id: usize) bool {
             _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
             st.repeat_timer = c.SetTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_REPEAT, app_mod.SCROLLBAR_REPEAT_INTERVAL, null);
         }
+    } else if (timer_id == app_mod.TIMER_SCROLLBAR_DRAG_FLUSH) {
+        if (st.dragging) flushPendingDrag(app, sf) else _ = c.KillTimer(sf.hwnd, timer_id);
     } else if (timer_id == app_mod.TIMER_SCROLLBAR_AUTOHIDE) {
         _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_AUTOHIDE);
         st.hide_timer = 0;
@@ -579,42 +595,28 @@ pub fn onTimer(app: *App, sf: Surface, timer_id: usize) bool {
 pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
     if (!app.config.scrollbar.enabled) return;
 
-    const corep = app.corep;
-    if (corep == null) return;
+    if (app.corep == null) return;
 
-    // When the cursor is in a grid an external window shows (its root or a
-    // float it hosts), that window's scrollbar is the one this update is
-    // for; the main window scrollbar only reflects grids composited on the
-    // main window. macOS updates both views after every flush.
-    // Non-blocking: on lock contention this serves the cached position; a
-    // cold cache (-1) simply falls through to the main-window update below.
-    var cur_row: i32 = 0;
-    var cur_col: i32 = 0;
-    var cursor_stale = false;
-    const cursor_grid = input.getCursorPositionNonBlocking(app, corep.?, &cur_row, &cur_col, &cursor_stale);
-    const cursor_ext = blk: {
-        if (cursor_grid <= 1) break :blk null;
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        break :blk callbacks.externalWindowShowingGridLocked(app, cursor_grid);
-    };
-    if (cursor_ext) |shown| {
-        if (cursor_stale) {
-            // The cached "on an external grid" position may predate the
-            // flush that posted this one-shot WM_APP_UPDATE_SCROLLBAR; the
-            // cursor may already be back on the main grid. Retry shortly
-            // instead of silently dropping the update. Deliberately not
-            // re-posted on SetTimer failure: the message would re-enter this
-            // handler with no delay, and the condition that fails SetTimer
-            // (USER handle pressure) persists, so it spins the message loop
-            // ahead of WM_PAINT. Losing one cosmetic update is milder.
-            _ = c.SetTimer(hwnd, app_mod.TIMER_SCROLLBAR_RETRY, app_mod.LOCK_RETRY_INTERVAL_MS, null);
-            return;
-        }
-        updateSurface(hwnd, app, externalSurface(shown.win, shown.root_grid_id));
-        return;
-    }
+    // Every surface, as macOS updates every view after a flush: a viewport
+    // can move in a window the cursor is not in (scrollbind, :windo). Each
+    // surface's grid is the core's answer (scrollbarGrid), and updateSurface
+    // acts only on a viewport change.
     updateSurface(hwnd, app, mainSurface(hwnd, app));
+    var i: usize = 0;
+    while (nthExternalSurface(app, i)) |sf| : (i += 1) updateSurface(hwnd, app, sf);
+}
+
+/// The i-th external window's surface. app.mu is not held across
+/// updateSurface, which takes it itself.
+fn nthExternalSurface(app: *App, i: usize) ?Surface {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    var it = app.external_windows.iterator();
+    var n: usize = 0;
+    while (it.next()) |entry| : (n += 1) {
+        if (n == i) return externalSurface(entry.value_ptr.*, entry.key_ptr.*);
+    }
+    return null;
 }
 
 /// Show or hide one surface's bar for the viewport its grid shows now.
@@ -622,7 +624,7 @@ pub fn updateScrollbar(hwnd: c.HWND, app: *App) void {
 /// re-enters updateScrollbar.
 fn updateSurface(retry_hwnd: c.HWND, app: *App, sf: Surface) void {
     var vp: app_mod.ViewportInfo = undefined;
-    switch (getViewportNonBlocking(app, scrollbarGrid(app, sf.root_grid), &vp)) {
+    switch (getViewportNonBlocking(app, scrollbarGrid(app, sf), &vp)) {
         .fresh => {},
         .none => return,
         .cached => {

@@ -129,6 +129,18 @@ fn runPhase(
             std.debug.print("[gui] the burst did not coalesce into a multi-row shift\n", .{});
             return error.ScrollHintNotCoalesced;
         }
+        // The hint line is logged for every hint, before the draw decides
+        // whether to blit, and a refused hint repaints to the same screen. So
+        // require an ACCEPTED blit, as scrollbind_layers_blit_matches_jump
+        // does. Only here: a one-row step seeds the ease, and an eased frame
+        // refuses the blit by design ("smooth"), so the single phase may
+        // legitimately blit nothing.
+        const blits = try app_log.countLinesSince(alloc, log_path, "[layer_blit] gridId=", t_scroll);
+        std.debug.print("[gui] continuous_j_scroll_matches_jump[burst]: blits accepted {d} (need 1)\n", .{blits});
+        if (blits == 0) {
+            std.debug.print("[gui] every shift was refused by the draw; the blit this guards never ran\n", .{});
+            return error.ScrollBlitDidNotRun;
+        }
     } else {
         // A held key's single-row steps must also seed the smooth-scroll ease,
         // or each row lands as a jump instead of easing in. The seed is staged

@@ -75,31 +75,6 @@ const margin_hit_threshold: usize = 3;
 
 const max_windows = 16;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.FloatWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 /// Rows of the capture the margin occupies, derived from what the app
 /// reports rather than assumed: the grid is the bottom `vpH` pixels of the
 /// capture (the rest is window chrome), and the margin is `marginTop`
@@ -132,12 +107,14 @@ fn marginBand(alloc: std.mem.Allocator, capture_h: usize, since_ms: f64) !Margin
     const chrome = @as(f64, @floatFromInt(capture_h)) - drawable_h;
     if (chrome < 0) return error.CaptureSmallerThanDrawable;
     const grid_top = chrome + vp_origin_y * 2.0;
+    // Round, don't truncate, as the main twins do: cell_h carries float fuzz,
+    // and truncation pulls a boundary one pixel into the content side.
     return .{
-        .start = @intFromFloat(grid_top),
-        .end = @intFromFloat(grid_top + margin_top * cell_h),
-        .bottom_start = @intFromFloat(grid_top + vp_h - margin_bottom * cell_h),
-        .grid_end = @intFromFloat(grid_top + vp_h),
-        .drawable_end = @intFromFloat(chrome + drawable_h),
+        .start = @intFromFloat(@round(grid_top)),
+        .end = @intFromFloat(@round(grid_top + margin_top * cell_h)),
+        .bottom_start = @intFromFloat(@round(grid_top + vp_h - margin_bottom * cell_h)),
+        .grid_end = @intFromFloat(@round(grid_top + vp_h)),
+        .drawable_end = @intFromFloat(@round(chrome + drawable_h)),
     };
 }
 
@@ -218,7 +195,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_win_set_cursor(_G.e2e_float, {40, 0}) " ++
             "return 1 end)()')",
     );
-    const opened = try waitNewWindow(g.app_pid, before, 150);
+    const opened = try driver.waitNewWindow(g.app_pid, before, 150);
     if (!platform.moveWindowBySize(g.app_pid, opened.bounds.w, opened.bounds.h, 60, 60)) {
         return error.MoveFailed;
     }
@@ -227,7 +204,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // way a user drag-resize does. The grid snaps to whole rows, so the
     // remainder is a strip the grid never covers — a structure the main
     // window does not have, since its grid fills its view.
-    const parked = try waitNewWindow(g.app_pid, before, 150);
+    const parked = try driver.waitNewWindow(g.app_pid, before, 150);
     if (!platform.setWindowSizeBySize(
         g.app_pid,
         parked.bounds.w,
@@ -236,7 +213,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         parked.bounds.h + 15,
     )) return error.ResizeFailed;
     gui_io.sleepNs(700 * std.time.ns_per_ms);
-    const float_win = try waitNewWindow(g.app_pid, before, 150);
+    const float_win = try driver.waitNewWindow(g.app_pid, before, 150);
 
     const t0 = try app_log.nowMs(alloc, log_path);
 

@@ -85,13 +85,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     );
     try g.waitWindowCount(base_windows + 1, 10_000);
 
-    const ext_grid: i64 = blk: {
-        const line = (try app_log.lastLineSince(alloc, log_path, "[external_window] open gridId=", 0)) orelse
-            return error.NoExternalWindowOpened;
-        defer alloc.free(line);
-        const v = app_log.field(line, "gridId") orelse return error.ExternalGridIdUnparsable;
-        break :blk @intFromFloat(v);
-    };
+    const ext_grid = try app_log.externalWindowGrid(alloc, log_path, 0);
 
     // The cursor goes back to the main window. The external surface now has
     // nothing to blink, and every toggle it is woken for is a wasted frame.

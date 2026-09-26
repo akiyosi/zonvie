@@ -45,31 +45,6 @@ const tolerance_px: f64 = 2;
 
 const max_windows = 16;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.FloatWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 /// Wait for the app to publish a shader cursor rect after `since_ms` and
 /// return its x/y in drawable pixels.
 fn waitCursorRect(alloc: std.mem.Allocator, since_ms: f64, timeout_ms: u64) !struct { x: f64, y: f64 } {
@@ -115,7 +90,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_create_buf(false, true), true, " ++
             "{external=true, width=40, height=12}) return 1 end)()')",
     );
-    const float_win = try waitNewWindow(g.app_pid, before, 100);
+    const float_win = try driver.waitNewWindow(g.app_pid, before, 100);
 
     // Park it somewhere known and fully on screen before measuring.
     const start_x: f64 = 80;

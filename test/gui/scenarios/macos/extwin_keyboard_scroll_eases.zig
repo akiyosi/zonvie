@@ -46,26 +46,6 @@ const min_offset_frames = 3;
 
 const max_windows = 16;
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        var buf: [max_windows]platform.MainWindow = undefined;
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        outer: for (now) |w| {
-            for (before) |b| {
-                if (b.number == w.number) continue :outer;
-            }
-            if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-            return w;
-        }
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 /// A burst of keys arriving faster than one ease settles. The offsets they
 /// seed have to STACK: the row a key scrolls is compensated whether or not the
 /// previous row has finished easing, so a re-seed must land while the offset
@@ -172,7 +152,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_win_set_cursor(_G.e2e_extwin, {200, 0}) " ++
             "return 1 end)()')",
     );
-    const extwin = try waitNewWindow(g.app_pid, before, 150);
+    const extwin = try driver.waitNewWindow(g.app_pid, before, 150);
     // Let the window settle so the first key is not racing its first frames.
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 

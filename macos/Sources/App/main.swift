@@ -237,7 +237,7 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
             [performance]
                 glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
                 glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                hl_cache_size               Highlight cache size (64-2048, default: 512)
+                hl_cache_size               Highlight cache size (64-2048, default: 2048)
 
         For more information, visit: https://github.com/akiyosi/zonvie
         """

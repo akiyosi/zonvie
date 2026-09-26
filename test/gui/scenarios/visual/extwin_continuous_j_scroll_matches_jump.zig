@@ -53,62 +53,6 @@ const steps: usize = 14;
 const ext_rows: i64 = 18;
 const ext_cols: i64 = 60;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
-/// captureStable for a window that is not the app's main one: retry until two
-/// consecutive captures are pixel-identical, so a frame caught mid-present is
-/// never what a comparison sees.
-fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
-    var timer = gui_io.Timer.start();
-    var prev: ?capture.Image = null;
-    defer if (prev) |*p| p.deinit(alloc);
-    while (true) {
-        gui_io.sleepNs(150 * std.time.ns_per_ms);
-        const cur = capture.captureWindow(alloc, window_number) catch |e| {
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-            continue;
-        };
-        if (prev) |*p| {
-            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                p.deinit(alloc);
-                prev = null;
-                return cur;
-            }
-            p.deinit(alloc);
-            prev = null;
-        }
-        prev = cur;
-        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-            const out = prev.?;
-            prev = null;
-            return out; // last capture even if not fully settled
-        }
-    }
-}
-
 /// The window minus the scrollbar strip on its right edge, which fades on its
 /// own clock and would register as a difference the scroll did not cause.
 fn bodyRegion(img: capture.Image) visual.Region {
@@ -171,12 +115,12 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ ext_cols, ext_rows },
     );
     try g.exec(open_cmd);
-    const ext_win = try waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     // Start with the cursor on the last visible row, so every `j` scrolls.
     try g.exec("execute('normal! 100GztL')");
-    var start = try captureWindowStable(alloc, ext_win.number, 8000);
+    var start = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer start.deinit(alloc);
 
     const topline_before = try g.evalInt("line('w0')");
@@ -190,7 +134,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         try g.remoteSend("j");
     }
 
-    var scrolled = try captureWindowStable(alloc, ext_win.number, 8000);
+    var scrolled = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer scrolled.deinit(alloc);
     if (scrolled.w != start.w or scrolled.h != start.h) return error.ExternalWindowResized;
 
@@ -231,7 +175,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // Land somewhere else first so the jump is not a no-op that leaves the
     // scrolled screen in place.
     try g.exec("execute('normal! 1Gzt0')");
-    var settled = try captureWindowStable(alloc, ext_win.number, 8000);
+    var settled = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     settled.deinit(alloc);
 
     var jump_buf: [96]u8 = undefined;
@@ -241,7 +185,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ topline_after, cursor_after },
     );
     try g.exec(jump);
-    var jumped = try captureWindowStable(alloc, ext_win.number, 8000);
+    var jumped = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer jumped.deinit(alloc);
     if (jumped.w != scrolled.w or jumped.h != scrolled.h) return error.ExternalWindowResized;
 

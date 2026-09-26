@@ -392,41 +392,34 @@ final class SharedRenderResources {
         // time in seconds" without specifying month indexing. Forward
         // Calendar's .month component verbatim (already 1..12), which
         // matches the most common interpretation.
-        // Recomputed at most once per wall-clock second (see
-        // shaderDateCache doc above) -- effects using iDate don't need
-        // finer than 1s granularity.
+        // The components are recomputed at most once per wall-clock second
+        // (see shaderDateCache doc above); the sub-second part of .w is added
+        // every frame, so it runs continuously as on Windows rather than in
+        // 1s steps.
         let wallDate = Date()
-        let wallSecond = Int(wallDate.timeIntervalSince1970)
+        let wallTime = wallDate.timeIntervalSince1970
+        let wallSecond = Int(wallTime)
         if wallSecond != shaderDateCacheSecond {
             shaderDateCacheSecond = wallSecond
             let comp = shaderDateCalendar.dateComponents(
-                [.year, .month, .day, .hour, .minute, .second, .nanosecond],
+                [.year, .month, .day, .hour, .minute, .second],
                 from: wallDate
             )
             let secsInDay: Float =
                 Float(comp.hour ?? 0) * 3600.0 +
                 Float(comp.minute ?? 0) * 60.0 +
-                Float(comp.second ?? 0) +
-                Float(comp.nanosecond ?? 0) / 1_000_000_000.0
+                Float(comp.second ?? 0)
             shaderDateCache = (Float(comp.year ?? 0), Float(comp.month ?? 1), Float(comp.day ?? 0), secsInDay)
         }
         uniforms.iDate.0 = shaderDateCache.year
         uniforms.iDate.1 = shaderDateCache.month
         uniforms.iDate.2 = shaderDateCache.day
-        uniforms.iDate.3 = shaderDateCache.secsInDay
+        uniforms.iDate.3 = shaderDateCache.secsInDay + Float(wallTime - Double(wallSecond))
         // iMouse unimplemented on macOS — stays zero.
 
         state.frameIndex &+= 1
         return uniforms
     }
-
-    /// The front texture this flush published, which every surface's committed
-    /// vertices address. Written here, where the swap happens, and read by the
-    /// surfaces as they commit — all on the core thread, inside the flush.
-    ///
-    /// ExternalGridView used to ask the MAIN renderer for its copy of this,
-    /// which worked only because external surfaces commit after it.
-    private(set) var committedAtlasTexture: MTLTexture?
 
     /// Close the transaction: publish this flush's staged CPU pixels, then swap
     /// the front texture the UVs address. Both halves, because a caller that
@@ -440,7 +433,6 @@ final class SharedRenderResources {
         guard commit.committed else {
             return .deferred("atlas back-sync still pending or failed")
         }
-        committedAtlasTexture = commit.texture
         return .published(texture: commit.texture)
     }
 
@@ -671,9 +663,11 @@ final class SurfaceShaderCursor {
         current = (current.0 + dx, current.1 + dy, current.2, current.3)
         previous = (previous.0 + dx, previous.1 + dy, previous.2, previous.3)
         // A cursor update that arrived during the drag is still waiting for a
-        // commit; move it too, or the commit would undo this re-anchor.
+        // commit; move it by the same distance, or the commit would undo this
+        // re-anchor. Shifted, not replaced: it may name a newer position than
+        // the committed one `rect` projects.
         staged.update { s in
-            if s.gridId == grid { s.rect = rect }
+            if s.gridId == grid { s.rect = (s.rect.0 + dx, s.rect.1 + dy, s.rect.2, s.rect.3) }
         }
     }
 

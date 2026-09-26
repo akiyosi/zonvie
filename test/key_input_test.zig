@@ -367,6 +367,28 @@ test "Windows function keys format as <Fn> instead of sending nothing" {
     }
 }
 
+test "F13 and above reach Neovim on both platforms" {
+    // kVK_F13..kVK_F20 from Carbon Events.h (non-contiguous), reported by
+    // AppKit as NSF13FunctionKey (U+F710) onward. Not hardware-confirmed.
+    const mac = [_]struct { code: u32, name: []const u8, chars: []const u8 }{
+        .{ .code = 105, .name = "<F13>", .chars = "\u{F710}" },
+        .{ .code = 107, .name = "<F14>", .chars = "\u{F711}" },
+        .{ .code = 113, .name = "<F15>", .chars = "\u{F712}" },
+        .{ .code = 106, .name = "<F16>", .chars = "\u{F713}" },
+        .{ .code = 64, .name = "<F17>", .chars = "\u{F714}" },
+        .{ .code = 79, .name = "<F18>", .chars = "\u{F715}" },
+        .{ .code = 80, .name = "<F19>", .chars = "\u{F716}" },
+        .{ .code = 90, .name = "<F20>", .chars = "\u{F717}" },
+    };
+    for (mac) |k| try expectKeyFormat(k.name, k.code, 0, k.chars, k.chars);
+
+    const names = [_][]const u8{ "<F13>", "<F14>", "<F15>", "<F16>", "<F17>", "<F18>", "<F19>", "<F20>", "<F21>", "<F22>", "<F23>", "<F24>" };
+    for (names, 0..) |name, i| {
+        // VK_F13 = 0x7C, contiguous through VK_F24 = 0x87.
+        try expectKeyFormat(name, WIN_VK_FLAG | (0x7C + @as(u32, @intCast(i))), 0, "", "");
+    }
+}
+
 test "modifiers compose with function keys on both platforms" {
     // Shift alone is not `has_mod`, so <S-F1> proves the table row is what
     // carries the key rather than the modifier branch.
@@ -377,6 +399,12 @@ test "modifiers compose with function keys on both platforms" {
     // Alt+F4 reaches Neovim as a key rather than being swallowed. Whether the
     // OS should close the window instead is a separate product question.
     try expectKeyFormat("<M-F4>", WIN_VK_FLAG | 0x73, MOD_ALT, "", "");
+}
+
+test "macOS keypad Enter sends <CR> like Windows VK_RETURN" {
+    // kVK_ANSI_KeypadEnter = 76; AppKit's characters are U+0003.
+    try expectKeyFormat("<CR>", 76, 0, "\x03", "\x03");
+    try expectKeyFormat("<CR>", WIN_VK_FLAG | 0x0D, 0, "", "");
 }
 
 test "Insert is named on Windows and deliberately absent on macOS" {

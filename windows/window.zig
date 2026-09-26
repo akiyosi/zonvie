@@ -730,7 +730,6 @@ const WM_APP_CLIPBOARD_GET = app_mod.WM_APP_CLIPBOARD_GET;
 const WM_APP_CLIPBOARD_SET = app_mod.WM_APP_CLIPBOARD_SET;
 const WM_APP_SSH_AUTH_PROMPT = app_mod.WM_APP_SSH_AUTH_PROMPT;
 const WM_APP_UPDATE_SCROLLBAR = app_mod.WM_APP_UPDATE_SCROLLBAR;
-const WM_APP_UPDATE_EXT_FLOAT_POS = app_mod.WM_APP_UPDATE_EXT_FLOAT_POS;
 const WM_APP_TRAY = app_mod.WM_APP_TRAY;
 const WM_APP_UPDATE_CURSOR_BLINK = app_mod.WM_APP_UPDATE_CURSOR_BLINK;
 const WM_APP_IME_OFF = app_mod.WM_APP_IME_OFF;
@@ -1482,7 +1481,6 @@ fn makeCoreCbs() core.Callbacks {
         .on_msg_showmode = messages.onMsgShowmode,
         .on_msg_showcmd = messages.onMsgShowcmd,
         .on_msg_ruler = messages.onMsgRuler,
-        .on_msg_history_show = messages.onMsgHistoryShow,
         .on_tabline_update = tabline_mod.onTablineUpdate,
         .on_tabline_hide = tabline_mod.onTablineHide,
         .on_agent_status = tabline_mod.onAgentStatus,
@@ -1526,6 +1524,17 @@ fn d3dInitThreadFn(app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] d3d_init_thread: device ready\n", .{});
 }
 
+/// Out of the WndProc body, whose comptime string literals share one branch
+/// quota.
+fn showDevcontainerUpFailed(hwnd: c.HWND) void {
+    _ = c.MessageBoxW(
+        hwnd,
+        std.unicode.utf8ToUtf16LeStringLiteral("devcontainer up failed. Check Docker and devcontainer.json."),
+        std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer Error"),
+        c.MB_OK | c.MB_ICONERROR,
+    );
+}
+
 // =========================================================================
 // Helper: build native-mode nvim command string
 // =========================================================================
@@ -1542,13 +1551,11 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
     if (needs_quote) writer.writeByte('\'') catch {};
     for (app.nvim_extra_args.items) |arg| {
         writer.writeByte(' ') catch {};
-        if (std.mem.indexOfScalar(u8, arg, ' ') != null) {
-            writer.writeByte('"') catch {};
-            writer.writeAll(arg) catch {};
-            writer.writeByte('"') catch {};
-        } else {
-            writer.writeAll(arg) catch {};
-        }
+        // An argument no quote can carry keeps the old double quotes.
+        const q = render_helpers.spawnArgQuote(arg) orelse '"';
+        if (q != 0) writer.writeByte(q) catch {};
+        writer.writeAll(arg) catch {};
+        if (q != 0) writer.writeByte(q) catch {};
     }
     return buf[0..w.end];
 }
@@ -3850,19 +3857,47 @@ pub export fn WndProc(
                             }
                         },
                         .confirm => {
-                            // Confirm messages: clear display stack and show
-                            if (req.replace_last != 0 or std.mem.eql(u8, kind_str, "return_prompt")) {
-                                app.display_messages.clearRetainingCapacity();
+                            if (messages.isConfirmKind(kind_str)) {
+                                // Kept out of the toast stack: the dialog shows
+                                // only its own text, and a resend
+                                // (confirm_dirty) does not add a second copy.
+                                messages.showMessageWindowOnUIThread(app, dm, true);
+                            } else {
+                                // Any other kind a route sends here stacks as
+                                // it always did, so two in one batch both show.
+                                if (req.replace_last != 0 or std.mem.eql(u8, kind_str, "return_prompt")) {
+                                    app.display_messages.clearRetainingCapacity();
+                                }
+                                var append_failed = false;
+                                app.display_messages.append(app.alloc, dm) catch {
+                                    append_failed = true;
+                                };
+                                messages.showMessageWindowOnUIThread(app, dm, append_failed);
                             }
-                            var append_failed = false;
-                            app.display_messages.append(app.alloc, dm) catch {
-                                append_failed = true;
-                            };
-                            messages.showMessageWindowOnUIThread(app, dm, append_failed);
                             // Confirm dialogs don't auto-hide (only kill message window timer, not mini)
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
-                        .ext_float => {
+                        .ext_float => if (messages.isStatusKind(kind_str)) {
+                            // showmode/showcmd/ruler are state, not a log
+                            // (macOS onMsgStatus's rule): the window shows the
+                            // status alone and does not time out, and empty
+                            // text hides it. Kept in the toast stack instead,
+                            // a toast's auto-hide or msg_clear wiped it while
+                            // the mode still held. A blocking dialog stays.
+                            if (!messages.messageWindowIsConfirm(app)) {
+                                _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
+                                if (dm.text_len == 0) {
+                                    messages.hideMessageWindow(app);
+                                } else {
+                                    app.display_messages.clearRetainingCapacity();
+                                    var append_failed = false;
+                                    app.display_messages.append(app.alloc, dm) catch {
+                                        append_failed = true;
+                                    };
+                                    messages.showMessageWindowOnUIThread(app, dm, append_failed);
+                                }
+                            }
+                        } else {
                             // Floating window: the display stack. The rule is
                             // the core's, shared with macOS; replace_last
                             // replaces only the last message, as the UI spec
@@ -3894,11 +3929,15 @@ pub export fn WndProc(
                             for (0..@min(drop, app.display_messages.items.len)) |_| {
                                 _ = app.display_messages.orderedRemove(0);
                             }
-                            messages.showMessageWindowOnUIThread(app, dm, append_failed);
-                            _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                            const timeout_ms = messageTimerMilliseconds(dm.timeout);
-                            if (timeout_ms > 0) {
-                                _ = c.SetTimer(hwnd, TIMER_MSG_AUTOHIDE, timeout_ms, null);
+                            // Re-laying the window would turn a blocking
+                            // dialog into a toast and auto-hide it.
+                            if (!messages.messageWindowIsConfirm(app)) {
+                                messages.showMessageWindowOnUIThread(app, dm, append_failed);
+                                _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
+                                const timeout_ms = messageTimerMilliseconds(dm.timeout);
+                                if (timeout_ms > 0) {
+                                    _ = c.SetTimer(hwnd, TIMER_MSG_AUTOHIDE, timeout_ms, null);
+                                }
                             }
                         },
                         .split => {
@@ -3906,7 +3945,7 @@ pub export fn WndProc(
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
                         .notification => {
-                            // TODO: Show OS notification
+                            if (app.tray_icon) |*tray| tray.showBalloon("Neovim", dm.text[0..dm.text_len]);
                         },
                         .none => {},
                     }
@@ -3933,14 +3972,6 @@ pub export fn WndProc(
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_MINI_UPDATE received: {s}\n", .{@tagName(mini_id)});
             if (getApp(hwnd)) |app| {
                 messages.updateMiniWindows(app);
-            }
-            return 0;
-        },
-
-        WM_APP_UPDATE_EXT_FLOAT_POS => {
-            if (applog.isEnabled()) applog.appLog("[win] WM_APP_UPDATE_EXT_FLOAT_POS received\n", .{});
-            if (getApp(hwnd)) |app| {
-                messages.updateExtFloatPositions(app);
             }
             return 0;
         },
@@ -4191,8 +4222,9 @@ pub export fn WndProc(
         },
 
         WM_APP_SNAP_MAIN_WINDOW => {
-            // Snap the main window's client rect down to a multiple of the
-            // current cell size in both axes. Posted from the RPC thread by
+            // Snap the main window's terminal content area (the client rect
+            // minus sidebar, titlebar tabs and an "always" scrollbar) down to
+            // a multiple of the current cell size in both axes. Posted from the RPC thread by
             // onGuiFont/onLineSpace after cell metrics change. The actual
             // SetWindowPos must run on the UI thread because it triggers a
             // synchronous WM_SIZE → updateLayoutToCore → grid_mu, which
@@ -4202,9 +4234,7 @@ pub export fn WndProc(
             // No-op when the remainder is already zero on both axes, so
             // this does not interfere with steady-state user resizes.
             if (getApp(hwnd)) |app| {
-                var client_rc: c.RECT = undefined;
                 var window_rc: c.RECT = undefined;
-                if (c.GetClientRect(hwnd, &client_rc) == 0) return 0;
                 if (c.GetWindowRect(hwnd, &window_rc) == 0) return 0;
 
                 app.mu.lockUncancelable(core.clock.io());
@@ -4213,30 +4243,22 @@ pub export fn WndProc(
                 app.mu.unlock(core.clock.io());
                 if (cell_w == 0 or cell_h == 0) return 0;
 
-                const client_w_i: i32 = client_rc.right - client_rc.left;
-                const client_h_i: i32 = client_rc.bottom - client_rc.top;
-                if (client_w_i <= 0 or client_h_i <= 0) return 0;
-                const client_w: u32 = @intCast(client_w_i);
-                const client_h: u32 = @intCast(client_h_i);
+                // The terminal area, not the whole client: sidebar, titlebar
+                // tabs and an "always" scrollbar keep their size, as in
+                // WM_APP_RESIZE_TO_GRID. Shrinking the window by the content's
+                // remainder removes it; the chrome is unaffected.
+                const content = app_mod.contentSizePx(hwnd, app);
+                if (content.w < cell_w or content.h < cell_h) return 0;
+                const rem_w: i32 = @intCast(content.w % cell_w);
+                const rem_h: i32 = @intCast(content.h % cell_h);
+                if (rem_w == 0 and rem_h == 0) return 0;
 
-                const snapped_w: u32 = (client_w / cell_w) * cell_w;
-                const snapped_h: u32 = (client_h / cell_h) * cell_h;
-                if (snapped_w == 0 or snapped_h == 0) return 0;
-                if (snapped_w == client_w and snapped_h == client_h) return 0;
-
-                // Frame delta = outer - client. AdjustWindowRectEx is not
-                // reliable here because the window may use a custom NCCALCSIZE
-                // (DWM titlebar mode), so derive the delta from the live rects.
-                const outer_w: i32 = window_rc.right - window_rc.left;
-                const outer_h: i32 = window_rc.bottom - window_rc.top;
-                const frame_dw: i32 = outer_w - client_w_i;
-                const frame_dh: i32 = outer_h - client_h_i;
-                const new_outer_w: c_int = @as(c_int, @intCast(snapped_w)) + frame_dw;
-                const new_outer_h: c_int = @as(c_int, @intCast(snapped_h)) + frame_dh;
+                const new_outer_w: c_int = (window_rc.right - window_rc.left) - rem_w;
+                const new_outer_h: c_int = (window_rc.bottom - window_rc.top) - rem_h;
 
                 if (applog.isEnabled()) applog.appLog(
-                    "[win] WM_APP_SNAP_MAIN_WINDOW: client=({d},{d}) -> ({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
-                    .{ client_w, client_h, snapped_w, snapped_h, cell_w, cell_h, new_outer_w, new_outer_h },
+                    "[win] WM_APP_SNAP_MAIN_WINDOW: content=({d},{d}) remainder=({d},{d}) cell=({d},{d}) outer=({d},{d})\n",
+                    .{ content.w, content.h, rem_w, rem_h, cell_w, cell_h, new_outer_w, new_outer_h },
                 );
                 _ = c.SetWindowPos(
                     hwnd,
@@ -4334,7 +4356,7 @@ pub export fn WndProc(
                     messages.updateMiniText(app, .custom, "");
                     messages.updateMiniWindows(app);
                 }
-            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE or wParam == TIMER_SCROLLBAR_FADE or wParam == TIMER_SCROLLBAR_REPEAT) {
+            } else if (wParam == TIMER_SCROLLBAR_AUTOHIDE or wParam == TIMER_SCROLLBAR_FADE or wParam == TIMER_SCROLLBAR_REPEAT or wParam == app_mod.TIMER_SCROLLBAR_DRAG_FLUSH) {
                 if (getApp(hwnd)) |app| {
                     _ = scrollbar.onTimer(app, scrollbar.mainSurface(hwnd, app), wParam);
                 } else {
@@ -4427,6 +4449,17 @@ pub export fn WndProc(
                         .right = 4096,
                         .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
                     };
+                    // In sidebar mode that band is editor content; the
+                    // indicators are in the sidebar strip.
+                    if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
+                        var client: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client);
+                        const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+                        tabline_rect = if (app.sidebar_position_right)
+                            .{ .left = client.right - sidebar_w, .top = 0, .right = client.right, .bottom = client.bottom }
+                        else
+                            .{ .left = 0, .top = 0, .right = sidebar_w, .bottom = client.bottom };
+                    }
                     _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
@@ -4559,6 +4592,16 @@ pub export fn WndProc(
                                 if (applog.isEnabled()) applog.appLog("[win] starting neovim via devcontainer exec\n", .{});
                                 const start_ok = core.zonvie_core_start(app.corep, nvim_path_ptr, 24, 80);
                                 if (applog.isEnabled()) applog.appLog("[win] zonvie_core_start -> {d}\n", .{start_ok});
+                                if (start_ok != 0) {
+                                    // No run loop exists to report an exit: close
+                                    // with code 1, as the deferred path does.
+                                    dialogs.hideDevcontainerProgressDialog();
+                                    app.devcontainer_up_pending = false;
+                                    app.neovim_exited.store(true, .release);
+                                    app_mod.g_exit_code.store(1, .seq_cst);
+                                    _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
+                                    return 0;
+                                }
 
                                 // Renderer is already initialized at this point; notify with correct rows/cols.
                                 core.zonvie_core_notify_layout_ready(app.corep, app.surf.surface.rows, app.surf.surface.cols);
@@ -4574,7 +4617,12 @@ pub export fn WndProc(
                             dialogs.hideDevcontainerProgressDialog();
                             app.devcontainer_up_pending = false;
                             if (applog.isEnabled()) applog.appLog("[win] devcontainer up failed\n", .{});
-                            // TODO: show error message to user
+                            // Nothing will start: say so and close, as macOS
+                            // does, rather than leave an empty window.
+                            showDevcontainerUpFailed(hwnd);
+                            app.neovim_exited.store(true, .release);
+                            app_mod.g_exit_code.store(1, .seq_cst);
+                            _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
                         }
                     }
                 }
@@ -4875,6 +4923,22 @@ pub export fn WndProc(
                 // releaseD2DDeviceObjects drops its own mutex before COM;
                 // call it with no outer app.mu held as well.
                 if (app.atlas) |*a| a.releaseD2DDeviceObjects();
+                // The shader clock and cursor belong to the app, not to this
+                // device generation: a fresh renderer restarted iTime at 0 in
+                // every window and drew its next cursor trail from (0,0).
+                // Kept on the App until a recovery publishes: a first attempt
+                // that fails (common right after a TDR) has already released
+                // the old renderer, and the retry had nothing to copy from.
+                if (old_main_renderer) |r| app.device_lost_shader_carry = .{
+                    .start_qpc = r.custom_shader_start_qpc,
+                    .last_qpc = r.custom_shader_last_qpc,
+                    .cur = r.shader_cursor_current,
+                    .prev = r.shader_cursor_previous,
+                    .cur_color = r.shader_cursor_current_color,
+                    .prev_color = r.shader_cursor_previous_color,
+                    .change_time = r.shader_cursor_change_time,
+                };
+                const carried_shader = app.device_lost_shader_carry;
                 if (old_main_renderer) |*r| r.deinit();
                 if (old_d3d_ctx) |ctx| _ = ctx.lpVtbl.*.Release.?(ctx);
                 if (old_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
@@ -4927,6 +4991,15 @@ pub export fn WndProc(
                     // pipelines, current client size, and current atlas size
                     // must all belong to the same renderer generation.
                     r.loadCustomShaderPipelines(&app.config);
+                    if (carried_shader) |s| {
+                        r.custom_shader_start_qpc = s.start_qpc;
+                        r.custom_shader_last_qpc = s.last_qpc;
+                        r.shader_cursor_current = s.cur;
+                        r.shader_cursor_previous = s.prev;
+                        r.shader_cursor_current_color = s.cur_color;
+                        r.shader_cursor_previous_color = s.prev_color;
+                        r.shader_cursor_change_time = s.change_time;
+                    }
                     if (app.corep) |corep| {
                         if (core.zonvie_core_get_glow_enabled(corep)) {
                             _ = r.prepareBloomShaders();
@@ -4988,11 +5061,13 @@ pub export fn WndProc(
                 app.d3d_device = new_d3d_device;
                 app.d3d_ctx = new_d3d_ctx;
                 app.renderer = recovered_gpu.?;
+                app.device_lost_shader_carry = null;
                 app.mu.unlock(core.clock.io());
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
                 app.atlas_upload.forceFull();
                 app.tabline_render_sig = 0;
+                app.sidebar_render_sig = 0;
                 app.mu.lockUncancelable(core.clock.io());
                 app.surf.surface.paint_full = true;
                 app.mu.unlock(core.clock.io());
@@ -5342,7 +5417,9 @@ pub export fn WndProc(
                             nvim_cmd_slice = quoted_nvim;
                         }
                     } else {
-                        nvim_cmd_slice = quoted_nvim;
+                        // Local (also a --dialog Local choice): the file and
+                        // `--` arguments go with it, as on the early path.
+                        nvim_cmd_slice = buildNativeNvimCmd(app, &nvim_cmd_buf);
                     }
 
                     // Start nvim
@@ -5615,7 +5692,9 @@ pub export fn WndProc(
         c.WM_IME_COMPOSITION => {
             if (applog.isEnabled()) applog.appLog("[IME] WM_IME_COMPOSITION lParam=0x{x}\n", .{@as(u32, @intCast(lParam & 0xFFFFFFFF))});
             if (getApp(hwnd)) |app| {
-                if (input.handleImeComposition(app, hwnd, lParam) == .alloc_failed) return 0;
+                // Even on .alloc_failed: DefWindowProc turns a GCS_RESULTSTR
+                // carried in the same message into WM_IME_CHAR.
+                _ = input.handleImeComposition(app, hwnd, lParam);
             }
             // Let DefWindowProc handle for default IME processing
             return c.DefWindowProcW(hwnd, msg, wParam, lParam);

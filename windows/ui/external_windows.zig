@@ -13,8 +13,9 @@ const drop_target = @import("drop_target.zig");
 const window_mod = @import("../window.zig");
 const render_pipeline_helpers = @import("../render_pipeline_helpers.zig");
 const callbacks = @import("../callbacks.zig");
-const msg_float_layout = @import("msg_float_layout.zig");
 const core = @import("zonvie_core");
+
+extern "user32" fn AdjustWindowRectExForDpi(rect: *c.RECT, style: c.DWORD, menu: c.BOOL, ex_style: c.DWORD, dpi: c.UINT) callconv(.winapi) c.BOOL;
 
 pub const ExternalSurfaceKind = enum {
     normal,
@@ -69,14 +70,23 @@ fn setMsgHover(app: *App, ext_win: *app_mod.ExternalWindow, grid_id: i64, hovere
 /// message window was open sent it back one copy-button width too narrow.
 pub const ExternalSurfaceInsets = struct { w: c_int, h: c_int };
 
+/// The cmdline's padding and icon strip (margins included) in client pixels,
+/// DPI-scaled like its copy button and the message padding.
+fn cmdlinePaddingPx(app: *const App) c_int {
+    return app.scalePx(@as(c_int, app_mod.CMDLINE_PADDING));
+}
+
+fn cmdlineIconStripPx(app: *const App) c_int {
+    return app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
+}
+
 pub fn externalSurfaceInsetsPx(app: *App, grid_id: i64, dpi_scale: f32) ExternalSurfaceInsets {
     const kind = classifyExternalSurface(grid_id);
     const is_cmdline = kind == .cmdline;
     const is_msg = kind == .msg_show or kind == .msg_history;
 
-    const cmdline_icon_w: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT +
-        app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT) else 0;
-    const cmdline_padding: c_int = if (is_cmdline) @intCast(app_mod.CMDLINE_PADDING * 2) else 0;
+    const cmdline_icon_w: c_int = if (is_cmdline) cmdlineIconStripPx(app) else 0;
+    const cmdline_padding: c_int = if (is_cmdline) cmdlinePaddingPx(app) * 2 else 0;
     const msg_padding: c_int = if (is_msg) app.scalePx(@as(c_int, app_mod.MSG_PADDING)) * 2 else 0;
     // WM_SIZE reads a normal window's columns back through
     // effectiveContentWidthAt, which takes the "always" scrollbar strip off;
@@ -108,9 +118,8 @@ pub const DecoratedContentOrigin = struct { x: f32, y: f32 };
 pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedContentOrigin {
     return switch (kind) {
         .cmdline => .{
-            .x = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT +
-                app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT),
-            .y = @floatFromInt(app_mod.CMDLINE_PADDING),
+            .x = @floatFromInt(cmdlinePaddingPx(app) + cmdlineIconStripPx(app)),
+            .y = @floatFromInt(cmdlinePaddingPx(app)),
         },
         .msg_show, .msg_history => blk: {
             const pad: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.MSG_PADDING)));
@@ -229,6 +238,7 @@ fn resolveDecoratedBgColor(app: *App, grid_id: i64, verts: []const app_mod.Verte
         }
     }
 
+    var shader_active = false;
     app.mu.lockUncancelable(core.clock.io());
     if (app.external_windows.get(grid_id)) |ew| {
         if (found) {
@@ -236,9 +246,13 @@ fn resolveDecoratedBgColor(app: *App, grid_id: i64, verts: []const app_mod.Verte
         } else if (ew.cached_bg_color) |cached| {
             orig = cached;
         }
+        shader_active = ew.renderer.custom_shader_pipelines.items.len != 0;
     }
     app.mu.unlock(core.clock.io());
 
+    // Under a custom shader the raw bg, as on macOS: the lightened one reads
+    // as foreground to a luminance-keyed shader and hides its effect.
+    if (shader_active) return .{ .orig = orig, .adjusted = orig };
     return .{ .orig = orig, .adjusted = app_mod.adjustBrightnessForCmdline(orig[0], orig[1], orig[2]) };
 }
 
@@ -401,7 +415,7 @@ fn drawDecoratedExternalSurface(
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
             if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
-                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
                 return;
             }
 
@@ -450,9 +464,9 @@ fn drawDecoratedExternalSurface(
             extra_idx = appendDecoratedBorderVerts(cmdline_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
             const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
-            const icon_x_px: f32 = @floatFromInt(app_mod.CMDLINE_PADDING + app_mod.CMDLINE_ICON_MARGIN_LEFT);
-            const icon_y_px: f32 = (window_h - @as(f32, @floatFromInt(app_mod.CMDLINE_ICON_SIZE))) / 2.0;
-            const icon_size_px: f32 = @floatFromInt(app_mod.CMDLINE_ICON_SIZE);
+            const icon_x_px: f32 = @floatFromInt(cmdlinePaddingPx(app) + app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT)));
+            const icon_size_px: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_SIZE)));
+            const icon_y_px: f32 = (window_h - icon_size_px) / 2.0;
             const icon_x_ndc: f32 = icon_x_px / (window_w / 2.0) - 1.0;
             const icon_y_ndc: f32 = 1.0 - icon_y_px / (window_h / 2.0);
             const icon_w_ndc: f32 = icon_size_px / (window_w / 2.0);
@@ -465,7 +479,7 @@ fn drawDecoratedExternalSurface(
 
             extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color, copy_hover, copy_copied);
 
-            try g.draw(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
+            try g.drawEx(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null, .{ .present = false });
             if (glow_enabled) {
                 g.drawBloomFromVerts(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
             }
@@ -474,7 +488,7 @@ fn drawDecoratedExternalSurface(
             const window_w: f32 = @floatFromInt(g.width);
             const window_h: f32 = @floatFromInt(g.height);
             if (!(window_w > 0 and window_h > 0)) {
-                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
                 return;
             }
 
@@ -503,7 +517,7 @@ fn drawDecoratedExternalSurface(
             var extra_idx: usize = vert_count;
             extra_idx = appendDecoratedBorderVerts(pum_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
 
-            try g.draw(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null);
+            try g.drawEx(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null, .{ .present = false });
             if (glow_enabled) {
                 g.drawBloomFromVerts(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
             }
@@ -532,7 +546,7 @@ fn drawDecoratedExternalSurface(
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
             if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
-                try g.draw(verts[0..vert_count], &[_]app_mod.Vertex{}, null);
+                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
                 return;
             }
 
@@ -584,7 +598,7 @@ fn drawDecoratedExternalSurface(
                 copy_hover,
                 copy_copied,
             );
-            try g.draw(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null);
+            try g.drawEx(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null, .{ .present = false });
             if (glow_enabled) {
                 g.drawBloomFromVerts(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
             }
@@ -1293,14 +1307,12 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
 /// Apply a changed lifecycle callback to an already-published HWND without
 /// replacing its renderer/surface contents. Must be called on the UI thread.
 /// Top-right placement for the message floats. Resolves the Win32 state and
-/// defers the arithmetic to msg_float_layout, which is covered by
-/// windows/ui/msg_float_layout_test.zig.
+/// defers the arithmetic to core.frontend_rules.msgFloatTopRight.
 ///
-/// Must be called with `app.mu` NOT held; getExtFloatTargetRect expects the
-/// lock and does not take it itself.
-fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) msg_float_layout.Point {
+/// Must be called with `app.mu` NOT held; messages.msgTargetRect takes it.
+fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) core.frontend_rules.Point {
+    const target_rect = messages.msgTargetRect(app, app.config.messages.msg_pos.ext_float);
     app.mu.lockUncancelable(core.clock.io());
-    const target_rect = app.getExtFloatTargetRect();
     // msg_show stacks below msg_history when both are up; msg_history itself
     // always sits at the top.
     const history_hwnd: ?c.HWND = if (is_msg_history) null else blk: {
@@ -1318,15 +1330,40 @@ fn msgFloatTopRight(app: *App, is_msg_history: bool, window_w: c_int) msg_float_
     return msgFloatOrigin(app, target_rect, window_w, history_bottom);
 }
 
-/// msg_float_layout.msgFloatTopRight at this monitor's scale. `app.mu` held
+/// Inset of the message floats from the target rect's right and top edges,
+/// before DPI scaling.
+const msg_float_margin_px: i32 = 10;
+/// Gap between msg_history and the msg_show float stacked below it, before
+/// DPI scaling.
+const msg_float_history_gap_px: i32 = 4;
+
+/// core.frontend_rules.msgFloatTopRight at this monitor's scale. `app.mu` held
 /// or not: it reads only the DPI scale.
-pub fn msgFloatOrigin(app: *App, target_rect: c.RECT, window_w: c_int, history_bottom: ?i32) msg_float_layout.Point {
-    return msg_float_layout.msgFloatTopRight(.{
+pub fn msgFloatOrigin(app: *App, target_rect: c.RECT, window_w: c_int, history_bottom: ?i32) core.frontend_rules.Point {
+    return core.frontend_rules.msgFloatTopRight(.{
         .left = target_rect.left,
         .top = target_rect.top,
         .right = target_rect.right,
         .bottom = target_rect.bottom,
-    }, window_w, history_bottom, app.scalePx(msg_float_layout.margin_px), app.scalePx(msg_float_layout.history_gap_px));
+    }, window_w, history_bottom, app.scalePx(msg_float_margin_px), app.scalePx(msg_float_history_gap_px));
+}
+
+/// Keep msg_show below msg_history after msg_history is created or changes
+/// size, as macOS's linkedMsgShowFrame does. `app.mu` NOT held.
+fn restackMsgShowBelowHistory(app: *App) void {
+    app.mu.lockUncancelable(core.clock.io());
+    const history_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID)) |w| w.hwnd else null;
+    const show_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |w| w.hwnd else null;
+    app.mu.unlock(core.clock.io());
+    const hh = history_hwnd orelse return;
+    const sh = show_hwnd orelse return;
+    var history_rect: c.RECT = undefined;
+    var show_rect: c.RECT = undefined;
+    if (c.GetWindowRect(hh, &history_rect) == 0 or c.GetWindowRect(sh, &show_rect) == 0) return;
+    const target_rect = messages.msgTargetRect(app, app.config.messages.msg_pos.ext_float);
+    const pos = msgFloatOrigin(app, target_rect, show_rect.right - show_rect.left, history_rect.bottom);
+    _ = c.SetWindowPos(sh, null, pos.x, pos.y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+    if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ pos.x, pos.y });
 }
 
 pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExternalWindow) bool {
@@ -1377,7 +1414,11 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     var x: c_int = 0;
     var y: c_int = 0;
     var flags: c.UINT = c.SWP_NOZORDER | c.SWP_NOACTIVATE;
-    if (req.start_row >= 0 and req.start_col >= 0) {
+    if (!is_special_window) {
+        // A regular external window stays where the user put it; its win_pos
+        // only placed it on creation (macOS ignores it on reuse too).
+        flags |= c.SWP_NOMOVE;
+    } else if (req.start_row >= 0 and req.start_col >= 0) {
         const origin_hwnd: ?c.HWND = if (anchor_hwnd != null) anchor_hwnd else main_hwnd;
         if (origin_hwnd) |origin| {
             var client_origin: c.POINT = .{ .x = 0, .y = 0 };
@@ -1438,11 +1479,21 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     if (updated and had_old_rect and (flags & c.SWP_NOMOVE) == 0) {
         if (pum_hwnd) |ph| {
             var pum_rect: c.RECT = undefined;
-            if ((x != old_rect.left or y != old_rect.top) and c.GetWindowRect(ph, &pum_rect) != 0) {
-                _ = c.SetWindowPos(ph, null, pum_rect.left + (x - old_rect.left), pum_rect.top + (y - old_rect.top), 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+            if (c.GetWindowRect(ph, &pum_rect) != 0) {
+                // With the edge it sits on: the cmdline keeps its centre, so
+                // its top and bottom move apart as it grows.
+                const dx = x - old_rect.left;
+                const dy = if (pum_rect.top >= old_rect.bottom)
+                    (y + window_h) - old_rect.bottom
+                else
+                    y - old_rect.top;
+                if (dx != 0 or dy != 0) {
+                    _ = c.SetWindowPos(ph, null, pum_rect.left + dx, pum_rect.top + dy, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+                }
             }
         }
     }
+    if (updated and is_msg_history) restackMsgShowBelowHistory(app);
     if (updated) _ = c.InvalidateRect(hwnd, null, c.FALSE);
     return updated;
 }
@@ -1458,9 +1509,7 @@ fn cmdlinePopupmenuOrigin(app: *App, start_col: i32, window_w: c_int, window_h: 
     const cw = cmdline_win orelse return null;
     var cmdline_rect: c.RECT = undefined;
     if (c.GetWindowRect(cw.hwnd, &cmdline_rect) == 0) return null;
-    const cmdline_content_x: c_int =
-        @as(c_int, @intCast(app_mod.CMDLINE_PADDING)) +
-        @as(c_int, @intCast(app_mod.CMDLINE_ICON_MARGIN_LEFT + app_mod.CMDLINE_ICON_SIZE + app_mod.CMDLINE_ICON_MARGIN_RIGHT));
+    const cmdline_content_x: c_int = cmdlinePaddingPx(app) + cmdlineIconStripPx(app);
     // The popupmenu draws at its client origin (decoratedContentOriginPx), so
     // its column lines up with no inset to subtract.
     const x = popupmenuPositionX(cmdline_rect.left + cmdline_content_x +
@@ -1625,8 +1674,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             if (c.GetWindowRect(mw.hwnd, &msg_rect) != 0) {
                 // Position directly below message window, centered horizontally
                 const msg_width = msg_rect.right - msg_rect.left;
-                pos_x = msg_rect.left + @divTrunc(msg_width - window_w, 2);
-                pos_y = msg_rect.bottom + 4; // 4px gap below message window
+                // 4px gap below the message window, kept on its monitor's
+                // work area (a tall dialog would push it under the taskbar).
+                const work = app_mod.monitorWorkArea(mw.hwnd);
+                app_mod.zonvie_core_clamp_window_origin(msg_rect.left + @divTrunc(msg_width - window_w, 2), msg_rect.bottom + 4, window_w, window_h, work.left, work.top, work.right, work.bottom, &pos_x, &pos_y);
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window below message: ({d},{d})\n", .{ pos_x, pos_y });
             } else {
                 // Fallback: center on the main window's monitor
@@ -1720,10 +1771,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     }
 
-    // Only the cmdline accepts file drops; a drop there inserts the path as
-    // text instead of opening the file. The other decorated surfaces have
-    // nothing to insert into.
-    if (is_cmdline) {
+    // A drop on the cmdline inserts the path as text; on a buffer window it
+    // opens the file, as on the main window (and on macOS). The other
+    // decorated surfaces have nothing to drop into.
+    if (is_cmdline or !is_special_window) {
         c.DragAcceptFiles(hwnd, 1);
     }
 
@@ -1794,7 +1845,6 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         y: c_int,
         flags: c.UINT,
     };
-    var deferred_setpos: ?DeferredSetWindowPos = null;
     var deferred_setpos_cmdline: ?DeferredSetWindowPos = null;
 
     // Determine if this is a float-origin external window (nvim_open_win external=true)
@@ -1918,25 +1968,6 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         return .retry;
     };
 
-    // If msg_history window was just created/shown, reposition msg_show window below it
-    if (is_msg_history) {
-        if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |msg_win| {
-            var history_rect: c.RECT = undefined;
-            var msg_rect: c.RECT = undefined;
-            if (c.GetWindowRect(hwnd, &history_rect) != 0 and c.GetWindowRect(msg_win.hwnd, &msg_rect) != 0) {
-                const pos = msgFloatOrigin(app, app.getExtFloatTargetRect(), msg_rect.right - msg_rect.left, history_rect.bottom);
-                // Defer SetWindowPos to after lock release
-                deferred_setpos = .{
-                    .hwnd = msg_win.hwnd,
-                    .hwnd_insert_after = null,
-                    .x = pos.x,
-                    .y = pos.y,
-                    .flags = c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE,
-                };
-            }
-        }
-    }
-
     // Only a window the cursor enters, as on macOS: a popupmenu or message
     // window gets no cursor report to correct it, so recording it named a
     // grid the cursor never moved to (the blink gate and msg_pos asked it).
@@ -1986,17 +2017,15 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
 
     // Register the OLE drop target outside the lock: RegisterDragDrop is a COM
     // call and must not run with app.mu held. Registration is what makes the
-    // drag cursor show that a drop here inserts a path rather than opening the
-    // file; the DragAcceptFiles above stays as the fallback if it fails.
-    if (is_cmdline) {
-        ext_window_ptr.surf.drop_target = drop_target.register(app, hwnd, true);
+    // drag cursor show what a drop here does (the cmdline inserts a path, an
+    // editor window opens the file); the DragAcceptFiles above stays as the
+    // fallback if it fails.
+    if (is_cmdline or !is_special_window) {
+        ext_window_ptr.surf.drop_target = drop_target.register(app, hwnd, is_cmdline);
     }
 
     // Now call SetWindowPos outside the lock to avoid deadlock
-    if (deferred_setpos) |sp| {
-        _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
-        if (applog.isEnabled()) applog.appLog("[win] repositioned msg_show below msg_history: ({d},{d})\n", .{ sp.x, sp.y });
-    }
+    if (is_msg_history) restackMsgShowBelowHistory(app);
     if (deferred_setpos_cmdline) |sp| {
         _ = c.SetWindowPos(sp.hwnd, sp.hwnd_insert_after, sp.x, sp.y, 0, 0, sp.flags);
         if (applog.isEnabled()) applog.appLog("[win] put message window below cmdline (cmdline created)\n", .{});
@@ -2367,6 +2396,7 @@ pub export fn ExternalWndProc(
                     return 0;
                 }
                 const new_dpi: u32 = @as(u32, @intCast(wParam & 0xFFFF)); // LOWORD
+                const new_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
                 if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_DPICHANGED hwnd={*} new_dpi={d}\n", .{ hwnd, new_dpi });
 
                 app.mu.lockUncancelable(core.clock.io());
@@ -2381,14 +2411,14 @@ pub export fn ExternalWndProc(
                         // -- rescaling it here based on one external
                         // window's monitor would corrupt every other
                         // window's glyph rendering on their next repaint.
-                        entry.value_ptr.*.dpi_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
+                        entry.value_ptr.*.dpi_scale = new_scale;
                         break;
                     }
                 }
                 app.mu.unlock(core.clock.io());
 
-                // Resize this window to the suggested rect from WM_DPICHANGED
-                // so it doesn't end up the wrong physical size after the move.
+                // WM_GETDPISCALEDSIZE (below) handed Windows the size to scale
+                // to, so the suggested rect already keeps the grid area.
                 const suggested: *const c.RECT = @ptrFromInt(@as(usize, @bitCast(lParam)));
                 _ = c.SetWindowPos(
                     hwnd,
@@ -2401,6 +2431,41 @@ pub export fn ExternalWndProc(
                 );
             }
             return 0;
+        },
+        0x02E4 => { // WM_GETDPISCALEDSIZE
+            // The size Windows would pick scales the whole window by the DPI
+            // ratio, but cells keep the main window's size (the shared
+            // atlas), so it made WM_SIZE ask Neovim for more rows and columns.
+            // Keep the grid area and re-derive only the chrome, as creation
+            // does. Answering here, rather than resizing in WM_DPICHANGED,
+            // lets Windows build the suggested rect around this size, so the
+            // window does not land mostly on the monitor it left and bounce.
+            const app = app_mod.getApp(hwnd) orelse return 0;
+            const new_dpi: u32 = @as(u32, @intCast(wParam & 0xFFFF));
+            const new_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
+            app.mu.lockUncancelable(core.clock.io());
+            const hit = findExternalWindowByHwndLocked(app, hwnd);
+            const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+            const old_scale: f32 = if (hit) |h| h.win.dpi_scale else app.dpi_scale;
+            app.mu.unlock(core.clock.io());
+            const gid = grid_id orelse return 0;
+            var client: c.RECT = undefined;
+            if (c.GetClientRect(hwnd, &client) == 0) return 0;
+            const old_in = externalSurfaceInsetsPx(app, gid, old_scale);
+            const new_in = externalSurfaceInsetsPx(app, gid, new_scale);
+            var r: c.RECT = .{
+                .left = 0,
+                .top = 0,
+                .right = client.right - old_in.w + new_in.w,
+                .bottom = client.bottom - old_in.h + new_in.h,
+            };
+            const style: c.DWORD = @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE));
+            const ex_style: c.DWORD = @bitCast(c.GetWindowLongW(hwnd, c.GWL_EXSTYLE));
+            if (AdjustWindowRectExForDpi(&r, style, 0, ex_style, new_dpi) == 0) return 0;
+            const size: *c.SIZE = @ptrFromInt(@as(usize, @bitCast(lParam)));
+            size.cx = r.right - r.left;
+            size.cy = r.bottom - r.top;
+            return 1;
         },
         c.WM_PAINT => {
             if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_PAINT hwnd={*}\n", .{hwnd});
@@ -2595,12 +2660,9 @@ pub export fn ExternalWndProc(
                 app.mu.unlock(core.clock.io());
 
                 if (hit) |h| {
+                    // The scroll-mode bar shows from updateScrollbar when the
+                    // viewport moves, as on the main window.
                     input.handleMouseWheel(hwnd, wParam, lParam, app, h.grid_id, horizontal);
-
-                    // Show scrollbar on vertical scroll if in scroll mode
-                    if (!horizontal and app.config.scrollbar.enabled and app.config.scrollbar.isScroll()) {
-                        scrollbar.show(app, scrollbar.externalSurface(h.win, h.grid_id));
-                    }
                 }
                 return 0;
             }
@@ -2829,11 +2891,16 @@ pub export fn ExternalWndProc(
         },
 
         c.WM_DROPFILES => {
-            // Only the cmdline window has DragAcceptFiles, so a drop here is
-            // always a path insertion, whatever mode the editor reports.
+            // A drop on the cmdline is always a path insertion, whatever mode
+            // the editor reports; a buffer window takes the main window's rule.
             const hDrop: c.HDROP = @ptrFromInt(@as(usize, wParam));
             defer c.DragFinish(hDrop);
-            if (app_mod.getApp(hwnd)) |app| window_mod.handleDroppedFiles(app, hDrop, true);
+            if (app_mod.getApp(hwnd)) |app| {
+                app.mu.lockUncancelable(core.clock.io());
+                const is_cmdline = if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.grid_id == app_mod.CMDLINE_GRID_ID else false;
+                app.mu.unlock(core.clock.io());
+                window_mod.handleDroppedFiles(app, hDrop, is_cmdline);
+            }
             return 0;
         },
 
@@ -3285,9 +3352,28 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
         // the decoration strip. Shader pixels live in client coords.
         var main_client_origin: c.POINT = .{ .x = 0, .y = 0 };
         var ext_client_origin: c.POINT = .{ .x = 0, .y = 0 };
-        if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
+        if (c.IsIconic(main_hwnd) != 0) {
+            // A minimized main window sits near (-32000,-32000): keep the
+            // offset of its last visible frame instead of jumping the
+            // universe, and the forwarded cursor, there and back.
+            off_x = g_sh.shader_window_offset_x;
+            off_y = g_sh.shader_window_offset_y;
+        } else if (c.ClientToScreen(main_hwnd, &main_client_origin) != 0 and c.ClientToScreen(hwnd, &ext_client_origin) != 0) {
             off_x = @floatFromInt(ext_client_origin.x - main_client_origin.x);
             off_y = @floatFromInt(ext_client_origin.y - main_client_origin.y);
+        }
+        // Either window moved. When the main renderer still holds the cursor
+        // this window forwarded, move it with the window rather than let the
+        // next forward rotate it into a trail from the old spot.
+        const dx = off_x - g_sh.shader_window_offset_x;
+        const dy = off_y - g_sh.shader_window_offset_y;
+        if (dx != 0 or dy != 0) {
+            if (g_sh.shader_cursor_forwarded) |fwd| {
+                if (app.renderer) |*mr| {
+                    if (std.mem.eql(f32, &fwd, &mr.shader_cursor_current)) mr.reanchorCursorShader(dx, dy);
+                }
+                g_sh.shader_cursor_forwarded = .{ fwd[0] + dx, fwd[1] + dy, fwd[2], fwd[3] };
+            }
         }
         if (cursor) |cur| if (cur.verts.len != 0) {
             if (app.renderer) |*main_r2| {
@@ -3301,10 +3387,9 @@ pub fn syncExternalShaderFrame(app: *App, hwnd: c.HWND, g_sh: *d3d11.Renderer, c
                     off_x + cur.content_origin.x + @as(f32, @floatFromInt(cur.layer_origin[0])),
                     off_y + cur.content_origin.y + @as(f32, @floatFromInt(cur.layer_origin[1])),
                 )) |cb| {
-                    main_r2.setCursorShaderState(
-                        .{ cb.left, cb.bottom, cb.width(), cb.height() },
-                        cur.verts[0].color,
-                    );
+                    const rect: [4]f32 = .{ cb.left, cb.bottom, cb.width(), cb.height() };
+                    main_r2.setCursorShaderState(rect, cur.verts[0].color);
+                    g_sh.shader_cursor_forwarded = rect;
                 }
             }
         };
