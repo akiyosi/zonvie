@@ -31,25 +31,6 @@ pub const redraw_handler = @import("redraw_handler.zig");
 pub const highlight = @import("highlight.zig");
 pub const log_mod = @import("log.zig");
 
-pub const CursorShape = enum(u32) {
-    block = 0,
-    vertical = 1,
-    horizontal = 2,
-};
-
-pub const Cursor = extern struct {
-    enabled: u32,
-    row: u32,
-    col: u32,
-    shape: CursorShape,
-    cell_percentage: u32,
-    fgRGB: u32,
-    bgRGB: u32,
-    blink_wait_ms: u32, // wait time before blink starts (ms), 0=no blink
-    blink_on_ms: u32, // on time for blink cycle (ms)
-    blink_off_ms: u32, // off time for blink cycle (ms)
-};
-
 // Decoration flags (must match ZONVIE_DECO_* in zonvie_core.h)
 pub const DECO_UNDERCURL: u32 = 1 << 0;
 pub const DECO_UNDERLINE: u32 = 1 << 1;
@@ -96,7 +77,7 @@ pub const Vertex = extern struct {
     position: [2]f32,
     texCoord: [2]f32,
     color: [4]f32 align(16), // 16-byte alignment to match Swift simd_float4
-    grid_id: i64, // 1 = global grid, >1 = sub-grid (float window)
+    grid_id: i64, // 1 = global grid, >1 = Neovim window grid, negative = core-owned grid
     deco_flags: u32, // DECO_* flags for decoration type
     deco_phase: f32, // phase offset for undercurl (cell column position)
 
@@ -233,15 +214,6 @@ pub const GetAsciiTableFn = *const fn (
 
 pub const VERT_UPDATE_MAIN: u32 = 1 << 0;
 pub const VERT_UPDATE_CURSOR: u32 = 1 << 1;
-
-pub const OnVerticesPartialFn = *const fn (
-    ctx: ?*anyopaque,
-    main_verts: ?[*]const Vertex,
-    main_count: usize,
-    cursor_verts: ?[*]const Vertex,
-    cursor_count: usize,
-    flags: u32,
-) callconv(.c) void;
 
 pub const OnVerticesRowFn = *const fn (
     ctx: ?*anyopaque,
@@ -553,6 +525,7 @@ pub const Callbacks = extern struct {
         chunk_count: usize,
     ) callconv(.c) void = null,
 
+    /// Reserved for layout; the core never invokes it (see zonvie_core.h).
     on_msg_history_show: ?*const fn (
         ctx: ?*anyopaque,
         entries: [*]const MsgHistoryEntry,
@@ -1188,7 +1161,6 @@ comptime {
 
 comptime {
     if (@sizeOf(cursor_rect.Rect) != 4 * 4) @compileError("zonvie_cursor_rect layout drifted from the header");
-    if (@sizeOf(cursor_rect.IntRect) != 4 * 4) @compileError("zonvie_cursor_irect layout drifted from the header");
     if (@sizeOf(win_layout.Frame) != 8 + 4 * 8) @compileError("zonvie_win_frame layout drifted from the header");
 }
 
@@ -1204,20 +1176,6 @@ pub export fn zonvie_core_cursor_rect(
     const dst = out orelse return false;
     const v = verts orelse return false;
     dst.* = cursor_rect.bounds(Vertex, v[0..count], origin_x_px, origin_y_px) orelse return false;
-    return true;
-}
-
-/// The whole pixels a cursor rectangle touches, clipped to the surface. False
-/// when nothing is left inside it.
-pub export fn zonvie_core_cursor_rect_inflate_clip(
-    rect: ?*const cursor_rect.Rect,
-    clip_w_px: i32,
-    clip_h_px: i32,
-    out: ?*cursor_rect.IntRect,
-) callconv(.c) bool {
-    const r = rect orelse return false;
-    const dst = out orelse return false;
-    dst.* = cursor_rect.inflateClip(r.*, clip_w_px, clip_h_px) orelse return false;
     return true;
 }
 
@@ -1308,13 +1266,7 @@ pub export fn zonvie_version() callconv(.c) [*:0]const u8 {
     return version_cstr;
 }
 
-pub export fn zonvie_core_note_input_trace(p: ?*zonvie_core, seq: u64, sent_ns: i64) callconv(.c) void {
-    if (p == null) return;
-    const box = asBox(p.?);
-    box.core.noteInputTrace(seq, sent_ns);
-}
-
-/// Non-blocking version of zonvie_core_note_input_trace. Drops the sample
+/// Record an input trace sample. Drops the sample
 /// (no [perf_input] line for this seq) if grid_mu could not be acquired,
 /// rather than blocking the input-send path with the very lock this trace
 /// exists to measure contention on. Returns true if the sample was recorded.
@@ -1715,8 +1667,7 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
 ///
 /// Rounds up: a deadline 1 ns away must report 1 ms, not 0, or a frontend
 /// that trusts the value schedules a timer that fires before the deadline and
-/// spins. Both exported entry points share this so the two cannot round
-/// differently.
+/// spins.
 ///
 /// The caller owns grid_mu; this only reads under it.
 fn nextMsgTimeoutMsLocked(box: *CoreBox) i64 {
@@ -1731,17 +1682,7 @@ fn nextMsgTimeoutMsLocked(box: *CoreBox) i64 {
 /// Returns milliseconds until the earliest pending message or render-
 /// maintenance deadline, clamped to >= 0. Returns -1 if no timeout is armed.
 /// Frontends use this to schedule one timer instead of polling every frame.
-pub export fn zonvie_core_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c) i64 {
-    if (p == null) return -1;
-    const box = asBox(p.?);
-    box.core.grid_mu.lockUncancelable(clock.io());
-    defer box.core.grid_mu.unlock(clock.io());
-    return nextMsgTimeoutMsLocked(box);
-}
-
-/// Non-blocking version of zonvie_core_next_msg_timeout_ms.
-/// Returns the same values on success, or -2 if the lock could not be
-/// acquired. -2 is distinct from -1 ("no timeout pending" -- a real,
+/// Non-blocking: returns -2 if the lock could not be acquired. -2 is distinct from -1 ("no timeout pending" -- a real,
 /// actionable answer) because the caller must NOT treat a busy lock as
 /// "nothing pending": doing so could silently drop an armed msg_show/
 /// msg_history/atlas maintenance deadline. On -2 the caller should re-arm its
@@ -1762,7 +1703,7 @@ pub export fn zonvie_core_try_next_msg_timeout_ms(p: ?*zonvie_core) callconv(.c)
 /// Ignores any grid that is not a message float.
 ///
 /// Both transitions change the earliest pending deadline, so the caller must
-/// re-arm its one-shot timer from zonvie_core_next_msg_timeout_ms afterwards.
+/// re-arm its one-shot timer from zonvie_core_try_next_msg_timeout_ms afterwards.
 pub export fn zonvie_core_set_msg_hover(p: ?*zonvie_core, grid_id: i64, hovered: i32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
@@ -2154,22 +2095,6 @@ pub export fn zonvie_core_get_visible_grids(
     return box.core.getVisibleGrids(out_grids.?[0..max_count]);
 }
 
-/// Non-blocking version of zonvie_core_get_visible_grids.
-/// Returns grid count on success, or -1 if the lock could not be acquired.
-/// Use this from the UI thread to avoid blocking when the core is in handleRedraw.
-pub export fn zonvie_core_try_get_visible_grids(
-    p: ?*zonvie_core,
-    out_grids: ?[*]GridInfo,
-    max_count: usize,
-) callconv(.c) i32 {
-    if (p == null or out_grids == null or max_count == 0) return -1;
-    const box = asBox(p.?);
-    if (box.core.tryGetVisibleGrids(out_grids.?[0..max_count])) |count| {
-        return @intCast(count);
-    }
-    return -1;
-}
-
 /// Non-blocking visible-grid snapshot with truncation detection.
 /// On success, returns the initialized prefix length and publishes the total
 /// visible-grid count from the same grid lock acquisition. A zero-capacity
@@ -2251,8 +2176,8 @@ pub export fn zonvie_core_get_cursor_position(
 
 /// Non-blocking version of zonvie_core_get_cursor_position.
 /// Returns the grid_id of the cursor on success, or -2 if the lock could
-/// not be acquired, or if core is null (grid_id is always >= 1, so -2 is
-/// unambiguous either way). Note this differs from the blocking
+/// not be acquired, or if core is null (a cursor grid_id may be the negative
+/// cmdline grid but is never -2, so -2 is unambiguous). Note this differs from the blocking
 /// zonvie_core_get_cursor_position above, which reserves -1 for null core.
 pub export fn zonvie_core_try_get_cursor_position(
     p: ?*zonvie_core,
@@ -2358,8 +2283,7 @@ pub export fn zonvie_core_set_option_as_meta(p: ?*zonvie_core, value: u8) callco
 }
 
 /// Write the three blink intervals into whichever out-pointers the caller
-/// supplied. Shared by the blocking and try variants so a future fourth
-/// interval cannot reach one and miss the other.
+/// supplied.
 ///
 /// The caller owns grid_mu; this only reads under it.
 fn writeCursorBlinkLocked(
@@ -2373,27 +2297,8 @@ fn writeCursorBlinkLocked(
     if (out_off_ms) |ptr| ptr.* = box.core.grid.cursor_blink_off_ms;
 }
 
-/// Get current cursor blink parameters (in milliseconds).
-pub export fn zonvie_core_get_cursor_blink(
-    p: ?*zonvie_core,
-    out_wait_ms: ?*u32,
-    out_on_ms: ?*u32,
-    out_off_ms: ?*u32,
-) callconv(.c) void {
-    if (p == null) {
-        if (out_wait_ms) |ptr| ptr.* = 0;
-        if (out_on_ms) |ptr| ptr.* = 0;
-        if (out_off_ms) |ptr| ptr.* = 0;
-        return;
-    }
-    const box = asBox(p.?);
-    box.core.grid_mu.lockUncancelable(clock.io());
-    defer box.core.grid_mu.unlock(clock.io());
-    writeCursorBlinkLocked(box, out_wait_ms, out_on_ms, out_off_ms);
-}
-
-/// Non-blocking version of zonvie_core_get_cursor_blink. On success, fills
-/// all three out params and returns true. On busy, leaves every out param
+/// Get current cursor blink parameters (in milliseconds) without blocking.
+/// On success, fills all three out params and returns true. On busy, leaves every out param
 /// UNTOUCHED (does not write a "safe default") -- the intended usage is
 /// for the caller to pre-seed the out params with its own last-known
 /// values, so an untouched param is automatically "serve cached value".
@@ -2418,13 +2323,13 @@ pub export fn zonvie_core_try_get_cursor_blink(
 ///
 /// Acquires grid_mu: sendMouseScroll's message-grid branch
 /// (handleMsgGridScroll) mutates Grid/vertex/atlas-scratch state directly
-/// and can invoke frontend callbacks (row_cb via sendExternalGridVerticesFiltered)
+/// and can invoke frontend callbacks (row_cb via the FlushCtx.onFlush bracket)
 /// — the SAME state handleRedraw mutates under grid_mu on the RPC thread.
 /// This is called directly from a mouse-wheel event on the UI thread, so
 /// without this lock the two threads race HashMap/ArrayList/atlas-scratch
 /// mutations. redraw_thread_id follows the same lock-then-set ordering as
 /// zonvie_core_retry_flush (see its doc comment) so a re-entrant callback
-/// from within sendExternalGridVerticesFiltered recognizes this thread as
+/// from within that bracket recognizes this thread as
 /// the current owner instead of self-deadlocking on grid_mu.
 pub export fn zonvie_core_send_mouse_scroll(
     p: ?*zonvie_core,
@@ -2486,16 +2391,11 @@ pub export fn zonvie_core_page_scroll(
 
 /// Process pending message scroll update (for throttled scroll).
 /// Call this after scroll events stop to ensure final position is rendered.
+/// Returns true when a scroll is still pending and the caller should retry.
 ///
 /// Acquires grid_mu — same rationale as zonvie_core_send_mouse_scroll:
 /// processPendingMsgScroll mutates the same Grid/vertex/atlas-scratch state
 /// and can invoke frontend callbacks, called from a UI-thread timer.
-pub export fn zonvie_core_process_pending_msg_scroll(
-    p: ?*zonvie_core,
-) callconv(.c) void {
-    _ = zonvie_core_process_pending_msg_scroll_retry_needed(p);
-}
-
 pub export fn zonvie_core_process_pending_msg_scroll_retry_needed(
     p: ?*zonvie_core,
 ) callconv(.c) bool {

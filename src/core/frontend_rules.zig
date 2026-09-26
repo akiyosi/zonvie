@@ -99,9 +99,7 @@ pub const Point = extern struct { x: i32, y: i32 };
 /// registers these grids with the "top-right" sentinel position, so x follows
 /// the window's current width and never a previous position: reusing that made
 /// a short message keep a long one's left edge. Margins are the caller's
-/// pixels, already scaled. macOS calls this; Windows still has the same body
-/// in windows/ui/msg_float_layout.zig, whose standalone test module
-/// (build.zig) cannot import the core.
+/// pixels, already scaled.
 pub fn msgFloatTopRight(target: Rect, window_w: i32, history_bottom: ?i32, margin: i32, gap: i32) Point {
     return .{
         .x = target.right - window_w - margin,
@@ -113,6 +111,51 @@ test "msg_show sits in from the top-right corner, below msg_history when shown" 
     const target: Rect = .{ .left = 0, .top = 100, .right = 800, .bottom = 600 };
     try std.testing.expectEqual(Point{ .x = 800 - 200 - 15, .y = 115 }, msgFloatTopRight(target, 200, null, 15, 6));
     try std.testing.expectEqual(Point{ .x = 800 - 200 - 15, .y = 300 + 6 }, msgFloatTopRight(target, 200, 300, 15, 6));
+}
+
+const msg_test_screen: Rect = .{ .left = 0, .top = 0, .right = 1920, .bottom = 1080 };
+
+test "a message float's right edge is invariant across every width" {
+    // The regression: a resize in place (SWP_NOMOVE) kept the previous long
+    // message's left edge. The right edge is the contract; the left edge must
+    // move whenever the width does.
+    const widths = [_]i32{ 1, 80, 400, 401, 1200, 1910 };
+    var previous_x: ?i32 = null;
+    for (widths) |w| {
+        const p = msgFloatTopRight(msg_test_screen, w, null, 10, 4);
+        try std.testing.expectEqual(msg_test_screen.right - 10, p.x + w);
+        try std.testing.expectEqual(@as(i32, 10), p.y);
+        if (previous_x) |prev| try std.testing.expect(p.x != prev);
+        previous_x = p.x;
+    }
+}
+
+test "a short message after a long one is not left where the long one was" {
+    const long = msgFloatTopRight(msg_test_screen, 900, null, 10, 4);
+    const short = msgFloatTopRight(msg_test_screen, 120, null, 10, 4);
+    try std.testing.expect(short.x > long.x);
+    try std.testing.expectEqual(long.x + 900, short.x + 120);
+}
+
+test "msg_show stacks below msg_history without changing its right edge" {
+    const history = msgFloatTopRight(msg_test_screen, 600, null, 10, 4);
+    const history_bottom = history.y + 300;
+    const show = msgFloatTopRight(msg_test_screen, 240, history_bottom, 10, 4);
+    try std.testing.expectEqual(history_bottom + 4, show.y);
+    try std.testing.expectEqual(msg_test_screen.right - 10, show.x + 240);
+}
+
+test "message placement follows a target rect off the screen origin" {
+    // msg_pos = window/grid hands over the cursor window's rect in screen
+    // coordinates, offset on both axes.
+    const windowed: Rect = .{ .left = 300, .top = 150, .right = 1400, .bottom = 900 };
+    try std.testing.expectEqual(Point{ .x = 1400 - 500 - 10, .y = 160 }, msgFloatTopRight(windowed, 500, null, 10, 4));
+}
+
+test "a message float wider than the target overhangs the left, never the right" {
+    const p = msgFloatTopRight(msg_test_screen, 2400, null, 10, 4);
+    try std.testing.expectEqual(msg_test_screen.right - 10, p.x + 2400);
+    try std.testing.expect(p.x < msg_test_screen.left);
 }
 
 // ---------------------------------------------------------------------------

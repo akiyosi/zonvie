@@ -528,6 +528,15 @@ struct SurfaceCursorOwner {
         stagedRootRow = rootRow
     }
 
+    /// Stage `gridId` for a cursor submission and return true, or return
+    /// false for an empty clear from a grid that does not own the cursor:
+    /// clearing another grid must not erase the owner's cursor.
+    mutating func admit(_ gridId: Int64, count: Int, rootRow: Int = -1) -> Bool {
+        guard count != 0 || owns(gridId) else { return false }
+        stage(gridId, rootRow: rootRow)
+        return true
+    }
+
     /// Publish what the bracket staged.
     mutating func commit() {
         committed = staged
@@ -663,5 +672,33 @@ struct SurfaceBlinkState {
         lock.lock()
         visible = newValue
         lock.unlock()
+    }
+}
+
+/// The grid a press claimed, kept for its drag and release, on both macOS
+/// surfaces. Another button pressed mid left-drag leaves the claim to the
+/// left button, and its release does not end it: taking it re-pinned the drag
+/// under the pointer and the second release cleared it. Windows' rule
+/// (pressEditorButton/takeButtonRelease).
+struct SurfacePressPin<Pin> {
+    private(set) var pinned: Pin?
+    private var leftOwns = false
+
+    /// `pin` runs only when this press takes the claim.
+    mutating func press(button: String, pin: () -> Pin?) {
+        guard !leftOwns else { return }
+        leftOwns = button == "left"
+        pinned = pin()
+    }
+
+    /// The pin this release is addressed to; ends the claim unless a left
+    /// drag continues past it.
+    mutating func release(button: String) -> Pin? {
+        let released = pinned
+        if !leftOwns || button == "left" {
+            leftOwns = false
+            pinned = nil
+        }
+        return released
     }
 }

@@ -126,24 +126,6 @@ fn measure(img: capture.Image, r: Rect) Sample {
     return out;
 }
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow) !platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    var attempt: u32 = 0;
-    while (attempt < 150) : (attempt += 1) {
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        for (now) |w| {
-            var seen = false;
-            for (before) |b| {
-                if (b.number == w.number) seen = true;
-            }
-            if (!seen and w.bounds.w >= 100 and w.bounds.h >= 100) return w;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-    platform.dumpWindowsForPid(pid);
-    return error.ExternalWindowNotFound;
-}
-
 /// Glide the float one way and back while the gesture is held, sampling the
 /// float's rect after each step. Returns the worst host strip and the worst
 /// stripe overrun beyond one settled cell.
@@ -254,7 +236,7 @@ fn runExternal(alloc: std.mem.Allocator) !Sample {
     const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
     try g.exec("luaeval('(function() " ++ host_lines_lua ++
         "_G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20})  return 1 end)()')");
-    const ext = try waitNewWindow(g.app_pid, before);
+    const ext = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // Covers the external window's centre, where the gesture lands.

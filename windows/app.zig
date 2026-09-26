@@ -16,7 +16,6 @@ pub const PaintRetryState = render_pipeline_helpers.PaintRetryState;
 
 // Re-export core types used across modules
 pub const Vertex = core.Vertex;
-pub const Cursor = core.Cursor;
 pub const GlyphEntry = core.GlyphEntry;
 pub const GlyphBitmap = core.GlyphBitmap;
 pub const MsgChunk = core.MsgChunk;
@@ -39,14 +38,12 @@ pub const zonvie_core_try_resize_grid = core.zonvie_core_try_resize_grid;
 pub const zonvie_core_get_viewport = core.zonvie_core_get_viewport;
 pub const zonvie_core_try_get_viewport = core.zonvie_core_try_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
-pub const zonvie_core_try_get_visible_grids = core.zonvie_core_try_get_visible_grids;
 pub const zonvie_core_try_get_visible_grids_complete = core.zonvie_core_try_get_visible_grids_complete;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
 pub const zonvie_core_try_get_cursor_position = core.zonvie_core_try_get_cursor_position;
 pub const zonvie_core_get_win_id = core.zonvie_core_get_win_id;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
 pub const zonvie_core_is_cursor_visible = core.zonvie_core_is_cursor_visible;
-pub const zonvie_core_get_cursor_blink = core.zonvie_core_get_cursor_blink;
 pub const zonvie_core_try_get_cursor_blink = core.zonvie_core_try_get_cursor_blink;
 pub const zonvie_core_send_mouse_scroll = core.zonvie_core_send_mouse_scroll;
 pub const zonvie_core_resolve_pointer_grid = core.zonvie_core_resolve_pointer_grid;
@@ -60,7 +57,6 @@ pub const zonvie_core_popupmenu_top = core.zonvie_core_popupmenu_top;
 pub const zonvie_core_cmdline_popupmenu_top = core.zonvie_core_cmdline_popupmenu_top;
 pub const zonvie_core_scroll_to_line = core.zonvie_core_scroll_to_line;
 pub const zonvie_core_page_scroll = core.zonvie_core_page_scroll;
-pub const zonvie_core_process_pending_msg_scroll = core.zonvie_core_process_pending_msg_scroll;
 pub const zonvie_core_process_pending_msg_scroll_retry_needed = core.zonvie_core_process_pending_msg_scroll_retry_needed;
 pub const zonvie_core_send_mouse_input = core.zonvie_core_send_mouse_input;
 pub const zonvie_core_update_layout_px = core.zonvie_core_update_layout_px;
@@ -101,7 +97,6 @@ pub const zonvie_core_set_option_value = core.zonvie_core_set_option_value;
 pub const zonvie_core_set_background_opacity = core.zonvie_core_set_background_opacity;
 pub const zonvie_core_perf_now_ns = core.zonvie_core_perf_now_ns;
 pub const zonvie_version = core.zonvie_version;
-pub const zonvie_core_note_input_trace = core.zonvie_core_note_input_trace;
 pub const zonvie_core_abort_flush = core.zonvie_core_abort_flush;
 pub const zonvie_core_retry_flush = core.zonvie_core_retry_flush;
 pub const zonvie_core_flush_had_atlas_corruption = core.zonvie_core_flush_had_atlas_corruption;
@@ -150,6 +145,24 @@ pub fn baseName(name: []const u8) []const u8 {
     return trimmed[last..];
 }
 
+/// What a tab entry keeps of the core's full name within `cap` bytes: the
+/// basename, which is all any consumer shows, cut on a UTF-8 boundary. Cutting
+/// the full path first lost the file name, or left a split character that
+/// drew no label at all.
+pub fn tabNameForStorage(name: []const u8, cap: usize) []const u8 {
+    const base = baseName(name);
+    if (base.len <= cap) return base;
+    var end = cap;
+    while (end > 0 and (base[end] & 0xC0) == 0x80) end -= 1;
+    return base[0..end];
+}
+
+test "tabNameForStorage keeps the basename of a name longer than the cap" {
+    try std.testing.expectEqualStrings("file.zig", tabNameForStorage("/very/deep/path/file.zig", 12));
+    // "あいう" is 9 bytes; a cap of 7 must not split the third character.
+    try std.testing.expectEqualStrings("あい", tabNameForStorage("/d/あいう", 7));
+}
+
 test "baseName ignores trailing separators" {
     try std.testing.expectEqualStrings("proj", baseName("oil:///home/u/proj/"));
     try std.testing.expectEqualStrings("a.zig", baseName("src\\a.zig"));
@@ -172,7 +185,6 @@ pub const WM_APP_CLIPBOARD_GET: c.UINT = c.WM_APP + 10;
 pub const WM_APP_CLIPBOARD_SET: c.UINT = c.WM_APP + 11;
 pub const WM_APP_SSH_AUTH_PROMPT: c.UINT = c.WM_APP + 12;
 pub const WM_APP_UPDATE_SCROLLBAR: c.UINT = c.WM_APP + 13;
-pub const WM_APP_UPDATE_EXT_FLOAT_POS: c.UINT = c.WM_APP + 14;
 pub const WM_APP_TRAY: c.UINT = c.WM_APP + 15;
 pub const WM_APP_UPDATE_CURSOR_BLINK: c.UINT = c.WM_APP + 16;
 pub const WM_APP_IME_OFF: c.UINT = c.WM_APP + 17;
@@ -322,6 +334,8 @@ pub const TIMER_MAIN_SIZE_REPLAY: c.UINT_PTR = 20;
 pub const TIMER_COPY_BUTTON_REVERT: c.UINT_PTR = 21;
 /// How long the copy button shows its checkmark (matches macOS's 0.8s).
 pub const COPY_BUTTON_REVERT_MS: c.UINT = 800;
+/// One-shot trailing send of a knob drag position the throttle held back.
+pub const TIMER_SCROLLBAR_DRAG_FLUSH: c.UINT_PTR = 22;
 pub const EXTERNAL_CREATE_RETRY_INTERVAL_MS: c.UINT = 100;
 pub const EXTERNAL_CREATE_RETRY_MAX_MS: u32 = 5000;
 pub const MSG_SCROLL_RETRY_INTERVAL_MS: c.UINT = 16;
@@ -338,7 +352,6 @@ pub const SCROLLBAR_REPEAT_INTERVAL: c.UINT = 100; // Interval during repeat
 pub const SCROLLBAR_WIDTH: f32 = 12.0;
 pub const SCROLLBAR_MARGIN: f32 = 2.0;
 pub const SCROLLBAR_MIN_KNOB_HEIGHT: f32 = 20.0;
-pub const SCROLLBAR_CORNER_RADIUS: f32 = 4.0;
 
 /// DPI-scaled scrollbar dimensions
 pub fn scrollbarWidth(dpi_scale: f32) f32 {
@@ -648,7 +661,6 @@ pub const TripleBufferedSurface = struct {
     rotation_mu: std.Io.Mutex = .init,
     write_index: u8 = 0,
     committed_index: u8 = 1,
-    flush_source_index: u8 = 1,
     is_in_flush: bool = false,
     commit_rev: u64 = 0,
 
@@ -745,7 +757,6 @@ pub const TripleBufferedSurface = struct {
             }
             if (picked == null) return false;
             self.write_index = picked.?;
-            self.flush_source_index = ci;
         }
 
         const wi = picked.?;
@@ -1587,6 +1598,17 @@ pub const MiniWindowId = enum(u2) {
 };
 
 /// Mini window state (one per type)
+/// See App.device_lost_shader_carry.
+pub const ShaderCarry = struct {
+    start_qpc: i64,
+    last_qpc: i64,
+    cur: [4]f32,
+    prev: [4]f32,
+    cur_color: [4]f32,
+    prev_color: [4]f32,
+    change_time: f32,
+};
+
 pub const MiniWindowState = struct {
     hwnd: ?c.HWND = null,
     text: [256]u8 = undefined,
@@ -1612,8 +1634,9 @@ pub const MessageWindow = struct {
         _ = c.DestroyWindow(self.hwnd);
     }
 
-    /// Get text color based on message kind
-    pub fn getTextColor(self: *const MessageWindow) c.COLORREF {
+    /// Get text color based on message kind; ordinary kinds use the Normal
+    /// foreground `normal_fg`, as on macOS.
+    pub fn getTextColor(self: *const MessageWindow, normal_fg: c.COLORREF) c.COLORREF {
         const kind_str = self.kind[0..self.kind_len];
         if (std.mem.eql(u8, kind_str, "emsg") or
             std.mem.eql(u8, kind_str, "echoerr") or
@@ -1631,7 +1654,7 @@ pub const MessageWindow = struct {
         } else if (std.mem.eql(u8, kind_str, "search_count")) {
             return c.RGB(153, 255, 153); // Light green for search count
         }
-        return c.RGB(220, 220, 220); // Default light gray
+        return normal_fg;
     }
 };
 
@@ -1657,10 +1680,6 @@ pub const TablineState = struct {
     hovered_new_tab_btn: bool = false,
     hwnd: ?c.HWND = null, // Child window for tabline
 
-    // Pending invalidate flag: if tabline_update arrives before hwnd is created,
-    // we need to trigger InvalidateRect after hwnd creation
-    pending_invalidate: bool = false,
-
     // Drag state for tab reordering
     dragging_tab: ?usize = null, // Index of tab being dragged
     drag_start_x: c_int = 0, // Mouse X when drag started
@@ -1676,6 +1695,9 @@ pub const TablineState = struct {
 
     // Close button pressed state (for proper click handling)
     close_button_pressed: ?usize = null, // Tab index of pressed close button
+    // Its tab's handle: the release closes that tab wherever a tabline_update
+    // in between moved it, as macOS does.
+    close_button_pressed_handle: i64 = 0,
 
     // New tab button pressed state (for proper click handling)
     new_tab_button_pressed: bool = false,
@@ -1734,6 +1756,14 @@ pub const TablineState = struct {
         self.tab_count = 0;
         self.current_tab = 0;
         self.visible = false;
+    }
+
+    /// The tab index `handle` is at now, or null once it is gone.
+    pub fn indexOfHandle(self: *const TablineState, handle: i64) ?usize {
+        for (self.tabs[0..self.tab_count], 0..) |tab, i| {
+            if (tab.handle == handle) return i;
+        }
+        return null;
     }
 
     /// Upsert/remove (state==0) the AI-agent state for a tab handle.
@@ -2304,33 +2334,12 @@ pub const LayerGridState = struct {
 
         const rows_buf = self.rows_buf.items;
         const origins = self.origin_rows.items;
-        if (rows_delta > 0) {
-            // Content moves up: row r takes row r + shift.
-            var r: u32 = row_start;
-            while (r + shift < row_end) : (r += 1) {
-                std.mem.swap(RowVerts, &rows_buf[r], &rows_buf[r + shift]);
-                std.mem.swap(u32, &origins[r], &origins[r + shift]);
-            }
-            var v: u32 = row_end - shift;
-            while (v < row_end) : (v += 1) {
-                rows_buf[v].verts.clearRetainingCapacity();
-                rows_buf[v].gen +%= 1;
-                origins[v] = v;
-            }
-        } else {
-            // Content moves down: row r takes row r - shift.
-            var r: u32 = row_end;
-            while (r > row_start + shift) {
-                r -= 1;
-                std.mem.swap(RowVerts, &rows_buf[r], &rows_buf[r - shift]);
-                std.mem.swap(u32, &origins[r], &origins[r - shift]);
-            }
-            var v: u32 = row_start;
-            while (v < row_start + shift) : (v += 1) {
-                rows_buf[v].verts.clearRetainingCapacity();
-                rows_buf[v].gen +%= 1;
-                origins[v] = v;
-            }
+        const band = render_pipeline_helpers.rotateRegion(RowVerts, rows_buf, row_start, row_end, rows_delta);
+        _ = render_pipeline_helpers.rotateRegion(u32, origins, row_start, row_end, rows_delta);
+        for (band.start..band.end) |v| {
+            rows_buf[v].verts.clearRetainingCapacity();
+            rows_buf[v].gen +%= 1;
+            origins[v] = @intCast(v);
         }
         // The bits have to travel with the rows they describe, or a row marked
         // earlier in this flush keeps its bit at the pre-shift index while its
@@ -2366,7 +2375,7 @@ pub const PaintRowRange = struct {
 
 /// External window state for win_external_pos grids
 /// The buffers one surface paints with: per-row GPU vertex buffers, the
-/// cursor and scrollbar overlays, the shift scratch, the per-paint lists, and
+/// cursor and scrollbar overlays, the per-paint lists, and
 /// where the cursor was last painted. The main window and every external
 /// window hold one; they used to be two sets of fields under two sets of
 /// names, and the shared row pass took them one pointer at a time.
@@ -2374,10 +2383,6 @@ pub const SurfacePaintState = struct {
     // Per-row GPU vertex buffers (TBS: uploaded from committed set row_verts).
     row_vbs: std.ArrayListUnmanaged(RowVB) = .empty,
     row_vb_retained_bytes: usize = 0,
-    // Persistent scratch for shiftRowVBs, sized to abs(vb_shift) before each
-    // shift, so large scrolls never overflow a fixed stack array. Holds
-    // shallow copies: the GPU buffers belong to row_vbs.
-    row_vbs_shift_scratch: std.ArrayListUnmanaged(RowVB) = .empty,
     // Persistent destination for linear dirty-row/range union during scroll.
     scroll_rows_merge_scratch: std.ArrayListUnmanaged(u32) = .empty,
     cursor_vb: ?*c.ID3D11Buffer = null,
@@ -2399,7 +2404,6 @@ pub const SurfacePaintState = struct {
     pub fn deinit(self: *SurfacePaintState, alloc: std.mem.Allocator, row_vb_budget: *RowVBPhysicalBudget) void {
         releaseRowVBs(self.row_vbs.items, row_vb_budget, &self.row_vb_retained_bytes);
         self.row_vbs.deinit(alloc);
-        self.row_vbs_shift_scratch.deinit(alloc);
         self.scroll_rows_merge_scratch.deinit(alloc);
         self.dirty_row_keys.deinit(alloc);
         self.rows_to_draw.deinit(alloc);
@@ -2437,6 +2441,8 @@ pub const ScrollbarState = struct {
     last_viewport_topline: i64 = -1,
     last_viewport_line_count: i64 = -1,
     last_viewport_botline: i64 = -1,
+    // Grid the bar last showed (0 = none yet); kept while grid_mu is busy.
+    last_grid: i64 = 0,
 };
 
 /// What every window's surface keeps, the main window's and each external
@@ -2482,7 +2488,6 @@ pub const WindowSurface = struct {
     /// `row_bytes` is what a row buffer returns to the row budget. Caller
     /// holds app.mu.
     pub fn detachOneRecoveryVB(self: *WindowSurface) ?RecoveryVB {
-        if (detachOneSurfaceGpuVB(&self.surface)) |vb| return .{ .buffer = vb, .row_bytes = 0 };
         if (detachOneRowVB(self.paint.row_vbs.items)) |d| return .{ .buffer = d.buffer, .row_bytes = d.bytes };
         if (self.paint.cursor_vb) |vb| {
             self.paint.cursor_vb = null;
@@ -2574,12 +2579,6 @@ pub const ExternalWindow = struct {
     // Per-window to prevent re-entrancy corruption when DXGI Present pumps messages.
     paint_scratch: std.ArrayListUnmanaged(Vertex) = .empty,
     paint_row_ranges: std.ArrayListUnmanaged(PaintRowRange) = .empty,
-    paint_dirty_row_keys: std.ArrayListUnmanaged(u32) = .empty,
-    paint_rows_to_draw: std.ArrayListUnmanaged(u32) = .empty,
-    // Back-texture damage submitted through the renderer's per-swapchain-
-    // buffer queue. Persistent so partial external paints allocate only when
-    // the grid's high-water row count grows.
-    paint_present_rects: std.ArrayListUnmanaged(c.RECT) = .empty,
     // Whether the last paint drew any root row, for atlasUploadOwesFullPaint.
     paint_drew_root_rows: bool = false,
 
@@ -2598,10 +2597,6 @@ pub const ExternalWindow = struct {
         self.paint_scratch.deinit(alloc);
         self.paint_row_ranges.deinit(alloc);
         self.flat_draw_scratch.deinit(alloc);
-        // Release GPU VBs from row_verts before deinitCpuState frees the list.
-        for (self.surf.surface.row_verts.items) |*rv| {
-            if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
-        }
         self.surf.surface.deinitCpuState(alloc);
         self.surf.paint.deinit(alloc, row_vb_budget);
         self.surf.tbs.deinit(alloc); // Handles slot release + pool deinit
@@ -2682,28 +2677,6 @@ pub fn cursorRowFromVerts(verts: []const Vertex, row_h_px: i32) u32 {
     return @intCast(@max(0, row_i));
 }
 
-pub fn snapshotSurfaceVerts(
-    alloc: std.mem.Allocator,
-    scratch: *std.ArrayListUnmanaged(Vertex),
-    row_mode: bool,
-    row_verts: []const RowVerts,
-    flat_verts: []const Vertex,
-    vert_count: usize,
-) bool {
-    scratch.clearRetainingCapacity();
-    scratch.ensureTotalCapacity(alloc, vert_count) catch return false;
-
-    if (row_mode) {
-        for (row_verts) |rv| {
-            if (rv.verts.items.len == 0) continue;
-            scratch.appendSliceAssumeCapacity(rv.verts.items);
-        }
-    } else {
-        scratch.appendSliceAssumeCapacity(flat_verts[0..vert_count]);
-    }
-    return true;
-}
-
 /// Flatten a committed set into `scratch` for a surface drawn as one list
 /// (decorated and flat-mode windows). The committed set, not the per-row
 /// mirror the core thread writes one callback at a time: a paint landing
@@ -2736,24 +2709,6 @@ pub fn snapshotSetRows(
         start += verts.len;
     }
     return true;
-}
-
-pub fn ensureRowVBReady(
-    g: *d3d11.Renderer,
-    rv: *RowVerts,
-    src: []const Vertex,
-) !bool {
-    if (src.len == 0) return false;
-
-    if (rv.uploaded_gen != rv.gen or rv.vb == null or rv.vb_bytes < src.len * @sizeOf(Vertex)) {
-        const need_bytes = src.len * @sizeOf(Vertex);
-        try g.ensureExternalVertexBuffer(&rv.vb, &rv.vb_bytes, need_bytes);
-        try g.uploadVertsToVB(rv.vb.?, src);
-        rv.uploaded_gen = rv.gen;
-        return true;
-    }
-
-    return false;
 }
 
 fn ensureBudgetedRowVertexBuffer(
@@ -2820,92 +2775,16 @@ pub fn ensureRowVBReadyFromSlot(
 /// After scroll up by N (delta > 0): row_vbs[i] = row_vbs[i+N], vacated tail entries reset.
 /// After scroll down by N (delta < 0): row_vbs[i] = row_vbs[i-N], vacated head entries reset.
 /// This keeps uploaded_slot aligned with row_map so VBs don't need re-upload for shifted rows.
-///
-/// `saved_scratch` must have capacity >= abs(delta); the caller owns it and
-/// typically reuses a persistent per-window buffer so this path stays
-/// allocation-free across flushes.
-pub fn shiftRowVBs(
-    row_vbs: []RowVB,
-    delta: i32,
-    row_start: u32,
-    row_end: u32,
-    saved_scratch: []RowVB,
-) void {
-    if (delta == 0) return;
-    const start: usize = @intCast(row_start);
+/// The vacated entries keep the scrolled-off rows' GPU buffers and only reset
+/// their upload state.
+pub fn shiftRowVBs(row_vbs: []RowVB, delta: i32, row_start: u32, row_end: u32) void {
     const end: usize = @min(@as(usize, @intCast(row_end)), row_vbs.len);
-    if (start >= end) return;
-    const region = row_vbs[start..end];
-    const abs_delta: usize = @intCast(if (delta < 0) -delta else delta);
-    if (abs_delta >= region.len) {
-        // Entire region shifted out: reset all.
-        for (region) |*vb| {
-            vb.uploaded_slot = SLOT_NONE;
-            vb.uploaded_ver = 0;
-        }
-        return;
+    if (delta == 0 or row_start >= end) return;
+    const band = render_pipeline_helpers.rotateRegion(RowVB, row_vbs, row_start, end, delta);
+    for (row_vbs[band.start..band.end]) |*vb| {
+        vb.uploaded_slot = SLOT_NONE;
+        vb.uploaded_ver = 0;
     }
-
-    // The vacated side reuses `abs_delta` RowVBs from the scrolled-off side
-    // to keep their GPU buffers (just resets upload state for re-upload).
-    // If the caller failed to size `saved_scratch`, fall back to resetting
-    // the entire region: this leaks the original GPU buffers for the
-    // scrolled-off rows, but never corrupts memory. Callers are expected to
-    // size the scratch via `ensureShiftScratch` so this fallback is unreachable.
-    if (saved_scratch.len < abs_delta) {
-        for (region) |*vb| {
-            vb.uploaded_slot = SLOT_NONE;
-            vb.uploaded_ver = 0;
-        }
-        return;
-    }
-
-    if (delta > 0) {
-        // Scroll up: row_vbs[start] gets row_vbs[start + abs_delta], etc.
-        // Save VBs that scroll off (at the top of the region).
-        for (0..abs_delta) |s| {
-            saved_scratch[s] = region[s];
-        }
-        var i: usize = 0;
-        while (i + abs_delta < region.len) : (i += 1) {
-            region[i] = region[i + abs_delta];
-        }
-        // Vacated tail entries: reuse saved VBs (keep GPU buffer, reset upload state).
-        for (0..abs_delta) |s| {
-            region[region.len - abs_delta + s] = saved_scratch[s];
-            region[region.len - abs_delta + s].uploaded_slot = SLOT_NONE;
-            region[region.len - abs_delta + s].uploaded_ver = 0;
-        }
-    } else {
-        // Scroll down: row_vbs[end-1] gets row_vbs[end-1-abs_delta], etc.
-        for (0..abs_delta) |s| {
-            saved_scratch[s] = region[region.len - 1 - s];
-        }
-        var i: usize = region.len;
-        while (i > abs_delta) {
-            i -= 1;
-            region[i] = region[i - abs_delta];
-        }
-        // Vacated head entries: reuse saved VBs.
-        // Index is region-local (region = row_vbs[start..end]).
-        for (0..abs_delta) |s| {
-            region[s] = saved_scratch[s];
-            region[s].uploaded_slot = SLOT_NONE;
-            region[s].uploaded_ver = 0;
-        }
-    }
-}
-
-/// Ensure `list` has at least `need` capacity+length, growing via `alloc` if
-/// needed. Used by scroll paths to size the scratch slice passed to
-/// `shiftRowVBs` so the shift itself is allocation-free.
-pub fn ensureShiftScratch(
-    alloc: std.mem.Allocator,
-    list: *std.ArrayListUnmanaged(RowVB),
-    need: usize,
-) void {
-    if (list.items.len >= need) return;
-    list.resize(alloc, need) catch {};
 }
 
 /// Scroll state consumed by paint. Returned by applyScrollShift.
@@ -2941,7 +2820,6 @@ pub fn applyScrollShift(
     g: *d3d11.Renderer,
     alloc: std.mem.Allocator,
     row_vbs: []RowVB,
-    shift_scratch: *std.ArrayListUnmanaged(RowVB),
     rows_to_draw: *std.ArrayListUnmanaged(u32),
     row_merge_scratch: *std.ArrayListUnmanaged(u32),
     scroll_rect: c.RECT,
@@ -2965,11 +2843,7 @@ pub fn applyScrollShift(
     // 1. Shift row_vbs within the scroll region only, matching remapRowSlots'
     //    [row_start, row_end) range.  Shifting the full array corrupts VB
     //    tracking for rows outside the scroll region (e.g. tabline at row 0).
-    if (vb_shift_rows != 0 and scroll_row_end > scroll_row_start) {
-        const abs_shift: u32 = @intCast(if (vb_shift_rows < 0) -vb_shift_rows else vb_shift_rows);
-        ensureShiftScratch(alloc, shift_scratch, abs_shift);
-        shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end, shift_scratch.items);
-    }
+    shiftRowVBs(row_vbs, vb_shift_rows, scroll_row_start, scroll_row_end);
 
     // 2. Cursor ghost erasure: add previous cursor row (shifted + original) to
     //    rows_to_draw. Only a row of the root is one: a cursor last painted in
@@ -3369,36 +3243,6 @@ pub fn drawRowModeSetupAndRowsFromSlots(
     );
 
     return result;
-}
-
-/// Flush pending atlas uploads to a D3D renderer.
-/// Both main window WM_PAINT and external window paintExternalWindow
-/// call this inside their respective gpu.lockContext() scopes.
-/// Returns the new upload cursor value.
-/// Device-loss recovery: release the GPU vertex buffers referenced by a
-/// SurfaceState. CPU vertex data survives; upload bookkeeping resets so the
-/// next paint re-creates and re-uploads the buffers on the new device.
-pub fn releaseSurfaceGpuVBs(surface: *SurfaceState) void {
-    for (surface.row_verts.items) |*rv| {
-        if (rv.vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
-        rv.vb = null;
-        rv.vb_bytes = 0;
-        rv.uploaded_gen = 0;
-    }
-}
-
-/// Detach one device-bound row buffer without calling COM. The caller may
-/// release the returned pointer after dropping app.mu.
-pub fn detachOneSurfaceGpuVB(surface: *SurfaceState) ?*c.ID3D11Buffer {
-    for (surface.row_verts.items) |*rv| {
-        if (rv.vb) |vb| {
-            rv.vb = null;
-            rv.vb_bytes = 0;
-            rv.uploaded_gen = 0;
-            return vb;
-        }
-    }
-    return null;
 }
 
 /// Detach one device-bound row buffer held by a grid drawn as a layer. These
@@ -4740,22 +4584,6 @@ pub fn drawScrollbarOverlayOverUnderlay(
     return captured_rect;
 }
 
-/// A frame that redraws every row still has to apply the row-buffer shift a
-/// scroll staged, or the stale slot order accumulates into the next partial
-/// frame. Both drivers had the four lines inline in their full-redraw arm.
-pub fn consumePendingVbShift(
-    alloc: std.mem.Allocator,
-    row_vbs: []RowVB,
-    shift_scratch: *std.ArrayListUnmanaged(RowVB),
-    vb_shift: i32,
-    scroll_row_start: u32,
-    scroll_row_end: u32,
-) void {
-    if (vb_shift == 0 or scroll_row_end <= scroll_row_start) return;
-    ensureShiftScratch(alloc, shift_scratch, @abs(vb_shift));
-    shiftRowVBs(row_vbs, vb_shift, scroll_row_start, scroll_row_end, shift_scratch.items);
-}
-
 pub fn drawScrollbarOverlay(
     g: *d3d11.Renderer,
     vb_ptr: *?*c.ID3D11Buffer,
@@ -4771,21 +4599,6 @@ pub fn drawScrollbarOverlay(
     // Scrollbar geometry is built in clip space by this frontend.
     g.setLayerTransform(0, 0, 0, 0);
     try g.drawVB(vb, scrollbar_verts.len);
-}
-
-/// Draw bloom/glow post-process overlay.
-/// Applies neon glow effect using the provided bloom and cursor vertices.
-/// Caller decides which cursor verts to pass (e.g. empty slice when cursor is blink-hidden).
-pub fn drawBloomOverlay(
-    g: *d3d11.Renderer,
-    bloom_verts: []const Vertex,
-    cursor_verts: []const Vertex,
-    glow_intensity: f32,
-    draw_params: RowModeDrawParams,
-) void {
-    if (bloom_verts.len == 0) return;
-    const bvp = draw_params.bloomViewport(g.width);
-    g.drawBloomFromVerts(bloom_verts, cursor_verts, glow_intensity, bvp.x, bvp.y, bvp.w, bvp.h);
 }
 
 const BloomRowsContext = struct {
@@ -5215,7 +5028,6 @@ pub const RowPassSurface = struct {
         return .{
             .tbs = &ws.tbs,
             .row_vbs = &paint.row_vbs,
-            .row_vbs_shift_scratch = &paint.row_vbs_shift_scratch,
             .scroll_rows_merge_scratch = &paint.scroll_rows_merge_scratch,
             .row_vb_retained_bytes = &paint.row_vb_retained_bytes,
             .cursor_vb = &paint.cursor_vb,
@@ -5227,7 +5039,6 @@ pub const RowPassSurface = struct {
 
     tbs: *TripleBufferedSurface,
     row_vbs: *std.ArrayListUnmanaged(RowVB),
-    row_vbs_shift_scratch: *std.ArrayListUnmanaged(RowVB),
     scroll_rows_merge_scratch: *std.ArrayListUnmanaged(u32),
     row_vb_retained_bytes: *usize,
     cursor_vb: *?*c.ID3D11Buffer,
@@ -5295,7 +5106,6 @@ pub fn drawSurfaceRowPass(
                 g,
                 app.alloc,
                 surface.row_vbs.items,
-                surface.row_vbs_shift_scratch,
                 rows_to_draw,
                 surface.scroll_rows_merge_scratch,
                 sr,
@@ -5340,14 +5150,9 @@ pub fn drawSurfaceRowPass(
             }
         }
     } else {
-        consumePendingVbShift(
-            app.alloc,
-            surface.row_vbs.items,
-            surface.row_vbs_shift_scratch,
-            in.snapshot.vb_shift,
-            in.snapshot.scroll_row_start,
-            in.snapshot.scroll_row_end,
-        );
+        // A frame that redraws every row still applies the staged shift, or
+        // the stale slot order carries into the next partial frame.
+        shiftRowVBs(surface.row_vbs.items, in.snapshot.vb_shift, in.snapshot.scroll_row_start, in.snapshot.scroll_row_end);
     }
 
     // The copy has to land before the rows below paint over the band it
@@ -5668,8 +5473,6 @@ pub const App = struct {
     // WM_PAINT(row) persistent buffers (avoid per-frame alloc/free)
     wm_paint_rects_snapshot: std.ArrayListUnmanaged(c.RECT) = .empty,
 
-    cursor: ?Cursor = null,
-
     row_mode_max_row_end: u32 = 0,
 
     // ---- NEW: self-managed damage queue (avoid OS update region dependency) ----
@@ -5764,6 +5567,9 @@ pub const App = struct {
     // blocking on app.mu, which recovery holds across parts of its own
     // handler and would otherwise self-deadlock against.
     device_lost_recovering: bool = false,
+    /// The main renderer's shader clock and cursor, carried from the lost
+    /// device to the renderer a recovery publishes. UI thread.
+    device_lost_shader_carry: ?ShaderCarry = null,
     // ResizeBuffers can synchronously pump this thread's message queue. Keep
     // App/renderer alive and defer every nested main resize until the outer
     // swapchain transition has completely unwound.
@@ -5798,6 +5604,7 @@ pub const App = struct {
     // gate). 0 forces a re-render — reset when the renderer/texture is
     // recreated (device-loss recovery).
     tabline_render_sig: u64 = 0,
+    sidebar_render_sig: u64 = 0,
     // Row-mode seed tracking: require a full set of rows before presenting.
     seed_pending: bool = true,
     seed_clear_pending: bool = true,
@@ -5845,8 +5652,6 @@ pub const App = struct {
     last_cursor_grid: i64 = 1,
     /// The grid on_cursor_grid_changed last named, for dropping its repeats.
     core_reported_cursor_grid: i64 = 1,
-    // Tick count when cursor left an external window (used to suppress main window activation briefly)
-    last_ext_window_exit_tick: i64 = 0,
 
     // Cursor blink state
     cursor_blink: core.frontend_rules.Blink = .{}, // .visible: the cursor is drawn
@@ -5904,6 +5709,10 @@ pub const App = struct {
     // Colorscheme default colors (0x00RRGGBB, or 0xFFFFFFFF = not set)
     colorscheme_bg: u32 = 0xFFFFFFFF,
     colorscheme_fg: u32 = 0xFFFFFFFF,
+    // A new default bg waiting for the flush commit, so the clear colour
+    // changes together with the cells (0xFFFFFFFF = none).
+    pending_colorscheme_bg: u32 = 0xFFFFFFFF,
+    pending_colorscheme_fg: u32 = 0xFFFFFFFF,
 
     // Pending title for deferred SetWindowTextW (avoids cross-thread SendMessage deadlock)
     pending_title: [512]u16 = undefined,
@@ -6017,11 +5826,6 @@ pub const App = struct {
     // Set before teardown joins d3d_init_thread. The worker owns any device it
     // creates until it observes this flag and publishes into App.
     d3d_init_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
-    /// Match the core's accepted grid-row limit. The per-surface SlotPool can
-    /// hold three 20,000-row sets (60,000 slots) below its u16 sentinel limit;
-    /// the core's aggregate cell cap remains the primary memory bound.
-    pub const max_row_buffers: u32 = 20_000;
 
     pub const AtlasResetAdmission = render_pipeline_helpers.AtlasResetAdmission;
 
@@ -6162,101 +5966,6 @@ pub const App = struct {
         return self.cached_visible_grids.items;
     }
 
-    /// Get target rectangle for ext-float (msg_show/msg_history) positioning
-    /// based on config.messages.msg_pos.ext_float setting
-    pub fn getExtFloatTargetRect(self: *App) c.RECT {
-        const pos_mode = self.config.messages.msg_pos.ext_float;
-
-        switch (pos_mode) {
-            .display => return monitorWorkArea(self.hwnd),
-            .window => {
-                // Window-based: use the window where cursor is
-                const cursor_grid = self.last_cursor_grid;
-
-                // Check if cursor is in an external window
-                if (self.external_windows.get(cursor_grid)) |ext_win| {
-                    var rect: c.RECT = undefined;
-                    if (c.GetWindowRect(ext_win.hwnd, &rect) != 0) {
-                        return rect;
-                    }
-                }
-
-                // Default to main window
-                if (self.hwnd) |main_hwnd| {
-                    var rect: c.RECT = undefined;
-                    if (c.GetClientRect(main_hwnd, &rect) != 0) {
-                        // Convert client rect to screen coordinates
-                        var pt: c.POINT = .{ .x = rect.left, .y = rect.top };
-                        _ = c.ClientToScreen(main_hwnd, &pt);
-                        const width = rect.right - rect.left;
-                        const height = rect.bottom - rect.top;
-                        // When using DWM custom titlebar, client area extends into titlebar.
-                        // Offset top to position below the custom titlebar area.
-                        const titlebar_offset: c_int = if (self.ext_tabline_enabled and self.tabline_style == .titlebar and self.content_hwnd == null)
-                            self.scalePx(TablineState.TAB_BAR_HEIGHT)
-                        else
-                            0;
-                        return c.RECT{
-                            .left = pt.x,
-                            .top = pt.y + titlebar_offset,
-                            .right = pt.x + width,
-                            .bottom = pt.y + height,
-                        };
-                    }
-                }
-
-                // Fallback to screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                return c.RECT{ .left = 0, .top = 0, .right = screen_w, .bottom = screen_h };
-            },
-            .grid => {
-                // Grid-based: use cursor grid's bounds
-                // Note: For ext-float, we use window bounds (same as .window mode)
-                // because calling zonvie_core_get_visible_grids here would cause deadlock
-                // when called from onVerticesRow with mutex locked.
-                // Mini windows use a different code path that handles grid bounds properly.
-                const cursor_grid = self.last_cursor_grid;
-
-                // Check if cursor is in an external window
-                if (self.external_windows.get(cursor_grid)) |ext_win| {
-                    var rect: c.RECT = undefined;
-                    if (c.GetWindowRect(ext_win.hwnd, &rect) != 0) {
-                        return rect;
-                    }
-                }
-
-                // For global grid, use main window client area
-                if (self.hwnd) |main_hwnd| {
-                    var rect: c.RECT = undefined;
-                    if (c.GetClientRect(main_hwnd, &rect) != 0) {
-                        var pt: c.POINT = .{ .x = rect.left, .y = rect.top };
-                        _ = c.ClientToScreen(main_hwnd, &pt);
-                        const width = rect.right - rect.left;
-                        const height = rect.bottom - rect.top;
-                        // When using DWM custom titlebar, client area extends into titlebar.
-                        // Offset top to position below the custom titlebar area.
-                        const titlebar_offset: c_int = if (self.ext_tabline_enabled and self.tabline_style == .titlebar and self.content_hwnd == null)
-                            self.scalePx(TablineState.TAB_BAR_HEIGHT)
-                        else
-                            0;
-                        return c.RECT{
-                            .left = pt.x,
-                            .top = pt.y + titlebar_offset,
-                            .right = pt.x + width,
-                            .bottom = pt.y + height,
-                        };
-                    }
-                }
-
-                // Fallback to screen
-                const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-                const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-                return c.RECT{ .left = 0, .top = 0, .right = screen_w, .bottom = screen_h };
-            },
-        }
-    }
-
     /// Scale a pixel value by the current DPI factor.
     pub fn scalePx(self: *const App, base_px: c_int) c_int {
         return @intFromFloat(@round(@as(f32, @floatFromInt(base_px)) * self.dpi_scale));
@@ -6342,13 +6051,7 @@ pub const App = struct {
             self.tabline_state.agent_emoji_hbm = null;
         }
 
-        // Main surface: release GPU VBs from row_verts, then CPU state
-        for (self.surf.surface.row_verts.items) |*rv| {
-            if (rv.vb) |p| {
-                const rel = p.*.lpVtbl.*.Release orelse null;
-                if (rel) |f| _ = f(p);
-            }
-        }
+        // Main surface CPU state (its row buffers live in surf.paint).
         self.surf.surface.deinitCpuState(self.alloc);
 
         // Triple-buffered surface cleanup (handles slot release + pool deinit)
@@ -6886,8 +6589,9 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         else
             0;
         // Chrome that sits beside the cmdline grid inside its own window.
-        const cmdline_chrome_w: u32 = CMDLINE_PADDING * 2 + CMDLINE_ICON_MARGIN_LEFT +
-            CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT + copy_button_w;
+        // DPI-scaled as external_windows.externalSurfaceInsetsPx sizes it.
+        const cmdline_chrome_w: u32 = @as(u32, @intCast(@max(0, app.scalePx(@as(c_int, CMDLINE_PADDING)) * 2 +
+            app.scalePx(@as(c_int, CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT))))) + copy_button_w;
 
         const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
         if (monitor) |mon| {
@@ -7472,6 +7176,8 @@ test "a layer frame is refused once the core republishes the root rows beside it
 test {
     // input.zig's pure helpers (the colon/semicolon swap) run with this suite.
     _ = @import("input.zig");
+    // Message placement rules and the status/confirm stack rules.
+    _ = @import("ui/messages.zig");
     // DirectWrite shaping with [font] family features (skips without the font).
     _ = @import("renderer/dwrite_d2d_renderer.zig");
 }

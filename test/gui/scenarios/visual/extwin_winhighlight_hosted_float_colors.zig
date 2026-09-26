@@ -29,24 +29,6 @@ const normal_bg = [3]i32{ 0x20, 0x60, 0xa0 };
 const float_bg = [3]i32{ 0xa0, 0x20, 0x60 };
 const tolerance: i32 = 24;
 
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow) !platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    var attempt: u32 = 0;
-    while (attempt < 150) : (attempt += 1) {
-        const now = buf[0..platform.windowsForPid(pid, &buf)];
-        for (now) |w| {
-            var seen = false;
-            for (before) |b| {
-                if (b.number == w.number) seen = true;
-            }
-            if (!seen and w.bounds.w >= 100 and w.bounds.h >= 100) return w;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-    platform.dumpWindowsForPid(pid);
-    return error.ExternalWindowNotFound;
-}
-
 /// Mean colour of a rectangle given in fractions of the capture.
 fn meanColour(img: capture.Image, x0f: f32, y0f: f32, x1f: f32, y1f: f32) [3]i32 {
     const fw: f32 = @floatFromInt(img.w);
@@ -95,7 +77,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) vim.api.nvim_buf_set_lines(b, 0, -1, false, {"host"}) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) vim.wo[_G.z_anchor].winhighlight = "NormalFloat:Normal" return 1 end)()')
     );
-    const ext = try waitNewWindow(g.app_pid, before);
+    const ext = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // A float over the left half of rows 4..15 (cols 6..30 of 60).

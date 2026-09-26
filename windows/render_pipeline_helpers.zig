@@ -1241,3 +1241,41 @@ pub fn shiftRowBits(
         bits.setRangeValue(.{ .start = row_start, .end = row_start + shift }, true);
     }
 }
+
+/// How one argument goes into a spawn command so the core's tokenizer
+/// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
+/// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote
+/// as grouping, never unescapes, and ends a quoted token at its quote (or at
+/// a backslash-quote pair). Null when neither quote can carry the argument
+/// (an empty one, or one with a space and both quote kinds).
+pub fn spawnArgQuote(arg: []const u8) ?u8 {
+    if (arg.len == 0) return null;
+    const needs_quote = std.mem.indexOfScalar(u8, arg, ' ') != null or arg[0] == '"' or arg[0] == '\'';
+    if (!needs_quote) return 0;
+    const ends_in_backslash = arg[arg.len - 1] == '\\';
+    for ([_]u8{ '"', '\'' }) |q| {
+        if (std.mem.indexOfScalar(u8, arg, q) == null and !ends_in_backslash) return q;
+    }
+    return null;
+}
+
+pub const RowBand = struct { start: usize, end: usize };
+
+/// Move the surviving entries of a scroll region `items[row_start..row_end]`
+/// by `rows_delta` (`> 0`: content moves up, as on_grid_row_scroll) and
+/// return the vacated band, which now holds the entries scrolled off: a
+/// rotation never drops or duplicates one, so each caller resets the band its
+/// own way and keeps whatever it owns. A shift covering the region vacates
+/// all of it and moves nothing.
+pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usize, rows_delta: i32) RowBand {
+    std.debug.assert(row_start <= row_end and row_end <= items.len);
+    const region = items[row_start..row_end];
+    const shift: usize = @abs(rows_delta);
+    if (shift >= region.len) return .{ .start = row_start, .end = row_end };
+    if (rows_delta > 0) {
+        std.mem.rotate(T, region, shift);
+        return .{ .start = row_end - shift, .end = row_end };
+    }
+    std.mem.rotate(T, region, region.len - shift);
+    return .{ .start = row_start, .end = row_start + shift };
+}

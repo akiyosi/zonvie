@@ -276,151 +276,121 @@ pub fn build(b: *std.Build) !void {
         if (windows_app_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
     }
 
-    // macOS external-grid font reset intersection test. It uses barriers to
-    // force the notification/commit ordering that previously erased freshly
-    // committed row counts.
+    // Standalone Swift unit tests: each compiles a few macos/Sources files
+    // together with one macos/Tests/*Tests.swift into its own executable.
     if (target.result.os.tag == .macos) {
-        const compile_font_reset_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_font_reset_test.addArgs(&.{
-            "-sanitize=thread",
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_font_reset_test.addFileArg(b.path("macos/Sources/Rendering/ExternalFontResetState.swift"));
-        compile_font_reset_test.addFileArg(b.path("macos/Sources/Core/FlushRetryBackoff.swift"));
-        compile_font_reset_test.addFileArg(b.path("macos/Tests/ExternalFontResetStateTests.swift"));
-        compile_font_reset_test.addArg("-o");
-        const font_reset_test_exe = compile_font_reset_test.addOutputFileArg("external-font-reset-tests");
-        const run_font_reset_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_font_reset_test.addFileArg(font_reset_test_exe);
-        test_step.dependOn(&run_font_reset_test.step);
-
-        // Metal row provisioning must retain each successful private-buffer
-        // prefix across retries while committed row content remains untouched.
-        const compile_row_provision_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_row_provision_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_row_provision_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
-        compile_row_provision_test.addFileArg(b.path("macos/Tests/SurfaceRowProvisionTests.swift"));
-        compile_row_provision_test.addArg("-o");
-        const row_provision_test_exe = compile_row_provision_test.addOutputFileArg("surface-row-provision-tests");
-        const run_row_provision_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_row_provision_test.addFileArg(row_provision_test_exe);
-        test_step.dependOn(&run_row_provision_test.step);
-
-        // Baseline placement inside a cell: FreeType's grid-fitted metrics
-        // overflow the line height it reports, and anchoring on them clips the
-        // glyph at the cell edge where rows join.
-        const compile_font_cell_fit_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_font_cell_fit_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_font_cell_fit_test.addFileArg(b.path("macos/Sources/Font/FontCellFit.swift"));
-        compile_font_cell_fit_test.addFileArg(b.path("macos/Tests/FontCellFitTests.swift"));
-        compile_font_cell_fit_test.addArg("-o");
-        const font_cell_fit_test_exe = compile_font_cell_fit_test.addOutputFileArg("font-cell-fit-tests");
-        const run_font_cell_fit_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_font_cell_fit_test.addFileArg(font_cell_fit_test_exe);
-        test_step.dependOn(&run_font_cell_fit_test.step);
-
-        // A variable font's Bold/Italic faces are instances of one file:
-        // FreeType must be handed their coordinates, merged with the user's.
-        const compile_font_instance_axes_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_font_instance_axes_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_font_instance_axes_test.addFileArg(b.path("macos/Sources/Font/FontInstanceAxes.swift"));
-        compile_font_instance_axes_test.addFileArg(b.path("macos/Tests/FontInstanceAxesTests.swift"));
-        compile_font_instance_axes_test.addArg("-o");
-        const font_instance_axes_test_exe = compile_font_instance_axes_test.addOutputFileArg("font-instance-axes-tests");
-        const run_font_instance_axes_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_font_instance_axes_test.addFileArg(font_instance_axes_test_exe);
-        test_step.dependOn(&run_font_instance_axes_test.step);
-
-        // Which of an NSEvent's two character strings a modified key carries.
-        // The rule lived inline in both keyDown handlers and drifted; it is a
-        // pure pick, so it is pinned here rather than left to a GUI run.
-        const compile_key_chars_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_key_chars_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_key_chars_test.addFileArg(b.path("macos/Sources/Core/KeyCharacterSelection.swift"));
-        compile_key_chars_test.addFileArg(b.path("macos/Tests/KeyCharacterSelectionTests.swift"));
-        compile_key_chars_test.addArg("-o");
-        const key_chars_test_exe = compile_key_chars_test.addOutputFileArg("key-character-selection-tests");
-        const run_key_chars_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_key_chars_test.addFileArg(key_chars_test_exe);
-        test_step.dependOn(&run_key_chars_test.step);
-
-        // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
-        // where they must be drawn, and that staged rows reach the screen only
-        // through their own bracket's commit.
-        const compile_scroll_retention_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_scroll_retention_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_scroll_retention_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
-        compile_scroll_retention_test.addFileArg(b.path("macos/Tests/ScrollRetentionTests.swift"));
-        compile_scroll_retention_test.addArg("-o");
-        const scroll_retention_test_exe = compile_scroll_retention_test.addOutputFileArg("scroll-retention-tests");
-        const run_scroll_retention_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_scroll_retention_test.addFileArg(scroll_retention_test_exe);
-        test_step.dependOn(&run_scroll_retention_test.step);
-
-        // The one rule that turns a pixel into a grid row while a sub-row ease
-        // is running. It had a second, band-less copy on the drag path, so a
-        // press and the drag after it disagreed about the same pixel.
-        const compile_scroll_row_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_scroll_row_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_scroll_row_test.addFileArg(b.path("macos/Sources/Rendering/MetalTypes.swift"));
-        compile_scroll_row_test.addFileArg(b.path("macos/Tests/ScrollAdjustedRowTests.swift"));
-        compile_scroll_row_test.addArg("-o");
-        const scroll_row_test_exe = compile_scroll_row_test.addOutputFileArg("scroll-adjusted-row-tests");
-        const run_scroll_row_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_scroll_row_test.addFileArg(scroll_row_test_exe);
-        test_step.dependOn(&run_scroll_row_test.step);
-
-        // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
-        // back texture, and the vacated band always inside the rows the
-        // caller redraws. The blit itself is checked against a real texture
-        // when a Metal device exists.
-        // The one gate that decides whether a surface draws at all. Both
-        // surfaces' original chains are transcribed in the test and every
-        // assignment of their terms is enumerated against the shared one.
-        const compile_draw_gate_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_draw_gate_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_draw_gate_test.addFileArg(b.path("macos/Sources/Rendering/SurfaceDrawGate.swift"));
-        compile_draw_gate_test.addFileArg(b.path("macos/Tests/SurfaceDrawGateTests.swift"));
-        compile_draw_gate_test.addArg("-o");
-        const draw_gate_test_exe = compile_draw_gate_test.addOutputFileArg("surface-draw-gate-tests");
-        const run_draw_gate_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_draw_gate_test.addFileArg(draw_gate_test_exe);
-        test_step.dependOn(&run_draw_gate_test.step);
-
-        const compile_row_scroll_blit_plan_test = b.addSystemCommand(&.{ "xcrun", "swiftc" });
-        compile_row_scroll_blit_plan_test.addArgs(&.{
-            "-module-cache-path",
-            "/tmp/zonvie-swift-module-cache",
-        });
-        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Sources/Rendering/RowScrollBlitPlan.swift"));
-        compile_row_scroll_blit_plan_test.addFileArg(b.path("macos/Tests/RowScrollBlitPlanTests.swift"));
-        compile_row_scroll_blit_plan_test.addArg("-o");
-        const row_scroll_blit_plan_test_exe = compile_row_scroll_blit_plan_test.addOutputFileArg("row-scroll-blit-plan-tests");
-        const run_row_scroll_blit_plan_test = b.addSystemCommand(&.{"/usr/bin/env"});
-        run_row_scroll_blit_plan_test.addFileArg(row_scroll_blit_plan_test_exe);
-        test_step.dependOn(&run_row_scroll_blit_plan_test.step);
+        const SwiftTest = struct {
+            exe_name: []const u8,
+            sources: []const []const u8,
+            tsan: bool = false,
+        };
+        const swift_tests = [_]SwiftTest{
+            // External-grid font reset intersection test. It uses barriers to
+            // force the notification/commit ordering that previously erased
+            // freshly committed row counts.
+            .{
+                .exe_name = "external-font-reset-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/ExternalFontResetState.swift",
+                    "macos/Sources/Core/FlushRetryBackoff.swift",
+                    "macos/Tests/ExternalFontResetStateTests.swift",
+                },
+                .tsan = true,
+            },
+            // Metal row provisioning must retain each successful private-buffer
+            // prefix across retries while committed row content remains untouched.
+            .{
+                .exe_name = "surface-row-provision-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/MetalTypes.swift",
+                    "macos/Tests/SurfaceRowProvisionTests.swift",
+                },
+            },
+            // Baseline placement inside a cell: FreeType's grid-fitted metrics
+            // overflow the line height it reports, and anchoring on them clips the
+            // glyph at the cell edge where rows join.
+            .{
+                .exe_name = "font-cell-fit-tests",
+                .sources = &.{
+                    "macos/Sources/Font/FontCellFit.swift",
+                    "macos/Tests/FontCellFitTests.swift",
+                },
+            },
+            // A variable font's Bold/Italic faces are instances of one file:
+            // FreeType must be handed their coordinates, merged with the user's.
+            .{
+                .exe_name = "font-instance-axes-tests",
+                .sources = &.{
+                    "macos/Sources/Font/FontInstanceAxes.swift",
+                    "macos/Tests/FontInstanceAxesTests.swift",
+                },
+            },
+            // Which of an NSEvent's two character strings a modified key carries.
+            // The rule lived inline in both keyDown handlers and drifted; it is a
+            // pure pick, so it is pinned here rather than left to a GUI run.
+            .{
+                .exe_name = "key-character-selection-tests",
+                .sources = &.{
+                    "macos/Sources/Core/KeyCharacterSelection.swift",
+                    "macos/Tests/KeyCharacterSelectionTests.swift",
+                },
+            },
+            // Smooth-scroll retained rows: which rows a scroll pushes off the edge,
+            // where they must be drawn, and that staged rows reach the screen only
+            // through their own bracket's commit.
+            .{
+                .exe_name = "scroll-retention-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/MetalTypes.swift",
+                    "macos/Tests/ScrollRetentionTests.swift",
+                },
+            },
+            // The one rule that turns a pixel into a grid row while a sub-row ease
+            // is running. It had a second, band-less copy on the drag path, so a
+            // press and the drag after it disagreed about the same pixel.
+            .{
+                .exe_name = "scroll-adjusted-row-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/MetalTypes.swift",
+                    "macos/Tests/ScrollAdjustedRowTests.swift",
+                },
+            },
+            // The one gate that decides whether a surface draws at all. Both
+            // surfaces' original chains are transcribed in the test and every
+            // assignment of their terms is enumerated against the shared one.
+            .{
+                .exe_name = "surface-draw-gate-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/SurfaceDrawGate.swift",
+                    "macos/Tests/SurfaceDrawGateTests.swift",
+                },
+            },
+            // The main-grid GPU scroll blit's arithmetic: rowEnd clamped to the
+            // back texture, and the vacated band always inside the rows the
+            // caller redraws. The blit itself is checked against a real texture
+            // when a Metal device exists.
+            .{
+                .exe_name = "row-scroll-blit-plan-tests",
+                .sources = &.{
+                    "macos/Sources/Rendering/RowScrollBlitPlan.swift",
+                    "macos/Tests/RowScrollBlitPlanTests.swift",
+                },
+            },
+        };
+        for (swift_tests) |t| {
+            const compile = b.addSystemCommand(&.{ "xcrun", "swiftc" });
+            if (t.tsan) compile.addArg("-sanitize=thread");
+            compile.addArgs(&.{
+                "-module-cache-path",
+                "/tmp/zonvie-swift-module-cache",
+            });
+            for (t.sources) |src| compile.addFileArg(b.path(src));
+            compile.addArg("-o");
+            const exe = compile.addOutputFileArg(t.exe_name);
+            const run = b.addSystemCommand(&.{"/usr/bin/env"});
+            run.addFileArg(exe);
+            test_step.dependOn(&run.step);
+        }
     }
 
     // Core inline tests (c_api.zig and its relative imports, including the
@@ -504,8 +474,6 @@ pub fn build(b: *std.Build) !void {
     });
     test_step.dependOn(&b.addRunArtifact(cursor_style_tests).step);
 
-    // Message routing tests. msg_route.zig is std-only, so it is exposed as a
-    // standalone module rather than pulled in through zonvie_core.
     // Which grid a pointer names. The rule both frontends were applying
     // separately, hoisted here; pure and inline-tested, so it runs on the
     // build host rather than needing a Windows one.
@@ -548,6 +516,8 @@ pub fn build(b: *std.Build) !void {
     const popup_placement_tests = b.addTest(.{ .root_module = popup_placement_test_mod });
     test_step.dependOn(&b.addRunArtifact(popup_placement_tests).step);
 
+    // Message routing tests. msg_route.zig is std-only, so it is exposed as a
+    // standalone module rather than pulled in through zonvie_core.
     const msg_route_mod = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -615,17 +585,6 @@ pub fn build(b: *std.Build) !void {
         .root_module = windows_render_helpers_test_mod,
     });
     test_step.dependOn(&b.addRunArtifact(windows_render_helpers_tests).step);
-
-    // Platform-independent placement tests for the ext_messages floats.
-    const windows_msg_float_layout_test_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .root_source_file = b.path("windows/ui/msg_float_layout_test.zig"),
-    });
-    const windows_msg_float_layout_tests = b.addTest(.{
-        .root_module = windows_msg_float_layout_test_mod,
-    });
-    test_step.dependOn(&b.addRunArtifact(windows_msg_float_layout_tests).step);
 
     // Platform-independent coverage for the Windows frontend's lossy,
     // non-blocking logging queue.

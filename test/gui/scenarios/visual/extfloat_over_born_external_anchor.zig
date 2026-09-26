@@ -78,62 +78,6 @@ const Arm = struct {
     post_scroll_paint: f64,
 };
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
-/// captureStable for a window that is not the app's main one: retry until two
-/// consecutive captures are pixel-identical, so a frame caught mid-present is
-/// never what a comparison sees.
-fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
-    var timer = gui_io.Timer.start();
-    var prev: ?capture.Image = null;
-    defer if (prev) |*p| p.deinit(alloc);
-    while (true) {
-        gui_io.sleepNs(150 * std.time.ns_per_ms);
-        const cur = capture.captureWindow(alloc, window_number) catch |e| {
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-            continue;
-        };
-        if (prev) |*p| {
-            if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                p.deinit(alloc);
-                prev = null;
-                return cur;
-            }
-            p.deinit(alloc);
-            prev = null;
-        }
-        prev = cur;
-        if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-            const out = prev.?;
-            prev = null;
-            return out; // last capture even if not fully settled
-        }
-    }
-}
-
 /// The window minus the scrollbar strip. Derived from the capture rather than
 /// hardcoded as a fraction, so it excludes the same pixels at any window size.
 fn bodyRegion(img: capture.Image) visual.Region {
@@ -190,18 +134,18 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
         },
     }
 
-    const ext_win = try waitNewWindow(g.app_pid, before_windows, 150);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 150);
     if (ext_win.number == main_number) return error.CapturedMainWindow;
     try g.exec("execute('normal! 100Gzt0')");
 
     // Gate one: the anchor's own window paints. A born-external window that
     // rendered nothing would make everything below a statement about the
     // window rather than about the float.
-    var pre_scroll = try captureWindowStable(alloc, ext_win.number, 8000);
+    var pre_scroll = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer pre_scroll.deinit(alloc);
     try g.remoteSend("3<C-e>");
     gui_io.sleepNs(400 * std.time.ns_per_ms);
-    var baseline = try captureWindowStable(alloc, ext_win.number, 8000);
+    var baseline = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer baseline.deinit(alloc);
     if (baseline.w != pre_scroll.w or baseline.h != pre_scroll.h) return error.ExternalWindowResized;
     const region = bodyRegion(baseline);
@@ -254,7 +198,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
         return error.FloatTookOwnWindow;
     }
 
-    var with_float = try captureWindowStable(alloc, ext_win.number, 8000);
+    var with_float = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer with_float.deinit(alloc);
     if (with_float.w != baseline.w or with_float.h != baseline.h) return error.ExternalWindowResized;
     const float_paint = visual.regionDiffRatio(baseline, with_float, region, 6);
@@ -263,7 +207,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
     // it rather than assume.
     try g.exec("execute('redraw!')");
     gui_io.sleepNs(800 * std.time.ns_per_ms);
-    var after_redraw = try captureWindowStable(alloc, ext_win.number, 8000);
+    var after_redraw = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer after_redraw.deinit(alloc);
     if (after_redraw.w != baseline.w or after_redraw.h != baseline.h) return error.ExternalWindowResized;
     const redraw_paint = visual.regionDiffRatio(baseline, after_redraw, region, 6);
@@ -273,7 +217,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
     // stale would report exactly the same zero as a float nobody drew.
     try g.remoteSend("3<C-e>");
     gui_io.sleepNs(400 * std.time.ns_per_ms);
-    var post_scroll = try captureWindowStable(alloc, ext_win.number, 8000);
+    var post_scroll = try driver.captureWindowStable(alloc, ext_win.number, 8000);
     defer post_scroll.deinit(alloc);
     if (post_scroll.w != baseline.w or post_scroll.h != baseline.h) return error.ExternalWindowResized;
     const post_scroll_paint = visual.regionDiffRatio(after_redraw, post_scroll, region, 6);

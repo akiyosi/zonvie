@@ -1035,7 +1035,11 @@ final class GlyphAtlas {
         }
 
         let faceIndex = ctFontFaceIndex(ctFont)
-        let urlKey = "\(url.absoluteString)#\(faceIndex)"
+        // A variable file's instances (SFNS regular and bold) share the URL;
+        // each needs its own handle loaded at its coordinates.
+        let instanceAxes = FontInstanceAxes.coordinates(of: ctFont)
+        var urlKey = "\(url.absoluteString)#\(faceIndex)"
+        for axis in instanceAxes { urlKey += "#\(axis.tag)=\(axis.value)" }
 
         if var cached = fallbackFacesByURL[urlKey] {
             // LRU: update access order on hit
@@ -1096,6 +1100,12 @@ final class GlyphAtlas {
         }
         let createEnd = CFAbsoluteTimeGetCurrent()
 
+        if let hbft = created, !instanceAxes.isEmpty {
+            let variations = instanceAxes.map(Self.fontAxis)
+            variations.withUnsafeBufferPointer { buf in
+                zonvie_ft_hb_font_set_variation_axes(hbft, buf.baseAddress, buf.count)
+            }
+        }
         if let hbft = created, !features.isEmpty {
             features.withUnsafeBufferPointer { buf in
                 zonvie_ft_hb_font_set_features(hbft, buf.baseAddress, buf.count)
@@ -1341,25 +1351,7 @@ final class GlyphAtlas {
             return nil
         }
 
-        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
-        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
-
-        let (selectedFont, selectedHbft): (CTFont?, OpaquePointer?) = {
-            if styleFlags == 0 {
-                return (font, hbftFont)
-            } else if isBold && isItalic {
-                return (boldItalicFont ?? boldFont ?? italicFont, hbftBoldItalic ?? hbftBold ?? hbftItalic)
-            } else if isBold {
-                return (boldFont, hbftBold)
-            } else if isItalic {
-                return (italicFont, hbftItalic)
-            } else {
-                return (font, hbftFont)
-            }
-        }()
-
-        let fontToUse = selectedFont ?? font
-        let hbftToUse = selectedHbft ?? hbftFont
+        let (fontToUse, hbftToUse) = selectFace_locked(styleFlags: styleFlags)
 
         guard let hbft = hbftToUse else {
             insertFailedScalar_locked(failKey)
@@ -1766,38 +1758,18 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = UInt32(bpp)
     }
 
-    /// Select the appropriate HBFT font handle for the given style flags.
+    /// Select the style face for the given style flags as one (CTFont, hbft)
+    /// pair: a style whose FreeType handle failed to load is skipped whole, so
+    /// glyph IDs from one face are never rasterized from another.
     /// Must be called with mu locked.
-    private func selectHbft_locked(styleFlags: UInt32) -> OpaquePointer? {
+    private func selectFace_locked(styleFlags: UInt32) -> (ctFont: CTFont, hbft: OpaquePointer?) {
         let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
         let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
 
-        if isBold && isItalic {
-            return hbftBoldItalic ?? hbftBold ?? hbftItalic ?? hbftFont
-        } else if isBold {
-            return hbftBold ?? hbftFont
-        } else if isItalic {
-            return hbftItalic ?? hbftFont
-        } else {
-            return hbftFont
-        }
-    }
-
-    /// Select the appropriate CTFont for the given style flags.
-    /// Must be called with mu locked.
-    private func selectCtFont_locked(styleFlags: UInt32) -> CTFont {
-        let isBold = (styleFlags & ZONVIE_STYLE_BOLD) != 0
-        let isItalic = (styleFlags & ZONVIE_STYLE_ITALIC) != 0
-
-        if isBold && isItalic {
-            return boldItalicFont ?? boldFont ?? italicFont ?? font
-        } else if isBold {
-            return boldFont ?? font
-        } else if isItalic {
-            return italicFont ?? font
-        } else {
-            return font
-        }
+        if isBold && isItalic, let f = boldItalicFont, let h = hbftBoldItalic { return (f, h) }
+        if isBold, let f = boldFont, let h = hbftBold { return (f, h) }
+        if isItalic, let f = italicFont, let h = hbftItalic { return (f, h) }
+        return (font, hbftFont)
     }
 
     /// Phase B: Shape a text run using HarfBuzz.
@@ -1815,7 +1787,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return 0 }
 
         // zonvie_hb_shape_utf32 outputs y_advance too, but our callback doesn't need it.
         // Use persistent buffer to avoid per-call heap allocation.
@@ -1847,7 +1819,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return 0 }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return 0 }
 
         let ok1 = zonvie_ft_hb_get_ascii_glyph_ids(hbft, outGlyphIDs)
         let ok2 = zonvie_ft_hb_get_ascii_x_advances(hbft, outXAdvances)
@@ -1861,7 +1833,7 @@ final class GlyphAtlas {
         os_unfair_lock_lock(&mu)
         defer { os_unfair_lock_unlock(&mu) }
 
-        guard let hbft = selectHbft_locked(styleFlags: styleFlags) else { return false }
+        guard let hbft = selectFace_locked(styleFlags: styleFlags).hbft else { return false }
 
         var bufPtr: UnsafePointer<UInt8>?
         var w: Int32 = 0, h: Int32 = 0, pitch: Int32 = 0
@@ -1881,7 +1853,7 @@ final class GlyphAtlas {
 
         if r != 0 || w <= 0 || h <= 0 || bufPtr == nil {
             // FreeType color failed — try CoreGraphics fallback
-            let ctFontToUse = selectCtFont_locked(styleFlags: styleFlags)
+            let ctFontToUse = selectFace_locked(styleFlags: styleFlags).ctFont
             if renderGlyphWithCoreGraphics_locked(
                 ctFont: ctFontToUse, glyphID: glyphID, outBitmap: outBitmap
             ) {

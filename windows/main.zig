@@ -311,17 +311,14 @@ pub fn main() u8 {
     var ext_popup_enabled = config.popup.external;
     var ext_messages_enabled = config.messages.external;
     var ext_tabline_enabled = config.tabline.external;
-    var tabline_style: app_mod.TablineStyle = .titlebar;
-    var sidebar_position_right: bool = false;
-    var sidebar_width_px: u32 = 200;
-    if (ext_tabline_enabled) {
-        if (std.mem.eql(u8, config.tabline.style, "sidebar")) {
-            tabline_style = .sidebar;
-        }
-        // "menu" is not supported on Windows, falls through to titlebar
-        sidebar_position_right = std.mem.eql(u8, config.tabline.sidebar_position, "right");
-        sidebar_width_px = config.tabline.sidebar_width;
-    }
+    // Resolved whether or not [tabline] external is set: --exttabline and the
+    // connection dialog turn ext_tabline on later and take this style (as
+    // macOS's effectiveTablineStyle does). Every reader also checks
+    // ext_tabline_enabled.
+    // "menu" is not supported on Windows, falls through to titlebar
+    const tabline_style: app_mod.TablineStyle = if (std.mem.eql(u8, config.tabline.style, "sidebar")) .sidebar else .titlebar;
+    const sidebar_position_right = std.mem.eql(u8, config.tabline.sidebar_position, "right");
+    const sidebar_width_px: u32 = config.tabline.sidebar_width;
     var ext_windows_enabled = config.windows.external;
     var cli_log_path: ?[]const u8 = null;
     var cli_nvim_path: ?[]const u8 = null;
@@ -442,7 +439,7 @@ pub fn main() u8 {
                     \\    [performance]
                     \\        glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
                     \\        glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                    \\        hl_cache_size               Highlight cache size (64-2048, default: 512)
+                    \\        hl_cache_size               Highlight cache size (64-2048, default: 2048)
                     \\        shape_cache_size            Shape cache size (512-65536, default: 4096)
                     \\        atlas_size                  Glyph atlas texture size (1024-4096, default: 2048)
                     \\
@@ -911,6 +908,10 @@ pub fn main() u8 {
         _ = c.MessageBoxW(null, &wide_msg, &wide_title, c.MB_OK | c.MB_ICONERROR);
         return 1;
     }
+
+    // ext_popupmenu is read from config.popup.external (the dialog overrides
+    // it the same way), so --extpopup lands there.
+    config.popup.external = ext_popup_enabled;
 
     const app = alloc.create(App) catch return 1;
     // errdefer alloc.destroy(app); // ← Remove this (causes double-free)

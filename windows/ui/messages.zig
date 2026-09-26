@@ -8,6 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 const input = @import("../input.zig");
+const callbacks = @import("../callbacks.zig");
 
 /// The grid a `.grid`-anchored message box hangs off: the cursor's, or, for a
 /// cursor inside a float (a telescope prompt), the window the float is
@@ -25,6 +26,88 @@ fn cursorAnchorGridId(grids: []const app_mod.GridInfo, cursor_grid: i64) i64 {
     return 1;
 }
 
+/// The main window's grid area in screen pixels: the client rect less its
+/// chrome (a titlebar tabline, a sidebar on either side). macOS measures
+/// against the terminal view for the same reason.
+fn mainSurfaceRect(client_screen: c.RECT, origin_x: c_int, origin_y: c_int, right_chrome_px: c_int) c.RECT {
+    return .{
+        .left = client_screen.left + origin_x,
+        .top = client_screen.top + origin_y,
+        .right = client_screen.right - right_chrome_px,
+        .bottom = client_screen.bottom,
+    };
+}
+
+/// A grid's cell rect on a surface whose cell (0,0) is `surface`'s top-left.
+fn gridCellRect(surface: c.RECT, g: app_mod.GridInfo, cell_w: u32, cell_h: u32) c.RECT {
+    const cw: c_int = @intCast(cell_w);
+    const ch: c_int = @intCast(cell_h);
+    return .{
+        .left = surface.left + g.start_col * cw,
+        .top = surface.top + g.start_row * ch,
+        .right = surface.left + (g.start_col + g.cols) * cw,
+        .bottom = surface.top + (g.start_row + g.rows) * ch,
+    };
+}
+
+/// Screen rect a message box is placed against: the monitor work area
+/// (.display), the window showing the cursor grid (.window), or the window
+/// grid the cursor is in, walked out of floats (.grid). The one rule for the
+/// ext-float create/update/reposition paths, the toast and the minis;
+/// macOS's getExtFloatTargetFrame. Takes `app.mu` itself, so call it with the
+/// lock NOT held, on the UI thread.
+pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
+    const main_hwnd = app.hwnd orelse return app_mod.monitorWorkArea(null);
+    if (mode == .display) return app_mod.monitorWorkArea(main_hwnd);
+
+    // The live cursor grid: app.last_cursor_grid is updated only through
+    // posted messages and can still name the previous grid (a closing
+    // cmdline) when a message placed in the same flush is laid out.
+    const cursor_grid: i64 = if (app.corep) |cp|
+        app_mod.zonvie_core_get_cursor_position(cp, null, null)
+    else
+        app.last_cursor_grid;
+    const grids: []const app_mod.GridInfo = if (mode == .grid)
+        (if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{})
+    else
+        &.{};
+    const anchor_grid = if (mode == .grid) cursorAnchorGridId(grids, cursor_grid) else cursor_grid;
+
+    app.mu.lockUncancelable(core.clock.io());
+    // Who draws the grid, not whether it is a window of its own: a float an
+    // external window hosts has no entry in external_windows.
+    const host_hwnd: ?c.HWND = if (callbacks.externalWindowShowingGridLocked(app, anchor_grid)) |shown| shown.win.hwnd else null;
+    const origin = input.surfaceOriginPx(app, true);
+    const right_chrome_px: c_int = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
+        app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))
+    else
+        0;
+    const cell_w = app.cell_w_px;
+    const cell_h = app.rowHeightPx();
+    app.mu.unlock(core.clock.io());
+
+    if (host_hwnd) |hwnd| {
+        var rect: c.RECT = undefined;
+        if (c.GetWindowRect(hwnd, &rect) != 0) return rect;
+    }
+
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(main_hwnd, &client) == 0) return app_mod.monitorWorkArea(main_hwnd);
+    var pt: c.POINT = .{ .x = 0, .y = 0 };
+    _ = c.ClientToScreen(main_hwnd, &pt);
+    const surface = mainSurfaceRect(.{
+        .left = pt.x,
+        .top = pt.y,
+        .right = pt.x + client.right,
+        .bottom = pt.y + client.bottom,
+    }, origin.x, origin.y, right_chrome_px);
+    if (mode == .grid) {
+        for (grids) |g| {
+            if (g.grid_id == anchor_grid) return gridCellRect(surface, g, cell_w, cell_h);
+        }
+    }
+    return surface;
+}
 
 /// Hand a prepared request to the UI thread and wake it. Caller must already
 /// hold app.mu.
@@ -59,11 +142,7 @@ fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) 
 }
 
 /// Append one chunk's text to `buf` at `len`, clamped to what is left, and
-/// return the new length. Three message paths concatenated chunks this way.
-///
-/// The caller decides what to do once the buffer is full: two of them break
-/// out of their loop, the history path keeps iterating and simply copies
-/// nothing more, since copy_len clamps to zero.
+/// return the new length. Once the buffer is full it copies nothing more.
 fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
     if (chunk.text_len == 0) return len;
     const text = chunk.text[0..chunk.text_len];
@@ -123,13 +202,15 @@ pub fn onMsgShow(
     const app: *App = @ptrCast(@alignCast(ctx.?));
     const kind_str = kind[0..kind_len];
 
-    // Build message text and get primary hl_id from first chunk
-    var msg_text: [2048]u8 = undefined;
+    // Build the text straight into the request: an intermediate 2 KiB buffer
+    // cut the core's 4 KiB confirm/history text (the choice line included).
+    var req = app_mod.PendingMessageRequest{};
+    const msg_text = &req.text;
     var msg_len: usize = 0;
     var primary_hl_id: u32 = 0;
     for (chunks[0..chunk_count]) |chunk| {
         if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-        msg_len = appendChunkText(&msg_text, msg_len, chunk);
+        msg_len = appendChunkText(msg_text, msg_len, chunk);
         if (msg_len >= msg_text.len) break;
     }
 
@@ -149,8 +230,6 @@ pub fn onMsgShow(
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
 
-    var req = app_mod.PendingMessageRequest{};
-    @memcpy(req.text[0..msg_len], msg_text[0..msg_len]);
     req.text_len = msg_len;
     const kind_copy_len = @min(kind_len, req.kind.len);
     @memcpy(req.kind[0..kind_copy_len], kind[0..kind_copy_len]);
@@ -263,62 +342,41 @@ pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) voi
     app.mini_windows[idx].text_len = copy_len;
 }
 
-pub fn onMsgHistoryShow(
-    ctx: ?*anyopaque,
-    entries: ?[*]const core.MsgHistoryEntry,
-    entry_count: usize,
-    prev_cmd: c_int,
-) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx orelse return));
+/// number_prompt asks the user to pick a numbered choice, so it belongs with
+/// the other blocking dialogs: centred over the app, height-clamped, no
+/// auto-hide, and not joined with the toast stack.
+pub fn isConfirmKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "confirm") or
+        std.mem.eql(u8, kind, "confirm_sub") or
+        std.mem.eql(u8, kind, "number_prompt");
+}
 
-    if (entries == null or entry_count == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: empty entries\n", .{});
-        return;
-    }
+/// Whether the message window currently shows a blocking dialog, which a
+/// toast update must not re-lay or auto-hide while Neovim waits for input.
+pub fn messageWindowIsConfirm(app: *const App) bool {
+    const mw = app.message_window orelse return false;
+    return isConfirmKind(mw.kind[0..mw.kind_len]);
+}
 
-    // Build combined content from all entries
-    var content_buf: [16384]u8 = undefined;
-    var content_len: usize = 0;
-
-    for (0..entry_count) |i| {
-        const entry = entries.?[i];
-        if (entry.chunk_count > 0) {
-            for (0..entry.chunk_count) |j| {
-                content_len = appendChunkText(&content_buf, content_len, entry.chunks[j]);
-            }
-            // Add newline between entries
-            if (content_len < content_buf.len - 1) {
-                content_buf[content_len] = '\n';
-                content_len += 1;
-            }
-        }
-    }
-
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_history_show: entries={d} prev_cmd={d} content_len={d}\n", .{ entry_count, prev_cmd, content_len });
-
-    // Queue for UI thread display - reuse message system for split view
-    app.mu.lockUncancelable(core.clock.io());
-    defer app.mu.unlock(core.clock.io());
-
-    var req = app_mod.PendingMessageRequest{};
-    const copy_len = @min(content_len, req.text.len);
-    @memcpy(req.text[0..copy_len], content_buf[0..copy_len]);
-    req.text_len = copy_len;
-    req.kind_len = 0; // No specific kind for history
-    req.hl_id = 0;
-    req.replace_last = 0;
-    req.append = 0;
-
-    enqueuePendingMessage(app, req, "history message");
+/// The kinds handleMsgMiniOrExtFloat queues for showmode/showcmd/ruler.
+pub fn isStatusKind(kind: []const u8) bool {
+    return std.mem.eql(u8, kind, "showmode") or
+        std.mem.eql(u8, kind, "showcmd") or
+        std.mem.eql(u8, kind, "ruler");
 }
 
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
     if (applog.isEnabled()) applog.appLog("[win] showMessageWindowOnUIThread: text_len={d} kind={s}\n", .{ msg.text_len, msg.kind[0..msg.kind_len] });
 
-    // Build combined content from display_messages stack
+    const kind_str = msg.kind[0..msg.kind_len];
+    const is_confirm = isConfirmKind(kind_str);
+
+    // Build combined content from display_messages stack. A confirm dialog
+    // shows only its own text: the stack holds toasts (a config error, status).
     var combined_text: [16384]u8 = undefined;
     var combined_len: usize = 0;
-    for (app.display_messages.items) |dm| {
+    const stack: []const app_mod.DisplayMessage = if (is_confirm) &.{} else app.display_messages.items;
+    for (stack) |dm| {
         if (combined_len > 0 and combined_len < combined_text.len - 1) {
             combined_text[combined_len] = '\n';
             combined_len += 1;
@@ -329,8 +387,8 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     }
     // Allocation failure while extending display_messages must not make the
     // current message disappear. The caller requests this fixed-buffer
-    // fallback when the append failed (and for split messages, which are not
-    // stored in the display stack at all).
+    // fallback when the append failed (and for confirm and split messages,
+    // which are not stored in the display stack at all).
     if (include_msg and combined_len < combined_text.len) {
         if (combined_len > 0 and combined_len < combined_text.len - 1) {
             combined_text[combined_len] = '\n';
@@ -347,16 +405,6 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         if (ch == '\n') line_count += 1;
     }
 
-    // Determine message type
-    const kind_str = msg.kind[0..msg.kind_len];
-    // number_prompt asks the user to pick a numbered choice, so it belongs
-    // with the other blocking dialogs: centered over the app, height-clamped,
-    // no auto-hide. The core pins every interactive prompt to the confirm
-    // view now, so a user can no longer route it elsewhere to escape the
-    // top-right toast placement it used to fall into.
-    const is_confirm = std.mem.eql(u8, kind_str, "confirm") or
-        std.mem.eql(u8, kind_str, "confirm_sub") or
-        std.mem.eql(u8, kind_str, "number_prompt");
     const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
 
     // External window with auto-hide
@@ -419,11 +467,11 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         window_x = app_rect.left + @divTrunc(app_width - window_width, 2);
         window_y = app_rect.bottom - window_height - app.scalePx(40);
     } else {
-        // Top-right of the main window's monitor for regular messages
-        // (screen coordinates like msg_history/macOS)
-        const work = app_mod.monitorWorkArea(app.hwnd);
-        window_x = work.right - window_width - app.scalePx(10);
-        window_y = work.top + app.scalePx(10);
+        // Regular messages: top-right of msg_pos.ext_float's target, as
+        // msg_show and macOS's toast.
+        const pos = external_windows.msgFloatOrigin(app, msgTargetRect(app, app.config.messages.msg_pos.ext_float), window_width, null);
+        window_x = pos.x;
+        window_y = pos.y;
     }
 
     // Check if this is a return_prompt (preserve layout from confirm dialog)
@@ -657,107 +705,24 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     app.mu.unlock(core.clock.io());
 }
 
-/// Update ext-float (msg_show/msg_history) window positions
-/// Called asynchronously via WM_APP_UPDATE_EXT_FLOAT_POS to avoid deadlock
+/// Move the ext-float message windows (msg_show/msg_history and the toast)
+/// after the main window moved or resized (TIMER_REPOSITION_FLOATS).
 pub fn updateExtFloatPositions(app: *App) void {
-    const main_hwnd = app.hwnd orelse return;
+    const target_rect = msgTargetRect(app, app.config.messages.msg_pos.ext_float);
 
-    // Query core for the live cursor grid (avoids stale app.last_cursor_grid;
-    // see updateMiniWindows for the race rationale).
-    const cursor_grid: i64 = if (app.corep) |cp|
-        app_mod.zonvie_core_get_cursor_position(cp, null, null)
-    else
-        app.last_cursor_grid;
-
-    // Get data while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
-    const pos_mode = app.config.messages.msg_pos.ext_float;
-    const cursor_ext_hwnd: ?c.HWND = if (app.external_windows.get(cursor_grid)) |ew| ew.hwnd else null;
-    const msg_show_entry = app.external_windows.get(app_mod.MESSAGE_GRID_ID);
-    const msg_history_entry = app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID);
-    const corep = app.corep;
-
-    // Copy window info
-    const msg_show_hwnd: ?c.HWND = if (msg_show_entry) |e| e.hwnd else null;
-    const msg_history_hwnd: ?c.HWND = if (msg_history_entry) |e| e.hwnd else null;
-    // When using DWM custom titlebar, client area extends into the titlebar.
-    // Compute offset to position floats below the custom titlebar area.
-    const titlebar_offset: c_int = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)
-    else
-        0;
+    const msg_show_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |e| e.hwnd else null;
+    const msg_history_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MSG_HISTORY_GRID_ID)) |e| e.hwnd else null;
     app.mu.unlock(core.clock.io());
 
-    // Calculate target rect based on position mode (mutex unlocked, safe to call core functions)
-    var target_rect: c.RECT = undefined;
-    switch (pos_mode) {
-        .display => target_rect = app_mod.monitorWorkArea(main_hwnd),
-        .window => {
-            // Window-based: use cursor's window
-            if (cursor_ext_hwnd) |hwnd| {
-                if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = app_mod.monitorWorkArea(main_hwnd);
-                }
-            } else {
-                var client_rect: c.RECT = undefined;
-                if (c.GetClientRect(main_hwnd, &client_rect) != 0) {
-                    var pt: c.POINT = .{ .x = 0, .y = 0 };
-                    _ = c.ClientToScreen(main_hwnd, &pt);
-                    target_rect = .{
-                        .left = pt.x,
-                        .top = pt.y + titlebar_offset,
-                        .right = pt.x + client_rect.right,
-                        .bottom = pt.y + client_rect.bottom,
-                    };
-                } else {
-                    target_rect = app_mod.monitorWorkArea(main_hwnd);
-                }
+    // The toast is placed like msg_show; a confirm dialog is centred instead.
+    if (app.message_window) |mw| {
+        if (!isConfirmKind(mw.kind[0..mw.kind_len])) {
+            if (windowSize(mw.hwnd)) |size| {
+                const pos = external_windows.msgFloatOrigin(app, target_rect, size.w, null);
+                _ = c.SetWindowPos(mw.hwnd, null, pos.x, pos.y, 0, 0, c.SWP_NOACTIVATE | c.SWP_NOZORDER | c.SWP_NOSIZE);
             }
-        },
-        .grid => {
-            // Grid-based: use cursor grid's bounds
-            if (cursor_ext_hwnd) |hwnd| {
-                // Cursor is in external window
-                if (c.GetWindowRect(hwnd, &target_rect) == 0) {
-                    target_rect = app_mod.monitorWorkArea(main_hwnd);
-                }
-            } else {
-                // Get grid bounds from core (safe now, outside of callback)
-                var client_rect: c.RECT = undefined;
-                _ = c.GetClientRect(main_hwnd, &client_rect);
-
-                var client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                _ = c.ClientToScreen(main_hwnd, &client_origin);
-
-                var grid_right_px: c_int = client_rect.right;
-                var grid_bottom_px: c_int = client_rect.bottom;
-
-                if (corep) |cp| {
-                    const cached = app.getVisibleGridsCached(cp);
-                    if (cached.len > 0) {
-                        for (cached) |grid| {
-                            if (grid.grid_id == cursor_grid) {
-                                const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
-                                const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
-                                grid_right_px = @intCast(end_col * cell_w);
-                                // cell_h already includes linespace; do NOT add linespace again.
-                                grid_bottom_px = @intCast(end_row * cell_h);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                target_rect = .{
-                    .left = client_origin.x,
-                    .top = client_origin.y + titlebar_offset,
-                    .right = client_origin.x + grid_right_px,
-                    .bottom = client_origin.y + grid_bottom_px,
-                };
-            }
-        },
+        }
     }
 
     // msg_history first: msg_show stacks below it.
@@ -791,7 +756,7 @@ fn windowSize(hwnd: c.HWND) ?struct { w: c_int, h: c_int } {
 
 /// Update or create mini windows (showmode / showcmd / ruler)
 pub fn updateMiniWindows(app: *App) void {
-    const main_hwnd = app.hwnd orelse return;
+    if (app.hwnd == null) return;
 
     // Get cell dimensions and config
     app.mu.lockUncancelable(core.clock.io());
@@ -800,112 +765,17 @@ pub fn updateMiniWindows(app: *App) void {
     const mini_pos_mode = app.config.messages.msg_pos.mini;
     app.mu.unlock(core.clock.io());
 
-    // Query the core directly for the current cursor grid instead of reading
-    // the cached app.last_cursor_grid. The cache is updated only via posted
-    // messages, so when updateMiniWindows runs from WM_APP_MSG_SHOW (posted
-    // earlier in the same flush than on_cursor_grid_changed fires), the cache
-    // can still point at the previous grid (e.g. a closing cmdline at -100)
-    // and anchor the mini to the wrong screen rect.
-    const cursor_grid: i64 = if (app.corep) |corep|
-        app_mod.zonvie_core_get_cursor_position(corep, null, null)
-    else
-        app.last_cursor_grid;
-
     // Mini-specific cell dimensions: ~75% of the editor cell so the popup
-    // looks visibly "mini" (matches macOS, which uses cellHeightPt * 0.75 for
-    // the mini font size). Floors keep the popup legible at small DPI.
+    // looks visibly "mini" (macOS sets its mini font size to cellHeightPt *
+    // 0.6, an em size rather than a cell height). Floors keep the popup
+    // legible at small DPI.
     const mini_cell_h_i: c_int = @max(@as(c_int, 12), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
     const mini_cell_w_i: c_int = @max(@as(c_int, 6), @as(c_int, @intCast(@divTrunc(cell_w * 3, 4))));
 
-    // Calculate target rect based on position mode
-    var anchor_x: c_int = 0;
-    var anchor_y: c_int = 0;
-
-    switch (mini_pos_mode) {
-        .display => {
-            // Display-based: bottom-right of the main window's monitor.
-            const work = app_mod.monitorWorkArea(main_hwnd);
-            anchor_x = work.right;
-            anchor_y = work.bottom;
-        },
-        .window => {
-            // Window-based: check if cursor is in external window
-            app.mu.lockUncancelable(core.clock.io());
-            const ext_win = app.external_windows.get(cursor_grid);
-            app.mu.unlock(core.clock.io());
-
-            if (ext_win) |ew| {
-                var rect: c.RECT = undefined;
-                if (c.GetWindowRect(ew.hwnd, &rect) != 0) {
-                    anchor_x = rect.right;
-                    anchor_y = rect.bottom;
-                } else {
-                    // Fallback to main window
-                    var client_rect: c.RECT = undefined;
-                    _ = c.GetClientRect(main_hwnd, &client_rect);
-                    var pt: c.POINT = .{ .x = client_rect.right, .y = client_rect.bottom };
-                    _ = c.ClientToScreen(main_hwnd, &pt);
-                    anchor_x = pt.x;
-                    anchor_y = pt.y;
-                }
-            } else {
-                // Main window
-                var client_rect: c.RECT = undefined;
-                _ = c.GetClientRect(main_hwnd, &client_rect);
-                var pt: c.POINT = .{ .x = client_rect.right, .y = client_rect.bottom };
-                _ = c.ClientToScreen(main_hwnd, &pt);
-                anchor_x = pt.x;
-                anchor_y = pt.y;
-            }
-        },
-        .grid => {
-            // Grid-based: use cursor grid's bounds
-            var client_rect: c.RECT = undefined;
-            _ = c.GetClientRect(main_hwnd, &client_rect);
-
-            var client_origin: c.POINT = .{ .x = 0, .y = 0 };
-            _ = c.ClientToScreen(main_hwnd, &client_origin);
-
-            var grid_right_px: c_int = client_rect.right;
-            var grid_bottom_px: c_int = client_rect.bottom;
-
-            // The window the cursor is in, walked out of any float.
-            const cached: []const app_mod.GridInfo = if (app.corep) |corep| app.getVisibleGridsCached(corep) else &.{};
-            const anchor_grid = cursorAnchorGridId(cached, cursor_grid);
-
-            // Check if that window is an external one first
-            app.mu.lockUncancelable(core.clock.io());
-            const ext_win = app.external_windows.get(anchor_grid);
-            app.mu.unlock(core.clock.io());
-
-            if (ext_win) |ew| {
-                var rect: c.RECT = undefined;
-                if (c.GetWindowRect(ew.hwnd, &rect) != 0) {
-                    anchor_x = rect.right;
-                    anchor_y = rect.bottom;
-                } else {
-                    anchor_x = client_origin.x + grid_right_px;
-                    anchor_y = client_origin.y + grid_bottom_px;
-                }
-            } else {
-                // Grid bounds from the core's (non-blocking) snapshot, in the
-                // editor area: the tab bar or sidebar sits before it.
-                for (cached) |grid| {
-                    if (grid.grid_id == anchor_grid) {
-                        const end_col: u32 = @intCast(@max(0, grid.start_col + @as(i32, @intCast(grid.cols))));
-                        const end_row: u32 = @intCast(@max(0, grid.start_row + @as(i32, @intCast(grid.rows))));
-                        const origin = input.surfaceOriginPx(app, true);
-                        grid_right_px = origin.x + @as(c_int, @intCast(end_col * cell_w));
-                        // cell_h already includes linespace; do NOT add linespace again.
-                        grid_bottom_px = origin.y + @as(c_int, @intCast(end_row * cell_h));
-                        break;
-                    }
-                }
-                anchor_x = client_origin.x + grid_right_px;
-                anchor_y = client_origin.y + grid_bottom_px;
-            }
-        },
-    }
+    // Minis stack upward from the target's bottom-right corner.
+    const target = msgTargetRect(app, mini_pos_mode);
+    const anchor_x: c_int = target.right;
+    const anchor_y: c_int = target.bottom;
 
     // Count visible minis and build stack order
     var stacked_height_px: c_int = 0;
@@ -1026,14 +896,15 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     // which locks grid_mu — calling it during WM_PAINT creates deadlock risk with
     // any core callback that blocks on the UI thread).
     var bg_rgb: c.COLORREF = c.RGB(38, 38, 46); // Default dark background
-    var fg_rgb: c.COLORREF = c.RGB(255, 255, 255); // Default white text
+    var fg_rgb: c.COLORREF = c.RGB(220, 220, 220); // Default light gray text
     {
         app.mu.lockUncancelable(core.clock.io());
         const fg = app.colorscheme_fg;
         const bg = app.colorscheme_bg;
         app.mu.unlock(core.clock.io());
 
-        if (bg != 0xFFFFFFFF and bg != 0) {
+        // 0xFFFFFFFF is the only "unset" value: 0 is a black Normal colour.
+        if (bg != 0xFFFFFFFF) {
             // Apply brightness adjustment
             var r = @as(u8, @intCast((bg >> 16) & 0xFF));
             var g = @as(u8, @intCast((bg >> 8) & 0xFF));
@@ -1043,7 +914,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
             b = @min(255, @as(u16, b) * 13 / 10 + 12);
             bg_rgb = c.RGB(r, g, b);
         }
-        if (fg != 0xFFFFFFFF and fg != 0) {
+        if (fg != 0xFFFFFFFF) {
             const r = @as(u8, @intCast((fg >> 16) & 0xFF));
             const g = @as(u8, @intCast((fg >> 8) & 0xFF));
             const b = @as(u8, @intCast(fg & 0xFF));
@@ -1082,7 +953,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     }
 
     // Set text colors based on message kind
-    const text_color = msg_win.getTextColor();
+    const text_color = msg_win.getTextColor(fg_rgb);
     _ = c.SetTextColor(hdc, text_color);
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
@@ -1149,14 +1020,14 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         const bg = app.colorscheme_bg;
         app.mu.unlock(core.clock.io());
 
-        if (bg != 0xFFFFFFFF and bg != 0) {
+        if (bg != 0xFFFFFFFF) {
             // Darken background slightly for mini windows
             const r = @as(u8, @intCast((bg >> 16) & 0xFF)) / 2;
             const g = @as(u8, @intCast((bg >> 8) & 0xFF)) / 2;
             const b = @as(u8, @intCast(bg & 0xFF)) / 2;
             bg_rgb = c.RGB(r, g, b);
         }
-        if (fg != 0xFFFFFFFF and fg != 0) {
+        if (fg != 0xFFFFFFFF) {
             const r = @as(u8, @intCast((fg >> 16) & 0xFF));
             const g = @as(u8, @intCast((fg >> 8) & 0xFF));
             const b = @as(u8, @intCast(fg & 0xFF));
@@ -1170,8 +1041,8 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.DeleteObject(bg_brush);
 
     // Create font at ~75% of the editor cell height so the mini popup is
-    // visibly smaller than the editor and the ext_float window. Matches the
-    // macOS mini font size (cellHeightPt * 0.75). Floor at 11 px for legibility.
+    // visibly smaller than the editor and the ext_float window. Floor at 11 px
+    // for legibility.
     const cell_h = app.cell_h_px;
     const font_height: c_int = @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
     const hfont = c.CreateFontW(
@@ -1220,4 +1091,53 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, c.DT_CENTER | c.DT_TOP);
 
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
+}
+
+fn testGrid(grid_id: i64, zindex: i64, anchor_grid: i64, start_row: i32, start_col: i32, rows: i32, cols: i32) app_mod.GridInfo {
+    var g = std.mem.zeroes(app_mod.GridInfo);
+    g.grid_id = grid_id;
+    g.zindex = zindex;
+    g.anchor_grid = anchor_grid;
+    g.start_row = start_row;
+    g.start_col = start_col;
+    g.rows = rows;
+    g.cols = cols;
+    return g;
+}
+
+test "msg target: a .grid box hangs off the split the float is anchored to, in surface space" {
+    const grids = [_]app_mod.GridInfo{
+        testGrid(1, 0, 0, 0, 0, 40, 120),
+        testGrid(2, 0, 0, 0, 0, 40, 60),
+        testGrid(3, 0, 0, 0, 61, 40, 59),
+        // A telescope prompt anchored to the right split.
+        testGrid(9, 50, 3, 5, 70, 1, 30),
+    };
+    const anchor = cursorAnchorGridId(&grids, 9);
+    try std.testing.expectEqual(@as(i64, 3), anchor);
+    try std.testing.expectEqual(@as(i64, 1), cursorAnchorGridId(&grids, 77));
+
+    // Left sidebar 200px, titlebar-free; client at screen (100, 50), 1400x900.
+    const surface = mainSurfaceRect(.{ .left = 100, .top = 50, .right = 1500, .bottom = 950 }, 200, 0, 0);
+    try std.testing.expectEqual(@as(c_int, 300), surface.left);
+    const r = gridCellRect(surface, grids[2], 10, 20);
+    try std.testing.expectEqual(@as(c_int, 300 + 61 * 10), r.left);
+    try std.testing.expectEqual(@as(c_int, 300 + 120 * 10), r.right);
+    try std.testing.expectEqual(@as(c_int, 50), r.top);
+    try std.testing.expectEqual(@as(c_int, 50 + 40 * 20), r.bottom);
+}
+
+test "msg target: a right sidebar and a titlebar tabline are outside the surface" {
+    const surface = mainSurfaceRect(.{ .left = 0, .top = 0, .right = 1000, .bottom = 800 }, 0, 32, 180);
+    try std.testing.expectEqual(@as(c_int, 820), surface.right);
+    try std.testing.expectEqual(@as(c_int, 32), surface.top);
+    try std.testing.expectEqual(@as(c_int, 800), surface.bottom);
+}
+
+test "message kinds: interactive prompts are dialogs, status kinds are not" {
+    try std.testing.expect(isConfirmKind("confirm"));
+    try std.testing.expect(isConfirmKind("number_prompt"));
+    try std.testing.expect(!isConfirmKind("emsg"));
+    try std.testing.expect(isStatusKind("showcmd"));
+    try std.testing.expect(!isStatusKind("echo"));
 }

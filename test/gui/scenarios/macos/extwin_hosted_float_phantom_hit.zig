@@ -42,42 +42,6 @@ const phantom_cols: i64 = 40;
 const scroll_steps: u32 = 12;
 const step_px: f64 = -40;
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-/// The frontmost window of `pid` covering the point, which is the one a posted
-/// scroll lands on. windowsForPid returns the on-screen list front to back.
-fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    for (buf[0..platform.windowsForPid(pid, &buf)]) |w| {
-        if (x >= w.bounds.x and x < w.bounds.x + w.bounds.w and
-            y >= w.bounds.y and y < w.bounds.y + w.bounds.h) return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     if (!platform.accessibilityTrusted()) {
         std.debug.print(
@@ -119,7 +83,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 400 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // Placed so that, read as main-window coordinates, it straddles the main
@@ -184,7 +148,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const main_win = platform.mainWindowForPid(g.app_pid) orelse return error.MainWindowNotFound;
     const cx = main_win.bounds.x + main_win.bounds.w * 0.5;
     const cy = main_win.bounds.y + main_win.bounds.h * 0.5;
-    const front = topmostWindowAt(g.app_pid, cx, cy) orelse return error.NoWindowUnderScrollPoint;
+    const front = driver.topmostWindowAt(g.app_pid, cx, cy) orelse return error.NoWindowUnderScrollPoint;
     if (front.number != main_win.number) {
         std.debug.print(
             "[gui] the main window is not frontmost at the scroll point; the gesture " ++

@@ -59,31 +59,6 @@ fn lastFor(alloc: std.mem.Allocator, want_main: bool, since_ms: f64) !?Report {
     return out;
 }
 
-fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        if (w.bounds.w < min_side or w.bounds.h < min_side) continue;
-        return w;
-    }
-    return null;
-}
-
-fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) !platform.MainWindow {
-    var timer = gui_io.Timer.start();
-    while (true) {
-        if (newWindow(pid, before, min_side)) |w| return w;
-        if (timer.read() / std.time.ns_per_ms >= 10_000) {
-            platform.dumpWindowsForPid(pid);
-            return error.ExternalWindowNotFound;
-        }
-        gui_io.sleepNs(100 * std.time.ns_per_ms);
-    }
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
@@ -121,7 +96,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 800 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
-    _ = try waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before, 100);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     // Now scroll the EXTERNAL window, from the keyboard, with the cursor in it.

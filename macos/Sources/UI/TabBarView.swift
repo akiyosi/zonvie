@@ -276,7 +276,9 @@ final class TabBarView: NSView {
                 NSRect(x: indicatorX - 1, y: 4, width: 2, height: tabHeight - 6).fill()
             }
 
-            // Draw floating tab at cursor position
+            // Draw floating tab at cursor position. A tabline_update can
+            // shrink `tabs` mid-drag (the tracking loop drains the main queue).
+            guard dragIdx < tabs.count else { return }
             let tab = tabs[dragIdx]
             let floatX = dragCurrentX - dragOffsetX
             let floatRect = NSRect(x: floatX, y: 6, width: tabWidth, height: tabHeight - 6)
@@ -501,7 +503,9 @@ final class TabBarView: NSView {
         let location = convert(event.locationInWindow, from: nil)
 
         if let index = tabIndex(at: location) {
-            if isCloseButton(at: location, tabIndex: index) {
+            // Only where drawTab shows the X: a selected or hovered tab.
+            let closeShown = tabs[index].handle == currentTab || hoveredTabIndex == index
+            if closeShown && isCloseButton(at: location, tabIndex: index) {
                 // Close button pressed - track until mouse up
                 trackCloseButtonClick(initialEvent: event, tabIndex: index)
             } else {
@@ -521,9 +525,13 @@ final class TabBarView: NSView {
         } else {
             // Empty area in titlebar
             if event.clickCount == 2 {
-                // Double-click: zoom (maximize/restore) window
-                // This follows macOS system behavior for titlebar double-click
-                window?.zoom(nil)
+                // Double-click: the system "double-click a window's title bar"
+                // setting (global domain); AppKit's handling is bypassed here.
+                switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+                case "Minimize": window?.miniaturize(nil)
+                case "None": break
+                default: window?.zoom(nil)
+                }
             } else {
                 // Single click: allow window dragging
                 window?.performDrag(with: event)
@@ -541,6 +549,9 @@ final class TabBarView: NSView {
 
         var isDragging = true
         isExternalDrag = false
+        // The loop drains the main queue, so a tabline_update can replace
+        // `tabs` mid-drag: the dragged tab is followed by its handle.
+        let draggedTab = tabs[tabIndex]
 
         while isDragging {
             guard let event = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else {
@@ -565,7 +576,7 @@ final class TabBarView: NSView {
                     // Entering external drag mode
                     isExternalDrag = true
                     ZonvieCore.appLog("[TAB-DRAG] Entering external drag mode for tab \(tabIndex)")
-                    dragPreviewHelper.create(tabName: tabs[tabIndex].name, at: screenLocation)
+                    dragPreviewHelper.create(tabName: draggedTab.name, at: screenLocation)
                 } else if !isOutsideTabBar && isExternalDrag {
                     // Returning to normal drag mode
                     isExternalDrag = false
@@ -597,23 +608,23 @@ final class TabBarView: NSView {
                 isDragging = false
                 ZonvieCore.appLog("[TAB-DRAG] mouseUp isExternalDrag=\(isExternalDrag) screenLocation=\(screenLocation)")
 
+                let currentIndex = tabs.firstIndex { $0.handle == draggedTab.handle }
                 if isExternalDrag {
-                    // Externalize the tab
-                    let tab = tabs[tabIndex]
-                    ZonvieCore.appLog("[TAB-DRAG] Externalizing tab handle=\(tab.handle) name=\(tab.name)")
                     dragPreviewHelper.destroy()
-                    onTabExternalized?(tab.handle, screenLocation)
-                } else {
+                    if currentIndex != nil {
+                        ZonvieCore.appLog("[TAB-DRAG] Externalizing tab handle=\(draggedTab.handle) name=\(draggedTab.name)")
+                        onTabExternalized?(draggedTab.handle, screenLocation)
+                    }
+                } else if let currentIndex {
                     let movedDistance = abs(location.x - dragStartX)
 
                     if movedDistance < dragThreshold {
                         // Didn't move enough - treat as click (select tab)
-                        let tab = tabs[tabIndex]
-                        onTabSelected?(tab.handle)
-                    } else if let targetIdx = dropTargetIndex {
+                        onTabSelected?(draggedTab.handle)
+                    } else if let targetIdx = dropTargetIndex.map({ min($0, tabs.count) }) {
                         // Actually moved - reorder tab
-                        if targetIdx != tabIndex && targetIdx != tabIndex + 1 {
-                            onTabMoved?(tabIndex, targetIdx)
+                        if targetIdx != currentIndex && targetIdx != currentIndex + 1 {
+                            onTabMoved?(currentIndex, targetIdx)
                         }
                     }
                 }

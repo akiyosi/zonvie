@@ -341,26 +341,6 @@ final class ZonvieCore {
     /// tick spends every surface's. Snapshots under the map lock and releases
     /// it before asking any view, so externalGridViewsLock is never held across
     /// a surface lock.
-    /// Merge every external surface's placement ledger into the float ledger's
-    /// per-frame scratch, after the main renderer has filled it. A float an
-    /// external window hosts travels the same way one on the main window does,
-    /// and without its half the debt correction was simply absent for it.
-    func appendExternalPlacementRowsUp(into out: inout [Int64: Int]) {
-        externalGridViewsLock.lock()
-        placementLedgerScratch.removeAll(keepingCapacity: true)
-        placementLedgerScratch.append(contentsOf: externalGridViews.values)
-        externalGridViewsLock.unlock()
-        defer { placementLedgerScratch.removeAll(keepingCapacity: true) }
-        for view in placementLedgerScratch {
-            guard view.gridId > 1 else { continue }
-            view.copyPlacementRowsUp(into: &out)
-        }
-    }
-
-    /// Snapshot buffer for the ledger merge above; its own, for the reason
-    /// smoothScrollSeedScratch states.
-    private var placementLedgerScratch: [ExternalGridView] = []
-
     func appendExternalSmoothScrollSeeds(into out: inout [(gridId: Int64, rowsDelta: Int)]) {
         externalGridViewsLock.lock()
         smoothScrollSeedScratch.removeAll(keepingCapacity: true)
@@ -1137,11 +1117,8 @@ final class ZonvieCore {
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
                 me.onMsgStatus(.ruler, label: "ruler", view: view, chunks: chunks, chunkCount: chunkCount)
             },
-            on_msg_history_show: { ctx, entries, entryCount, prevCmd in
-                guard let ctx else { return }
-                let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                me.onMsgHistoryShow(entries: entries, entryCount: entryCount, prevCmd: prevCmd)
-            },
+            // The core never invokes it (see zonvie_core.h).
+            on_msg_history_show: nil,
             // Clipboard callbacks
             on_clipboard_get: { ctx, register, outBuf, outLen, maxLen in
                 guard let ctx, let outBuf, let outLen else { return 0 }
@@ -1448,7 +1425,7 @@ final class ZonvieCore {
                 // (for the flushFailed check) — nothing mutates
                 // externalGridViews between there and here.
                 for gridView in me.extViewsScratch {
-                    gridView.commitFlush()
+                    gridView.commitFlush(publishedAtlasTexture: publishedAtlasTexture)
                 }
                 me.externalGridViewsLock.lock()
                 if let owners = me.pendingGridSurfaceOwners { me.gridSurfaceOwners = owners }
@@ -1563,7 +1540,15 @@ final class ZonvieCore {
                     // which holds no sets for the grid and failed the whole flush.
                     ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(surfaceId) grid=\(gid) reason=host_not_registered")
 
-                case .mainRoot, .mainLayer, .unplaced:
+                case .unplaced:
+                    // An external grid whose own view is not registered yet.
+                    // As on the row path, the hint is dropped: registration
+                    // force-resends every row. Sent to the main renderer it
+                    // failed the whole flush (no sets), or shifted a copy of a
+                    // former main layer that is no longer drawn.
+                    ZonvieCore.renderTrace("flush=\(core.renderTraceFlushId) event=route_defer surface=\(gid) grid=\(gid) reason=view_not_registered")
+
+                case .mainRoot, .mainLayer:
                     // A grid the main surface places as a layer shifts its own
                     // row slots in that surface's renderer. The call ignores
                     // grid 1, which holds no layer sets.
@@ -1688,9 +1673,15 @@ final class ZonvieCore {
         core = nil
         ctxPtr = nil
 
-        // Cleanup SSH_ASKPASS script
+        // Cleanup SSH_ASKPASS script. It is per process, like the SSH_ASKPASS
+        // variable, so it stays while another SSH session may still spawn ssh
+        // (a remote :restart does). The session list is main-thread state.
         if let path = sshAskpassPath {
-            try? FileManager.default.removeItem(atPath: path)
+            let stillUsed = !Thread.isMainThread || SessionManager.shared.sessions.contains { s in
+                guard let other = s.viewController?.core, other !== self else { return false }
+                return other.sshAskpassPath == path
+            }
+            if !stillUsed { try? FileManager.default.removeItem(atPath: path) }
         }
     }
 
@@ -2873,9 +2864,10 @@ final class ZonvieCore {
         ZonvieCore.appLog("[external_window] setPendingExternalWindowPosition: \(position)")
         pendingExternalWindowPosition = position
 
-        // Clear pending position after timeout to prevent stale state if externalization fails
+        // Clear pending position after timeout to prevent stale state if externalization fails.
+        // Only this drag's: a newer drag's position is left to its own timer.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            if self?.pendingExternalWindowPosition != nil {
+            if self?.pendingExternalWindowPosition == position {
                 ZonvieCore.appLog("[external_window] clearing stale pendingExternalWindowPosition (timeout)")
                 self?.pendingExternalWindowPosition = nil
             }
@@ -4163,7 +4155,9 @@ final class ZonvieCore {
         // their rows at the new cell size.
         view.renderer.notifyCellMetricsIfChanged()
 
-        DispatchQueue.main.async {
+        // The row height changed, so snap the window as a guifont change does.
+        DispatchQueue.main.async { [weak self] in
+            self?.scheduleWindowSnap()
             view.requestRedraw(nil)
         }
     }
@@ -4185,6 +4179,7 @@ final class ZonvieCore {
     /// only signal a frontend gets that nvim swapped underneath.
     fileprivate func handleRestartEvent(listenAddr: String) {
         advanceExternalWindowSessionGeneration()
+        resetCoreReportedCursorGrid()
         ZonvieCore.appLog("restart: reconnecting to listen_addr=\(listenAddr)")
     }
 
@@ -4193,7 +4188,15 @@ final class ZonvieCore {
     /// server keeps running headless instead of dying.
     fileprivate func handleConnectEvent(serverAddr: String) {
         advanceExternalWindowSessionGeneration()
+        resetCoreReportedCursorGrid()
         ZonvieCore.appLog("connect: hot-swap to server_addr=\(serverAddr)")
+    }
+
+    /// The new session's grid ids restart and the core forgets its last cursor
+    /// grid; forget ours too, or its first report of a reused id reads as a
+    /// repeat. Queued behind the old session's reports, ahead of the new ones.
+    private func resetCoreReportedCursorGrid() {
+        DispatchQueue.main.async { [weak self] in self?.coreReportedCursorGrid = 1 }
     }
 
 
@@ -4750,12 +4753,7 @@ final class ZonvieCore {
             for (gridId, window) in self.externalWindows {
                 // Skip special windows (cmdline, popupmenu, msg_show, msg_history)
                 // These are handled differently and don't need resize
-                if gridId == ZonvieCore.cmdlineGridId ||
-                   gridId == ZonvieCore.popupmenuGridId ||
-                   gridId == ZonvieCore.messageGridId ||
-                   gridId == ZonvieCore.msgHistoryGridId {
-                    continue
-                }
+                if self.classifyExternalGridKind(gridId) != .normal { continue }
 
                 guard let gridView = self.externalGridViews[gridId] else { continue }
                 let rows = gridView.gridRows
@@ -4773,21 +4771,27 @@ final class ZonvieCore {
                 let newWidth = CGFloat(cols) * cellWidthPx / scale
                 let newHeight = CGFloat(rows) * cellHeightPx / scale
 
+                // New metrics go on the delegate before setFrame, and the resize
+                // callback is suppressed, so windowDidResize cannot report a row
+                // count computed from the old metrics.
+                let delegate = self.externalWindowDelegates[gridId]
+                delegate?.cellWidthPx = cellWidthPx
+                delegate?.cellHeightPx = cellHeightPx
+                delegate?.suppressResizeCallback = true
+
+                // The window is titled: size the frame from the content rect.
                 let currentFrame = window.frame
+                let frameRect = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: newWidth, height: newHeight))
                 let newFrame = NSRect(
                     x: currentFrame.origin.x,
-                    y: currentFrame.origin.y + currentFrame.height - newHeight,  // Keep top-left position
-                    width: newWidth,
-                    height: newHeight
+                    y: currentFrame.maxY - frameRect.height,  // Keep top-left position
+                    width: frameRect.width,
+                    height: frameRect.height
                 )
                 window.setFrame(newFrame, display: false)
 
                 gridView.frame = NSRect(x: 0, y: 0, width: newWidth, height: newHeight)
-
-                if let delegate = self.externalWindowDelegates[gridId] {
-                    delegate.cellWidthPx = cellWidthPx
-                    delegate.cellHeightPx = cellHeightPx
-                }
+                delegate?.suppressResizeCallback = false
 
                 // Force Neovim to redraw this grid by changing size then restoring
                 // Neovim ignores resize requests with same size, so we change it first
@@ -4852,15 +4856,10 @@ final class ZonvieCore {
     /// Pending messages for stack display (echo/error/warning only)
     private var pendingMessages: [(kind: String, content: String, hlId: Int32)] = []
 
-    /// Prompt window for confirm/return_prompt (bottom-center)
+    /// Prompt window for confirm-view messages (centred on the app window)
     private var promptWindow: NSWindow?
     private var promptTextField: NSTextField?
     private var promptContainerView: NSView?
-    /// Saved prompt window size for return_prompt (preserve confirm dialog layout)
-    private var savedPromptWidth: CGFloat = 0
-    private var savedPromptHeight: CGFloat = 0
-    /// Track if current prompt is from confirm dialog
-    private var promptIsConfirm: Bool = false
 
     // MARK: - Mini View System (showmode/showcmd/ruler)
 
@@ -4903,6 +4902,10 @@ final class ZonvieCore {
 
     /// Track last cursor grid to detect transitions from external windows
     private var lastCursorGrid: Int64 = 1
+    /// The grid the core last reported (main thread). Repeats are detected
+    /// against this, not lastCursorGrid, which window creation also writes
+    /// for a window the cursor may never enter.
+    private var coreReportedCursorGrid: Int64 = 1
 
 
     private func onExternalWindow(
@@ -4975,77 +4978,32 @@ final class ZonvieCore {
                let existingGridView = self.externalGridViews[gridId] {
                 self.externalWindowInstalledLifecycleTokens[gridId] = lifecycleToken
                 self.externalWindowInstalledSessionGenerations[gridId] = sessionGeneration
-                switch specialKind {
-                case .popupmenu:
-                    self.refreshDecoratedExternalWindow(
-                        gridId: gridId,
-                        window: existingWindow,
-                        gridView: existingGridView,
-                        rows: rows,
-                        cols: cols,
-                        preLayoutFrame: self.buildReusedDecoratedWindowFrame(
-                            kind: specialKind,
-                            existingWindow: existingWindow,
-                            win: win,
-                            startRow: startRow,
-                            startCol: startCol,
-                            mainView: mainView,
-                            cellW: cellW,
-                            cellH: cellH,
-                            scale: scale,
-                            geometry: geometry
-                        )
-                    )
-                    return
-                case .cmdline:
-                    let preLayoutFrame = self.buildReusedDecoratedWindowFrame(
-                        kind: specialKind,
-                        existingWindow: existingWindow,
-                        win: win,
-                        startRow: startRow,
-                        startCol: startCol,
-                        mainView: mainView,
-                        cellW: cellW,
-                        cellH: cellH,
-                        scale: scale,
-                        geometry: geometry
-                    )
-                    if let cmdWin = existingWindow as? CmdlineWindow {
-                        cmdWin.suppressPositionSave = (preLayoutFrame != nil)
-                    }
-                    self.refreshDecoratedExternalWindow(
-                        gridId: gridId,
-                        window: existingWindow,
-                        gridView: existingGridView,
-                        rows: rows,
-                        cols: cols,
-                        preLayoutFrame: preLayoutFrame
-                    )
-                    if let preLayoutFrame {
-                        ZonvieCore.appLog("[external_window] cmdline repositioned below prompt at (\(preLayoutFrame.origin.x), \(preLayoutFrame.origin.y))")
-                    }
-                    return
-                case .msgHistory:
-                    self.refreshDecoratedExternalWindow(
-                        gridId: gridId,
-                        window: existingWindow,
-                        gridView: existingGridView,
-                        rows: rows,
-                        cols: cols
-                    )
-                    return
-                case .msgShow:
-                    self.refreshDecoratedExternalWindow(
-                        gridId: gridId,
-                        window: existingWindow,
-                        gridView: existingGridView,
-                        rows: rows,
-                        cols: cols
-                    )
-                    return
-                case .normal:
-                    return
+                guard specialKind != .normal else { return }
+                // Nil for the message kinds: their layout places them.
+                let preLayoutFrame = self.buildReusedDecoratedWindowFrame(
+                    kind: specialKind,
+                    existingWindow: existingWindow,
+                    win: win,
+                    startRow: startRow,
+                    startCol: startCol,
+                    mainView: mainView,
+                    cellW: cellW,
+                    cellH: cellH,
+                    scale: scale,
+                    geometry: geometry
+                )
+                if let cmdWin = existingWindow as? CmdlineWindow {
+                    cmdWin.suppressPositionSave = (preLayoutFrame != nil)
                 }
+                self.refreshDecoratedExternalWindow(
+                    gridId: gridId,
+                    window: existingWindow,
+                    gridView: existingGridView,
+                    rows: rows,
+                    cols: cols,
+                    preLayoutFrame: preLayoutFrame
+                )
+                return
             }
 
             // Pipeline readiness precedes AppKit host construction. A failed
@@ -6216,9 +6174,8 @@ final class ZonvieCore {
         window: NSWindow,
         gridView: ExternalGridView
     ) {
-        // Only a window the cursor enters. The core reports the cursor moving
-        // onto it once the window is registered, and this makes that report a
-        // no-op; a popupmenu or message window gets no such report, so
+        // Only a window the cursor may enter; a popupmenu or message window
+        // gets no cursor report, so
         // recording it named a grid the cursor never left for, and the blink
         // gate asked a window that had since closed. The gate cannot read the
         // core instead: the change arrives mid-flush, while grid_mu is held.
@@ -6381,7 +6338,7 @@ final class ZonvieCore {
         cellW: CGFloat,
         windowWidth: CGFloat,
         windowHeight: CGFloat
-    ) -> (rect: NSRect, direction: String)? {
+    ) -> NSRect? {
         guard let cmdlineWindow = self.externalWindows[ZonvieCore.cmdlineGridId] else {
             return nil
         }
@@ -6406,8 +6363,76 @@ final class ZonvieCore {
             Int32((-screenTop).rounded())
         )
         let y = -CGFloat(popupTopDown) - windowHeight
-        return (NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
-                y > cmdlineFrame.minY ? "above" : "below")
+        popupmenuPlacedAbove = y > cmdlineFrame.minY
+        return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
+    }
+
+    /// Uses startRow/startCol from external_grids directly — Neovim's
+    /// popupmenu_show row/col without async indirection. popupmenuAnchorGrid
+    /// is used only for cmdline detection.
+    private func isCmdlinePopupmenu(startRow: Int32) -> Bool {
+        (popupmenuAnchorGrid == -1) || (startRow == -1)
+    }
+
+    /// The popupmenu frame for both creation and reuse: against the cmdline
+    /// for cmdline completion, else against Neovim's anchor cell in the
+    /// anchor external window or the terminal view. Nil when there is nothing
+    /// to place it against; each caller has its own fallback.
+    private func popupmenuPlacement(
+        win: Int64,
+        startRow: Int32,
+        startCol: Int32,
+        mainView: MetalTerminalView,
+        cellW: CGFloat,
+        cellH: CGFloat,
+        scale: CGFloat,
+        windowWidth: CGFloat,
+        windowHeight: CGFloat
+    ) -> NSRect? {
+        if isCmdlinePopupmenu(startRow: startRow) {
+            return cmdlinePopupmenuPlacement(
+                startCol: startCol, cellW: cellW,
+                windowWidth: windowWidth, windowHeight: windowHeight
+            )
+        }
+
+        if win > 0,
+           let anchorWindow = self.externalWindows[win],
+           let anchorContentView = anchorWindow.contentView {
+            anchorContentView.layoutSubtreeIfNeeded()
+            let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
+            let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
+            // The anchor window's own scale: its cells are laid out in
+            // its own points, which differ from the main window's on a
+            // screen of another density.
+            return popupmenuWindowRect(
+                anchorRow: startRow,
+                anchorCol: startCol,
+                windowWidth: windowWidth,
+                windowHeight: windowHeight,
+                cellW: cellW,
+                cellH: cellH,
+                scale: anchorWindow.backingScaleFactor,
+                referenceFrame: anchorContentFrame,
+                screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+            )
+        }
+
+        if let tvFrame = self.terminalViewScreenFrame() {
+            return popupmenuWindowRect(
+                anchorRow: startRow,
+                anchorCol: startCol,
+                windowWidth: windowWidth,
+                windowHeight: windowHeight,
+                cellW: cellW,
+                cellH: cellH,
+                scale: scale,
+                referenceFrame: tvFrame,
+                screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+            )
+        }
+
+        return nil
     }
 
     private func buildInitialDecoratedWindowRect(
@@ -6468,70 +6493,19 @@ final class ZonvieCore {
             return NSRect(x: 100, y: 100, width: containerWidth, height: containerHeight)
 
         case .popupmenu:
-            // Use startRow/startCol from external_grids directly — these are
-            // Neovim's popupmenu_show row/col without async indirection.
-            // popupmenuAnchorGrid is used only for cmdline detection.
-            let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
-            if isCmdlineCompletion {
-                if let placement = cmdlinePopupmenuPlacement(
-                    startCol: startCol, cellW: cellW,
-                    windowWidth: windowWidth, windowHeight: windowHeight
-                ) {
-                    ZonvieCore.appLog("[external_window] popupmenu positioned \(placement.direction) cmdline at (\(placement.rect.origin.x),\(placement.rect.origin.y))")
-                    return placement.rect
-                }
-
-                if let screen = NSScreen.main {
-                    let screenFrame = screen.visibleFrame
-                    let x = screenFrame.midX - windowWidth / 2
-                    let y = screenFrame.midY
-                    return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
-                }
-
-                return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
-            }
-
-            // Buffer completion: position using Neovim's anchor (row, col)
-            if win > 0,
-               let anchorWindow = self.externalWindows[win],
-               let anchorContentView = anchorWindow.contentView {
-                anchorContentView.layoutSubtreeIfNeeded()
-                let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
-                let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
-                // The anchor window's own scale: its cells are laid out in
-                // its own points, which differ from the main window's on a
-                // screen of another density.
-                let frame = popupmenuWindowRect(
-                    anchorRow: startRow,
-                    anchorCol: startCol,
-                    windowWidth: windowWidth,
-                    windowHeight: windowHeight,
-                    cellW: cellW,
-                    cellH: cellH,
-                    scale: anchorWindow.backingScaleFactor,
-                    referenceFrame: anchorContentFrame,
-                    screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                )
-                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) relative to ext_win=\(win)")
+            if let frame = popupmenuPlacement(
+                win: win, startRow: startRow, startCol: startCol, mainView: mainView,
+                cellW: cellW, cellH: cellH, scale: scale,
+                windowWidth: windowWidth, windowHeight: windowHeight
+            ) {
+                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) win=\(win) anchor=(\(startRow),\(startCol))")
                 return frame
             }
-
-            if let tvFrame = self.terminalViewScreenFrame() {
-                let frame = popupmenuWindowRect(
-                    anchorRow: startRow,
-                    anchorCol: startCol,
-                    windowWidth: windowWidth,
-                    windowHeight: windowHeight,
-                    cellW: cellW,
-                    cellH: cellH,
-                    scale: scale,
-                    referenceFrame: tvFrame,
-                    screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                )
-                ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) from anchor (\(startRow),\(startCol))")
-                return frame
+            if isCmdlinePopupmenu(startRow: startRow), let screen = NSScreen.main {
+                let screenFrame = screen.visibleFrame
+                return NSRect(x: screenFrame.midX - windowWidth / 2, y: screenFrame.midY,
+                              width: windowWidth, height: windowHeight)
             }
-
             return NSRect(x: 100, y: 100, width: windowWidth, height: windowHeight)
 
         case .msgHistory, .msgShow:
@@ -6661,9 +6635,17 @@ final class ZonvieCore {
         )
         // Back to AppKit's bottom-left origin.
         let y = -CGFloat(popupTopDown) - windowHeight
+        popupmenuPlacedAbove = CGFloat(popupTopDown) < anchorY - refTop
 
         return NSRect(x: x, y: y, width: windowWidth, height: windowHeight)
     }
+
+    /// Whether the last placement put the popupmenu above what it completes.
+    /// The layout resizes the window with its own screen's scale (placement
+    /// used the main window's), and must keep the edge that faces the anchor:
+    /// keeping the top of a menu flipped above grew it down over the anchor
+    /// row. Main thread only.
+    private var popupmenuPlacedAbove = false
 
     private func buildReusedDecoratedWindowFrame(
         kind: ExternalGridKind,
@@ -6679,56 +6661,11 @@ final class ZonvieCore {
     ) -> NSRect? {
         switch kind {
         case .popupmenu:
-            let windowWidth = geometry.windowWidth
-            let windowHeight = geometry.windowHeight
-            var windowRect = existingWindow.frame
-            let isCmdlineCompletion = (popupmenuAnchorGrid == -1) || (startRow == -1)
-
-            if isCmdlineCompletion {
-                if let placement = cmdlinePopupmenuPlacement(
-                    startCol: startCol, cellW: cellW,
-                    windowWidth: windowWidth, windowHeight: windowHeight
-                ) {
-                    windowRect = placement.rect
-                }
-                return windowRect
-            }
-
-            if win > 0,
-               let anchorWindow = self.externalWindows[win],
-               let anchorContentView = anchorWindow.contentView {
-                anchorContentView.layoutSubtreeIfNeeded()
-                let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
-                let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
-                // The anchor window's own scale, as for a new popupmenu.
-                return popupmenuWindowRect(
-                    anchorRow: startRow,
-                    anchorCol: startCol,
-                    windowWidth: windowWidth,
-                    windowHeight: windowHeight,
-                    cellW: cellW,
-                    cellH: cellH,
-                    scale: anchorWindow.backingScaleFactor,
-                    referenceFrame: anchorContentFrame,
-                    screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                )
-            }
-
-            if let tvFrame = self.terminalViewScreenFrame() {
-                return popupmenuWindowRect(
-                    anchorRow: startRow,
-                    anchorCol: startCol,
-                    windowWidth: windowWidth,
-                    windowHeight: windowHeight,
-                    cellW: cellW,
-                    cellH: cellH,
-                    scale: scale,
-                    referenceFrame: tvFrame,
-                    screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-                )
-            }
-
-            return windowRect
+            return popupmenuPlacement(
+                win: win, startRow: startRow, startCol: startCol, mainView: mainView,
+                cellW: cellW, cellH: cellH, scale: scale,
+                windowWidth: geometry.windowWidth, windowHeight: geometry.windowHeight
+            ) ?? existingWindow.frame
 
         case .cmdline:
             guard self.promptWindow?.isVisible == true,
@@ -7085,9 +7022,23 @@ final class ZonvieCore {
         // reopened the next, shorter cmdline off to the left.
         let cmdlineWindow = context.window as? CmdlineWindow
         let savedSuppress = cmdlineWindow?.suppressPositionSave ?? false
+        let oldFrame = context.window.frame
         cmdlineWindow?.suppressPositionSave = true
         context.window.setFrame(layout.windowFrame, display: true)
         cmdlineWindow?.suppressPositionSave = savedSuppress
+        // The completion menu is placed against the cmdline, which moves as it
+        // grows: carry it along with the edge it sits on (as Windows does).
+        // The cmdline keeps its centre, so its top and bottom move apart.
+        if cmdlineWindow != nil,
+           let pumWindow = self.externalWindows[ZonvieCore.popupmenuGridId] {
+            let dx = layout.windowFrame.minX - oldFrame.minX
+            let dy = pumWindow.frame.minY >= oldFrame.maxY
+                ? layout.windowFrame.maxY - oldFrame.maxY
+                : layout.windowFrame.minY - oldFrame.minY
+            if dx != 0 || dy != 0 {
+                pumWindow.setFrameOrigin(NSPoint(x: pumWindow.frame.minX + dx, y: pumWindow.frame.minY + dy))
+            }
+        }
         if let linkedMsgShowFrame = layout.linkedMsgShowFrame,
            let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId] {
             msgShowWindow.setFrame(linkedMsgShowFrame, display: true)
@@ -7168,13 +7119,19 @@ final class ZonvieCore {
         let containerHeight = contentHeight + (popupmenuPadding * 2)
 
         // Window position is managed by popupmenuWindowRect (called from
-        // on_external_window). Do not recalculate it here — just keep the
-        // current frame so internal layout (padding, viewport, chrome) is
-        // updated without moving the window.
+        // on_external_window). Do not recalculate it here — keep the edge the
+        // placement put against the anchor. The size is the container's: the
+        // placement was sized with the main window's scale, or kept a stale
+        // frame when it had no anchor. A wider frame stays on its screen.
+        let y = popupmenuPlacedAbove ? oldFrame.minY : oldFrame.maxY - containerHeight
+        var x = oldFrame.minX
+        if let visible = (context.window.screen ?? NSScreen.main)?.visibleFrame {
+            x = max(visible.minX, min(x, visible.maxX - containerWidth))
+        }
         return DecoratedExternalLayout(
             containerFrame: NSRect(x: 0, y: 0, width: containerWidth, height: containerHeight),
             gridFrame: NSRect(x: popupmenuPadding, y: popupmenuPadding, width: contentWidth, height: contentHeight),
-            windowFrame: oldFrame,
+            windowFrame: NSRect(x: x, y: y, width: containerWidth, height: containerHeight),
             iconFrame: nil,
             linkedMsgShowFrame: nil
         )
@@ -7286,9 +7243,9 @@ final class ZonvieCore {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
 
-            let lastGrid = self.lastCursorGrid
-            let isGridChange = (lastGrid != gridId)
+            let isGridChange = (self.coreReportedCursorGrid != gridId)
 
+            self.coreReportedCursorGrid = gridId
             self.lastCursorGrid = gridId
 
             if !isGridChange {
@@ -7844,20 +7801,9 @@ final class ZonvieCore {
             kindStr = ""
         }
 
-        var contentStr = ""
-        var primaryHlId: Int32 = 0  // Use first chunk's hl_id for color
-        if let chunks = chunks, chunkCount > 0 {
-            for i in 0..<chunkCount {
-                let chunk = chunks[i]
-                if i == 0 {
-                    primaryHlId = Int32(bitPattern: chunk.hl_id)
-                }
-                if let textPtr = chunk.text, chunk.text_len > 0 {
-                    let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                    contentStr += text
-                }
-            }
-        }
+        let contentStr = ZonvieCore.concatMsgChunks(chunks, chunkCount)
+        // Use first chunk's hl_id for color
+        let primaryHlId: Int32 = (chunks != nil && chunkCount > 0) ? Int32(bitPattern: chunks![0].hl_id) : 0
 
         let timeoutSec = Double(timeoutMs) / 1000.0
 
@@ -7889,8 +7835,7 @@ final class ZonvieCore {
                 // to this view, so there is no configuration that avoids it.
                 let isConfirm = kindStr == "confirm" || kindStr == "confirm_sub" ||
                     kindStr == "number_prompt"
-                let isReturnPrompt = kindStr == "return_prompt"
-                self.showPromptWindow(content: contentStr, hlId: primaryHlId, isConfirm: isConfirm, isReturnPrompt: isReturnPrompt)
+                self.showPromptWindow(content: contentStr, hlId: primaryHlId, isConfirm: isConfirm)
             } else if isMini {
                 self.updateMini(.custom, content: contentStr, timeout: timeoutSec)
             } else {
@@ -7981,76 +7926,6 @@ final class ZonvieCore {
             }
         }
         return out
-    }
-
-    private func onMsgHistoryShow(
-        entries: UnsafePointer<zonvie_msg_history_entry>?,
-        entryCount: Int,
-        prevCmd: Int32
-    ) {
-        guard let entries = entries, entryCount > 0 else {
-            ZonvieCore.appLog("[msg_history_show] empty entries")
-            return
-        }
-
-        var fullContent = ""
-        for i in 0..<entryCount {
-            let entry = entries[i]
-            var entryText = ""
-
-            if let chunks = entry.chunks, entry.chunk_count > 0 {
-                for j in 0..<Int(entry.chunk_count) {
-                    let chunk = chunks[j]
-                    if let textPtr = chunk.text, chunk.text_len > 0 {
-                        let text = String(bytes: UnsafeBufferPointer(start: textPtr, count: chunk.text_len), encoding: .utf8) ?? ""
-                        entryText += text
-                    }
-                }
-            }
-
-            if !entryText.isEmpty {
-                if !fullContent.isEmpty {
-                    fullContent += "\n"
-                }
-                fullContent += entryText
-            }
-        }
-
-        ZonvieCore.appLog("[msg_history_show] entries=\(entryCount) prev_cmd=\(prevCmd) content_len=\(fullContent.count)")
-
-        DispatchQueue.main.async { [weak self] in
-            self?.showMessageHistoryWindow(content: fullContent, prevCmd: prevCmd != 0)
-        }
-    }
-
-    private func showMessageHistoryWindow(content: String, prevCmd: Bool) {
-        guard let mainView = self.terminalView,
-              let renderer = mainView.renderer else {
-            return
-        }
-
-        let cellH = CGFloat(renderer.cellHeightPx)
-        let scale = mainView.window?.backingScaleFactor ?? 1.0
-        let fontSize = max(12.0, cellH / scale * 0.8)
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-
-        let lineCount = content.components(separatedBy: "\n").count
-        let fgColor = self.getNormalForegroundColor()
-        let bgColor = self.getNormalBackgroundColor().withAlphaComponent(0.95)
-        let borderColor = NSColor.gray.withAlphaComponent(0.5)
-        let targetFrame = getExtFloatTargetFrame()
-        let padding: CGFloat = 10
-
-        showLongMessageWindow(
-            content: content,
-            font: font,
-            fgColor: fgColor,
-            bgColor: bgColor,
-            borderColor: borderColor,
-            padding: padding,
-            targetFrame: targetFrame,
-            lineCount: lineCount
-        )
     }
 
     // MARK: - Mini View Display
@@ -8378,10 +8253,6 @@ final class ZonvieCore {
         }
     }
 
-    // Store scroll view and text view for long messages
-    private var messageScrollView: NSScrollView?
-    private var messageTextView: NSTextView?
-
     /// Get color for message kind (error=red, warning=yellow, etc.)
     private func getColorForMessageKind(_ kind: String, hlId: Int32) -> NSColor {
         switch kind {
@@ -8587,8 +8458,8 @@ final class ZonvieCore {
         let targetFrame = getExtFloatTargetFrame()
         ZonvieCore.appLog("[ext-float] showMessageWindow: targetFrame=\(targetFrame) extFloatPos=\(ZonvieConfig.shared.messages.extFloatPos)")
 
-        let isPrompt = ["confirm", "confirm_sub", "return_prompt"].contains(kind)
-
+        // Prompts never get here: the core pins them to the confirm view
+        // (showPromptWindow) or answers return_prompt itself.
         showShortMessageWindow(
             content: content,
             font: font,
@@ -8596,15 +8467,14 @@ final class ZonvieCore {
             bgColor: adjustedBg,
             borderColor: borderColor,
             padding: padding,
-            targetFrame: targetFrame,
-            isPrompt: isPrompt
+            targetFrame: targetFrame
         )
 
-        // Start auto-hide timer for external window (but not for prompts)
+        // Start auto-hide timer for external window
         // timeout_ms=0 means no auto-hide (e.g. errors), manual dismiss only
         messageAutoHideWorkItem?.cancel()
         messageAutoHideWorkItem = nil
-        if !isPrompt && timeoutMs > 0 {
+        if timeoutMs > 0 {
             let workItem = DispatchWorkItem { [weak self] in
                 // The messages the user watched go are gone from the stack
                 // too, as on Windows: a later replace_last or push shows only
@@ -8624,8 +8494,7 @@ final class ZonvieCore {
         bgColor: NSColor,
         borderColor: NSColor,
         padding: CGFloat,
-        targetFrame: NSRect,
-        isPrompt: Bool = false
+        targetFrame: NSRect
     ) {
         let textAttributes: [NSAttributedString.Key: Any] = [
             .font: font,
@@ -8643,55 +8512,22 @@ final class ZonvieCore {
         let windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
         let windowHeight = max(30, boundingBox.height + (padding * 2) + 4)
 
-        // Position: prompts go to bottom center, regular messages to top-right
-        let windowX: CGFloat
-        let windowY: CGFloat
-        if isPrompt {
-            windowX = targetFrame.midX - windowWidth / 2
-            windowY = targetFrame.minY + 50  // Near bottom
-        } else {
-            windowX = targetFrame.maxX - windowWidth - 10
-            windowY = targetFrame.maxY - windowHeight - 10
-        }
+        // Top-right of the target frame
+        let windowX = targetFrame.maxX - windowWidth - 10
+        let windowY = targetFrame.maxY - windowHeight - 10
 
         if let window = self.extFloatWindow,
            let containerView = self.messageContainerView,
            let textField = self.messageTextField {
-            if self.messageScrollView != nil {
-                // Was in long mode, need to recreate
-                self.hideMessageWindow()
-                showShortMessageWindow(content: content, font: font, fgColor: fgColor, bgColor: bgColor, borderColor: borderColor, padding: padding, targetFrame: targetFrame, isPrompt: isPrompt)
-                return
-            }
-
             textField.stringValue = content
             textField.textColor = fgColor
             containerView.layer?.borderColor = borderColor.cgColor
 
-            let newBoundingBox = content.boundingRect(
-                with: constraintRect,
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: textAttributes,
-                context: nil
-            )
-            let newWindowWidth = max(100, min(maxWidth, newBoundingBox.width + (padding * 2) + 10))
-            let newWindowHeight = max(30, newBoundingBox.height + (padding * 2) + 4)
-
-            let newWindowX: CGFloat
-            let newWindowY: CGFloat
-            if isPrompt {
-                newWindowX = targetFrame.midX - newWindowWidth / 2
-                newWindowY = targetFrame.minY + 50
-            } else {
-                newWindowX = targetFrame.maxX - newWindowWidth - 10
-                newWindowY = targetFrame.maxY - newWindowHeight - 10
-            }
-
-            window.setFrame(NSRect(x: newWindowX, y: newWindowY, width: newWindowWidth, height: newWindowHeight), display: true)
-            containerView.frame = NSRect(x: 0, y: 0, width: newWindowWidth, height: newWindowHeight)
-            textField.frame = NSRect(x: padding, y: padding, width: newWindowWidth - (padding * 2), height: newWindowHeight - (padding * 2))
+            window.setFrame(NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight), display: true)
+            containerView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
+            textField.frame = NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2))
             window.orderFront(nil)
-            ZonvieCore.appLog("[msg_window] updated: '\(content.prefix(50))...' isPrompt=\(isPrompt)")
+            ZonvieCore.appLog("[msg_window] updated: '\(content.prefix(50))...'")
         } else {
             let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
             let window = NSWindow(
@@ -8704,9 +8540,9 @@ final class ZonvieCore {
             // it pays for it by following activation with its level (see
             // setCmdlineWindowActive) — its own comment says a `.floating`
             // window that never hides "would sit above every other app's
-            // windows". These two panels took the first half and not the
-            // second, and setCmdlineWindowActive is guarded to the cmdline
-            // grid, so nothing ever lowered them. A config.toml parse error
+            // windows". This panel took the first half and not the second,
+            // and setCmdlineWindowActive is guarded to the cmdline grid, so
+            // nothing ever lowered it. A config.toml parse error
             // reaches this path ungated by ext_messages, with timeout 0, no
             // close button and no on_msg_clear to retire it: one malformed
             // line and a red panel sits over every application for the rest of
@@ -8717,7 +8553,7 @@ final class ZonvieCore {
 
             let containerView = Self.makeRoundedPanelContainer(
                 width: windowWidth, height: windowHeight,
-                background: bgColor, border: borderColor, borderWidth: isPrompt ? 2.0 : 1.0)
+                background: bgColor, border: borderColor, borderWidth: 1.0)
 
             let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
             textField.stringValue = content
@@ -8744,116 +8580,8 @@ final class ZonvieCore {
             self.extFloatWindow = window
             self.messageTextField = textField
             self.messageContainerView = containerView
-            self.messageScrollView = nil
-            self.messageTextView = nil
 
-            ZonvieCore.appLog("[msg_window] created: '\(content.prefix(50))...' isPrompt=\(isPrompt)")
-        }
-    }
-
-    private func showLongMessageWindow(
-        content: String,
-        font: NSFont,
-        fgColor: NSColor,
-        bgColor: NSColor,
-        borderColor: NSColor,
-        padding: CGFloat,
-        targetFrame: NSRect,
-        lineCount: Int
-    ) {
-        let maxWidth = min(targetFrame.width * 0.5, 600.0)
-        let maxHeight = min(targetFrame.height * 0.4, CGFloat(lineCount) * font.pointSize * 1.4 + padding * 2)
-        let windowWidth = maxWidth
-        let windowHeight = max(100, maxHeight)
-
-        let windowX = targetFrame.maxX - windowWidth - 10
-        let windowY = targetFrame.maxY - windowHeight - 10
-
-        if let window = self.extFloatWindow,
-           let containerView = self.messageContainerView,
-           let scrollView = self.messageScrollView,
-           let textView = self.messageTextView {
-            textView.string = content
-            textView.font = font
-            textView.textColor = fgColor
-
-            let newHeight = max(100, min(targetFrame.height * 0.4, CGFloat(lineCount) * font.pointSize * 1.4 + padding * 2))
-            let newWindowY = targetFrame.maxY - newHeight - 10
-
-            window.setFrame(NSRect(x: windowX, y: newWindowY, width: windowWidth, height: newHeight), display: true)
-            containerView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: newHeight)
-            scrollView.frame = NSRect(x: padding, y: padding, width: windowWidth - padding * 2, height: newHeight - padding * 2)
-
-            window.orderFront(nil)
-            ZonvieCore.appLog("[msg_window] updated long: \(lineCount) lines")
-        } else {
-            if self.extFloatWindow != nil {
-                self.hideMessageWindow()
-            }
-
-            let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
-            let window = NSWindow(
-                contentRect: windowRect,
-                styleMask: [.borderless],
-                backing: .buffered,
-                defer: false
-            )
-            // `false` here is what the cmdline window takes deliberately, and
-            // it pays for it by following activation with its level (see
-            // setCmdlineWindowActive) — its own comment says a `.floating`
-            // window that never hides "would sit above every other app's
-            // windows". These two panels took the first half and not the
-            // second, and setCmdlineWindowActive is guarded to the cmdline
-            // grid, so nothing ever lowered them. A config.toml parse error
-            // reaches this path ungated by ext_messages, with timeout 0, no
-            // close button and no on_msg_clear to retire it: one malformed
-            // line and a red panel sits over every application for the rest of
-            // the session. Nothing here needs to outlive deactivation — unlike
-            // the cmdline, this is not a drag target and its text is not
-            // selectable — so it takes the same `true` as every sibling.
-            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
-
-            let containerView = Self.makeRoundedPanelContainer(
-                width: windowWidth, height: windowHeight,
-                background: bgColor, border: borderColor, borderWidth: 1.0)
-
-            let scrollView = NSScrollView(frame: NSRect(x: padding, y: padding, width: windowWidth - padding * 2, height: windowHeight - padding * 2))
-            scrollView.hasVerticalScroller = true
-            scrollView.hasHorizontalScroller = false
-            scrollView.autohidesScrollers = true
-            scrollView.borderType = .noBorder
-            scrollView.drawsBackground = false
-
-            let textView = NSTextView(frame: scrollView.bounds)
-            textView.string = content
-            textView.font = font
-            textView.textColor = fgColor
-            textView.backgroundColor = .clear
-            textView.drawsBackground = false
-            textView.isEditable = false
-            textView.isSelectable = true
-            textView.isVerticallyResizable = true
-            textView.isHorizontallyResizable = false
-            textView.textContainer?.widthTracksTextView = true
-            textView.textContainer?.containerSize = NSSize(width: scrollView.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
-
-            scrollView.documentView = textView
-            containerView.addSubview(scrollView)
-            window.contentView = containerView
-
-            if ZonvieConfig.shared.blurEnabled {
-                ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
-            }
-
-            window.orderFront(nil)
-
-            self.extFloatWindow = window
-            self.messageContainerView = containerView
-            self.messageScrollView = scrollView
-            self.messageTextView = textView
-            self.messageTextField = nil
-
-            ZonvieCore.appLog("[msg_window] created long: \(lineCount) lines")
+            ZonvieCore.appLog("[msg_window] created: '\(content.prefix(50))...'")
         }
     }
 
@@ -8872,8 +8600,8 @@ final class ZonvieCore {
         // This matches noice.nvim's long_message_to_split behavior.
     }
 
-    /// Shows prompt window centered in app window (for confirm/return_prompt)
-    private func showPromptWindow(content: String, hlId: Int32, isConfirm: Bool, isReturnPrompt: Bool) {
+    /// Shows prompt window centered in app window (for the confirm view)
+    private func showPromptWindow(content: String, hlId: Int32, isConfirm: Bool) {
         guard let mainView = self.terminalView,
               let renderer = mainView.renderer,
               let mainWindow = mainView.window else {
@@ -8901,13 +8629,7 @@ final class ZonvieCore {
             .foregroundColor: fgColor
         ]
 
-        let constraintWidth: CGFloat
-        if isReturnPrompt && self.savedPromptWidth > 0 {
-            constraintWidth = self.savedPromptWidth - (padding * 2)
-        } else {
-            constraintWidth = maxWidth - (padding * 2)
-        }
-        let constraintRect = CGSize(width: constraintWidth, height: .greatestFiniteMagnitude)
+        let constraintRect = CGSize(width: maxWidth - (padding * 2), height: .greatestFiniteMagnitude)
         let boundingBox = content.boundingRect(
             with: constraintRect,
             options: [.usesLineFragmentOrigin, .usesFontLeading],
@@ -8915,18 +8637,10 @@ final class ZonvieCore {
             context: nil
         )
 
-        let windowWidth: CGFloat
-        let windowHeight: CGFloat
-        if isReturnPrompt && self.savedPromptWidth > 0 {
-            windowWidth = self.savedPromptWidth
-            windowHeight = self.savedPromptHeight
-            ZonvieCore.appLog("[prompt_window] return_prompt: preserving layout (saved_width=\(windowWidth))")
-        } else {
-            windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
-            windowHeight = isConfirm ?
-                max(200, min(boundingBox.height + (padding * 2) + 4, appFrame.height - 100)) :
-                max(30, boundingBox.height + (padding * 2) + 4)
-        }
+        let windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
+        let windowHeight = isConfirm ?
+            max(200, min(boundingBox.height + (padding * 2) + 4, appFrame.height - 100)) :
+            max(30, boundingBox.height + (padding * 2) + 4)
 
         let windowX = appFrame.midX - windowWidth / 2
         let windowY = appFrame.midY - windowHeight / 2
@@ -8937,36 +8651,12 @@ final class ZonvieCore {
             textField.stringValue = content
             textField.textColor = fgColor
 
-            if isReturnPrompt && self.savedPromptWidth > 0 {
-                window.orderFront(nil)
-                ZonvieCore.appLog("[prompt_window] updated (preserved): '\(content.prefix(50))...'")
-            } else {
-                let newBoundingBox = content.boundingRect(
-                    with: constraintRect,
-                    options: [.usesLineFragmentOrigin, .usesFontLeading],
-                    attributes: textAttributes,
-                    context: nil
-                )
-                let newWindowWidth = max(100, min(maxWidth, newBoundingBox.width + (padding * 2) + 10))
-                let newWindowHeight = isConfirm ?
-                    max(200, min(newBoundingBox.height + (padding * 2) + 4, appFrame.height - 100)) :
-                    max(30, newBoundingBox.height + (padding * 2) + 4)
-                let newWindowX = appFrame.midX - newWindowWidth / 2
-                let newWindowY = appFrame.midY - newWindowHeight / 2
+            window.setFrame(NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight), display: true)
+            containerView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
+            textField.frame = NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2))
+            window.orderFront(nil)
 
-                window.setFrame(NSRect(x: newWindowX, y: newWindowY, width: newWindowWidth, height: newWindowHeight), display: true)
-                containerView.frame = NSRect(x: 0, y: 0, width: newWindowWidth, height: newWindowHeight)
-                textField.frame = NSRect(x: padding, y: padding, width: newWindowWidth - (padding * 2), height: newWindowHeight - (padding * 2))
-                window.orderFront(nil)
-
-                if isConfirm {
-                    self.savedPromptWidth = newWindowWidth
-                    self.savedPromptHeight = newWindowHeight
-                    self.promptIsConfirm = true
-                }
-
-                ZonvieCore.appLog("[prompt_window] updated: '\(content.prefix(50))...'")
-            }
+            ZonvieCore.appLog("[prompt_window] updated: '\(content.prefix(50))...'")
         } else {
             let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
             let window = NSWindow(
@@ -9008,12 +8698,6 @@ final class ZonvieCore {
             self.promptTextField = textField
             self.promptContainerView = containerView
 
-            if isConfirm {
-                self.savedPromptWidth = windowWidth
-                self.savedPromptHeight = windowHeight
-                self.promptIsConfirm = true
-            }
-
             ZonvieCore.appLog("[prompt_window] created: '\(content.prefix(50))...' frame=\(window.frame)")
         }
     }
@@ -9022,9 +8706,6 @@ final class ZonvieCore {
     private func hidePromptWindow() {
         if let window = self.promptWindow {
             window.orderOut(nil)
-            self.savedPromptWidth = 0
-            self.savedPromptHeight = 0
-            self.promptIsConfirm = false
             ZonvieCore.appLog("[prompt_window] hidden")
         }
     }
@@ -9078,8 +8759,9 @@ final class ZonvieCore {
         data: UnsafePointer<UInt8>,
         len: Int
     ) -> Int32 {
-        guard len > 0 else { return 1 }
-
+        // An empty register (len 0, `:let @+ = ''`) still replaces the
+        // clipboard: reporting success while keeping the old contents let
+        // "+p paste them back.
         let content = String(decoding: UnsafeBufferPointer(start: data, count: len), as: UTF8.self)
 
         // Keep the synchronous set semantics in normal operation, but fail

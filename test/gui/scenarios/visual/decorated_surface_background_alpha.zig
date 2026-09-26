@@ -58,18 +58,6 @@ const grid_lines: i64 = 30;
 
 const stems = "llllllllllllllllllllllllllllll";
 
-fn newWindow(pid: i32, before: []const platform.MainWindow) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
-        for (before) |b| {
-            if (b.number == w.number) continue :outer;
-        }
-        return w;
-    }
-    return null;
-}
-
 fn lumAt(img: capture.Image, x: u32, y: u32) u32 {
     const i = (@as(usize, y) * img.w + x) * 4;
     const r: u32 = img.rgba[i];
@@ -250,7 +238,7 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
     try g.remoteSend(stems);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
-    const cmd_win = newWindow(g.app_pid, before) orelse return error.CmdlineWindowNotFound;
+    const cmd_win = driver.newWindow(g.app_pid, before, 0) orelse return error.CmdlineWindowNotFound;
     if (cmd_win.bounds.w < @as(f64, @floatFromInt(x_lo + x_trailing_inset)) or cmd_win.bounds.h < 10) {
         std.debug.print(
             "[gui] {s}: cmdline window too small to measure: {d}x{d}\n",

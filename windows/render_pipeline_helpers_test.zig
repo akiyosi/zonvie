@@ -1337,3 +1337,37 @@ test "a blink-off frame draws no cursor vertices" {
     try std.testing.expectEqual(@as(usize, 2), helpers.cursorVertsForFrame(V, &cursor, true).len);
     try std.testing.expectEqual(@as(usize, 0), helpers.cursorVertsForFrame(V, &cursor, false).len);
 }
+
+test "rotateRegion moves survivors and parks the scrolled-off entries in the vacated band" {
+    // Rows outside [1, 6) stay put; content moves up by 2.
+    var up = [_]u8{ 'x', 'a', 'b', 'c', 'd', 'e', 'y' };
+    const up_band = helpers.rotateRegion(u8, &up, 1, 6, 2);
+    try std.testing.expectEqualSlices(u8, "xcdeaby", &up);
+    try std.testing.expectEqual(helpers.RowBand{ .start = 4, .end = 6 }, up_band);
+
+    // Content moves down by 2.
+    var down = [_]u8{ 'x', 'a', 'b', 'c', 'd', 'e', 'y' };
+    const down_band = helpers.rotateRegion(u8, &down, 1, 6, -2);
+    try std.testing.expectEqualSlices(u8, "xdeabcy", &down);
+    try std.testing.expectEqual(helpers.RowBand{ .start = 1, .end = 3 }, down_band);
+}
+
+test "spawnArgQuote picks a quote the core's tokenizer gives back unchanged" {
+    try std.testing.expectEqual(@as(?u8, 0), helpers.spawnArgQuote("notes.txt"));
+    try std.testing.expectEqual(@as(?u8, 0), helpers.spawnArgQuote("a\"b"));
+    try std.testing.expectEqual(@as(?u8, '"'), helpers.spawnArgQuote("my notes.txt"));
+    // `-c "echo \"hi there\""` arrives as `echo "hi there"`: double quotes
+    // would end the token at the first inner one.
+    try std.testing.expectEqual(@as(?u8, '\''), helpers.spawnArgQuote("echo \"hi there\""));
+    try std.testing.expectEqual(@as(?u8, '"'), helpers.spawnArgQuote("'quoted'"));
+    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("it's \"x\""));
+    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("C:\\My Dir\\"));
+    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote(""));
+}
+
+test "rotateRegion vacates the whole region when the shift covers it" {
+    var items = [_]u8{ 'a', 'b', 'c' };
+    const band = helpers.rotateRegion(u8, &items, 0, 3, -3);
+    try std.testing.expectEqualSlices(u8, "abc", &items);
+    try std.testing.expectEqual(helpers.RowBand{ .start = 0, .end = 3 }, band);
+}
