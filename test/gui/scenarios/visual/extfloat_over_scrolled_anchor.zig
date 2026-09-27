@@ -72,8 +72,6 @@ const step_settle_ms = 300;
 /// grid scrolled, not on whether the rows underneath are correct.
 const scrollbar_exclude_px: f64 = 48;
 
-const max_windows = 16;
-
 /// The window minus the scrollbar strip. Derived from the capture rather than
 /// hardcoded as a fraction, so it excludes the same pixels at any window size.
 fn bodyRegion(img: capture.Image) visual.Region {
@@ -130,8 +128,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // A blinking cursor alone produces a false diff between two captures.
     try g.exec("execute('set guicursor=a:block-blinkon0')");
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before_windows = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_windows = driver.snapshotWindows(g.app_pid);
 
     // The external window, with a buffer whose every line differs across the
     // full width: a screen made of similar lines would survive a bad shift
@@ -151,7 +148,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 150);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows.slice(),150);
     try g.exec("execute('normal! 100Gzt0')");
 
     var without_float = try driver.captureWindowStable(alloc, ext_win.number, 8000);
@@ -168,7 +165,7 @@ fn runWithConfig(alloc: std.mem.Allocator, config_dir: []const u8) !void {
     // The premise: this float is composited into the anchor's rows, not given
     // an OS window of its own. If the frontend ever draws it separately there
     // are no float pixels for a shift to drag, and everything below is void.
-    const window_count = platform.windowsForPid(g.app_pid, &before_buf);
+    const window_count = driver.snapshotWindows(g.app_pid).len;
     if (window_count != before_windows.len + 1) {
         std.debug.print(
             "[gui] the anchored float took an OS window of its own ({d} windows, expected {d}); it is not composited\n",

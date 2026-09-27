@@ -43,8 +43,6 @@ const move_dy_pt: f64 = 100;
 /// projection does; a stale rect is off by the whole move, not by one px.
 const tolerance_px: f64 = 2;
 
-const max_windows = 16;
-
 /// Wait for the app to publish a shader cursor rect after `since_ms` and
 /// return its x/y in drawable pixels.
 fn waitCursorRect(alloc: std.mem.Allocator, since_ms: f64, timeout_ms: u64) !struct { x: f64, y: f64 } {
@@ -83,14 +81,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     // Open an external float; the cursor goes into it, which is what makes
     // this view the one publishing the shader cursor rect.
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     try g.exec(
         "luaeval('(function() _G.e2e_float = vim.api.nvim_open_win(" ++
             "vim.api.nvim_create_buf(false, true), true, " ++
             "{external=true, width=40, height=12}) return 1 end)()')",
     );
-    const float_win = try driver.waitNewWindow(g.app_pid, before, 100);
+    const float_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
 
     // Park it somewhere known and fully on screen before measuring.
     const start_x: f64 = 80;
@@ -149,9 +146,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // the user sees as a wild trail. Both rects must sit inside the main
     // window's drawable.
     const main_win = blk: {
-        var buf: [max_windows]platform.MainWindow = undefined;
-        const wins = buf[0..platform.windowsForPid(g.app_pid, &buf)];
-        for (wins) |wnd| {
+        const wins = driver.snapshotWindows(g.app_pid);
+        for (wins.slice()) |wnd| {
             if (wnd.number != float_win.number) break :blk wnd;
         }
         return error.MainWindowNotFound;

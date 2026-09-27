@@ -1475,6 +1475,9 @@ final class GlyphAtlas {
             var position = CGPoint(x: originX, y: originY)
             var g = glyph
 
+            // White, so a monochrome glyph compacts to coverage below
+            // (a colour font ignores the fill).
+            ctx.setFillColor(CGColor.white)
             CTFontDrawGlyphs(ctFont, &g, &position, 1, ctx)
             return true
         }
@@ -1496,8 +1499,34 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = 4
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
+        if !CTFontGetSymbolicTraits(ctFont).contains(.traitColorGlyphs) {
+            compactWhiteRgbaToCoverage_locked(width: bitmapW, height: bitmapH, outBitmap: outBitmap)
+        }
 
         return true
+    }
+
+    /// Rewrite the white-on-transparent premultiplied RGBA glyph in
+    /// rasterizeScratch as 1-bpp coverage (its alpha), in place. The core tags
+    /// every 4-bpp glyph colour emoji and draws it as-is, so a monochrome CG
+    /// fallback would ignore the highlight fg; as coverage it takes it, like
+    /// a FreeType glyph (Windows compacts its D2D fallback the same way).
+    /// Must be called with mu locked.
+    private func compactWhiteRgbaToCoverage_locked(
+        width: Int, height: Int, outBitmap: UnsafeMutablePointer<zonvie_glyph_bitmap>
+    ) {
+        rasterizeScratch.withUnsafeMutableBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            // Forward in place: pixel i reads byte 4i+3 >= i.
+            for i in 0..<(width * height) {
+                base[i] = base[i * 4 + 3]
+            }
+        }
+        rasterizeScratch.withUnsafeBufferPointer { buf in
+            outBitmap.pointee.pixels = buf.baseAddress
+        }
+        outBitmap.pointee.pitch = Int32(width)
+        outBitmap.pointee.bytes_per_pixel = 1
     }
 
     /// Render a multi-codepoint emoji cluster using CoreText line layout.
@@ -1524,6 +1553,9 @@ final class GlyphAtlas {
         CFAttributedStringReplaceString(attrStr, CFRange(location: 0, length: 0), str as CFString)
         let fullRange = CFRange(location: 0, length: CFAttributedStringGetLength(attrStr))
         CFAttributedStringSetAttribute(attrStr, fullRange, kCTFontAttributeName, ef)
+        // White, so a run CoreText sets in a monochrome fallback font
+        // compacts to coverage below (the default is black).
+        CFAttributedStringSetAttribute(attrStr, fullRange, kCTForegroundColorAttributeName, CGColor.white)
 
         // Create a CTLine and measure its bounds
         let line = CTLineCreateWithAttributedString(attrStr)
@@ -1594,6 +1626,14 @@ final class GlyphAtlas {
         outBitmap.pointee.bytes_per_pixel = 4
         outBitmap.pointee.ascent_px = ascentPx
         outBitmap.pointee.descent_px = descentPx
+        let runs = CTLineGetGlyphRuns(line) as! [CTRun]
+        let monochrome = runs.allSatisfy { run in
+            guard let runFont = (CTRunGetAttributes(run) as NSDictionary)[kCTFontAttributeName] else { return false }
+            return !CTFontGetSymbolicTraits(runFont as! CTFont).contains(.traitColorGlyphs)
+        }
+        if monochrome {
+            compactWhiteRgbaToCoverage_locked(width: bitmapW, height: bitmapH, outBitmap: outBitmap)
+        }
 
         return true
     }

@@ -21,7 +21,6 @@ const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_app.log";
 
-const max_windows = 16;
 const settle_polls = 4; // bounds unchanged for 4 * 250 ms = startup settled
 const tol_px = 150.0; // float-anchored placement is off by several hundred px
 
@@ -95,8 +94,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const in_float = try g.evalInt("luaeval('(vim.api.nvim_get_current_win() == _G.e2e_float) and 1 or 0')");
     if (in_float != 1) return error.CursorNotInFloat;
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
 
     const t_search = try app_log.nowMs(alloc, log_path);
     var minis = std.AutoHashMap(u32, void).init(alloc);
@@ -113,8 +112,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 10_000) return error.Timeout;
 
-        var now_buf: [max_windows]platform.MainWindow = undefined;
-        const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+        const now_snap = driver.snapshotWindows(g.app_pid);
+        const now = now_snap.slice();
         try miniWindowNumbers(alloc, t_search, &minis);
 
         var fresh: usize = 0;

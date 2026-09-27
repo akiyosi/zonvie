@@ -22,7 +22,6 @@ const app_log = @import("../../app_log.zig");
 const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_extwin_anim_reuse.log";
-const max_windows = 16;
 const idle_ms = 1500;
 
 const Counts = struct { frames: usize, redrawn_idle: usize };
@@ -55,14 +54,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
 
     try g.exec("execute('set nocursorline noruler noshowcmd laststatus=0 guicursor+=a:blinkon0')");
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
             "vim.api.nvim_buf_set_lines(b, 0, -1, true, {\"one\", \"two\", \"three\"}) " ++
             "vim.api.nvim_open_win(b, false, {external=true, width=40, height=12}) return 1 end)()')",
     );
-    _ = try driver.waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);

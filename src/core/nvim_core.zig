@@ -734,7 +734,6 @@ pub const Core = struct {
     /// the cheapest surface. Entries and their buffers are reused across
     /// flushes; a steady-state flush allocates nothing here.
     flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SubGridLedgerSnapshot) = .empty,
-    flush_subgrid_aggregate_snapshot: usize = 0,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -3243,30 +3242,17 @@ pub const Core = struct {
     pub fn sendInput(self: *Core, keys: []const u8) void {
         self.log.write("[input] sendInput: \"{s}\"\n", .{keys});
         // Escape '<' as '<lt>' for Neovim input notation
-        var needs_escape = false;
-        for (keys) |c| {
-            if (c == '<') {
-                needs_escape = true;
-                break;
-            }
-        }
-
-        if (needs_escape) {
+        if (std.mem.indexOfScalar(u8, keys, '<') != null) {
             // sendInput/sendKeyEvent may be called concurrently now (macOS
             // key-repeat synthesis calls this from a display-link thread as
             // well as the normal per-keystroke caller), so key_buf needs a
             // lock even though requestInput()'s own write path is safe.
             self.key_buf_mu.lockUncancelable(clock.io());
             defer self.key_buf_mu.unlock(clock.io());
-            self.key_buf.clearRetainingCapacity();
-            for (keys) |c| {
-                if (c == '<') {
-                    self.key_buf.appendSlice(self.alloc, "<lt>") catch return;
-                } else {
-                    self.key_buf.append(self.alloc, c) catch return;
-                }
-            }
-            self.requestInput(self.key_buf.items) catch |e| {
+            self.key_buf.ensureTotalCapacity(self.alloc, keys.len * 4) catch return;
+            var out = KeyOut{ .buf = self.key_buf.allocatedSlice() };
+            if (!out.escapedText(keys)) return;
+            self.requestInput(out.buf[0..out.pos]) catch |e| {
                 self.log.write("sendInput err: {any}\n", .{e});
             };
         } else {
@@ -3327,6 +3313,7 @@ pub const Core = struct {
             self.handleMsgGridScroll(direction);
             return;
         }
+        if (!pointer_target.wheelReachesNeovim(grid_id)) return;
         // Resolve grid_id -1 to cursor_grid so Neovim receives a valid grid ID
         const effective_id = if (grid_id == -1) self.grid.cursor_grid else grid_id;
         self.requestMouseScroll(effective_id, row, col, direction, modifier) catch |e| {
@@ -3390,13 +3377,14 @@ pub const Core = struct {
         defer self.grid_mu.unlock(clock.io());
         const cursor_grid = self.grid.cursor_grid;
         if (self.grid.surfaceForGrid(cursor_grid)) |owner| {
-            if (owner == surface_id) {
-                // Only a window's grid (one Neovim sent a viewport for): the
-                // cursor also visits the message grid for a ':' command, and
-                // remembering that left the bar with no knob afterwards.
-                if (surface_id == 1 and self.grid.getViewport(cursor_grid) != null) {
-                    self.main_scrollbar_grid = cursor_grid;
-                }
+            // Only a window's grid (one Neovim sent a viewport for): the cursor
+            // also visits the message grid for a ':' command, and naming that
+            // grid left the main bar with no knob while the command line was
+            // open. The main surface then keeps the window it last showed.
+            if (owner == surface_id and
+                (surface_id != 1 or self.grid.getViewport(cursor_grid) != null))
+            {
+                if (surface_id == 1) self.main_scrollbar_grid = cursor_grid;
                 return cursor_grid;
             }
         }
@@ -3741,6 +3729,22 @@ pub const Core = struct {
         return changed;
     }
 
+    /// Take grid_mu and publish this thread as its owner, so a callback that
+    /// re-enters updateLayoutPx on this thread does not lock again. The id is
+    /// stored only after locking and cleared before unlocking: visible outside
+    /// the locked section, another thread (zonvie_core_retry_flush on the UI
+    /// thread) could read or clobber it mid-callback and self-deadlock on
+    /// grid_mu.
+    pub fn lockGridAsRedrawOwner(self: *Core) void {
+        self.grid_mu.lockUncancelable(clock.io());
+        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    }
+
+    pub fn unlockGridAsRedrawOwner(self: *Core) void {
+        self.redraw_thread_id.store(0, .seq_cst);
+        self.grid_mu.unlock(clock.io());
+    }
+
     // Internal implementation: assumes grid_mu is already held or we're in a safe context.
     // Exposed via zonvie_core_update_layout_px_locked C ABI for frontends that
     // hold grid_mu themselves (see zonvie_core_lock_grid).
@@ -3863,25 +3867,49 @@ pub const Core = struct {
         return @as(u32, cp);
     }
 
-    fn appendModPrefix(buf: *std.ArrayListUnmanaged(u8), alloc: std.mem.Allocator, mods: u32) !void {
-        // mods bitmask:
-        // 1<<0 Ctrl, 1<<1 Alt/Meta, 1<<2 Shift, 1<<3 Super(Command)
-        var first = true;
+    /// Bounded writer over a caller buffer; every append reports overflow.
+    const KeyOut = struct {
+        buf: []u8,
+        pos: usize = 0,
 
-        const add = struct {
-            fn f(b: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, s: []const u8, first2: *bool) !void {
-                if (!first2.*) try b.append(a, '-');
-                try b.appendSlice(a, s);
-                first2.* = false;
+        fn byte(self: *KeyOut, b: u8) bool {
+            if (self.pos >= self.buf.len) return false;
+            self.buf[self.pos] = b;
+            self.pos += 1;
+            return true;
+        }
+
+        fn slice(self: *KeyOut, s: []const u8) bool {
+            if (self.pos + s.len > self.buf.len) return false;
+            @memcpy(self.buf[self.pos..][0..s.len], s);
+            self.pos += s.len;
+            return true;
+        }
+
+        /// The "C-M-S-D-" prefix of the mods bitmask:
+        /// 1<<0 Ctrl, 1<<1 Alt/Meta, 1<<2 Shift, 1<<3 Super(Command).
+        fn mods(self: *KeyOut, m: u32) bool {
+            for ("CMSD", 0..) |letter, bit| {
+                if (m & (@as(u32, 1) << @intCast(bit)) == 0) continue;
+                if (!self.byte(letter) or !self.byte('-')) return false;
             }
-        }.f;
+            return true;
+        }
 
-        if ((mods & (1 << 0)) != 0) try add(buf, alloc, "C", &first);
-        if ((mods & (1 << 1)) != 0) try add(buf, alloc, "M", &first);
-        if ((mods & (1 << 2)) != 0) try add(buf, alloc, "S", &first);
-        if ((mods & (1 << 3)) != 0) try add(buf, alloc, "D", &first);
+        /// Text for nvim_input, where '<' starts key notation: it goes as <lt>.
+        /// '\' and '|' need no escaping for nvim_input.
+        fn escapedText(self: *KeyOut, s: []const u8) bool {
+            for (s) |c| {
+                const ok = if (c == '<') self.slice("<lt>") else self.byte(c);
+                if (!ok) return false;
+            }
+            return true;
+        }
+    };
 
-        if (!first) try buf.append(alloc, '-');
+    /// The Neovim name of a special key, for either platform's keycode.
+    pub fn specialKeyName(keycode: u32) ?[]const u8 {
+        return if (isWinVkKeycode(keycode)) winSpecialName(winVk(keycode)) else macSpecialName(keycode);
     }
 
     pub fn isWinVkKeycode(keycode: u32) bool {
@@ -3999,98 +4027,12 @@ pub const Core = struct {
     // Pure function for key event formatting (testable, no side effects).
     // Returns a slice of out_buf containing the formatted key string, or null if no output.
     pub fn formatKeyEvent(out_buf: []u8, keycode: u32, mods: u32, chars: []const u8, ign: []const u8) ?[]const u8 {
-        var pos: usize = 0;
-
-        const appendByte = struct {
-            fn f(buf: []u8, p: *usize, byte: u8) bool {
-                if (p.* >= buf.len) return false;
-                buf[p.*] = byte;
-                p.* += 1;
-                return true;
-            }
-        }.f;
-
-        const appendSlice = struct {
-            fn f(buf: []u8, p: *usize, s: []const u8) bool {
-                if (p.* + s.len > buf.len) return false;
-                @memcpy(buf[p.*..][0..s.len], s);
-                p.* += s.len;
-                return true;
-            }
-        }.f;
-
-        // Helper to append modifier prefix (C-M-S-D-)
-        const writeMods = struct {
-            fn f(buf: []u8, p: *usize, m: u32) bool {
-                var first = true;
-                if ((m & (1 << 0)) != 0) { // Ctrl
-                    if (!first) {
-                        if (p.* >= buf.len) return false;
-                        buf[p.*] = '-';
-                        p.* += 1;
-                    }
-                    if (p.* >= buf.len) return false;
-                    buf[p.*] = 'C';
-                    p.* += 1;
-                    first = false;
-                }
-                if ((m & (1 << 1)) != 0) { // Alt/Meta
-                    if (!first) {
-                        if (p.* >= buf.len) return false;
-                        buf[p.*] = '-';
-                        p.* += 1;
-                    }
-                    if (p.* >= buf.len) return false;
-                    buf[p.*] = 'M';
-                    p.* += 1;
-                    first = false;
-                }
-                if ((m & (1 << 2)) != 0) { // Shift
-                    if (!first) {
-                        if (p.* >= buf.len) return false;
-                        buf[p.*] = '-';
-                        p.* += 1;
-                    }
-                    if (p.* >= buf.len) return false;
-                    buf[p.*] = 'S';
-                    p.* += 1;
-                    first = false;
-                }
-                if ((m & (1 << 3)) != 0) { // Super/Command
-                    if (!first) {
-                        if (p.* >= buf.len) return false;
-                        buf[p.*] = '-';
-                        p.* += 1;
-                    }
-                    if (p.* >= buf.len) return false;
-                    buf[p.*] = 'D';
-                    p.* += 1;
-                    first = false;
-                }
-                if (!first) {
-                    if (p.* >= buf.len) return false;
-                    buf[p.*] = '-';
-                    p.* += 1;
-                }
-                return true;
-            }
-        }.f;
+        var out = KeyOut{ .buf = out_buf };
 
         // 1) Special keys by keycode (macOS / Win32)
-        if (isWinVkKeycode(keycode)) {
-            if (winSpecialName(winVk(keycode))) |name| {
-                if (!appendByte(out_buf, &pos, '<')) return null;
-                if (!writeMods(out_buf, &pos, mods)) return null;
-                if (!appendSlice(out_buf, &pos, name)) return null;
-                if (!appendByte(out_buf, &pos, '>')) return null;
-                return out_buf[0..pos];
-            }
-        } else if (macSpecialName(keycode)) |name| {
-            if (!appendByte(out_buf, &pos, '<')) return null;
-            if (!writeMods(out_buf, &pos, mods)) return null;
-            if (!appendSlice(out_buf, &pos, name)) return null;
-            if (!appendByte(out_buf, &pos, '>')) return null;
-            return out_buf[0..pos];
+        if (specialKeyName(keycode)) |name| {
+            if (!out.byte('<') or !out.mods(mods) or !out.slice(name) or !out.byte('>')) return null;
+            return out_buf[0..out.pos];
         }
 
         // 2) For modified keys (Ctrl/Alt/Super), use charsIgnoringModifiers when it is a single codepoint.
@@ -4098,50 +4040,27 @@ pub const Core = struct {
         if (has_mod) {
             const base_cp = firstCodepointUtf8(ign) orelse firstCodepointUtf8(chars) orelse return null;
 
-            if (!appendByte(out_buf, &pos, '<')) return null;
-            if (!writeMods(out_buf, &pos, mods)) return null;
+            if (!out.byte('<') or !out.mods(mods)) return null;
 
             // Lowercase for ASCII letters to match Neovim notation (<C-x>)
             if (base_cp <= 0x7F) {
                 var ch: u8 = @intCast(base_cp);
                 if (ch >= 'A' and ch <= 'Z') ch = ch - 'A' + 'a';
-                if (!appendByte(out_buf, &pos, ch)) return null;
+                if (!out.byte(ch)) return null;
             } else {
                 var tmp: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(@intCast(base_cp), &tmp) catch return null;
-                if (!appendSlice(out_buf, &pos, tmp[0..n])) return null;
+                if (!out.slice(tmp[0..n])) return null;
             }
 
-            if (!appendByte(out_buf, &pos, '>')) return null;
-            return out_buf[0..pos];
+            if (!out.byte('>')) return null;
+            return out_buf[0..out.pos];
         }
 
         // 3) No mods: pass through raw characters (text input)
         if (chars.len == 0) return null;
-
-        // Check if we need to escape '<' as '<lt>'
-        var needs_escape = false;
-        for (chars) |c| {
-            if (c == '<') {
-                needs_escape = true;
-                break;
-            }
-        }
-
-        if (needs_escape) {
-            for (chars) |c| {
-                if (c == '<') {
-                    if (!appendSlice(out_buf, &pos, "<lt>")) return null;
-                } else {
-                    if (!appendByte(out_buf, &pos, c)) return null;
-                }
-            }
-            return out_buf[0..pos];
-        } else {
-            // No escaping needed, just copy
-            if (!appendSlice(out_buf, &pos, chars)) return null;
-            return out_buf[0..pos];
-        }
+        if (!out.escapedText(chars)) return null;
+        return out_buf[0..out.pos];
     }
 
     pub fn sendKeyEvent(self: *Core, keycode: u32, mods: u32, chars: []const u8, ign: []const u8) void {
@@ -4151,85 +4070,11 @@ pub const Core = struct {
         // from macOS key-repeat synthesis's display-link thread.
         self.key_buf_mu.lockUncancelable(clock.io());
         defer self.key_buf_mu.unlock(clock.io());
-        self.key_buf.clearRetainingCapacity();
-
-        // 1) Special keys by keycode (macOS / Win32)
-        if (isWinVkKeycode(keycode)) {
-            if (winSpecialName(winVk(keycode))) |name| {
-                self.key_buf.append(self.alloc, '<') catch return;
-                appendModPrefix(&self.key_buf, self.alloc, mods) catch return;
-                self.key_buf.appendSlice(self.alloc, name) catch return;
-                self.key_buf.append(self.alloc, '>') catch return;
-
-                self.emitInputString(self.key_buf.items);
-                return;
-            }
-        } else if (macSpecialName(keycode)) |name| {
-            self.key_buf.append(self.alloc, '<') catch return;
-            appendModPrefix(&self.key_buf, self.alloc, mods) catch return;
-            self.key_buf.appendSlice(self.alloc, name) catch return;
-            self.key_buf.append(self.alloc, '>') catch return;
-
-            self.emitInputString(self.key_buf.items);
-            return;
-        }
-
-        // 2) For modified keys (Ctrl/Alt/Super), use charsIgnoringModifiers when it is a single codepoint.
-        const has_mod = (mods & ((1 << 0) | (1 << 1) | (1 << 3))) != 0;
-        if (has_mod) {
-            const base_cp = firstCodepointUtf8(ign) orelse firstCodepointUtf8(chars) orelse return;
-
-            // If it's a control ASCII produced as a result of Ctrl, prefer the angle-bracket form anyway.
-            self.key_buf.clearRetainingCapacity();
-            self.key_buf.append(self.alloc, '<') catch return;
-            appendModPrefix(&self.key_buf, self.alloc, mods) catch return;
-
-            // Lowercase for ASCII letters to match Neovim notation (<C-x>)
-            if (base_cp <= 0x7F) {
-                var ch: u8 = @intCast(base_cp);
-                if (ch >= 'A' and ch <= 'Z') ch = ch - 'A' + 'a';
-                self.key_buf.append(self.alloc, ch) catch return;
-            } else {
-                var tmp: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(@intCast(base_cp), &tmp) catch return;
-                self.key_buf.appendSlice(self.alloc, tmp[0..n]) catch return;
-            }
-
-            self.key_buf.append(self.alloc, '>') catch return;
-
-            self.emitInputString(self.key_buf.items);
-            return;
-        }
-
-        // 3) No mods: pass through raw characters (text input)
-        // Neovim's nvim_input interprets <...> as special key notation (e.g., <CR>, <Esc>).
-        // We must escape '<' as '<lt>' to send a literal '<' character.
-        // Note: '\' and '|' can be escaped as <Bslash> and <Bar>, but are not required
-        // for nvim_input - they're passed through as-is.
-        if (chars.len == 0) return;
-
-        // Check if we need to escape any characters
-        var needs_escape = false;
-        for (chars) |c| {
-            if (c == '<') {
-                needs_escape = true;
-                break;
-            }
-        }
-
-        if (needs_escape) {
-            self.key_buf.clearRetainingCapacity();
-            for (chars) |c| {
-                if (c == '<') {
-                    self.key_buf.appendSlice(self.alloc, "<lt>") catch return;
-                } else {
-                    self.key_buf.append(self.alloc, c) catch return;
-                }
-            }
-            self.emitInputString(self.key_buf.items);
-        } else {
-            self.emitInputString(chars);
-        }
+        // formatKeyEvent's longest output: every text byte as "<lt>", or '<',
+        // four modifiers, a name or one codepoint and '>'.
+        self.key_buf.ensureTotalCapacity(self.alloc, chars.len * 4 + 32) catch return;
+        const s = formatKeyEvent(self.key_buf.allocatedSlice(), keycode, mods, chars, ign) orelse return;
+        self.emitInputString(s);
     }
 
     // ---- guifont notify ----
@@ -4278,20 +4123,13 @@ pub const Core = struct {
     ///
     /// Called from the redraw thread (grid_mu held).
     pub fn handleRestartEvent(self: *Core, listen_addr: []const u8) !void {
-        const owned = self.alloc.dupe(u8, listen_addr) catch |e| {
+        // :restart is NOT a hot-swap (the old nvim dies), so spawn fallback on
+        // connect failure is the desired recovery. Resetting the flags also
+        // clears one a prior :connect queued (then aborted).
+        self.queueReconnect(listen_addr, false) catch |e| {
             self.log.write("handleRestartEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        const old = self.restart_pending_addr;
-        // Explicit reset in case a prior :connect queued (then aborted) left
-        // the hot-swap flag set; :restart is NOT a hot-swap (the old nvim
-        // dies), so spawn fallback on connect failure is the desired recovery.
-        self.restart_pending_is_connect_hotswap = false;
-        self.connect_keeps_child_alive = false;
-        // Publish the address last so any observer that sees a pending restart
-        // also sees the restart (not hot-swap) cleanup policy above.
-        self.restart_pending_addr = owned;
-        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleRestartEvent: listen_addr={s}\n", .{listen_addr});
 
@@ -4313,19 +4151,27 @@ pub const Core = struct {
     /// (`:connect`, old server stays alive headless) from a server
     /// replacement (`:restart`, old server dies).
     pub fn handleConnectEvent(self: *Core, server_addr: []const u8) !void {
-        const owned = self.alloc.dupe(u8, server_addr) catch |e| {
+        self.queueReconnect(server_addr, true) catch |e| {
             self.log.write("handleConnectEvent: dupe failed: {any}\n", .{e});
             return e;
         };
-        const old = self.restart_pending_addr;
-        self.restart_pending_is_connect_hotswap = true;
-        self.connect_keeps_child_alive = true;
-        self.restart_pending_addr = owned;
-        if (old) |addr| self.alloc.free(addr);
 
         self.log.write("handleConnectEvent: server_addr={s}\n", .{server_addr});
 
         self.emitOnConnect(server_addr);
+    }
+
+    /// Record the server the run loop reconnects to once this session ends,
+    /// with its cleanup policy. On OOM nothing changes.
+    fn queueReconnect(self: *Core, addr: []const u8, hotswap: bool) !void {
+        const owned = try self.alloc.dupe(u8, addr);
+        const old = self.restart_pending_addr;
+        self.restart_pending_is_connect_hotswap = hotswap;
+        self.connect_keeps_child_alive = hotswap;
+        // Published last so any observer that sees a pending reconnect also
+        // sees its cleanup policy above.
+        self.restart_pending_addr = owned;
+        if (old) |a| self.alloc.free(a);
     }
 
     /// Dedicated writer thread: drains write_queue and writes to stdin pipe.
@@ -5814,12 +5660,6 @@ pub const Core = struct {
     }
 
     // --- Forwarding stubs for flush.zig ---
-
-    /// Compare current external_grids with known_external_grids and notify frontend.
-    /// Returns true if new external grids were added (need forced render).
-    pub fn notifyExternalWindowChanges(self: *Core) bool {
-        return flush.notifyExternalWindowChanges(self);
-    }
 
     pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         flush.sendExternalGridVertices(self, force_render);
@@ -7483,6 +7323,25 @@ test "a float an external window hosts is reported in that window's cells" {
         try std.testing.expectEqual(@as(i32, 1), g.start_col);
     }
     try std.testing.expect(found);
+}
+
+test "the main scrollbar keeps its window while the cursor is on the message grid" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try core.grid.resizeGrid(1, 20, 40);
+    try core.grid.resizeGrid(2, 18, 40);
+    try core.grid.setWinPos(2, 1000, 0, 0);
+    try core.grid.setViewport(2, 1000, 0, 17, 0, 0, 100, 0);
+    // The message grid a ':' command visits: placed on the main surface but
+    // never given a viewport.
+    try core.grid.resizeGrid(3, 2, 40);
+    try core.grid.setWinPos(3, 1001, 18, 0);
+
+    core.grid.setCursor(2, 0, 0);
+    try std.testing.expectEqual(@as(?i64, 2), core.tryScrollbarGridForSurface(1));
+    core.grid.setCursor(3, 0, 0);
+    try std.testing.expectEqual(@as(?i64, 2), core.tryScrollbarGridForSurface(1));
 }
 
 test "a grid no surface places reports no placing surface" {

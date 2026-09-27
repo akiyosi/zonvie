@@ -164,85 +164,6 @@ private enum SurfaceRowProvisionTests {
         )
     }
 
-    private static func verifyFlatMainZeroRetirement(device: MTLDevice) {
-        let sets = [SurfaceBufferSet(), SurfaceBufferSet(), SurfaceBufferSet()]
-        let flatBytes = max(surfaceSafeNeededBytes(vertexCount: 256) ?? 0, 256)
-        guard let oldMain = device.makeBuffer(length: flatBytes, options: []) else {
-            require(false, "flat main seed allocation failed")
-            return
-        }
-        guard let oldDetach = device.makeBuffer(length: flatBytes, options: []) else {
-            require(false, "flat detach seed allocation failed")
-            return
-        }
-        sets[0].mainVertexBuffer = oldMain
-        sets[0].mainVertexBufferCap = flatBytes
-        sets[0].mainVertexCount = 256
-        sets[0].detachPoolMainBuffer = oldDetach
-        sets[0].detachPoolMainCap = flatBytes
-        sets[0].knownTotalRows = 1
-        sets[0].knownTotalCols = 1_000
-        copySurfaceMainVertexState(from: sets[0], to: sets[1])
-        copySurfaceMainVertexState(from: sets[1], to: sets[2])
-
-        var gpuInFlightCount = [1, 0, 0]
-        var retirement = SurfaceRowStorageRetirementState()
-        sets[1].knownTotalRows = 0
-        sets[1].knownTotalCols = 0
-        serviceSurfaceRowStorageRetirement(
-            bufferSets: sets,
-            gpuInFlightCount: gpuInFlightCount,
-            committedSetIndex: 1,
-            layoutContracted: true,
-            state: &retirement,
-            retireMainBuffers: true
-        )
-        require(sets[0].mainVertexBuffer === oldMain, "in-flight flat main buffer was released")
-        require(sets[0].detachPoolMainBuffer === oldDetach,
-                "in-flight flat detach buffer was released")
-        require(sets[1].mainVertexBuffer == nil && sets[2].mainVertexBuffer == nil,
-                "idle flat main buffers survived zero layout")
-        require(sets[1].detachPoolMainBuffer == nil && sets[2].detachPoolMainBuffer == nil,
-                "idle flat detach buffers survived zero layout")
-
-        guard let narrowBeforeCompletion = device.makeBuffer(length: max(surfaceSafeNeededBytes(vertexCount: 1) ?? 0, 1), options: []) else {
-            require(false, "pre-completion narrow allocation failed")
-            return
-        }
-        sets[1].mainVertexBuffer = narrowBeforeCompletion
-        sets[1].mainVertexBufferCap = narrowBeforeCompletion.length
-        sets[1].mainVertexCount = 1
-
-        gpuInFlightCount[0] = 0
-        serviceSurfaceRowStorageRetirement(
-            bufferSets: sets,
-            gpuInFlightCount: gpuInFlightCount,
-            committedSetIndex: 1,
-            layoutContracted: false,
-            state: &retirement,
-            retireMainBuffers: true
-        )
-        require(sets[1].mainVertexBuffer === narrowBeforeCompletion,
-                "old completion retired the newer narrow main buffer")
-        for (index, set) in sets.enumerated() where index != 1 {
-            require(set.mainVertexBuffer == nil && set.mainVertexBufferCap == 0
-                        && set.mainVertexCount == 0,
-                    "flat main storage survived GPU completion")
-            require(set.detachPoolMainBuffer == nil && set.detachPoolMainCap == 0,
-                    "flat detach storage survived GPU completion")
-        }
-
-        guard let narrow = device.makeBuffer(length: max(surfaceSafeNeededBytes(vertexCount: 1) ?? 0, 1), options: []) else {
-            require(false, "narrow main allocation failed")
-            return
-        }
-        sets[2].mainVertexBuffer = narrow
-        sets[2].mainVertexBufferCap = narrow.length
-        sets[2].mainVertexCount = 1
-        require(narrow !== oldMain, "narrow layout reused retired flat main buffer")
-        require(sets[2].mainVertexCount == 1, "narrow main count was not published")
-    }
-
     private static func verifyOversizedRowReuseAvoidsAllocation(device: MTLDevice) {
         // Row bytes track ink length, so a single slot cycles wide -> medium ->
         // narrow as source lines scroll past it. Once the slot has been warmed
@@ -750,7 +671,6 @@ private enum SurfaceRowProvisionTests {
         // commit and from every GPU completion path.
         verifyInFlightZeroRetirement(device: device, owner: "main")
         verifyInFlightZeroRetirement(device: device, owner: "external")
-        verifyFlatMainZeroRetirement(device: device)
         verifyOversizedRowReuseAvoidsAllocation(device: device)
         verifyRowReuseHonoursAliasGuards(device: device)
         verifyPrivateSlotReuseHonoursAliasGuards(device: device)

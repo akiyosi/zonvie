@@ -483,12 +483,6 @@ pub const Harness = struct {
         };
     }
 
-    pub fn msgShowCount(h: *Harness) usize {
-        h.msg_mu.lockUncancelable(zc.clock.io());
-        defer h.msg_mu.unlock(zc.clock.io());
-        return h.msg_shows.items.len;
-    }
-
     /// True if any recorded on_msg_showmode matches `pred`.
     pub fn hasMsgShowmode(h: *Harness, comptime pred: fn (MsgShowEvent) bool) bool {
         h.msg_mu.lockUncancelable(zc.clock.io());
@@ -1081,20 +1075,5 @@ pub const Harness = struct {
         h.core.grid_mu.lockUncancelable(zc.clock.io());
         defer h.core.grid_mu.unlock(zc.clock.io());
         return h.core.grid.takeUncoveredScrollRows(grid_id);
-    }
-
-    /// Get cell width (in terminal cells) for a character.
-    /// Emoji and CJK are typically 2 cells; ASCII is 1 cell.
-    /// This is a simplified approximation; actual width depends on glyph metrics.
-    pub fn cellWidthAt(h: *Harness, grid_id: i64, row: u32, col: u32) u32 {
-        h.core.grid_mu.lockUncancelable(zc.clock.io());
-        defer h.core.grid_mu.unlock(zc.clock.io());
-        const c = h.core.grid.getCellGrid(grid_id, row, col);
-        // Simplified heuristic: codepoints > U+1F300 (emoji range) → 2 cells.
-        // Real logic depends on glyph metrics from the font.
-        if (c.cp == 0) return 0; // wide-char continuation or unset
-        if (c.cp > 0x1F300) return 2; // emoji range (approximate)
-        if (c.cp >= 0x2000) return 2; // CJK and similar
-        return 1;
     }
 };

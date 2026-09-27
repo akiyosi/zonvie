@@ -33,7 +33,6 @@ const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_extwin_shader_alpha.log";
 const marker = "[ext_shader]";
-const max_windows = 16;
 
 /// ZonvieCore.cmdlineGridId: the surface id the ext-cmdline logs under.
 const cmdline_grid_id: f64 = -100;
@@ -96,14 +95,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     // A normal editor window with a window of its own.
     try g.exec(
         \\luaeval('(function() _G.z_ext = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, {external=true, width=50, height=14}) return 1 end)()')
     );
-    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     const ext_grid = @as(f64, @floatFromInt(

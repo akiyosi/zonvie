@@ -17,6 +17,26 @@ const TabEntry = app_mod.TabEntry;
 /// linking.
 const tab_font_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
 
+/// The tab label font at `height_pt` (negative: character height), DPI-scaled.
+fn createTabFont(app: *App, height_pt: c_int) c.HFONT {
+    return c.CreateFontW(
+        app.scalePx(height_pt),
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.CLEARTYPE_QUALITY,
+        c.DEFAULT_PITCH | c.FF_DONTCARE,
+        tab_font_face,
+    );
+}
+
 // ---- Shared helpers for titlebar and sidebar tab operations ----
 
 /// Extract the display name (basename) from a tab entry.
@@ -228,10 +248,11 @@ fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void
 
 /// Calculate a drop target index from a mouse position along a uniform-sized item list.
 /// Works for both X-axis (titlebar) and Y-axis (sidebar) by passing the appropriate coordinate.
-fn calculateDropTarget(mouse_pos: c_int, item_count: usize, item_size: c_int) usize {
+/// Item i spans origin + i*stride for item_size pixels.
+fn calculateDropTarget(mouse_pos: c_int, item_count: usize, origin: c_int, stride: c_int, item_size: c_int) usize {
     var target_idx: usize = 0;
     for (0..item_count) |i| {
-        const item_center: c_int = @as(c_int, @intCast(i)) * item_size + @divTrunc(item_size, 2);
+        const item_center: c_int = origin + @as(c_int, @intCast(i)) * stride + @divTrunc(item_size, 2);
         if (mouse_pos < item_center) {
             target_idx = i;
             break;
@@ -322,11 +343,40 @@ pub fn tablineHitTest(app: *App, client_width: c_int, tab_count: usize, x: c_int
     return .none;
 }
 
-/// Drop the titlebar tab bar's hover and repaint its band. For every way the
-/// pointer can leave it: into the non-client area, below it into the editor,
+/// Where the dragged tab is now, or null when no drag is on or it closed.
+fn draggedTabIndexNow(st: *const TablineState) ?usize {
+    if (st.dragging_tab == null) return null;
+    return st.indexOfHandle(st.dragging_tab_handle);
+}
+
+/// The main window's sidebar strip, in client pixels.
+pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
+    var client: c.RECT = std.mem.zeroes(c.RECT);
+    _ = c.GetClientRect(hwnd, &client);
+    const w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
+    return if (app.sidebar_position_right)
+        .{ .left = client.right - w, .top = 0, .right = client.right, .bottom = client.bottom }
+    else
+        .{ .left = 0, .top = 0, .right = w, .bottom = client.bottom };
+}
+
+/// Drop the tab bar's (or sidebar's) hover and repaint its band. For every
+/// way the pointer can leave it: into the non-client area, into the editor,
 /// or out of the window altogether.
 pub fn clearTablineHover(app: *App, hwnd: c.HWND) void {
-    if (!app.ext_tabline_enabled or app.tabline_style != .titlebar) return;
+    if (!app.ext_tabline_enabled) return;
+    if (app.tabline_style == .sidebar) {
+        if (app.tabline_state.hovered_tab == null and
+            app.tabline_state.hovered_close == null and
+            !app.tabline_state.hovered_new_tab_btn) return;
+        app.tabline_state.hovered_tab = null;
+        app.tabline_state.hovered_close = null;
+        app.tabline_state.hovered_new_tab_btn = false;
+        const sidebar_rect = sidebarRectPx(app, hwnd);
+        _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
+        return;
+    }
+    if (app.tabline_style != .titlebar) return;
     if (app.tabline_state.hovered_tab == null and
         app.tabline_state.hovered_close == null and
         app.tabline_state.hovered_window_btn == null and
@@ -408,24 +458,7 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
             const tab_count: c_int = @intCast(app.tabline_state.tab_count);
             if (tab_count > 0) {
                 const tab_width = tabWidthPx(app, client_width, tab_count);
-
-                // Find which slot the mouse is over
-                var target_idx: usize = 0;
-                var tab_x: c_int = app.scalePx(TablineState.WINDOW_CONTROLS_WIDTH);
-                for (0..app.tabline_state.tab_count) |i| {
-                    const tab_center = tab_x + @divTrunc(tab_width, 2);
-                    if (x < tab_center) {
-                        target_idx = i;
-                        break;
-                    }
-                    target_idx = i + 1;
-                    tab_x += tab_width + 1;
-                }
-                // Clamp to valid range
-                if (target_idx > app.tabline_state.tab_count) {
-                    target_idx = app.tabline_state.tab_count;
-                }
-                app.tabline_state.drop_target_index = target_idx;
+                app.tabline_state.drop_target_index = calculateDropTarget(x, app.tabline_state.tab_count, tabLeftPx(app, tab_width, 0), tab_width + 1, tab_width);
             }
         }
 
@@ -519,7 +552,14 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
     // Buttons record their pressed state and act on mouseUp; capture so the
     // mouseUp arrives even if the pointer leaves.
-    switch (tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y)) {
+    var hit = tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y);
+    // A close button is pressable only where it is drawn (selected or hovered),
+    // as in the sidebar.
+    if (hit == .close) {
+        const i = hit.close;
+        if (app.tabline_state.tabs[i].handle != app.tabline_state.current_tab and app.tabline_state.hovered_tab != i) hit = .{ .tab = i };
+    }
+    switch (hit) {
         .window_button => |b| {
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{b});
             app.tabline_state.pressed_window_btn = b;
@@ -541,6 +581,7 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
             app.tabline_state.drag_offset_x = x - tabLeftPx(app, tab_width, i);
             app.tabline_state.drag_current_x = x;
             app.tabline_state.dragging_tab = i;
+            app.tabline_state.dragging_tab_handle = app.tabline_state.tabs[i].handle;
             app.tabline_state.drop_target_index = i;
 
             // Select the tab being dragged so :tabmove works on it
@@ -630,7 +671,8 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     }
 
     // Save drag state before ReleaseCapture, which triggers WM_CAPTURECHANGED synchronously
-    const drag_idx_opt = app.tabline_state.dragging_tab;
+    const drag_idx_opt = draggedTabIndexNow(&app.tabline_state);
+    const was_dragging = app.tabline_state.dragging_tab != null;
     const drop_target_opt = app.tabline_state.drop_target_index;
     const drag_start = app.tabline_state.drag_start_x;
     const was_external_drag = app.tabline_state.is_external_drag;
@@ -639,6 +681,9 @@ pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     app.tabline_state.cancelDrag();
     destroyDragPreviewWindow(app);
     _ = c.ReleaseCapture();
+
+    // The dragged tab closed mid-drag: nothing to move.
+    if (was_dragging and drag_idx_opt == null) _ = c.InvalidateRect(hwnd, null, 0);
 
     if (drag_idx_opt) |drag_idx| {
         // Handle external drag: externalize the tab
@@ -829,22 +874,7 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                     const app: *App = @ptrFromInt(@as(usize, @bitCast(app_ptr)));
 
                     // Create DPI-scaled font
-                    const hfont = c.CreateFontW(
-                        app.scalePx(-12),
-                        0,
-                        0,
-                        0,
-                        c.FW_NORMAL,
-                        0,
-                        0,
-                        0,
-                        c.DEFAULT_CHARSET,
-                        c.OUT_DEFAULT_PRECIS,
-                        c.CLIP_DEFAULT_PRECIS,
-                        c.CLEARTYPE_QUALITY,
-                        c.DEFAULT_PITCH | c.FF_DONTCARE,
-                        tab_font_face,
-                    );
+                    const hfont = createTabFont(app, -12);
                     const old_font = c.SelectObject(hdc, hfont);
 
                     const text_pad = app.scalePx(10);
@@ -982,9 +1012,14 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
     const old_bmp = c.SelectObject(mem_dc, dib);
     defer _ = c.SelectObject(mem_dc, old_bmp);
 
-    switch (surface) {
-        .tabline => drawTablineContent(app, mem_dc, @intCast(width)),
-        .sidebar => drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height)),
+    {
+        // The core thread rewrites tabline_state under app.mu.
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        switch (surface) {
+            .tabline => drawTablineContent(app, mem_dc, @intCast(width)),
+            .sidebar => drawSidebarContent(app, mem_dc, @intCast(width), @intCast(height)),
+        }
     }
 
     // GDI does not set the alpha channel; force it opaque.
@@ -1009,7 +1044,6 @@ fn renderOffscreenToD3D(app: *App, surface: OffscreenSurface, width: u32, height
 /// and only using D3D11 for final display.
 pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     if (app.renderer == null) return;
-    if (app.tabline_state.tab_count == 0) return;
     if (width == 0 or height == 0) return;
 
     // Change gate: WM_PAINT calls this unconditionally, but the tab strip
@@ -1018,13 +1052,15 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
     // pass over every pixel and a full-texture GPU upload — per keystroke
     // repaint and per cursor-blink toggle. Skip when the drawn content is
     // byte-identical to what the D3D texture already holds.
+    app.mu.lockUncancelable(core.clock.io());
     const sig = tablineRenderSignature(app, width, height);
-    if (sig == app.tabline_render_sig) return;
+    app.mu.unlock(core.clock.io());
+    if (sig == if (app.renderer) |*r| r.stripContentSig(.tabline).* else return) return;
 
     // Only record the signature after a successful upload so a failed
     // upload retries on the next paint.
     if (renderOffscreenToD3D(app, .tabline, width, height)) {
-        app.tabline_render_sig = sig;
+        if (app.renderer) |*r| r.stripContentSig(.tabline).* = sig;
     }
 }
 
@@ -1032,10 +1068,12 @@ pub fn renderTablineToD3D(app: *App, width: u32, height: u32) void {
 /// nothing drawSidebarContent reads has changed: it was re-rendered and fully
 /// re-uploaded on every WM_PAINT, cursor blinks included.
 pub fn renderSidebarToD3D(app: *App, width: u32, height: u32) void {
+    app.mu.lockUncancelable(core.clock.io());
     const sig = sidebarRenderSignature(app, width, height);
-    if (sig == app.sidebar_render_sig) return;
+    app.mu.unlock(core.clock.io());
+    if (sig == if (app.renderer) |*r| r.stripContentSig(.sidebar).* else return) return;
     if (renderOffscreenToD3D(app, .sidebar, width, height)) {
-        app.sidebar_render_sig = sig;
+        if (app.renderer) |*r| r.stripContentSig(.sidebar).* = sig;
     }
 }
 
@@ -1139,16 +1177,105 @@ fn currentTitlebarPalette() TitlebarPalette {
     };
 }
 
-pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
-    if (app.tabline_state.tab_count == 0) {
-        return;
+/// The minimize, maximize and close buttons at the right end of the titlebar.
+fn drawWindowButtons(app: *App, hdc: c.HDC, client_width: c_int, pal: anytype) void {
+    const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
+    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
+    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
+    const btn_start_x = client_width - btns_total;
+
+    // DPI-scaled icon geometry (icon is 10px at 96 DPI, centered in btn_w)
+    const wbtn_icon_size = app.scalePx(10);
+    const wbtn_icon_inset = @divTrunc(btn_w - wbtn_icon_size, 2);
+    const wbtn_pen_width: c_int = @max(1, app.scalePx(1));
+
+    // Check hover states
+    const hovered_btn = app.tabline_state.hovered_window_btn;
+
+    // Minimize button
+    {
+        const btn_x = btn_start_x;
+        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
+
+        // Hover highlight
+        if (hovered_btn == 0) {
+            const min_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
+            _ = c.FillRect(hdc, &btn_rect, min_hover_brush);
+            _ = c.DeleteObject(min_hover_brush);
+        }
+
+        // Draw minimize icon (horizontal line)
+        const min_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
+        const old_min_icon_pen = c.SelectObject(hdc, min_icon_pen);
+        const icon_y = @divTrunc(bar_height, 2);
+        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, icon_y, null);
+        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, icon_y);
+        _ = c.SelectObject(hdc, old_min_icon_pen);
+        _ = c.DeleteObject(min_icon_pen);
     }
 
+    // Maximize button
+    {
+        const btn_x = btn_start_x + btn_w;
+        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
+
+        // Hover highlight
+        if (hovered_btn == 1) {
+            const max_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
+            _ = c.FillRect(hdc, &btn_rect, max_hover_brush);
+            _ = c.DeleteObject(max_hover_brush);
+        }
+
+        // Draw maximize icon (rectangle)
+        const max_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
+        const old_max_icon_pen = c.SelectObject(hdc, max_icon_pen);
+        const max_null_brush = c.GetStockObject(c.NULL_BRUSH);
+        const old_max_brush = c.SelectObject(hdc, max_null_brush);
+        const max_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
+        _ = c.Rectangle(hdc, btn_x + wbtn_icon_inset, max_icon_top, btn_x + wbtn_icon_inset + wbtn_icon_size, max_icon_top + wbtn_icon_size);
+        _ = c.SelectObject(hdc, old_max_brush);
+        _ = c.SelectObject(hdc, old_max_icon_pen);
+        _ = c.DeleteObject(max_icon_pen);
+    }
+
+    // Close button
+    {
+        const btn_x = btn_start_x + btn_w * 2;
+        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
+
+        // Red hover highlight for close button
+        if (hovered_btn == 2) {
+            const close_hover_brush = c.CreateSolidBrush(pal.wbtn_close_hover_bg);
+            _ = c.FillRect(hdc, &btn_rect, close_hover_brush);
+            _ = c.DeleteObject(close_hover_brush);
+        }
+
+        // Draw X icon
+        const close_icon_color = if (hovered_btn == 2) pal.wbtn_close_hover_icon else pal.wbtn_icon;
+        const close_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, close_icon_color);
+        const old_close_icon_pen = c.SelectObject(hdc, close_icon_pen);
+        const close_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
+        // GDI LineTo excludes the endpoint pixel. Extend each LineTo target by one
+        // step in the line direction so the visual diagonals fully cover the
+        // wbtn_icon_size_px x wbtn_icon_size_px square symmetrically (otherwise
+        // the bottom corners are clipped, making the bottom of the X look shorter).
+        const x_left = btn_x + wbtn_icon_inset;
+        const x_right_last = btn_x + wbtn_icon_inset + wbtn_icon_size - 1;
+        const y_top = close_icon_top;
+        const y_bottom_last = close_icon_top + wbtn_icon_size - 1;
+        _ = c.MoveToEx(hdc, x_left, y_top, null);
+        _ = c.LineTo(hdc, x_right_last + 1, y_bottom_last + 1);
+        _ = c.MoveToEx(hdc, x_right_last, y_top, null);
+        _ = c.LineTo(hdc, x_left - 1, y_bottom_last + 1);
+        _ = c.SelectObject(hdc, old_close_icon_pen);
+        _ = c.DeleteObject(close_icon_pen);
+    }
+}
+
+pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
     const tab_padding = app.scalePx(TablineState.TAB_PADDING);
     const close_size = app.scalePx(TablineState.TAB_CLOSE_SIZE);
-    const btns_total = app.scalePx(TablineState.WINDOW_BTNS_TOTAL);
-    const btn_w = app.scalePx(TablineState.WINDOW_BTN_WIDTH);
     const drag_threshold = app.scalePx(TablineState.DRAG_THRESHOLD);
     const close_margin = app.scalePx(6);
     const close_inset = app.scalePx(3);
@@ -1171,6 +1298,13 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     };
     _ = c.FillRect(hdc, &bar_rect, bg_brush);
 
+    // No tabs (a session swap until its first tabline_update): the empty bar
+    // tablineHitTest assumes, window buttons live and the rest caption.
+    if (app.tabline_state.tab_count == 0) {
+        drawWindowButtons(app, hdc, client_width, pal);
+        return;
+    }
+
     // Calculate tab width
     const tab_count: c_int = @intCast(app.tabline_state.tab_count);
     const tab_width = tabWidthPx(app, client_width, tab_count);
@@ -1188,22 +1322,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
     }
 
     // Font
-    const font = c.CreateFontW(
-        app.scalePx(-12),
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.CLEARTYPE_QUALITY,
-        c.DEFAULT_PITCH | c.FF_DONTCARE,
-        tab_font_face,
-    );
+    const font = createTabFont(app, -12);
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
     defer _ = c.SelectObject(hdc, old_font);
@@ -1361,95 +1480,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         _ = c.DeleteObject(plus_brush);
     }
 
-    // Draw window control buttons (min, max, close) on the right
-    const btn_start_x = client_width - btns_total;
-
-    // DPI-scaled icon geometry (icon is 10px at 96 DPI, centered in btn_w)
-    const wbtn_icon_size = app.scalePx(10);
-    const wbtn_icon_inset = @divTrunc(btn_w - wbtn_icon_size, 2);
-    const wbtn_pen_width: c_int = @max(1, app.scalePx(1));
-
-    // Check hover states
-    const hovered_btn = app.tabline_state.hovered_window_btn;
-
-    // Minimize button
-    {
-        const btn_x = btn_start_x;
-        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
-
-        // Hover highlight
-        if (hovered_btn == 0) {
-            const min_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
-            _ = c.FillRect(hdc, &btn_rect, min_hover_brush);
-            _ = c.DeleteObject(min_hover_brush);
-        }
-
-        // Draw minimize icon (horizontal line)
-        const min_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
-        const old_min_icon_pen = c.SelectObject(hdc, min_icon_pen);
-        const icon_y = @divTrunc(bar_height, 2);
-        _ = c.MoveToEx(hdc, btn_x + wbtn_icon_inset, icon_y, null);
-        _ = c.LineTo(hdc, btn_x + wbtn_icon_inset + wbtn_icon_size, icon_y);
-        _ = c.SelectObject(hdc, old_min_icon_pen);
-        _ = c.DeleteObject(min_icon_pen);
-    }
-
-    // Maximize button
-    {
-        const btn_x = btn_start_x + btn_w;
-        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
-
-        // Hover highlight
-        if (hovered_btn == 1) {
-            const max_hover_brush = c.CreateSolidBrush(pal.wbtn_hover_bg);
-            _ = c.FillRect(hdc, &btn_rect, max_hover_brush);
-            _ = c.DeleteObject(max_hover_brush);
-        }
-
-        // Draw maximize icon (rectangle)
-        const max_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, pal.wbtn_icon);
-        const old_max_icon_pen = c.SelectObject(hdc, max_icon_pen);
-        const max_null_brush = c.GetStockObject(c.NULL_BRUSH);
-        const old_max_brush = c.SelectObject(hdc, max_null_brush);
-        const max_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
-        _ = c.Rectangle(hdc, btn_x + wbtn_icon_inset, max_icon_top, btn_x + wbtn_icon_inset + wbtn_icon_size, max_icon_top + wbtn_icon_size);
-        _ = c.SelectObject(hdc, old_max_brush);
-        _ = c.SelectObject(hdc, old_max_icon_pen);
-        _ = c.DeleteObject(max_icon_pen);
-    }
-
-    // Close button
-    {
-        const btn_x = btn_start_x + btn_w * 2;
-        var btn_rect = c.RECT{ .left = btn_x, .top = 0, .right = btn_x + btn_w, .bottom = bar_height };
-
-        // Red hover highlight for close button
-        if (hovered_btn == 2) {
-            const close_hover_brush = c.CreateSolidBrush(pal.wbtn_close_hover_bg);
-            _ = c.FillRect(hdc, &btn_rect, close_hover_brush);
-            _ = c.DeleteObject(close_hover_brush);
-        }
-
-        // Draw X icon
-        const close_icon_color = if (hovered_btn == 2) pal.wbtn_close_hover_icon else pal.wbtn_icon;
-        const close_icon_pen = c.CreatePen(c.PS_SOLID, wbtn_pen_width, close_icon_color);
-        const old_close_icon_pen = c.SelectObject(hdc, close_icon_pen);
-        const close_icon_top = @divTrunc(bar_height - wbtn_icon_size, 2);
-        // GDI LineTo excludes the endpoint pixel. Extend each LineTo target by one
-        // step in the line direction so the visual diagonals fully cover the
-        // wbtn_icon_size_px x wbtn_icon_size_px square symmetrically (otherwise
-        // the bottom corners are clipped, making the bottom of the X look shorter).
-        const x_left = btn_x + wbtn_icon_inset;
-        const x_right_last = btn_x + wbtn_icon_inset + wbtn_icon_size - 1;
-        const y_top = close_icon_top;
-        const y_bottom_last = close_icon_top + wbtn_icon_size - 1;
-        _ = c.MoveToEx(hdc, x_left, y_top, null);
-        _ = c.LineTo(hdc, x_right_last + 1, y_bottom_last + 1);
-        _ = c.MoveToEx(hdc, x_right_last, y_top, null);
-        _ = c.LineTo(hdc, x_left - 1, y_bottom_last + 1);
-        _ = c.SelectObject(hdc, old_close_icon_pen);
-        _ = c.DeleteObject(close_icon_pen);
-    }
+    drawWindowButtons(app, hdc, client_width, pal);
 
     // Draw drop indicator and floating tab only when actually dragging (moved beyond threshold)
     if (is_actually_dragging) {
@@ -1469,6 +1500,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
         // Draw floating tab at cursor position
         if (app.tabline_state.dragging_tab) |drag_idx| {
+            if (drag_idx >= app.tabline_state.tab_count) return;
             const tab = &app.tabline_state.tabs[drag_idx];
 
             // Calculate floating tab position - centered on cursor
@@ -1585,9 +1617,14 @@ pub fn onTablineHide(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_tabline_hide\n", .{});
 
+    // Fired on a session reset: drop the old session's tabs so they are
+    // neither drawn nor clickable until its first tabline_update.
     app.mu.lockUncancelable(core.clock.io());
-    app.tabline_state.visible = false;
+    app.tabline_state.clear();
     app.mu.unlock(core.clock.io());
+    if (app.hwnd) |main_hwnd| {
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_TABLINE_INVALIDATE, 0, 0);
+    }
 
     // Hide child window
     if (app.tabline_state.hwnd) |tabline_hwnd| {
@@ -1773,22 +1810,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
     }
 
     // Font
-    const font = c.CreateFontW(
-        app.scalePx(-12),
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.CLEARTYPE_QUALITY,
-        c.DEFAULT_PITCH | c.FF_DONTCARE,
-        tab_font_face,
-    );
+    const font = createTabFont(app, -12);
     defer _ = c.DeleteObject(font);
     const old_font = c.SelectObject(hdc, font);
     defer _ = c.SelectObject(hdc, old_font);
@@ -1935,22 +1957,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
         // "New Tab" text
         _ = c.SetTextColor(hdc, new_tab_color);
-        const small_font = c.CreateFontW(
-            app.scalePx(-11),
-            0,
-            0,
-            0,
-            c.FW_NORMAL,
-            0,
-            0,
-            0,
-            c.DEFAULT_CHARSET,
-            c.OUT_DEFAULT_PRECIS,
-            c.CLIP_DEFAULT_PRECIS,
-            c.CLEARTYPE_QUALITY,
-            c.DEFAULT_PITCH | c.FF_DONTCARE,
-            tab_font_face,
-        );
+        const small_font = createTabFont(app, -11);
         const old_small_font = c.SelectObject(hdc, small_font);
         const new_tab_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("New Tab");
         var nt_rect = c.RECT{
@@ -1983,7 +1990,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
                 // C) Floating tab row at drag position
                 if (drag_idx < app.tabline_state.tab_count) {
                     const drag_tab = &app.tabline_state.tabs[drag_idx];
-                    const float_y = app.tabline_state.drag_current_y - @divTrunc(row_h, 2);
+                    const float_y = app.tabline_state.drag_current_y - app.tabline_state.drag_offset_y;
 
                     // Floating row background (accent color approximation)
                     const float_brush = c.CreateSolidBrush(c.RGB(colors.indicator_r, colors.indicator_g, colors.indicator_b));
@@ -2064,14 +2071,7 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     const is_hovered = app.tabline_state.hovered_tab == tab_idx;
 
     // Close button hit test (for local_x within sidebar)
-    var sb_local_x: c_int = undefined;
-    if (app.sidebar_position_right) {
-        var client_rect2: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &client_rect2);
-        sb_local_x = x - (client_rect2.right - sidebar_w);
-    } else {
-        sb_local_x = x;
-    }
+    const sb_local_x = x - sidebarRectPx(app, hwnd).left;
 
     if ((is_selected or is_hovered) and
         sb_local_x >= close_x_start and sb_local_x < close_x_start + close_size and
@@ -2092,8 +2092,10 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     }
 
     app.tabline_state.dragging_tab = tab_idx;
+    app.tabline_state.dragging_tab_handle = tab.handle;
     app.tabline_state.drag_start_x = x;
     app.tabline_state.drag_current_x = x;
+    app.tabline_state.drag_offset_y = y - @as(c_int, @intCast(tab_idx)) * row_h;
     app.tabline_state.drag_start_y = y;
     app.tabline_state.drag_current_y = y;
     app.tabline_state.drop_target_index = null;
@@ -2134,7 +2136,7 @@ pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
 
     // Handle drag end
     const was_external_drag = app.tabline_state.is_external_drag;
-    const drag_idx_opt = app.tabline_state.dragging_tab;
+    const drag_idx_opt = draggedTabIndexNow(&app.tabline_state);
     const drop_target_opt = app.tabline_state.drop_target_index;
     const drag_start_y_saved = app.tabline_state.drag_start_y;
 
@@ -2188,12 +2190,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
             const close_x_start = sidebar_w - sep_w - close_size - app.scalePx(8);
             const close_y_start = @as(c_int, @intCast(pressed_tab_idx)) * row_h + @divTrunc(row_h - close_size, 2);
 
-            var sb_x = x;
-            if (app.sidebar_position_right) {
-                var client_rect: c.RECT = undefined;
-                _ = c.GetClientRect(hwnd, &client_rect);
-                sb_x = x - (client_rect.right - sidebar_w);
-            }
+            const sb_x = x - sidebarRectPx(app, hwnd).left;
 
             const is_still_over_close = (sb_x >= close_x_start and sb_x < close_x_start + close_size and
                 y >= close_y_start and y < close_y_start + close_size);
@@ -2210,12 +2207,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     // Handle new tab button pressed state - cancel if mouse leaves the button
     if (app.tabline_state.new_tab_button_pressed) {
         const tabs_bottom: c_int = @as(c_int, @intCast(app.tabline_state.tab_count)) * row_h;
-        var sb_x = x;
-        if (app.sidebar_position_right) {
-            var client_rect: c.RECT = undefined;
-            _ = c.GetClientRect(hwnd, &client_rect);
-            sb_x = x - (client_rect.right - sidebar_w);
-        }
+        const sb_x = x - sidebarRectPx(app, hwnd).left;
 
         const is_still_over_new_tab = (sb_x >= 0 and sb_x < sidebar_w - sep_w and
             y >= tabs_bottom and y < tabs_bottom + new_tab_h);
@@ -2300,7 +2292,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
                         app.tabline_state.drag_start_y - y;
 
                     if (dy > app.scalePx(TablineState.DRAG_THRESHOLD)) {
-                        app.tabline_state.drop_target_index = calculateDropTarget(y, app.tabline_state.tab_count, row_h);
+                        app.tabline_state.drop_target_index = calculateDropTarget(y, app.tabline_state.tab_count, 0, row_h, row_h);
                     }
                 }
             }
@@ -2317,14 +2309,7 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     if (row_h <= 0) return;
 
     // Local x within sidebar
-    var sb_local_x: c_int = undefined;
-    if (app.sidebar_position_right) {
-        var client_rect: c.RECT = undefined;
-        _ = c.GetClientRect(hwnd, &client_rect);
-        sb_local_x = x - (client_rect.right - sidebar_w);
-    } else {
-        sb_local_x = x;
-    }
+    const sb_local_x = x - sidebarRectPx(app, hwnd).left;
 
     const tab_idx: usize = @intCast(@divTrunc(@max(0, y), row_h));
 

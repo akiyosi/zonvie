@@ -156,6 +156,10 @@ final class SharedRenderResources {
     private var pipelineNeedsBuilding = true
     private var pipelineRetryDelaySeconds: TimeInterval = 0.1
     private var pipelineRetryNotBefore: CFAbsoluteTime = 0
+    /// Every surface a missing pipeline turned away since the last wake, so
+    /// the retry (or another surface's successful build) wakes all of them,
+    /// not only the one that attempted the build. Main thread.
+    private let viewsAwaitingPipeline = NSHashTable<MTKView>.weakObjects()
     /// The archive compiled pipelines are cached in, so later launches skip
     /// the XPC compiler service.
     private var binaryArchive: MTLBinaryArchive?
@@ -325,17 +329,14 @@ final class SharedRenderResources {
     ) -> zonvie_shader_uniforms {
         let state = timing ?? shaderTimeBase
         let now = CACurrentMediaTime()
-        if state.startTimeSec == 0 {
-            // External views (timing != shaderTimeBase) inherit the
-            // main view's iTime origin once main has started so iTime
-            // and iTimeCursorChange (which the main path computes
-            // against shaderTimeBase.startTimeSec) stay in the same
-            // time base across the whole app.
-            if state !== shaderTimeBase, shaderTimeBase.startTimeSec != 0 {
-                state.startTimeSec = shaderTimeBase.startTimeSec
-            } else {
-                state.startTimeSec = now
-            }
+        // One iTime origin for every surface, set by whichever draws first:
+        // iTimeCursorChange is measured against shaderTimeBase, so a surface
+        // with an origin of its own would see cursor changes shifted in time.
+        if shaderTimeBase.startTimeSec == 0 {
+            shaderTimeBase.startTimeSec = now
+        }
+        if state.lastTimeSec == 0 {
+            state.startTimeSec = shaderTimeBase.startTimeSec
             state.lastTimeSec = now
         }
         let iTime = Float(now - state.startTimeSec)
@@ -837,10 +838,12 @@ extension SharedRenderResources {
         if pipeline != nil && sampler != nil {
             pipelineRetryDelaySeconds = 0.1
             pipelineRetryNotBefore = 0
+            wakeViewsAwaitingPipeline()
             return true
         }
 
         let now = CFAbsoluteTimeGetCurrent()
+        viewsAwaitingPipeline.add(view)
         guard pipelineNeedsBuilding, now >= pipelineRetryNotBefore else { return false }
 
         pipelineNeedsBuilding = false
@@ -851,6 +854,8 @@ extension SharedRenderResources {
             pipelineRetryDelaySeconds = 0.1
             pipelineRetryNotBefore = 0
             ZonvieCore.appLog("[Renderer] Pipeline built on demand")
+            viewsAwaitingPipeline.remove(view)
+            wakeViewsAwaitingPipeline()
             return true
         }
 
@@ -861,17 +866,28 @@ extension SharedRenderResources {
         pipelineNeedsBuilding = true
         pipelineRetryNotBefore = now + retryDelay
         pipelineRetryDelaySeconds = min(pipelineRetryDelaySeconds * 2, 5.0)
-        DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self, weak view] in
-            guard let self, let view,
+        DispatchQueue.main.asyncAfter(deadline: .now() + retryDelay) { [weak self] in
+            guard let self,
                   self.pipeline == nil,
                   CFAbsoluteTimeGetCurrent() >= self.pipelineRetryNotBefore else { return }
-            if let terminalView = view as? MetalTerminalView {
-                terminalView.requestRedraw()
+            self.wakeViewsAwaitingPipeline()
+        }
+        return false
+    }
+
+    /// Wake every surface turned away since the last wake; each asks again
+    /// and re-registers if it is turned away again.
+    private func wakeViewsAwaitingPipeline() {
+        guard viewsAwaitingPipeline.count > 0 else { return }
+        let views = viewsAwaitingPipeline.allObjects
+        viewsAwaitingPipeline.removeAllObjects()
+        for view in views {
+            if let surface = view as? GridInputView {
+                surface.requestRedraw()
             } else {
                 view.setNeedsDisplay(view.bounds)
             }
         }
-        return false
     }
 
     func pipelineRetryDelay() -> TimeInterval {

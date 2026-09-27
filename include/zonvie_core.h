@@ -231,8 +231,12 @@ typedef void (*zonvie_on_log_fn)(
 
 /*
   guifont notification:
-    bytes = UTF-8 string formatted as: "<font_name>\t<point_size>"
-    Example: "Menlo\t14"
+    bytes = UTF-8, newline-separated candidate list, one font per line:
+      "<font_name>\t<point_size>[\t<features>]\n<font_name>\t<point_size>..."
+    Example: "JetBrains Mono\t14\t+ss01,-liga\nMenlo\t14"
+    Read each line with zonvie_core_parse_font_candidate and use the first
+    font that loads. The literal "*" (`:set guifont=*`) is a font picker
+    request, not a font name.
   (Swift/Win32 side should treat it as data-only and just apply.)
 */
 typedef void (*zonvie_on_guifont_fn)(
@@ -2181,7 +2185,7 @@ typedef enum {
 // Result of routing a message
 typedef struct {
     zonvie_msg_view_type view;
-    float timeout;  // -1 = no auto-hide, 0 = use default
+    float timeout;  // auto-hide after this many seconds; 0 = no auto-hide
 } zonvie_route_result;
 
 // Load config from file path.

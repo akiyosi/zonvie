@@ -168,6 +168,8 @@ pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool 
         return true;
     }
 
+    if (isAltNumpadDigit(mods, vk)) return false;
+
     // Ctrl/Alt combos go through send_key_event with the characters the core
     // needs to decide <C-x> and the like.
     if ((mods & (MOD_CTRL | MOD_ALT)) != 0) {
@@ -186,6 +188,20 @@ pub fn handleKeyDownMessage(app: *App, wParam: c.WPARAM, lParam: c.LPARAM) bool 
         return true;
     }
     return false;
+}
+
+/// Alt+numpad digits type an Alt code: the system delivers the character as
+/// WM_CHAR when Alt is released, so the digits are not <M-0>..<M-9>.
+fn isAltNumpadDigit(mods: u32, vk: u32) bool {
+    return mods == MOD_ALT and vk >= c.VK_NUMPAD0 and vk <= c.VK_NUMPAD9;
+}
+
+test "isAltNumpadDigit leaves Alt codes to the system" {
+    try std.testing.expect(isAltNumpadDigit(MOD_ALT, c.VK_NUMPAD0));
+    try std.testing.expect(isAltNumpadDigit(MOD_ALT, c.VK_NUMPAD9));
+    try std.testing.expect(!isAltNumpadDigit(MOD_ALT | MOD_CTRL, c.VK_NUMPAD1));
+    try std.testing.expect(!isAltNumpadDigit(0, c.VK_NUMPAD1));
+    try std.testing.expect(!isAltNumpadDigit(MOD_ALT, '1'));
 }
 
 /// Ctrl and Alt both held (AltGr) and the key composed a printable character,
@@ -856,7 +872,10 @@ pub fn mouseButtonResult(msg: c.UINT) c.LRESULT {
 /// lost the left release once this button was let go. Capture so a drag that
 /// leaves the window keeps arriving; not again mid-drag, since whether
 /// re-capturing notifies WM_CAPTURECHANGED is not worth depending on.
+/// Capture held with no editor button down belongs to a scrollbar or tab
+/// drag: another button then stays out of the editor, as it would its release.
 pub fn pressEditorButton(app: *App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, target: MouseTarget) void {
+    if (uiOwnsCapture(app.mouse_button_held, msg, c.GetCapture() == hwnd)) return;
     const b = mouseButton(msg, wParam);
     if (app.mouse_button_held != 1) {
         app.mouse_button_held = b.code;
@@ -871,9 +890,17 @@ pub const ButtonRelease = struct {
     /// (chrome, scrollbar, copy button), which then gets no release either.
     press_grid: i64,
     /// Another button let go mid left-drag: the drag, its capture and its
-    /// release still belong to the left button.
+    /// release still belong to the left button. Also true for a non-left
+    /// release with no editor button held: any capture is a scrollbar or tab
+    /// drag's, and releasing it would cancel that drag.
     left_drag_continues: bool,
 };
+
+/// A non-left press while this window holds capture and no editor button is
+/// down: the capture is a scrollbar or tab drag's.
+pub fn uiOwnsCapture(mouse_button_held: u8, msg: c.UINT, window_has_capture: bool) bool {
+    return mouse_button_held == 0 and msg != c.WM_LBUTTONDOWN and window_has_capture;
+}
 
 /// Read and clear the press state before anything can return early: a
 /// branch that returned first left a button held, and every later
@@ -881,7 +908,7 @@ pub const ButtonRelease = struct {
 pub fn takeButtonRelease(app: *App, msg: c.UINT) ButtonRelease {
     const rel: ButtonRelease = .{
         .press_grid = app.mouse_press_grid_id,
-        .left_drag_continues = app.mouse_button_held == 1 and msg != c.WM_LBUTTONUP,
+        .left_drag_continues = msg != c.WM_LBUTTONUP and (app.mouse_button_held == 1 or app.mouse_button_held == 0),
     };
     if (!rel.left_drag_continues) {
         app.mouse_button_held = 0;

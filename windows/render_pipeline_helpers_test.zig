@@ -939,6 +939,23 @@ test "damage compaction preserves disjoint rectangles" {
 // contract for the DWrite side, which has to invert the map itself.
 // ---------------------------------------------------------------------------
 
+test "shapeChunkLen: a run within the limit is one chunk" {
+    const s = [_]u32{ 'a', 'b', 'c' };
+    try std.testing.expectEqual(@as(usize, 3), helpers.shapeChunkLen(&s, 3));
+}
+
+test "shapeChunkLen: a long run is cut just after its last space inside the limit" {
+    // "ab cd->gh": the limit of 6 lands inside "->", so the cut goes after
+    // the space and "cd->" stays in one chunk.
+    const s = [_]u32{ 'a', 'b', ' ', 'c', 'd', '-', '>', 'g', 'h' };
+    try std.testing.expectEqual(@as(usize, 3), helpers.shapeChunkLen(&s, 6));
+}
+
+test "shapeChunkLen: a long run without a space is cut at the limit" {
+    const s = [_]u32{ 'a', 'b', 'c', 'd', 'e' };
+    try std.testing.expectEqual(@as(usize, 4), helpers.shapeChunkLen(&s, 4));
+}
+
 fn expectInversion(
     cluster_map: []const u16,
     scalar_idx: []const u32,
@@ -1227,6 +1244,18 @@ test "a shift the row storage refuses leaves the row bits alone" {
     try expectBits(&bits, &.{5});
 }
 
+test "checkShift: no-op, fitting and refused shifts" {
+    try std.testing.expectEqual(helpers.ShiftCheck.noop, helpers.checkShift(0, 10, 0, 10));
+    try std.testing.expectEqual(helpers.ShiftCheck.noop, helpers.checkShift(10, 4, 3, 10));
+    try std.testing.expectEqual(helpers.ShiftCheck.fits, helpers.checkShift(0, 10, 9, 10));
+    try std.testing.expectEqual(helpers.ShiftCheck.fits, helpers.checkShift(0, 10, -9, 10));
+    // A shift covering the whole region leaves no row to carry.
+    try std.testing.expectEqual(helpers.ShiftCheck.invalid, helpers.checkShift(0, 10, 10, 10));
+    try std.testing.expectEqual(helpers.ShiftCheck.invalid, helpers.checkShift(0, 10, -10, 10));
+    // The region runs past the storage.
+    try std.testing.expectEqual(helpers.ShiftCheck.invalid, helpers.checkShift(0, 11, 3, 10));
+}
+
 test "two shifts in one flush compose" {
     const alloc = std.testing.allocator;
     var bits = try bitsFrom(alloc, 10, &.{6});
@@ -1363,6 +1392,24 @@ test "spawnArgQuote picks a quote the core's tokenizer gives back unchanged" {
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("it's \"x\""));
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("C:\\My Dir\\"));
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote(""));
+}
+
+test "devcontainerPathArg drops what would break the quoted devcontainer argument" {
+    const cases = [_]struct { raw: []const u8, want: []const u8 }{
+        .{ .raw = ".\\proj\\", .want = ".\\proj" },
+        .{ .raw = "C:\\My Dir\\\\", .want = "C:\\My Dir" },
+        .{ .raw = "\"C:\\proj\"", .want = "C:\\proj" },
+        .{ .raw = "C:\\", .want = "C:\\." },
+        .{ .raw = "\"D:\\\"", .want = "D:\\." },
+        .{ .raw = "/work/app", .want = "/work/app" },
+        .{ .raw = "\\", .want = "\\." },
+    };
+    for (cases) |case| {
+        var buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try helpers.writeDevcontainerPathArg(&w, case.raw);
+        try std.testing.expectEqualStrings(case.want, buf[0..w.end]);
+    }
 }
 
 test "rotateRegion vacates the whole region when the shift covers it" {

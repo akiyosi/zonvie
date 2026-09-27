@@ -1265,8 +1265,8 @@ pub const Viewport = struct {
 /// grid 1 is only a container, so remembering the main grid alone protected the
 /// cheapest surface.
 pub const DirtySnapshot = struct {
-    dirty_all: bool = false,
-    rows: std.DynamicBitSetUnmanaged = .{},
+    /// Grid 1. `live` is unused for it.
+    main: SubDirty = .{},
     /// Per sub-grid, keyed by grid id. Entries and their bitsets are reused
     /// across flushes; a steady-state flush allocates nothing here.
     subs: std.AutoHashMapUnmanaged(i64, SubDirty) = .{},
@@ -1285,8 +1285,8 @@ pub const DirtySnapshot = struct {
     };
 
     pub fn deinit(self: *DirtySnapshot, alloc: std.mem.Allocator) void {
-        self.rows.deinit(alloc);
-        self.rows = .{};
+        self.main.rows.deinit(alloc);
+        self.main.rows = .{};
         var it = self.subs.valueIterator();
         while (it.next()) |sub| sub.rows.deinit(alloc);
         self.subs.deinit(alloc);
@@ -1389,6 +1389,9 @@ pub const Grid = struct {
     /// Current mode name (e.g., "normal", "insert", "terminal")
     /// Fixed-size buffer to avoid allocation; null-terminated.
     current_mode_name: [16]u8 = [_]u8{0} ** 16,
+    /// A msg_showmode arrived since the last flush event (mode_change clears
+    /// showmode on leaving insert only when none did).
+    showmode_set_since_flush: bool = false,
 
     win_layer: std.AutoHashMapUnmanaged(i64, WinLayer) = .{},
 
@@ -1444,8 +1447,6 @@ pub const Grid = struct {
     // Track grid_ids that received grid_scroll events (for frontend pixel offset clearing)
     scrolled_grid_ids: [16]i64 = [_]i64{0} ** 16,
     scrolled_grid_count: u8 = 0,
-    main_scroll_notify_pending: bool = false,
-    main_scroll_notify_rows: i32 = 0,
     // More than 16 distinct grids can scroll in one redraw batch (many
     // external windows/floats). In that case flush derives the complete set
     // from the allocation-free per-grid scroll_notify_pending bits instead of
@@ -1651,8 +1652,8 @@ pub const Grid = struct {
         // session if grid_ids overlap.
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
-        self.main_scroll_notify_pending = false;
-        self.main_scroll_notify_rows = 0;
+        self.main_buf.scroll_notify_pending = false;
+        self.main_buf.scroll_notify_rows = 0;
 
         // Bump revs so any rev-equality short-circuit (e.g. last_sent_*
         // tracking on the Core side) cannot match the new session's
@@ -1946,43 +1947,29 @@ pub const Grid = struct {
     /// frontend rejection can restore exactly that instead of resending every
     /// row. Allocation happens on layout change only, never per flush.
     pub fn snapshotDirty(self: *const Grid, alloc: std.mem.Allocator, out: *DirtySnapshot) !void {
-        out.dirty_all = self.main_buf.dirty_all;
-        const len = self.main_buf.dirty_rows.bit_length;
-        if (out.rows.bit_length != len) {
-            out.rows.deinit(alloc);
-            out.rows = .{};
-            out.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
-        } else if (len != 0) {
-            out.rows.unsetAll();
-        }
-        if (len != 0) {
-            var it = self.main_buf.dirty_rows.iterator(.{});
-            while (it.next()) |bit| out.rows.set(bit);
-        }
+        try snapshotBufDirty(alloc, &self.main_buf, &out.main);
 
         var stale = out.subs.valueIterator();
         while (stale.next()) |sub| sub.live = false;
 
         var sg_it = self.sub_grids.iterator();
         while (sg_it.next()) |e| {
-            const buf = e.value_ptr;
             const gop = try out.subs.getOrPut(alloc, e.key_ptr.*);
             if (!gop.found_existing) gop.value_ptr.* = .{};
-            const sub = gop.value_ptr;
-            sub.live = true;
-            sub.dirty = buf.dirty;
-            sub.dirty_all = buf.dirty_all;
-            const sub_len = buf.dirty_rows.bit_length;
-            if (sub.rows.bit_length != sub_len) {
-                sub.rows.deinit(alloc);
-                sub.rows = .{};
-                sub.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, sub_len);
-            } else if (sub_len != 0) {
-                sub.rows.unsetAll();
+            gop.value_ptr.live = true;
+            try snapshotBufDirty(alloc, e.value_ptr, gop.value_ptr);
+        }
+        // Drop entries of destroyed grids: grid handles are never reused.
+        while (out.subs.count() > self.sub_grids.count()) {
+            var dead_id: ?i64 = null;
+            var dead_it = out.subs.iterator();
+            while (dead_it.next()) |e| {
+                if (e.value_ptr.live) continue;
+                dead_id = e.key_ptr.*;
+                break;
             }
-            if (sub_len == 0) continue;
-            var row_it = buf.dirty_rows.iterator(.{});
-            while (row_it.next()) |bit| sub.rows.set(bit);
+            var kv = out.subs.fetchRemove(dead_id orelse break).?;
+            kv.value.rows.deinit(alloc);
         }
     }
 
@@ -1990,32 +1977,43 @@ pub const Grid = struct {
     /// snapshot stay set: a rejected flush must resend what it consumed plus
     /// anything that changed afterwards.
     pub fn restoreDirty(self: *Grid, snapshot: *const DirtySnapshot) void {
-        if (snapshot.dirty_all) self.main_buf.dirty_all = true;
-        if (snapshot.rows.bit_length != 0 and self.main_buf.dirty_rows.bit_length != 0) {
-            const len = @min(snapshot.rows.bit_length, self.main_buf.dirty_rows.bit_length);
-            var it = snapshot.rows.iterator(.{});
-            while (it.next()) |bit| {
-                if (bit >= len) break;
-                self.main_buf.dirty_rows.set(bit);
-            }
-        }
+        restoreBufDirty(&self.main_buf, &snapshot.main);
 
         var sub_it = snapshot.subs.iterator();
         while (sub_it.next()) |e| {
-            const sub = e.value_ptr;
             // Absent at snapshot time, or destroyed since: a grid that reuses
             // the id starts fully dirty on its own account.
-            if (!sub.live) continue;
+            if (!e.value_ptr.live) continue;
             const buf = self.sub_grids.getPtr(e.key_ptr.*) orelse continue;
-            if (sub.dirty) buf.dirty = true;
-            if (sub.dirty_all) buf.dirty_all = true;
-            if (sub.rows.bit_length == 0 or buf.dirty_rows.bit_length == 0) continue;
-            const sub_len = @min(sub.rows.bit_length, buf.dirty_rows.bit_length);
-            var row_it = sub.rows.iterator(.{});
-            while (row_it.next()) |bit| {
-                if (bit >= sub_len) break;
-                buf.dirty_rows.set(bit);
-            }
+            restoreBufDirty(buf, e.value_ptr);
+        }
+    }
+
+    fn snapshotBufDirty(alloc: std.mem.Allocator, buf: *const GridBuf, out: *DirtySnapshot.SubDirty) !void {
+        out.dirty = buf.dirty;
+        out.dirty_all = buf.dirty_all;
+        const len = buf.dirty_rows.bit_length;
+        if (out.rows.bit_length != len) {
+            out.rows.deinit(alloc);
+            out.rows = .{};
+            out.rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, len);
+        } else if (len != 0) {
+            out.rows.unsetAll();
+        }
+        if (len == 0) return;
+        var it = buf.dirty_rows.iterator(.{});
+        while (it.next()) |bit| out.rows.set(bit);
+    }
+
+    fn restoreBufDirty(buf: *GridBuf, s: *const DirtySnapshot.SubDirty) void {
+        if (s.dirty) buf.dirty = true;
+        if (s.dirty_all) buf.dirty_all = true;
+        if (s.rows.bit_length == 0 or buf.dirty_rows.bit_length == 0) return;
+        const len = @min(s.rows.bit_length, buf.dirty_rows.bit_length);
+        var it = s.rows.iterator(.{});
+        while (it.next()) |bit| {
+            if (bit >= len) break;
+            buf.dirty_rows.set(bit);
         }
     }
 
@@ -2257,11 +2255,8 @@ pub const Grid = struct {
         if (placed.surface != 1) {
             // The root's damage is in its own rows (surfacePlacement).
             if (self.sub_grids.getPtr(placed.surface)) |asg| {
-                asg.dirty = true;
                 const local: i64 = placed.row + @as(i64, row);
-                if (local >= 0 and local < @as(i64, @intCast(asg.dirty_rows.bit_length))) {
-                    asg.dirty_rows.set(@intCast(local));
-                }
+                if (local >= 0 and local <= std.math.maxInt(u32)) asg.markDirtyRow(@intCast(local));
             }
             return;
         }
@@ -2404,13 +2399,9 @@ pub const Grid = struct {
         rows_in: i32,
         cols: i32,
     ) void {
-        var target_rows = self.rows;
-        var target_cols = self.cols;
-        if (grid_id != 1) {
-            const target = self.sub_grids.get(grid_id) orelse return;
-            target_rows = target.rows;
-            target_cols = target.cols;
-        }
+        const target = self.bufForConst(grid_id) orelse return;
+        const target_rows = target.rows;
+        const target_cols = target.cols;
         if (target_rows == 0 or target_cols == 0 or rows_in == 0) return;
 
         // Establish one normalized region/delta used by cells, overflow
@@ -2428,16 +2419,10 @@ pub const Grid = struct {
         if (rows > height_i32) rows = height_i32;
         if (rows < -height_i32) rows = -height_i32;
 
-        if (grid_id == 1) {
-            if (scrollChangesCells(self.rows, self.cols, top, bot, left, right, rows)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-        } else if (self.sub_grids.get(grid_id)) |sg| {
-            if ((self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) and
-                scrollChangesCells(sg.rows, sg.cols, top, bot, left, right, rows))
-            {
-                self.glyph_working_set_rev +%= 1;
-            }
+        if ((grid_id == 1 or self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) and
+            scrollChangesCells(target_rows, target_cols, top, bot, left, right, rows))
+        {
+            self.glyph_working_set_rev +%= 1;
         }
 
         // Advance cursor_rev if cursor is in scroll region (cursor text may change)
@@ -2508,8 +2493,7 @@ pub const Grid = struct {
                     const fp = fe.value_ptr.*;
                     if (fp.anchor_grid != grid_id) continue;
                     const fsg = self.sub_grids.get(fe.key_ptr.*) orelse continue;
-                    var fr: u32 = 0;
-                    while (fr < fsg.rows) : (fr += 1) self.dirtyCompositedRow(fp, fr);
+                    self.dirtyLayerBand(fp, fsg.rows);
                 }
             }
 
@@ -2524,13 +2508,11 @@ pub const Grid = struct {
     /// exactly the distance the content travelled, which the notification alone
     /// could not tell it.
     fn recordScrolledGrid(self: *Grid, grid_id: i64, rows_delta: i32) void {
-        if (grid_id == 1) {
-            self.main_scroll_notify_pending = true;
-            self.main_scroll_notify_rows +|= rows_delta;
-        } else if (self.sub_grids.getPtr(grid_id)) |sg| {
-            sg.scroll_notify_pending = true;
-            sg.scroll_notify_rows +|= rows_delta;
-            sg.row_scroll_notify_pending = true;
+        if (self.bufFor(grid_id)) |buf| {
+            buf.scroll_notify_pending = true;
+            buf.scroll_notify_rows +|= rows_delta;
+            // Grid 1 has no row-shift path.
+            if (grid_id != 1) buf.row_scroll_notify_pending = true;
         }
 
         // Check if already recorded
@@ -2552,14 +2534,13 @@ pub const Grid = struct {
     /// Zero for a grid with nothing pending, which is also what a caller that
     /// asks about an unknown grid gets.
     pub fn scrolledGridNotifyRows(self: *const Grid, grid_id: i64) i32 {
-        if (grid_id == 1) return self.main_scroll_notify_rows;
-        if (self.sub_grids.get(grid_id)) |sg| return sg.scroll_notify_rows;
-        return 0;
+        const buf = self.bufForConst(grid_id) orelse return 0;
+        return buf.scroll_notify_rows;
     }
 
     /// Whether this redraw batch carried a scroll on any grid.
     pub fn batchScrolled(self: *const Grid) bool {
-        return self.main_scroll_notify_pending or
+        return self.main_buf.scroll_notify_pending or
             self.scrolled_grid_count != 0 or
             self.scrolled_grid_overflow;
     }
@@ -2590,8 +2571,8 @@ pub const Grid = struct {
     pub fn clearScrolledGrids(self: *Grid) void {
         self.scrolled_grid_count = 0;
         self.scrolled_grid_overflow = false;
-        self.main_scroll_notify_pending = false;
-        self.main_scroll_notify_rows = 0;
+        self.main_buf.scroll_notify_pending = false;
+        self.main_buf.scroll_notify_rows = 0;
         var pos_it = self.win_pos.valueIterator();
         while (pos_it.next()) |pos| pos.moved_in_batch = false;
         var sg_it = self.sub_grids.valueIterator();
@@ -2607,12 +2588,9 @@ pub const Grid = struct {
     /// was not reached. In overflow mode the authoritative per-grid bits remain
     /// the source of truth; compacting still keeps diagnostics consistent.
     pub fn consumeScrolledGridNotification(self: *Grid, grid_id: i64) void {
-        if (grid_id == 1) {
-            self.main_scroll_notify_pending = false;
-            self.main_scroll_notify_rows = 0;
-        } else if (self.sub_grids.getPtr(grid_id)) |sg| {
-            sg.scroll_notify_pending = false;
-            sg.scroll_notify_rows = 0;
+        if (self.bufFor(grid_id)) |buf| {
+            buf.scroll_notify_pending = false;
+            buf.scroll_notify_rows = 0;
         }
 
         var index: usize = 0;
@@ -2680,6 +2658,9 @@ pub const Grid = struct {
             buf.deinit(self.alloc);
         }
         self.recordDestroyedGrid(grid_id);
+        // A scroll earlier in this batch must not reach the frontend as an
+        // on_grid_scroll for a grid that no longer exists.
+        self.consumeScrolledGridNotification(grid_id);
         self.clearOverflowForGrid(grid_id);
         _ = self.win_pos.remove(grid_id);
         _ = self.grid_win_ids.remove(grid_id);
@@ -3106,16 +3087,14 @@ pub const Grid = struct {
         // Neovim emits viewport metadata for a live grid. Ignore malformed
         // unknown IDs instead of creating an independently unbounded map that
         // bypasses the subgrid count and metadata budgets.
-        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) return;
+        const buf = self.bufForConst(grid_id) orelse return;
         // A movement larger than the window is a jump (gg, G, a tag jump), not
         // a scroll: Neovim documents scroll_delta as approximate past a screen,
         // nothing scrolled off the edge to retain, and a sub-cell offset cannot
         // smooth it anyway. Such a jump also invalidates any remainder still
         // waiting, so the running total restarts from it rather than carrying
         // a stale one that would later be reported as movement.
-        const window_rows: i64 = if (grid_id == 1)
-            @intCast(self.rows)
-        else if (self.sub_grids.get(grid_id)) |sg| @intCast(sg.rows) else 0;
+        const window_rows: i64 = buf.rows;
         const is_jump = window_rows > 0 and (scroll_delta > window_rows or scroll_delta < -window_rows);
         const previous = self.viewport.get(grid_id);
         const carried: i64 = if (is_jump)
@@ -3177,7 +3156,7 @@ pub const Grid = struct {
         // them here left that window's winbar row inside the scrollable area
         // for the rest of the session. Bounded by the same budget as the
         // sub-grid metadata it accompanies.
-        if (grid_id != 1 and !self.sub_grids.contains(grid_id)) {
+        if (self.bufForConst(grid_id) == null) {
             const inserts_new = !self.viewport_margins.contains(grid_id);
             if (!subgridInsertFits(self.viewport_margins.count(), inserts_new)) return;
             try self.viewport_margins.put(self.alloc, grid_id, .{
@@ -3216,12 +3195,7 @@ pub const Grid = struct {
         // harmless for composited grids, whose containing rows are dirtied
         // below so retained main/external-anchor row buffers are replaced.
         sg.markAllDirty();
-        if (self.win_pos.get(grid_id)) |p| {
-            var row: u32 = 0;
-            while (row < sg.rows) : (row += 1) {
-                self.dirtyCompositedRow(p, row);
-            }
-        }
+        if (self.win_pos.get(grid_id)) |p| self.dirtyLayerBand(p, sg.rows);
     }
 
     /// Get viewport margins for a grid. Returns default (all zeros) if not set.
@@ -3230,18 +3204,12 @@ pub const Grid = struct {
         // Clamped on the way out, not on the way in: margins can be kept for a
         // grid whose size has not arrived yet, and clamping them against a size
         // of zero would erase them permanently.
-        var rows = self.rows;
-        var cols = self.cols;
-        if (grid_id != 1) {
-            const sg = self.sub_grids.get(grid_id) orelse return .{};
-            rows = sg.rows;
-            cols = sg.cols;
-        }
+        const buf = self.bufForConst(grid_id) orelse return .{};
         return .{
-            .top = @min(stored.top, rows),
-            .bottom = @min(stored.bottom, rows),
-            .left = @min(stored.left, cols),
-            .right = @min(stored.right, cols),
+            .top = @min(stored.top, buf.rows),
+            .bottom = @min(stored.bottom, buf.rows),
+            .left = @min(stored.left, buf.cols),
+            .right = @min(stored.right, buf.cols),
         };
     }
 
@@ -4477,19 +4445,54 @@ test "scroll notification overflow retains main provenance across pending overwr
     grid.scrollGrid(1, 0, 3, 0, 3, 1, 0);
     grid.scrollGrid(18, 0, 3, 0, 3, 1, 0);
     try std.testing.expect(grid.scrolled_grid_overflow);
-    try std.testing.expect(grid.main_scroll_notify_pending);
+    try std.testing.expect(grid.main_buf.scroll_notify_pending);
     try std.testing.expect(grid.sub_grids.get(18).?.scroll_notify_pending);
 
     // A pre-dispatch retry discards row-shift state but must retain offset
     // notification provenance independently.
     var sg_it = grid.sub_grids.valueIterator();
     while (sg_it.next()) |sg| sg.clearScrollState();
-    try std.testing.expect(grid.main_scroll_notify_pending);
+    try std.testing.expect(grid.main_buf.scroll_notify_pending);
     try std.testing.expect(grid.sub_grids.get(18).?.scroll_notify_pending);
 
     grid.clearScrolledGrids();
-    try std.testing.expect(!grid.main_scroll_notify_pending);
+    try std.testing.expect(!grid.main_buf.scroll_notify_pending);
     try std.testing.expect(!grid.sub_grids.get(18).?.scroll_notify_pending);
+}
+
+test "a grid destroyed after its scroll leaves no scroll notification" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    try grid.resizeGrid(1, 3, 3);
+    try grid.resizeGrid(2, 3, 3);
+    try grid.setWinPos(2, 1000, 0, 0);
+    try grid.resizeGrid(3, 3, 3);
+    try grid.setWinPos(3, 1001, 0, 0);
+    grid.scrollGrid(2, 0, 3, 0, 3, 1, 0);
+    grid.scrollGrid(3, 0, 3, 0, 3, 1, 0);
+
+    try grid.destroyGrid(2);
+    try std.testing.expectEqual(@as(u8, 1), grid.scrolled_grid_count);
+    try std.testing.expectEqual(@as(i64, 3), grid.scrolled_grid_ids[0]);
+}
+
+test "the dirty snapshot forgets destroyed grids" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var snapshot = DirtySnapshot{};
+    defer snapshot.deinit(std.testing.allocator);
+
+    try grid.resizeGrid(1, 3, 3);
+    try grid.resizeGrid(2, 3, 3);
+    try grid.resizeGrid(3, 3, 3);
+    try grid.snapshotDirty(std.testing.allocator, &snapshot);
+    try std.testing.expectEqual(@as(u32, 2), snapshot.subs.count());
+
+    try grid.destroyGrid(3);
+    try grid.snapshotDirty(std.testing.allocator, &snapshot);
+    try std.testing.expectEqual(@as(u32, 1), snapshot.subs.count());
+    try std.testing.expect(snapshot.subs.contains(2));
 }
 
 test "every status channel stores, replaces and dirties independently" {

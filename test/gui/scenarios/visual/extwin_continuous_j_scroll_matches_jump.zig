@@ -44,7 +44,6 @@ const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_extwin_j_scroll.log";
-const max_windows = 16;
 
 /// Rows to walk past the bottom. Enough that a mark left one row behind shows
 /// as a band rather than a single stray line.
@@ -105,8 +104,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         \\setline(1, map(range(1, 400), {_, i -> printf('%3d %s', i, repeat(nr2char(65 + i % 26), 60))}))
     );
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     var cmd_buf: [256]u8 = undefined;
     const open_cmd = try std.fmt.bufPrint(
@@ -115,7 +113,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ ext_cols, ext_rows },
     );
     try g.exec(open_cmd);
-    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     // Start with the cursor on the last visible row, so every `j` scrolls.

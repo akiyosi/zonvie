@@ -28,7 +28,6 @@ const gui_io = @import("../../gui_io.zig");
 const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_extwin_float_trackpad_scroll.log";
-const max_windows = 16;
 
 /// The float's placement inside the 60x20 host. The driver's trackpad gesture
 /// lands on the host window's centre (roughly host row 10, col 30), so the
@@ -48,8 +47,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     const before_count = before.len;
 
     // The host: an ordinary editor window given a window of its own, with far
@@ -58,7 +56,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 400 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // The float, likewise longer than it shows: a float whose content fits is
@@ -105,7 +103,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         );
         return error.HostWindowLostKeyToMain;
     }
-    const window_count = platform.windowsForPid(g.app_pid, &before_buf);
+    const window_count = driver.snapshotWindows(g.app_pid).len;
     if (window_count != before_count + 1) {
         std.debug.print(
             "[gui] expected the float to be composited into the external window, but the app has {d} windows (was {d} plus the anchor)\n",

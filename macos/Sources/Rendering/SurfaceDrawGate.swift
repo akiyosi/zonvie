@@ -608,6 +608,37 @@ func fastScrollThresholdPt(
     return rowHeightPx * Double(rows) / scale
 }
 
+/// The surface-wide reasons no GPU scroll blit may run this frame, shared by
+/// both surfaces. Each surface adds its own per-layer or per-surface terms.
+struct SurfaceScrollBlitGate {
+    var hasPresentedOnce: Bool
+    var smoothScrolling: Bool
+    var drawableSizeChanged: Bool
+    var hasNewCommit: Bool
+    var glowEnabled: Bool
+    var blurEnabled: Bool
+    var useTwoPass: Bool
+
+    /// The first reason that refuses a blit, or nil when one may run.
+    var refusal: String? {
+        // The back texture's pixels are not a previous frame yet.
+        if !hasPresentedOnce { return "presented" }
+        // An eased frame's pixels are already shifted by the shader offset;
+        // shifting them again is the 1-row jitter.
+        if smoothScrolling { return "smooth" }
+        // No previous pixels at these coordinates, or no new commit and so no
+        // remapped row slots to shift.
+        if drawableSizeChanged || !hasNewCommit { return "resize" }
+        // Bloom composites the whole back texture and forces .clear, which
+        // erases anything the blit moved.
+        if glowEnabled { return "glow" }
+        // Blur's partial redraw needs the overwrite-background and alpha-glyph
+        // pipelines; fail closed to a full redraw.
+        if blurEnabled && !useTwoPass { return "blur" }
+        return nil
+    }
+}
+
 /// Settle a surface's frame-side scroll state against ITS OWN commit, and
 /// take the hold its committed snapshot is read under. Returns with `lock`
 /// held.

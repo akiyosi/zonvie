@@ -24,7 +24,6 @@ const Gui = driver.Gui;
 const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_mini_hosted_anchor.log";
-const max_windows = 16;
 
 /// The OS window numbers the app says are minis, from `[mini_window]`.
 fn miniWindowNumbers(alloc: std.mem.Allocator, since_ms: f64, out: *std.AutoHashMap(u32, void)) !void {
@@ -74,8 +73,8 @@ fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !vo
     g.activateApp();
     gui_io.sleepNs(700 * std.time.ns_per_ms);
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
     const main_b = platform.mainWindowBoundsForPid(g.app_pid) orelse return error.MainWindowNotFound;
 
     // An external window, and a float anchored inside it with searchable
@@ -102,11 +101,10 @@ fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !vo
     // size rather than by total: the app's own small overlays (a showcmd mini,
     // 122x13 here) come and go on their own, and a window of the float's size
     // is what "it got its own" would look like.
-    var now_buf: [max_windows]platform.MainWindow = undefined;
     {
-        const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+        const now = driver.snapshotWindows(g.app_pid);
         var big: usize = 0;
-        for (now) |w| {
+        for (now.slice()) |w| {
             if (w.bounds.w >= 150 and w.bounds.h >= 100) big += 1;
         }
         var big_before: usize = 0;
@@ -134,7 +132,8 @@ fn check(alloc: std.mem.Allocator, config_dir: []const u8, mode: []const u8) !vo
     while (true) {
         if (timer.read() / std.time.ns_per_ms >= 10_000) return error.Timeout;
 
-        const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+        const now_snap = driver.snapshotWindows(g.app_pid);
+        const now = now_snap.slice();
         try miniWindowNumbers(alloc, t_search, &minis);
 
         var found = false;

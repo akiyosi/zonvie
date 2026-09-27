@@ -64,6 +64,89 @@ fn emSizePxForPointSize(dpi: u32, point_size: f32) f32 {
     return point_size * @as(f32, @floatFromInt(dpi)) / 72.0;
 }
 
+const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
+
+/// en-us IDWriteTextFormat for `name_w` at `size_px`; null on failure.
+fn createTextFormat(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bool, italic: bool, size_px: f32) ?*c.IDWriteTextFormat {
+    const create_fn = factory.lpVtbl.*.CreateTextFormat orelse return null;
+    var fmt: ?*c.IDWriteTextFormat = null;
+    const hr = create_fn(
+        factory,
+        name_w,
+        null,
+        if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
+        if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
+        c.DWRITE_FONT_STRETCH_NORMAL,
+        size_px,
+        std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
+        &fmt,
+    );
+    if (hr != 0) {
+        safeRelease(fmt);
+        return null;
+    }
+    return fmt;
+}
+
+/// Design advances of `gids` at `em_size_px`, as 26.6 pixels. False when the
+/// face has no usable metrics; the caller then uses the cell width.
+fn designAdvances26_6(face: *c.IDWriteFontFace, em_size_px: f32, gids: []const c.UINT16, out_adv: []i32) bool {
+    std.debug.assert(gids.len <= 128 and out_adv.len >= gids.len);
+    const fvtbl = face.lpVtbl.*;
+    const get_fm_fn = fvtbl.GetMetrics orelse return false;
+    const get_gm_fn = fvtbl.GetDesignGlyphMetrics orelse return false;
+    var fm: c.DWRITE_FONT_METRICS = undefined;
+    get_fm_fn(face, &fm);
+    if (fm.designUnitsPerEm == 0) return false;
+    var gm: [128]c.DWRITE_GLYPH_METRICS = undefined;
+    if (c.FAILED(get_gm_fn(face, gids.ptr, @intCast(gids.len), &gm, c.FALSE))) return false;
+    const scale: f32 = em_size_px / @as(f32, @floatFromInt(fm.designUnitsPerEm)) * 64.0;
+    for (gm[0..gids.len], out_adv[0..gids.len]) |m, *adv| {
+        adv.* = @intFromFloat(@as(f32, @floatFromInt(m.advanceWidth)) * scale);
+    }
+    return true;
+}
+
+/// First system-collection face of family `name_w` matching the weight and
+/// slant; null when the family or a matching face is missing.
+fn matchFontFace(factory: *c.IDWriteFactory, name_w: [*:0]const u16, bold: bool, italic: bool) ?*c.IDWriteFontFace {
+    var sys_fc: ?*c.IDWriteFontCollection = null;
+    const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse return null;
+    if (c.FAILED(get_fc_fn(factory, &sys_fc, c.FALSE)) or sys_fc == null) return null;
+    defer safeRelease(sys_fc);
+    const fc = sys_fc.?;
+
+    var index: u32 = 0;
+    var exists: c.BOOL = c.FALSE;
+    const find_fn = fc.lpVtbl.*.FindFamilyName orelse return null;
+    if (c.FAILED(find_fn(fc, name_w, &index, &exists)) or exists == c.FALSE) return null;
+
+    var family: ?*c.IDWriteFontFamily = null;
+    const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return null;
+    if (c.FAILED(get_family_fn(fc, index, &family)) or family == null) return null;
+    defer safeRelease(family);
+
+    var font: ?*c.IDWriteFont = null;
+    const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse return null;
+    const hr_font = get_first_fn(
+        family.?,
+        if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
+        c.DWRITE_FONT_STRETCH_NORMAL,
+        if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
+        &font,
+    );
+    if (c.FAILED(hr_font) or font == null) return null;
+    defer safeRelease(font);
+
+    var face: ?*c.IDWriteFontFace = null;
+    const create_face_fn = font.?.lpVtbl.*.CreateFontFace orelse return null;
+    if (c.FAILED(create_face_fn(font.?, &face))) {
+        safeRelease(face);
+        return null;
+    }
+    return face;
+}
+
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     hwnd: c.HWND,
@@ -92,6 +175,9 @@ pub const Renderer = struct {
     has_color_tables: ?bool = null,
     font_em_size: f32 = 14.0,
     emoji_font_size: f32 = 0, // scaled em size for Segoe UI Emoji (0 = not yet computed)
+    // Regular Segoe UI Emoji format at emoji_font_size; released with every
+    // emoji_font_size reset.
+    emoji_text_format: ?*c.IDWriteTextFormat = null,
     base_point_size: f32 = 14.0, // original point size before DPI scaling
     // Base font weight/slant chosen via the font picker (`:set guifont=*`).
     // Normally regular; a picked Bold/Italic face sets these so the base font
@@ -113,9 +199,6 @@ pub const Renderer = struct {
     il: ?*c.ID3D11InputLayout = null,
     sampler: ?*c.ID3D11SamplerState = null,
     blend: ?*c.ID3D11BlendState = null,
-
-    // VS constants (viewport transform)
-    vs_cb: ?*c.ID3D11Buffer = null,
 
     // Glyph cache: scalar -> entry (aligned with core types)
     // Styled glyph cache: (scalar | (style_flags << 21)) -> entry
@@ -432,12 +515,12 @@ pub const Renderer = struct {
         self.glyph_tmp.deinit(self.alloc);
         self.pending_uploads.deinit(self.alloc);
 
-        safeRelease(self.vs_cb);
         safeRelease(self.blend);
         safeRelease(self.sampler);
 
         safeRelease(self.text_analyzer);
         safeRelease(self.text_format);
+        safeRelease(self.emoji_text_format);
         safeRelease(self.font_face);
         safeRelease(self.bold_font_face);
         safeRelease(self.italic_font_face);
@@ -574,18 +657,10 @@ pub const Renderer = struct {
     /// Uses DWrite TextLayout to measure the actual line height, then scales down
     /// if the emoji font's metrics exceed the cell height.
     fn computeEmojiFontSize(self: *Renderer, dwrite_factory: *c.IDWriteFactory, cell_h_f: f32) f32 {
-        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
-        const locale: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("en-us");
-
         // Create a temporary text format at font_em_size to measure
-        var tmp_fmt: ?*c.IDWriteTextFormat = null;
-        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return self.font_em_size;
-        const hr_tf = create_tf(dwrite_factory, emoji_font_name, null, c.DWRITE_FONT_WEIGHT_NORMAL, c.DWRITE_FONT_STYLE_NORMAL, c.DWRITE_FONT_STRETCH_NORMAL, self.font_em_size, locale, &tmp_fmt);
-        if (hr_tf != 0 or tmp_fmt == null) return self.font_em_size;
-        defer {
-            const base: *c.IUnknown = @ptrCast(tmp_fmt.?);
-            _ = base.lpVtbl.*.Release.?(base);
-        }
+        const tmp_fmt = createTextFormat(dwrite_factory, emoji_font_name, false, false, self.font_em_size);
+        if (tmp_fmt == null) return self.font_em_size;
+        defer safeRelease(tmp_fmt);
 
         // Measure a sample emoji character
         const sample: [2]c.WCHAR = .{ 0xD83D, 0xDE01 }; // U+1F601 😁
@@ -613,7 +688,7 @@ pub const Renderer = struct {
     /// D2D color emoji rendering: render a Unicode scalar (or cluster) via D2D
     /// DrawTextW into a 32-bit BGRA DIB section, then copy to glyph_tmp as RGBA.
     /// Returns true if color emoji was successfully rendered.
-    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
+    fn rasterizeColorEmojiGDI(self: *Renderer, scalar: u32, fallback_style: u32, corep: ?*core.zonvie_core, out_bitmap: *core.GlyphBitmap) bool {
         // Use oversized buffer so emoji glyphs are not clipped.
         // Emoji fonts often render taller than the cell height (ascent + descent
         // can exceed em size). The actual glyph bounds are scanned afterwards and
@@ -653,8 +728,10 @@ pub const Renderer = struct {
                 .format = c.DXGI_FORMAT_B8G8R8A8_UNORM,
                 .alphaMode = c.D2D1_ALPHA_MODE_PREMULTIPLIED,
             },
-            .dpiX = 0,
-            .dpiY = 0,
+            // 96 so DIPs are device pixels: emoji_font_size and the layout
+            // rect below are already in pixels.
+            .dpiX = 96,
+            .dpiY = 96,
             .usage = c.D2D1_RENDER_TARGET_USAGE_NONE,
             .minLevel = c.D2D1_FEATURE_LEVEL_DEFAULT,
         };
@@ -681,25 +758,22 @@ pub const Renderer = struct {
             self.emoji_font_size = self.computeEmojiFontSize(dwrite_factory, cell_h_f);
         }
 
-        const emoji_font_name: [*:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI Emoji");
-        var text_format: ?*c.IDWriteTextFormat = null;
-        const create_tf = dwrite_factory.lpVtbl.*.CreateTextFormat orelse return false;
-        const hr_tf = create_tf(
-            dwrite_factory,
-            emoji_font_name,
-            null, // font collection (system default)
-            c.DWRITE_FONT_WEIGHT_NORMAL,
-            c.DWRITE_FONT_STYLE_NORMAL,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            self.emoji_font_size,
-            std.unicode.utf8ToUtf16LeStringLiteral("en-us"),
-            &text_format,
-        );
-        if (hr_tf != 0 or text_format == null) return false;
-        defer {
-            const base: *c.IUnknown = @ptrCast(text_format.?);
-            _ = base.lpVtbl.*.Release.?(base);
-        }
+        // A styled notdef fallback keeps its run's weight and slant; everything
+        // else shares the cached regular format.
+        const fb_bold = (fallback_style & STYLE_BOLD) != 0;
+        const fb_italic = (fallback_style & STYLE_ITALIC) != 0;
+        var styled_format: ?*c.IDWriteTextFormat = null;
+        defer safeRelease(styled_format);
+        const text_format: ?*c.IDWriteTextFormat = if (fb_bold or fb_italic) blk: {
+            styled_format = createTextFormat(dwrite_factory, emoji_font_name, fb_bold, fb_italic, self.emoji_font_size);
+            break :blk styled_format;
+        } else blk: {
+            if (self.emoji_text_format == null) {
+                self.emoji_text_format = createTextFormat(dwrite_factory, emoji_font_name, false, false, self.emoji_font_size);
+            }
+            break :blk self.emoji_text_format;
+        };
+        if (text_format == null) return false;
 
         // Convert cluster scalars to UTF-16.
         // If flush set a multi-scalar cluster context, use the full cluster;
@@ -1004,8 +1078,10 @@ pub const Renderer = struct {
         var emoji_cl_len: u8 = 0;
         _ = core.zonvie_core_get_emoji_cluster(corep, &emoji_cl_len);
         const non_ascii = scalar > 0x7F;
-        const gdi_first = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0 or (glyph_index == 0 and non_ascii);
-        if (gdi_first and self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
+        const is_emoji = core.flush_mod.isEmojiPresentation(scalar) or emoji_cl_len > 0;
+        const gdi_first = is_emoji or (glyph_index == 0 and non_ascii);
+        const fallback_style: u32 = if (is_emoji) 0 else style_flags;
+        if (gdi_first and self.rasterizeColorEmojiGDI(scalar, fallback_style, corep, out_bitmap)) return;
 
         // The by-scalar path always retries an empty ClearType bound as
         // aliased, then falls back to GDI colour emoji before giving up.
@@ -1014,7 +1090,7 @@ pub const Renderer = struct {
             // DWrite produced an empty bitmap. For non-ASCII scalars this may
             // be a colour emoji that DWrite ClearType/aliased cannot render.
             if (!gdi_first and non_ascii) {
-                if (self.rasterizeColorEmojiGDI(scalar, corep, out_bitmap)) return;
+                if (self.rasterizeColorEmojiGDI(scalar, 0, corep, out_bitmap)) return;
             }
             // Empty glyph (space etc.)
             out_bitmap.pixels = null;
@@ -1286,9 +1362,6 @@ pub const Renderer = struct {
 
         if (self.dwrite_factory == null) return error.NotInitialized;
 
-        const dw_weight: c.DWRITE_FONT_WEIGHT = if (bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL;
-        const dw_style: c.DWRITE_FONT_STYLE = if (italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL;
-
         // DPI scaling: scale point size to physical pixels
         const scaled_size: f32 = emSizePxForPointSize(self.dpi, point_size);
 
@@ -1318,64 +1391,12 @@ pub const Renderer = struct {
         errdefer safeRelease(new_face);
 
         // CreateTextFormat (scaled for DPI)
-        const vtbl = factory.lpVtbl.*;
-        const create_fn = vtbl.CreateTextFormat orelse return error.DWriteFactoryMissingCreateTextFormat;
-
-        const hr = create_fn(
-            factory,
-            @ptrCast(name_w.ptr),
-            null,
-            dw_weight,
-            dw_style,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            scaled_size,
-            @ptrCast(L("en-us")),
-            &new_fmt,
-        );
-        if (hr != 0 or new_fmt == null) return error.DWriteCreateTextFormatFailed;
+        new_fmt = createTextFormat(factory, @ptrCast(name_w.ptr), bold, italic, scaled_size) orelse
+            return error.DWriteCreateTextFormatFailed;
 
         // Build font_face from system font collection using the same family name.
-        var sys_fc: ?*c.IDWriteFontCollection = null;
-        const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse
-            return error.DWriteFactoryMissingGetSystemFontCollection;
-
-        const hr_fc = get_fc_fn(factory, &sys_fc, c.FALSE);
-        if (c.FAILED(hr_fc) or sys_fc == null) return error.DWriteGetSystemFontCollectionFailed;
-        defer safeRelease(sys_fc);
-
-        const fc = sys_fc.?;
-
-        var index: u32 = 0;
-        var exists: c.BOOL = c.FALSE;
-        const find_fn = fc.lpVtbl.*.FindFamilyName orelse return error.DWriteFontCollectionMissingFindFamilyName;
-
-        const hr_find = find_fn(fc, @ptrCast(name_w.ptr), &index, &exists);
-        if (c.FAILED(hr_find) or exists == c.FALSE) return error.DWriteFamilyNotFound;
-
-        var family: ?*c.IDWriteFontFamily = null;
-        const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return error.DWriteFontCollectionMissingGetFontFamily;
-
-        const hr_fam = get_family_fn(fc, index, &family);
-        if (c.FAILED(hr_fam) or family == null) return error.DWriteGetFontFamilyFailed;
-        defer safeRelease(family);
-
-        var font: ?*c.IDWriteFont = null;
-        const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse
-            return error.DWriteFontFamilyMissingGetFirstMatchingFont;
-
-        const hr_font = get_first_fn(
-            family.?,
-            dw_weight,
-            c.DWRITE_FONT_STRETCH_NORMAL,
-            dw_style,
-            &font,
-        );
-        if (c.FAILED(hr_font) or font == null) return error.DWriteGetFontFailed;
-        defer safeRelease(font);
-
-        const create_face_fn = font.?.lpVtbl.*.CreateFontFace orelse return error.DWriteFontMissingCreateFontFace;
-        const hr_face = create_face_fn(font.?, &new_face);
-        if (c.FAILED(hr_face) or new_face == null) return error.DWriteCreateFontFaceFailed;
+        new_face = matchFontFace(factory, @ptrCast(name_w.ptr), bold, italic) orelse
+            return error.DWriteFontFaceNotFound;
 
         // NOTE: Bold/Italic/Bold+Italic font variants are created eagerly
         // via ensureStyledFontFaces() at the end of this function.
@@ -1414,6 +1435,8 @@ pub const Renderer = struct {
 
         self.font_em_size = scaled_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
+        safeRelease(self.emoji_text_format);
+        self.emoji_text_format = null;
         self.base_point_size = point_size;
         self.base_bold = bold;
         self.base_italic = italic;
@@ -1443,17 +1466,6 @@ pub const Renderer = struct {
             self.font_face = self.withUserAxes(face);
             self.base_face_varied = self.font_face != face;
         }
-        // Ensure text analyzer is available when features are set
-        if (self.font_feature_count > 0 and self.text_analyzer == null) {
-            const dw_factory = self.dwrite_factory orelse return error.NotInitialized;
-            var analyzer: ?*c.IDWriteTextAnalyzer = null;
-            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return error.DWriteFactoryMissingCreateTextAnalyzer;
-            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
-            if (!c.FAILED(hr_ta) and analyzer != null) {
-                self.text_analyzer = analyzer;
-            }
-        }
-
         try self.recomputeCellMetrics();
 
         // Invalidate GSUB lig trigger cache (font faces changed).
@@ -1495,14 +1507,28 @@ pub const Renderer = struct {
         }
     }
 
+    /// The shared IDWriteTextAnalyzer, created on first use. Caller holds mu.
+    fn ensureTextAnalyzerLocked(self: *Renderer) ?*c.IDWriteTextAnalyzer {
+        if (self.text_analyzer) |a| return a;
+        const dw_factory = self.dwrite_factory orelse return null;
+        const create_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return null;
+        var analyzer: ?*c.IDWriteTextAnalyzer = null;
+        if (c.FAILED(create_fn(dw_factory, &analyzer))) {
+            safeRelease(analyzer);
+            return null;
+        }
+        self.text_analyzer = analyzer;
+        return analyzer;
+    }
+
     /// Get glyph index for a scalar, applying OpenType features if set.
     /// Falls back to GetGlyphIndicesW when no features or analyzer unavailable.
     fn getGlyphIndexForScalar(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
-        if (self.font_feature_count > 0 and self.text_analyzer != null) {
-            if (self.getGlyphIndexViaAnalyzer(face, scalar)) |gid| {
+        if (self.font_feature_count > 0) if (self.ensureTextAnalyzerLocked()) |analyzer| {
+            if (self.getGlyphIndexViaAnalyzer(analyzer, face, scalar)) |gid| {
                 return gid;
             } else |_| {}
-        }
+        };
 
         // Default path: direct cmap lookup (no features)
         const fvtbl = face.lpVtbl.*;
@@ -1515,8 +1541,7 @@ pub const Renderer = struct {
     }
 
     /// Use IDWriteTextAnalyzer::GetGlyphs to get feature-aware glyph index.
-    fn getGlyphIndexViaAnalyzer(self: *Renderer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
-        const analyzer = self.text_analyzer orelse return error.NoTextAnalyzer;
+    fn getGlyphIndexViaAnalyzer(self: *Renderer, analyzer: *c.IDWriteTextAnalyzer, face: *c.IDWriteFontFace, scalar: u32) !c.UINT16 {
         const atbl = analyzer.lpVtbl.*;
 
         var text_buf: [2]c.WCHAR = undefined;
@@ -1624,101 +1649,15 @@ pub const Renderer = struct {
         self.styled_fonts_initialized = true;
 
         const factory = self.dwrite_factory orelse return;
-
-        // Get system font collection
-        var sys_fc: ?*c.IDWriteFontCollection = null;
-        const get_fc_fn = factory.lpVtbl.*.GetSystemFontCollection orelse return;
-        const hr_fc = get_fc_fn(factory, &sys_fc, c.FALSE);
-        if (c.FAILED(hr_fc) or sys_fc == null) return;
-        defer safeRelease(sys_fc);
-
-        const fc = sys_fc.?;
-
-        // Find font family by name
-        var index: u32 = 0;
-        var exists: c.BOOL = c.FALSE;
-        const find_fn = fc.lpVtbl.*.FindFamilyName orelse return;
-        const hr_find = find_fn(fc, @ptrCast(&self.font_name), &index, &exists);
-        if (c.FAILED(hr_find) or exists == c.FALSE) return;
-
-        var family: ?*c.IDWriteFontFamily = null;
-        const get_family_fn = fc.lpVtbl.*.GetFontFamily orelse return;
-        const hr_fam = get_family_fn(fc, index, &family);
-        if (c.FAILED(hr_fam) or family == null) return;
-        defer safeRelease(family);
-
-        const get_first_fn = family.?.lpVtbl.*.GetFirstMatchingFont orelse return;
-
-        // Bold variant
-        {
-            var bold_font: ?*c.IDWriteFont = null;
-            const hr_bold = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_BOLD,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_NORMAL,
-                &bold_font,
-            );
-            if (!c.FAILED(hr_bold) and bold_font != null) {
-                const cf = bold_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_bold_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(bold_font.?, &new_bold_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.bold_font_face = if (new_bold_face) |bf| self.withUserAxes(bf) else null;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(bold_font);
-            }
-        }
-
-        // Italic variant
-        {
-            var italic_font: ?*c.IDWriteFont = null;
-            const hr_italic = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_NORMAL,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_ITALIC,
-                &italic_font,
-            );
-            if (!c.FAILED(hr_italic) and italic_font != null) {
-                const cf = italic_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_italic_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(italic_font.?, &new_italic_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.italic_font_face = if (new_italic_face) |itf| self.withUserAxes(itf) else null;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Italic font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(italic_font);
-            }
-        }
-
-        // Bold+Italic variant
-        {
-            var bold_italic_font: ?*c.IDWriteFont = null;
-            const hr_bi = get_first_fn(
-                family.?,
-                c.DWRITE_FONT_WEIGHT_BOLD,
-                c.DWRITE_FONT_STRETCH_NORMAL,
-                c.DWRITE_FONT_STYLE_ITALIC,
-                &bold_italic_font,
-            );
-            if (!c.FAILED(hr_bi) and bold_italic_font != null) {
-                const cf = bold_italic_font.?.lpVtbl.*.CreateFontFace orelse null;
-                if (cf) |make_face_fn| {
-                    var new_bold_italic_face: ?*c.IDWriteFontFace = null;
-                    const hr_cf = make_face_fn(bold_italic_font.?, &new_bold_italic_face);
-                    if (!c.FAILED(hr_cf)) {
-                        self.bold_italic_font_face = if (new_bold_italic_face) |bif| self.withUserAxes(bif) else null;
-                        if (applog.isEnabled()) applog.appLog("[dwrite] Bold+Italic font face created (lazy)\n", .{});
-                    }
-                }
-                safeRelease(bold_italic_font);
-            }
+        const Variant = struct { bold: bool, italic: bool, slot: *?*c.IDWriteFontFace };
+        const variants = [_]Variant{
+            .{ .bold = true, .italic = false, .slot = &self.bold_font_face },
+            .{ .bold = false, .italic = true, .slot = &self.italic_font_face },
+            .{ .bold = true, .italic = true, .slot = &self.bold_italic_font_face },
+        };
+        for (variants) |v| {
+            const face = matchFontFace(factory, @ptrCast(&self.font_name), v.bold, v.italic) orelse continue;
+            v.slot.* = self.withUserAxes(face);
         }
     }
 
@@ -1804,10 +1743,14 @@ pub const Renderer = struct {
         self.dpi = new_dpi;
         if (applog.isEnabled()) applog.appLog("[d2d] DPI changed: {d} -> {d}\n", .{ old_dpi, new_dpi });
 
-        // Re-scale font_em_size and metrics proportionally
-        const scale: f32 = @as(f32, @floatFromInt(new_dpi)) / @as(f32, @floatFromInt(old_dpi));
-        self.font_em_size *= scale;
+        // Assign the em size exactly as setFontUtf8WithStyle computes it, so its
+        // unchanged-font early return still matches after a DPI round trip.
+        const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
+        const scale: f32 = if (self.font_em_size > 0) new_font_size / self.font_em_size else 1.0;
+        self.font_em_size = new_font_size;
         self.emoji_font_size = 0; // reset: will be recomputed on next emoji render
+        safeRelease(self.emoji_text_format);
+        self.emoji_text_format = null;
         self.ascent_px *= scale;
         self.descent_px *= scale;
 
@@ -1816,27 +1759,8 @@ pub const Renderer = struct {
             safeRelease(self.text_format);
             self.text_format = null;
 
-            const factory = self.dwrite_factory.?;
-            const vtbl = factory.lpVtbl.*;
-            if (vtbl.CreateTextFormat) |create_fn| {
-                const new_font_size: f32 = emSizePxForPointSize(new_dpi, self.base_point_size);
-                var new_fmt: ?*c.IDWriteTextFormat = null;
-                const hr = create_fn(
-                    factory,
-                    @ptrCast(&self.font_name),
-                    null,
-                    // The picked base style, as setFontUtf8WithStyle measures it.
-                    if (self.base_bold) c.DWRITE_FONT_WEIGHT_BOLD else c.DWRITE_FONT_WEIGHT_NORMAL,
-                    if (self.base_italic) c.DWRITE_FONT_STYLE_ITALIC else c.DWRITE_FONT_STYLE_NORMAL,
-                    c.DWRITE_FONT_STRETCH_NORMAL,
-                    new_font_size,
-                    @ptrCast(L("en-us")),
-                    &new_fmt,
-                );
-                if (hr == 0 and new_fmt != null) {
-                    self.text_format = new_fmt;
-                }
-            }
+            // The picked base style, as setFontUtf8WithStyle measures it.
+            self.text_format = createTextFormat(self.dwrite_factory.?, @ptrCast(&self.font_name), self.base_bold, self.base_italic, new_font_size);
         }
 
         // Re-compute cell metrics with new TextFormat
@@ -1921,23 +1845,47 @@ pub const Renderer = struct {
 
         const face = self.selectFontFace(style_flags) orelse return 0;
 
-        // For very long runs that exceed the stack-allocated shaping buffers,
-        // fall back to per-codepoint glyph lookup (correct rendering, no ligatures/kerning).
-        // This avoids returning 0 which would trigger the slower per-cell path in the core.
-        if (scalar_count > SHAPE_MAX_SCALARS) {
-            return self.shapeFallbackPerCodepoint(face, scalars, scalar_count, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+        // Runs longer than the stack shaping buffers are shaped in chunks cut
+        // after a space, so features and ligatures still apply. A failed
+        // chunk of a long run falls back to per-codepoint lookup rather than
+        // returning 0 (the core's slower per-cell path).
+        var total: usize = 0;
+        var start: usize = 0;
+        while (start < scalar_count) {
+            const len = render_pipeline_helpers.shapeChunkLen(scalars[start..scalar_count], SHAPE_MAX_SCALARS);
+            const cap = out_cap -| total;
+            const n = self.shapeChunkLocked(face, scalars + start, len, out_glyph_ids + @min(total, out_cap), out_clusters + @min(total, out_cap), out_x_advance + @min(total, out_cap), out_x_offset + @min(total, out_cap), out_y_offset + @min(total, out_cap), cap);
+            if (n == 0) {
+                if (scalar_count <= SHAPE_MAX_SCALARS) return 0;
+                return self.shapeFallbackPerCodepoint(face, scalars, scalar_count, out_glyph_ids, out_clusters, out_x_advance, out_x_offset, out_y_offset, out_cap);
+            }
+            // The chunk's clusters are chunk-relative; a count over `cap`
+            // left the buffers unfilled and only adds to the total.
+            if (n <= cap) {
+                for (out_clusters[total..][0..n]) |*cl| cl.* += @intCast(start);
+            }
+            total += n;
+            start += len;
         }
+        return total;
+    }
 
-        // Ensure text analyzer exists (create lazily if needed)
-        if (self.text_analyzer == null) {
-            const dw_factory = self.dwrite_factory orelse return 0;
-            var analyzer: ?*c.IDWriteTextAnalyzer = null;
-            const create_analyzer_fn = dw_factory.lpVtbl.*.CreateTextAnalyzer orelse return 0;
-            const hr_ta = create_analyzer_fn(dw_factory, &analyzer);
-            if (c.FAILED(hr_ta) or analyzer == null) return 0;
-            self.text_analyzer = analyzer;
-        }
-        const analyzer = self.text_analyzer orelse return 0;
+    /// shapeTextRunDWrite for one run of at most SHAPE_MAX_SCALARS scalars,
+    /// with clusters relative to `scalars`. Caller holds mu.
+    fn shapeChunkLocked(
+        self: *Renderer,
+        face: *c.IDWriteFontFace,
+        scalars: [*]const u32,
+        scalar_count: usize,
+        out_glyph_ids: [*]u32,
+        out_clusters: [*]u32,
+        out_x_advance: [*]i32,
+        out_x_offset: [*]i32,
+        out_y_offset: [*]i32,
+        out_cap: usize,
+    ) usize {
+        std.debug.assert(scalar_count > 0 and scalar_count <= SHAPE_MAX_SCALARS);
+        const analyzer = self.ensureTextAnalyzerLocked() orelse return 0;
 
         // --- 1) Convert UTF-32 scalars → UTF-16 ---
         var utf16_buf: [SHAPE_MAX_UTF16]c.WCHAR = undefined;
@@ -2072,7 +2020,7 @@ pub const Renderer = struct {
         return gcount;
     }
 
-    /// Per-codepoint glyph fallback for runs exceeding SHAPE_MAX_SCALARS.
+    /// Per-codepoint glyph fallback for a run whose shaping failed.
     /// Returns 1:1 glyph mapping with correct advances but no multi-glyph shaping.
     /// Must be called with self.mu locked.
     fn shapeFallbackPerCodepoint(
@@ -2089,62 +2037,26 @@ pub const Renderer = struct {
     ) usize {
         if (scalar_count > out_cap) return scalar_count;
 
-        const fvtbl = face.lpVtbl.*;
-        const get_glyph_fn = fvtbl.GetGlyphIndicesW orelse return 0;
-        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
-            // No metrics available — use cell_w_px for advances
-            for (0..scalar_count) |i| {
-                out_glyph_ids[i] = 0;
-                out_clusters[i] = @intCast(i);
-                out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-                out_x_offset[i] = 0;
-                out_y_offset[i] = 0;
-            }
-            return scalar_count;
-        };
-
-        // Compute advance scale factor
-        var fm: c.DWRITE_FONT_METRICS = undefined;
-        const get_fm_fn = fvtbl.GetMetrics orelse return 0;
-        get_fm_fn(face, &fm);
-        const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
-        if (du_per_em <= 0.0) return 0;
-        const scale: f32 = self.font_em_size / du_per_em * 64.0;
+        const get_glyph_fn = face.lpVtbl.*.GetGlyphIndicesW orelse return 0;
+        const cell_adv: i32 = @as(i32, @intCast(self.cell_w_px)) * 64;
 
         // Process in small batches to keep stack usage minimal
         const BATCH = 128;
         var batch_cp: [BATCH]c.UINT32 = undefined;
         var batch_gids: [BATCH]c.UINT16 = undefined;
-        var batch_metrics: [BATCH]c.DWRITE_GLYPH_METRICS = undefined;
 
         var si: usize = 0;
         while (si < scalar_count) {
             const n = @min(BATCH, scalar_count - si);
             for (0..n) |i| batch_cp[i] = scalars[si + i];
-
-            const hr_gi = get_glyph_fn(face, &batch_cp, @intCast(n), &batch_gids);
-            if (c.FAILED(hr_gi)) {
-                // Fill remaining with cell_w_px fallback
-                for (si..scalar_count) |i| {
-                    out_glyph_ids[i] = 0;
-                    out_clusters[i] = @intCast(i);
-                    out_x_advance[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-                    out_x_offset[i] = 0;
-                    out_y_offset[i] = 0;
-                }
-                return scalar_count;
+            const have_gids = !c.FAILED(get_glyph_fn(face, &batch_cp, @intCast(n), &batch_gids));
+            if (!have_gids) @memset(batch_gids[0..n], 0);
+            if (!have_gids or !designAdvances26_6(face, self.font_em_size, batch_gids[0..n], out_x_advance[si..][0..n])) {
+                @memset(out_x_advance[si..][0..n], cell_adv);
             }
-
-            const hr_gm = get_metrics_fn(face, &batch_gids, @intCast(n), &batch_metrics, c.FALSE);
-            const has_metrics = !c.FAILED(hr_gm);
-
             for (0..n) |i| {
                 out_glyph_ids[si + i] = batch_gids[i];
                 out_clusters[si + i] = @intCast(si + i);
-                out_x_advance[si + i] = if (has_metrics)
-                    @intFromFloat(@as(f32, @floatFromInt(batch_metrics[i].advanceWidth)) * scale)
-                else
-                    @as(i32, @intCast(self.cell_w_px)) * 64;
                 out_x_offset[si + i] = 0;
                 out_y_offset[si + i] = 0;
             }
@@ -2223,35 +2135,8 @@ pub const Renderer = struct {
         if (applog.isEnabled()) applog.appLog("[ascii_table] GetGlyphIndicesW done style={d}\n", .{style_flags});
 
         // --- 2) X Advances: design units → 26.6 fixed-point pixels ---
-        var glyph_metrics: [128]c.DWRITE_GLYPH_METRICS = undefined;
-        const get_metrics_fn = fvtbl.GetDesignGlyphMetrics orelse {
-            // Fallback: use cell_w_px for all advances
-            for (0..128) |i| {
-                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-            }
-            @memset(out_lig_triggers[0..128], 0);
-            return true;
-        };
-
-        const hr_gm = get_metrics_fn(face, &glyph_ids_u16, 128, &glyph_metrics, c.FALSE);
-        if (c.FAILED(hr_gm)) {
-            // Fallback to cell_w_px
-            for (0..128) |i| {
-                out_x_advances[i] = @as(i32, @intCast(self.cell_w_px)) * 64;
-            }
-        } else {
-            // Get designUnitsPerEm for conversion
-            var fm: c.DWRITE_FONT_METRICS = undefined;
-            const get_fm_fn = fvtbl.GetMetrics orelse return false;
-            get_fm_fn(face, &fm);
-            const du_per_em: f32 = @floatFromInt(fm.designUnitsPerEm);
-            if (du_per_em <= 0.0) return false;
-
-            const scale: f32 = self.font_em_size / du_per_em * 64.0;
-            for (0..128) |i| {
-                const adv_du: f32 = @floatFromInt(glyph_metrics[i].advanceWidth);
-                out_x_advances[i] = @intFromFloat(adv_du * scale);
-            }
+        if (!designAdvances26_6(face, self.font_em_size, &glyph_ids_u16, out_x_advances[0..128])) {
+            @memset(out_x_advances[0..128], @as(i32, @intCast(self.cell_w_px)) * 64);
         }
         if (applog.isEnabled()) applog.appLog("[ascii_table] GetDesignGlyphMetrics done style={d}\n", .{style_flags});
 

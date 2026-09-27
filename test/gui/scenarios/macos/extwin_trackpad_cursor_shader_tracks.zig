@@ -36,7 +36,6 @@ const scroll_marker = "[ExternalGridView] scroll offset:";
 
 const grid_rows = 20;
 const grid_cols = 60;
-const max_windows = 16;
 /// Gestures alternate direction and stay short, so the cursor's screen row
 /// walks up and down the middle of the window without reaching an edge. A
 /// cursor pinned at an edge keeps its rect across a landing, and a rect that
@@ -103,8 +102,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     try g.exec(
         "luaeval('(function() local b = vim.api.nvim_create_buf(false, true) " ++
@@ -116,7 +114,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_win_set_cursor(_G.e2e_extwin, {200, 0}) " ++
             "return 1 end)()')",
     );
-    const extwin = try driver.waitNewWindow(g.app_pid, before, 150);
+    const extwin = try driver.waitNewWindow(g.app_pid, before.slice(),150);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);

@@ -37,7 +37,6 @@ const app_log = @import("../../app_log.zig");
 
 const log_path = "tmp/gui_scrollbar_surface.log";
 const marker = "[scrollbar]";
-const max_windows = 16;
 
 const Report = struct { surface: i64, grid: i64, topline: i64 };
 
@@ -89,14 +88,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
     std.debug.print("[gui] main window: grid {d}, topline {d}\n", .{ main_seen.grid, main_seen.topline });
 
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     // An external window, likewise longer than it shows.
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 800 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
-    _ = try driver.waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     // Now scroll the EXTERNAL window, from the keyboard, with the cursor in it.

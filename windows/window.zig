@@ -1576,11 +1576,11 @@ fn buildDevcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]co
     var w = std.Io.Writer.fixed(buf);
     const writer = &w;
     writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-    writer.writeAll(workspace) catch {};
+    render_helpers.writeDevcontainerPathArg(writer, workspace) catch {};
     writer.writeAll("\"") catch {};
     if (config_path) |cfg| {
         writer.writeAll(" --config \"") catch {};
-        writer.writeAll(cfg) catch {};
+        render_helpers.writeDevcontainerPathArg(writer, cfg) catch {};
         writer.writeAll("\"") catch {};
     }
     writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
@@ -1822,18 +1822,23 @@ pub export fn WndProc(
                     if (on_right) return c.HTRIGHT;
 
                     // Check if in tabbar area (custom caption)
+                    // In client coordinates, as the paint and the other hit
+                    // tests use: a maximized window's client area is inset
+                    // from its window rect (WM_NCCALCSIZE).
                     const tabbar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-                    if (y < window_rect.top + tabbar_height) {
+                    var client_pt: c.POINT = .{ .x = x, .y = y };
+                    _ = c.ScreenToClient(hwnd, &client_pt);
+                    if (client_pt.y < tabbar_height) {
                         // In tabbar area - check if clicking on interactive elements or empty space
-                        const client_x = x - window_rect.left;
-                        const client_width = window_rect.right - window_rect.left;
+                        var client_rect: c.RECT = undefined;
+                        _ = c.GetClientRect(hwnd, &client_rect);
 
                         // Window buttons, tabs and the + button take the click;
                         // the empty rest of the bar drags the window.
                         app.mu.lockUncancelable(core.clock.io());
                         const tab_count = app.tabline_state.tab_count;
                         app.mu.unlock(core.clock.io());
-                        return switch (tabline_mod.tablineHitTest(app, client_width, tab_count, client_x, y - window_rect.top)) {
+                        return switch (tabline_mod.tablineHitTest(app, client_rect.right, tab_count, client_pt.x, client_pt.y)) {
                             .none => c.HTCAPTION,
                             else => c.HTCLIENT,
                         };
@@ -2396,7 +2401,7 @@ pub export fn WndProc(
                     // Update tabline/sidebar texture (rendered via GDI offscreen -> D3D11 texture)
                     // This avoids DWM composition issues by keeping GDI rendering offscreen
                     if (app.ext_tabline_enabled) {
-                        if (app.tabline_style == .titlebar and app.tabline_state.tab_count > 0) {
+                        if (app.tabline_style == .titlebar) {
                             const tabline_width: u32 = @intCast(@max(1, client_for_content.right));
                             const tabline_height: u32 = @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT));
                             tabline_mod.renderTablineToD3D(app, tabline_width, tabline_height);
@@ -2411,15 +2416,7 @@ pub export fn WndProc(
                     }
 
                     if (!row_mode) {
-                        // Flat rendering no longer references the per-row
-                        // buffers retained by a previous row-mode frame.
-                        _ = app_mod.resizeRowVBsForPaint(
-                            app.alloc,
-                            &app.surf.paint.row_vbs,
-                            &app.row_vb_budget,
-                            &app.surf.paint.row_vb_retained_bytes,
-                            0,
-                        );
+                        app.surf.dropRowVBs(app);
 
                         // A mode transition can leave a row-mode scrollbar in
                         // retained back_tex. Restore it and widen this flat
@@ -2863,7 +2860,6 @@ pub export fn WndProc(
                             .row_vb_len = committed.row_map.items.len,
                             .total_rows = effective_rows,
                             .preserve_back = preserve_back,
-                            .layer_paint_full = paint_full_snapshot,
                             .cell_w_px = @intCast(@max(1, app.cell_w_px)),
                             .layer_present = .{
                                 .rects = present_rects,
@@ -3865,7 +3861,7 @@ pub export fn WndProc(
                             } else {
                                 // Any other kind a route sends here stacks as
                                 // it always did, so two in one batch both show.
-                                if (req.replace_last != 0 or std.mem.eql(u8, kind_str, "return_prompt")) {
+                                if (req.replace_last != 0) {
                                     app.display_messages.clearRetainingCapacity();
                                 }
                                 var append_failed = false;
@@ -3877,24 +3873,31 @@ pub export fn WndProc(
                             // Confirm dialogs don't auto-hide (only kill message window timer, not mini)
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
-                        .ext_float => if (messages.isStatusKind(kind_str)) {
+                        .ext_float => if (messages.statusChannel(kind_str)) |channel| {
                             // showmode/showcmd/ruler are state, not a log
-                            // (macOS onMsgStatus's rule): the window shows the
-                            // status alone and does not time out, and empty
-                            // text hides it. Kept in the toast stack instead,
-                            // a toast's auto-hide or msg_clear wiped it while
-                            // the mode still held. A blocking dialog stays.
+                            // (macOS onMsgStatus's rule): each channel keeps
+                            // its latest text, the window shows the non-empty
+                            // ones and does not time out, and it hides only
+                            // when all three are empty. One shared slot made
+                            // the last writer win, and an empty showcmd hid
+                            // the mode. A blocking dialog stays.
+                            app.status_messages[channel] = if (dm.text_len == 0) null else dm;
                             if (!messages.messageWindowIsConfirm(app)) {
                                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                                if (dm.text_len == 0) {
-                                    messages.hideMessageWindow(app);
-                                } else {
-                                    app.display_messages.clearRetainingCapacity();
-                                    var append_failed = false;
-                                    app.display_messages.append(app.alloc, dm) catch {
+                                app.display_messages.clearRetainingCapacity();
+                                var shown: ?app_mod.DisplayMessage = null;
+                                var append_failed = false;
+                                for (app.status_messages) |entry| {
+                                    const m = entry orelse continue;
+                                    app.display_messages.append(app.alloc, m) catch {
                                         append_failed = true;
                                     };
-                                    messages.showMessageWindowOnUIThread(app, dm, append_failed);
+                                    shown = m;
+                                }
+                                if (shown) |m| {
+                                    messages.showMessageWindowOnUIThread(app, m, append_failed);
+                                } else {
+                                    messages.hideMessageWindow(app);
                                 }
                             }
                         } else {
@@ -3988,7 +3991,7 @@ pub export fn WndProc(
         WM_APP_CLIPBOARD_GET => {
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_CLIPBOARD_GET received\n", .{});
             if (getApp(hwnd)) |app| {
-                dialogs.handleClipboardGetOnUIThread(app);
+                dialogs.handleClipboardGetOnUIThread(app, @truncate(wParam));
             }
             return 0;
         },
@@ -3996,7 +3999,7 @@ pub export fn WndProc(
         WM_APP_CLIPBOARD_SET => {
             if (applog.isEnabled()) applog.appLog("[win] WM_APP_CLIPBOARD_SET received\n", .{});
             if (getApp(hwnd)) |app| {
-                dialogs.handleClipboardSetOnUIThread(app);
+                dialogs.handleClipboardSetOnUIThread(app, @truncate(wParam));
             }
             return 0;
         },
@@ -4452,13 +4455,7 @@ pub export fn WndProc(
                     // In sidebar mode that band is editor content; the
                     // indicators are in the sidebar strip.
                     if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
-                        var client: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client);
-                        const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                        tabline_rect = if (app.sidebar_position_right)
-                            .{ .left = client.right - sidebar_w, .top = 0, .right = client.right, .bottom = client.bottom }
-                        else
-                            .{ .left = 0, .top = 0, .right = sidebar_w, .bottom = client.bottom };
+                        tabline_rect = tabline_mod.sidebarRectPx(app, hwnd);
                     }
                     _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
                 }
@@ -4499,12 +4496,6 @@ pub export fn WndProc(
                             app.in_present_shader_animation_frame = false;
                             _ = app.finishActiveOperation();
                         }
-                        // Not while minimized: nothing shows the frame, and
-                        // WM_PAINT returns early for an iconic window too. The
-                        // external windows below keep animating.
-                        if (c.IsIconic(hwnd) == 0) {
-                            if (app.renderer) |*r| r.presentShaderAnimationFrame();
-                        }
                         // Iterating external_windows under app.mu while
                         // calling Present on each renderer would self-
                         // deadlock if DXGI's Present pumps a message whose
@@ -4538,7 +4529,6 @@ pub export fn WndProc(
                         app.mu.unlock(core.clock.io());
 
                         var anim_dev_lost = false;
-                        if (app.renderer) |*r| anim_dev_lost = r.device_lost;
                         var i: usize = 0;
                         while (i < app.shader_anim_external_renderers.items.len) : (i += 1) {
                             const renderer = app.shader_anim_external_renderers.items[i];
@@ -4555,6 +4545,17 @@ pub export fn WndProc(
                         // afterwards; retain only their allocation capacity.
                         app.shader_anim_external_grids.clearRetainingCapacity();
                         app.shader_anim_external_renderers.clearRetainingCapacity();
+
+                        // After the externals: their sync re-anchors the main
+                        // renderer's shader cursor when a window moved, and the
+                        // main frame drew one tick behind it.
+                        // Not while minimized: nothing shows the frame, and
+                        // WM_PAINT returns early for an iconic window too. The
+                        // external windows above keep animating.
+                        if (c.IsIconic(hwnd) == 0) {
+                            if (app.renderer) |*r| r.presentShaderAnimationFrame();
+                        }
+                        if (app.renderer) |*r| anim_dev_lost = anim_dev_lost or r.device_lost;
 
                         // presentShaderAnimationFrame() sets device_lost on a
                         // failed Present but, unlike the WM_PAINT path, this
@@ -5057,6 +5058,18 @@ pub export fn WndProc(
                     if (new_d3d_device) |dev| _ = dev.lpVtbl.*.Release.?(dev);
                     return 0;
                 }
+                // The Renderer.init fallback made its own device: publish it,
+                // as startup does, or external windows can never re-open.
+                if (new_d3d_device == null) {
+                    if (recovered_gpu.?.device) |dev| {
+                        if (recovered_gpu.?.ctx) |ctx| {
+                            _ = dev.lpVtbl.*.AddRef.?(dev);
+                            _ = ctx.lpVtbl.*.AddRef.?(ctx);
+                            new_d3d_device = dev;
+                            new_d3d_ctx = ctx;
+                        }
+                    }
+                }
                 app.mu.lockUncancelable(core.clock.io());
                 app.d3d_device = new_d3d_device;
                 app.d3d_ctx = new_d3d_ctx;
@@ -5066,14 +5079,7 @@ pub export fn WndProc(
 
                 // 4. Full reseed: GPU atlas + all rows + tabline texture.
                 app.atlas_upload.forceFull();
-                app.tabline_render_sig = 0;
-                app.sidebar_render_sig = 0;
-                app.mu.lockUncancelable(core.clock.io());
-                app.surf.surface.paint_full = true;
-                app.mu.unlock(core.clock.io());
-                {
-                    app.surf.tbs.requestFullPaint();
-                }
+                app_mod.requestSurfaceFullPaint(app, &app.surf);
 
                 // 5. External windows share the App device rebuilt above.
                 // Snapshot grid_ids and pin each via paint_ref_count under
@@ -5209,7 +5215,6 @@ pub export fn WndProc(
                     var old_renderer = ext_win.renderer;
                     ext_win.renderer = new_renderer;
                     // Force full content reseed on the fresh device.
-                    ext_win.atlas_version = 0;
                     ext_win.dpi_scale = @as(f32, @floatFromInt(ext_dpi)) / 96.0;
                     ext_win.surf.surface.paint_full = true;
                     ext_win.needs_redraw = true;
@@ -5749,14 +5754,8 @@ pub export fn WndProc(
                             return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
-                        var client_rect_sb: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client_rect_sb);
-                        const sidebar_w_px = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                        const in_sidebar = if (app.sidebar_position_right)
-                            x >= @as(i16, @intCast(client_rect_sb.right - sidebar_w_px))
-                        else
-                            x < @as(i16, @intCast(sidebar_w_px));
-                        if (in_sidebar) {
+                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
+                        if (x >= sb_rect.left and x < sb_rect.right) {
                             // Left button: handle sidebar interaction
                             // Right/middle button: consume event to prevent Neovim input
                             if (msg == c.WM_LBUTTONDOWN) {
@@ -5829,14 +5828,8 @@ pub export fn WndProc(
                             return 0;
                         }
                         // Check if event is in sidebar area — consume all buttons
-                        var client_rect_sb2: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client_rect_sb2);
-                        const sb_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                        const in_sb = if (app.sidebar_position_right)
-                            x_up >= @as(i16, @intCast(client_rect_sb2.right - sb_w))
-                        else
-                            x_up < @as(i16, @intCast(sb_w));
-                        if (in_sb) {
+                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
+                        if (x_up >= sb_rect.left and x_up < sb_rect.right) {
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
@@ -5906,13 +5899,8 @@ pub export fn WndProc(
                             tabline_mod.clearTablineHover(app, hwnd);
                         }
                     } else if (app.tabline_style == .sidebar) {
-                        var client_rect_sb3: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client_rect_sb3);
-                        const sb_w3 = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                        const in_sb3 = if (app.sidebar_position_right)
-                            x >= @as(i16, @intCast(client_rect_sb3.right - sb_w3))
-                        else
-                            x < @as(i16, @intCast(sb_w3));
+                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
+                        const in_sb3 = x >= sb_rect.left and x < sb_rect.right;
 
                         // A pressed close/new-tab button keeps getting moves
                         // wherever the pointer goes: its "left the button,
@@ -5923,18 +5911,12 @@ pub export fn WndProc(
                             app.tabline_state.new_tab_button_pressed;
                         if (app.tabline_state.dragging_tab != null or sidebar_button_pressed or (!editor_drag and in_sb3)) {
                             tabline_mod.handleSidebarMouseMove(app, hwnd, @as(c_int, x), @as(c_int, y));
+                            // The right sidebar borders the scrollbar track.
+                            scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
                             // Consume event: sidebar area is UI, not Neovim editor input
                             return 0;
                         } else {
-                            if (app.tabline_state.hovered_tab != null or
-                                app.tabline_state.hovered_close != null or
-                                app.tabline_state.hovered_new_tab_btn)
-                            {
-                                app.tabline_state.hovered_tab = null;
-                                app.tabline_state.hovered_close = null;
-                                app.tabline_state.hovered_new_tab_btn = false;
-                                _ = c.InvalidateRect(hwnd, null, 0);
-                            }
+                            tabline_mod.clearTablineHover(app, hwnd);
                         }
                     }
                 }
@@ -6182,6 +6164,16 @@ pub export fn WndProc(
                     if (app.config.input.ime_disable_on_activate) {
                         input.setIMEOff(hwnd);
                     }
+                    // Undo the deactivation hide: these exist only while they
+                    // have content, and nothing else re-shows a live one.
+                    inline for ([_]MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
+                        if (app.mini_windows[@intFromEnum(id)].hwnd) |mini_hwnd| {
+                            _ = c.ShowWindow(mini_hwnd, 8); // SW_SHOWNA
+                        }
+                    }
+                    if (app.message_window) |msg_win| {
+                        _ = c.ShowWindow(msg_win.hwnd, 8); // SW_SHOWNA
+                    }
                     // App is being activated - show special external windows
                     app.mu.lockUncancelable(core.clock.io());
                     defer app.mu.unlock(core.clock.io());
@@ -6211,27 +6203,6 @@ pub export fn WndProc(
             if (getApp(hwnd)) |app| {
                 scrollbar.leave(app, scrollbar.mainSurface(hwnd, app));
                 tabline_mod.clearTablineHover(app, hwnd);
-                if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
-                    if (app.tabline_state.hovered_tab != null or
-                        app.tabline_state.hovered_close != null or
-                        app.tabline_state.hovered_new_tab_btn)
-                    {
-                        app.tabline_state.hovered_tab = null;
-                        app.tabline_state.hovered_close = null;
-                        app.tabline_state.hovered_new_tab_btn = false;
-                        // Invalidate sidebar region
-                        var client_rect: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client_rect);
-                        const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                        var sidebar_rect: c.RECT = .{
-                            .left = if (app.sidebar_position_right) client_rect.right - sidebar_w else 0,
-                            .top = 0,
-                            .right = if (app.sidebar_position_right) client_rect.right else sidebar_w,
-                            .bottom = client_rect.bottom,
-                        };
-                        _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
-                    }
-                }
             }
             return 0;
         },
@@ -6263,13 +6234,7 @@ pub export fn WndProc(
                         var client_rect: c.RECT = undefined;
                         _ = c.GetClientRect(hwnd, &client_rect);
                         if (app.tabline_style == .sidebar) {
-                            const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
-                            var sidebar_rect: c.RECT = .{
-                                .left = if (app.sidebar_position_right) client_rect.right - sidebar_w else 0,
-                                .top = 0,
-                                .right = if (app.sidebar_position_right) client_rect.right else sidebar_w,
-                                .bottom = client_rect.bottom,
-                            };
+                            const sidebar_rect = tabline_mod.sidebarRectPx(app, hwnd);
                             _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
                         } else {
                             var tabline_rect: c.RECT = .{

@@ -195,7 +195,27 @@ final class ViewController: NSViewController {
     /// ConnectionConfig chosen in the `--dialog` dialog. Mirrors viewDidLoad's
     /// start dispatch, but feeds the connection through `core.connectionConfig`
     /// (which takes priority over CLI flags / config.toml inside start()).
-    private func startWithConnection(_ cfg: ConnectionConfig) {
+    private func startWithConnection(_ dialogCfg: ConnectionConfig) {
+        var cfg = dialogCfg
+        // The spawn command's quoting cannot carry a quote inside a path (the
+        // --nvim rule in main.swift, and the Windows dialog): one pair around
+        // the whole path is dropped, and a path still holding one is ignored.
+        var path = cfg.nvimPath
+        if path.count >= 2, let first = path.first, first == "\"" || first == "'", path.last == first {
+            path = String(path.dropFirst().dropLast())
+        }
+        if path.contains("'") || path.contains("\"") {
+            ZonvieCore.appLog("[ViewController] --dialog: nvim path contains quote characters; ignoring it")
+            if let window = view.window {
+                let alert = NSAlert()
+                alert.messageText = "The Neovim path contains a quote character and was ignored."
+                alert.alertStyle = .warning
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            }
+            path = ""
+        }
+        cfg.nvimPath = path
+
         // Apply per-connection environment variables (KEY=VALUE per line) before
         // the core spawns nvim, so the child inherits them.
         for line in cfg.envVars.components(separatedBy: "\n") {

@@ -44,7 +44,6 @@ const key_gap_ms = 300;
 /// that a seed landed; the animation is the frames after it.
 const min_offset_frames = 3;
 
-const max_windows = 16;
 
 /// A burst of keys arriving faster than one ease settles. The offsets they
 /// seed have to STACK: the row a key scrolls is compensated whether or not the
@@ -136,8 +135,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     var g = try Gui.init(alloc, .{ .app_args = &.{ "--log", log_path } });
     defer g.deinit();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     // Enough lines to scroll through without reaching the buffer end, which
     // would block the scroll and hand the offset to the edge bounce instead
@@ -152,7 +150,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_win_set_cursor(_G.e2e_extwin, {200, 0}) " ++
             "return 1 end)()')",
     );
-    const extwin = try driver.waitNewWindow(g.app_pid, before, 150);
+    const extwin = try driver.waitNewWindow(g.app_pid, before.slice(),150);
     // Let the window settle so the first key is not racing its first frames.
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 

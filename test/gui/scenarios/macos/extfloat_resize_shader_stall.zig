@@ -45,7 +45,6 @@ const observe_ms: u64 = 3000;
 /// produced in the field report.
 const resize_steps: u32 = 26;
 
-const max_windows = 16;
 
 fn measure(alloc: std.mem.Allocator, since_ms: f64, label: []const u8) !app_log.Cadence {
     gui_io.sleepNs(observe_ms * std.time.ns_per_ms);
@@ -99,8 +98,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
 
     // Open an external float at the size the field report used.
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
     try g.exec(
         "luaeval('(function() _G.e2e_main = vim.api.nvim_get_current_win() " ++
             "_G.e2e_float = vim.api.nvim_open_win(vim.api.nvim_create_buf(false, true), true, " ++

@@ -51,6 +51,18 @@ fn failFlush(app: *App) void {
     requestFlushRetry(app);
 }
 
+/// Post `msg` to the main window unless one is already pending: `flag` is
+/// claimed false -> true here, the handler clears it, and a failed post (or no
+/// window yet) clears it again so the next flush retries.
+fn postCoalesced(app: *App, flag: *std.atomic.Value(bool), msg: c.UINT) void {
+    if (flag.cmpxchgStrong(false, true, .release, .monotonic) != null) return;
+    const hwnd = app.hwnd orelse {
+        flag.store(false, .release);
+        return;
+    };
+    if (c.PostMessageW(hwnd, msg, 0, 0) == 0) flag.store(false, .release);
+}
+
 /// Lazily open the main row/flat write set on its first actual mutation.
 /// No-op and cursor-only flushes consequently avoid the O(max_rows) slot
 /// release/copy/retain work in TripleBufferedSurface.beginFlush.
@@ -1616,15 +1628,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // Always re-evaluate message deadlines, including when this flush is
     // cancelled below. A msg_show OOM keeps its pending deadline armed and
     // must not lose the only UI-thread timer driver with the TBS commit.
-    if (app.msg_throttle_arm_posted.cmpxchgStrong(false, true, .release, .monotonic) == null) {
-        if (app.hwnd) |hwnd| {
-            if (c.PostMessageW(hwnd, app_mod.WM_APP_MSG_THROTTLE_ARM, 0, 0) == 0) {
-                app.msg_throttle_arm_posted.store(false, .release);
-            }
-        } else {
-            app.msg_throttle_arm_posted.store(false, .release);
-        }
-    }
+    postCoalesced(app, &app.msg_throttle_arm_posted, app_mod.WM_APP_MSG_THROTTLE_ARM);
 
     // Emit one aggregate after releasing app.mu. Per-row inspection and output
     // are verbose-only in onVerticesRow.
@@ -1681,33 +1685,13 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // shaders for the current enabled period.
     if (app.corep) |corep| {
         if (core.zonvie_core_get_glow_enabled(corep)) {
-            if (app.glow_prepare_posted.cmpxchgStrong(false, true, .release, .monotonic) == null) {
-                if (app.hwnd) |hwnd| {
-                    if (c.PostMessageW(hwnd, app_mod.WM_APP_PREPARE_GLOW, 0, 0) == 0) {
-                        app.glow_prepare_posted.store(false, .release);
-                    }
-                } else {
-                    app.glow_prepare_posted.store(false, .release);
-                }
-            }
+            postCoalesced(app, &app.glow_prepare_posted, app_mod.WM_APP_PREPARE_GLOW);
         } else {
             app.glow_prepare_posted.store(false, .release);
         }
     }
 
-    // Coalesce: only post if not already pending (atomic CAS: false -> true)
-    if (app.scrollbar_update_pending.cmpxchgStrong(false, true, .release, .monotonic) == null) {
-        // CAS succeeded: we own the pending slot
-        if (app.hwnd) |hwnd| {
-            if (c.PostMessageW(hwnd, app_mod.WM_APP_UPDATE_SCROLLBAR, 0, 0) == 0) {
-                // PostMessage failed: reset pending to avoid permanent stall
-                app.scrollbar_update_pending.store(false, .release);
-            }
-        } else {
-            // No hwnd yet: reset pending
-            app.scrollbar_update_pending.store(false, .release);
-        }
-    }
+    postCoalesced(app, &app.scrollbar_update_pending, app_mod.WM_APP_UPDATE_SCROLLBAR);
 
     // Coalesce all per-callback dirty state into a single InvalidateRect per
     // window.  Individual vertex callbacks (onVerticesRow, storeMainSurfaceCursor,
@@ -2261,18 +2245,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
 // =========================================================================
 
 pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
-    const app: *App = @ptrCast(@alignCast(ctx orelse return));
-    _ = app.external_session_generation.fetchAdd(1, .acq_rel);
-    // The new session's grid ids restart, and the core forgets its last
-    // cursor grid (resetForNewSession); forget ours too, or its first report
-    // of a reused id reads as a repeat. Core thread, like its only reader.
-    app.core_reported_cursor_grid = 1;
-    if (!applog.isEnabled()) return;
-    if (addr_ptr) |p| {
-        applog.appLog("[win] on_restart: reconnecting to listen_addr={s}\n", .{p[0..addr_len]});
-    } else {
-        applog.appLog("[win] on_restart: (no listen_addr)\n", .{});
-    }
+    onSessionSwap(ctx, "on_restart: reconnecting to listen_addr", addr_ptr, addr_len);
 }
 
 /// Receive the `connect` UI event (`:connect <addr>`). Same flicker-free
@@ -2280,6 +2253,10 @@ pub fn onRestart(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) call
 /// keeps running headless instead of dying. The core handles the actual
 /// hot-swap; this callback is informational only.
 pub fn onConnect(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) callconv(.c) void {
+    onSessionSwap(ctx, "on_connect: hot-swap to server_addr", addr_ptr, addr_len);
+}
+
+fn onSessionSwap(ctx: ?*anyopaque, comptime label: []const u8, addr_ptr: ?[*]const u8, addr_len: usize) void {
     const app: *App = @ptrCast(@alignCast(ctx orelse return));
     _ = app.external_session_generation.fetchAdd(1, .acq_rel);
     // The new session's grid ids restart, and the core forgets its last
@@ -2287,11 +2264,8 @@ pub fn onConnect(ctx: ?*anyopaque, addr_ptr: ?[*]const u8, addr_len: usize) call
     // of a reused id reads as a repeat. Core thread, like its only reader.
     app.core_reported_cursor_grid = 1;
     if (!applog.isEnabled()) return;
-    if (addr_ptr) |p| {
-        applog.appLog("[win] on_connect: hot-swap to server_addr={s}\n", .{p[0..addr_len]});
-    } else {
-        applog.appLog("[win] on_connect: (no server_addr)\n", .{});
-    }
+    const addr: []const u8 = if (addr_ptr) |p| p[0..addr_len] else "(none)";
+    applog.appLog("[win] " ++ label ++ "={s}\n", .{addr});
 }
 
 pub fn onExit(ctx: ?*anyopaque, exit_code: i32) callconv(.c) void {
@@ -2478,43 +2452,11 @@ pub fn onClipboardGet(
 
     if (applog.isEnabled()) applog.appLog("[win] clipboard_get: called\n", .{});
 
-    const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else {
-        out_len.* = 0;
-        return 1;
-    };
-
-    const hwnd = app.hwnd orelse {
-        out_len.* = 0;
-        return 1;
-    };
-
-    // Create event if not exists (manual-reset, initially non-signaled)
-    if (app.clipboard_event == null) {
-        app.clipboard_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
-        if (app.clipboard_event == null) {
-            if (applog.isEnabled()) applog.appLog("[win] clipboard_get: CreateEventW failed\n", .{});
-            out_len.* = 0;
-            return 1;
-        }
-    }
-
-    // Reset event
-    _ = c.ResetEvent(app.clipboard_event);
-
-    // Post message to UI thread
-    if (c.PostMessageW(hwnd, app_mod.WM_APP_CLIPBOARD_GET, 0, 0) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_get: PostMessageW failed\n", .{});
-        out_len.* = 0;
-        return 1;
-    }
-
-    // Wait for UI thread to complete (timeout: 5 seconds)
-    const wait_result = c.WaitForSingleObject(app.clipboard_event, 5000);
-    if (wait_result != c.WAIT_OBJECT_0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_get: WaitForSingleObject failed or timeout\n", .{});
-        out_len.* = 0;
-        return 1;
-    }
+    // Failures return 0, as zonvie_core.h says; the core then answers empty.
+    out_len.* = 0;
+    const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else return 0;
+    const hwnd = app.hwnd orelse return 0;
+    if (!runClipboardOnUiThread(app, hwnd, app_mod.WM_APP_CLIPBOARD_GET, null)) return 0;
 
     // Copy what fits, but report the full size: the core retries with a bigger
     // buffer when out_len exceeds max_len, so clamping here would silently
@@ -2539,43 +2481,66 @@ pub fn onClipboardSet(
 
     if (applog.isEnabled()) applog.appLog("[win] clipboard_set: called len={d}\n", .{len});
 
-    if (len == 0) return 1;
-
     const app: *App = if (ctx) |ctxp| @ptrCast(@alignCast(ctxp)) else return 0;
 
     const hwnd = app.hwnd orelse return 0;
 
-    // Create event if not exists
-    if (app.clipboard_event == null) {
-        app.clipboard_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
-        if (app.clipboard_event == null) {
-            if (applog.isEnabled()) applog.appLog("[win] clipboard_set: CreateEventW failed\n", .{});
-            return 0;
-        }
-    }
-
-    // Reset event
-    _ = c.ResetEvent(app.clipboard_event);
-
-    // Store data pointer and length for UI thread
-    app.clipboard_set_data = data;
-    app.clipboard_set_len = len;
-
-    // Post message to UI thread
-    if (c.PostMessageW(hwnd, app_mod.WM_APP_CLIPBOARD_SET, 0, 0) == 0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_set: PostMessageW failed\n", .{});
-        return 0;
-    }
-
-    // Wait for UI thread to complete (timeout: 5 seconds)
-    const wait_result = c.WaitForSingleObject(app.clipboard_event, 5000);
-    if (wait_result != c.WAIT_OBJECT_0) {
-        if (applog.isEnabled()) applog.appLog("[win] clipboard_set: WaitForSingleObject failed or timeout\n", .{});
-        return 0;
-    }
+    // An empty register is set too: it replaces the clipboard with "".
+    if (!runClipboardOnUiThread(app, hwnd, app_mod.WM_APP_CLIPBOARD_SET, data[0..len])) return 0;
 
     if (applog.isEnabled()) applog.appLog("[win] clipboard_set: result={d}\n", .{app.clipboard_result});
     return app.clipboard_result;
+}
+
+/// Hand one clipboard request to the UI thread and wait up to 5s for it. A
+/// set's payload is copied into clipboard_buf first, so a handler that runs
+/// after the timeout never reads the core's freed buffer. True when the
+/// handler completed; clipboard_buf/len/result then stay put until the next
+/// request, since no handler acts without a pending one.
+fn runClipboardOnUiThread(app: *App, hwnd: c.HWND, msg: c.UINT, payload: ?[]const u8) bool {
+    const io = core.clock.io();
+    var seq: u32 = 0;
+    {
+        app.clipboard_mu.lockUncancelable(io);
+        defer app.clipboard_mu.unlock(io);
+        if (app.clipboard_event == null) {
+            // Manual-reset, initially non-signaled.
+            app.clipboard_event = c.CreateEventW(null, c.TRUE, c.FALSE, null);
+            if (app.clipboard_event == null) {
+                if (applog.isEnabled()) applog.appLog("[win] clipboard: CreateEventW failed\n", .{});
+                return false;
+            }
+        }
+        if (payload) |p| {
+            if (app.clipboard_buf.len < p.len) {
+                const grown = app.alloc.alloc(u8, p.len) catch return false;
+                if (app.clipboard_buf.len != 0) app.alloc.free(app.clipboard_buf);
+                app.clipboard_buf = grown;
+            }
+            @memcpy(app.clipboard_buf[0..p.len], p);
+            app.clipboard_len = p.len;
+        }
+        app.clipboard_seq +%= 1;
+        if (app.clipboard_seq == 0) app.clipboard_seq = 1;
+        seq = app.clipboard_seq;
+        app.clipboard_active_seq = seq;
+        app.clipboard_result = 0;
+        _ = c.ResetEvent(app.clipboard_event);
+    }
+
+    const posted = c.PostMessageW(hwnd, msg, seq, 0) != 0;
+    const signaled = posted and c.WaitForSingleObject(app.clipboard_event, 5000) == c.WAIT_OBJECT_0;
+
+    app.clipboard_mu.lockUncancelable(io);
+    defer app.clipboard_mu.unlock(io);
+    // The handler clears the active request once its result is written; one
+    // that finished just after the timeout still counts.
+    const done = app.clipboard_active_seq != seq;
+    if (!done) {
+        app.clipboard_active_seq = 0;
+        if (applog.isEnabled()) applog.appLog("[win] clipboard: request {d} not completed (posted={} signaled={})\n", .{ seq, posted, signaled });
+    }
+    return done;
 }
 
 /// SSH authentication prompt callback
@@ -2599,17 +2564,25 @@ pub fn onSSHAuthPrompt(
     };
     @memcpy(owned, prompt[0..prompt_len]);
 
-    // Free any previous owned prompt that was not consumed
+    // Under app.mu: the UI handler takes the prompt from this field. Free any
+    // previous one it has not taken yet.
+    app.mu.lockUncancelable(core.clock.io());
     if (app.ssh_prompt_owned) |old| {
         app.alloc.free(old);
     }
     app.ssh_prompt_owned = owned;
+    app.mu.unlock(core.clock.io());
 
     if (c.PostMessageW(hwnd, app_mod.WM_APP_SSH_AUTH_PROMPT, 0, 0) == 0) {
         if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt: PostMessageW failed\n", .{});
-        // UI thread will never consume this prompt, free it now.
-        app.alloc.free(owned);
-        app.ssh_prompt_owned = null;
+        // This post will never consume the prompt; free it unless an earlier
+        // pending handler already took it.
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        if (app.ssh_prompt_owned) |cur| if (cur.ptr == owned.ptr) {
+            app.alloc.free(owned);
+            app.ssh_prompt_owned = null;
+        };
     }
 }
 
@@ -2645,7 +2618,7 @@ pub fn queueExternalWindowResizes(
         const insets = external_windows.externalSurfaceInsetsPx(app, grid_id, ext_win.dpi_scale);
         var content_w: c_int = @as(c_int, @intCast(ext_win.surf.surface.cols * cell_w)) + insets.w;
         const content_h: c_int = @as(c_int, @intCast(ext_win.surf.surface.rows * cell_h)) + insets.h;
-        content_w = external_windows.clampCmdlineWidthToWorkArea(app, grid_id, content_w);
+        if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd));
 
         // This window's ACTUAL current style/exstyle: WS_OVERLAPPEDWINDOW has
         // caption and border non-client area that WS_POPUP does not, and

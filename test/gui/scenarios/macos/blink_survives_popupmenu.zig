@@ -27,17 +27,6 @@ const gui_io = @import("../../gui_io.zig");
 const log_path = "tmp/gui_blink_popupmenu.log";
 const toggle_marker = "[blink] blink toggled to ";
 
-fn countSince(alloc: std.mem.Allocator, since_ms: f64) !usize {
-    const lines = try app_log.linesSince(alloc, log_path, toggle_marker, since_ms);
-    defer alloc.free(lines);
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        if (line.len != 0) n += 1;
-    }
-    return n;
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     if (!platform.accessibilityTrusted()) {
         std.debug.print("[gui] skipped: not trusted for Accessibility, cannot minimize the main window\n", .{});
@@ -76,7 +65,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.remoteSend("<Esc>");
     const t_before = try app_log.nowMs(alloc, log_path);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
-    const before = try countSince(alloc, t_before);
+    const before = try app_log.countLinesSince(alloc, log_path, toggle_marker, t_before);
 
     // Insert-mode completion opens the external popupmenu; the cursor stays
     // on the float's grid throughout.
@@ -90,7 +79,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const t_after = try app_log.nowMs(alloc, log_path);
     gui_io.sleepNs(2000 * std.time.ns_per_ms);
-    const after = try countSince(alloc, t_after);
+    const after = try app_log.countLinesSince(alloc, log_path, toggle_marker, t_after);
 
     _ = platform.setWindowMinimizedBySize(g.app_pid, main_b.w, main_b.h, false);
 

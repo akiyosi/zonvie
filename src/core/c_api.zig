@@ -1646,12 +1646,8 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     // implementations MUST NOT synchronously call back into core APIs that acquire
     // grid_mu. Use async dispatch (DispatchQueue.main.async on macOS, PostMessage
     // on Windows) instead.
-    box.core.grid_mu.lockUncancelable(clock.io());
-    box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
-    defer {
-        box.core.redraw_thread_id.store(0, .seq_cst);
-        box.core.grid_mu.unlock(clock.io());
-    }
+    box.core.lockGridAsRedrawOwner();
+    defer box.core.unlockGridAsRedrawOwner();
 
     // The timeout can create/remove external grids. onFlush runs vertex
     // generation and external-window lifecycle notification inside the same
@@ -1737,8 +1733,6 @@ pub export fn zonvie_core_set_background_opacity(p: ?*zonvie_core, opacity: f32)
     box.core.background_opacity = std.math.clamp(opacity, 0.0, 1.0);
 }
 
-/// Get list of visible grids for hit-testing.
-/// Returns number of grids written (up to max_count).
 /// Where a pointer landed. `row`/`col` are the named grid's own cells.
 pub const zonvie_pointer_hit = pointer_target.Hit;
 
@@ -1986,11 +1980,7 @@ pub export fn zonvie_core_msg_float_origin(
 }
 
 pub export fn zonvie_core_key_is_special(keycode: u32) callconv(.c) bool {
-    const name = if (core.Core.isWinVkKeycode(keycode))
-        core.Core.winSpecialName(core.Core.winVk(keycode))
-    else
-        core.Core.macSpecialName(keycode);
-    return name != null;
+    return core.Core.specialKeyName(keycode) != null;
 }
 
 pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
@@ -2344,11 +2334,9 @@ pub export fn zonvie_core_send_mouse_scroll(
     const dir_str = std.mem.span(direction.?);
     const mod_str = if (modifier) |m| std.mem.span(m) else "";
     if (grid_id == grid_mod.MESSAGE_GRID_ID) {
-        box.core.grid_mu.lockUncancelable(clock.io());
-        box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        box.core.lockGridAsRedrawOwner();
+        defer box.core.unlockGridAsRedrawOwner();
         box.core.sendMouseScroll(grid_id, row, col, dir_str, mod_str);
-        box.core.redraw_thread_id.store(0, .seq_cst);
-        box.core.grid_mu.unlock(clock.io());
         return;
     }
 
@@ -2401,13 +2389,10 @@ pub export fn zonvie_core_process_pending_msg_scroll_retry_needed(
 ) callconv(.c) bool {
     if (p == null) return false;
     const box = asBox(p.?);
-    box.core.grid_mu.lockUncancelable(clock.io());
-    box.core.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    box.core.lockGridAsRedrawOwner();
+    defer box.core.unlockGridAsRedrawOwner();
     box.core.processPendingMsgScroll();
-    const retry_needed = box.core.msg_scroll_pending;
-    box.core.redraw_thread_id.store(0, .seq_cst);
-    box.core.grid_mu.unlock(clock.io());
-    return retry_needed;
+    return box.core.msg_scroll_pending;
 }
 
 /// Send mouse input event to Neovim (click, drag, release).
@@ -2629,7 +2614,7 @@ pub const zonvie_msg_event = enum(c_int) {
 /// Result of routing a message
 pub const zonvie_route_result = extern struct {
     view: zonvie_msg_view_type,
-    timeout: f32, // -1 = no auto-hide, 0 = use default
+    timeout: f32, // auto-hide after this many seconds; 0 = no auto-hide
 };
 
 /// Load config from file path.
