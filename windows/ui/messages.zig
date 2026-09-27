@@ -9,6 +9,7 @@ const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 const input = @import("../input.zig");
 const callbacks = @import("../callbacks.zig");
+const render_helpers = @import("../render_pipeline_helpers.zig");
 
 /// The grid a `.grid`-anchored message box hangs off: the cursor's, or, for a
 /// cursor inside a float (a telescope prompt), the window the float is
@@ -244,10 +245,20 @@ pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_msg_clear\n", .{});
 
-    // Post message to UI thread to hide window
-    if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MSG_CLEAR, 0, 0);
-    }
+    // In the message queue, not a separate post: a WM_APP_MSG_SHOW already
+    // queued drains the statuses the core resends after this clear, and a
+    // clear handled after them wiped them.
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    enqueuePendingMessage(app, .{ .clear = true }, "clear");
+}
+
+/// on_msg_clear on the UI thread: the toast, its stack and the ext_float
+/// statuses (the core resends the ones it still holds).
+pub fn clearMessagesOnUIThread(app: *App, hwnd: c.HWND) void {
+    _ = c.KillTimer(hwnd, app_mod.TIMER_MSG_AUTOHIDE);
+    app.status_messages = .{ null, null, null };
+    hideMessageWindow(app);
 }
 
 pub fn onMsgShowmode(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
@@ -333,9 +344,7 @@ pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) voi
     const idx = @intFromEnum(id);
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
-    const copy_len = @min(text.len, app.mini_windows[idx].text.len);
-    @memcpy(app.mini_windows[idx].text[0..copy_len], text[0..copy_len]);
-    app.mini_windows[idx].text_len = copy_len;
+    app.mini_windows[idx].text_len = render_helpers.copyUtf8Truncated(&app.mini_windows[idx].text, text);
 }
 
 /// The kinds Neovim blocks on (confirm, confirm_sub, number_prompt): centred
@@ -523,7 +532,14 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         // based on line count. The text will be word-wrapped.
         window_width = @max(app.scalePx(100), @min(app.scalePx(800), app_width - app.scalePx(40)));
         // Height: line_count * line_height + padding, but at least 200px for readability
-        const calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        var calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        // The paint word-wraps, so long E325 lines take several rows: measured
+        // as the paint draws them, or the choice line falls off the bottom.
+        const text_pad = app.scalePx(message_text_pad_px);
+        const stored = combined_text[0..@min(combined_len, message_text_capacity)];
+        if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
+            calc_height = @max(calc_height, text_h + 2 * text_pad);
+        }
         window_height = @max(app.scalePx(200), @min(calc_height, app_height - app.scalePx(100)));
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog: line_count={d} calc_height={d} window_height={d}\n", .{ line_count, calc_height, window_height });
     } else {

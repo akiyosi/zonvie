@@ -1418,3 +1418,20 @@ test "rotateRegion vacates the whole region when the shift covers it" {
     try std.testing.expectEqualSlices(u8, "abc", &items);
     try std.testing.expectEqual(helpers.RowBand{ .start = 0, .end = 3 }, band);
 }
+
+test "copyUtf8Truncated copies text that fits unchanged" {
+    var buf: [8]u8 = undefined;
+    const n = helpers.copyUtf8Truncated(&buf, "abcdefgh");
+    try std.testing.expectEqualStrings("abcdefgh", buf[0..n]);
+}
+
+test "copyUtf8Truncated cuts an overflow at a UTF-8 boundary and marks it" {
+    var buf: [8]u8 = undefined;
+    // "a" + two 3-byte kana: the byte-count cut lands inside the second kana.
+    const n = helpers.copyUtf8Truncated(&buf, "a\u{3042}\u{3044}xyz");
+    try std.testing.expectEqualStrings("a\u{3042}\u{2026}", buf[0..n]);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buf[0..n]));
+
+    const m = helpers.copyUtf8Truncated(&buf, "abcdefghij");
+    try std.testing.expectEqualStrings("abcde\u{2026}", buf[0..m]);
+}

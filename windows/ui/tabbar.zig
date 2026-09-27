@@ -349,6 +349,61 @@ fn draggedTabIndexNow(st: *const TablineState) ?usize {
     return st.indexOfHandle(st.dragging_tab_handle);
 }
 
+/// The release of a pressed close or new-tab button, for the titlebar and the
+/// sidebar. A press still set means the pointer stayed on the button: moving
+/// off it cancels the press. True when the release was consumed.
+fn releaseTabButton(app: *App, hwnd: c.HWND) bool {
+    if (app.tabline_state.close_button_pressed != null) {
+        app.tabline_state.close_button_pressed = null;
+        _ = c.ReleaseCapture();
+        if (app.tabline_state.indexOfHandle(app.tabline_state.close_button_pressed_handle)) |idx| {
+            if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: close button released on tab {d}, closing\n", .{idx});
+            if (app.corep) |corep| {
+                var cmd_buf: [32]u8 = undefined;
+                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{idx + 1}) catch return true;
+                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+            }
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return true;
+    }
+    if (app.tabline_state.new_tab_button_pressed) {
+        app.tabline_state.new_tab_button_pressed = false;
+        _ = c.ReleaseCapture();
+        if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: new tab button released, creating new tab\n", .{});
+        if (app.corep) |corep| {
+            const cmd = "tabnew";
+            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
+        }
+        _ = c.InvalidateRect(hwnd, null, 0);
+        return true;
+    }
+    return false;
+}
+
+/// Enter or leave external-drag mode as a dragged tab at client (x, y) leaves
+/// or re-enters `strip` (client pixels, the titlebar band or the sidebar)
+/// expanded by EXTERNAL_DRAG_THRESHOLD, and move the preview with it. The
+/// threshold is physical pixels, not DPI-scaled, as macOS's 50pt.
+fn trackExternalDrag(app: *App, hwnd: c.HWND, strip: c.RECT, x: c_int, y: c_int) void {
+    const t: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
+    const outside = x < strip.left - t or x > strip.right + t or y < strip.top - t or y > strip.bottom + t;
+    var screen_pt: c.POINT = .{ .x = x, .y = y };
+    _ = c.ClientToScreen(hwnd, &screen_pt);
+    const st = &app.tabline_state;
+    if (outside and !st.is_external_drag) {
+        st.is_external_drag = true;
+        st.drop_target_index = null;
+        if (applog.isEnabled()) applog.appLog("[tabline] entering external drag mode for tab {?d}\n", .{st.dragging_tab});
+        createDragPreviewWindow(app, st.dragging_tab.?, screen_pt.x, screen_pt.y);
+    } else if (!outside and st.is_external_drag) {
+        st.is_external_drag = false;
+        if (applog.isEnabled()) applog.appLog("[tabline] returning to normal drag mode\n", .{});
+        destroyDragPreviewWindow(app);
+    }
+    if (st.is_external_drag) updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
+}
+
 /// The main window's sidebar strip, in client pixels.
 pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
     var client: c.RECT = std.mem.zeroes(c.RECT);
@@ -404,54 +459,15 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
 
     // DPI-scaled constants
     const bar_height = app.scalePx(TablineState.TAB_BAR_HEIGHT);
-    // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
-    // threshold, which should be constant in physical pixels regardless of DPI.
-    const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
     const hit = tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y);
 
     // Handle dragging
-    if (app.tabline_state.dragging_tab) |drag_idx| {
+    if (app.tabline_state.dragging_tab != null) {
         app.tabline_state.drag_current_x = x;
 
-        // Check if mouse is outside tabbar area bounds (for external drag)
-        // Uses tabbar region (top of window, TAB_BAR_HEIGHT tall) instead of full window
-        var is_outside_tabbar = false;
-        if (app.hwnd) |main_hwnd| {
-            var window_rect: c.RECT = undefined;
-            if (c.GetWindowRect(main_hwnd, &window_rect) != 0) {
-                // Convert client coords to screen coords
-                var screen_pt: c.POINT = .{ .x = x, .y = y };
-                _ = c.ClientToScreen(hwnd, &screen_pt);
-
-                // Tabbar area = top of window, TAB_BAR_HEIGHT tall
-                var tabbar_rect = window_rect;
-                tabbar_rect.bottom = tabbar_rect.top + bar_height;
-
-                // Expand tabbar rect by threshold
-                const threshold = ext_drag_threshold;
-                const expanded_left = tabbar_rect.left - threshold;
-                const expanded_top = tabbar_rect.top - threshold;
-                const expanded_right = tabbar_rect.right + threshold;
-                const expanded_bottom = tabbar_rect.bottom + threshold;
-
-                is_outside_tabbar = (screen_pt.x < expanded_left or screen_pt.x > expanded_right or
-                    screen_pt.y < expanded_top or screen_pt.y > expanded_bottom);
-
-                if (is_outside_tabbar and !app.tabline_state.is_external_drag) {
-                    app.tabline_state.is_external_drag = true;
-                    if (applog.isEnabled()) applog.appLog("[tabline] entering external drag mode for tab {d}\n", .{drag_idx});
-                    createDragPreviewWindow(app, drag_idx, screen_pt.x, screen_pt.y);
-                } else if (!is_outside_tabbar and app.tabline_state.is_external_drag) {
-                    app.tabline_state.is_external_drag = false;
-                    if (applog.isEnabled()) applog.appLog("[tabline] returning to normal drag mode\n", .{});
-                    destroyDragPreviewWindow(app);
-                }
-
-                if (app.tabline_state.is_external_drag) {
-                    updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
-                }
-            }
-        }
+        // The band the tabs are drawn in: client rows 0..bar_height. The
+        // window rect starts a frame above it when maximized.
+        trackExternalDrag(app, hwnd, .{ .left = 0, .top = 0, .right = client_width, .bottom = bar_height }, x, y);
 
         // Normal in-window drag: calculate drop target
         if (!app.tabline_state.is_external_drag) {
@@ -606,42 +622,7 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 pub fn handleTablineMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: x={d} y={d} dragging_tab={?} is_external_drag={} close_button_pressed={?}\n", .{ x, y, app.tabline_state.dragging_tab, app.tabline_state.is_external_drag, app.tabline_state.close_button_pressed });
 
-    // Handle close button release first (before ReleaseCapture)
-    // Note: If mouse moved away from close button, close_button_pressed was already
-    // cleared in handleTablineMouseMoveInChild. So if we get here with close_button_pressed
-    // still set, the mouse is still over the button and we should execute the close action.
-    if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
-        app.tabline_state.close_button_pressed = null;
-        _ = c.ReleaseCapture();
-
-        // Execute close action - mouse was still over button (otherwise mouseMove would have cancelled)
-        if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: close button released on tab {d}, closing\n", .{pressed_tab_idx});
-        if (app.tabline_state.indexOfHandle(app.tabline_state.close_button_pressed_handle)) |idx| {
-            if (app.corep) |corep| {
-                var cmd_buf: [32]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{idx + 1}) catch return;
-                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-            }
-        }
-        _ = c.InvalidateRect(hwnd, null, 0);
-        return;
-    }
-
-    // Handle new tab button release
-    // Note: If mouse moved away, new_tab_button_pressed was already cleared in handleTablineMouseMoveInChild
-    if (app.tabline_state.new_tab_button_pressed) {
-        app.tabline_state.new_tab_button_pressed = false;
-        _ = c.ReleaseCapture();
-
-        // Execute new tab action
-        if (applog.isEnabled()) applog.appLog("[tabline] mouseUp: new tab button released, creating new tab\n", .{});
-        if (app.corep) |corep| {
-            const cmd = "tabnew";
-            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-        }
-        _ = c.InvalidateRect(hwnd, null, 0);
-        return;
-    }
+    if (releaseTabButton(app, hwnd)) return;
 
     // Handle window button release (min/max/close)
     // Note: If mouse moved away, pressed_window_btn was already cleared in handleTablineMouseMoveInChild
@@ -879,39 +860,45 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
 
                     const text_pad = app.scalePx(10);
 
-                    if (app.tabline_state.dragging_tab) |drag_idx| {
-                        if (drag_idx < app.tabline_state.tab_count) {
-                            const tab = &app.tabline_state.tabs[drag_idx];
-                            if (tab.name_len > 0) {
-                                // Display name (basename, preserving the agent-status glyph).
-                                var name_buf: [256]u8 = undefined;
-                                const display_name = name_buf[0..extractTabDisplayName(tab, &name_buf)];
+                    // Display name (basename, preserving the agent-status glyph)
+                    // of the dragged tab by its handle, as the release resolves
+                    // it: tabs[] moves under app.mu on the core thread.
+                    var name_buf: [256]u8 = undefined;
+                    const name_len: ?usize = blk: {
+                        app.mu.lockUncancelable(core.clock.io());
+                        defer app.mu.unlock(core.clock.io());
+                        const drag_idx = draggedTabIndexNow(&app.tabline_state) orelse break :blk null;
+                        const tab = &app.tabline_state.tabs[drag_idx];
+                        break :blk if (tab.name_len > 0) extractTabDisplayName(tab, &name_buf) else 0;
+                    };
+                    if (name_len) |len| {
+                        if (len > 0) {
+                            const display_name = name_buf[0..len];
 
-                                // Draw text
-                                var text_rect = rect;
-                                text_rect.left += text_pad;
-                                text_rect.right -= text_pad;
-                                _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                                _ = c.SetTextColor(hdc, preview_pal.text_selected);
+                            // Draw text
+                            var text_rect = rect;
+                            text_rect.left += text_pad;
+                            text_rect.right -= text_pad;
+                            _ = c.SetBkMode(hdc, c.TRANSPARENT);
+                            _ = c.SetTextColor(hdc, preview_pal.text_selected);
 
-                                // Convert UTF-8 to UTF-16. A tab name is up to
-                                // 255 bytes, so up to 255 UTF-16 units: 128 was
-                                // written past on a long ASCII name.
-                                var wide_buf: [256]u16 = undefined;
-                                const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name) catch 0;
-                                if (wide_len > 0) {
-                                    _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER | c.DT_END_ELLIPSIS);
-                                }
-                            } else {
-                                // No name
-                                const no_name = [_]u16{ '[', 'N', 'o', ' ', 'N', 'a', 'm', 'e', ']', 0 };
-                                var text_rect = rect;
-                                text_rect.left += text_pad;
-                                text_rect.right -= text_pad;
-                                _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                                _ = c.SetTextColor(hdc, preview_pal.text_normal);
-                                _ = c.DrawTextW(hdc, &no_name, 9, &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER);
+                            // Convert UTF-8 to UTF-16. A tab name is up to
+                            // 255 bytes, so up to 255 UTF-16 units: 128 was
+                            // written past on a long ASCII name.
+                            var wide_buf: [256]u16 = undefined;
+                            const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name) catch 0;
+                            if (wide_len > 0) {
+                                _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER | c.DT_END_ELLIPSIS);
                             }
+                        } else {
+                            // No name
+                            const no_name = [_]u16{ '[', 'N', 'o', ' ', 'N', 'a', 'm', 'e', ']', 0 };
+                            var text_rect = rect;
+                            text_rect.left += text_pad;
+                            text_rect.right -= text_pad;
+                            _ = c.SetBkMode(hdc, c.TRANSPARENT);
+                            _ = c.SetTextColor(hdc, preview_pal.text_normal);
+                            _ = c.DrawTextW(hdc, &no_name, 9, &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER);
                         }
                     }
 
@@ -2105,34 +2092,7 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
 /// Handle mouse up in sidebar area
 pub fn handleSidebarMouseUp(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
-    // Handle close button release
-    if (app.tabline_state.close_button_pressed != null) {
-        app.tabline_state.close_button_pressed = null;
-        _ = c.ReleaseCapture();
-
-        if (app.tabline_state.indexOfHandle(app.tabline_state.close_button_pressed_handle)) |idx| {
-            if (app.corep) |corep| {
-                var cmd_buf: [32]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&cmd_buf, "{d}tabclose", .{idx + 1}) catch return;
-                app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-            }
-        }
-        _ = c.InvalidateRect(hwnd, null, 0);
-        return;
-    }
-
-    // Handle new tab button release
-    if (app.tabline_state.new_tab_button_pressed) {
-        app.tabline_state.new_tab_button_pressed = false;
-        _ = c.ReleaseCapture();
-
-        if (app.corep) |corep| {
-            const cmd = "tabnew";
-            app_mod.zonvie_core_send_command(corep, cmd.ptr, cmd.len);
-        }
-        _ = c.InvalidateRect(hwnd, null, 0);
-        return;
-    }
+    if (releaseTabButton(app, hwnd)) return;
 
     // Handle drag end
     const was_external_drag = app.tabline_state.is_external_drag;
@@ -2179,10 +2139,6 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
     const sep_w = app.scalePx(TablineState.SIDEBAR_SEPARATOR_WIDTH);
     const sidebar_w = app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)));
     const new_tab_h = app.scalePx(TablineState.SIDEBAR_NEW_TAB_HEIGHT);
-    // External drag threshold: do NOT DPI-scale. This is a mouse movement distance
-    // threshold, which should be constant in physical pixels regardless of DPI.
-    // macOS uses 50 points (always unscaled), so we match that behavior.
-    const ext_drag_threshold: c_int = TablineState.EXTERNAL_DRAG_THRESHOLD;
 
     // Handle close button pressed state - cancel if mouse leaves the button
     if (app.tabline_state.close_button_pressed) |pressed_tab_idx| {
@@ -2225,76 +2181,16 @@ pub fn handleSidebarMouseMove(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         app.tabline_state.drag_current_x = x;
         app.tabline_state.drag_current_y = y;
 
-        // Check if mouse is outside sidebar bounds (for external drag)
-        if (app.hwnd) |main_hwnd| {
-            var client_rect: c.RECT = undefined;
-            if (c.GetClientRect(main_hwnd, &client_rect) != 0) {
-                var screen_pt: c.POINT = .{ .x = x, .y = y };
-                _ = c.ClientToScreen(hwnd, &screen_pt);
+        trackExternalDrag(app, hwnd, sidebarRectPx(app, hwnd), x, y);
+        if (!app.tabline_state.is_external_drag) {
+            // Internal reorder: calculate drop target from Y position
+            const dy = if (y > app.tabline_state.drag_start_y)
+                y - app.tabline_state.drag_start_y
+            else
+                app.tabline_state.drag_start_y - y;
 
-                // Get client area origin in screen coordinates
-                var client_origin: c.POINT = .{ .x = 0, .y = 0 };
-                _ = c.ClientToScreen(main_hwnd, &client_origin);
-
-                // Compute sidebar rect in screen coordinates (from client area, not window frame)
-                var sidebar_rect: c.RECT = undefined;
-                if (app.sidebar_position_right) {
-                    sidebar_rect = .{
-                        .left = client_origin.x + client_rect.right - sidebar_w,
-                        .top = client_origin.y,
-                        .right = client_origin.x + client_rect.right,
-                        .bottom = client_origin.y + client_rect.bottom,
-                    };
-                } else {
-                    sidebar_rect = .{
-                        .left = client_origin.x,
-                        .top = client_origin.y,
-                        .right = client_origin.x + sidebar_w,
-                        .bottom = client_origin.y + client_rect.bottom,
-                    };
-                }
-
-                const threshold = ext_drag_threshold;
-                const is_outside = (screen_pt.x < sidebar_rect.left - threshold or
-                    screen_pt.x > sidebar_rect.right + threshold or
-                    screen_pt.y < sidebar_rect.top - threshold or
-                    screen_pt.y > sidebar_rect.bottom + threshold);
-
-                if (applog.isEnabled()) {
-                    applog.appLog(
-                        "[sidebar-drag] screen=({d},{d}) sidebar=({d},{d},{d},{d}) threshold={d} outside={d} client_x={d} sidebar_w={d}\n",
-                        .{
-                            screen_pt.x,        screen_pt.y,
-                            sidebar_rect.left,  sidebar_rect.top,
-                            sidebar_rect.right, sidebar_rect.bottom,
-                            threshold,          @as(i32, @intFromBool(is_outside)),
-                            x,                  sidebar_w,
-                        },
-                    );
-                }
-
-                if (is_outside and !app.tabline_state.is_external_drag) {
-                    app.tabline_state.is_external_drag = true;
-                    app.tabline_state.drop_target_index = null;
-                    createDragPreviewWindow(app, app.tabline_state.dragging_tab.?, screen_pt.x, screen_pt.y);
-                } else if (!is_outside and app.tabline_state.is_external_drag) {
-                    app.tabline_state.is_external_drag = false;
-                    destroyDragPreviewWindow(app);
-                }
-
-                if (app.tabline_state.is_external_drag) {
-                    updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
-                } else {
-                    // Internal reorder: calculate drop target from Y position
-                    const dy = if (y > app.tabline_state.drag_start_y)
-                        y - app.tabline_state.drag_start_y
-                    else
-                        app.tabline_state.drag_start_y - y;
-
-                    if (dy > app.scalePx(TablineState.DRAG_THRESHOLD)) {
-                        app.tabline_state.drop_target_index = calculateDropTarget(y, app.tabline_state.tab_count, 0, row_h, row_h);
-                    }
-                }
+            if (dy > app.scalePx(TablineState.DRAG_THRESHOLD)) {
+                app.tabline_state.drop_target_index = calculateDropTarget(y, app.tabline_state.tab_count, 0, row_h, row_h);
             }
         }
 

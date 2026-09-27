@@ -5039,6 +5039,138 @@ fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
     self.log.write("[{s}] overflow map update failed: {any}\n", .{ scope, err });
 }
 
+/// One cmdline state's line before horizontal scroll: firstc, prompt, indent,
+/// content (control characters as ^X) and special_char. The single-line and
+/// block paths both measure and write it through this and CmdlineRowWriter.
+const CmdlineLine = struct {
+    width: u32,
+    /// Display column of the byte offset `pos`.
+    cursor_col: u32,
+    /// Caret notation in the content suppresses special_char.
+    has_control_chars: bool,
+
+    fn of(state: *const grid_mod.CmdlineState) CmdlineLine {
+        const has_control_chars = cmdlineHasControlChars(state.content.items);
+        var lead: u32 = if (state.firstc != 0) 1 else 0;
+        lead += countDisplayWidth(state.prompt);
+        lead += state.indent;
+
+        var width = lead;
+        for (state.content.items) |chunk| width += countDisplayWidth(chunk.text);
+        if (!has_control_chars) width += countDisplayWidth(state.getSpecialChar());
+
+        var cursor_col = lead;
+        var bytes_remaining: u32 = state.pos;
+        for (state.content.items) |chunk| {
+            const text = chunk.text;
+            if (bytes_remaining == 0) break;
+            if (bytes_remaining >= text.len) {
+                cursor_col += countDisplayWidth(text);
+                bytes_remaining -= @intCast(text.len);
+                continue;
+            }
+            var byte_i: usize = 0;
+            while (byte_i < text.len and bytes_remaining > 0) {
+                const cluster = scanEmojiCluster(text, byte_i);
+                if (cluster.codepoint_count == 0) break;
+                cursor_col += if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) 2 else cluster.display_width;
+                bytes_remaining -|= @intCast(cluster.end_byte - byte_i);
+                byte_i = cluster.end_byte;
+            }
+            break;
+        }
+        return .{ .width = width, .cursor_col = cursor_col, .has_control_chars = has_control_chars };
+    }
+};
+
+/// Cmdline grid width for content `line_width` columns wide: the frontend's
+/// default width (chrome already subtracted), grown up to screen_cols, past
+/// which the content scrolls. Without a frontend default, the main grid's.
+fn cmdlineGridWidth(g: *const grid_mod.Grid, line_width: u32) u32 {
+    const min_width: u32 = if (g.cmdline_default_cols > 0)
+        g.cmdline_default_cols
+    else if (g.cols > 0) g.cols else 80;
+    const max_width: u32 = if (g.screen_cols > 0) g.screen_cols else min_width;
+    return @min(@max(line_width + 1, min_width), max_width); // +1 for the cursor
+}
+
+/// Horizontal scroll of a `width`-column cmdline window: `prev` moves only
+/// when the cursor cell leaves the window, and never past the content's end.
+fn cmdlineScrollOffset(prev: u32, cursor_col: u32, line_width: u32, width: u32) u32 {
+    var off = prev;
+    if (cursor_col + 1 > off + width) {
+        off = cursor_col + 1 - width;
+    } else if (cursor_col < off) {
+        off = cursor_col;
+    }
+    const max_off = if (line_width + 1 > width) line_width + 1 - width else 0;
+    return @min(off, max_off);
+}
+
+/// Writes one cmdline grid row left to right, skipping the first
+/// `scroll_offset` display columns. Each write returns false once the row
+/// is full; nothing after that is written.
+const CmdlineRowWriter = struct {
+    grid: *grid_mod.Grid,
+    row: u32,
+    scroll_offset: u32,
+    width: u32,
+    logical_col: u32 = 0,
+    grid_col: u32 = 0,
+
+    fn cell(w: *CmdlineRowWriter, cp: u32, hl_id: u32) bool {
+        if (w.logical_col >= w.scroll_offset) {
+            if (w.grid_col >= w.width) return false;
+            w.grid.putCellGrid(grid_mod.CMDLINE_GRID_ID, w.row, w.grid_col, cp, hl_id);
+            w.grid_col += 1;
+        }
+        w.logical_col += 1;
+        return true;
+    }
+
+    fn cluster(w: *CmdlineRowWriter, cp: u32, hl_id: u32, extras: []const u32) !bool {
+        if (w.logical_col >= w.scroll_offset) {
+            if (w.grid_col >= w.width) return false;
+            try w.grid.putCellGridCluster(grid_mod.CMDLINE_GRID_ID, w.row, w.grid_col, cp, hl_id, extras);
+            w.grid_col += 1;
+        }
+        w.logical_col += 1;
+        return true;
+    }
+
+    /// `caret` writes control characters as ^X and ^?; the prompt and
+    /// special_char are written as they are.
+    fn text(w: *CmdlineRowWriter, s: []const u8, hl_id: u32, caret: bool) !bool {
+        var byte_i: usize = 0;
+        while (byte_i < s.len) {
+            const c = scanEmojiCluster(s, byte_i);
+            if (c.codepoint_count == 0) break;
+            if (caret and (c.first_cp < 0x20 or c.first_cp == 0x7F)) {
+                if (!w.cell('^', hl_id)) return false;
+                if (!w.cell(if (c.first_cp == 0x7F) '?' else '@' + c.first_cp, hl_id)) return false;
+            } else {
+                if (!try w.cluster(c.first_cp, hl_id, c.extras[0..c.extras_len])) return false;
+                if (c.display_width >= 2 and !w.cell(0, hl_id)) return false;
+            }
+            byte_i = c.end_byte;
+        }
+        return true;
+    }
+
+    fn line(w: *CmdlineRowWriter, state: *const grid_mod.CmdlineState, has_control_chars: bool) !void {
+        if (state.firstc != 0 and !w.cell(state.firstc, 0)) return;
+        if (!try w.text(state.prompt, state.prompt_hl_id, false)) return;
+        var i: u32 = 0;
+        while (i < state.indent) : (i += 1) {
+            if (!w.cell(' ', 0)) return;
+        }
+        for (state.content.items) |chunk| {
+            if (!try w.text(chunk.text, chunk.hl_id, true)) return;
+        }
+        if (!has_control_chars) _ = try w.text(state.getSpecialChar(), 0, false);
+    }
+};
+
 /// Check for cmdline state changes and create/update/close external float window via Neovim API.
 /// The cmdline is rendered by Neovim in an external float window.
 pub fn notifyCmdlineChanges(self: *Core) void {
@@ -5120,96 +5252,12 @@ pub fn notifyCmdlineChanges(self: *Core) void {
             );
         }
 
-        // Check if content has control characters (affects special_char display)
-        const has_control_chars = blk: {
-            for (state.content.items) |chunk| {
-                var citer = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-                while (citer.nextCodepoint()) |cp| {
-                    if (cp < 0x20 or cp == 0x7F) break :blk true;
-                }
-            }
-            break :blk false;
-        };
+        const line = CmdlineLine.of(state);
+        const display_width = line.width;
+        const width = cmdlineGridWidth(&self.grid, display_width);
 
-        // Calculate display width: firstc + prompt + indent + content (with caret notation) + special_char
-        var display_width: u32 = 0;
-        if (state.firstc != 0) display_width += 1;
-        display_width += countDisplayWidth(state.prompt);
-        display_width += state.indent;
-        for (state.content.items) |chunk| {
-            display_width += countDisplayWidth(chunk.text);
-        }
-        const special = state.getSpecialChar();
-        if (!has_control_chars and special.len > 0) {
-            display_width += countDisplayWidth(special);
-        }
-
-        // Grid width: start at the frontend's default width (a fraction of the
-        // main window, chrome already subtracted), expand up to screen width,
-        // then scroll. Without a frontend default, fall back to the main grid.
-        const min_width: u32 = if (self.grid.cmdline_default_cols > 0)
-            self.grid.cmdline_default_cols
-        else if (self.grid.cols > 0) self.grid.cols else 80;
-        const max_width: u32 = if (self.grid.screen_cols > 0) self.grid.screen_cols else min_width;
-        const content_width: u32 = display_width + 1; // +1 for cursor
-        const width: u32 = @min(@max(content_width, min_width), max_width);
-
-        // Calculate cursor display column (before scroll) for scroll offset calculation.
-        // This duplicates the cursor_col logic below but is needed before grid writing.
-        var cursor_display_col: u32 = 0;
-        if (state.firstc != 0) cursor_display_col += 1;
-        cursor_display_col += countDisplayWidth(state.prompt);
-        cursor_display_col += state.indent;
-        {
-            var cdc_bytes_remaining: u32 = state.pos;
-            for (state.content.items) |chunk| {
-                const ctext = chunk.text;
-                if (cdc_bytes_remaining == 0) break;
-                if (cdc_bytes_remaining >= ctext.len) {
-                    cursor_display_col += countDisplayWidth(ctext);
-                    cdc_bytes_remaining -= @intCast(ctext.len);
-                    continue;
-                }
-                var cbyte_i: usize = 0;
-                while (cbyte_i < ctext.len) {
-                    if (cdc_bytes_remaining == 0) break;
-                    const cluster = scanEmojiCluster(ctext, cbyte_i);
-                    if (cluster.codepoint_count == 0) break;
-                    const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
-                    if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
-                        cursor_display_col += 2;
-                    } else {
-                        cursor_display_col += cluster.display_width;
-                    }
-                    if (cdc_bytes_remaining >= cluster_bytes) {
-                        cdc_bytes_remaining -= cluster_bytes;
-                    } else {
-                        cdc_bytes_remaining = 0;
-                    }
-                    cbyte_i = cluster.end_byte;
-                }
-                break;
-            }
-        }
-
-        // Calculate scroll offset: keep cursor visible within the viewport.
-        // Start from previous scroll offset and adjust only when cursor escapes
-        // the visible range, providing smooth scrolling in both directions.
-        const scroll_offset: u32 = blk: {
-            var off = state.scroll_offset;
-            const cursor_right_edge = cursor_display_col + 1; // +1 for cursor cell
-            if (cursor_right_edge > off + width) {
-                // Cursor past right edge of viewport: scroll right
-                off = cursor_right_edge - width;
-            } else if (cursor_display_col < off) {
-                // Cursor past left edge of viewport: scroll left
-                off = cursor_display_col;
-            }
-            // Clamp: don't scroll past end of content
-            const max_off = if (display_width + 1 > width) display_width + 1 - width else 0;
-            off = @min(off, max_off);
-            break :blk off;
-        };
+        const cursor_display_col = line.cursor_col;
+        const scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_display_col, display_width, width);
         state.scroll_offset = scroll_offset;
 
         // Create or resize cmdline grid
@@ -5219,147 +5267,11 @@ pub fn notifyCmdlineChanges(self: *Core) void {
         };
         self.grid.clearGrid(cmdline_grid_id);
 
-        // Write to grid with proper hl_ids, accounting for scroll offset
-        var logical_col: u32 = 0; // Position in the full content
-        var grid_col: u32 = 0; // Position in the visible grid
-
-        // Helper to write a cell, respecting scroll offset
-        const WriterState = struct {
-            grid: *grid_mod.Grid,
-            grid_id: i64,
-            scroll_offset: u32,
-            width: u32,
-            logical_col: *u32,
-            grid_col: *u32,
-
-            fn writeCell(s: @This(), cp: u32, hl_id: u32) bool {
-                if (s.logical_col.* >= s.scroll_offset) {
-                    if (s.grid_col.* >= s.width) return false;
-                    s.grid.putCellGrid(s.grid_id, 0, s.grid_col.*, cp, hl_id);
-                    s.grid_col.* += 1;
-                }
-                s.logical_col.* += 1;
-                return true;
-            }
-
-            fn writeCluster(s: @This(), cp: u32, hl_id: u32, extras: []const u32) !bool {
-                if (s.logical_col.* >= s.scroll_offset) {
-                    if (s.grid_col.* >= s.width) return false;
-                    try s.grid.putCellGridCluster(s.grid_id, 0, s.grid_col.*, cp, hl_id, extras);
-                    s.grid_col.* += 1;
-                }
-                s.logical_col.* += 1;
-                return true;
-            }
+        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = 0, .scroll_offset = scroll_offset, .width = width };
+        writer.line(state, line.has_control_chars) catch |e| {
+            abortClusterUpdate(self, "cmdline", e);
+            return;
         };
-
-        var writer = WriterState{
-            .grid = &self.grid,
-            .grid_id = cmdline_grid_id,
-            .scroll_offset = scroll_offset,
-            .width = width,
-            .logical_col = &logical_col,
-            .grid_col = &grid_col,
-        };
-
-        // firstc (e.g. ':' '/' '?') - use hl_id 0 (default)
-        if (state.firstc != 0) {
-            if (!writer.writeCell(state.firstc, 0)) {}
-        }
-
-        // prompt - use prompt_hl_id (cluster-aware)
-        if (state.prompt.len > 0) {
-            var pbyte_i: usize = 0;
-            while (pbyte_i < state.prompt.len) {
-                const pc = scanEmojiCluster(state.prompt, pbyte_i);
-                if (pc.codepoint_count == 0) break;
-                const wrote_base = writer.writeCluster(
-                    pc.first_cp,
-                    state.prompt_hl_id,
-                    pc.extras[0..pc.extras_len],
-                ) catch |e| {
-                    abortClusterUpdate(self, "cmdline", e);
-                    return;
-                };
-                if (!wrote_base) break;
-                if (pc.display_width >= 2) {
-                    if (!writer.writeCell(0, state.prompt_hl_id)) break;
-                }
-                pbyte_i = pc.end_byte;
-            }
-        }
-
-        // indent (spaces) - use hl_id 0
-        var indent_i: u32 = 0;
-        while (indent_i < state.indent) : (indent_i += 1) {
-            if (!writer.writeCell(' ', 0)) break;
-        }
-
-        // content chunks - use each chunk's hl_id, with caret notation for control chars.
-        // Multi-codepoint sequences (emoji ZWJ, VS16, etc.) are stored as:
-        //   first codepoint → Cell.cp, extra codepoints → overflow map.
-        for (state.content.items) |chunk| {
-            const text = chunk.text;
-            var byte_i: usize = 0;
-            while (byte_i < text.len) {
-                const cluster = scanEmojiCluster(text, byte_i);
-                if (cluster.codepoint_count == 0) break;
-
-                if (cluster.first_cp < 0x20) {
-                    if (!writer.writeCell('^', chunk.hl_id)) break;
-                    if (!writer.writeCell('@' + cluster.first_cp, chunk.hl_id)) break;
-                    byte_i = cluster.end_byte;
-                    continue;
-                }
-                if (cluster.first_cp == 0x7F) {
-                    if (!writer.writeCell('^', chunk.hl_id)) break;
-                    if (!writer.writeCell('?', chunk.hl_id)) break;
-                    byte_i = cluster.end_byte;
-                    continue;
-                }
-
-                // Write the base cell. Track whether it was actually written
-                // (scrolled-off cells are skipped by writeCell).
-                const wrote_base = writer.writeCluster(
-                    cluster.first_cp,
-                    chunk.hl_id,
-                    cluster.extras[0..cluster.extras_len],
-                ) catch |e| {
-                    abortClusterUpdate(self, "cmdline", e);
-                    return;
-                };
-                if (!wrote_base) break;
-
-                // Continuation cell only for double-width characters
-                if (cluster.display_width >= 2) {
-                    if (!writer.writeCell(0, chunk.hl_id)) break;
-                }
-
-                byte_i = cluster.end_byte;
-            }
-        }
-
-        // special_char (shown at cursor position after Ctrl-V etc.) - cluster-aware
-        if (!has_control_chars and special.len > 0) {
-            var sbyte_i: usize = 0;
-            while (sbyte_i < special.len) {
-                const sc = scanEmojiCluster(special, sbyte_i);
-                if (sc.codepoint_count == 0) break;
-                const wrote_base = writer.writeCluster(
-                    sc.first_cp,
-                    0,
-                    sc.extras[0..sc.extras_len],
-                ) catch |e| {
-                    abortClusterUpdate(self, "cmdline", e);
-                    return;
-                };
-                if (!wrote_base) break;
-                if (sc.display_width >= 2) {
-                    if (!writer.writeCell(0, 0)) break;
-                }
-                sbyte_i = sc.end_byte;
-            }
-        }
 
         // Cursor position in the visible grid: reuse pre-computed cursor_display_col,
         // adjusted for scroll offset.
@@ -5409,26 +5321,15 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     const block_lines = self.grid.cmdline_block.lines.items;
     const block_line_count: u32 = @intCast(block_lines.len);
 
-    // Calculate total rows and max width
-    // Minimum width = the frontend's default cmdline width (chrome already
-    // subtracted), falling back to the global grid width. Must match the
-    // single-line path in notifyCmdlineChanges, or the window snaps to a
-    // different width the moment a block becomes visible.
-    const min_width: u32 = if (self.grid.cmdline_default_cols > 0)
-        self.grid.cmdline_default_cols
-    else if (self.grid.cols > 0) self.grid.cols else 40;
-    var max_width: u32 = min_width;
-
-    // Calculate width from block lines (accounting for control characters)
+    var widest: u32 = 0;
     for (block_lines) |line| {
         var line_width: u32 = 0;
         for (line.items) |chunk| {
             line_width += countDisplayWidth(chunk.text);
         }
-        if (line_width + 1 > max_width) max_width = line_width + 1;
+        widest = @max(widest, line_width);
     }
 
-    // Calculate current cmdline line width if visible
     var cursor_col: u32 = 0;
     var current_has_control_chars = false;
     var current_state: ?*grid_mod.CmdlineState = null;
@@ -5436,69 +5337,23 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     if (current_line_visible) {
         if (self.grid.cmdline_states.getPtr(visible_level)) |state| {
             current_state = state;
-
-            // Check for control characters
-            current_has_control_chars = blk: {
-                for (state.content.items) |chunk| {
-                    var citer = std.unicode.Utf8View.initUnchecked(chunk.text).iterator();
-                    while (citer.nextCodepoint()) |cp| {
-                        if (cp < 0x20 or cp == 0x7F) break :blk true;
-                    }
-                }
-                break :blk false;
-            };
-
-            // Calculate display width
-            var current_width: u32 = 0;
-            if (state.firstc != 0) current_width += 1;
-            current_width += countDisplayWidth(state.prompt);
-            current_width += state.indent;
-            for (state.content.items) |chunk| {
-                current_width += countDisplayWidth(chunk.text);
-            }
-            const special = state.getSpecialChar();
-            if (!current_has_control_chars and special.len > 0) {
-                current_width += countDisplayWidth(special);
-            }
-            if (current_width + 1 > max_width) max_width = current_width + 1;
-
-            // Cursor position: firstc + prompt + indent + display_pos
-            // pos is a byte offset (same as regular cmdline).
-            if (state.firstc != 0) cursor_col += 1;
-            cursor_col += countDisplayWidth(state.prompt);
-            cursor_col += state.indent;
-            var bytes_remaining: u32 = state.pos;
-            outer: for (state.content.items) |chunk| {
-                const ctext = chunk.text;
-                if (bytes_remaining == 0) break :outer;
-                if (bytes_remaining >= ctext.len) {
-                    cursor_col += countDisplayWidth(ctext);
-                    bytes_remaining -= @intCast(ctext.len);
-                    continue;
-                }
-                var cbyte_i: usize = 0;
-                while (cbyte_i < ctext.len) {
-                    if (bytes_remaining == 0) break :outer;
-                    const cluster = scanEmojiCluster(ctext, cbyte_i);
-                    if (cluster.codepoint_count == 0) break;
-                    const cluster_bytes: u32 = @intCast(cluster.end_byte - cbyte_i);
-                    if (cluster.first_cp < 0x20 or cluster.first_cp == 0x7F) {
-                        cursor_col += 2;
-                    } else {
-                        cursor_col += cluster.display_width;
-                    }
-                    if (bytes_remaining >= cluster_bytes) {
-                        bytes_remaining -= cluster_bytes;
-                    } else {
-                        bytes_remaining = 0;
-                    }
-                    cbyte_i = cluster.end_byte;
-                }
-            }
+            const line = CmdlineLine.of(state);
+            current_has_control_chars = line.has_control_chars;
+            widest = @max(widest, line.width);
+            cursor_col = line.cursor_col;
         }
     }
 
-    // Frontend will constrain max_width to screen width
+    // The single-line path's width rule. Past screen_cols every row scrolls
+    // together to keep the cursor on the current line visible.
+    const max_width = cmdlineGridWidth(&self.grid, widest);
+    var scroll_offset: u32 = 0;
+    if (current_state) |state| {
+        scroll_offset = cmdlineScrollOffset(state.scroll_offset, cursor_col, widest, max_width);
+        state.scroll_offset = scroll_offset;
+        cursor_col -|= scroll_offset;
+    }
+
     const total_rows: u32 = block_line_count + (if (current_line_visible) @as(u32, 1) else @as(u32, 0));
 
     // Create or resize cmdline grid
@@ -5510,201 +5365,23 @@ pub fn sendCmdlineBlockShow(self: *Core, current_line_visible: bool, visible_lev
     // Clear the grid first
     self.grid.clearGrid(cmdline_grid_id);
 
-    // Write block lines to grid using scanEmojiCluster for multi-codepoint emoji
     for (block_lines, 0..) |line, row_idx| {
-        const row: u32 = @intCast(row_idx);
-        var col: u32 = 0;
+        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = @intCast(row_idx), .scroll_offset = scroll_offset, .width = max_width };
         for (line.items) |chunk| {
-            const text = chunk.text;
-            var byte_i: usize = 0;
-            while (byte_i < text.len) {
-                if (col >= max_width) break;
-                const cluster = scanEmojiCluster(text, byte_i);
-                if (cluster.codepoint_count == 0) break;
-
-                if (cluster.first_cp < 0x20) {
-                    self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
-                    col += 1;
-                    if (col >= max_width) {
-                        byte_i = cluster.end_byte;
-                        break;
-                    }
-                    self.grid.putCellGrid(cmdline_grid_id, row, col, '@' + cluster.first_cp, chunk.hl_id);
-                    col += 1;
-                } else if (cluster.first_cp == 0x7F) {
-                    self.grid.putCellGrid(cmdline_grid_id, row, col, '^', chunk.hl_id);
-                    col += 1;
-                    if (col >= max_width) {
-                        byte_i = cluster.end_byte;
-                        break;
-                    }
-                    self.grid.putCellGrid(cmdline_grid_id, row, col, '?', chunk.hl_id);
-                    col += 1;
-                } else {
-                    self.grid.putCellGridCluster(
-                        cmdline_grid_id,
-                        row,
-                        col,
-                        cluster.first_cp,
-                        chunk.hl_id,
-                        cluster.extras[0..cluster.extras_len],
-                    ) catch |e| {
-                        abortClusterUpdate(self, "cmdline_block", e);
-                        return false;
-                    };
-                    col += 1;
-                    if (cluster.display_width >= 2) {
-                        if (col >= max_width) {
-                            byte_i = cluster.end_byte;
-                            break;
-                        }
-                        self.grid.putCellGrid(cmdline_grid_id, row, col, 0, chunk.hl_id);
-                        col += 1;
-                    }
-                }
-
-                byte_i = cluster.end_byte;
-            }
+            const more = writer.text(chunk.text, chunk.hl_id, true) catch |e| {
+                abortClusterUpdate(self, "cmdline_block", e);
+                return false;
+            };
+            if (!more) break;
         }
     }
 
-    // Write current cmdline line (last row) with proper hl_ids
-    if (current_line_visible) {
-        if (current_state) |state| {
-            var col: u32 = 0;
-
-            // firstc (e.g. ':' '/' '?') - use hl_id 0 (default)
-            if (state.firstc != 0) {
-                self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, state.firstc, 0);
-                col += 1;
-            }
-
-            // prompt - use prompt_hl_id (cluster-aware)
-            if (state.prompt.len > 0) {
-                var pbyte_i: usize = 0;
-                while (pbyte_i < state.prompt.len) {
-                    if (col >= max_width) break;
-                    const pc = scanEmojiCluster(state.prompt, pbyte_i);
-                    if (pc.codepoint_count == 0) break;
-                    self.grid.putCellGridCluster(
-                        cmdline_grid_id,
-                        block_line_count,
-                        col,
-                        pc.first_cp,
-                        state.prompt_hl_id,
-                        pc.extras[0..pc.extras_len],
-                    ) catch |e| {
-                        abortClusterUpdate(self, "cmdline_block", e);
-                        return false;
-                    };
-                    col += 1;
-                    if (pc.display_width >= 2) {
-                        if (col >= max_width) {
-                            pbyte_i = pc.end_byte;
-                            break;
-                        }
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, state.prompt_hl_id);
-                        col += 1;
-                    }
-                    pbyte_i = pc.end_byte;
-                }
-            }
-
-            // indent (spaces) - use hl_id 0
-            var indent_i: u32 = 0;
-            while (indent_i < state.indent and col < max_width) : (indent_i += 1) {
-                self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, ' ', 0);
-                col += 1;
-            }
-
-            // content chunks - cluster-aware (matching regular cmdline path)
-            for (state.content.items) |chunk| {
-                const text = chunk.text;
-                var byte_i: usize = 0;
-                while (byte_i < text.len) {
-                    if (col >= max_width) break;
-                    const cluster = scanEmojiCluster(text, byte_i);
-                    if (cluster.codepoint_count == 0) break;
-
-                    if (cluster.first_cp < 0x20) {
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
-                        col += 1;
-                        if (col >= max_width) {
-                            byte_i = cluster.end_byte;
-                            break;
-                        }
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '@' + cluster.first_cp, chunk.hl_id);
-                        col += 1;
-                    } else if (cluster.first_cp == 0x7F) {
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '^', chunk.hl_id);
-                        col += 1;
-                        if (col >= max_width) {
-                            byte_i = cluster.end_byte;
-                            break;
-                        }
-                        self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, '?', chunk.hl_id);
-                        col += 1;
-                    } else {
-                        self.grid.putCellGridCluster(
-                            cmdline_grid_id,
-                            block_line_count,
-                            col,
-                            cluster.first_cp,
-                            chunk.hl_id,
-                            cluster.extras[0..cluster.extras_len],
-                        ) catch |e| {
-                            abortClusterUpdate(self, "cmdline_block", e);
-                            return false;
-                        };
-                        col += 1;
-                        if (cluster.display_width >= 2) {
-                            if (col >= max_width) {
-                                byte_i = cluster.end_byte;
-                                break;
-                            }
-                            self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, chunk.hl_id);
-                            col += 1;
-                        }
-                    }
-
-                    byte_i = cluster.end_byte;
-                }
-            }
-
-            // special_char (shown at cursor position after Ctrl-V etc.) - cluster-aware
-            if (!current_has_control_chars) {
-                const special = state.getSpecialChar();
-                if (special.len > 0) {
-                    var sbyte_i: usize = 0;
-                    while (sbyte_i < special.len) {
-                        if (col >= max_width) break;
-                        const sc = scanEmojiCluster(special, sbyte_i);
-                        if (sc.codepoint_count == 0) break;
-                        self.grid.putCellGridCluster(
-                            cmdline_grid_id,
-                            block_line_count,
-                            col,
-                            sc.first_cp,
-                            0,
-                            sc.extras[0..sc.extras_len],
-                        ) catch |e| {
-                            abortClusterUpdate(self, "cmdline_block", e);
-                            return false;
-                        };
-                        col += 1;
-                        if (sc.display_width >= 2) {
-                            if (col >= max_width) {
-                                sbyte_i = sc.end_byte;
-                                break;
-                            }
-                            self.grid.putCellGrid(cmdline_grid_id, block_line_count, col, 0, 0);
-                            col += 1;
-                        }
-                        sbyte_i = sc.end_byte;
-                    }
-                }
-            }
-        }
+    if (current_state) |state| {
+        var writer: CmdlineRowWriter = .{ .grid = &self.grid, .row = block_line_count, .scroll_offset = scroll_offset, .width = max_width };
+        writer.line(state, current_has_control_chars) catch |e| {
+            abortClusterUpdate(self, "cmdline_block", e);
+            return false;
+        };
     }
 
     // Mark as external grid
@@ -5936,12 +5613,17 @@ pub fn sendPopupmenuShow(self: *Core) bool {
     const max_height: u32 = 15;
     const height: u32 = @intCast(@min(items.len, max_height));
 
-    // Calculate scroll offset to keep selected item visible
+    // The window moves only when the selection leaves it.
     const selected_u: usize = if (selected >= 0) @intCast(selected) else 0;
-    var scroll_offset: usize = 0;
-    if (selected_u >= height) {
-        scroll_offset = selected_u - height + 1;
+    var scroll_offset: usize = @min(self.grid.popupmenu.first, items.len - height);
+    if (selected >= 0) {
+        if (selected_u < scroll_offset) {
+            scroll_offset = selected_u;
+        } else if (selected_u >= scroll_offset + height) {
+            scroll_offset = selected_u - height + 1;
+        }
     }
+    self.grid.popupmenu.first = @intCast(scroll_offset);
     const display_start = scroll_offset;
     const display_end = @min(scroll_offset + height, items.len);
 
@@ -6249,15 +5931,9 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
             hid_message = true;
             self.log.write("[msg] auto-hide: msg_show timeout expired\n", .{});
             self.grid.message_state.clearMessages(self.grid.alloc);
+            // The window closes through notifyExternalWindowChanges, later in
+            // the same flush, as every other synthetic grid does.
             hideChannelView(self, .show, .ext_float);
-            // Remove from known_external_grids and notify close only if it was tracked.
-            // This prevents spurious close notifications for grids that were never
-            // registered or already closed.
-            if (self.known_external_grids.remove(grid_mod.MESSAGE_GRID_ID)) {
-                if (self.cb.on_external_window_close) |cb| {
-                    cb(self.ctx, grid_mod.MESSAGE_GRID_ID);
-                }
-            }
             // Clear callback-based message windows (extFloatWindow etc),
             // but preserve promptWindow if confirm is active
             if (!self.grid.message_state.confirm_msg.active) sendMsgClear(self);
@@ -6271,12 +5947,6 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
             self.log.write("[msg] auto-hide: msg_history timeout expired\n", .{});
             hideChannelView(self, .history, .ext_float);
             self.grid.msg_history_state.clear(self.grid.alloc);
-            // Same guard: only notify if it was actually tracked
-            if (self.known_external_grids.remove(grid_mod.MSG_HISTORY_GRID_ID)) {
-                if (self.cb.on_external_window_close) |cb| {
-                    cb(self.ctx, grid_mod.MSG_HISTORY_GRID_ID);
-                }
-            }
         }
     }
     if (hid_message) self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
@@ -6709,6 +6379,7 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                     }
                 },
                 .history => |entries| {
+                    self.msg_history_scroll_offset = 0;
                     if (!renderMsgHistoryGrid(self, entries)) return false;
                 },
             }
@@ -6984,7 +6655,7 @@ fn beginMsgPanelGrid(self: *Core, grid_id: i64, height: u32, width: u32) !void {
 /// padding column.
 fn writeMsgPanelRow(self: *Core, grid_id: i64, row: u32, line: []const u8, width: u32) void {
     var col: u32 = 1; // Start with 1 cell padding
-    var iter = std.unicode.Utf8View.initUnchecked(line).iterator();
+    var iter: ScalarCursor = .{ .bytes = line };
     while (iter.nextCodepoint()) |cp| {
         if (col >= width - 1) break;
         self.grid.putCellGrid(grid_id, row, col, cp, 0);
@@ -7213,6 +6884,27 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
             self.msg_scroll_pending = true;
         }
     }
+}
+
+/// Wheel over the msg_history float: moves its window over the history by
+/// 'mousescroll' ver lines and publishes it in one flush. Unthrottled, unlike
+/// the msg_show float: the panel is at most 20 rows.
+pub fn handleMsgHistoryScroll(self: *Core, direction: []const u8) void {
+    if (!self.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID)) return;
+    pauseChannelAutoHide(self, .history);
+    const amount: u32 = self.mousescroll_ver.load(.acquire);
+    const prev = self.msg_history_scroll_offset;
+    if (std.mem.eql(u8, direction, "down")) {
+        self.msg_history_scroll_offset +|= amount;
+    } else if (std.mem.eql(u8, direction, "up")) {
+        self.msg_history_scroll_offset -|= amount;
+    }
+    if (!renderMsgHistoryGrid(self, self.grid.msg_history_state.entries.items)) return;
+    if (self.msg_history_scroll_offset == prev) return;
+    var fctx = FlushCtx{ .core = self };
+    FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
+        if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
+    };
 }
 
 /// Process pending scroll update (called from flush or timer).
@@ -7512,10 +7204,13 @@ pub fn sendMsgHistoryShow(self: *Core) bool {
 fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) bool {
     const history_grid_id = grid_mod.MSG_HISTORY_GRID_ID;
 
-    // Build content lines from entries
-    var lines: [256][256]u8 = undefined;
-    var line_lens: [256]usize = undefined;
-    var line_count: usize = 0;
+    // Build content lines from entries. A ring of the newest 256 lines: line
+    // n lives in slot n % 256, so a history longer than that keeps its end,
+    // which the scroll must be able to reach.
+    const ring_len = 256;
+    var lines: [ring_len][256]u8 = undefined;
+    var line_lens: [ring_len]usize = undefined;
+    var line_count: usize = 0; // every line built, including overwritten ones
     var max_width: u32 = 20;
 
     // An entry's chunks run together and split on '\n' (CRLF as LF), as the
@@ -7527,45 +7222,49 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
         // entry ended on a newline (the callback and split sinks agree).
         const reopen = entry.append and line_count > 0 and prev_line_open;
         if (reopen) line_count -= 1;
-        if (line_count >= lines.len) break;
         const first_line = line_count;
-        var line_len: usize = if (reopen) line_lens[line_count] else 0;
+        var line_len: usize = if (reopen) line_lens[line_count % ring_len] else 0;
         var line_full = false; // as in buildMsgLineCache
-        chunks: for (entry.content.items) |chunk| {
+        for (entry.content.items) |chunk| {
             var rest = chunk.text;
             while (true) {
+                const line = &lines[line_count % ring_len];
                 const nl = std.mem.indexOfScalar(u8, rest, '\n');
                 var seg = if (nl) |p| rest[0..p] else rest;
                 if (nl != null and seg.len > 0 and seg[seg.len - 1] == '\r') seg = seg[0 .. seg.len - 1];
-                const copy_len = if (line_full) 0 else utf8PrefixLen(seg, lines[line_count].len - line_len);
-                @memcpy(lines[line_count][line_len..][0..copy_len], seg[0..copy_len]);
+                const copy_len = if (line_full) 0 else utf8PrefixLen(seg, line.len - line_len);
+                @memcpy(line[line_len..][0..copy_len], seg[0..copy_len]);
                 line_len += copy_len;
                 if (copy_len < seg.len) line_full = true;
                 const p = nl orelse break;
-                line_lens[line_count] = line_len;
-                max_width = @max(max_width, countDisplayWidth(lines[line_count][0..line_len]));
+                line_lens[line_count % ring_len] = line_len;
+                max_width = @max(max_width, countDisplayWidth(line[0..line_len]));
                 line_count += 1;
                 line_len = 0;
                 line_full = false;
-                if (line_count >= lines.len) break :chunks;
                 rest = rest[p + 1 ..];
             }
         }
         // The last line, unless a trailing newline already ended it.
         prev_line_open = line_len > 0 or line_count == first_line;
-        if (line_count < lines.len and prev_line_open) {
-            line_lens[line_count] = line_len;
-            max_width = @max(max_width, countDisplayWidth(lines[line_count][0..line_len]));
+        if (prev_line_open) {
+            line_lens[line_count % ring_len] = line_len;
+            max_width = @max(max_width, countDisplayWidth(lines[line_count % ring_len][0..line_len]));
             line_count += 1;
         }
     }
 
     if (line_count == 0) return true;
+    const kept: usize = @min(line_count, ring_len);
+    const oldest_kept = line_count - kept;
 
-    // Calculate grid dimensions
+    // Calculate grid dimensions. Like Neovim's pager, the panel opens at the
+    // oldest line and scrolls (handleMsgHistoryScroll).
     const max_height: u32 = 20;
-    const height: u32 = @intCast(@min(line_count, max_height));
+    const height: u32 = @intCast(@min(kept, max_height));
     const width: u32 = msgPanelWidth(max_width);
+    const first: u32 = @min(self.msg_history_scroll_offset, @as(u32, @intCast(kept)) - height);
+    self.msg_history_scroll_offset = first;
 
     self.log.write("[msg_history] show: entries={d} size={d}x{d}\n", .{ entries.len, width, height });
 
@@ -7578,7 +7277,8 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
 
     // Write lines to grid
     for (0..height) |row_idx| {
-        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[row_idx][0..line_lens[row_idx]], width);
+        const i = (oldest_kept + first + row_idx) % ring_len;
+        writeMsgPanelRow(self, history_grid_id, @intCast(row_idx), lines[i][0..line_lens[i]], width);
     }
 
     // Register as external grid, positioned like msg_show.
@@ -7873,9 +7573,17 @@ pub const EmojiCluster = struct {
 /// width scan cut at arbitrary byte counts. An invalid lead byte, or one whose
 /// continuation bytes are missing or cut off, comes back alone, and
 /// utf8Decode then rejects it.
-const ScalarCursor = struct {
+pub const ScalarCursor = struct {
     bytes: []const u8,
-    i: usize,
+    i: usize = 0,
+
+    /// The next scalar, U+FFFD for each bad byte.
+    pub fn nextCodepoint(self: *ScalarCursor) ?u21 {
+        const s = self.next() orelse return null;
+        // utf8Decode passes a lone byte through unchecked.
+        if (s.len == 1) return if (s[0] < 0x80) s[0] else 0xFFFD;
+        return std.unicode.utf8Decode(s) catch 0xFFFD;
+    }
 
     fn next(self: *ScalarCursor) ?[]const u8 {
         if (self.i >= self.bytes.len) return null;
@@ -7895,6 +7603,37 @@ const ScalarCursor = struct {
     }
 };
 
+/// Whether cmdline content holds a control character (shown in caret
+/// notation). Neovim's text may be invalid UTF-8.
+fn cmdlineHasControlChars(chunks: []const grid_mod.CmdlineChunk) bool {
+    for (chunks) |chunk| {
+        var it: ScalarCursor = .{ .bytes = chunk.text };
+        while (it.nextCodepoint()) |cp| {
+            if (cp < 0x20 or cp == 0x7F) return true;
+        }
+    }
+    return false;
+}
+
+test "the cmdline control-character scan and the panel writer take invalid UTF-8" {
+    const chunks = [_]grid_mod.CmdlineChunk{
+        .{ .hl_id = 0, .text = "a\xff\xe3" },
+        .{ .hl_id = 0, .text = "\xc3" },
+    };
+    try std.testing.expect(!cmdlineHasControlChars(&chunks));
+    const with_ctrl = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "\xffx\x01" }};
+    try std.testing.expect(cmdlineHasControlChars(&with_ctrl));
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    const mgid = grid_mod.MESSAGE_GRID_ID;
+    core.msg_cached_max_width = 4;
+    try seedMsgCacheLine(&core, "a\xff\xe3");
+    try std.testing.expect(renderMsgGridFromCache(&core, 0));
+    try std.testing.expectEqual(@as(u32, 0xFFFD), core.grid.getCellGrid(mgid, 0, 2).cp);
+}
+
 test "the width scan survives truncated and invalid UTF-8" {
     // 'a', then each byte of the cut sequence as one replacement cell.
     try std.testing.expectEqual(@as(u32, 3), countDisplayWidth("a\xe3\x81"));
@@ -7902,6 +7641,225 @@ test "the width scan survives truncated and invalid UTF-8" {
     // A lead byte without its continuation bytes does not swallow "ab".
     try std.testing.expectEqual(@as(u32, 3), countDisplayWidth("\xe3ab"));
     try std.testing.expectEqual(@as(u32, 3), countDisplayWidth("\u{3042}x"));
+}
+
+/// The cmdline grid as text: size, cursor and scroll offset, then each row's
+/// cells up to the last non-blank one as `cp[:hl][+extra...]` in hex.
+fn expectCmdlineGrid(core: *Core, expected: []const u8) !void {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const a = std.testing.allocator;
+    const gid = grid_mod.CMDLINE_GRID_ID;
+    const sg = core.grid.sub_grids.get(gid).?;
+    const off: u32 = if (core.grid.cmdline_states.get(1)) |s| s.scroll_offset else 0;
+    try buf.print(a, "{d}x{d} cur={d},{d} off={d}\n", .{ sg.rows, sg.cols, core.grid.cursor_row, core.grid.cursor_col, off });
+    for (0..sg.rows) |r| {
+        const row: u32 = @intCast(r);
+        var last: u32 = 0;
+        for (0..sg.cols) |c| {
+            const cell = core.grid.getCellGrid(gid, row, @intCast(c));
+            if (cell.cp != ' ' or cell.hl != 0) last = @intCast(c + 1);
+        }
+        for (0..last) |c| {
+            const col: u32 = @intCast(c);
+            const cell = core.grid.getCellGrid(gid, row, col);
+            if (c > 0) try buf.append(a, ' ');
+            try buf.print(a, "{x}", .{cell.cp});
+            if (cell.hl != 0) try buf.print(a, ":{d}", .{cell.hl});
+            if (core.grid.getOverflow(gid, row, col)) |extras| {
+                for (extras) |e| try buf.print(a, "+{x}", .{e});
+            }
+        }
+        try buf.append(a, '\n');
+    }
+    std.testing.expectEqualStrings(expected, buf.items) catch |e| {
+        std.debug.print("ACTUAL<<<\n{s}>>>\n", .{buf.items});
+        return e;
+    };
+}
+
+fn initCmdlineTestCore() !Core {
+    var core = Core.initForTest(std.testing.allocator);
+    errdefer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.ext_cmdline_enabled = true;
+    core.grid.cmdline_default_cols = 12;
+    core.grid.screen_cols = 20;
+    return core;
+}
+
+test "cmdline single-line output: caret notation, wide chars, prompt, indent, special_char, scroll" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    try core.grid.setCmdlineShow(&.{ .{ .hl_id = 5, .text = "ab\x01c" }, .{ .hl_id = 6, .text = "\x7f" } }, 3, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,5 off=0
+        \\3a 61:5 62:5 5e:5 41:5 63:5 5e:6 3f:6
+        \\
+    );
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 7, .text = "a\u{3042}b\u{1F44D}\u{1F3FB}x" }}, 4, '/', "P>", 2, 1, 9);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x13 cur=0,8 off=0
+        \\2f 50:9 3e:9 20 20 61:7 3042:7 0:7 62:7 1f44d:7+1f3fb 0:7 78:7
+        \\
+    );
+
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "abc" }}, 1, ':', "", 0, 1, 0);
+    core.grid.setCmdlineSpecialChar("\u{3042}", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,2 off=0
+        \\3a 61 62 63 3042 0
+        \\
+    );
+
+    // Control characters suppress special_char.
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = "a\x02" }}, 2, ':', "", 0, 1, 0);
+    core.grid.setCmdlineSpecialChar("v", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\1x12 cur=0,4 off=0
+        \\3a 61 5e 42
+        \\
+    );
+
+    // Wider than screen_cols: a wide char straddles the left edge.
+    const long = "a" ++ "\u{3042}" ** 15;
+    const long_row = "0:3" ++ " 3042:3 0:3" ** 9 ++ "\n";
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 3, .text = long }}, long.len, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,19 off=13\n" ++ long_row);
+
+    // The offset is kept until the cursor leaves the window.
+    core.grid.setCmdlinePos(1 + 3 * 10, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,9 off=13\n" ++ long_row);
+    core.grid.setCmdlinePos(1, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,0 off=2\n3042:3 0:3" ++ " 3042:3 0:3" ** 9 ++ "\n");
+
+    // A caret pair straddles the left edge.
+    const carets = "\x01" ** 12;
+    const carets_row = "41:2" ++ " 5e:2 41:2" ** 9 ++ "\n";
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 2, .text = carets }}, carets.len, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,19 off=6\n" ++ carets_row);
+    core.grid.setCmdlinePos(5, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core, "1x20 cur=0,5 off=6\n" ++ carets_row);
+}
+
+test "cmdline block output: block lines and the current line" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    const line0 = [_]grid_mod.CmdlineChunk{.{ .hl_id = 3, .text = "a\x01b" }};
+    const line1 = [_]grid_mod.CmdlineChunk{ .{ .hl_id = 4, .text = "\u{3042}\u{1F44D}" }, .{ .hl_id = 0, .text = "\x7fz" } };
+    try core.grid.setCmdlineBlockShow(&.{ &line0, &line1 });
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 8, .text = "q\u{3042}" }}, 1, ':', "p", 1, 1, 9);
+    core.grid.setCmdlineSpecialChar("x", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\3x12 cur=2,4 off=0
+        \\61:3 5e:3 41:3 62:3
+        \\3042:4 0:4 1f44d:4 0:4 5e 3f 7a
+        \\3a 70:9 20 71:8 3042:8 0:8 78
+        \\
+    );
+
+    // Control characters in the current line suppress special_char.
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 8, .text = "\x1b\u{3042}w" }}, 4, ':', "", 0, 1, 0);
+    core.grid.setCmdlineSpecialChar("x", false, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\3x12 cur=2,5 off=0
+        \\61:3 5e:3 41:3 62:3
+        \\3042:4 0:4 1f44d:4 0:4 5e 3f 7a
+        \\3a 5e:8 5b:8 3042:8 0:8 77:8
+        \\
+    );
+
+    // A block line wider than the default width widens the grid.
+    const wide = [_]grid_mod.CmdlineChunk{.{ .hl_id = 1, .text = "0123456789\u{3042}\x01" }};
+    try core.grid.appendCmdlineBlock(&wide);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\4x15 cur=3,5 off=0
+        \\61:3 5e:3 41:3 62:3
+        \\3042:4 0:4 1f44d:4 0:4 5e 3f 7a
+        \\30:1 31:1 32:1 33:1 34:1 35:1 36:1 37:1 38:1 39:1 3042:1 0:1 5e:1 41:1
+        \\3a 5e:8 5b:8 3042:8 0:8 77:8
+        \\
+    );
+
+    // No current line: the cursor sits on the last block line.
+    core.grid.setCmdlineHide(1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\3x15 cur=2,0 off=0
+        \\61:3 5e:3 41:3 62:3
+        \\3042:4 0:4 1f44d:4 0:4 5e 3f 7a
+        \\30:1 31:1 32:1 33:1 34:1 35:1 36:1 37:1 38:1 39:1 3042:1 0:1 5e:1 41:1
+        \\
+    );
+}
+
+test "the popupmenu window moves only when the selection leaves it" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    var items: [30]grid_mod.PopupmenuItem = undefined;
+    var words: [30][3]u8 = undefined;
+    for (&items, &words, 0..) |*item, *w, i| {
+        w.* = .{ 'w', '0' + @as(u8, @intCast(i / 10)), '0' + @as(u8, @intCast(i % 10)) };
+        item.* = .{ .word = w };
+    }
+    const pgid = grid_mod.POPUPMENU_GRID_ID;
+    // The top row's word ends at column 3: "w06" is item 6.
+    try core.grid.setPopupmenuShow(&items, 20, 0, 0, 1);
+    try std.testing.expect(sendPopupmenuShow(&core));
+    try std.testing.expectEqual(@as(u32, '6'), core.grid.getCellGrid(pgid, 0, 3).cp);
+
+    // Moving up inside the window moves the highlight, not the list.
+    core.grid.setPopupmenuSelect(19);
+    try std.testing.expect(sendPopupmenuShow(&core));
+    try std.testing.expectEqual(@as(u32, '6'), core.grid.getCellGrid(pgid, 0, 3).cp);
+
+    // Above the window, the selection becomes the top row.
+    core.grid.setPopupmenuSelect(3);
+    try std.testing.expect(sendPopupmenuShow(&core));
+    try std.testing.expectEqual(@as(u32, '3'), core.grid.getCellGrid(pgid, 0, 3).cp);
+}
+
+test "a block cmdline wider than screen_cols is clamped and scrolls to the cursor" {
+    var core = try initCmdlineTestCore();
+    defer core.deinitForTest();
+
+    const line0 = [_]grid_mod.CmdlineChunk{.{ .hl_id = 0, .text = "abcdefghijklmnopqrstuvwxyz" }};
+    try core.grid.setCmdlineBlockShow(&.{&line0});
+    const digits = "0123456789" ** 3;
+    try core.grid.setCmdlineShow(&.{.{ .hl_id = 0, .text = digits }}, digits.len, ':', "", 0, 1, 0);
+    notifyCmdlineChanges(&core);
+    // ':' + 30 columns + the cursor cell in a 20-column window.
+    try expectCmdlineGrid(&core,
+        \\2x20 cur=1,19 off=12
+        \\6d 6e 6f 70 71 72 73 74 75 76 77 78 79 7a
+        \\31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37 38 39
+        \\
+    );
+
+    core.grid.setCmdlinePos(0, 1);
+    notifyCmdlineChanges(&core);
+    try expectCmdlineGrid(&core,
+        \\2x20 cur=1,0 off=1
+        \\62 63 64 65 66 67 68 69 6a 6b 6c 6d 6e 6f 70 71 72 73 74 75
+        \\30 31 32 33 34 35 36 37 38 39 30 31 32 33 34 35 36 37 38 39
+        \\
+    );
 }
 
 /// Scan one emoji cluster starting at `start` in a UTF-8 string.
@@ -11808,6 +11766,75 @@ test "history dispatches through its own view set and hides on empty" {
     try std.testing.expect(!core.grid.external_grids.contains(grid_mod.MSG_HISTORY_GRID_ID));
 }
 
+test "a history longer than the line ring still scrolls to its newest line" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+
+    const n = 300;
+    var texts: [n][4]u8 = undefined;
+    var entries: [n]grid_mod.MsgHistoryEntry = undefined;
+    for (&texts, &entries, 0..) |*t, *e, i| {
+        t.* = .{ 'l', '0' + @as(u8, @intCast(i / 100)), '0' + @as(u8, @intCast(i / 10 % 10)), '0' + @as(u8, @intCast(i % 10)) };
+        e.* = try makeTestHistoryEntry(&core, t);
+    }
+    defer for (&entries) |*e| e.deinit(core.alloc);
+
+    core.msg_history_scroll_offset = std.math.maxInt(u32);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    const bottom = panelRows(&core, hgid) - 1;
+    // "l299" on the last row: cells 1..4 after the padding column.
+    for ("l299", 1..) |ch, col| {
+        try std.testing.expectEqual(@as(u32, ch), core.grid.getCellGrid(hgid, bottom, @intCast(col)).cp);
+    }
+}
+
+test "the history float opens at the oldest line and scrolls to the newest" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.ext_messages_enabled = true;
+    var routes = [_]config.MsgRoute{
+        .{ .filter = .{ .event = .msg_history_show }, .view = .ext_float, .opts = .{ .timeout = 0 } },
+    };
+    core.msg_config.messages.routes = &routes;
+
+    var entries: [30]grid_mod.MsgHistoryEntry = @splat(.{});
+    var texts: [30][3]u8 = undefined;
+    defer for (&entries) |*e| e.content.deinit(std.testing.allocator);
+    for (&entries, &texts, 0..) |*e, *t, i| {
+        t.* = .{ 'l', '0' + @as(u8, @intCast(i / 10)), '0' + @as(u8, @intCast(i % 10)) };
+        try e.content.append(std.testing.allocator, .{ .hl_id = 0, .text = t });
+    }
+    try core.grid.setMsgHistoryShow(&entries, false);
+    try std.testing.expect(sendMsgHistoryShow(&core));
+    // Cleared by notifyMessageChanges in production; left set, the scroll's
+    // flush would show the history again.
+    core.grid.msg_history_state.dirty = false;
+
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    const TopLine = struct {
+        fn of(c: *Core) [2]u32 {
+            // The panel's first text column holds 'l'; the two digits follow.
+            var col: u32 = 0;
+            while (c.grid.getCellGrid(hgid, 0, col).cp != 'l') col += 1;
+            return .{ c.grid.getCellGrid(hgid, 0, col + 1).cp, c.grid.getCellGrid(hgid, 0, col + 2).cp };
+        }
+    };
+    try std.testing.expectEqual([2]u32{ '0', '0' }, TopLine.of(&core));
+
+    core.mousescroll_ver.store(3, .release);
+    core.sendMouseScroll(hgid, 0, 0, "down", "");
+    try std.testing.expectEqual([2]u32{ '0', '3' }, TopLine.of(&core));
+    var i: usize = 0;
+    while (i < 10) : (i += 1) core.sendMouseScroll(hgid, 0, 0, "down", "");
+    // 30 lines in 20 rows: the newest is on the bottom row.
+    try std.testing.expectEqual([2]u32{ '1', '0' }, TopLine.of(&core));
+    core.sendMouseScroll(hgid, 0, 0, "up", "");
+    try std.testing.expectEqual([2]u32{ '0', '7' }, TopLine.of(&core));
+}
+
 test "auto-hide expiry clears the visible flag through the hide funnel" {
     // Out-of-band hides (auto-hide timeout, msg_clear) used to bypass the
     // ViewSet, leaving `visible` stale so the next empty cycle issued a
@@ -11829,6 +11856,35 @@ test "auto-hide expiry clears the visible flag through the hide funnel" {
     // The next empty cycle has nothing to hide — no spurious action.
     try core.msg_views.beginCycle(core.alloc, 0);
     try std.testing.expectEqual(msg_view.Action.none, core.msg_views.action(.ext_float));
+}
+
+test "an auto-hidden message float closes once, through the flush's window diff" {
+    const Recorder = struct {
+        fn close(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
+            const ids: *std.ArrayListUnmanaged(i64) = @ptrCast(@alignCast(ctx.?));
+            ids.append(std.testing.allocator, grid_id) catch unreachable;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.ext_messages_enabled = true;
+    var closed: std.ArrayListUnmanaged(i64) = .empty;
+    defer closed.deinit(std.testing.allocator);
+    core.ctx = &closed;
+    core.cb.on_external_window_close = Recorder.close;
+
+    try appendTestMessage(&core, 1, "echo", "visible");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+    notifyExternalWindowChanges(&core);
+    try std.testing.expect(core.known_external_grids.contains(grid_mod.MESSAGE_GRID_ID));
+
+    core.msg_show_auto_hide_at = clock.nowNs() - 1;
+    var flush_ctx = FlushCtx{ .core = &core };
+    try flush_ctx.onFlush(24, 80);
+    try std.testing.expectEqualSlices(i64, &.{grid_mod.MESSAGE_GRID_ID}, closed.items);
+    try std.testing.expect(!core.known_external_grids.contains(grid_mod.MESSAGE_GRID_ID));
 }
 
 test "scrolling the message float pauses its auto-hide" {

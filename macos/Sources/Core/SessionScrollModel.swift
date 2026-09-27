@@ -218,6 +218,8 @@ final class SessionScrollModel {
     /// external window draws. Main thread only.
     private var easeCandidateScratch: [Int64] = []
     private var externalEaseGridScratch: Set<Int64> = []
+    /// Snapshot of smoothScrollGrids for the decay loop, which removes from it.
+    private var easeDecayScratch: [Int64] = []
     private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
@@ -854,7 +856,9 @@ final class SessionScrollModel {
                     // opens — the committed set still holds the on-screen rows
                     // at that point.
                     view.noteGridScroll(gridId: gridId, rowsDelta: rowsDelta)
-                case .deferred:
+                case .deferred, .unplaced:
+                    // No surface draws it yet: the main renderer has no rows
+                    // of it to capture.
                     break
                 default:
                     renderer?.captureRetainedRowForGridScroll(gridId: gridId, rowsDelta: rowsDelta)
@@ -1352,7 +1356,9 @@ final class SessionScrollModel {
 
         if !smoothScrollGrids.isEmpty {
             let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
-            for gridId in Array(smoothScrollGrids) {
+            easeDecayScratch.removeAll(keepingCapacity: true)
+            easeDecayScratch.append(contentsOf: smoothScrollGrids)
+            for gridId in easeDecayScratch {
                 // Clamped to what the drawing surface's retention can cover:
                 // past that the vacated band has no row to show.
                 let limitPx = externalEaseGridScratch.contains(gridId) ? externalMaxOffsetPx : maxOffsetPx

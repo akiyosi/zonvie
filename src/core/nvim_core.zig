@@ -910,6 +910,7 @@ pub const Core = struct {
 
     // Scroll state for msg_show ext-float (Zonvie's own grid)
     msg_scroll_offset: u32 = 0, // Current scroll offset (lines from top)
+    msg_history_scroll_offset: u32 = 0, // The msg_history float's, likewise
     msg_total_lines: u32 = 0, // Total line count in current message content
     msg_cached_max_width: u32 = 0, // Cached max line width for grid sizing
     msg_scroll_pending: bool = false, // Pending scroll update (for throttling)
@@ -1568,6 +1569,13 @@ pub const Core = struct {
             }
         }
 
+        // Neovim sends an empty status only after a non-empty one of its own,
+        // so a new server would leave this session's showmode/showcmd/ruler up.
+        var had_status: [grid_mod.StatusChannel.all.len]bool = undefined;
+        for (grid_mod.StatusChannel.all, &had_status) |channel, *had| {
+            had.* = self.grid.message_state.status_content[channel.index()].items.len > 0;
+        }
+
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
         self.grid.resetForNewSession();
@@ -1586,6 +1594,9 @@ pub const Core = struct {
         if (self.cb.on_tabline_hide) |cb| cb(self.ctx);
         if (self.cb.on_popupmenu_hide) |cb| cb(self.ctx);
         if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+        for (grid_mod.StatusChannel.all, had_status) |channel, had| {
+            if (had) flush.sendMsgStatus(self, channel);
+        }
 
         // Core-side flush bookkeeping. Without resetting these, the next
         // flush could short-circuit on rev equality or use stale
@@ -1617,6 +1628,7 @@ pub const Core = struct {
         self.msg_show_auto_hide_at = null;
         self.msg_history_auto_hide_at = null;
         self.msg_scroll_offset = 0;
+        self.msg_history_scroll_offset = 0;
         self.msg_total_lines = 0;
         self.msg_cached_max_width = 0;
         self.msg_scroll_pending = false;
@@ -3313,6 +3325,10 @@ pub const Core = struct {
             self.handleMsgGridScroll(direction);
             return;
         }
+        if (grid_id == grid_mod.MSG_HISTORY_GRID_ID) {
+            flush.handleMsgHistoryScroll(self, direction);
+            return;
+        }
         if (!pointer_target.wheelReachesNeovim(grid_id)) return;
         // Resolve grid_id -1 to cursor_grid so Neovim receives a valid grid ID
         const effective_id = if (grid_id == -1) self.grid.cursor_grid else grid_id;
@@ -3853,18 +3869,11 @@ pub const Core = struct {
         self.requestInput(s) catch |e| self.log.write("emitInputString err: {any}\n", .{e});
     }
 
+    /// The first scalar of `s`, U+FFFD for a bad lead byte (std's iterator
+    /// traps on one); null only for an empty string.
     fn firstCodepointUtf8(s: []const u8) ?u32 {
-        if (s.len == 0) return null;
-        var it = std.unicode.Utf8Iterator{ .bytes = s, .i = 0 };
-        // Avoid Utf8Iterator.nextCodepoint() because it can panic on invalid
-        // UTF-8: it decodes with `catch unreachable`, so an overlong or
-        // truncated sequence off the wire would abort the render thread.
-        // The empty case returned above, so the iterator has at least one
-        // slice. The optional return type stays: callers chain it with
-        // `orelse`, and it is the s.len == 0 branch they consume.
-        const slice = it.nextCodepointSlice().?;
-        const cp = std.unicode.utf8Decode(slice) catch return 0xFFFD;
-        return @as(u32, cp);
+        var it: flush.ScalarCursor = .{ .bytes = s };
+        return it.nextCodepoint() orelse return null;
     }
 
     /// Bounded writer over a caller buffer; every append reports overflow.
@@ -6787,6 +6796,35 @@ test "session reset republishes the latest desired resize" {
     try std.testing.expectEqual(@as(u32, 113), core.pending_resize_cols);
     try std.testing.expectEqual(@as(usize, 0), core.hl.map.count());
     try std.testing.expectEqual(@as(usize, 0), core.hl.groups.count());
+}
+
+test "session reset sends an empty status for each one still showing" {
+    const State = struct {
+        showmode: [2]usize = .{ 0, 0 }, // calls, chunk count of the last
+        ruler_calls: u32 = 0,
+
+        fn onShowmode(ctx: ?*anyopaque, _: c_api.zonvie_msg_view_type, _: [*]const c_api.MsgChunk, count: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.showmode = .{ self.showmode[0] + 1, count };
+        }
+        fn onRuler(ctx: ?*anyopaque, _: c_api.zonvie_msg_view_type, _: [*]const c_api.MsgChunk, _: usize) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.ruler_calls += 1;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_msg_showmode = State.onShowmode;
+    core.cb.on_msg_ruler = State.onRuler;
+
+    try core.grid.setMsgStatus(.showmode, &.{.{ .hl_id = 0, .text = "-- INSERT --" }});
+    core.resetSessionState();
+    try std.testing.expectEqual(@as(usize, 1), state.showmode[0]);
+    try std.testing.expectEqual(@as(usize, 0), state.showmode[1]);
+    // A channel that showed nothing is not sent.
+    try std.testing.expectEqual(@as(u32, 0), state.ruler_calls);
 }
 
 test "redraw allocation failure poisons epoch and suppresses batch presentation" {

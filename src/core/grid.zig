@@ -712,6 +712,8 @@ pub const PopupmenuItem = struct {
 pub const PopupmenuState = struct {
     items: std.ArrayListUnmanaged(PopupmenuItem) = .empty,
     selected: i32 = -1,
+    /// First item shown; kept across selections like Neovim's pum_first.
+    first: u32 = 0,
     row: i32 = 0,
     col: i32 = 0,
     grid_id: i64 = 1,
@@ -738,6 +740,7 @@ pub const PopupmenuState = struct {
         }
         self.items.clearRetainingCapacity();
         self.selected = -1;
+        self.first = 0;
         self.row = 0;
         self.col = 0;
         self.grid_id = 1;
