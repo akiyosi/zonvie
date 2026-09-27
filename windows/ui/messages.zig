@@ -86,27 +86,29 @@ pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
     const cell_h = app.rowHeightPx();
     app.mu.unlock(core.clock.io());
 
+    // Its client area, as the main window below and macOS's contentLayoutRect:
+    // the outer rect of a captioned external window holds the title bar and
+    // the invisible resize borders.
     if (host_hwnd) |hwnd| {
-        var rect: c.RECT = undefined;
-        if (c.GetWindowRect(hwnd, &rect) != 0) return rect;
+        if (clientScreenRect(hwnd)) |rect| return rect;
     }
 
-    var client: c.RECT = undefined;
-    if (c.GetClientRect(main_hwnd, &client) == 0) return app_mod.monitorWorkArea(main_hwnd);
-    var pt: c.POINT = .{ .x = 0, .y = 0 };
-    _ = c.ClientToScreen(main_hwnd, &pt);
-    const surface = mainSurfaceRect(.{
-        .left = pt.x,
-        .top = pt.y,
-        .right = pt.x + client.right,
-        .bottom = pt.y + client.bottom,
-    }, origin.x, origin.y, right_chrome_px);
+    const client = clientScreenRect(main_hwnd) orelse return app_mod.monitorWorkArea(main_hwnd);
+    const surface = mainSurfaceRect(client, origin.x, origin.y, right_chrome_px);
     if (mode == .grid) {
         for (grids) |g| {
             if (g.grid_id == anchor_grid) return gridCellRect(surface, g, cell_w, cell_h);
         }
     }
     return surface;
+}
+
+fn clientScreenRect(hwnd: c.HWND) ?c.RECT {
+    var client: c.RECT = undefined;
+    if (c.GetClientRect(hwnd, &client) == 0) return null;
+    var pt: c.POINT = .{ .x = 0, .y = 0 };
+    if (c.ClientToScreen(hwnd, &pt) == 0) return null;
+    return .{ .left = pt.x, .top = pt.y, .right = pt.x + client.right, .bottom = pt.y + client.bottom };
 }
 
 /// Hand a prepared request to the UI thread and wake it. Caller must already
@@ -130,14 +132,9 @@ fn enqueuePendingMessage(app: *App, req: app_mod.PendingMessageRequest, what: []
 /// it. The .mini route and the fallback route for the views with no dedicated
 /// display did this identically.
 fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) void {
-    const idx = @intFromEnum(mini_id);
-    app.mu.lockUncancelable(core.clock.io());
-    @memcpy(app.mini_windows[idx].text[0..text.len], text);
-    app.mini_windows[idx].text_len = text.len;
-    app.mu.unlock(core.clock.io());
-
+    updateMiniText(app, mini_id, text);
     if (app.hwnd) |main_hwnd| {
-        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, idx), 0);
+        _ = c.PostMessageW(main_hwnd, app_mod.WM_APP_MINI_UPDATE, @as(c.WPARAM, @intFromEnum(mini_id)), 0);
     }
 }
 
@@ -255,24 +252,23 @@ pub fn onMsgClear(ctx: ?*anyopaque) callconv(.c) void {
 
 pub fn onMsgShowmode(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_showmode, .showmode, "showmode", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .showmode, "showmode", chunks, chunk_count);
 }
 
 pub fn onMsgShowcmd(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_showcmd, .showcmd, "showcmd", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .showcmd, "showcmd", chunks, chunk_count);
 }
 
 pub fn onMsgRuler(ctx: ?*anyopaque, view: app_mod.zonvie_msg_view_type, chunks: [*]const app_mod.MsgChunk, chunk_count: usize) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
-    handleMsgMiniOrExtFloat(app, view, .msg_ruler, .ruler, "ruler", chunks, chunk_count);
+    handleMsgMiniOrExtFloat(app, view, .ruler, "ruler", chunks, chunk_count);
 }
 
 /// Common handler for showmode/showcmd/ruler that can route to mini or ext_float
 pub fn handleMsgMiniOrExtFloat(
     app: *App,
     view: app_mod.zonvie_msg_view_type,
-    event: core.zonvie_msg_event,
     mini_id: app_mod.MiniWindowId,
     kind_str: []const u8,
     chunks: [*]const app_mod.MsgChunk,
@@ -286,10 +282,7 @@ pub fn handleMsgMiniOrExtFloat(
         if (text_len >= text_buf.len) break;
     }
 
-    // Get timeout from config
-    const route_result = app_mod.zonvie_core_route_message(app.corep, event, null, 1);
-
-    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\" view={d} timeout={d:.1}\n", .{ kind_str, chunk_count, text_buf[0..text_len], @intFromEnum(view), route_result.timeout });
+    if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\" view={d}\n", .{ kind_str, chunk_count, text_buf[0..text_len], @intFromEnum(view) });
 
     // Route based on view type
     switch (view) {
@@ -315,8 +308,8 @@ pub fn handleMsgMiniOrExtFloat(
             req.hl_id = 0;
             req.replace_last = 0;
             req.append = 0;
+            // No timeout: the status arm keeps the text until it is emptied.
             req.view_type = .ext_float;
-            req.timeout = route_result.timeout;
 
             enqueuePendingMessage(app, req, "message");
         },
@@ -334,22 +327,21 @@ pub fn handleMsgMiniOrExtFloat(
     }
 }
 
-/// Update mini window text directly (for UI thread usage)
+/// Update mini window text directly (for UI thread usage). Under app.mu: the
+/// core thread writes the same buffer in updateMiniWindow.
 pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) void {
     const idx = @intFromEnum(id);
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
     const copy_len = @min(text.len, app.mini_windows[idx].text.len);
     @memcpy(app.mini_windows[idx].text[0..copy_len], text[0..copy_len]);
     app.mini_windows[idx].text_len = copy_len;
 }
 
-/// number_prompt asks the user to pick a numbered choice, so it belongs with
-/// the other blocking dialogs: centred over the app, height-clamped, no
-/// auto-hide, and not joined with the toast stack.
-pub fn isConfirmKind(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, "confirm") or
-        std.mem.eql(u8, kind, "confirm_sub") or
-        std.mem.eql(u8, kind, "number_prompt");
-}
+/// The kinds Neovim blocks on (confirm, confirm_sub, number_prompt): centred
+/// over the app, height-clamped, no auto-hide, not joined with the toast
+/// stack. The core's list, which its router pins to the confirm view.
+pub const isConfirmKind = core.config.isInteractivePrompt;
 
 /// Whether the message window currently shows a blocking dialog, which a
 /// toast update must not re-lay or auto-hide while Neovim waits for input.
@@ -358,11 +350,113 @@ pub fn messageWindowIsConfirm(app: *const App) bool {
     return isConfirmKind(mw.kind[0..mw.kind_len]);
 }
 
-/// The kinds handleMsgMiniOrExtFloat queues for showmode/showcmd/ruler.
-pub fn isStatusKind(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, "showmode") or
-        std.mem.eql(u8, kind, "showcmd") or
-        std.mem.eql(u8, kind, "ruler");
+/// The channel (App.status_messages index) of a kind handleMsgMiniOrExtFloat
+/// queues for showmode/showcmd/ruler, or null for any other kind.
+pub fn statusChannel(kind: []const u8) ?usize {
+    if (std.mem.eql(u8, kind, "showmode")) return 0;
+    if (std.mem.eql(u8, kind, "showcmd")) return 1;
+    if (std.mem.eql(u8, kind, "ruler")) return 2;
+    return null;
+}
+
+/// Bytes the message window keeps; one UTF-16 unit per byte decodes all of it.
+const message_text_capacity = @typeInfo(@FieldType(app_mod.MessageWindow, "text")).array.len;
+/// Inset of the message window's text from each edge, before DPI scaling.
+const message_text_pad_px: c_int = 12;
+
+fn fillMessageWindow(mw: *app_mod.MessageWindow, text: []const u8, msg: app_mod.DisplayMessage, line_count: u32, is_long_mode: bool) void {
+    const copy_len = @min(text.len, mw.text.len);
+    @memcpy(mw.text[0..copy_len], text[0..copy_len]);
+    mw.text_len = copy_len;
+    @memcpy(mw.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
+    mw.kind_len = msg.kind_len;
+    mw.hl_id = msg.hl_id;
+    mw.line_count = line_count;
+    mw.is_long_mode = is_long_mode;
+}
+
+/// The GDI font the message window and the minis draw in.
+fn createPanelFont(height_px: c_int) c.HFONT {
+    return c.CreateFontW(
+        height_px,
+        0,
+        0,
+        0,
+        c.FW_NORMAL,
+        0,
+        0,
+        0,
+        c.DEFAULT_CHARSET,
+        c.OUT_DEFAULT_PRECIS,
+        c.CLIP_DEFAULT_PRECIS,
+        c.DEFAULT_QUALITY,
+        c.FIXED_PITCH | c.FF_MODERN,
+        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
+    );
+}
+
+/// ~75% of the editor cell height, so the mini reads as smaller than the
+/// editor and the ext_float window; floored for legibility.
+fn miniFontPx(app: *const App) c_int {
+    return @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(app.cell_h_px * 3, 4))));
+}
+/// Inset of a mini's text from its left and right edges, before DPI scaling.
+const mini_text_pad_px: c_int = 4;
+/// '\n' breaks lines (no DT_SINGLELINE), so DT_TOP: DT_VCENTER needs SINGLELINE.
+const mini_draw_flags: c.UINT = c.DT_CENTER | c.DT_TOP;
+
+fn colorrefFromRgb(rgb: u32) c.COLORREF {
+    return c.RGB(@as(u8, @truncate(rgb >> 16)), @as(u8, @truncate(rgb >> 8)), @as(u8, @truncate(rgb)));
+}
+
+fn colorrefFromFloat(rgb: [3]f32) c.COLORREF {
+    return c.RGB(
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[0], 0.0, 1.0) * 255.0))),
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[1], 0.0, 1.0) * 255.0))),
+        @as(u8, @intFromFloat(@round(std.math.clamp(rgb[2], 0.0, 1.0) * 255.0))),
+    );
+}
+
+/// The message window's bg from the Normal bg: the cmdline's brightness rule,
+/// as the decorated surfaces and macOS's toast (lighter on dark schemes,
+/// darker on light ones).
+fn messageWindowBg(normal_bg: u32) c.COLORREF {
+    return colorrefFromFloat(app_mod.adjustBrightnessForCmdline(
+        @as(f32, @floatFromInt((normal_bg >> 16) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt((normal_bg >> 8) & 0xFF)) / 255.0,
+        @as(f32, @floatFromInt(normal_bg & 0xFF)) / 255.0,
+    ));
+}
+
+const TextSizePx = struct { w: c_int, h: c_int };
+
+/// What DrawTextW with `flags` would cover for `text` in the panel font at
+/// `font_px`, `width_px` wide. Boxes are sized with the font they are painted
+/// in, not with editor cell metrics.
+fn measureTextPx(hwnd: c.HWND, font_px: c_int, text: []const u16, width_px: c_int, flags: c.UINT) ?TextSizePx {
+    if (text.len == 0) return null;
+    const hdc = c.GetDC(hwnd) orelse return null;
+    defer _ = c.ReleaseDC(hwnd, hdc);
+    const hfont = createPanelFont(font_px);
+    const old_font = c.SelectObject(hdc, hfont);
+    defer {
+        _ = c.SelectObject(hdc, old_font);
+        _ = c.DeleteObject(hfont);
+    }
+    var rect: c.RECT = .{ .left = 0, .top = 0, .right = width_px, .bottom = 0 };
+    if (c.DrawTextW(hdc, @ptrCast(text.ptr), @intCast(text.len), &rect, flags | c.DT_CALCRECT) == 0) return null;
+    return .{ .w = rect.right - rect.left, .h = rect.bottom - rect.top };
+}
+
+/// Measure and paint of a wrapped toast. DT_EDITCONTROL breaks a word wider
+/// than the line (a path, a URL) instead of letting it run off the edge.
+const wrapped_draw_flags: c.UINT = c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK | c.DT_EDITCONTROL;
+
+fn wrappedTextHeightPx(hwnd: c.HWND, font_px: c_int, text: []const u8, width_px: c_int) ?c_int {
+    var utf16: [message_text_capacity]u16 = undefined;
+    const len = utf8ToUtf16Lossy(&utf16, text);
+    const size = measureTextPx(hwnd, font_px, utf16[0..len], width_px, wrapped_draw_flags) orelse return null;
+    return size.h;
 }
 
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
@@ -405,7 +499,8 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         if (ch == '\n') line_count += 1;
     }
 
-    const is_prompt = is_confirm or std.mem.eql(u8, kind_str, "return_prompt");
+    // Word-wrapped: a dialog, several lines, or a line wider than the cap.
+    var is_long_mode = is_confirm or line_count > 1;
 
     // External window with auto-hide
     const cell_h = app.rowHeightPx();
@@ -435,8 +530,20 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         // For regular messages, use text-based width calculation
         const text_len_int: c_int = @intCast(combined_len);
         const estimated_width: c_int = @intCast(@as(u32, @intCast(text_len_int)) * (cell_h / 2) + @as(u32, @intCast(padding * 2)));
-        window_width = @max(app.scalePx(100), @min(estimated_width, app.scalePx(600)));
+        const max_width = app.scalePx(600);
+        window_width = @max(app.scalePx(100), @min(estimated_width, max_width));
         window_height = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
+        // Text wider than the cap wraps, and the box grows to hold it: measured
+        // in the paint font, as macOS measures its toast. A single line was
+        // drawn DT_SINGLELINE and cut at the right edge.
+        if (estimated_width > max_width) {
+            is_long_mode = true;
+            const text_pad = app.scalePx(message_text_pad_px);
+            const stored = combined_text[0..@min(combined_len, message_text_capacity)];
+            if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
+                window_height = @max(window_height, text_h + 2 * text_pad);
+            }
+        }
     }
 
     // Position based on message type (relative to app window)
@@ -462,10 +569,6 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
             }
         }
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog position: x={d} y={d} ext_cmdline={}\n", .{ window_x, window_y, app.ext_cmdline_enabled });
-    } else if (is_prompt) {
-        // Bottom center for other prompts (relative to app window)
-        window_x = app_rect.left + @divTrunc(app_width - window_width, 2);
-        window_y = app_rect.bottom - window_height - app.scalePx(40);
     } else {
         // Regular messages: top-right of msg_pos.ext_float's target, as
         // msg_show and macOS's toast.
@@ -474,32 +577,12 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         window_y = pos.y;
     }
 
-    // Check if this is a return_prompt (preserve layout from confirm dialog)
-    const is_return_prompt = std.mem.eql(u8, kind_str, "return_prompt");
-
     if (app.message_window) |*msg_win| {
-        // Update existing window
-        const copy_len = @min(combined_len, msg_win.text.len);
-        @memcpy(msg_win.text[0..copy_len], combined_text[0..copy_len]);
-        msg_win.text_len = copy_len;
-        @memcpy(msg_win.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
-        msg_win.kind_len = msg.kind_len;
-        msg_win.hl_id = msg.hl_id;
-        msg_win.line_count = line_count;
-
-        // For return_prompt, preserve the layout from the previous confirm dialog
-        if (is_return_prompt and msg_win.saved_width > 0) {
-            // Keep the saved is_long_mode and don't resize the window
-            msg_win.is_long_mode = msg_win.saved_is_long_mode;
-            // Just redraw without resizing
-            _ = c.InvalidateRect(msg_win.hwnd, null, c.TRUE);
-            _ = c.ShowWindow(msg_win.hwnd, c.SW_SHOWNOACTIVATE);
-            if (applog.isEnabled()) applog.appLog("[win] return_prompt: preserving layout (saved_width={d})\n", .{msg_win.saved_width});
-            return;
-        }
-
-        // Use long mode (word wrap) for confirm dialogs or multi-line messages
-        msg_win.is_long_mode = is_confirm or line_count > 1;
+        // Update existing window. Written under app.mu: onFlushEnd reads
+        // message_window on the core thread.
+        app.mu.lockUncancelable(core.clock.io());
+        fillMessageWindow(msg_win, combined_text[0..combined_len], msg, line_count, is_long_mode);
+        app.mu.unlock(core.clock.io());
 
         // Resize and reposition window
         _ = c.SetWindowPos(
@@ -511,13 +594,6 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
             window_height,
             c.SWP_NOZORDER | c.SWP_NOACTIVATE,
         );
-
-        // Save layout for return_prompt if this is a confirm dialog
-        if (is_confirm) {
-            msg_win.saved_width = window_width;
-            msg_win.saved_height = window_height;
-            msg_win.saved_is_long_mode = msg_win.is_long_mode;
-        }
 
         // Redraw the window
         _ = c.InvalidateRect(msg_win.hwnd, null, c.TRUE);
@@ -555,23 +631,11 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     }
 
     // Store window state
-    var msg_win = app_mod.MessageWindow{
-        .hwnd = msg_hwnd.?,
-        .line_count = line_count,
-        // Use long mode (word wrap) for confirm dialogs or multi-line messages
-        .is_long_mode = is_confirm or line_count > 1,
-        // Save layout for return_prompt if this is a confirm dialog
-        .saved_width = if (is_confirm) window_width else 0,
-        .saved_height = if (is_confirm) window_height else 0,
-        .saved_is_long_mode = is_confirm or line_count > 1,
-    };
-    const copy_len = @min(combined_len, msg_win.text.len);
-    @memcpy(msg_win.text[0..copy_len], combined_text[0..copy_len]);
-    msg_win.text_len = copy_len;
-    @memcpy(msg_win.kind[0..msg.kind_len], msg.kind[0..msg.kind_len]);
-    msg_win.kind_len = msg.kind_len;
-    msg_win.hl_id = msg.hl_id;
+    var msg_win = app_mod.MessageWindow{ .hwnd = msg_hwnd.? };
+    fillMessageWindow(&msg_win, combined_text[0..combined_len], msg, line_count, is_long_mode);
+    app.mu.lockUncancelable(core.clock.io());
     app.message_window = msg_win;
+    app.mu.unlock(core.clock.io());
 
     // Set userdata so ExternalWndProc can find App
     _ = c.SetWindowLongPtrW(msg_hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
@@ -589,10 +653,15 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
 
 /// Hide and destroy message window
 pub fn hideMessageWindow(app: *App) void {
-    if (app.message_window) |*msg_win| {
+    if (app.message_window) |msg_win| {
         if (applog.isEnabled()) applog.appLog("[win] hiding message window\n", .{});
-        msg_win.deinit();
+        // Unpublished before it is destroyed: onFlushEnd invalidates it from
+        // the core thread under app.mu.
+        app.mu.lockUncancelable(core.clock.io());
         app.message_window = null;
+        app.mu.unlock(core.clock.io());
+        var closing = msg_win;
+        closing.deinit();
     }
     // Clear display messages stack
     app.display_messages.clearRetainingCapacity();
@@ -600,7 +669,8 @@ pub fn hideMessageWindow(app: *App) void {
 
 /// Resize external window asynchronously.
 /// Called via WM_APP_RESIZE_POPUPMENU to avoid deadlock with WM_SIZE handler.
-/// Handles cmdline (keep center), popupmenu (keep top-left), and regular ext_windows (keep top-left).
+/// The cmdline re-centres on its monitor, the message floats keep their
+/// top-right anchor, everything else keeps its top-left.
 pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     // Get pending resize info while mutex is locked
     app.mu.lockUncancelable(core.clock.io());
@@ -636,25 +706,15 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     if (is_cmdline) {
         // Re-center cmdline on the current monitor after font size change.
         // Preserving the old position caused visible drift on repeated changes.
-        const monitor = c.MonitorFromWindow(ext_hwnd, c.MONITOR_DEFAULTTONEAREST);
-        if (monitor) |mon| {
-            var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
-            mi.cbSize = @sizeOf(c.MONITORINFO);
-            if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                const work_w = mi.rcWork.right - mi.rcWork.left;
-                const work_h = mi.rcWork.bottom - mi.rcWork.top;
-                pos_x = mi.rcWork.left + @divTrunc(work_w - window_w, 2);
-                pos_y = mi.rcWork.top + @divTrunc(work_h - window_h, 3);
-            } else {
-                const work = app_mod.monitorWorkArea(app.hwnd);
-                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
-            }
-        } else {
-            const work = app_mod.monitorWorkArea(app.hwnd);
-            pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-            pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
-        }
+        const work = app_mod.monitorWorkArea(ext_hwnd);
+        pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
+        pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
+    } else if (grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID) {
+        // The message floats keep their top-right anchor, as on every other
+        // re-layout; the top-left one grew them past the right margin.
+        const pos = external_windows.msgFloatTopRight(app, grid_id == app_mod.MSG_HISTORY_GRID_ID, window_w);
+        pos_x = pos.x;
+        pos_y = pos.y;
     } else {
         pos_x = current_rect.left;
         pos_y = current_rect.top;
@@ -703,6 +763,10 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
         app.cmdline_saved_y = null;
     }
     app.mu.unlock(core.clock.io());
+
+    // The two message floats resize in hash-map order; msg_show may have been
+    // placed against msg_history's old bottom.
+    if (grid_id == app_mod.MSG_HISTORY_GRID_ID) external_windows.restackMsgShowBelowHistory(app);
 }
 
 /// Move the ext-float message windows (msg_show/msg_history and the toast)
@@ -756,21 +820,12 @@ fn windowSize(hwnd: c.HWND) ?struct { w: c_int, h: c_int } {
 
 /// Update or create mini windows (showmode / showcmd / ruler)
 pub fn updateMiniWindows(app: *App) void {
-    if (app.hwnd == null) return;
+    const main_hwnd = app.hwnd orelse return;
 
-    // Get cell dimensions and config
     app.mu.lockUncancelable(core.clock.io());
-    const cell_w = app.cell_w_px;
-    const cell_h = app.rowHeightPx();
     const mini_pos_mode = app.config.messages.msg_pos.mini;
+    const font_px = miniFontPx(app);
     app.mu.unlock(core.clock.io());
-
-    // Mini-specific cell dimensions: ~75% of the editor cell so the popup
-    // looks visibly "mini" (macOS sets its mini font size to cellHeightPt *
-    // 0.6, an em size rather than a cell height). Floors keep the popup
-    // legible at small DPI.
-    const mini_cell_h_i: c_int = @max(@as(c_int, 12), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
-    const mini_cell_w_i: c_int = @max(@as(c_int, 6), @as(c_int, @intCast(@divTrunc(cell_w * 3, 4))));
 
     // Minis stack upward from the target's bottom-right corner.
     const target = msgTargetRect(app, mini_pos_mode);
@@ -789,39 +844,28 @@ pub fn updateMiniWindows(app: *App) void {
         app.mu.unlock(core.clock.io());
 
         if (text_len == 0) {
-            // Hide this mini window
+            // Hide this mini window. Unpublished under app.mu first: onFlushEnd
+            // invalidates the minis from the core thread.
             if (app.mini_windows[idx].hwnd) |mini_hwnd| {
-                _ = c.DestroyWindow(mini_hwnd);
+                app.mu.lockUncancelable(core.clock.io());
                 app.mini_windows[idx].hwnd = null;
+                app.mu.unlock(core.clock.io());
+                _ = c.DestroyWindow(mini_hwnd);
             }
             continue;
         }
 
         if (applog.isEnabled()) applog.appLog("[win] updateMiniWindows: idx={d} text=\"{s}\"\n", .{ idx, text_buf[0..text_len] });
 
-        // Compute line count and longest-line byte length so multi-line messages
-        // are fully visible. UTF-8 '\n' (0x0A) is a single byte so byte-level counting works.
-        var line_count: usize = 1;
-        var max_line_bytes: usize = 0;
-        var line_start: usize = 0;
-        var i: usize = 0;
-        while (i < text_len) : (i += 1) {
-            if (text_buf[i] == '\n') {
-                const len = i - line_start;
-                if (len > max_line_bytes) max_line_bytes = len;
-                line_count += 1;
-                line_start = i + 1;
-            }
-        }
-        if (text_len - line_start > max_line_bytes) max_line_bytes = text_len - line_start;
-
-        // Width based on longest line, height grows with line count.
-        // Use mini-cell metrics so the popup is visibly smaller than the
-        // editor (and than ext_float windows that use full cell metrics).
-        const max_line_i: c_int = @intCast(max_line_bytes);
-        const text_width: c_int = max_line_i * mini_cell_w_i + app.scalePx(12);
-        const window_width: c_int = @max(app.scalePx(40), text_width);
-        const window_height: c_int = mini_cell_h_i * @as(c_int, @intCast(line_count));
+        // Sized from the text in the font paintMiniWindow draws it in; editor
+        // cell metrics clipped it under a negative linespace or a font
+        // narrower than Consolas. Lines break at '\n' only.
+        var text_utf16: [256]u16 = undefined;
+        const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
+        const text_size = measureTextPx(main_hwnd, font_px, text_utf16[0..text_utf16_len], 0, mini_draw_flags) orelse
+            TextSizePx{ .w = 0, .h = font_px };
+        const window_width: c_int = @max(app.scalePx(40), text_size.w + 2 * app.scalePx(mini_text_pad_px));
+        const window_height: c_int = text_size.h;
 
         // Position: right edge of target area, stacking upward from bottom
         const window_x = anchor_x - window_width;
@@ -859,7 +903,9 @@ pub fn updateMiniWindows(app: *App) void {
                 continue;
             }
 
+            app.mu.lockUncancelable(core.clock.io());
             app.mini_windows[idx].hwnd = mini_hwnd;
+            app.mu.unlock(core.clock.io());
             _ = c.SetWindowLongPtrW(mini_hwnd, c.GWLP_USERDATA, @bitCast(@intFromPtr(app)));
 
             if (use_transparency) {
@@ -904,22 +950,8 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
         app.mu.unlock(core.clock.io());
 
         // 0xFFFFFFFF is the only "unset" value: 0 is a black Normal colour.
-        if (bg != 0xFFFFFFFF) {
-            // Apply brightness adjustment
-            var r = @as(u8, @intCast((bg >> 16) & 0xFF));
-            var g = @as(u8, @intCast((bg >> 8) & 0xFF));
-            var b = @as(u8, @intCast(bg & 0xFF));
-            r = @min(255, @as(u16, r) * 13 / 10 + 12);
-            g = @min(255, @as(u16, g) * 13 / 10 + 12);
-            b = @min(255, @as(u16, b) * 13 / 10 + 12);
-            bg_rgb = c.RGB(r, g, b);
-        }
-        if (fg != 0xFFFFFFFF) {
-            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-            const b = @as(u8, @intCast(fg & 0xFF));
-            fg_rgb = c.RGB(r, g, b);
-        }
+        if (bg != 0xFFFFFFFF) bg_rgb = messageWindowBg(bg);
+        if (fg != 0xFFFFFFFF) fg_rgb = colorrefFromRgb(fg);
     }
 
     // Fill background
@@ -927,25 +959,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     _ = c.FillRect(hdc, &rect, bg_brush);
     _ = c.DeleteObject(bg_brush);
 
-    // Create font
-    const cell_h = app.cell_h_px;
-    const font_height: c_int = @intCast(cell_h);
-    const hfont = c.CreateFontW(
-        font_height,
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.DEFAULT_QUALITY,
-        c.FIXED_PITCH | c.FF_MODERN,
-        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
-    );
+    const hfont = createPanelFont(@intCast(app.cell_h_px));
     const old_font = c.SelectObject(hdc, hfont);
     defer {
         _ = c.SelectObject(hdc, old_font);
@@ -958,11 +972,11 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
     _ = c.SetBkMode(hdc, c.TRANSPARENT);
 
     // Convert text to UTF-16 using proper UTF-8 decoding
-    var text_utf16: [4096]u16 = undefined;
+    var text_utf16: [message_text_capacity]u16 = undefined;
     const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, msg_win.text[0..msg_win.text_len]);
 
     // Draw text with padding
-    const padding: c_int = app.scalePx(12);
+    const padding: c_int = app.scalePx(message_text_pad_px);
     var text_rect = c.RECT{
         .left = rect.left + padding,
         .top = rect.top + padding,
@@ -972,7 +986,7 @@ pub fn paintMessageWindow(hwnd: c.HWND, app: *App) void {
 
     // Use different draw flags based on long mode
     const draw_flags: c.UINT = if (msg_win.is_long_mode)
-        c.DT_LEFT | c.DT_TOP | c.DT_WORDBREAK
+        wrapped_draw_flags
     else
         c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE;
 
@@ -1020,19 +1034,10 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         const bg = app.colorscheme_bg;
         app.mu.unlock(core.clock.io());
 
-        if (bg != 0xFFFFFFFF) {
-            // Darken background slightly for mini windows
-            const r = @as(u8, @intCast((bg >> 16) & 0xFF)) / 2;
-            const g = @as(u8, @intCast((bg >> 8) & 0xFF)) / 2;
-            const b = @as(u8, @intCast(bg & 0xFF)) / 2;
-            bg_rgb = c.RGB(r, g, b);
-        }
-        if (fg != 0xFFFFFFFF) {
-            const r = @as(u8, @intCast((fg >> 16) & 0xFF));
-            const g = @as(u8, @intCast((fg >> 8) & 0xFF));
-            const b = @as(u8, @intCast(fg & 0xFF));
-            fg_rgb = c.RGB(r, g, b);
-        }
+        // The Normal pair itself, as macOS's mini: halving the bg left the
+        // Normal fg unreadable on light schemes.
+        if (bg != 0xFFFFFFFF) bg_rgb = colorrefFromRgb(bg);
+        if (fg != 0xFFFFFFFF) fg_rgb = colorrefFromRgb(fg);
     }
 
     // Fill background
@@ -1040,27 +1045,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     _ = c.FillRect(hdc, &rect, bg_brush);
     _ = c.DeleteObject(bg_brush);
 
-    // Create font at ~75% of the editor cell height so the mini popup is
-    // visibly smaller than the editor and the ext_float window. Floor at 11 px
-    // for legibility.
-    const cell_h = app.cell_h_px;
-    const font_height: c_int = @max(@as(c_int, 11), @as(c_int, @intCast(@divTrunc(cell_h * 3, 4))));
-    const hfont = c.CreateFontW(
-        font_height,
-        0,
-        0,
-        0,
-        c.FW_NORMAL,
-        0,
-        0,
-        0,
-        c.DEFAULT_CHARSET,
-        c.OUT_DEFAULT_PRECIS,
-        c.CLIP_DEFAULT_PRECIS,
-        c.DEFAULT_QUALITY,
-        c.FIXED_PITCH | c.FF_MODERN,
-        @ptrCast(&[_:0]u16{ 'C', 'o', 'n', 's', 'o', 'l', 'a', 's', 0 }),
-    );
+    const hfont = createPanelFont(miniFontPx(app));
     const old_font = c.SelectObject(hdc, hfont);
     defer {
         _ = c.SelectObject(hdc, old_font);
@@ -1078,7 +1063,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
 
     // Draw text centered
-    const mini_pad = app.scalePx(4);
+    const mini_pad = app.scalePx(mini_text_pad_px);
     var text_rect = c.RECT{
         .left = rect.left + mini_pad,
         .top = rect.top,
@@ -1086,9 +1071,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
         .bottom = rect.bottom,
     };
 
-    // Multi-line: omit DT_SINGLELINE so '\n' breaks lines; DT_VCENTER is unsupported
-    // without DT_SINGLELINE, so use DT_TOP. Keep DT_CENTER for horizontal centering.
-    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, c.DT_CENTER | c.DT_TOP);
+    _ = c.DrawTextW(hdc, @ptrCast(&text_utf16), @intCast(text_utf16_len), &text_rect, mini_draw_flags);
 
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
 }
@@ -1138,6 +1121,28 @@ test "message kinds: interactive prompts are dialogs, status kinds are not" {
     try std.testing.expect(isConfirmKind("confirm"));
     try std.testing.expect(isConfirmKind("number_prompt"));
     try std.testing.expect(!isConfirmKind("emsg"));
-    try std.testing.expect(isStatusKind("showcmd"));
-    try std.testing.expect(!isStatusKind("echo"));
+    try std.testing.expectEqual(@as(?usize, 1), statusChannel("showcmd"));
+    try std.testing.expectEqual(@as(?usize, null), statusChannel("echo"));
+    try std.testing.expect(isConfirmKind("confirm_sub"));
+    try std.testing.expect(!isConfirmKind("return_prompt"));
+}
+
+test "message window bg: darker than a light Normal bg, lighter than a dark one" {
+    // #fdf6e3 turned pure white under the old *1.3+12 rule.
+    const light = messageWindowBg(0xfdf6e3);
+    try std.testing.expect(light != c.RGB(255, 255, 255));
+    // COLORREF is 0x00BBGGRR.
+    try std.testing.expect((light & 0xFF) < 0xfd);
+    const dark = messageWindowBg(0x1e1e2e);
+    try std.testing.expect(((dark >> 16) & 0xFF) > 0x2e);
+    // The mini paints the Normal pair itself.
+    try std.testing.expectEqual(c.RGB(0xfa, 0xfa, 0xfa), colorrefFromRgb(0xfafafa));
+}
+
+test "cmdline width: clamped to the work area it is given, other surfaces untouched" {
+    const laptop: c.RECT = .{ .left = 2560, .top = 0, .right = 2560 + 1366, .bottom = 768 };
+    const margin: c_int = @intCast(app_mod.CMDLINE_SCREEN_MARGIN);
+    try std.testing.expectEqual(1366 - margin, external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 3000, laptop));
+    try std.testing.expectEqual(@as(c_int, 400), external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 400, laptop));
+    try std.testing.expectEqual(@as(c_int, 3000), external_windows.clampCmdlineWidthToWorkArea(app_mod.MESSAGE_GRID_ID, 3000, laptop));
 }

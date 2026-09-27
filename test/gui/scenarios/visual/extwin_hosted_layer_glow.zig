@@ -62,8 +62,6 @@ const log_path = "tmp/gui_extwin_hosted_layer_glow.log";
 /// over RPC with a startup retry, so it is not in force when `exec` returns.
 const glow_ready_marker = "glow config: enabled";
 
-const max_windows = 16;
-
 /// External window and the float it hosts, in cells.
 const ext_rows: u32 = 20;
 const ext_cols: u32 = 60;
@@ -111,8 +109,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     // the rows that are bright.
     try g.exec("execute('highlight Search guifg=#00ff66 guibg=NONE gui=NONE')");
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before_windows = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_windows = driver.snapshotWindows(g.app_pid);
 
     // The external window. Opened as an editor float and externalized after
     // the placement has reached the core, so the float below is composited at
@@ -125,7 +122,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() vim.api.nvim_win_set_config(_G.z_ext, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows.slice(),100);
 
     // The hosted layer: a float inside the external window whose first four
     // rows carry the glow group, then four blank rows, then four plain ones.

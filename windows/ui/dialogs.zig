@@ -1,9 +1,11 @@
 const std = @import("std");
+const core = @import("zonvie_core");
 const app_mod = @import("../app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const window_mod = @import("../window.zig");
+const render_helpers = @import("../render_pipeline_helpers.zig");
 
 // --- SSH Password Dialog state ---
 
@@ -23,6 +25,14 @@ pub var g_devcontainer_up_success: std.atomic.Value(bool) = std.atomic.Value(boo
 
 /// Handle SSH auth prompt on UI thread
 pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
+    // Take the prompt: the core thread frees and replaces the field, and this
+    // handler blocks on console input while using it.
+    app.mu.lockUncancelable(core.clock.io());
+    const prompt_owned = app.ssh_prompt_owned;
+    app.ssh_prompt_owned = null;
+    app.mu.unlock(core.clock.io());
+    defer if (prompt_owned) |buf| app.alloc.free(buf);
+
     // Check if we have pre-entered password from initial dialog
     if (app.ssh_password) |password| {
         if (applog.isEnabled()) applog.appLog("[win] ssh_auth_prompt_ui: using pre-entered password ({d} chars)\n", .{password.len});
@@ -58,7 +68,7 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
 
     // Write prompt to console
     var written: c.DWORD = 0;
-    if (app.ssh_prompt_owned) |buf| {
+    if (prompt_owned) |buf| {
         _ = c.WriteConsoleA(hConsoleOut, buf.ptr, @intCast(buf.len), &written, null);
         _ = c.WriteConsoleA(hConsoleOut, " ", 1, &written, null);
     }
@@ -84,12 +94,6 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     // Send password to stdin via core
     if (read > 0 and app.corep != null) {
         app_mod.zonvie_core_send_stdin_data(app.corep, &password_buf, @intCast(read));
-    }
-
-    // Free the owned prompt buffer (no longer needed)
-    if (app.ssh_prompt_owned) |buf| {
-        app.alloc.free(buf);
-        app.ssh_prompt_owned = null;
     }
 
     // Hide console after password entry
@@ -535,11 +539,11 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     var writer = std.Io.Writer.fixed(&cmd_buf);
 
     writer.writeAll("cmd /c \"devcontainer up --workspace-folder \"\"") catch {};
-    writer.writeAll(workspace) catch {};
+    render_helpers.writeDevcontainerPathArg(&writer, workspace) catch {};
     writer.writeAll("\"\"") catch {};
     if (config_path) |cfg| {
         writer.writeAll(" --config \"\"") catch {};
-        writer.writeAll(cfg) catch {};
+        render_helpers.writeDevcontainerPathArg(&writer, cfg) catch {};
         writer.writeAll("\"\"") catch {};
     }
     writer.writeAll(" --additional-features \"{\"\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\"\":{}}\"") catch {};
@@ -603,7 +607,12 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
 }
 
 /// Handle clipboard get on UI thread (called via WM_APP_CLIPBOARD_GET)
-pub fn handleClipboardGetOnUIThread(app: *App) void {
+pub fn handleClipboardGetOnUIThread(app: *App, seq: u32) void {
+    app.clipboard_mu.lockUncancelable(core.clock.io());
+    defer app.clipboard_mu.unlock(core.clock.io());
+    if (!claimClipboardRequest(app, seq)) return;
+    defer finishClipboardRequest(app);
+
     app.clipboard_len = 0;
     app.clipboard_result = 1; // Success (empty)
 
@@ -612,24 +621,16 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
     // Open clipboard
     if (c.OpenClipboard(hwnd) == 0) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: OpenClipboard failed\n", .{});
-        _ = c.SetEvent(app.clipboard_event);
         return;
     }
     defer _ = c.CloseClipboard();
 
     // Get CF_UNICODETEXT data
     const hdata = c.GetClipboardData(c.CF_UNICODETEXT);
-    if (hdata == null) {
-        // Empty clipboard
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (hdata == null) return; // Empty clipboard
 
     const ptr = c.GlobalLock(hdata);
-    if (ptr == null) {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (ptr == null) return;
     defer _ = c.GlobalUnlock(hdata);
 
     // Convert UTF-16 to UTF-8
@@ -645,10 +646,7 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
         null,
     );
 
-    if (utf8_len <= 0) {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    }
+    if (utf8_len <= 0) return;
 
     // utf8_len counts the terminating NUL that WideCharToMultiByte writes, so
     // the payload is one byte shorter and the buffer must hold both.
@@ -660,7 +658,6 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
                 .{needed + 1},
             );
             app.clipboard_len = 0;
-            _ = c.SetEvent(app.clipboard_event);
             return;
         };
         if (app.clipboard_buf.len != 0) app.alloc.free(app.clipboard_buf);
@@ -682,18 +679,14 @@ pub fn handleClipboardGetOnUIThread(app: *App) void {
 
     app.clipboard_len = needed;
     if (applog.isEnabled()) applog.appLog("[win] clipboard_get_ui: len={d}\n", .{needed});
-
-    // Signal completion
-    _ = c.SetEvent(app.clipboard_event);
 }
 
 /// Put UTF-8 text on the Windows clipboard as CF_UNICODETEXT. Must run on the
-/// UI thread. An empty slice succeeds without touching the clipboard.
+/// UI thread. An empty slice replaces the clipboard with an empty string, as
+/// macOS does, so `:let @+ = ''` does not leave the old text for "+p.
 pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
-    if (text.len == 0) return true;
-
     // Convert UTF-8 to UTF-16
-    const wide_len = c.MultiByteToWideChar(
+    const wide_len: c_int = if (text.len == 0) 0 else c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
         @ptrCast(text.ptr),
@@ -702,7 +695,7 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
         0,
     );
 
-    if (wide_len <= 0) {
+    if (text.len != 0 and wide_len <= 0) {
         if (applog.isEnabled()) applog.appLog("[win] clipboard_set_ui: UTF-8 to UTF-16 conversion failed\n", .{});
         return false;
     }
@@ -731,7 +724,7 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
     }
 
     // Convert and copy
-    _ = c.MultiByteToWideChar(
+    if (wide_len > 0) _ = c.MultiByteToWideChar(
         c.CP_UTF8,
         0,
         @ptrCast(text.ptr),
@@ -757,19 +750,27 @@ pub fn setClipboardTextUtf8(owner_hwnd: c.HWND, text: []const u8) bool {
     return true;
 }
 
-/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET)
-pub fn handleClipboardSetOnUIThread(app: *App) void {
-    app.clipboard_result = 0; // Failure by default
+/// Handle clipboard set on UI thread (called via WM_APP_CLIPBOARD_SET). The
+/// payload is the app-owned copy in clipboard_buf.
+pub fn handleClipboardSetOnUIThread(app: *App, seq: u32) void {
+    app.clipboard_mu.lockUncancelable(core.clock.io());
+    defer app.clipboard_mu.unlock(core.clock.io());
+    if (!claimClipboardRequest(app, seq)) return;
+    defer finishClipboardRequest(app);
 
-    const data = app.clipboard_set_data orelse {
-        _ = c.SetEvent(app.clipboard_event);
-        return;
-    };
-    const len = app.clipboard_set_len;
+    app.clipboard_result = if (setClipboardTextUtf8(app.hwnd orelse null, app.clipboard_buf[0..app.clipboard_len])) 1 else 0;
+}
 
-    if (setClipboardTextUtf8(app.hwnd orelse null, data[0..len])) {
-        app.clipboard_result = 1;
-    }
+/// Caller holds clipboard_mu. False when request `seq` is no longer pending:
+/// its caller timed out, and a later request may own the shared state.
+fn claimClipboardRequest(app: *App, seq: u32) bool {
+    return seq != 0 and app.clipboard_active_seq == seq;
+}
+
+/// Caller holds clipboard_mu. Clearing the active request is what tells the
+/// waiting core thread the result is complete.
+fn finishClipboardRequest(app: *App) void {
+    app.clipboard_active_seq = 0;
     _ = c.SetEvent(app.clipboard_event);
 }
 

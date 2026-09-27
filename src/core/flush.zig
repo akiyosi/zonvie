@@ -7,7 +7,6 @@ const c_api = @import("c_api.zig");
 const grid_mod = @import("grid.zig");
 const highlight = @import("highlight.zig");
 const Highlights = highlight.Highlights;
-const ResolvedAttrWithStyles = highlight.ResolvedAttrWithStyles;
 const redraw = @import("redraw_handler.zig");
 const config = @import("config.zig");
 const msg_view = @import("msg_view.zig");
@@ -220,7 +219,19 @@ fn snapshotVertexRowLedgers(core: *Core) bool {
         saved.surface_vertex_count = buf.surface_vertex_count;
         saved.live = true;
     }
-    core.flush_subgrid_aggregate_snapshot = core.grid.subgrid_surface_vertex_count;
+    // Drop entries of destroyed grids. Neovim never reuses a grid handle, so
+    // kept entries only grew the map with every float ever opened.
+    while (core.flush_subgrid_ledgers.count() > core.grid.sub_grids.count()) {
+        var dead_id: ?i64 = null;
+        var dead_it = core.flush_subgrid_ledgers.iterator();
+        while (dead_it.next()) |e| {
+            if (e.value_ptr.live) continue;
+            dead_id = e.key_ptr.*;
+            break;
+        }
+        var kv = core.flush_subgrid_ledgers.fetchRemove(dead_id orelse break).?;
+        kv.value.counts.deinit(core.alloc);
+    }
     core.flush_row_ledger_snapshot_valid = true;
     return true;
 }
@@ -235,8 +246,7 @@ fn restoreVertexRowLedgers(core: *Core) bool {
     var check = core.flush_subgrid_ledgers.iterator();
     while (check.next()) |e| {
         if (!e.value_ptr.live) continue;
-        const buf = core.grid.sub_grids.getPtr(e.key_ptr.*) orelse return false;
-        if (e.value_ptr.ledger_valid and buf.vertex_row_counts.len != e.value_ptr.counts.items.len) return false;
+        if (!core.grid.sub_grids.contains(e.key_ptr.*)) return false;
     }
 
     @memcpy(core.grid.main_buf.vertex_row_counts, saved);
@@ -247,11 +257,26 @@ fn restoreVertexRowLedgers(core: *Core) bool {
     while (it.next()) |e| {
         if (!e.value_ptr.live) continue;
         const buf = core.grid.sub_grids.getPtr(e.key_ptr.*).?;
-        if (e.value_ptr.ledger_valid) @memcpy(buf.vertex_row_counts, e.value_ptr.counts.items);
         buf.surface_vertex_count = e.value_ptr.surface_vertex_count;
-        buf.vertex_row_ledger_valid = e.value_ptr.ledger_valid;
+        if (!e.value_ptr.ledger_valid) {
+            buf.vertex_row_ledger_valid = false;
+        } else if (buf.vertex_row_counts.len == e.value_ptr.counts.items.len) {
+            @memcpy(buf.vertex_row_counts, e.value_ptr.counts.items);
+            buf.vertex_row_ledger_valid = true;
+        } else {
+            // Reshaped inside this flush (the popupmenu or cmdline grid): its
+            // saved rows no longer line up, so this grid alone is restored
+            // invalid and regenerated whole.
+            buf.vertex_row_ledger_valid = false;
+            buf.markAllDirty();
+        }
     }
-    core.grid.subgrid_surface_vertex_count = core.flush_subgrid_aggregate_snapshot;
+    // Summed rather than taken from the snapshot: a grid created inside the
+    // flush (cmdline, popupmenu) has no entry and keeps the rows it charged.
+    var subgrid_total: usize = 0;
+    var sg_it = core.grid.sub_grids.valueIterator();
+    while (sg_it.next()) |sg| subgrid_total +|= sg.surface_vertex_count;
+    core.grid.subgrid_surface_vertex_count = subgrid_total;
     return true;
 }
 
@@ -895,31 +920,6 @@ pub const MsgCachedLine = struct {
     display_width: u16 = 0,
 };
 
-/// Cache for highlight and glyph lookups during vertex generation.
-/// Shared across all rows in a single flush to maximize cache hits.
-/// Cache for highlight and glyph lookups during vertex generation.
-/// hl_cache_buf / hl_valid_buf are heap-allocated by NvimCore and passed as slices
-/// to avoid large fixed-size arrays on the stack.
-pub const FlushCache = struct {
-    // Slices into heap-allocated buffers owned by NvimCore
-    hl_cache_buf: []ResolvedAttrWithStyles,
-    hl_valid_buf: []bool,
-
-    // Performance counters
-    perf_hl_cache_hits: u32 = 0,
-    perf_hl_cache_misses: u32 = 0,
-
-    /// Reset cache for a new flush (clear valid flags and counters).
-    /// Zero the per-grid counters only. `hl_id` is a Neovim-global id and the
-    /// resolved attribute does not depend on which grid asked, so the validity
-    /// bits survive: they are reset once per flush, as the main pass resets
-    /// them once for itself.
-    pub fn resetCounters(self: *FlushCache) void {
-        self.perf_hl_cache_hits = 0;
-        self.perf_hl_cache_misses = 0;
-    }
-};
-
 // ---------------------------------------------------------------
 // Scroll-aware flush: fast path eligibility
 // ---------------------------------------------------------------
@@ -1287,6 +1287,121 @@ pub const RowGenStats = struct {
     // glyph_ns - shape_us*1000 - atlas_ensure_ns - quad_emit_ns.
     atlas_ensure_ns: i64 = 0, // ensureGlyphPhase2 / ensureGlyphByID / ensure_styled / ensure_base
     quad_emit_ns: i64 = 0, // pushGlyphQuadAssumeCapacity
+};
+
+/// The root row pass's per-flush perf counters and their log lines.
+const RootRowPerf = struct {
+    hl_cache_hits: u32 = 0,
+    hl_cache_misses: u32 = 0,
+    shape_cache_hits: u32 = 0,
+    shape_cache_misses: u32 = 0,
+    ascii_fast_path: u32 = 0,
+    prep_hl_init_us: i64 = 0,
+    prep_glyph_init_us: i64 = 0,
+    compose_sum_us: i64 = 0,
+    total_sum_us: i64 = 0,
+    cache_store_sum_us: i64 = 0,
+    cb_sum_us: i64 = 0,
+    post_misc_sum_us: i64 = 0,
+    row_count: u32 = 0,
+    max_total_us: i64 = 0,
+    max_total_idx: u32 = 0,
+    max_cb_us: i64 = 0,
+    max_cb_idx: u32 = 0,
+    // Sums of generateRowVertices' per-pass times (ns).
+    pass_bg_sum_ns: i64 = 0,
+    pass_under_sum_ns: i64 = 0,
+    pass_glyph_sum_ns: i64 = 0,
+    pass_strike_sum_ns: i64 = 0,
+    pass_overline_sum_ns: i64 = 0,
+    pass_glyph_max_ns: i64 = 0,
+    pass_glyph_max_idx: u32 = 0,
+    atlas_ensure_sum_ns: i64 = 0,
+    quad_emit_sum_ns: i64 = 0,
+
+    fn addGen(self: *RootRowPerf, stats: RowGenStats, r: u32, compose_us: i64, total_us: i64) void {
+        self.compose_sum_us += compose_us;
+        self.total_sum_us += total_us;
+        self.row_count += 1;
+        if (total_us > self.max_total_us) {
+            self.max_total_us = total_us;
+            self.max_total_idx = r;
+        }
+        // Pass 3 (glyph) tracks its own max row: it dominates.
+        self.pass_bg_sum_ns += stats.bg_ns;
+        self.pass_under_sum_ns += stats.under_ns;
+        self.pass_glyph_sum_ns += stats.glyph_ns;
+        self.pass_strike_sum_ns += stats.strike_ns;
+        self.pass_overline_sum_ns += stats.overline_ns;
+        self.atlas_ensure_sum_ns += stats.atlas_ensure_ns;
+        self.quad_emit_sum_ns += stats.quad_emit_ns;
+        if (stats.glyph_ns > self.pass_glyph_max_ns) {
+            self.pass_glyph_max_ns = stats.glyph_ns;
+            self.pass_glyph_max_idx = r;
+        }
+    }
+
+    fn addPost(self: *RootRowPerf, r: u32, cache_store_us: i64, row_cb_us: i64, post_misc_us: i64) void {
+        self.cache_store_sum_us += cache_store_us;
+        self.cb_sum_us += row_cb_us;
+        self.post_misc_sum_us += post_misc_us;
+        if (row_cb_us > self.max_cb_us) {
+            self.max_cb_us = row_cb_us;
+            self.max_cb_idx = r;
+        }
+    }
+
+    fn log(self: *const RootRowPerf, core: *Core) void {
+        core.log.write(
+            "[perf] row_mode_breakdown rows={d} compose_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_cb_row={d} max_cb_us={d}\n",
+            .{
+                self.row_count,
+                self.compose_sum_us,
+                self.cache_store_sum_us,
+                self.cb_sum_us,
+                self.post_misc_sum_us,
+                self.total_sum_us,
+                self.max_total_idx,
+                self.max_total_us,
+                self.max_cb_idx,
+                self.max_cb_us,
+            },
+        );
+        // glyph_sum_ns includes shape callback time; subtract the
+        // row_mode shape sum to isolate glyph-emit cost.
+        // ensure_sum_ns and quad_emit_sum_ns sub-divide it, and
+        // the residual (glyph - shape*1000 - ensure - quad) is
+        // roughly cache lookup. Those two cost two clock reads per
+        // quad, so they are verbose-tier only and report -1 otherwise.
+        core.log.write(
+            "[perf] row_mode_pass_breakdown rows={d} bg_sum_ns={d} under_sum_ns={d} glyph_sum_ns={d} strike_sum_ns={d} overline_sum_ns={d} max_glyph_row={d} max_glyph_ns={d} ensure_sum_ns={d} quad_emit_sum_ns={d}\n",
+            .{
+                self.row_count,
+                self.pass_bg_sum_ns,
+                self.pass_under_sum_ns,
+                self.pass_glyph_sum_ns,
+                self.pass_strike_sum_ns,
+                self.pass_overline_sum_ns,
+                self.pass_glyph_max_idx,
+                self.pass_glyph_max_ns,
+                if (core.log.verbose) self.atlas_ensure_sum_ns else -1,
+                if (core.log.verbose) self.quad_emit_sum_ns else -1,
+            },
+        );
+        core.log.write(
+            "[perf] row_mode_prep hl_init_us={d} glyph_init_us={d}\n",
+            .{ self.prep_hl_init_us, self.prep_glyph_init_us },
+        );
+        // Cache statistics: helps tune cache sizes and identify bottlenecks
+        core.log.write(
+            "[perf] hl_cache hits={d} misses={d}\n",
+            .{ self.hl_cache_hits, self.hl_cache_misses },
+        );
+        core.log.write(
+            "[perf] shape_cache hits={d} misses={d} size={d} ascii_fast={d}\n",
+            .{ self.shape_cache_hits, self.shape_cache_misses, core.shape_cache_sets * @as(u32, nvim_core.SHAPE_CACHE_WAYS), self.ascii_fast_path },
+        );
+    }
 };
 
 fn ensureShapingScratch(core: *Core, run_len: usize) !void {
@@ -3147,7 +3262,7 @@ pub const FlushCtx = struct {
                 // grid's rows by which surface places it, and a timer/retry
                 // flush has no redraw-batch phase to do it in. An allocation
                 // failure here also cancels and retries the same transaction.
-                _ = notifyExternalWindowChanges(ctx.core);
+                notifyExternalWindowChanges(ctx.core);
                 notifySurfaceLayouts(ctx.core);
 
                 const t_ext: i128 = if (perf_enabled) clock.nowNs() else 0;
@@ -3233,15 +3348,15 @@ pub const FlushCtx = struct {
         // different "before what" questions — and a frontend stages layers and
         // promotes them at commit, so publishing twice is idempotent. Removing
         // either one breaks the ordering the other does not cover.
-        _ = notifyExternalWindowChanges(ctx.core);
+        notifyExternalWindowChanges(ctx.core);
         publishSurfaceLayouts(ctx.core);
         if (ctx.core.flush_aborted) return;
 
         // Dispatch grid_scroll events AFTER abort check so they are preserved on retry.
         if (ctx.core.cb.on_grid_scroll) |cb| {
             if (scrolled_overflow) {
-                if (ctx.core.grid.main_scroll_notify_pending) {
-                    cb(ctx.core.ctx, 1, ctx.core.grid.main_scroll_notify_rows);
+                if (ctx.core.grid.main_buf.scroll_notify_pending) {
+                    cb(ctx.core.ctx, 1, ctx.core.grid.main_buf.scroll_notify_rows);
                     ctx.core.grid.consumeScrolledGridNotification(1);
                 }
                 if (!ctx.core.flush_aborted) {
@@ -3436,41 +3551,14 @@ pub const FlushCtx = struct {
                     }
 
                     if (log_enabled and scrolled_count > 0) {
-                        const cached_sg_count = ctx.core.grid_entries.items.len;
+                        const cached_sg_count = ctx.core.grid.sub_grids.count();
                         ctx.core.log.write(
                             "[scroll_debug] flush_row_mode dirty_rows={d} rebuild_all={any} scrolled_count={d} scrolled_grid_ids[0]={d} subgrid_count={d} cursor_row={d} cursor_col={d}\n",
                             .{ log_dirty_rows, rebuild_all, scrolled_count, ctx.core.grid.scrolled_grid_ids[0], cached_sg_count, ctx.core.grid.cursor_row, ctx.core.grid.cursor_col },
                         );
                     }
 
-                    var perf_hl_cache_hits: u32 = 0;
-                    var perf_hl_cache_misses: u32 = 0;
-                    var perf_shape_cache_hits: u32 = 0;
-                    var perf_shape_cache_misses: u32 = 0;
-                    var perf_ascii_fast_path: u32 = 0;
-                    var perf_row_prep_hl_init_us: i64 = 0;
-                    var perf_row_prep_glyph_init_us: i64 = 0;
-                    var perf_row_compose_sum_us: i64 = 0;
-                    var perf_row_total_sum_us: i64 = 0;
-                    var perf_row_cache_store_sum_us: i64 = 0;
-                    var perf_row_cb_sum_us: i64 = 0;
-                    var perf_row_post_misc_sum_us: i64 = 0;
-                    var perf_row_count: u32 = 0;
-                    var perf_row_max_total_us: i64 = 0;
-                    var perf_row_max_total_idx: u32 = 0;
-                    var perf_row_max_cb_us: i64 = 0;
-                    var perf_row_max_cb_idx: u32 = 0;
-                    // Per-flush sums of generateRowVertices per-pass times (ns).
-                    // Dumped in row_mode_pass_breakdown alongside row_mode_breakdown.
-                    var perf_row_pass_bg_sum_ns: i64 = 0;
-                    var perf_row_pass_under_sum_ns: i64 = 0;
-                    var perf_row_pass_glyph_sum_ns: i64 = 0;
-                    var perf_row_pass_strike_sum_ns: i64 = 0;
-                    var perf_row_pass_overline_sum_ns: i64 = 0;
-                    var perf_row_pass_glyph_max_ns: i64 = 0;
-                    var perf_row_pass_glyph_max_idx: u32 = 0;
-                    var perf_row_atlas_ensure_sum_ns: i64 = 0;
-                    var perf_row_quad_emit_sum_ns: i64 = 0;
+                    var perf = RootRowPerf{};
 
                     var t_prep_hl_init_start: i128 = 0;
                     if (log_enabled) t_prep_hl_init_start = clock.nowNs();
@@ -3479,7 +3567,7 @@ pub const FlushCtx = struct {
                     };
                     if (log_enabled) {
                         const t_prep_hl_init_end = clock.nowNs();
-                        perf_row_prep_hl_init_us = @intCast(@divTrunc(@max(0, t_prep_hl_init_end - t_prep_hl_init_start), 1000));
+                        perf.prep_hl_init_us = @intCast(@divTrunc(@max(0, t_prep_hl_init_end - t_prep_hl_init_start), 1000));
                     }
                     var t_prep_glyph_init_start: i128 = 0;
                     if (log_enabled) t_prep_glyph_init_start = clock.nowNs();
@@ -3488,7 +3576,7 @@ pub const FlushCtx = struct {
                     };
                     if (log_enabled) {
                         const t_prep_glyph_init_end = clock.nowNs();
-                        perf_row_prep_glyph_init_us = @intCast(@divTrunc(@max(0, t_prep_glyph_init_end - t_prep_glyph_init_start), 1000));
+                        perf.prep_glyph_init_us = @intCast(@divTrunc(@max(0, t_prep_glyph_init_end - t_prep_glyph_init_start), 1000));
                     }
 
                     // Direct-index O(1) lookup into NvimCore-owned buffers
@@ -3540,32 +3628,8 @@ pub const FlushCtx = struct {
                         if (atlas_retried) {
                             // Reset all per-pass mutable state for a clean retry.
                             had_glyph_miss = false;
-                            perf_hl_cache_hits = 0;
-                            perf_hl_cache_misses = 0;
-                            perf_shape_cache_hits = 0;
-                            perf_shape_cache_misses = 0;
-                            perf_ascii_fast_path = 0;
-                            perf_row_prep_hl_init_us = 0;
-                            perf_row_prep_glyph_init_us = 0;
-                            perf_row_compose_sum_us = 0;
-                            perf_row_total_sum_us = 0;
-                            perf_row_cache_store_sum_us = 0;
-                            perf_row_cb_sum_us = 0;
-                            perf_row_post_misc_sum_us = 0;
-                            perf_row_count = 0;
-                            perf_row_pass_bg_sum_ns = 0;
-                            perf_row_pass_under_sum_ns = 0;
-                            perf_row_pass_glyph_sum_ns = 0;
-                            perf_row_pass_strike_sum_ns = 0;
-                            perf_row_pass_overline_sum_ns = 0;
-                            perf_row_pass_glyph_max_ns = 0;
-                            perf_row_pass_glyph_max_idx = 0;
-                            perf_row_atlas_ensure_sum_ns = 0;
-                            perf_row_quad_emit_sum_ns = 0;
-                            perf_row_max_total_us = 0;
-                            perf_row_max_total_idx = 0;
-                            perf_row_max_cb_us = 0;
-                            perf_row_max_cb_idx = 0;
+                            // The prep timings were measured once, before the loop.
+                            perf = .{ .prep_hl_init_us = perf.prep_hl_init_us, .prep_glyph_init_us = perf.prep_glyph_init_us };
                             if (log_enabled) {
                                 log_dirty_rows = rows; // Retry processes all rows
                                 t_rows_start_ns = clock.nowNs();
@@ -3599,7 +3663,7 @@ pub const FlushCtx = struct {
                                 t_row_compose_start = clock.nowNs();
                             }
 
-                            composeGridRow(ctx.core, main_src, r, main_tables, &perf_hl_cache_hits, &perf_hl_cache_misses);
+                            composeGridRow(ctx.core, main_src, r, main_tables, &perf.hl_cache_hits, &perf.hl_cache_misses);
 
                             var t_row_compose_end: i128 = 0;
                             var t_row_gen_start: i128 = 0;
@@ -3623,33 +3687,15 @@ pub const FlushCtx = struct {
                                 break;
                             };
                             had_glyph_miss = had_glyph_miss or row_gen_stats.had_glyph_miss;
-                            perf_shape_cache_hits += row_gen_stats.shape_cache_hits;
-                            perf_shape_cache_misses += row_gen_stats.shape_cache_misses;
-                            perf_ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
+                            perf.shape_cache_hits += row_gen_stats.shape_cache_hits;
+                            perf.shape_cache_misses += row_gen_stats.shape_cache_misses;
+                            perf.ascii_fast_path += row_gen_stats.ascii_fast_path_runs;
                             if (log_enabled) {
                                 const t_row_gen_end = clock.nowNs();
                                 row_compose_us = @intCast(@divTrunc(@max(0, t_row_compose_end - t_row_compose_start), 1000));
                                 const gen_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_gen_start), 1000));
                                 const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_gen_end - t_row_compose_start), 1000));
-                                perf_row_compose_sum_us += row_compose_us;
-                                perf_row_total_sum_us += total_us;
-                                perf_row_count += 1;
-                                if (total_us > perf_row_max_total_us) {
-                                    perf_row_max_total_us = total_us;
-                                    perf_row_max_total_idx = r;
-                                }
-                                // Pass 3 (glyph) tracks its own max row: it dominates.
-                                perf_row_pass_bg_sum_ns += row_gen_stats.bg_ns;
-                                perf_row_pass_under_sum_ns += row_gen_stats.under_ns;
-                                perf_row_pass_glyph_sum_ns += row_gen_stats.glyph_ns;
-                                perf_row_pass_strike_sum_ns += row_gen_stats.strike_ns;
-                                perf_row_pass_overline_sum_ns += row_gen_stats.overline_ns;
-                                perf_row_atlas_ensure_sum_ns += row_gen_stats.atlas_ensure_ns;
-                                perf_row_quad_emit_sum_ns += row_gen_stats.quad_emit_ns;
-                                if (row_gen_stats.glyph_ns > perf_row_pass_glyph_max_ns) {
-                                    perf_row_pass_glyph_max_ns = row_gen_stats.glyph_ns;
-                                    perf_row_pass_glyph_max_idx = r;
-                                }
+                                perf.addGen(row_gen_stats, r, row_compose_us, total_us);
                                 // Per-row line: verbose tier only. Formatting + I/O for
                                 // 2 lines x N rows per flush measurably perturbs the
                                 // pipeline (~1-2ms/flush); the per-flush aggregates
@@ -3736,13 +3782,7 @@ pub const FlushCtx = struct {
                                 const total_us: i64 = @intCast(@divTrunc(@max(0, t_row_after_cb - t_row_compose_start), 1000));
                                 const known_total_us = row_compose_us + cache_store_us + row_cb_us;
                                 const post_misc_us: i64 = @max(0, total_us - known_total_us);
-                                perf_row_cache_store_sum_us += cache_store_us;
-                                perf_row_cb_sum_us += row_cb_us;
-                                perf_row_post_misc_sum_us += post_misc_us;
-                                if (row_cb_us > perf_row_max_cb_us) {
-                                    perf_row_max_cb_us = row_cb_us;
-                                    perf_row_max_cb_idx = r;
-                                }
+                                perf.addPost(r, cache_store_us, row_cb_us, post_misc_us);
                                 // Per-row line: verbose tier only (see row_mode above).
                                 if (ctx.core.log.verbose) {
                                     ctx.core.log.write(
@@ -3800,57 +3840,9 @@ pub const FlushCtx = struct {
                         const dur_us: i64 = @intCast(@divTrunc(@max(0, t_rows_done_ns - t_rows_start_ns), 1000));
                         ctx.core.log.write(
                             "[perf] row_mode_compose rows={d} cols={d} dirty_rows={d} subgrids={d} us={d}\n",
-                            .{ rows, cols, log_dirty_rows, ctx.core.grid_entries.items.len, dur_us },
+                            .{ rows, cols, log_dirty_rows, ctx.core.grid.sub_grids.count(), dur_us },
                         );
-                        ctx.core.log.write(
-                            "[perf] row_mode_breakdown rows={d} compose_sum_us={d} cache_store_sum_us={d} row_cb_sum_us={d} post_misc_sum_us={d} total_sum_us={d} max_total_row={d} max_total_us={d} max_cb_row={d} max_cb_us={d}\n",
-                            .{
-                                perf_row_count,
-                                perf_row_compose_sum_us,
-                                perf_row_cache_store_sum_us,
-                                perf_row_cb_sum_us,
-                                perf_row_post_misc_sum_us,
-                                perf_row_total_sum_us,
-                                perf_row_max_total_idx,
-                                perf_row_max_total_us,
-                                perf_row_max_cb_idx,
-                                perf_row_max_cb_us,
-                            },
-                        );
-                        // glyph_sum_ns includes shape callback time; subtract the
-                        // row_mode shape sum to isolate glyph-emit cost.
-                        // ensure_sum_ns and quad_emit_sum_ns sub-divide it, and
-                        // the residual (glyph - shape*1000 - ensure - quad) is
-                        // roughly cache lookup. Those two cost two clock reads per
-                        // quad, so they are verbose-tier only and report -1 otherwise.
-                        ctx.core.log.write(
-                            "[perf] row_mode_pass_breakdown rows={d} bg_sum_ns={d} under_sum_ns={d} glyph_sum_ns={d} strike_sum_ns={d} overline_sum_ns={d} max_glyph_row={d} max_glyph_ns={d} ensure_sum_ns={d} quad_emit_sum_ns={d}\n",
-                            .{
-                                perf_row_count,
-                                perf_row_pass_bg_sum_ns,
-                                perf_row_pass_under_sum_ns,
-                                perf_row_pass_glyph_sum_ns,
-                                perf_row_pass_strike_sum_ns,
-                                perf_row_pass_overline_sum_ns,
-                                perf_row_pass_glyph_max_idx,
-                                perf_row_pass_glyph_max_ns,
-                                if (ctx.core.log.verbose) perf_row_atlas_ensure_sum_ns else -1,
-                                if (ctx.core.log.verbose) perf_row_quad_emit_sum_ns else -1,
-                            },
-                        );
-                        ctx.core.log.write(
-                            "[perf] row_mode_prep hl_init_us={d} glyph_init_us={d}\n",
-                            .{ perf_row_prep_hl_init_us, perf_row_prep_glyph_init_us },
-                        );
-                        // Cache statistics: helps tune cache sizes and identify bottlenecks
-                        ctx.core.log.write(
-                            "[perf] hl_cache hits={d} misses={d}\n",
-                            .{ perf_hl_cache_hits, perf_hl_cache_misses },
-                        );
-                        ctx.core.log.write(
-                            "[perf] shape_cache hits={d} misses={d} size={d} ascii_fast={d}\n",
-                            .{ perf_shape_cache_hits, perf_shape_cache_misses, ctx.core.shape_cache_sets * @as(u32, nvim_core.SHAPE_CACHE_WAYS), perf_ascii_fast_path },
-                        );
+                        perf.log(ctx.core);
                     }
                 }
             }
@@ -4290,12 +4282,10 @@ fn publishSurfaceLayouts(self: *Core) void {
     }
 }
 
-pub fn notifyExternalWindowChanges(self: *Core) bool {
-    var new_grids_added = false;
-
+pub fn notifyExternalWindowChanges(self: *Core) void {
     // Never emit window lifecycle callbacks for a flush whose frontend
     // transaction was cancelled; the retry flush repeats them before its commit.
-    if (self.flush_aborted) return false;
+    if (self.flush_aborted) return;
 
     // Removal marks the slot as a tombstone without rehashing or relocating
     // entries, so advancing the iterator then removeByPtr is safe and visits
@@ -4305,7 +4295,7 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
         const grid_id = entry.key_ptr.*;
         if (!self.grid.external_grids.contains(grid_id)) {
             if (self.cb.on_external_window_close) |cb| cb(self.ctx, grid_id);
-            if (self.flush_aborted) return new_grids_added;
+            if (self.flush_aborted) return;
             self.known_external_grids.removeByPtr(entry.key_ptr);
         }
     }
@@ -4355,7 +4345,7 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
             // was never recorded (duplicate opens, lost closes on retry).
             self.known_external_grids.ensureUnusedCapacity(self.alloc, 1) catch {
                 self.flush_aborted = true;
-                return new_grids_added;
+                return;
             };
         }
 
@@ -4366,7 +4356,7 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
         // (Windows does this when queueing or PostMessageW fails), which every
         // frontend cancels in on_flush_end; the retry flush revisits this grid
         // and every undispatched one.
-        if (self.flush_aborted) return new_grids_added;
+        if (self.flush_aborted) return;
 
         // Add/update the known set only after the callback completed without
         // aborting. New entries use the capacity reserved above; changed ones
@@ -4380,13 +4370,10 @@ pub fn notifyExternalWindowChanges(self: *Core) bool {
         };
         if (is_new) {
             self.known_external_grids.putAssumeCapacityNoClobber(grid_id, known_info);
-            new_grids_added = true;
         } else if (self.known_external_grids.getPtr(grid_id)) |known| {
             known.* = known_info;
         }
     }
-
-    return new_grids_added;
 }
 
 fn externalCursorVisibleOnGrid(grid: *const grid_mod.Grid, grid_id: i64) bool {
@@ -4488,10 +4475,7 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
     // codepoints (VS16, ZWJ, skin tone).
     const overflow = core.grid.getOverflow(q.grid_id, q.row, q.col);
     if (overflow) |extras| {
-        const is_emoji = isEmojiPresentation(cp) or for (extras) |e| {
-            if (e == 0xFE0F or e == 0x200D or (e >= 0x1F3FB and e <= 0x1F3FF)) break true;
-        } else false;
-        if (is_emoji) {
+        if (isEmojiPresentation(cp) or extrasMarkEmojiCluster(extras)) {
             core.emoji_cluster_buf[0] = cp;
             const elen = @min(extras.len, core.emoji_cluster_buf.len - 1);
             for (0..elen) |ei| core.emoji_cluster_buf[1 + ei] = extras[ei];
@@ -4627,12 +4611,11 @@ fn sendGridCursor(
 
             // The cursor glyph ensure above can trigger an atlas reset no
             // later code re-checks; handle it here rather than leak the flag
-            // to the next grid. The commit is cancelled, so nothing is sent.
+            // to the next grid. The commit is cancelled, so nothing is sent;
+            // the end of the external pass does the recovery.
             if (self.atlas_reset_during_flush) {
                 saw_atlas_reset.* = true;
                 self.atlas_reset_during_flush = false;
-                self.grid.markAllDirty();
-                self.invalidateMirroredFrameState();
                 return true;
             }
 
@@ -4796,13 +4779,11 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         self.log.write("[ext_grid] Failed to initialize glyph cache\n", .{});
     };
 
-    var cache = FlushCache{
-        .hl_cache_buf = self.hl_cache_buf orelse &.{},
-        // Once per flush, not once per pass or grid: the bits are indexed by
-        // Neovim's global hl_id, so a resolution grid 1 or another grid paid
-        // for is good for every grid in the same flush.
-        .hl_valid_buf = self.hlValidForFlush(),
-    };
+    const ext_hl_cache: []highlight.ResolvedAttrWithStyles = self.hl_cache_buf orelse &.{};
+    // Once per flush, not once per pass or grid: the bits are indexed by
+    // Neovim's global hl_id, so a resolution grid 1 or another grid paid for
+    // is good for every grid in the same flush.
+    const ext_hl_valid: []bool = self.hlValidForFlush();
     // Glyph cache is persistent across flushes (same as row_mode path).
 
     // If any grid triggers an atlas reset, already-sent grids have stale UVs.
@@ -4852,10 +4833,12 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
             cursor_grid, self.last_ext_cursor_grid, cursor_rev,          self.last_ext_cursor_rev,
         });
 
-        if (!force_render and !force_redraw_this and !sg.dirty and !cursor_affected and !cursor_moved_within) continue;
+        // cursor_moved_within is a subset of cursor_affected.
+        if (!force_render and !force_redraw_this and !sg.dirty and !cursor_affected) continue;
 
-        // Counters only: the hl validity table is this whole pass's, cleared above.
-        cache.resetCounters();
+        // Counters only: the hl validity table is this whole pass's.
+        var hl_cache_hits: u32 = 0;
+        var hl_cache_misses: u32 = 0;
 
         // Full redraw only for forced operations, not cursor-only changes.
         // Cursor rows are handled via dirty_rows marking below.
@@ -4916,8 +4899,8 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 .skip_default_bg = surface_skips_default_bg,
             };
             const ext_tables = RowComposeTables{
-                .hl_cache = cache.hl_cache_buf,
-                .hl_valid = cache.hl_valid_buf,
+                .hl_cache = ext_hl_cache,
+                .hl_valid = ext_hl_valid,
                 .glow_enabled = ext_glow_enabled,
                 .glow_all = ext_glow_all,
                 .glow_hl_ids = ext_glow_hl_ids,
@@ -4945,16 +4928,9 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                 // Otherwise use the dirty_rows bitmap, except after a scroll
                 // the fast path rejected: the frontend cannot shift rows
                 // itself, so every row must be regenerated.
-                if (!need_full_redraw and !ext_scroll_needs_full_regen) {
-                    // dirty_all dominates; otherwise a row the bitset does
-                    // not cover is regenerated, never skipped.
-                    if (!sg.dirty_all and
-                        sg.dirty_rows.bit_length > row and
-                        !sg.dirty_rows.isSet(@as(usize, row)))
-                    {
-                        continue;
-                    }
-                }
+                // A bitset shorter than the rows only exists for a zero-cell
+                // shape, which has nothing to generate.
+                if (!need_full_redraw and !ext_scroll_needs_full_regen and !sg.isRowDirty(row)) continue;
                 regen_count += 1;
 
                 ext_verts.clearRetainingCapacity();
@@ -4970,7 +4946,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                     break;
                 };
 
-                composeGridRow(self, ext_src, row, ext_tables, &cache.perf_hl_cache_hits, &cache.perf_hl_cache_misses);
+                composeGridRow(self, ext_src, row, ext_tables, &hl_cache_hits, &hl_cache_misses);
                 const row_gen_stats = generateGridRow(self, ext_src, row, ext_glow_enabled, ext_verts) catch |err| {
                     ext_verts.clearRetainingCapacity();
                     ext_had_row_error = true;
@@ -4990,8 +4966,6 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
                     // pass cancels the whole commit. Nothing sent from here
                     // on would survive it: stop, rather than restart this
                     // grid's rows or clear them to empty as this did.
-                    self.grid.markAllDirty();
-                    self.invalidateMirroredFrameState();
                     break;
                 }
 
@@ -5021,17 +4995,13 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
         });
 
         self.log.write("[ext_grid_perf] grid_id={d} hl_cache hits={d} misses={d}\n", .{
-            grid_id, cache.perf_hl_cache_hits, cache.perf_hl_cache_misses,
+            grid_id, hl_cache_hits, hl_cache_misses,
         });
 
         // Skipped on mid-flush abort: keep dirty so the rows are re-sent.
         if (!self.flush_aborted) sg.clearDirtyContent();
         // Re-mark dirty so the failed rows regenerate next flush.
         if (ext_had_row_error) {
-            sg.markAllDirty();
-        }
-        // Re-mark dirty so the grid re-renders with correct UVs next flush.
-        if (ext_saw_atlas_reset) {
             sg.markAllDirty();
         }
         // A rasterizer miss is transient (font backend/cache publication may
@@ -6290,11 +6260,7 @@ pub fn checkMsgAutoHideTimeout(self: *Core) void {
             }
             // Clear callback-based message windows (extFloatWindow etc),
             // but preserve promptWindow if confirm is active
-            if (!self.grid.message_state.confirm_msg.active) {
-                if (self.cb.on_msg_clear) |cb| {
-                    cb(self.ctx);
-                }
-            }
+            if (!self.grid.message_state.confirm_msg.active) sendMsgClear(self);
         }
     }
 
@@ -6387,9 +6353,7 @@ pub fn notifyMessageChanges(self: *Core) void {
         } else {
             // Confirm dismissed -> notify frontend to hide prompt window
             self.log.write("[msg] confirm dismissed -> on_msg_clear\n", .{});
-            if (self.cb.on_msg_clear) |cb| {
-                cb(self.ctx);
-            }
+            sendMsgClear(self);
             sent_msg_clear = true;
         }
     }
@@ -6407,9 +6371,7 @@ pub fn notifyMessageChanges(self: *Core) void {
         if (cleared_in_batch and !sent_msg_clear) {
             hideChannelView(self, .show, .ext_float);
             self.msg_show_pending_since = null;
-            if (self.cb.on_msg_clear) |cb| {
-                cb(self.ctx);
-            }
+            sendMsgClear(self);
             sent_msg_clear = true;
         }
 
@@ -6420,9 +6382,7 @@ pub fn notifyMessageChanges(self: *Core) void {
                 hideChannelView(self, .show, .ext_float);
                 self.msg_show_pending_since = null;
                 if (!sent_msg_clear) {
-                    if (self.cb.on_msg_clear) |cb| {
-                        cb(self.ctx);
-                    }
+                    sendMsgClear(self);
                     sent_msg_clear = true;
                 }
             }
@@ -6606,9 +6566,7 @@ pub fn sendMsgShow(self: *Core) bool {
         // Full state reset (scroll, cache, grid -102) then explicit on_msg_clear
         hideChannelView(self, .show, .ext_float);
         self.log.write("[msg] sendMsgShow: hide (empty)\n", .{});
-        if (self.cb.on_msg_clear) |cb| {
-            cb(self.ctx);
-        }
+        sendMsgClear(self);
         return true;
     }
 
@@ -6733,7 +6691,7 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 sendMsgShowCallback(self, msg, msg.content.items, view, state.timeout);
             },
             // History is routed as one unit; the callback combines entries.
-            .history => |entries| sendMsgHistoryCallbackAll(self, entries, view),
+            .history => |entries| sendMsgHistoryCallbackAll(self, entries, view, state.timeout),
         },
         // Core-rendered view: the channel's external grid.
         .ext_float => {
@@ -6794,13 +6752,14 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                     buf.append(self.alloc, '\n') catch break :blk false;
                     line_count += 1;
                 } else true,
-                .history => blk: for (content.history) |entry| {
+                .history => blk: for (content.history, 0..) |entry, i| {
+                    // An appended (echon) entry continues the previous line.
+                    if (entry.append and i > 0) buf.items.len -= 1 else line_count += 1;
                     for (entry.content.items) |chunk| {
                         buf.appendSlice(self.alloc, chunk.text) catch break :blk false;
                         line_count += @intCast(std.mem.count(u8, chunk.text, "\n"));
                     }
                     buf.append(self.alloc, '\n') catch break :blk false;
-                    line_count += 1;
                 } else true,
             };
             if (!ok) {
@@ -6827,7 +6786,7 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
                 // every other exit from this arm either clears or aborts, and
                 // silently keeping stale text on screen is worse than an
                 // empty message area.
-                if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+                sendMsgClear(self);
                 return true;
             }
 
@@ -6853,7 +6812,7 @@ fn showChannelView(self: *Core, ch: MsgChannel, view: config.MsgViewType, conten
             // Only now that the content is on its way to Neovim: clearing the
             // frontend's pending prompt windows any earlier would empty the
             // message UI with nothing to replace it if the steps above failed.
-            if (self.cb.on_msg_clear) |cb| cb(self.ctx);
+            sendMsgClear(self);
         },
     }
     return true;
@@ -7410,7 +7369,7 @@ pub fn sendConfigError(self: *Core, err_msg: []const u8) void {
 }
 
 /// Send all msg_history entries combined to frontend callback (for mini view).
-pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHistoryEntry, view: config.MsgViewType) void {
+pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHistoryEntry, view: config.MsgViewType, timeout_sec: f32) void {
     const cb = self.cb.on_msg_show orelse return;
 
     // Build combined text from all entries
@@ -7418,8 +7377,9 @@ pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHisto
     var text_len: usize = 0;
 
     for (entries, 0..) |entry, entry_idx| {
-        // Add newline between entries
-        if (entry_idx > 0 and text_len < text_buf.len - 1) {
+        // Add newline between entries; an appended (echon) entry continues
+        // the previous line, as :messages shows it.
+        if (entry_idx > 0 and !entry.append and text_len < text_buf.len - 1) {
             text_buf[text_len] = '\n';
             text_len += 1;
         }
@@ -7458,24 +7418,40 @@ pub fn sendMsgHistoryCallbackAll(self: *Core, entries: []const grid_mod.MsgHisto
         0, // history (don't use this flag, use kind instead)
         0, // append
         0, // id
-        0, // timeout_ms (no auto-hide for history)
+        // The route's: the default history route has 0 (no auto-hide).
+        messageTimeoutMs(timeout_sec),
     );
 }
 
 /// Send one status channel (showmode / showcmd / ruler) to the frontend.
 /// The three differ only in which slot they read, which route they consult,
 /// and which callback they reach; the rest of the send path is identical.
-pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
-    const chunks = self.grid.message_state.status_content[channel.index()].items;
-
-    const event: config.MsgEvent = switch (channel) {
+fn statusEvent(channel: grid_mod.StatusChannel) config.MsgEvent {
+    return switch (channel) {
         .showmode => .msg_showmode,
         .showcmd => .msg_showcmd,
         .ruler => .msg_ruler,
     };
+}
+
+/// on_msg_clear tears down the frontends' message window, which also shows a
+/// status routed to ext_float. msg_clear does not clear showmode, and nothing
+/// marks the status dirty, so a status still showing is sent again.
+fn sendMsgClear(self: *Core) void {
+    const cb = self.cb.on_msg_clear orelse return;
+    cb(self.ctx);
+    for (grid_mod.StatusChannel.all) |channel| {
+        if (self.grid.message_state.status_content[channel.index()].items.len == 0) continue;
+        if (self.msg_config.routeMessage(statusEvent(channel), "", 1).view != .ext_float) continue;
+        sendMsgStatus(self, channel);
+    }
+}
+
+pub fn sendMsgStatus(self: *Core, channel: grid_mod.StatusChannel) void {
+    const chunks = self.grid.message_state.status_content[channel.index()].items;
 
     // Route message using config
-    const route_result = self.msg_config.routeMessage(event, "", 1);
+    const route_result = self.msg_config.routeMessage(statusEvent(channel), "", 1);
     self.log.write("[msg] sendMsgStatus({s}) chunks={d} routed to view={s}\n", .{ @tagName(channel), chunks.len, @tagName(route_result.view) });
 
     if (route_result.view == .none) return; // Don't show anything
@@ -7545,10 +7521,15 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
     // An entry's chunks run together and split on '\n' (CRLF as LF), as the
     // msg_show panel's line cache does: a multi-line entry (a Lua traceback)
     // was squashed into one clipped row with a control character in it.
+    var prev_line_open = false;
     for (entries) |entry| {
+        // An appended (echon) entry continues the previous line, unless that
+        // entry ended on a newline (the callback and split sinks agree).
+        const reopen = entry.append and line_count > 0 and prev_line_open;
+        if (reopen) line_count -= 1;
         if (line_count >= lines.len) break;
         const first_line = line_count;
-        var line_len: usize = 0;
+        var line_len: usize = if (reopen) line_lens[line_count] else 0;
         var line_full = false; // as in buildMsgLineCache
         chunks: for (entry.content.items) |chunk| {
             var rest = chunk.text;
@@ -7571,7 +7552,8 @@ fn renderMsgHistoryGrid(self: *Core, entries: []const grid_mod.MsgHistoryEntry) 
             }
         }
         // The last line, unless a trailing newline already ended it.
-        if (line_count < lines.len and (line_len > 0 or line_count == first_line)) {
+        prev_line_open = line_len > 0 or line_count == first_line;
+        if (line_count < lines.len and prev_line_open) {
             line_lens[line_count] = line_len;
             max_width = @max(max_width, countDisplayWidth(lines[line_count][0..line_len]));
             line_count += 1;
@@ -7746,7 +7728,14 @@ fn ensureCachedPhase2Glyph(
     }
 
     var resolved: ?c_api.GlyphEntry = null;
-    const use_scalar_cluster = extras.len != 0 or isEmojiPresentation(scalar);
+    // With a shaper, row generation's emoji predicate: a combining mark or
+    // VS15 tail shaped by the text font must not go to the frontends'
+    // color-emoji rasterizer, whose result lands under the same cluster key
+    // the row fallback reads. Without one, the scalar rasterizer is the only
+    // path that draws the whole cluster.
+    const can_shape = core.cb.on_shape_text_run != null and core.cb.on_rasterize_glyph_by_id != null;
+    const use_scalar_cluster = isEmojiPresentation(scalar) or extrasMarkEmojiCluster(extras) or
+        (extras.len != 0 and !can_shape);
 
     if (use_scalar_cluster) {
         // The scalar rasterizer consumes this side-channel for complete emoji
@@ -7762,11 +7751,15 @@ fn ensureCachedPhase2Glyph(
             var x_adv: [8]i32 = undefined;
             var x_off: [8]i32 = undefined;
             var y_off: [8]i32 = undefined;
-            const one_scalar = [1]u32{scalar};
+            // The whole cluster: a font that composes e + U+0301 into one
+            // glyph gives the cursor the same picture as the row.
+            var cluster: [16]u32 = undefined;
+            cluster[0] = scalar;
+            @memcpy(cluster[1..][0..extras.len], extras);
             const glyph_count = shape(
                 core.ctx,
-                &one_scalar,
-                1,
+                &cluster,
+                1 + extras.len,
                 style_flags,
                 &glyph_ids,
                 &clusters,
@@ -8228,14 +8221,14 @@ test "flush begin abort preserves undispatched scroll state" {
 
     var flush_ctx = FlushCtx{ .core = &core };
     try flush_ctx.onFlush(3, 3);
-    try std.testing.expect(core.grid.main_scroll_notify_pending);
+    try std.testing.expect(core.grid.main_buf.scroll_notify_pending);
     try std.testing.expect(!core.grid.main_buf.dirty_all);
     try std.testing.expectEqual(@as(u32, 0), state.scroll_calls);
 
     state.abort_begin = false;
     try flush_ctx.onFlush(3, 3);
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
-    try std.testing.expect(!core.grid.main_scroll_notify_pending);
+    try std.testing.expect(!core.grid.main_buf.scroll_notify_pending);
 }
 
 test "zero-sized main still commits external grid transaction" {
@@ -8548,6 +8541,50 @@ test "vertex budget permits aggregate redistribution across external surfaces" {
     );
 }
 
+test "a refused flush restores reshaped and newly created grids without a full invalidation" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+    core.grid.main_buf.vertex_row_ledger_valid = true;
+
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try core.grid.resizeGrid(3, 2, 1);
+    try core.grid.putSyntheticExternal(3, .{ .win = 3, .start_row = 0, .start_col = 0 });
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 10);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 1, 10);
+    try replaceGridSurfaceRowVertexCount(&core, 3, core.grid.sub_grids.getPtr(3).?, 0, 10);
+    try validateCompletedVertexBudget(&core);
+    try std.testing.expect(snapshotVertexRowLedgers(&core));
+    finishVertexBudgetTransaction(&core, true);
+
+    // A destroyed grid's saved ledger goes with it.
+    try core.grid.destroyGrid(3);
+    try std.testing.expect(snapshotVertexRowLedgers(&core));
+    try std.testing.expectEqual(@as(u32, 1), core.flush_subgrid_ledgers.count());
+
+    // Inside the refused attempt: grid 2 is reshaped (the popupmenu) and
+    // grid 4 is created and charged (the cmdline).
+    try beginVertexBudgetTransaction(&core);
+    try std.testing.expect(snapshotVertexRowLedgers(&core));
+    try core.grid.resizeGrid(2, 3, 1);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 5);
+    try core.grid.resizeGrid(4, 1, 1);
+    try core.grid.putSyntheticExternal(4, .{ .win = 4, .start_row = 0, .start_col = 0 });
+    try replaceGridSurfaceRowVertexCount(&core, 4, core.grid.sub_grids.getPtr(4).?, 0, 7);
+    core.grid.sub_grids.getPtr(2).?.clearDirty();
+    finishVertexBudgetTransactionRestoring(&core, false, true);
+
+    try std.testing.expect(core.grid.main_buf.vertex_row_ledger_valid);
+    const reshaped = core.grid.sub_grids.getPtr(2).?;
+    try std.testing.expect(!reshaped.vertex_row_ledger_valid);
+    try std.testing.expect(reshaped.dirty_all);
+    try std.testing.expectEqual(@as(usize, 20), reshaped.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 7), core.grid.sub_grids.getPtr(4).?.surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 27), core.grid.subgrid_surface_vertex_count);
+}
+
 test "external vertex aggregate follows lifecycle without layout-order scans" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -8697,7 +8734,7 @@ test "scroll callback abort consumes only dispatched IDs" {
     try flush_ctx.onFlush(3, 3);
     try std.testing.expectEqual(@as(u32, 1), state.scroll_calls);
     try std.testing.expectEqual(@as(i64, 1), state.ids[0]);
-    try std.testing.expect(!core.grid.main_scroll_notify_pending);
+    try std.testing.expect(!core.grid.main_buf.scroll_notify_pending);
     try std.testing.expect(core.grid.sub_grids.get(2).?.scroll_notify_pending);
     try std.testing.expectEqual(@as(u8, 1), core.grid.scrolled_grid_count);
     try std.testing.expectEqual(@as(i64, 2), core.grid.scrolled_grid_ids[0]);
@@ -9566,6 +9603,89 @@ test "cursor Phase 2 glyphs reuse persistent scalar and cluster cache entries" {
     try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_a) != null);
     try std.testing.expect(try ensureCachedPhase2Glyph(&core, 0x1F469, 0, &cluster_b) != null);
     try std.testing.expectEqual(@as(u32, 3), state.raster_calls);
+}
+
+test "a cursor on a combining-mark cluster is shaped by the text font, not the emoji path" {
+    const State = struct {
+        shaped_len: usize = 0,
+        by_id_calls: u32 = 0,
+
+        fn shape(
+            ctx: ?*anyopaque,
+            scalars: [*]const u32,
+            scalar_count: usize,
+            style_flags: u32,
+            out_glyph_ids: [*]u32,
+            out_clusters: [*]u32,
+            out_x_advance: [*]i32,
+            out_x_offset: [*]i32,
+            out_y_offset: [*]i32,
+            out_cap: usize,
+        ) callconv(.c) usize {
+            _ = scalars;
+            _ = style_flags;
+            _ = out_cap;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.shaped_len = scalar_count;
+            // The font composes e + U+0301 into one glyph.
+            out_glyph_ids[0] = 42;
+            out_clusters[0] = 0;
+            out_x_advance[0] = 64;
+            out_x_offset[0] = 0;
+            out_y_offset[0] = 0;
+            return 1;
+        }
+
+        fn rasterById(ctx: ?*anyopaque, glyph_id: u32, style_flags: u32, out_bitmap: *c_api.GlyphBitmap) callconv(.c) c_int {
+            _ = glyph_id;
+            _ = style_flags;
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.by_id_calls += 1;
+            out_bitmap.* = .{
+                .pixels = null,
+                .width = 1,
+                .height = 1,
+                .pitch = 1,
+                .bearing_x = 0,
+                .bearing_y = 1,
+                .advance_26_6 = 64,
+                .ascent_px = 1,
+                .descent_px = 0,
+                .bytes_per_pixel = 1,
+            };
+            return 1;
+        }
+
+        fn upload(ctx: ?*anyopaque, dest_x: u32, dest_y: u32, width: u32, height: u32, bitmap: *const c_api.GlyphBitmap) callconv(.c) void {
+            _ = ctx;
+            _ = dest_x;
+            _ = dest_y;
+            _ = width;
+            _ = height;
+            _ = bitmap;
+        }
+
+        fn create(ctx: ?*anyopaque, atlas_w: u32, atlas_h: u32) callconv(.c) void {
+            _ = ctx;
+            _ = atlas_w;
+            _ = atlas_h;
+        }
+    };
+
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    var state = State{};
+    core.ctx = &state;
+    core.cb.on_shape_text_run = State.shape;
+    core.cb.on_rasterize_glyph_by_id = State.rasterById;
+    core.cb.on_atlas_upload = State.upload;
+    core.cb.on_atlas_create = State.create;
+
+    const combining = [_]u32{0x0301};
+    try std.testing.expect(try ensureCachedPhase2Glyph(&core, 'e', 0, &combining) != null);
+    try std.testing.expectEqual(@as(u8, 0), core.emoji_cluster_len);
+    try std.testing.expectEqual(@as(usize, 2), state.shaped_len);
+    try std.testing.expectEqual(@as(u32, 1), state.by_id_calls);
 }
 
 test "cursor Phase 2 cache uses canonical ASCII slots and row glyph IDs" {
@@ -11317,7 +11437,7 @@ test "external close detection visits known grids once and removes in place" {
     try core.known_external_grids.put(core.alloc, 11, .{ .win = 11, .start_row = 0, .start_col = 0, .rows = 2, .cols = 2 });
     try core.grid.external_grids.put(core.alloc, 11, .{ .win = 11, .start_row = 0, .start_col = 0 });
 
-    _ = notifyExternalWindowChanges(&core);
+    notifyExternalWindowChanges(&core);
     try std.testing.expectEqualSlices(i64, &.{10}, closed.items);
     try std.testing.expect(!core.known_external_grids.contains(10));
     try std.testing.expect(core.known_external_grids.contains(11));
@@ -11361,14 +11481,14 @@ test "external open abort stops later lifecycle callbacks until retry" {
     core.ctx = &state;
     core.cb.on_external_window = State.open;
 
-    _ = notifyExternalWindowChanges(&core);
+    notifyExternalWindowChanges(&core);
     try std.testing.expect(core.flush_aborted);
     try std.testing.expectEqual(@as(u32, 1), state.calls);
     try std.testing.expectEqual(@as(usize, 0), core.known_external_grids.count());
 
     core.flush_aborted = false;
     state.abort_first = false;
-    _ = notifyExternalWindowChanges(&core);
+    notifyExternalWindowChanges(&core);
     try std.testing.expect(!core.flush_aborted);
     try std.testing.expectEqual(@as(u32, 3), state.calls);
     try std.testing.expectEqual(@as(usize, 2), core.known_external_grids.count());
@@ -12525,6 +12645,18 @@ test "each status channel reaches its own route and its own callback" {
     notifyMessageChanges(&core);
     try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
     try std.testing.expectEqual(@as(u32, 1), state.showcmd_calls);
+
+    // An on_msg_clear the core sends on its own (the msg_show auto-hide)
+    // tears down the frontends' message window, the ext_float status's too:
+    // that status is sent again, and only that one.
+    const ClearProbe = struct {
+        fn onClear(_: ?*anyopaque) callconv(.c) void {}
+    };
+    core.cb.on_msg_clear = ClearProbe.onClear;
+    core.msg_show_auto_hide_at = clock.nowNs() - 1;
+    checkMsgAutoHideTimeout(&core);
+    try std.testing.expectEqual(@as(u32, 1), state.showmode_calls);
+    try std.testing.expectEqual(@as(u32, 2), state.showcmd_calls);
 }
 
 test "the internal and ABI message view enums agree name for name and value for value" {
@@ -13414,9 +13546,59 @@ test "history sent as one on_msg_show chunk is never cut inside a character" {
     var entries = [_]grid_mod.MsgHistoryEntry{try makeTestHistoryEntry(&core, &text)};
     defer for (&entries) |*e| e.deinit(core.alloc);
 
-    sendMsgHistoryCallbackAll(&core, &entries, .mini);
+    sendMsgHistoryCallbackAll(&core, &entries, .mini, 0);
     try std.testing.expectEqual(@as(usize, 4095), Probe.text_len);
     try std.testing.expect(Probe.valid);
+}
+
+test "history puts an appended entry on the previous line and keeps the route timeout" {
+    // `:echo "abc" | echon "def"` is one line in :messages.
+    const Probe = struct {
+        var text: [64]u8 = undefined;
+        var text_len: usize = 0;
+        var timeout_ms: u32 = 0;
+        fn onShow(_: ?*anyopaque, _: c_api.zonvie_msg_view_type, _: [*]const u8, _: usize, chunks: [*]const c_api.MsgChunk, _: usize, _: c_int, _: c_int, _: c_int, _: i64, timeout: u32) callconv(.c) void {
+            text_len = chunks[0].text_len;
+            @memcpy(text[0..text_len], chunks[0].text[0..text_len]);
+            timeout_ms = timeout;
+        }
+    };
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(24, 80);
+    core.cb.on_msg_show = Probe.onShow;
+
+    var entries = [_]grid_mod.MsgHistoryEntry{
+        try makeTestHistoryEntry(&core, "abc"),
+        try makeTestHistoryEntry(&core, "def"),
+        try makeTestHistoryEntry(&core, "ghi"),
+    };
+    defer for (&entries) |*e| e.deinit(core.alloc);
+    entries[1].append = true;
+
+    sendMsgHistoryCallbackAll(&core, &entries, .mini, 3);
+    try std.testing.expectEqualStrings("abcdef\nghi", Probe.text[0..Probe.text_len]);
+    try std.testing.expectEqual(@as(u32, 3000), Probe.timeout_ms);
+
+    const hgid = grid_mod.MSG_HISTORY_GRID_ID;
+    try std.testing.expect(renderMsgHistoryGrid(&core, &entries));
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 0, 4).cp);
+    try std.testing.expectEqual(@as(u32, 'g'), core.grid.getCellGrid(hgid, 1, 1).cp);
+
+    // After an entry that ended on a newline, the appended one starts a row,
+    // as the callback sink's "abc\ndef" does.
+    var nl_entries = [_]grid_mod.MsgHistoryEntry{
+        try makeTestHistoryEntry(&core, "abc\n"),
+        try makeTestHistoryEntry(&core, "def"),
+    };
+    defer for (&nl_entries) |*e| e.deinit(core.alloc);
+    nl_entries[1].append = true;
+    sendMsgHistoryCallbackAll(&core, &nl_entries, .mini, 2);
+    try std.testing.expectEqualStrings("abc\ndef", Probe.text[0..Probe.text_len]);
+    try std.testing.expect(renderMsgHistoryGrid(&core, &nl_entries));
+    try std.testing.expectEqual(@as(u32, 2), panelRows(&core, hgid));
+    try std.testing.expectEqual(@as(u32, 'd'), core.grid.getCellGrid(hgid, 1, 1).cp);
 }
 
 test "a multi-line history entry takes one row per line" {
@@ -13880,7 +14062,7 @@ test "a surface layout waits for the external window that receives it" {
     try std.testing.expect(try core.grid.setWinExternalPos(2, 42));
     try core.grid.pending_ext_window_grids.put(core.alloc, 2, .{ .grid_id = 2, .width = 6, .height = 4 });
 
-    _ = notifyExternalWindowChanges(&core);
+    notifyExternalWindowChanges(&core);
     notifySurfaceLayouts(&core);
     // Only the main surface: a layout for a surface the frontend has never
     // been told to create aborts the flush there and retries forever.
@@ -13890,7 +14072,7 @@ test "a surface layout waits for the external window that receives it" {
 
     // The requested resize lands: the open goes out first, then the layout.
     try core.grid.resizeGrid(2, 4, 6);
-    _ = notifyExternalWindowChanges(&core);
+    notifyExternalWindowChanges(&core);
     try std.testing.expectEqual(@as(u32, 1), state.opens);
     notifySurfaceLayouts(&core);
     try std.testing.expect(state.saw_layout_for_2);

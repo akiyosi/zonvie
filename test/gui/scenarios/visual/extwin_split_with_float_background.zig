@@ -24,8 +24,6 @@ const capture = driver.capture;
 const fixture = @import("fixture.zig");
 const gui_io = @import("../../gui_io.zig");
 
-const max_windows = 16;
-
 /// `Normal`'s background for this run: far from black on every channel.
 const normal_bg = [3]u8{ 0x20, 0x60, 0xa0 };
 /// A channel may differ by this much (colour-space conversion in the capture).
@@ -74,12 +72,11 @@ fn runWith(alloc: std.mem.Allocator, config_dir: []const u8, log_path: []const u
     );
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     // The user's repro: externalize the split that hosts the float.
     try g.remoteSend("<C-w>ge");
-    const ext = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
     var img = try capture.captureWindow(alloc, ext.number);

@@ -1089,6 +1089,18 @@ pub fn invertClusterMap(
     }
 }
 
+/// Length of the next shaping chunk of `scalars`, at most `max_len`. A run
+/// that does not fit is cut just after its last space inside the limit, so
+/// no ligature or cluster spans the cut; with no space it is cut at the limit.
+pub fn shapeChunkLen(scalars: []const u32, max_len: usize) usize {
+    if (scalars.len <= max_len) return scalars.len;
+    var i = max_len;
+    while (i > 0) : (i -= 1) {
+        if (scalars[i - 1] == ' ') return i;
+    }
+    return max_len;
+}
+
 /// The row-scroll blit arithmetic lives in the core now
 /// (`src/core/row_scroll.zig`), so both frontends get the same answer to the
 /// same geometry. Aliased under the name the paint code already uses.
@@ -1223,10 +1235,8 @@ pub fn shiftRowBits(
     row_end: u32,
     rows_delta: i32,
 ) void {
-    if (rows_delta == 0 or row_end <= row_start) return;
-    if (row_end > bits.bit_length) return;
+    if (checkShift(row_start, row_end, rows_delta, bits.bit_length) != .fits) return;
     const shift: u32 = @intCast(@abs(rows_delta));
-    if (shift == 0 or shift >= row_end - row_start) return;
 
     if (rows_delta > 0) {
         var r: u32 = row_start;
@@ -1259,7 +1269,32 @@ pub fn spawnArgQuote(arg: []const u8) ?u8 {
     return null;
 }
 
+/// A devcontainer workspace or config path as the devcontainer commands can
+/// quote it: one pair of Explorer "Copy as path" quotes dropped, and trailing
+/// backslashes dropped (`C:\proj\` is `C:\proj`); a root keeps its backslash
+/// and gets a `.` after it (`C:\.`). Inside `"..."` a trailing backslash
+/// escapes the closing quote, and the rest of the command becomes part of
+/// the path.
+pub fn writeDevcontainerPathArg(w: *std.Io.Writer, raw: []const u8) !void {
+    var p = raw;
+    if (p.len >= 2 and p[0] == '"' and p[p.len - 1] == '"') p = p[1 .. p.len - 1];
+    while (p.len > 1 and p[p.len - 1] == '\\' and p[p.len - 2] != ':') p = p[0 .. p.len - 1];
+    try w.writeAll(p);
+    if (p.len > 0 and p[p.len - 1] == '\\') try w.writeByte('.');
+}
+
 pub const RowBand = struct { start: usize, end: usize };
+
+pub const ShiftCheck = enum { noop, fits, invalid };
+
+/// Classify a row shift of `[row_start, row_end)` by `rows_delta` over storage
+/// of `len` rows: nothing to move, a shift that leaves surviving rows, or one
+/// that overruns the storage or covers the whole region.
+pub fn checkShift(row_start: u32, row_end: u32, rows_delta: i32, len: usize) ShiftCheck {
+    if (rows_delta == 0 or row_end <= row_start) return .noop;
+    if (row_end > len or @abs(rows_delta) >= row_end - row_start) return .invalid;
+    return .fits;
+}
 
 /// Move the surviving entries of a scroll region `items[row_start..row_end]`
 /// by `rows_delta` (`> 0`: content moves up, as on_grid_row_scroll) and

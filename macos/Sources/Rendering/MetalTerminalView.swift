@@ -227,14 +227,7 @@ final class MetalTerminalView: GridInputView {
 
     override var sharedResources: SharedRenderResources { renderer.shared }
 
-    /// When the command line is a separate window this view is purely the
-    /// buffer, so a drop here opens: the command line has its own drop
-    /// target. Only when it is drawn in this window's bottom row
-    /// ([cmdline] external = false) does a drop while it is up insert.
-    override var dropInsertsPath: Bool {
-        guard let core, !core.hasExternalCmdlineWindow else { return false }
-        return core.getCurrentMode().hasPrefix("cmdline")
-    }
+    override var dropInsertsPath: Bool { bufferDropInsertsPath }
 
     /// Expose drawable size without requiring MetalKit import at call site.
     var currentDrawableSize: CGSize { drawableSize }
@@ -256,6 +249,9 @@ final class MetalTerminalView: GridInputView {
     // (compactMap/etc.) every call — this runs in the pre-draw path on
     // every scrolled frame.
     private var scrollOffsetInfoScratch: [GridSurfaceRenderer.ScrollOffsetInfo] = []
+    /// Set when the last offset update dropped the scroll transform (fixed-float
+    /// mask or offset set overflowed), so the frame is cell-aligned. Main thread.
+    private var drewWithoutScrollTransform = false
     private var gridInfoMapScratch: [Int64: ZonvieCore.GridInfo] = [:]
     private var visibleGridIdsScratch: Set<Int64> = []
     // Reused by the fixedRects collection below; updateFixedFloatRects()
@@ -500,7 +496,7 @@ final class MetalTerminalView: GridInputView {
             guard let g = pointerGeometry(at: location) else { return }
             let globalCol = g.globalCol
 
-            let dragOffsetPx = scrollModel?.visualScrollOffsetPx(gridId: cache.gridId, cellHeightPx: g.cellH) ?? 0
+            let dragOffsetPx = drawnScrollOffsetPx(cache.gridId, cellH: g.cellH)
 
             // The band the press cached, not the grid as it stands now: a drag
             // that resizes the grids would otherwise answer a different
@@ -606,7 +602,9 @@ final class MetalTerminalView: GridInputView {
         if let userInfo = event.trackingArea?.userInfo as? [String: Bool],
            userInfo["scrollbar"] == true {
             let config = ZonvieConfig.shared.scrollbar
-            if config.enabled && config.isHover {
+            // In "scroll" mode show() armed the auto-hide delay; leave the
+            // bar to it, as the external surface and Windows do.
+            if config.enabled && config.isHover && !config.isScroll {
                 hideScrollbar()
             }
         }
@@ -935,12 +933,9 @@ final class MetalTerminalView: GridInputView {
             let gridTopYNDC = 1.0 - gridTopPx * ndcScale
 
             scrollOffsetInfoScratch.append(GridSurfaceRenderer.ScrollOffsetInfo(
-                gridId: gridId,
+                grid: info,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
-                gridRows: info.rows,
-                marginTop: info.marginTop,
-                marginBottom: info.marginBottom,
                 // The z-aware guard only discards this grid's scrolled content
                 // under STRICTLY higher fixed floats, so a directly-scrolled
                 // float keeps drawing above its own backdrop.
@@ -979,17 +974,12 @@ final class MetalTerminalView: GridInputView {
                 // guard compares its own zindex against the mask segment's, so
                 // it cannot self-discard, while lower-z content scrolled in
                 // the same frame is still masked under it.
-                fixedFloatRectsScratch.append(GridSurfaceRenderer.FixedFloatRect(
-                    x0: Float(g.startCol) * cellW,
-                    x1: Float(g.startCol + g.cols) * cellW,
-                    top: Float(g.startRow) * cellHeightPx,
-                    bottom: Float(g.startRow + g.rows) * cellHeightPx,
-                    zindex: Int32(clamping: g.zindex)
-                ))
-                // One entry beyond the representable maximum is enough to
-                // select the cell-aligned fallback; do not grow this hot-path
-                // scratch buffer with every remaining float.
-                if fixedFloatRectsScratch.count > GridSurfaceRenderer.maxFixedFloatRects { break }
+                guard GridSurfaceRenderer.FixedFloatRect.append(
+                    originPx: simd_float2(Float(g.startCol) * cellW, Float(g.startRow) * cellHeightPx),
+                    cols: Int(g.cols), rows: Int(g.rows), z: Int(clamping: g.zindex),
+                    cellW: cellW, cellH: cellHeightPx,
+                    into: &fixedFloatRectsScratch
+                ) else { break }
             }
         }
         let fixedFloatMaskRepresentable = renderer.updateFixedFloatRects(fixedFloatRectsScratch)
@@ -998,9 +988,12 @@ final class MetalTerminalView: GridInputView {
         // or let shifted content bleed through an omitted fixed float. Fall
         // back to the committed, cell-aligned frame when either constant
         // buffer would overflow instead of truncating semantic state.
+        drewWithoutScrollTransform = false
         if !fixedFloatMaskRepresentable {
+            drewWithoutScrollTransform = true
             scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
         } else if !scrollOffsetsComplete || scrollOffsetInfoScratch.count > Self.maxScrollOffsets {
+            drewWithoutScrollTransform = true
             scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
             renderer.updateFixedFloatRects([])
         }
@@ -1096,6 +1089,12 @@ final class MetalTerminalView: GridInputView {
         )
     }
 
+    /// The ease offset the last frame drew `grid` with: none at all on a frame
+    /// that dropped the scroll transform, as on the external surface.
+    private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat) -> CGFloat {
+        drewWithoutScrollTransform ? 0 : scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
+    }
+
     private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
         // Early return when renderer is uninitialized (cellMetrics not yet available).
@@ -1143,7 +1142,7 @@ final class MetalTerminalView: GridInputView {
         // Adjust for smooth scroll offset: during scrolling, content rows are
         // visually shifted by scrollOffsetPx. Without this adjustment, clicking
         // on visually-shifted content selects the wrong row.
-        let offsetPx = scrollModel?.visualScrollOffsetPx(gridId: bestGridId, cellHeightPx: cellH) ?? 0
+        let offsetPx = drawnScrollOffsetPx(bestGridId, cellH: cellH)
 
         if adjustForSmoothScroll, let grid = grids.first(where: { $0.gridId == bestGridId }) {
             localRow = scrollAdjustedLocalRow(
@@ -1559,6 +1558,15 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     /// Whether a drop inserts the paths at the cursor rather than opening
     /// the files. Each surface decides; the rest of a drop is the same.
     var dropInsertsPath: Bool { false }
+
+    /// A buffer surface's rule: when the command line is a separate window
+    /// that window is the drop target for it, so a drop here opens. Only when
+    /// it is drawn in the main window ([cmdline] external = false) does a drop
+    /// while it is up insert.
+    final var bufferDropInsertsPath: Bool {
+        guard let core, !core.hasExternalCmdlineWindow else { return false }
+        return core.getCurrentMode().hasPrefix("cmdline")
+    }
 
     func registerFileDrops() {
         if acceptsFileDrops { registerForDraggedTypes([.fileURL]) }

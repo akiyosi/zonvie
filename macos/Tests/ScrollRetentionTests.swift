@@ -849,7 +849,43 @@ private enum ScrollRetentionTests {
         requireEqual(ledger, [9: 1], "a closed float's entry is dropped while another float opens")
     }
 
+    /// Replaying the ledger the way the main renderer's beginFlush does must
+    /// give every surviving capture the source shift of ALL the steps of its
+    /// grid before it, including dropped and capture-less ones. Removing the
+    /// first step outright left the survivors reading one row too few.
+    private static func verifyReplayLedgerKeepsDroppedShift() {
+        var ledger = RetentionReplayLedger(maxCapturable: 4)
+        // (grid, delta, capturable), oldest first.
+        let noted: [(Int64, Int, Bool)] = [
+            (2, 1, true), (3, 5, false), (2, 1, true), (2, 2, false), (2, 1, true),
+            (4, 1, true), (2, 1, true), (2, 1, true), (3, 1, true), (2, 3, false),
+        ]
+        var truth: [Int] = []
+        var runningShift: [Int64: Int] = [:]
+        for (grid, delta, capturable) in noted {
+            ledger.note(gridId: grid, rowsDelta: delta, capturable: capturable)
+            if capturable { truth.append(runningShift[grid] ?? 0) }
+            runningShift[grid, default: 0] += delta
+        }
+        var shift = ledger.leadShift
+        var replayed: [Int] = []
+        for step in ledger.steps {
+            if step.capturable { replayed.append(shift[step.gridId] ?? 0) }
+            shift[step.gridId, default: 0] += step.rowsDelta
+        }
+        requireEqual(ledger.steps.filter(\.capturable).count, 4, "only four capturable steps are kept")
+        requireEqual(replayed, Array(truth.suffix(4)), "survivors read past every older step of their grid")
+        requireEqual(shift, runningShift, "the replay ends where the content ended")
+        require(ledger.steps.first?.capturable ?? true, "the oldest kept step captures")
+
+        var shiftOnly = RetentionReplayLedger(maxCapturable: 4)
+        for _ in 0..<100 { shiftOnly.note(gridId: 2, rowsDelta: 1, capturable: false) }
+        require(shiftOnly.steps.isEmpty, "capture-less steps with nothing to replay fold into the lead")
+        requireEqual(shiftOnly.leadShift, [2: 100], "and keep their rows")
+    }
+
     static func main() {
+        verifyReplayLedgerKeepsDroppedShift()
         verifyLedgerForgetsALoneClosedLayer()
         verifyFloatDebtBaselineFollowsOneGrid()
         verifyCommittedRowMutationLedger()

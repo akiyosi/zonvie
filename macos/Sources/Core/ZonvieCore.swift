@@ -560,9 +560,13 @@ final class ZonvieCore {
     // Notification posted when Neovim is ready (first vertices received)
     static let neovimReadyNotification = NSNotification.Name("ZonvieNeovimReady")
     private var hasNotifiedReady = false
+    /// Main-thread copy of hasNotifiedReady, set just before the notification.
+    private(set) var isNeovimReady = false
 
     // Notification posted when colorscheme (default bg/fg) changes
     static let colorschemeDidChangeNotification = NSNotification.Name("ZonvieColorschemeDidChange")
+    /// default_colors_set awaiting a committed flush. Core thread, under grid_mu.
+    private var pendingDefaultColors: (fg: UInt32, bg: UInt32)?
 
     // Timeout for quit request (to handle unresponsive Neovim)
     private var quitTimeoutWorkItem: DispatchWorkItem?
@@ -765,6 +769,7 @@ final class ZonvieCore {
                     core.hasNotifiedReady = true
                     ZonvieCore.appLog("zonvie: posting neovimReadyNotification")
                     DispatchQueue.main.async {
+                        core.isNeovimReady = true
                         NotificationCenter.default.post(name: ZonvieCore.neovimReadyNotification, object: core)
                         // Close devcontainer progress dialog if shown
                         core.hideDevcontainerProgress()
@@ -892,41 +897,26 @@ final class ZonvieCore {
                                     totalCols: tc
                                 )
                             }
-                            // Save main vertices to pending as fallback for
-                            // the hide/re-show race: the gridView found above
-                            // may belong to the previous session (close dispatch
-                            // pending on main). Skip cursor-only updates (fl & 2)
-                            // — cursor vertices carry the cursor fg color as bg,
-                            // which would overwrite the correct Normal bg in
-                            // pending config and replace main content.
-                            if fl & 2 == 0 {
-                                let savedVerts = prepared.vertices
-                                let savedBgColor: NSColor? = (rs == 0) ? {
-                                    let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                    return isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                }() : nil
+                            // Save the config to pending as fallback for the
+                            // hide/re-show race: the gridView found above may
+                            // belong to the previous session (close dispatch
+                            // pending on main). Skip cursor-only updates: cursor
+                            // vertices carry the cursor fg color as bg.
+                            let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                            if fl & 2 == 0, rs == 0,
+                               let bgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor {
                                 DispatchQueue.main.async { [weak core] in
                                     guard let core = core else { return }
-                                    if var existing = core.pendingExternalVertices[gridId] {
-                                        existing.rowVertices[rs] = savedVerts
-                                        existing.rows = totalRows
-                                        existing.cols = totalCols
-                                        core.pendingExternalVertices[gridId] = existing
-                                    } else {
-                                        core.pendingExternalVertices[gridId] = (rowVertices: [rs: savedVerts], rows: totalRows, cols: totalCols)
-                                    }
-                                    if let bgColor = savedBgColor {
-                                        core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
-                                        if let window = core.externalWindows[gridId] {
-                                            core.applyExternalGridConfig(
-                                                gridId: gridId,
-                                                window: window,
-                                                gridView: gridView,
-                                                bgColor: bgColor,
-                                                rows: totalRows,
-                                                cols: totalCols
-                                            )
-                                        }
+                                    core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
+                                    if let window = core.externalWindows[gridId] {
+                                        core.applyExternalGridConfig(
+                                            gridId: gridId,
+                                            window: window,
+                                            gridView: gridView,
+                                            bgColor: bgColor,
+                                            rows: totalRows,
+                                            cols: totalCols
+                                        )
                                     }
                                 }
                             }
@@ -947,39 +937,26 @@ final class ZonvieCore {
                     // after commitFlush() has published the committed state.
                     delivered = true
                 case .unplaced:
-                    // No gridView yet on core thread: copy vertex data and defer
-                    // to main thread for window configuration or pending capture.
-                    // Vertex content itself is never published from this delayed
-                    // closure: its UVs belong to the source flush's atlas generation,
-                    // which may no longer be the committed generation when the main
-                    // queue runs. Window creation schedules a bracketed full resend.
-                    if let verts = verts, vertCount > 0 {
-                        let vertexArray = Array(UnsafeBufferPointer(start: verts, count: Int(vertCount)))
-                        DispatchQueue.main.async { [weak core] in
-                            guard let core = core else { return }
-                            // Window creation already scheduled a full resend. A delayed
-                            // source-flush copy must not overwrite that newer transaction.
-                            guard core.externalGridViews[gridId] == nil else { return }
-                            // Cursor geometry has no atlas-independent configuration to
-                            // preserve; the bracketed resend regenerates it with content.
-                            guard fl & 2 == 0 else { return }
-                            let prepared = core.prepareExternalVertexArray(gridId: gridId, vertices: vertexArray)
-                            if rs == 0 {
-                                let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
-                                let effectiveBgColor = isPopupmenu ? core.popupmenuBgColor : prepared.bgColor
-                                if let bgColor = effectiveBgColor {
-                                    core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
-                                }
-                            }
-                            ZonvieCore.appLog("[on_vertices_row] gridId=\(gridId) no gridView yet, saving \(prepared.vertices.count) vertices for row \(rs)")
-                            if var existing = core.pendingExternalVertices[gridId] {
-                                existing.rowVertices[rs] = prepared.vertices
-                                existing.rows = totalRows
-                                existing.cols = totalCols
-                                core.pendingExternalVertices[gridId] = existing
-                            } else {
-                                core.pendingExternalVertices[gridId] = (rowVertices: [rs: prepared.vertices], rows: totalRows, cols: totalCols)
-                            }
+                    // No gridView yet: keep only the atlas-independent config
+                    // (background, size) for window registration. Vertex content
+                    // is never kept: its UVs belong to this flush's atlas
+                    // generation, and window creation schedules a bracketed full
+                    // resend. Cursor geometry carries no config.
+                    guard !isCursorUpdate else { return }
+                    let background = ZonvieCore.extractExternalGridBackground(
+                        verts: verts,
+                        vertCount: Int(vertCount)
+                    )
+                    DispatchQueue.main.async { [weak core] in
+                        guard let core = core else { return }
+                        // Window creation already scheduled a full resend. A delayed
+                        // source-flush config must not overwrite that newer transaction.
+                        guard core.externalGridViews[gridId] == nil else { return }
+                        let isPopupmenu = (gridId == ZonvieCore.popupmenuGridId)
+                        guard let bgColor = isPopupmenu ? core.popupmenuBgColor : background?.color else { return }
+                        // Row 0 decides; another row only fills an empty slot.
+                        if rs == 0 || core.pendingExternalGridConfig[gridId] == nil {
+                            core.pendingExternalGridConfig[gridId] = (bgColor: bgColor, rows: totalRows, cols: totalCols)
                         }
                     }
                 }
@@ -1427,6 +1404,16 @@ final class ZonvieCore {
                 for gridView in me.extViewsScratch {
                     gridView.commitFlush(publishedAtlasTexture: publishedAtlasTexture)
                 }
+                if let colors = me.pendingDefaultColors {
+                    me.pendingDefaultColors = nil
+                    DispatchQueue.main.async {
+                        NotificationCenter.default.post(
+                            name: ZonvieCore.colorschemeDidChangeNotification,
+                            object: me,
+                            userInfo: ["bgRGB": colors.bg, "fgRGB": colors.fg]
+                        )
+                    }
+                }
                 me.externalGridViewsLock.lock()
                 if let owners = me.pendingGridSurfaceOwners { me.gridSurfaceOwners = owners }
                 me.externalGridViewsLock.unlock()
@@ -1444,18 +1431,14 @@ final class ZonvieCore {
                 me.cancelScheduledFlushRetry()
             },
 
-            // Colorscheme change notification (from default_colors_set redraw event).
-            // Runs on core thread with grid_mu held — dispatch to main for UI update.
+            // Colorscheme change (default_colors_set). Runs on the core thread
+            // with grid_mu held. Staged and published by the commit on
+            // on_flush_end, as Windows pending_colorscheme_*: posted here, the
+            // chrome restyled ahead of cells an aborted flush had not drawn.
             on_default_colors_set: { ctx, fg, bg in
                 guard let ctx else { return }
                 let me = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                DispatchQueue.main.async {
-                    NotificationCenter.default.post(
-                        name: ZonvieCore.colorschemeDidChangeNotification,
-                        object: me,
-                        userInfo: ["bgRGB": bg, "fgRGB": fg]
-                    )
-                }
+                me.pendingDefaultColors = (fg: fg, bg: bg)
             },
 
             // ext_windows layout operation callbacks
@@ -1659,6 +1642,7 @@ final class ZonvieCore {
         self.core = zonvie_core_create(&cb, MemoryLayout<zonvie_callbacks>.size, self.ctxPtr)
 
         setupSSHNotificationObserver()
+        setupMessageFloatFollowObservers()
     }
 
     deinit {
@@ -1666,6 +1650,9 @@ final class ZonvieCore {
         if let observer = sshNotificationObserver {
             NotificationCenter.default.removeObserver(observer)
             sshNotificationObserver = nil
+        }
+        for observer in messageFloatFollowObservers {
+            NotificationCenter.default.removeObserver(observer)
         }
 
         stop()
@@ -2096,8 +2083,10 @@ final class ZonvieCore {
                 ZonvieCore.appLog("[start] SSH mode: password auth")
             }
             sshCmd += " -o StrictHostKeyChecking=accept-new"
-            // Use --nvim override for remote nvim path, default to bare "nvim" (PATH lookup)
-            let remoteNvim = cliNvimPath ?? "nvim"
+            // Remote nvim: the dialog's Neovim path, else --nvim, else bare
+            // "nvim" (PATH lookup). Windows stores the dialog path the same way.
+            let dialogNvim = connectionConfig.flatMap { $0.nvimPath.isEmpty ? nil : $0.nvimPath }
+            let remoteNvim = dialogNvim ?? cliNvimPath ?? "nvim"
             // Escape \ for remote shell double-quote context
             let escapedNvim = remoteNvim.replacingOccurrences(of: "\\", with: "\\\\")
             // Quote path with \" for remote shell: Zig parser preserves \" inside single-quotes,
@@ -2191,9 +2180,11 @@ final class ZonvieCore {
 
         // Enable Zig core logging based on app log setting
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
-        // verbose must be applied core-side (unlike perfOnly/scrollOnly it
-        // cannot be filtered at the Swift sink — the point is to skip the
-        // core's per-row formatting cost entirely).
+        // Tier filters apply core-side, before formatting: a line the sink
+        // would drop is then never formatted, crossed over on_log and copied
+        // into Swift strings (the connect path and Windows set them too).
+        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
         zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
 
         return result
@@ -2516,7 +2507,9 @@ final class ZonvieCore {
         // MetalTerminalView path to deliver the actual rows/cols computed
         // from the post-layout drawable size, exactly like the native path.
         zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
-        // See spawn path above: verbose must gate at the core, not the sink.
+        // See spawn path above: the tier filters gate at the core.
+        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
         zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
 
         // Note: Progress dialog will be closed by neovimReadyNotification observer
@@ -4366,16 +4359,10 @@ final class ZonvieCore {
         scheduleFlushRetry()
     }
     private var externalWindowDelegates: [Int64: ExternalWindowDelegate] = [:]
-    /// Pending background color configuration (applied when window is created)
+    /// Pending background color configuration (applied when window is created).
+    /// Vertex content is never kept for a window that does not exist yet:
+    /// window creation drives a bracketed full resend instead. Main thread only.
     private var pendingExternalGridConfig: [Int64: (bgColor: NSColor?, rows: UInt32, cols: UInt32)] = [:]
-    /// Pending vertices for external grids. Their colors/dimensions configure a
-    /// newly-created window, but their atlas-dependent content is not replayed:
-    /// window creation drives a bracketed full resend instead.
-    /// Stores vertices per-row to handle row-based vertex submission.
-    /// NOTE: All access to externalGridViews, pendingExternalVertices, and
-    /// externalWindows is confined to the main thread. The on_vertices_row callback
-    /// copies vertex data on the RPC thread and dispatches to main for capture.
-    private var pendingExternalVertices: [Int64: (rowVertices: [Int: [zonvie_vertex]], rows: UInt32, cols: UInt32)] = [:]
 
     /// Pending external window requests (queued when terminalView or pipeline is not ready yet)
     private struct PendingExternalWindowRequest {
@@ -5208,6 +5195,10 @@ final class ZonvieCore {
     private struct ExternalGridBackground {
         let rgba: SIMD4<Float>
         let vertexIndex: Int
+
+        var color: NSColor {
+            NSColor(red: CGFloat(rgba.x), green: CGFloat(rgba.y), blue: CGFloat(rgba.z), alpha: CGFloat(rgba.w))
+        }
     }
 
     /// Extract only atlas-independent metadata while the core callback's raw
@@ -5245,16 +5236,7 @@ final class ZonvieCore {
         precondition(Thread.isMainThread, "configureExternalGridFromRow must be called on the main thread")
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) rows=\(rows) cols=\(cols)")
 
-        let isSpecialGrid = (gridId == ZonvieCore.cmdlineGridId || gridId == ZonvieCore.popupmenuGridId ||
-                             gridId == ZonvieCore.messageGridId || gridId == ZonvieCore.msgHistoryGridId)
-        let bgColor = background.map {
-            NSColor(
-                red: CGFloat($0.rgba.x),
-                green: CGFloat($0.rgba.y),
-                blue: CGFloat($0.rgba.z),
-                alpha: CGFloat($0.rgba.w)
-            )
-        }
+        let bgColor = background?.color
         ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) bgVertexIdx=\(background?.vertexIndex ?? -1) bgColor=\(String(describing: bgColor))")
 
         // No nested async hop: the resize must complete before
@@ -5265,7 +5247,7 @@ final class ZonvieCore {
             return
         }
 
-        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) applying bg color=\(bgColor) isSpecial=\(isSpecialGrid)")
+        ZonvieCore.appLog("[configureExtGridRow] gridId=\(gridId) applying bg color=\(bgColor)")
 
         self.applyExternalGridConfig(
             gridId: gridId,
@@ -5384,6 +5366,14 @@ final class ZonvieCore {
             return
         }
 
+        _ = removeInstalledExternalWindow(gridId: gridId)
+        Self.closeRemovedExternalWindow(window)
+        ZonvieCore.appLog("[external_window] detached superseded window gridId=\(gridId) installedToken=\(installedToken)")
+    }
+
+    /// The teardown a superseded detach and a close share: forget the
+    /// installed incarnation of `gridId` and return its window, not closed.
+    private func removeInstalledExternalWindow(gridId: Int64) -> NSWindow? {
         externalWindowDelegates.removeValue(forKey: gridId)
         externalWindowInstalledLifecycleTokens.removeValue(forKey: gridId)
         externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
@@ -5395,16 +5385,21 @@ final class ZonvieCore {
         // would blank the window it is still drawing.
         removedView?.releaseGridBuffers(gridId: gridId)
         externalWindowWinIds.removeValue(forKey: gridId)
-        externalWindows.removeValue(forKey: gridId)
+        // Nothing else evicts these once the grid is gone (a dead grid_id is
+        // never re-queried); mirrors Windows closeExternalWindowOnUIThread.
         cachedViewports.removeValue(forKey: gridId)
         if cachedUrlState.gridId == gridId {
             cachedUrlState = (0, 0, 0, false)
         }
+        return externalWindows.removeValue(forKey: gridId)
+    }
 
+    private static func closeRemovedExternalWindow(_ window: NSWindow) {
         window.delegate = nil
+        // Release contentView before close so the ExternalGridView can
+        // deallocate now instead of with the deferred NSWindow deallocation.
         window.contentView = nil
         window.close()
-        ZonvieCore.appLog("[external_window] detached superseded window gridId=\(gridId) installedToken=\(installedToken)")
     }
 
     private func onExternalWindowClose(gridId: Int64) {
@@ -5441,33 +5436,11 @@ final class ZonvieCore {
                 return
             }
 
-            self.externalWindowDelegates.removeValue(forKey: gridId)
-            self.externalWindowInstalledLifecycleTokens.removeValue(forKey: gridId)
-            self.externalWindowInstalledSessionGenerations.removeValue(forKey: gridId)
-            self.externalGridViewsLock.lock()
-            let removedView = self.externalGridViews.removeValue(forKey: gridId)
-            self.externalGridViewsLock.unlock()
-            // See the sibling teardown above: the view owns its buffers until
-            // it is removed.
-            removedView?.releaseGridBuffers(gridId: gridId)
-            self.externalWindowWinIds.removeValue(forKey: gridId)
+            let removedWindow = self.removeInstalledExternalWindow(gridId: gridId)
 
-            // Clean up pending vertex/config data for this grid.
-            // Without this, vertex arrays accumulated before window creation
-            // would leak indefinitely when the grid is closed.
+            // Drop config stashed before window creation for this grid.
             if closeIsLatestAction {
-                self.pendingExternalVertices.removeValue(forKey: gridId)
                 self.pendingExternalGridConfig.removeValue(forKey: gridId)
-            }
-
-            // Evict the scrollbar viewport cache entry for this grid; nothing
-            // else removes it once the grid is gone (a dead grid_id is never
-            // re-queried), so long sessions would otherwise accumulate one
-            // stale entry per closed external window (mirrors the Windows
-            // fix in external_windows.zig's closeExternalWindowOnUIThread).
-            self.cachedViewports.removeValue(forKey: gridId)
-            if self.cachedUrlState.gridId == gridId {
-                self.cachedUrlState = (0, 0, 0, false)
             }
 
             // Drop any queued window-creation request for this gridId.
@@ -5482,7 +5455,7 @@ final class ZonvieCore {
             self.externalResourceRetryDelayByGrid.removeValue(forKey: gridId)
             self.externalWindowRetryDeadlineByGrid.removeValue(forKey: gridId)
 
-            if let window = self.externalWindows.removeValue(forKey: gridId) {
+            if let window = removedWindow {
                 // Preserve positions only for same-session tab close/reopen.
                 // Session restart/connect must not transplant the previous
                 // server's position into a reused grid id.
@@ -5500,12 +5473,7 @@ final class ZonvieCore {
                 } else {
                     self.savedExternalWindowPositions.removeValue(forKey: gridId)
                 }
-                window.delegate = nil
-                // Release contentView reference before close so the
-                // ExternalGridView can deallocate immediately instead of
-                // waiting for the deferred NSWindow deallocation.
-                window.contentView = nil
-                window.close()
+                Self.closeRemovedExternalWindow(window)
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
             }
 
@@ -5803,14 +5771,11 @@ final class ZonvieCore {
         // because the core sends its cells OPAQUE (alpha 1). It needs the alpha
         // override to force them transparent so the shader shows through; only
         // the +0.05 lightening is dropped under a shader.
+        let firstBg: NSColor? = kind == .popupmenu ? nil : vertices.withUnsafeBufferPointer {
+            ZonvieCore.extractExternalGridBackground(verts: $0.baseAddress, vertCount: $0.count)?.color
+        }
         if kind != .popupmenu, shaderActive {
-            var rawBg: NSColor? = nil
-            for v in vertices where v.texCoord.0 < 0 {
-                rawBg = NSColor(red: CGFloat(v.color.0), green: CGFloat(v.color.1),
-                                blue: CGFloat(v.color.2), alpha: CGFloat(v.color.3))
-                break
-            }
-            return (vertices, rawBg)
+            return (vertices, firstBg)
         }
 
         // For popupmenu, the container bg color comes from the core callback
@@ -5850,20 +5815,7 @@ final class ZonvieCore {
         }
 
         // Non-popupmenu decorated grids (cmdline, msg): use first bg vertex
-        var bgColor: NSColor? = nil
-        for v in vertices {
-            if v.texCoord.0 < 0 {
-                bgColor = NSColor(
-                    red: CGFloat(v.color.0),
-                    green: CGFloat(v.color.1),
-                    blue: CGFloat(v.color.2),
-                    alpha: CGFloat(v.color.3)
-                )
-                break
-            }
-        }
-
-        guard let bgColor else { return (vertices, nil) }
+        guard let bgColor = firstBg else { return (vertices, nil) }
 
         var adjustedVertices = vertices
         let adjustedBg = bgColor.adjustedForCmdlineBackground()
@@ -6009,15 +5961,80 @@ final class ZonvieCore {
         containerView.wantsLayer = true
         containerView.layer?.cornerRadius = 8.0
         containerView.layer?.masksToBounds = true
-        if ZonvieConfig.shared.blurEnabled {
-            let opacity = ZonvieConfig.shared.backgroundAlpha
-            containerView.layer?.backgroundColor = background.withAlphaComponent(CGFloat(opacity)).cgColor
-        } else {
-            containerView.layer?.backgroundColor = background.cgColor
-        }
+        containerView.layer?.backgroundColor = panelBackground(background)
         containerView.layer?.borderColor = border.cgColor
         containerView.layer?.borderWidth = borderWidth
         return containerView
+    }
+
+    private static func panelBackground(_ background: NSColor) -> CGColor {
+        guard ZonvieConfig.shared.blurEnabled else { return background.cgColor }
+        return background.withAlphaComponent(CGFloat(ZonvieConfig.shared.backgroundAlpha)).cgColor
+    }
+
+    /// The borderless text panel the ext-float toast and the confirm prompt
+    /// share. Every call applies the current font and colours, so a guifont or
+    /// colorscheme change reaches a panel that already exists.
+    private static func showTextPanel(
+        existing: (window: NSWindow, container: NSView, textField: NSTextField)?,
+        frame: NSRect,
+        content: String,
+        font: NSFont,
+        fg: NSColor,
+        bg: NSColor,
+        border: NSColor,
+        borderWidth: CGFloat,
+        padding: CGFloat
+    ) -> (window: NSWindow, container: NSView, textField: NSTextField) {
+        let textFrame = NSRect(x: padding, y: padding, width: frame.width - (padding * 2), height: frame.height - (padding * 2))
+        if let existing {
+            existing.textField.stringValue = content
+            existing.textField.font = font
+            existing.textField.textColor = fg
+            existing.container.layer?.backgroundColor = panelBackground(bg)
+            existing.container.layer?.borderColor = border.cgColor
+            existing.window.setFrame(frame, display: true)
+            existing.container.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
+            existing.textField.frame = textFrame
+            existing.window.orderFront(nil)
+            return existing
+        }
+
+        let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        // `false` here is what the cmdline window takes deliberately, and
+        // it pays for it by following activation with its level (see
+        // setCmdlineWindowActive). Nothing here needs to outlive
+        // deactivation: a config.toml parse error reaches the toast with
+        // timeout 0 and no close button, and a `.floating` panel that never
+        // hides would sit above every other application.
+        applyFloatingPanelSettings(window, hidesOnDeactivate: true)
+
+        let containerView = makeRoundedPanelContainer(
+            width: frame.width, height: frame.height,
+            background: bg, border: border, borderWidth: borderWidth)
+
+        let textField = NSTextField(frame: textFrame)
+        textField.stringValue = content
+        textField.font = font
+        textField.textColor = fg
+        textField.backgroundColor = .clear
+        textField.isBordered = false
+        textField.isEditable = false
+        textField.isSelectable = false
+        textField.drawsBackground = false
+        textField.alignment = .left
+        textField.lineBreakMode = .byWordWrapping
+        textField.maximumNumberOfLines = 0
+
+        containerView.addSubview(textField)
+        window.contentView = containerView
+
+        if ZonvieConfig.shared.blurEnabled {
+            applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
+        }
+
+        window.orderFront(nil)
+        return (window, containerView, textField)
     }
 
     private func applyExternalWindowSettings(
@@ -6182,40 +6199,17 @@ final class ZonvieCore {
         if kind == .normal || kind == .cmdline {
             self.lastCursorGrid = gridId
         }
-        window.makeKeyAndOrderFront(nil)
+        // A session in the background must not take the key window from the
+        // one the user is typing into (as onCursorGridChanged).
+        if SessionManager.shared.isFront(self) {
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            // Shown with its own session's windows, not over the front one.
+            window.order(.above, relativeTo: terminalView?.window?.windowNumber ?? 0)
+        }
         window.makeFirstResponder(gridView)
         let windowType = self.externalGridKindLogLabel(kind)
         ZonvieCore.appLog("[external_window] created \(windowType) window for gridId=\(gridId)")
-    }
-
-    private func extractBackgroundColor(from vertices: [zonvie_vertex]) -> NSColor? {
-        for v in vertices {
-            if v.texCoord.0 < 0 {
-                return NSColor(
-                    red: CGFloat(v.color.0),
-                    green: CGFloat(v.color.1),
-                    blue: CGFloat(v.color.2),
-                    alpha: CGFloat(v.color.3)
-                )
-            }
-        }
-        return nil
-    }
-
-    private func extractPendingExternalBackgroundColor(
-        from rowVertices: [Int: [zonvie_vertex]]
-    ) -> NSColor? {
-        if let firstRowVertices = rowVertices[0], let bgColor = extractBackgroundColor(from: firstRowVertices) {
-            return bgColor
-        }
-
-        for vertices in rowVertices.values {
-            if let bgColor = extractBackgroundColor(from: vertices) {
-                return bgColor
-            }
-        }
-
-        return nil
     }
 
     private func applyPendingExternalState(
@@ -6223,34 +6217,7 @@ final class ZonvieCore {
         window: NSWindow,
         gridView: ExternalGridView
     ) {
-        let pendingConfig = self.pendingExternalGridConfig.removeValue(forKey: gridId)
-
-        if let pendingVerts = self.pendingExternalVertices.removeValue(forKey: gridId) {
-            let totalVertCount = pendingVerts.rowVertices.values.reduce(0) { $0 + $1.count }
-            ZonvieCore.appLog("[external_window] consuming pending vertex metadata for gridId=\(gridId) rows=\(pendingVerts.rowVertices.count) totalVerts=\(totalVertCount)")
-
-            if let pendingConfig {
-                ZonvieCore.appLog("[external_window] applying pending config for gridId=\(gridId) bgColor=\(pendingConfig.bgColor)")
-                self.applyExternalGridConfig(
-                    gridId: gridId,
-                    window: window,
-                    gridView: gridView,
-                    bgColor: pendingConfig.bgColor,
-                    rows: pendingConfig.rows,
-                    cols: pendingConfig.cols
-                )
-            } else if let bgColor = extractPendingExternalBackgroundColor(from: pendingVerts.rowVertices) {
-                ZonvieCore.appLog("[external_window] applying bg color from pending vertices for gridId=\(gridId)")
-                self.applyExternalGridConfig(
-                    gridId: gridId,
-                    window: window,
-                    gridView: gridView,
-                    bgColor: bgColor,
-                    rows: pendingVerts.rows,
-                    cols: pendingVerts.cols
-                )
-            }
-        } else if let pendingConfig {
+        if let pendingConfig = self.pendingExternalGridConfig.removeValue(forKey: gridId) {
             ZonvieCore.appLog("[external_window] applying pending config for gridId=\(gridId) bgColor=\(pendingConfig.bgColor)")
             self.applyExternalGridConfig(
                 gridId: gridId,
@@ -6262,11 +6229,9 @@ final class ZonvieCore {
             )
         }
 
-        // Pending vertices were generated against the atlas back texture of an
-        // earlier flush. Publishing them with a live committed snapshot can pair
-        // UV generation N with texture N-1 or N+1. Discard those atlas-dependent
-        // copies and regenerate every grid through the normal flush bracket,
-        // which commits the atlas before external views.
+        // Content sent before the window existed was generated against an
+        // earlier flush's atlas and was not kept. Regenerate every grid through
+        // the normal flush bracket, which commits the atlas before external views.
         DispatchQueue.main.async { [weak self] in
             guard let self, let corePtr = self.core else { return }
             // Always defer one main-queue turn: this method can run inline from
@@ -6451,16 +6416,10 @@ final class ZonvieCore {
     ) -> NSRect {
         switch kind {
         case .cmdline:
-            let promptWinVisible = self.promptWindow?.isVisible == true
-            if promptWinVisible, let promptWin = self.promptWindow, let screen = NSScreen.main, let mainWindow = mainView.window {
-                let promptFrame = promptWin.frame
-                let screenFrame = screen.visibleFrame
-                let appFrame = mainWindow.frame
-                let x = appFrame.midX - containerWidth / 2
-                var y = promptFrame.origin.y - 4 - containerHeight
-                y = max(screenFrame.minY, y)
-                ZonvieCore.appLog("[external_window] cmdline positioned below prompt at (\(x), \(y))")
-                return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+            if let mainWindow = mainView.window,
+               let frame = cmdlineFrameBelowPrompt(size: NSSize(width: containerWidth, height: containerHeight), mainWindow: mainWindow) {
+                ZonvieCore.appLog("[external_window] cmdline positioned below prompt at (\(frame.minX), \(frame.minY))")
+                return frame
             }
 
             // Kept on the screen the saved origin is on (the core's rule,
@@ -6668,23 +6627,31 @@ final class ZonvieCore {
             ) ?? existingWindow.frame
 
         case .cmdline:
-            guard self.promptWindow?.isVisible == true,
-                  let promptWin = self.promptWindow,
-                  let screen = NSScreen.main,
-                  let mainWindow = mainView.window else { return nil }
-            let promptFrame = promptWin.frame
-            let screenFrame = screen.visibleFrame
-            let appFrame = mainWindow.frame
-            let containerWidth = existingWindow.frame.width
-            let containerHeight = existingWindow.frame.height
-            let x = appFrame.midX - containerWidth / 2
-            var y = promptFrame.origin.y - 4 - containerHeight
-            y = max(screenFrame.minY, y)
-            return NSRect(x: x, y: y, width: containerWidth, height: containerHeight)
+            guard let mainWindow = mainView.window else { return nil }
+            return cmdlineFrameBelowPrompt(size: existingWindow.frame.size, mainWindow: mainWindow)
 
         case .msgShow, .msgHistory, .normal:
             return nil
         }
+    }
+
+    /// The cmdline below a visible confirm prompt, centred on the app window
+    /// and kept inside the prompt's screen by the core's clamp, as Windows
+    /// places it. Nil when no prompt is showing.
+    private func cmdlineFrameBelowPrompt(size: NSSize, mainWindow: NSWindow) -> NSRect? {
+        guard let promptWin = promptWindow, promptWin.isVisible,
+              let screen = promptWin.screen ?? NSScreen.main else { return nil }
+        let screenFrame = screen.visibleFrame
+        var x: Int32 = 0
+        var y: Int32 = 0
+        zonvie_core_clamp_window_origin(
+            Int32((mainWindow.frame.midX - size.width / 2).rounded()),
+            Int32((promptWin.frame.minY - 4 - size.height).rounded()),
+            Int32(size.width.rounded()), Int32(size.height.rounded()),
+            Int32(screenFrame.minX.rounded()), Int32(screenFrame.minY.rounded()),
+            Int32(screenFrame.maxX.rounded()), Int32(screenFrame.maxY.rounded()),
+            &x, &y)
+        return NSRect(x: CGFloat(x), y: CGFloat(y), width: size.width, height: size.height)
     }
 
     private func refreshDecoratedExternalWindow(
@@ -7631,8 +7598,10 @@ final class ZonvieCore {
             return
         }
 
+        // `needed` is the full text size, not the bytes written: the grid can
+        // grow between the two calls (grid_mu is released in between).
         guard needed > 0,
-              let text = String(bytes: buffer[0..<Int(needed)], encoding: .utf8) else {
+              let text = String(bytes: buffer[0..<min(Int(needed), buffer.count)], encoding: .utf8) else {
             ZonvieCore.appLog("[copy_button] gridId=\(gridId) had no text to copy")
             return
         }
@@ -7868,9 +7837,26 @@ final class ZonvieCore {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             self.pendingMessages.removeAll()
+            // The core resends every status it still holds right after this
+            // clear (sendMsgClear); a session reset holds none.
+            self.extFloatStatus.removeAll()
             self.hideMessageWindow()
             self.hidePromptWindow()
         }
+    }
+
+    /// The latest non-empty text of each status routed to ext_float. They
+    /// share the toast with msg_show.
+    private var extFloatStatus: [MiniWindowId: String] = [:]
+
+    private func showExtFloatStatusOrHide() {
+        let channels = MiniWindowId.allCases.filter { extFloatStatus[$0] != nil }
+        guard let last = channels.last else {
+            hideMessageWindow()
+            return
+        }
+        let content = channels.compactMap { extFloatStatus[$0] }.joined(separator: "\n")
+        showMessageWindow(kind: last.rawValue, content: content)
     }
 
     /// showmode, showcmd and ruler are one status message under three
@@ -7899,13 +7885,10 @@ final class ZonvieCore {
             case ZONVIE_MSG_VIEW_MINI:
                 self.updateMini(miniId, content: contentStr)
             case ZONVIE_MSG_VIEW_EXT_FLOAT:
-                // ext_float: state-driven (no timeout needed, cleared when
-                // Neovim sends empty content)
-                if contentStr.isEmpty {
-                    self.hideMessageWindow()
-                } else {
-                    self.showMessageWindow(kind: label, content: contentStr)
-                }
+                // ext_float: state-driven (no timeout; each channel is cleared
+                // when Neovim sends it empty), as Windows status_messages.
+                self.extFloatStatus[miniId] = contentStr.isEmpty ? nil : contentStr
+                self.showExtFloatStatusOrHide()
             case ZONVIE_MSG_VIEW_NOTIFICATION:
                 self.showOSNotification(title: "Neovim", body: contentStr)
             default:
@@ -8022,7 +8005,9 @@ final class ZonvieCore {
 
         if var state = miniWindows[miniId], let window = state.window, let label = state.label {
             state.content = content
+            let font = miniFont(mainWindow: mainWindow)
             label.stringValue = content
+            label.font = font
             label.textColor = normalFg
             miniWindows[miniId] = state
 
@@ -8035,7 +8020,6 @@ final class ZonvieCore {
                 }
             }
 
-            let font = label.font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
             let size = miniWindowSize(
                 content: content,
                 font: font,
@@ -8076,13 +8060,10 @@ final class ZonvieCore {
         }
     }
 
-    private func createMiniWindow(
-        for miniId: MiniWindowId,
-        content: String,
-        mainWindow: NSWindow,
-        fgColor: NSColor,
-        bgColor: NSColor
-    ) -> MiniWindowState {
+    /// Mini font is noticeably smaller than the editor font: ~60% of the
+    /// editor cell height (NSFont.pointSize is a typographic em — a gentler
+    /// ratio like 0.75 still renders close to the editor row).
+    private func miniFont(mainWindow: NSWindow) -> NSFont {
         let scale = mainWindow.backingScaleFactor
         let cellHeightPt: CGFloat
         if let renderer = terminalView?.renderer {
@@ -8090,12 +8071,17 @@ final class ZonvieCore {
         } else {
             cellHeightPt = 18
         }
+        return NSFont.monospacedSystemFont(ofSize: max(10, cellHeightPt * 0.6), weight: .regular)
+    }
 
-        // Mini font is noticeably smaller than the editor font. Use ~60% of
-        // the editor cell height (NSFont.pointSize is a typographic em — a
-        // gentler ratio like 0.75 still renders close to the editor row).
-        let fontSize = max(10, cellHeightPt * 0.6)
-        let font = NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
+    private func createMiniWindow(
+        for miniId: MiniWindowId,
+        content: String,
+        mainWindow: NSWindow,
+        fgColor: NSColor,
+        bgColor: NSColor
+    ) -> MiniWindowState {
+        let font = miniFont(mainWindow: mainWindow)
 
         // Window box wraps tightly around the font's actual rendered metrics.
         let size = miniWindowSize(
@@ -8159,79 +8145,10 @@ final class ZonvieCore {
 
     /// Update positions of all visible mini windows (stacking from bottom to top)
     private func updateMiniPositions() {
-        guard let mainWindow = terminalView?.window,
-              let renderer = terminalView?.renderer else { return }
-
-        let scale = mainWindow.backingScaleFactor
-        let cellHeightPx = CGFloat(renderer.cellHeightPx)
-        let cellWidthPx = CGFloat(renderer.cellWidthPx)
-
-        let config = ZonvieConfig.shared
-        let positionMode = config.messages.miniPos
-
-        // Calculate anchor point (bottom-right of the target area)
-        let anchorX: CGFloat  // Screen X coordinate of right edge
-        let anchorY: CGFloat  // Screen Y coordinate of bottom edge
-
-        switch positionMode {
-        case .display:
-            // Display-based: bottom-right of the current screen
-            if let screen = mainWindow.screen ?? NSScreen.main {
-                let screenFrame = screen.visibleFrame
-                anchorX = screenFrame.maxX
-                anchorY = screenFrame.minY
-            } else {
-                // Fallback to main window
-                anchorX = mainWindow.frame.maxX
-                anchorY = mainWindow.frame.minY
-            }
-
-        case .window:
-            // Window-based: bottom-right of the window where cursor is.
-            // A float grid (e.g. telescope prompt) is not a window — anchor
-            // to the main window instead of the float's host.
-            let content = gridContentScreenFrame(of: windowCompositingCursorGrid(mainWindow))
-            anchorX = content.maxX
-            anchorY = content.minY
-
-        case .grid:
-            // Grid-based: bottom-right of the grid where cursor is
-            let grids = getVisibleGridsCached()
-            let targetGrid = cursorAnchorGrid(in: grids)
-
-            // An external grid is a window of its own. The core reports it at
-            // (0,0) with no placement inside the main window
-            // (include/zonvie_core.h), so measuring its size against the MAIN
-            // window's origin put the mini at an arbitrary interior point of a
-            // window the user is not typing in — or past its edge when the
-            // external grid is the larger of the two. `.window` mode resolves
-            // this a few lines above; `.grid` never did, and `.grid` is the
-            // default for minis, so this is what an ext_windows user sees.
-            //
-            // Resolved from `targetGrid`, not from the cursor grid: the float
-            // walk above can land on a grid hosted by an external window.
-            // Which surface composites the anchor grid, not whether the grid
-            // IS a window: a grid an external window merely contains answers
-            // no to the second and yes to the first.
-            let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
-            let content = gridContentScreenFrame(of: anchorWindow)
-
-            let gridRightPt: CGFloat
-            let gridBottomPt: CGFloat
-            if let grid = targetGrid {
-                // startCol/startRow are 0 for an external grid, so this
-                // degenerates to its own content size — which is right: an
-                // external grid IS its whole window.
-                gridRightPt = CGFloat(grid.startCol + grid.cols) * (cellWidthPx / scale)
-                gridBottomPt = CGFloat(grid.startRow + grid.rows) * (cellHeightPx / scale)
-            } else {
-                gridRightPt = content.width
-                gridBottomPt = content.height
-            }
-
-            anchorX = content.minX + gridRightPt
-            anchorY = content.maxY - gridBottomPt
-        }
+        // Bottom-right of the target area
+        guard let target = msgTargetFrame(ZonvieConfig.shared.messages.miniPos) else { return }
+        let anchorX = target.maxX
+        let anchorY = target.minY
 
         let visibleMinis = MiniWindowId.allCases.filter { miniWindows[$0]?.isVisible == true }
 
@@ -8341,11 +8258,6 @@ final class ZonvieCore {
     /// The grid an ext-UI element should be measured against: the one the
     /// cursor is in, or — when that is a float — the window grid the float
     /// hangs off. Grid 1 when neither is found.
-    ///
-    /// Written out twice, in `updateMiniPositions`' `.grid` branch and in
-    /// `getExtFloatTargetFrame`. `7df3136` and `62b92ab` each removed one
-    /// layer ABOVE this one — the anchor window it feeds — and left the walk
-    /// that produces the grid duplicated underneath both times.
     private func cursorAnchorGrid(in grids: [GridInfo]) -> GridInfo? {
         let cursorGridId = getCursorPositionNonBlocking().gridId
         var target = grids.first { $0.gridId == cursorGridId }
@@ -8373,55 +8285,46 @@ final class ZonvieCore {
 
     /// Get target frame for ext-float positioning based on config
     private func getExtFloatTargetFrame() -> NSRect {
-        guard let mainView = self.terminalView,
-              let mainWindow = mainView.window,
-              let screen = mainWindow.screen ?? NSScreen.main else {
-            return NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
-        }
+        return msgTargetFrame(ZonvieConfig.shared.messages.extFloatPos)
+            ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
+    }
 
-        let config = ZonvieConfig.shared
-        let positionMode = config.messages.extFloatPos
+    /// The screen rect minis and ext-float messages are placed against (the
+    /// macOS side of Windows msgTargetRect). Nil without a main window.
+    private func msgTargetFrame(_ mode: ZonvieConfig.MsgPosition) -> NSRect? {
+        guard let mainView = self.terminalView, let mainWindow = mainView.window else { return nil }
 
-        switch positionMode {
+        switch mode {
         case .display:
-            return screen.visibleFrame
+            return (mainWindow.screen ?? NSScreen.main)?.visibleFrame ?? mainWindow.frame
 
         case .window:
-            // Window-based: use the window where cursor is.
-            // A float grid (e.g. telescope prompt) is not a window — anchor
-            // to the main window instead of the float's host.
+            // The window that composites the cursor grid. A float grid (e.g.
+            // telescope prompt) is not a window of its own.
             return gridContentScreenFrame(of: windowCompositingCursorGrid(mainWindow))
 
         case .grid:
-            guard let renderer = mainView.renderer else {
-                return screen.visibleFrame
-            }
-
-            let scale = mainWindow.backingScaleFactor
-            let cellWidthPx = CGFloat(renderer.cellWidthPx)
-            let cellHeightPx = CGFloat(renderer.cellHeightPx)
-
-            let grids = getVisibleGridsCached()
-            let targetGrid = cursorAnchorGrid(in: grids)
-
+            // An external grid is reported at (0,0) with no placement inside the
+            // main window (include/zonvie_core.h), so it is measured against the
+            // window that composites it, which for an external root is its own.
+            let targetGrid = cursorAnchorGrid(in: getVisibleGridsCached())
             let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
             let content = gridContentScreenFrame(of: anchorWindow)
+            guard let grid = targetGrid, let renderer = mainView.renderer else { return content }
 
-            if let grid = targetGrid {
-                let gridLeftPt = CGFloat(grid.startCol) * (cellWidthPx / scale)
-                let gridTopPt = CGFloat(grid.startRow) * (cellHeightPx / scale)
-                let gridWidthPt = CGFloat(grid.cols) * (cellWidthPx / scale)
-                let gridHeightPt = CGFloat(grid.rows) * (cellHeightPx / scale)
-
-                return NSRect(
-                    x: content.minX + gridLeftPt,
-                    y: content.maxY - gridTopPt - gridHeightPt,
-                    width: gridWidthPt,
-                    height: gridHeightPt
-                )
-            } else {
-                return screen.visibleFrame
-            }
+            // The anchor window's own scale: an external window lays out its
+            // cells with it, as resizeExternalWindows does.
+            let scale = anchorWindow.backingScaleFactor
+            let cellW_pt = CGFloat(renderer.cellWidthPx) / scale
+            let cellH_pt = CGFloat(renderer.cellHeightPx) / scale
+            let width_pt = CGFloat(grid.cols) * cellW_pt
+            let height_pt = CGFloat(grid.rows) * cellH_pt
+            return NSRect(
+                x: content.minX + CGFloat(grid.startCol) * cellW_pt,
+                y: content.maxY - CGFloat(grid.startRow) * cellH_pt - height_pt,
+                width: width_pt,
+                height: height_pt
+            )
         }
     }
 
@@ -8512,77 +8415,22 @@ final class ZonvieCore {
         let windowWidth = max(100, min(maxWidth, boundingBox.width + (padding * 2) + 10))
         let windowHeight = max(30, boundingBox.height + (padding * 2) + 4)
 
-        // Top-right of the target frame
-        let windowX = targetFrame.maxX - windowWidth - 10
-        let windowY = targetFrame.maxY - windowHeight - 10
+        // Top-right of the target frame, by the core rule msg_show uses
+        let frame = messageFloatFrame(size: NSSize(width: windowWidth, height: windowHeight), below: nil)
 
+        var existing: (window: NSWindow, container: NSView, textField: NSTextField)? = nil
         if let window = self.extFloatWindow,
            let containerView = self.messageContainerView,
            let textField = self.messageTextField {
-            textField.stringValue = content
-            textField.textColor = fgColor
-            containerView.layer?.borderColor = borderColor.cgColor
-
-            window.setFrame(NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight), display: true)
-            containerView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-            textField.frame = NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2))
-            window.orderFront(nil)
-            ZonvieCore.appLog("[msg_window] updated: '\(content.prefix(50))...'")
-        } else {
-            let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
-            let window = NSWindow(
-                contentRect: windowRect,
-                styleMask: [.borderless],
-                backing: .buffered,
-                defer: false
-            )
-            // `false` here is what the cmdline window takes deliberately, and
-            // it pays for it by following activation with its level (see
-            // setCmdlineWindowActive) — its own comment says a `.floating`
-            // window that never hides "would sit above every other app's
-            // windows". This panel took the first half and not the second,
-            // and setCmdlineWindowActive is guarded to the cmdline grid, so
-            // nothing ever lowered it. A config.toml parse error
-            // reaches this path ungated by ext_messages, with timeout 0, no
-            // close button and no on_msg_clear to retire it: one malformed
-            // line and a red panel sits over every application for the rest of
-            // the session. Nothing here needs to outlive deactivation — unlike
-            // the cmdline, this is not a drag target and its text is not
-            // selectable — so it takes the same `true` as every sibling.
-            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
-
-            let containerView = Self.makeRoundedPanelContainer(
-                width: windowWidth, height: windowHeight,
-                background: bgColor, border: borderColor, borderWidth: 1.0)
-
-            let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
-            textField.stringValue = content
-            textField.font = font
-            textField.textColor = fgColor
-            textField.backgroundColor = .clear
-            textField.isBordered = false
-            textField.isEditable = false
-            textField.isSelectable = false
-            textField.drawsBackground = false
-            textField.alignment = .left
-            textField.lineBreakMode = .byWordWrapping
-            textField.maximumNumberOfLines = 0  // Allow multiline
-
-            containerView.addSubview(textField)
-            window.contentView = containerView
-
-            if ZonvieConfig.shared.blurEnabled {
-                ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
-            }
-
-            window.orderFront(nil)
-
-            self.extFloatWindow = window
-            self.messageTextField = textField
-            self.messageContainerView = containerView
-
-            ZonvieCore.appLog("[msg_window] created: '\(content.prefix(50))...'")
+            existing = (window, containerView, textField)
         }
+        let panel = Self.showTextPanel(
+            existing: existing, frame: frame, content: content, font: font,
+            fg: fgColor, bg: bgColor, border: borderColor, borderWidth: 1.0, padding: padding)
+        self.extFloatWindow = panel.window
+        self.messageContainerView = panel.container
+        self.messageTextField = panel.textField
+        ZonvieCore.appLog("[msg_window] \(existing == nil ? "created" : "updated"): '\(content.prefix(50))...'")
     }
 
     /// Hides and cleans up the ext-float window (both external window and split view)
@@ -8642,64 +8490,26 @@ final class ZonvieCore {
             max(200, min(boundingBox.height + (padding * 2) + 4, appFrame.height - 100)) :
             max(30, boundingBox.height + (padding * 2) + 4)
 
-        let windowX = appFrame.midX - windowWidth / 2
-        let windowY = appFrame.midY - windowHeight / 2
+        let frame = NSRect(
+            x: appFrame.midX - windowWidth / 2,
+            y: appFrame.midY - windowHeight / 2,
+            width: windowWidth,
+            height: windowHeight
+        )
 
+        var existing: (window: NSWindow, container: NSView, textField: NSTextField)? = nil
         if let window = self.promptWindow,
            let containerView = self.promptContainerView,
            let textField = self.promptTextField {
-            textField.stringValue = content
-            textField.textColor = fgColor
-
-            window.setFrame(NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight), display: true)
-            containerView.frame = NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight)
-            textField.frame = NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2))
-            window.orderFront(nil)
-
-            ZonvieCore.appLog("[prompt_window] updated: '\(content.prefix(50))...'")
-        } else {
-            let windowRect = NSRect(x: windowX, y: windowY, width: windowWidth, height: windowHeight)
-            let window = NSWindow(
-                contentRect: windowRect,
-                styleMask: [.borderless],
-                backing: .buffered,
-                defer: false
-            )
-            // Hide when app loses focus (like ext-cmdline)
-            Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
-
-            let containerView = Self.makeRoundedPanelContainer(
-                width: windowWidth, height: windowHeight,
-                background: adjustedBg, border: borderColor, borderWidth: 2.0)
-
-            let textField = NSTextField(frame: NSRect(x: padding, y: padding, width: windowWidth - (padding * 2), height: windowHeight - (padding * 2)))
-            textField.stringValue = content
-            textField.font = font
-            textField.textColor = fgColor
-            textField.backgroundColor = .clear
-            textField.isBordered = false
-            textField.isEditable = false
-            textField.isSelectable = false
-            textField.drawsBackground = false
-            textField.alignment = .left
-            textField.lineBreakMode = .byWordWrapping
-            textField.maximumNumberOfLines = 0
-
-            containerView.addSubview(textField)
-            window.contentView = containerView
-
-            if ZonvieConfig.shared.blurEnabled {
-                ZonvieCore.applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
-            }
-
-            window.orderFront(nil)
-
-            self.promptWindow = window
-            self.promptTextField = textField
-            self.promptContainerView = containerView
-
-            ZonvieCore.appLog("[prompt_window] created: '\(content.prefix(50))...' frame=\(window.frame)")
+            existing = (window, containerView, textField)
         }
+        let panel = Self.showTextPanel(
+            existing: existing, frame: frame, content: content, font: font,
+            fg: fgColor, bg: adjustedBg, border: borderColor, borderWidth: 2.0, padding: padding)
+        self.promptWindow = panel.window
+        self.promptContainerView = panel.container
+        self.promptTextField = panel.textField
+        ZonvieCore.appLog("[prompt_window] \(existing == nil ? "created" : "updated"): '\(content.prefix(50))...' frame=\(frame)")
     }
 
     /// Hides the prompt window
@@ -8911,8 +8721,8 @@ final class ZonvieCore {
         // A grid the main surface draws has its retained row captured and its
         // distance released by that surface's bracket, so the scroll joins it.
         switch resolveGridRoute(gridId: gridId) {
-        case .externalRoot, .externalLayer, .deferred: break
-        default: _ = beginMainFlushIfNeeded()
+        case .externalRoot, .externalLayer, .deferred, .unplaced: break
+        case .mainRoot, .mainLayer: _ = beginMainFlushIfNeeded()
         }
         scrollModel.clearScrollOffsetForGrid(gridId, rowsDelta: rowsDelta)
     }
@@ -9004,6 +8814,56 @@ final class ZonvieCore {
             self?.showSSHPasswordDialog(prompt: prompt)
         }
         ZonvieCore.appLog("[SSH] Notification observer setup complete")
+    }
+
+    private var messageFloatFollowObservers: [Any] = []
+    private var messageFloatRepositionScheduled = false
+
+    /// The message floats and minis are placed against the main window or the
+    /// external window the cursor is in, so they follow those windows when
+    /// they move or resize, as Windows does from WM_MOVE/WM_SIZE.
+    private func setupMessageFloatFollowObservers() {
+        for name in [NSWindow.didMoveNotification, NSWindow.didResizeNotification] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                guard let self, let window = notification.object as? NSWindow,
+                      self.isMessageFloatAnchorWindow(window),
+                      !self.messageFloatRepositionScheduled else { return }
+                // Coalesce a drag's burst of events into one placement.
+                self.messageFloatRepositionScheduled = true
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.messageFloatRepositionScheduled = false
+                    self.repositionMessageFloats()
+                }
+            }
+            messageFloatFollowObservers.append(observer)
+        }
+    }
+
+    /// The main window or an ext_windows grid window; never a message,
+    /// cmdline or popupmenu window, which this placement moves itself.
+    private func isMessageFloatAnchorWindow(_ window: NSWindow) -> Bool {
+        if window === terminalView?.window { return true }
+        guard let gridId = externalWindows.first(where: { $0.value === window })?.key else { return false }
+        return classifyExternalGridKind(gridId) == .normal
+    }
+
+    /// Re-place msg_history, the msg_show below it, the ext-float toast and
+    /// the minis against their current target (Windows updateExtFloatPositions
+    /// plus updateMiniWindows).
+    private func repositionMessageFloats() {
+        var historyFrame: NSRect? = nil
+        if let history = externalWindows[ZonvieCore.msgHistoryGridId], history.isVisible {
+            history.setFrame(messageFloatFrame(size: history.frame.size, below: nil), display: false)
+            historyFrame = history.frame
+        }
+        if let msgShow = externalWindows[ZonvieCore.messageGridId], msgShow.isVisible {
+            msgShow.setFrame(messageFloatFrame(size: msgShow.frame.size, below: historyFrame), display: false)
+        }
+        if let toast = extFloatWindow, toast.isVisible {
+            toast.setFrame(messageFloatFrame(size: toast.frame.size, below: nil), display: false)
+        }
+        updateMiniPositions()
     }
 
     private func showSSHPasswordDialog(prompt: String) {

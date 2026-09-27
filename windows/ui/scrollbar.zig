@@ -39,10 +39,10 @@ fn getViewportNonBlocking(app: *App, grid_id: i64, out_vp: *app_mod.ViewportInfo
     return .none;
 }
 
-fn trackDamageRect(client_width: i32, client_height: i32, dpi_scale: f32, top_offset_px: f32) ?c.RECT {
+fn trackDamageRect(client_width: i32, client_height: i32, dpi_scale: f32, top_offset_px: f32, right_inset_px: f32) ?c.RECT {
     if (client_width <= 0 or client_height <= 0) return null;
 
-    const cw: f32 = @floatFromInt(client_width);
+    const cw: f32 = @as(f32, @floatFromInt(client_width)) - right_inset_px;
     const ch: f32 = @floatFromInt(client_height);
     const margin = app_mod.scrollbarMargin(dpi_scale);
     const width = app_mod.scrollbarWidth(dpi_scale);
@@ -59,6 +59,14 @@ fn trackDamageRect(client_width: i32, client_height: i32, dpi_scale: f32, top_of
     return .{ .left = left, .top = top, .right = right, .bottom = bottom };
 }
 
+test "trackDamageRect keeps the track left of a right inset" {
+    const plain = trackDamageRect(800, 600, 1.0, 0, 0).?;
+    const inset = trackDamageRect(800, 600, 1.0, 0, 200).?;
+    try std.testing.expectEqual(plain.left - 200, inset.left);
+    try std.testing.expectEqual(plain.right - 200, inset.right);
+    try std.testing.expectEqual(plain.top, inset.top);
+}
+
 /// One surface's scrollbar: the window it is drawn in, its state, the root grid
 /// whose knob it shows, and the chrome around it. The main window and every
 /// external window go through the same functions below with their own
@@ -70,6 +78,8 @@ pub const Surface = struct {
     dpi_scale: f32,
     /// Space a titlebar tabline takes above the track (main window only).
     top_offset_px: f32,
+    /// Space a right sidebar tabline takes right of the track (main window only).
+    right_inset_px: f32 = 0,
     /// External windows inset the knob 1px inside its track and the main
     /// window does not; the two look different, and making them agree is a
     /// visual decision, not a side effect of sharing code.
@@ -81,12 +91,16 @@ pub const Surface = struct {
 pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
     // Only titlebar mode occupies vertical space above the terminal; sidebar
     // mode shifts content horizontally and must keep the track at the top.
+    // A right sidebar is drawn over the client's right edge, so the track
+    // sits left of it (the sidebar would otherwise take its input).
+    const right_sidebar = app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right;
     return .{
         .hwnd = hwnd,
         .state = &app.surf.scrollbar,
         .root_grid = 1,
         .dpi_scale = app.dpi_scale,
         .top_offset_px = @floatFromInt(input.surfaceOriginPx(app, true).y),
+        .right_inset_px = if (right_sidebar) @floatFromInt(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))) else 0,
         .knob_inset_px = 0,
     };
 }
@@ -109,7 +123,7 @@ pub fn externalSurface(ext_win: *app_mod.ExternalWindow, grid_id: i64) Surface {
 /// core viewport: it is also needed once fade-out reaches zero, when only the
 /// previously saved overlay must be restored.
 pub fn trackRect(sf: Surface, client_width: i32, client_height: i32) ?c.RECT {
-    return trackDamageRect(client_width, client_height, sf.dpi_scale, sf.top_offset_px);
+    return trackDamageRect(client_width, client_height, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
 }
 
 fn invalidateTrack(sf: Surface) void {
@@ -134,7 +148,7 @@ fn repaintTrack(app: *App, sf: Surface) void {
 }
 
 pub fn geometry(app: *App, sf: Surface, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
-    return scrollbarGeometryFor(app, scrollbarGrid(app, sf), client_width, client_height, sf.dpi_scale, sf.top_offset_px);
+    return scrollbarGeometryFor(app, scrollbarGrid(app, sf), client_width, client_height, sf.dpi_scale, sf.top_offset_px, sf.right_inset_px);
 }
 
 /// The track and knob quads at `alpha` (a paint passes the alpha it
@@ -169,6 +183,7 @@ fn scrollbarGeometryFor(
     client_height: i32,
     dpi: f32,
     top_offset_px: f32,
+    right_inset_px: f32,
 ) app_mod.ScrollbarGeometry {
     var vp: app_mod.ViewportInfo = undefined;
     if (getViewportNonBlocking(app, grid_id, &vp) == .none) return .{
@@ -189,7 +204,7 @@ fn scrollbarGeometryFor(
     app_mod.zonvie_core_scrollbar_metrics(vp.topline, vp.botline, vp.line_count, &metrics);
     const is_scrollable = metrics.is_scrollable != 0;
 
-    const cw: f32 = @floatFromInt(client_width);
+    const cw: f32 = @as(f32, @floatFromInt(client_width)) - right_inset_px;
     const ch: f32 = @floatFromInt(client_height);
 
     const sb_width = app_mod.scrollbarWidth(dpi);
@@ -385,6 +400,7 @@ pub fn mouseDown(app: *App, sf: Surface, mouse_x: i32, mouse_y: i32) bool {
             st.dragging = true;
             st.drag_grab_px = @as(f32, @floatFromInt(mouse_y)) - geom.knob_top;
             _ = c.SetCapture(sf.hwnd);
+            show(app, sf);
             return true;
         },
         .track_above, .track_below => {
@@ -467,6 +483,8 @@ pub fn mouseUp(app: *App, sf: Surface) void {
         flushPendingDrag(app, sf);
         st.dragging = false;
         _ = c.ReleaseCapture();
+        // An auto-hide that fired mid-drag was skipped; re-arm it.
+        if (app.config.scrollbar.isScroll()) show(app, sf);
     }
     if (st.repeat_timer != 0) {
         _ = c.KillTimer(sf.hwnd, app_mod.TIMER_SCROLLBAR_REPEAT);
@@ -505,6 +523,8 @@ pub fn hover(app: *App, sf: Surface, mouse_x: i32, mouse_y: i32) bool {
         show(app, sf);
         return true;
     }
+    // Scroll mode's auto-hide would fade the bar under the pointer.
+    if (in_track and app.config.scrollbar.isScroll()) show(app, sf);
     if (!in_track and sf.state.hover) leave(app, sf);
     return false;
 }

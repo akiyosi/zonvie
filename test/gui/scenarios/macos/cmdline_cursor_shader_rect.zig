@@ -25,7 +25,6 @@ const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_cmdline_cursor_shader.log";
 const marker = "[shader_cursor]";
-const max_windows = 16;
 
 /// ZonvieCore.cmdlineGridId (macos/Sources/Core/ZonvieCore.swift:4343): the id
 /// the ext-cmdline's surface publishes its shader cursor rect under.
@@ -65,8 +64,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     try g.exec("execute('set laststatus=0 noruler')");
 
-    var main_buf: [max_windows]platform.MainWindow = undefined;
-    const main_wins = main_buf[0..platform.windowsForPid(g.app_pid, &main_buf)];
+    const main_snap = driver.snapshotWindows(g.app_pid);
+    const main_wins = main_snap.slice();
     if (main_wins.len == 0) return error.MainWindowNotFound;
     const main_win = main_wins[0];
 

@@ -334,10 +334,15 @@ final class ScrollRetention {
         return depth
     }
 
+    /// The depth a band this many rows wide is retained at.
+    static func depthRows(forBandRows rows: Int) -> Int {
+        min(max(rows, minDepthRows), maxDepthRows)
+    }
+
     /// Raise the retention to cover a band this many rows wide, clamped to
     /// [`minDepthRows`, `maxDepthRows`].
     func setDepthRows(_ rows: Int) {
-        let clamped = min(max(rows, Self.minDepthRows), Self.maxDepthRows)
+        let clamped = Self.depthRows(forBandRows: rows)
         lock.lock()
         depth = clamped
         lock.unlock()
@@ -726,6 +731,67 @@ func captureSurfaceRetainedRow(
         targetRow: targetRow,
         cellHeightPx: cellHeightPx
     ))
+}
+
+/// The grid_scroll steps a surface consumed in brackets that did not commit,
+/// kept so the next bracket can stage them again against the committed set.
+///
+/// Only `maxCapturable` steps that capture rows are kept (each takes ring
+/// buffers). A step that is dropped, or that captures nothing, still moved its
+/// grid's content, so its rows go to `leadShift`: every later capture of that
+/// grid reads that much further into the committed set. Dropping a step loses
+/// its retained rows, never its shift.
+struct RetentionReplayLedger {
+    struct Step: Equatable {
+        let gridId: Int64
+        var rowsDelta: Int
+        let capturable: Bool
+    }
+
+    let maxCapturable: Int
+    /// Oldest first. The first step, when there is one, is capturable.
+    private(set) var steps: [Step] = []
+    /// Per grid, rows moved by steps older than every entry of `steps`.
+    private(set) var leadShift: [Int64: Int] = [:]
+
+    init(maxCapturable: Int) {
+        self.maxCapturable = maxCapturable
+    }
+
+    mutating func note(gridId: Int64, rowsDelta: Int, capturable: Bool) {
+        if capturable {
+            steps.append(Step(gridId: gridId, rowsDelta: rowsDelta, capturable: true))
+        } else if steps.isEmpty {
+            leadShift[gridId, default: 0] += rowsDelta
+        } else if let last = steps.last, !last.capturable, last.gridId == gridId {
+            steps[steps.count - 1].rowsDelta += rowsDelta
+        } else {
+            steps.append(Step(gridId: gridId, rowsDelta: rowsDelta, capturable: false))
+        }
+        var capturableCount = 0
+        for step in steps where step.capturable { capturableCount += 1 }
+        // The second bound keeps shift-only steps of alternating grids from
+        // growing the list without limit.
+        while capturableCount > maxCapturable || steps.count > maxCapturable * 8 {
+            dropOldest()
+            capturableCount -= 1
+        }
+    }
+
+    /// Fold the oldest (capturable) step, and the shift-only steps it leaves
+    /// at the front, into `leadShift`.
+    private mutating func dropOldest() {
+        guard !steps.isEmpty else { return }
+        repeat {
+            let first = steps.removeFirst()
+            leadShift[first.gridId, default: 0] += first.rowsDelta
+        } while steps.first.map({ !$0.capturable }) ?? false
+    }
+
+    mutating func removeAll() {
+        steps.removeAll(keepingCapacity: true)
+        leadShift.removeAll(keepingCapacity: true)
+    }
 }
 
 /// Maps a layer's vertex space to clip space, mirroring `LayerTransform` in
@@ -1299,11 +1365,6 @@ final class SurfaceBufferSet {
     // grids advance it only after a flush regenerated every logical row.
     var fontGeneration: UInt64 = 0
 
-    // Main vertex buffer (used by GridSurfaceRenderer, not by ExternalGridView)
-    var mainVertexBuffer: MTLBuffer? = nil
-    var mainVertexBufferCap: Int = 0
-    var mainVertexCount: Int = 0
-
     // Atlas texture frozen at commit time alongside this set's vertex data
     // (ExternalGridView only; GridSurfaceRenderer reads committedAtlasTexture
     // under its own `lock` in the same scope as its committed-index snapshot).
@@ -1317,8 +1378,6 @@ final class SurfaceBufferSet {
     // On COW detach, reuse a pool buffer instead of calling device.makeBuffer().
     var detachPoolRowBuffers: [MTLBuffer?] = []
     var detachPoolRowCapacities: [Int] = []
-    var detachPoolMainBuffer: MTLBuffer? = nil
-    var detachPoolMainCap: Int = 0
 
     // Private per-row buffer pool, owned exclusively by this set: the safe
     // write target when the detach pool cannot be reused (sharesSource &&
@@ -2401,7 +2460,6 @@ func applySurfaceZeroCellLayout(
     for index in bufferSet.rowState.counts.indices {
         bufferSet.rowState.counts[index] = 0
     }
-    bufferSet.mainVertexCount = 0
     bufferSet.pendingScroll = nil
     return true
 }
@@ -2491,82 +2549,6 @@ struct SurfaceRowStorageRetirementState {
     private var pending0 = false
     private var pending1 = false
     private var pending2 = false
-    private var pendingMain0 = false
-    private var pendingMain1 = false
-    private var pendingMain2 = false
-    private var pendingMainBuffer0: MTLBuffer?
-    private var pendingMainBuffer1: MTLBuffer?
-    private var pendingMainBuffer2: MTLBuffer?
-    private var pendingDetachMain0: MTLBuffer?
-    private var pendingDetachMain1: MTLBuffer?
-    private var pendingDetachMain2: MTLBuffer?
-
-    mutating func markMainBuffersPending(_ index: Int, bufferSet: SurfaceBufferSet) {
-        switch index {
-        case 0:
-            pendingMain0 = true
-            pendingMainBuffer0 = bufferSet.mainVertexBuffer
-            pendingDetachMain0 = bufferSet.detachPoolMainBuffer
-        case 1:
-            pendingMain1 = true
-            pendingMainBuffer1 = bufferSet.mainVertexBuffer
-            pendingDetachMain1 = bufferSet.detachPoolMainBuffer
-        case 2:
-            pendingMain2 = true
-            pendingMainBuffer2 = bufferSet.mainVertexBuffer
-            pendingDetachMain2 = bufferSet.detachPoolMainBuffer
-        default: break
-        }
-    }
-
-    func isMainBuffersPending(_ index: Int) -> Bool {
-        switch index {
-        case 0: return pendingMain0
-        case 1: return pendingMain1
-        case 2: return pendingMain2
-        default: return false
-        }
-    }
-
-    func pendingMainBuffer(_ index: Int) -> MTLBuffer? {
-        switch index {
-        case 0: return pendingMainBuffer0
-        case 1: return pendingMainBuffer1
-        case 2: return pendingMainBuffer2
-        default: return nil
-        }
-    }
-
-    func pendingDetachMainBuffer(_ index: Int) -> MTLBuffer? {
-        switch index {
-        case 0: return pendingDetachMain0
-        case 1: return pendingDetachMain1
-        case 2: return pendingDetachMain2
-        default: return nil
-        }
-    }
-
-    mutating func clearMainBuffersPending(_ index: Int) {
-        switch index {
-        case 0:
-            pendingMain0 = false
-            pendingMainBuffer0 = nil
-            pendingDetachMain0 = nil
-        case 1:
-            pendingMain1 = false
-            pendingMainBuffer1 = nil
-            pendingDetachMain1 = nil
-        case 2:
-            pendingMain2 = false
-            pendingMainBuffer2 = nil
-            pendingDetachMain2 = nil
-        default: break
-        }
-    }
-
-    var hasMainBuffersPending: Bool {
-        pendingMain0 || pendingMain1 || pendingMain2
-    }
 
     mutating func markPending(_ index: Int) {
         switch index {
@@ -2609,18 +2591,14 @@ struct SurfaceRowStorageRetirementState {
 /// Release one buffer set's GPU read and let any storage that was waiting on it
 /// retire.
 ///
-/// Both surfaces wrote this out: the same guard against a stale or already-zero
-/// index, the same decrement, and the same retirement service call, differing
-/// only in whether the main vertex buffers retire too — an external surface has
-/// none. Getting the guard wrong strands a set as permanently in-flight, which
+/// Getting the guard wrong strands a set as permanently in-flight, which
 /// `beginFlush` then refuses forever, so it is worth having in one place.
 func completeSurfaceGpuRead(
     setIndex: Int,
     gpuInFlightCount: inout [Int],
     bufferSets: [SurfaceBufferSet],
     committedSetIndex: Int,
-    retirement: inout SurfaceRowStorageRetirementState,
-    retireMainBuffers: Bool
+    retirement: inout SurfaceRowStorageRetirementState
 ) {
     guard setIndex >= 0,
           setIndex < gpuInFlightCount.count,
@@ -2632,8 +2610,7 @@ func completeSurfaceGpuRead(
         gpuInFlightCount: gpuInFlightCount,
         committedSetIndex: committedSetIndex,
         layoutContracted: false,
-        state: &retirement,
-        retireMainBuffers: retireMainBuffers
+        state: &retirement
     )
 }
 
@@ -2653,8 +2630,7 @@ func serviceSurfaceRowStorageRetirement(
     gpuInFlightCount: [Int],
     committedSetIndex: Int,
     layoutContracted: Bool,
-    state: inout SurfaceRowStorageRetirementState,
-    retireMainBuffers: Bool = false
+    state: inout SurfaceRowStorageRetirementState
 ) {
     guard bufferSets.count == 3,
           gpuInFlightCount.count == 3,
@@ -2665,11 +2641,6 @@ func serviceSurfaceRowStorageRetirement(
     if layoutContracted {
         for index in bufferSets.indices {
             state.markPending(index)
-        }
-        if retireMainBuffers {
-            for index in bufferSets.indices {
-                state.markMainBuffersPending(index, bufferSet: bufferSets[index])
-            }
         }
     }
 
@@ -2687,31 +2658,6 @@ func serviceSurfaceRowStorageRetirement(
             state.clearPending(index)
         }
     }
-
-    if state.hasMainBuffersPending {
-        for index in bufferSets.indices
-        where state.isMainBuffersPending(index) && gpuInFlightCount[index] == 0 {
-            let set = bufferSets[index]
-            if let pending = state.pendingMainBuffer(index), set.mainVertexBuffer === pending {
-                set.mainVertexBuffer = nil
-                set.mainVertexBufferCap = 0
-                set.mainVertexCount = 0
-            }
-            if let pending = state.pendingDetachMainBuffer(index), set.detachPoolMainBuffer === pending {
-                set.detachPoolMainBuffer = nil
-                set.detachPoolMainCap = 0
-            }
-            state.clearMainBuffersPending(index)
-        }
-    }
-}
-
-func copySurfaceMainVertexState(from src: SurfaceBufferSet, to dst: SurfaceBufferSet) {
-    dst.detachPoolMainBuffer = dst.mainVertexBuffer
-    dst.detachPoolMainCap = dst.mainVertexBufferCap
-    dst.mainVertexBuffer = src.mainVertexBuffer
-    dst.mainVertexBufferCap = src.mainVertexBufferCap
-    dst.mainVertexCount = src.mainVertexCount
 }
 
 /// Ensure a writable row buffer for the given slot.
@@ -3684,7 +3630,9 @@ func bindSingleSurfaceScrollOffset(
 final class SurfaceFixedFloatMask {
     /// One entry beyond this selects the cell-aligned fallback instead of a
     /// partial mask, which would let shifted content bleed through an omitted
-    /// float.
+    /// float. setFragmentBytes is limited to 4096 bytes; sixteen arbitrary
+    /// rectangles produce at most 31 bands and 496 intervals, fitting both
+    /// buffers.
     static let maxRects = 16
 
     /// Whether a surface's committed layers hold more fixed floats than a
@@ -3785,49 +3733,6 @@ func bindSurfaceFragmentState(
         fixedFloatIntervals.withUnsafeBytes { ptr in
             encoder.setFragmentBytes(ptr.baseAddress!, length: fixedFloatIntervals.count * intervalStride, index: 5)
         }
-    }
-}
-
-/// Encode non-row-mode content draw (2-pass for blur, or single-pass with optional scissor).
-func encodeSurfaceNonRowContent(
-    encoder: MTLRenderCommandEncoder,
-    vertexBuffer: MTLBuffer?,
-    vertexCount: Int,
-    pipeline: MTLRenderPipelineState,
-    backgroundPipeline: MTLRenderPipelineState?,
-    glyphPipeline: MTLRenderPipelineState?,
-    useTwoPass: Bool,
-    scissorRect: MTLScissorRect? = nil,
-    unifiedBlurPipeline: MTLRenderPipelineState? = nil
-) {
-    guard vertexCount > 0, let vb = vertexBuffer else { return }
-
-    var zeroTranslation: Float = 0
-    encoder.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
-
-    // Single-pass via programmable blending supersedes 2-pass when available.
-    if useTwoPass, let unified = unifiedBlurPipeline {
-        encoder.setRenderPipelineState(unified)
-        if let sr = scissorRect {
-            encoder.setScissorRect(sr)
-        }
-        encoder.setVertexBuffer(vb, offset: 0, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-    } else if useTwoPass, let bgPipe = backgroundPipeline, let glyphPipe = glyphPipeline {
-        encoder.setRenderPipelineState(bgPipe)
-        encoder.setVertexBuffer(vb, offset: 0, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-
-        encoder.setRenderPipelineState(glyphPipe)
-        encoder.setVertexBuffer(vb, offset: 0, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
-    } else {
-        encoder.setRenderPipelineState(pipeline)
-        if let sr = scissorRect {
-            encoder.setScissorRect(sr)
-        }
-        encoder.setVertexBuffer(vb, offset: 0, index: 0)
-        encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: vertexCount)
     }
 }
 

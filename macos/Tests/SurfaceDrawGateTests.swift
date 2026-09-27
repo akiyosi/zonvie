@@ -781,7 +781,70 @@ private enum SurfaceDrawGateTests {
         expect(pin.pinned, nil, "lone middle release ends the claim")
     }
 
+    /// SurfaceScrollBlitGate against both hand-written originals, over every
+    /// assignment of its seven terms.
+    ///
+    /// GridSurfaceRenderer.draw (refusal ladder, first match wins):
+    ///     !presented -> "presented"; smooth -> "smooth";
+    ///     sizeChanged || !newCommit -> "resize"; glow -> "glow";
+    ///     blur && !twoPass -> "blur"
+    /// ExternalGridView.draw (mayGpuScrollCopy's surface-wide terms):
+    ///     newCommit && presented && !smooth && !sizeChanged && !glow
+    ///         && (!blur || twoPass)
+    private static func verifyScrollBlitGate() {
+        var allowed = 0
+        for mask in 0..<(1 << 7) {
+            let presented = bit(mask, 0)
+            let smooth = bit(mask, 1)
+            let sizeChg = bit(mask, 2)
+            let newCommit = bit(mask, 3)
+            let glow = bit(mask, 4)
+            let blur = bit(mask, 5)
+            let twoPass = bit(mask, 6)
+            let mainOriginal: String?
+            if !presented {
+                mainOriginal = "presented"
+            } else if smooth {
+                mainOriginal = "smooth"
+            } else if sizeChg || !newCommit {
+                mainOriginal = "resize"
+            } else if glow {
+                mainOriginal = "glow"
+            } else if blur && !twoPass {
+                mainOriginal = "blur"
+            } else {
+                mainOriginal = nil
+            }
+            let externalOriginal = newCommit && presented && !smooth && !sizeChg && !glow
+                && (!blur || twoPass)
+            let refusal = SurfaceScrollBlitGate(
+                hasPresentedOnce: presented,
+                smoothScrolling: smooth,
+                drawableSizeChanged: sizeChg,
+                hasNewCommit: newCommit,
+                glowEnabled: glow,
+                blurEnabled: blur,
+                useTwoPass: twoPass
+            ).refusal
+            if refusal != mainOriginal || (refusal == nil) != externalOriginal {
+                failures += 1
+                if failures <= 10 {
+                    print("FAIL scroll blit gate mask=\(mask): shared=\(String(describing: refusal))"
+                        + " main=\(String(describing: mainOriginal)) external=\(externalOriginal)")
+                }
+            }
+            if refusal == nil { allowed += 1 }
+        }
+        // Only presented, !smooth, !sizeChg, newCommit, !glow, and the three
+        // blur/twoPass pairs other than (blur, !twoPass) allow a blit.
+        if allowed != 3 {
+            failures += 1
+            print("FAIL scroll blit gate: \(allowed) assignments allow a blit, expected 3")
+        }
+    }
+
     static func main() {
+        verifyScrollBlitGate()
         verifyMainSurface()
         verifyCommittedExtent()
         verifyCursorOwner()

@@ -54,7 +54,6 @@ const float_cols = 30;
 const step_px: f64 = -6;
 const steps_per_gesture: u32 = 8;
 const gestures: u32 = 6;
-const max_windows = 16;
 
 /// Violations tolerated before the run is called a failure. A frame can be
 /// missed or doubled by the capture clock, and the established convention in
@@ -122,10 +121,9 @@ pub fn run(alloc: std.mem.Allocator) !void {
         return error.FloatsNotOpen;
     }
 
-    var win_buf: [max_windows]platform.MainWindow = undefined;
-    const wins = win_buf[0..platform.windowsForPid(g.app_pid, &win_buf)];
+    const wins = driver.snapshotWindows(g.app_pid);
     var main_win: ?platform.MainWindow = null;
-    for (wins) |w| {
+    for (wins.slice()) |w| {
         if (w.bounds.w >= 150 and w.bounds.h >= 150) {
             main_win = w;
             break;

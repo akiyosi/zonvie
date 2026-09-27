@@ -36,7 +36,6 @@ const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_extfloat_hosted_cursor_shader.log";
 const marker = "[shader_cursor]";
-const max_windows = 16;
 
 /// The two columns the float is opened at, inside the external window. Far
 /// enough apart that the expected delta is many cells wide, so a stale rect
@@ -96,8 +95,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     const before_count = before.len;
 
     // The host: an ordinary editor window given a window of its own. Its buffer
@@ -106,7 +104,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     try g.exec(
         \\luaeval('(function() local b = vim.api.nvim_create_buf(false, true) local l = {} for i = 1, 200 do l[i] = string.format("%3d host line", i) end vim.api.nvim_buf_set_lines(b, 0, -1, false, l) _G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20}) return 1 end)()')
     );
-    const ext_win = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before.slice(), 100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // Cell metrics in the same drawable pixels the rect is expressed in
@@ -136,7 +134,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_float).win == _G.z_anchor) and 1 or 0')") != 1) {
         return error.FloatNotAnchoredToExternal;
     }
-    const window_count = platform.windowsForPid(g.app_pid, &before_buf);
+    const window_count = driver.snapshotWindows(g.app_pid).len;
     if (window_count != before_count + 1) {
         std.debug.print(
             "[gui] expected the float to be composited into the external window, but the app has {d} windows (was {d} plus the anchor)\n",
@@ -205,11 +203,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
         defer alloc.free(line);
         break :blk app_log.field(line, "scale") orelse return error.BackingScaleUnknown;
     };
-    var now_buf: [max_windows]platform.MainWindow = undefined;
-    const now_wins = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+    const now_wins = driver.snapshotWindows(g.app_pid);
     var main_win: ?platform.MainWindow = null;
     var host_win: ?platform.MainWindow = null;
-    for (now_wins) |wnd| {
+    for (now_wins.slice()) |wnd| {
         if (wnd.number == ext_win.number) host_win = wnd else if (main_win == null) main_win = wnd;
     }
     const host = host_win orelse return error.ExternalWindowGone;

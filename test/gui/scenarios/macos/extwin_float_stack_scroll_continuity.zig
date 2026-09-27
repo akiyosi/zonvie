@@ -33,7 +33,6 @@ const layer_draw = @import("layer_draw.zig");
 const log_path = "tmp/gui_extwin_float_stack.log";
 const draw_marker = "[ext_layer_draw]";
 const cell_marker = "[ext_draw_debug]";
-const max_windows = 16;
 
 /// The host window's grid, in cells. Wide and tall enough that the floats
 /// below stack inside it and the trackpad gesture lands on content.
@@ -153,8 +152,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     g.activateApp();
     gui_io.sleepNs(700 * std.time.ns_per_ms);
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     const before_count = before.len;
 
     // The host: an external window with far more lines than it shows.
@@ -169,7 +167,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         .{ host_cols, host_rows },
     );
     try g.exec(open_host);
-    _ = try driver.waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(700 * std.time.ns_per_ms);
 
     // A stack of bufpos-anchored floats over it, unfocused so the wheel
@@ -199,7 +197,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (try g.evalInt("luaeval('(vim.api.nvim_win_get_config(_G.z_floats[1]).win == _G.z_anchor) and 1 or 0')") != 1) {
         return error.FloatNotAnchoredToExternal;
     }
-    const window_count = platform.windowsForPid(g.app_pid, &before_buf);
+    const window_count = driver.snapshotWindows(g.app_pid).len;
     if (window_count != before_count + 1) {
         std.debug.print(
             "[gui] expected the floats to be composited into the external window, but the " ++

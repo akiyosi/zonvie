@@ -36,7 +36,6 @@ const gui_io = @import("../../gui_io.zig");
 
 const log_path = "tmp/gui_main_idle_extwin.log";
 const updates = 12;
-const max_windows = 16;
 
 /// Main frames drawn only because a commit landed.
 fn emptyCommitFrames(alloc: std.mem.Allocator, since_ms: f64) !usize {
@@ -63,13 +62,7 @@ fn cursorOnlyMainPasses(alloc: std.mem.Allocator, since_ms: f64) !usize {
             std.mem.indexOf(u8, line, "dirty=0 rect=0 layerWork=0 scroll=0 scrollOff=0 smooth=0 shaderCur=1 blink=0 sizeChg=0 anim=0 -> draw") != null;
         if (cursor_only) drawn += 1;
     }
-    const skips = try app_log.linesSince(alloc, log_path, "[draw] skipMainPass=true", since_ms);
-    defer alloc.free(skips);
-    var skipped: usize = 0;
-    var sit = std.mem.splitScalar(u8, skips, '\n');
-    while (sit.next()) |line| {
-        if (line.len != 0) skipped += 1;
-    }
+    const skipped = try app_log.countLinesSince(alloc, log_path, "[draw] skipMainPass=true", since_ms);
     std.debug.print("[gui] cursor-only main frames: {d}; main passes skipped: {d}\n", .{ drawn, skipped });
     if (drawn == 0) return error.NoCursorOnlyFrame;
     return drawn -| skipped;
@@ -101,14 +94,13 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     try g.exec("execute('set nocursorline noruler noshowcmd laststatus=0 guicursor+=a:blinkon0')");
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     // A second buffer in an external window; focus stays in the main window.
     try g.exec(
         "luaeval('(function() _G.z_buf = vim.api.nvim_create_buf(false, true) " ++
             "vim.api.nvim_open_win(_G.z_buf, false, {external=true, width=40, height=12}) return 1 end)()')",
     );
-    _ = try driver.waitNewWindow(g.app_pid, before, 100);
+    _ = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);
