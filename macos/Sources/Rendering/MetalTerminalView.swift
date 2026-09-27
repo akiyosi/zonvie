@@ -23,12 +23,14 @@ func surfaceOtherMouseButtonName(_ buttonNumber: Int) -> String? {
 
 /// Neovim's modifier prefix for a mouse event ("S", "C", "A", "D").
 func neovimModifierString(_ flags: NSEvent.ModifierFlags) -> String {
-    var mods = ""
-    if flags.contains(.shift) { mods += "S" }
-    if flags.contains(.control) { mods += "C" }
-    if flags.contains(.option) { mods += "A" }
-    if flags.contains(.command) { mods += "D" }
-    return mods
+    var mods: UInt32 = 0
+    if flags.contains(.shift) { mods |= UInt32(ZONVIE_MOD_SHIFT) }
+    if flags.contains(.control) { mods |= UInt32(ZONVIE_MOD_CTRL) }
+    if flags.contains(.option) { mods |= UInt32(ZONVIE_MOD_ALT) }
+    if flags.contains(.command) { mods |= UInt32(ZONVIE_MOD_SUPER) }
+    var buf = [CChar](repeating: 0, count: 5)
+    _ = zonvie_core_mouse_modifiers(mods, &buf)
+    return String(cString: buf)
 }
 
 /// One surface's scrollbar: which grid its knob shows, when the knob moves,
@@ -39,7 +41,7 @@ func neovimModifierString(_ flags: NSEvent.ModifierFlags) -> String {
 /// busy core lock (so its knob stayed stale after the last flush of a scroll
 /// burst), no first-show, no estimated knob after a page click, ignored the
 /// knob slot's part on one side and not the other, and showed only in "scroll"
-/// mode. The views keep only what differs — their hover tracking areas.
+/// mode. Hover tracking is GridInputView's, one rule for both.
 ///
 /// A knob drag is throttled to one scroll per interval with a trailing send
 /// for the last position. The main window used to flush that last position
@@ -431,12 +433,6 @@ final class MetalTerminalView: GridInputView {
         needsLayout = true
 
         applyAlwaysScrollbarVisibility()
-        let scrollbarConfig = ZonvieConfig.shared.scrollbar
-
-        // Setup hover tracking for scrollbar (if "hover" mode is enabled)
-        if scrollbarConfig.enabled && scrollbarConfig.isHover {
-            setupScrollbarHoverTracking()
-        }
 
         if window != nil {
             window?.acceptsMouseMovedEvents = true
@@ -529,66 +525,12 @@ final class MetalTerminalView: GridInputView {
         ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
         layoutScrollbar()
-        // Update hover tracking area if hover mode is enabled
-        let config = ZonvieConfig.shared.scrollbar
-        if config.enabled && config.isHover {
-            setupScrollbarHoverTracking()
-        }
     }
-
-    private var scrollbarTrackingArea: NSTrackingArea?
 
     // The cell a click here would name, ease undone: hovering read the drawn
     // row, so mid-ease the hand showed over a row a click missed.
     override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
         hitTestGrid(at: location)
-    }
-
-    private func setupScrollbarHoverTracking() {
-        if let existing = scrollbarTrackingArea {
-            removeTrackingArea(existing)
-        }
-
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        let trackingRect = NSRect(
-            x: bounds.width - scrollerWidth - 30,  // 30px margin for easier hover
-            y: 0,
-            width: scrollerWidth + 30,
-            height: bounds.height
-        )
-
-        let trackingArea = NSTrackingArea(
-            rect: trackingRect,
-            options: [.mouseEnteredAndExited, .activeAlways],
-            owner: self,
-            userInfo: ["scrollbar": true]
-        )
-        addTrackingArea(trackingArea)
-        scrollbarTrackingArea = trackingArea
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        if let userInfo = event.trackingArea?.userInfo as? [String: Bool],
-           userInfo["scrollbar"] == true {
-            let config = ZonvieConfig.shared.scrollbar
-            if config.enabled && config.isHover {
-                showScrollbar()
-            }
-        }
-        super.mouseEntered(with: event)
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        if let userInfo = event.trackingArea?.userInfo as? [String: Bool],
-           userInfo["scrollbar"] == true {
-            let config = ZonvieConfig.shared.scrollbar
-            // In "scroll" mode show() armed the auto-hide delay; leave the
-            // bar to it, as the external surface and Windows do.
-            if config.enabled && config.isHover && !config.isScroll {
-                hideScrollbar()
-            }
-        }
-        super.mouseExited(with: event)
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -1488,6 +1430,8 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     /// this surface shows no URL hover. Each surface resolves it its own way.
     func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? { nil }
 
+    /// One area over the bounds serves the URL hand and the scrollbar hover;
+    /// AppKit asks for it on geometry changes, so it is not rebuilt per layout.
     private var urlTrackingArea: NSTrackingArea?
     private var lastUrlCursorIsHand = false
 
@@ -1497,7 +1441,7 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
         super.updateTrackingAreas()
         if let existing = urlTrackingArea { removeTrackingArea(existing) }
         urlTrackingArea = nil
-        guard tracksURLHover else { return }
+        guard tracksURLHover || hoverScrollbarEnabled else { return }
         let area = NSTrackingArea(
             rect: bounds,
             options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
@@ -1511,8 +1455,18 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     /// Whether this surface shows the hand over a URL.
     var tracksURLHover: Bool { true }
 
+    override func mouseEntered(with event: NSEvent) {
+        if event.trackingArea === urlTrackingArea, hoverScrollbarEnabled {
+            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
+        }
+        super.mouseEntered(with: event)
+    }
+
     override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        if hoverScrollbarEnabled {
+            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
+        }
         guard tracksURLHover, let core,
               let cell = urlHoverCell(at: convert(event.locationInWindow, from: nil))
         else { return }
@@ -1523,9 +1477,14 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     }
 
     override func mouseExited(with event: NSEvent) {
-        if event.trackingArea === urlTrackingArea, lastUrlCursorIsHand {
-            lastUrlCursorIsHand = false
-            NSCursor.arrow.set()
+        if event.trackingArea === urlTrackingArea {
+            if hoverScrollbarEnabled {
+                updateScrollbarHover(overStrip: false)
+            }
+            if lastUrlCursorIsHand {
+                lastUrlCursorIsHand = false
+                NSCursor.arrow.set()
+            }
         }
         super.mouseExited(with: event)
     }
@@ -1811,6 +1770,39 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
 
     func hideScrollbar() {
         scrollbarController.hide()
+    }
+
+    /// Whether the pointer was last seen over the scrollbar strip.
+    private var pointerOverScrollbarStrip = false
+
+    /// Whether this surface shows its scrollbar on hover.
+    var hoverScrollbarEnabled: Bool {
+        let config = ZonvieConfig.shared.scrollbar
+        return config.enabled && config.isHover && hostsScrollbar
+    }
+
+    /// Whether the pointer is over the strip the scrollbar occupies.
+    private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
+        let locationInView = convert(event.locationInWindow, from: nil)
+        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+        return locationInView.x >= bounds.width - scrollerWidth
+    }
+
+    /// Show and hide only on the pointer crossing the strip, and never hide a
+    /// bar "scroll" mode showed: its own delay hides it. Windows'
+    /// scrollbar.hover/leave rule. Every move over the strip re-shows, or a
+    /// "scroll" mode delay would fade the bar under a pointer resting on it.
+    private func updateScrollbarHover(overStrip: Bool) {
+        if overStrip {
+            pointerOverScrollbarStrip = true
+            showScrollbar()
+            return
+        }
+        guard pointerOverScrollbarStrip else { return }
+        pointerOverScrollbarStrip = false
+        if !ZonvieConfig.shared.scrollbar.isScroll {
+            hideScrollbar()
+        }
     }
 
     @objc func scrollerDidScroll(_ sender: NSScroller) {

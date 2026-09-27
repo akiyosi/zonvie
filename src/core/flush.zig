@@ -1541,6 +1541,19 @@ fn sendGridRow(core: *Core, row_cb: anytype, src: GridRowSource, row: u32, verts
     row_cb(core.ctx, src.grid_id, row, 1, verts.ptr, verts.len, c_api.VERT_UPDATE_MAIN, src.rows, src.cols);
 }
 
+/// Cancel this flush because the atlas was replaced under it: rows already
+/// published point into the old atlas, so the frontend must drop the whole
+/// transaction (flush_atlas_corrupted is read by on_flush_end, before the outer
+/// defer) and every surface regenerates against the fresh one next flush. The
+/// cursor is a separate consumer gated on cursor_rev alone.
+fn cancelFlushForAtlasReset(core: *Core) void {
+    core.atlas_reset_during_flush = false;
+    core.flush_atlas_corrupted = true;
+    core.grid.markEverySurfaceDirty();
+    core.invalidateMirroredFrameState();
+    core.grid.cursor_rev +%= 1;
+}
+
 /// Unified 5-pass row vertex generation shared by global grid (row_mode) and
 /// external grid paths.  Caller must pre-populate `core.row_cells` (including
 /// `deco_base_flags`) before calling.  Returns stats including glyph miss flag.
@@ -3749,10 +3762,7 @@ pub const FlushCtx = struct {
                                         .{r},
                                     );
                                 }
-                                ctx.core.flush_atlas_corrupted = true;
-                                ctx.core.grid.markEverySurfaceDirty();
-                                ctx.core.invalidateMirroredFrameState();
-                                ctx.core.grid.cursor_rev +%= 1;
+                                cancelFlushForAtlasReset(ctx.core);
                                 return;
                             }
 
@@ -3847,20 +3857,9 @@ pub const FlushCtx = struct {
                 }
             }
 
-            // Vertices emitted before an atlas reset carry stale UVs and would
-            // sample unrelated contents for one frame. Preserve dirty state so
-            // the next flush regenerates against the fresh atlas.
-            if (ctx.core.atlas_reset_during_flush) {
-                ctx.core.grid.markEverySurfaceDirty();
-                ctx.core.invalidateMirroredFrameState();
-                ctx.core.atlas_reset_during_flush = false;
-                // Dirtying repairs the next flush only; cancel this transaction
-                // so the rows already published against the replaced atlas
-                // generation are never committed. Set here, not left to the
-                // outer defer: on_flush_end reads it and runs before that.
-                ctx.core.flush_atlas_corrupted = true;
-                return;
-            }
+            // A reset still pending here (e.g. from the cursor pass) leaves
+            // the rows already published with stale UVs.
+            if (ctx.core.atlas_reset_during_flush) cancelFlushForAtlasReset(ctx.core);
             return;
         }
     }
@@ -5018,17 +5017,7 @@ pub fn sendExternalGridVertices(self: *Core, force_render: bool) void {
     // MAIN grid is included: this function runs as a deferred call AFTER the
     // main row loop already dispatched its vertices this same flush, with UVs
     // baked against the pre-reset atlas.
-    if (ext_saw_atlas_reset_any) {
-        self.grid.markEverySurfaceDirty();
-        self.invalidateMirroredFrameState();
-        // The cursor is a separate vertex consumer gated on cursor_rev alone,
-        // which none of the dirtying above touches.
-        self.grid.cursor_rev +%= 1;
-        // markAllDirty schedules a correct NEXT flush; it cannot undo THIS
-        // flush's already-dispatched main vertices, so signal frontends to
-        // cancel the current commit entirely.
-        self.flush_atlas_corrupted = true;
-    }
+    if (ext_saw_atlas_reset_any) cancelFlushForAtlasReset(self);
 }
 
 fn abortClusterUpdate(self: *Core, scope: []const u8, err: anyerror) void {
