@@ -1,5 +1,6 @@
 const std = @import("std");
 const clock = @import("zonvie_core").clock;
+const frontend_rules = @import("zonvie_core").frontend_rules;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
@@ -24,6 +25,11 @@ pub const std_options = std.Options{
 /// an align-2 pointer.
 fn makeIntResource(id: u16) ?*const anyopaque {
     return @ptrFromInt(@as(usize, id));
+}
+
+/// Whether the bare flag at args[i] takes args[i + 1] as its value.
+fn nextIsValue(args: []const []const u8, i: usize) bool {
+    return frontend_rules.cliNextIsValue(if (i + 1 < args.len) args[i + 1] else null);
 }
 
 /// user32 LoadIconW redeclared with an align-agnostic resource-name pointer
@@ -568,45 +574,24 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --wsl={s} flag detected\n", .{wsl_distro.?});
         } else if (std.mem.startsWith(u8, arg, "--ssh=")) {
             ssh_mode = true;
-            const value = arg[6..]; // after "--ssh="
-            // Parse user@host:port format (port is after last colon, only if numeric)
-            if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
-                const port_str = value[colon_idx + 1 ..];
-                if (std.fmt.parseInt(u16, port_str, 10)) |port| {
-                    ssh_host = value[0..colon_idx];
-                    ssh_port = port;
-                } else |_| {
-                    ssh_host = value;
-                }
-            } else {
-                ssh_host = value;
-            }
+            const target = frontend_rules.sshTarget(arg[6..]); // after "--ssh="
+            ssh_host = target.host;
+            if (target.port) |port| ssh_port = port;
             if (applog.isEnabled()) applog.appLog("[win] --ssh={s} flag detected\n", .{ssh_host.?});
         } else if (std.mem.eql(u8, arg, "--ssh")) {
             ssh_mode = true;
-            // Only consume the next token as the host when it is a value, not
-            // another flag — otherwise `--ssh --dialog` grabs "--dialog".
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
-                const value = args[i + 1];
+            if (nextIsValue(args, i)) {
+                const target = frontend_rules.sshTarget(args[i + 1]);
                 i += 1;
-                if (std.mem.lastIndexOfScalar(u8, value, ':')) |colon_idx| {
-                    const port_str = value[colon_idx + 1 ..];
-                    if (std.fmt.parseInt(u16, port_str, 10)) |port| {
-                        ssh_host = value[0..colon_idx];
-                        ssh_port = port;
-                    } else |_| {
-                        ssh_host = value;
-                    }
-                } else {
-                    ssh_host = value;
-                }
+                ssh_host = target.host;
+                if (target.port) |port| ssh_port = port;
             }
             if (applog.isEnabled()) applog.appLog("[win] --ssh flag detected\n", .{});
         } else if (std.mem.startsWith(u8, arg, "--ssh-identity=")) {
             ssh_identity = arg[15..]; // after "--ssh-identity="
             if (applog.isEnabled()) applog.appLog("[win] --ssh-identity flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--ssh-identity")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 ssh_identity = args[i + 1];
                 i += 1;
             }
@@ -617,7 +602,7 @@ pub fn main() u8 {
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer={s} flag detected\n", .{devcontainer_workspace.?});
         } else if (std.mem.eql(u8, arg, "--devcontainer")) {
             devcontainer_mode = true;
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 devcontainer_workspace = args[i + 1];
                 i += 1;
             }
@@ -626,7 +611,7 @@ pub fn main() u8 {
             devcontainer_config = arg[22..]; // after "--devcontainer-config="
             if (applog.isEnabled()) applog.appLog("[win] --devcontainer-config flag detected\n", .{});
         } else if (std.mem.eql(u8, arg, "--devcontainer-config")) {
-            if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) {
+            if (nextIsValue(args, i)) {
                 devcontainer_config = args[i + 1];
                 i += 1;
             }

@@ -1845,6 +1845,10 @@ final class ZonvieCore {
             if arg == "--" {
                 break
             }
+            // A bare flag takes the next token as its value only when that is
+            // not itself a flag, as the dialog seed (main.swift) and
+            // windows/main.zig read it.
+            let valueFollows = ZonvieCore.cliNextIsValue(args, after: argIdx)
             if arg.hasPrefix("--connect-nvim=") {
                 connectAddr = String(arg.dropFirst("--connect-nvim=".count))
             } else if arg == "--connect-nvim" {
@@ -1871,39 +1875,27 @@ final class ZonvieCore {
                     connectAddr = ""
                 }
             } else if arg.hasPrefix("--ssh=") {
-                let value = String(arg.dropFirst("--ssh=".count))
-                // Parse user@host:port format (port is after last colon, but only if it's numeric)
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    sshHost = String(value[..<lastColon])
-                    sshPort = portPart
-                } else {
-                    sshHost = value
-                }
-            } else if arg == "--ssh" && argIdx + 1 < args.count {
-                // Space-separated: --ssh user@host[:port]
-                let value = args[argIdx + 1]
+                let target = ZonvieCore.sshTarget(String(arg.dropFirst("--ssh=".count)))
+                sshHost = target.host
+                if let port = target.port { sshPort = port }
+            } else if arg == "--ssh" && valueFollows {
+                let target = ZonvieCore.sshTarget(args[argIdx + 1])
                 argIdx += 1
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    sshHost = String(value[..<lastColon])
-                    sshPort = portPart
-                } else {
-                    sshHost = value
-                }
+                sshHost = target.host
+                if let port = target.port { sshPort = port }
             } else if arg.hasPrefix("--ssh-identity=") {
                 sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
-            } else if arg == "--ssh-identity" && argIdx + 1 < args.count {
+            } else if arg == "--ssh-identity" && valueFollows {
                 sshIdentity = args[argIdx + 1]
                 argIdx += 1
             } else if arg.hasPrefix("--devcontainer=") {
                 devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
-            } else if arg == "--devcontainer" && argIdx + 1 < args.count {
+            } else if arg == "--devcontainer" && valueFollows {
                 devcontainerWorkspace = args[argIdx + 1]
                 argIdx += 1
             } else if arg.hasPrefix("--devcontainer-config=") {
                 devcontainerConfig = String(arg.dropFirst("--devcontainer-config=".count))
-            } else if arg == "--devcontainer-config" && argIdx + 1 < args.count {
+            } else if arg == "--devcontainer-config" && valueFollows {
                 devcontainerConfig = args[argIdx + 1]
                 argIdx += 1
             } else if arg == "--devcontainer-rebuild" {
@@ -2445,18 +2437,23 @@ final class ZonvieCore {
     private func startDevcontainerExec(workspace: String, configPath: String?, rows: UInt32, cols: UInt32) {
         guard let core = core else { return }
 
-        // Build devcontainer exec command
-        var cmd = "devcontainer exec --workspace-folder \"\(workspace)\""
-        if let config = configPath {
-            cmd += " --config \"\(config)\""
+        var cmd = [CChar](repeating: 0, count: 4096)
+        let ws = Array(workspace.utf8)
+        let cfg = configPath.map { Array($0.utf8) }
+        ws.withUnsafeBufferPointer { wsBuf in
+            if let cfg {
+                cfg.withUnsafeBufferPointer { cfgBuf in
+                    _ = zonvie_core_devcontainer_exec_cmd(&cmd, cmd.count, wsBuf.baseAddress, ws.count, cfgBuf.baseAddress, cfg.count)
+                }
+            } else {
+                _ = zonvie_core_devcontainer_exec_cmd(&cmd, cmd.count, wsBuf.baseAddress, ws.count, nil, 0)
+            }
         }
-        cmd += " --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed"
 
-        ZonvieCore.appLog("[devcontainer] Starting exec: \(cmd)")
+        ZonvieCore.appLog("[devcontainer] Starting exec: \(String(cString: cmd))")
 
         applyCoreStartOptions()
-        let cstr = (cmd as NSString).utf8String
-        _ = zonvie_core_start(core, cstr, rows, cols)
+        _ = zonvie_core_start(core, cmd, rows, cols)
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
         // here. The rows/cols passed in from ViewController are placeholders
         // (1×1) — calling notify with them would race with the legitimate
@@ -2840,23 +2837,31 @@ final class ZonvieCore {
         // Wait -> do nothing, user can try closing again later
     }
 
-    /// Set the position for the next external window created via nvim_win_set_config(external=true).
-    /// This is used by tab externalization to place the window at the mouse cursor position.
-    /// The pending position is automatically cleared after 500ms if not consumed (to prevent stale state).
+    /// The drop point for the next external window created via
+    /// nvim_win_set_config(external=true), from tab externalization. Good for
+    /// 500 ms, so a failed externalization leaves no stale point.
     func setPendingExternalWindowPosition(_ position: NSPoint) {
         ZonvieCore.appLog("[external_window] setPendingExternalWindowPosition: \(position)")
-        pendingExternalWindowPosition = position
-
-        // Clear pending position after timeout to prevent stale state if externalization fails.
-        // Only this drag's: a newer drag's position is left to its own timer.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            if self?.pendingExternalWindowPosition == position {
-                ZonvieCore.appLog("[external_window] clearing stale pendingExternalWindowPosition (timeout)")
-                self?.pendingExternalWindowPosition = nil
-            }
-        }
+        zonvie_placement_set_pending(&externalPlacement, position.x, position.y, ZonvieCore.monotonicMs())
     }
 
+
+    /// `user@host[:port]` split by the core's rule.
+    static func sshTarget(_ value: String) -> (host: String, port: Int?) {
+        var hostLen: Int = 0
+        var port: Int32 = -1
+        let bytes = Array(value.utf8)
+        bytes.withUnsafeBufferPointer { buf in
+            zonvie_core_parse_ssh_target(buf.baseAddress, bytes.count, &hostLen, &port)
+        }
+        return (String(decoding: bytes[0..<hostLen], as: UTF8.self), port < 0 ? nil : Int(port))
+    }
+
+    /// Whether the bare flag at args[idx] takes args[idx + 1] as its value.
+    static func cliNextIsValue(_ args: [String], after idx: Int) -> Bool {
+        guard idx + 1 < args.count else { return false }
+        return args[idx + 1].withCString { zonvie_core_cli_next_is_value($0, strlen($0)) }
+    }
 
     func sendKeyEvent(
         keyCode: UInt32,
@@ -4271,17 +4276,13 @@ final class ZonvieCore {
     private var externalWindowInstalledLifecycleTokens: [Int64: UInt64] = [:]
     private var externalWindowInstalledSessionGenerations: [Int64: UInt64] = [:]
 
-    /// Pending position for the next regular external window (set by tab externalization)
-    /// When set, the next regular external window will be placed at this position, then this is cleared.
-    private var pendingExternalWindowPosition: NSPoint? = nil
-    /// Saved positions for external windows (grid_id -> origin).
-    /// When a window is hidden (e.g. tab switch), its position is saved here.
-    /// On recreation, the saved position is used instead of Neovim's coordinates.
-    private struct SavedExternalWindowPosition {
-        let origin: NSPoint
-        let sessionGeneration: UInt64
+    /// Where the next regular external window goes: a tab drag's drop point,
+    /// or the origin the grid's window closed at. The rule is the core's.
+    private var externalPlacement = zonvie_placement_memory()
+
+    private static func monotonicMs() -> Int64 {
+        Int64(ProcessInfo.processInfo.systemUptime * 1000)
     }
-    private var savedExternalWindowPositions: [Int64: SavedExternalWindowPosition] = [:]
     /// Tracks external grid views (grid_id -> ExternalGridView).
     /// Mutations happen on main thread only (window create/close).
     /// Reads also happen from core thread (flush callbacks) under externalGridViewsLock.
@@ -4723,61 +4724,65 @@ final class ZonvieCore {
     func resizeExternalWindows(cellWidthPx: CGFloat, cellHeightPx: CGFloat) {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            guard let mainView = self.terminalView else { return }
-            // No shared scale here: each window converts with its own, below.
             ZonvieCore.appLog("[resizeExternalWindows] cellW=\(cellWidthPx) cellH=\(cellHeightPx)")
 
             for (gridId, window) in self.externalWindows {
                 // Skip special windows (cmdline, popupmenu, msg_show, msg_history)
                 // These are handled differently and don't need resize
                 if self.classifyExternalGridKind(gridId) != .normal { continue }
-
-                guard let gridView = self.externalGridViews[gridId] else { continue }
-                let rows = gridView.gridRows
-                let cols = gridView.gridCols
-
+                guard let gridView = self.externalGridViews[gridId],
+                      let delegate = self.externalWindowDelegates[gridId] else { continue }
+                // The delegate's counts: gridView.gridRows/gridCols are
+                // core-thread bracket state.
+                // New metrics go on the delegate before setFrame, so
+                // windowDidResize cannot report a row count computed from the
+                // old metrics -- also for a window not configured yet, whose
+                // next user drag would otherwise count rows with the old size.
+                delegate.cellWidthPx = cellWidthPx
+                delegate.cellHeightPx = cellHeightPx
+                let rows = delegate.lastGridRows
+                let cols = delegate.lastGridCols
                 guard rows > 0 && cols > 0 else { continue }
-
-                // The window's OWN scale converts its pixel cell metrics to the
-                // points its frame is set in. Using the main window's put an
-                // external window on a different-DPI screen at a size whose
-                // drawable no longer matches `rows * cellHeightPx`, which is the
-                // viewport the surface renders into. The view already resolves
-                // every other scale from its own window.
-                let scale = window.backingScaleFactor
-                let newWidth = CGFloat(cols) * cellWidthPx / scale
-                let newHeight = CGFloat(rows) * cellHeightPx / scale
-
-                // New metrics go on the delegate before setFrame, and the resize
-                // callback is suppressed, so windowDidResize cannot report a row
-                // count computed from the old metrics.
-                let delegate = self.externalWindowDelegates[gridId]
-                delegate?.cellWidthPx = cellWidthPx
-                delegate?.cellHeightPx = cellHeightPx
-                delegate?.suppressResizeCallback = true
-
-                // The window is titled: size the frame from the content rect.
-                let currentFrame = window.frame
-                let frameRect = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: newWidth, height: newHeight))
-                let newFrame = NSRect(
-                    x: currentFrame.origin.x,
-                    y: currentFrame.maxY - frameRect.height,  // Keep top-left position
-                    width: frameRect.width,
-                    height: frameRect.height
-                )
-                window.setFrame(newFrame, display: false)
-
-                gridView.frame = NSRect(x: 0, y: 0, width: newWidth, height: newHeight)
-                delegate?.suppressResizeCallback = false
-
-                // Force Neovim to redraw this grid by changing size then restoring
-                // Neovim ignores resize requests with same size, so we change it first
-                self.tryResizeGrid(gridId: gridId, rows: rows + 1, cols: cols)
-                self.tryResizeGrid(gridId: gridId, rows: rows, cols: cols)
-
-                ZonvieCore.appLog("[resizeExternalWindows] gridId=\(gridId) rows=\(rows) cols=\(cols) newSize=\(newWidth)x\(newHeight)")
+                // No grid resize round-trip: the core regenerates every
+                // surface's rows for the new metrics (invalidate_glyph_cache),
+                // as Windows relies on. Asking Neovim for rows+1 then rows made
+                // every window grow a row and shrink, with two WinResized.
+                self.frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                         rows: rows, cols: cols, cellW: cellWidthPx, cellH: cellHeightPx,
+                                         applyAnchors: false)
+                ZonvieCore.appLog("[resizeExternalWindows] gridId=\(gridId) rows=\(rows) cols=\(cols)")
             }
         }
+    }
+
+    /// Size a regular external window to `rows x cols` of `cellW x cellH`
+    /// pixels, in the window's own scale (the main window's put a window on a
+    /// different-DPI screen at a size whose drawable no longer matched the
+    /// viewport). The resize callback is suppressed across setFrame. Anchors:
+    /// top-left, except (`applyAnchors`) during a user drag that fixes the
+    /// bottom or right edge; a font change always keeps the top-left.
+    private func frameExternalWindow(
+        _ window: NSWindow, gridView: ExternalGridView, delegate: ExternalWindowDelegate,
+        rows: UInt32, cols: UInt32, cellW: CGFloat, cellH: CGFloat,
+        applyAnchors: Bool = true, display: Bool = false
+    ) {
+        let scale = window.backingScaleFactor
+        let contentWidth = CGFloat(cols) * cellW / scale
+        let contentHeight = CGFloat(rows) * cellH / scale
+        delegate.suppressResizeCallback = true
+        let oldFrame = window.frame
+        let anchorsApply = applyAnchors && (window.inLiveResize || delegate.anchorsDescribeCurrentGesture)
+        let anchorBottom = anchorsApply && delegate.userResizeAnchorsBottom
+        let anchorRight = anchorsApply && delegate.userResizeAnchorsRight
+        let frameRect = window.frameRect(forContentRect: NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight))
+        window.setFrame(NSRect(
+            x: anchorRight ? oldFrame.maxX - frameRect.width : oldFrame.origin.x,
+            y: anchorBottom ? oldFrame.origin.y : oldFrame.maxY - frameRect.height,
+            width: frameRect.width,
+            height: frameRect.height
+        ), display: display)
+        gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
+        delegate.suppressResizeCallback = false
     }
 
     /// Custom NSWindow subclass for cmdline window.
@@ -5262,56 +5267,20 @@ final class ZonvieCore {
         guard let mainView = self.terminalView, let renderer = mainView.renderer else { return }
         let cellW = CGFloat(renderer.cellWidthPx)
         let cellH = CGFloat(renderer.cellHeightPx)
-        // This window's own scale, for the reason resizeExternalWindows states.
-        let scale = window.backingScaleFactor
-
         // Regular ext_windows grid: Neovim controls grid dimensions (<C-w>+, :resize, etc.).
-        // Resize the OS window to match the grid size.
-        let contentWidth = CGFloat(cols) * cellW / scale
-        let contentHeight = CGFloat(rows) * cellH / scale
-
-        // Compare using row/col counts stored on the delegate to avoid floating-point drift.
-        // The delegate tracks the last-set rows/cols, so this is an exact integer comparison.
-        let delegate = window.delegate as? ExternalWindowDelegate
-        let lastRows = delegate?.lastGridRows ?? 0
-        let lastCols = delegate?.lastGridCols ?? 0
-        if rows != lastRows || cols != lastCols {
-            // Track the rows/cols we're about to set BEFORE setFrame, because
-            // setFrame may trigger windowDidResize synchronously or via RunLoop.
-            // The lastGridRows/lastGridCols check in windowDidResize prevents
-            // the callback from calling tryResizeGrid with stale window dimensions.
-            delegate?.lastGridRows = rows
-            delegate?.lastGridCols = cols
-            delegate?.suppressResizeCallback = true
-
-            // Anchor the edge the user is not dragging: default top-left, but a
-            // top-edge drag keeps the bottom fixed and a left-edge drag keeps
-            // the right fixed (macOS coords: origin.y + height = top).
-            // The anchors describe one drag, so they apply while it is running
-            // and to its trailing confirmation; every other resize falls back
-            // to the top-left anchor.
-            let oldFrame = window.frame
-            let oldTop = oldFrame.origin.y + oldFrame.height
-            let anchorsApply = window.inLiveResize
-                || (delegate?.anchorsDescribeCurrentGesture ?? false)
-            let anchorBottom = anchorsApply && (delegate?.userResizeAnchorsBottom ?? false)
-            let anchorRight = anchorsApply && (delegate?.userResizeAnchorsRight ?? false)
-
-            let contentRect = NSRect(x: oldFrame.origin.x, y: 0, width: contentWidth, height: contentHeight)
-            let frameRect = window.frameRect(forContentRect: contentRect)
-            let newFrame = NSRect(
-                x: anchorRight ? oldFrame.maxX - frameRect.width : oldFrame.origin.x,
-                y: anchorBottom ? oldFrame.origin.y : oldTop - frameRect.height,
-                width: frameRect.width,
-                height: frameRect.height
-            )
-            window.setFrame(newFrame, display: true)
-
-            gridView.frame = NSRect(x: 0, y: 0, width: contentWidth, height: contentHeight)
-
-            delegate?.suppressResizeCallback = false
-
-            ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols) content=\(contentWidth)x\(contentHeight)")
+        // Resize the OS window to match the grid size. Integer row/col counts
+        // on the delegate, not the frame, so floating-point drift cannot
+        // re-frame it.
+        if let delegate = window.delegate as? ExternalWindowDelegate,
+           rows != delegate.lastGridRows || cols != delegate.lastGridCols {
+            // Recorded BEFORE setFrame: windowDidResize may run synchronously,
+            // and its lastGridRows/Cols check keeps it from calling
+            // tryResizeGrid with stale window dimensions.
+            delegate.lastGridRows = rows
+            delegate.lastGridCols = cols
+            frameExternalWindow(window, gridView: gridView, delegate: delegate,
+                                rows: rows, cols: cols, cellW: cellW, cellH: cellH, display: true)
+            ZonvieCore.appLog("[ext_windows] resized grid=\(gridId) rows=\(rows) cols=\(cols)")
         }
 
         // Set clear color from the NormalFloat highlight group (external windows are floats).
@@ -5438,20 +5407,11 @@ final class ZonvieCore {
                 // Preserve positions only for same-session tab close/reopen.
                 // Session restart/connect must not transplant the previous
                 // server's position into a reused grid id.
-                if installedSessionGeneration == currentSessionGeneration {
-                    if self.savedExternalWindowPositions.count > 100 {
-                        if let oldest = self.savedExternalWindowPositions.keys.min() {
-                            self.savedExternalWindowPositions.removeValue(forKey: oldest)
-                        }
-                    }
-                    self.savedExternalWindowPositions[gridId] = SavedExternalWindowPosition(
-                        origin: window.frame.origin,
-                        sessionGeneration: currentSessionGeneration
-                    )
-                    ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
-                } else {
-                    self.savedExternalWindowPositions.removeValue(forKey: gridId)
-                }
+                // No installed generation is never the current one.
+                zonvie_placement_save(
+                    &self.externalPlacement, gridId, window.frame.origin.x, window.frame.origin.y,
+                    installedSessionGeneration ?? currentSessionGeneration &+ 1, currentSessionGeneration)
+                ZonvieCore.appLog("[external_window] saved position for gridId=\(gridId): \(window.frame.origin)")
                 Self.closeRemovedExternalWindow(window)
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
                 // msg_show was stacked below msg_history: move it back up.
@@ -5621,6 +5581,9 @@ final class ZonvieCore {
     /// the core/RPC thread wait forever. During teardown the main thread can be
     /// blocked in zonvie_core_stop/destroy while that thread is inside a
     /// callback; DispatchQueue.main.sync would then deadlock the join.
+    /// Clipboard get/set wait, the same 5s as Windows' clipboard bridge.
+    nonisolated private static let clipboardMainThreadTimeout: DispatchTimeInterval = .seconds(5)
+
     nonisolated private func performMainThreadCallback<T>(
         timeout: DispatchTimeInterval = .milliseconds(250),
         _ body: @escaping () -> T
@@ -6474,23 +6437,22 @@ final class ZonvieCore {
         }
 
         // A drag-out drop point is the user's latest word on where this window
-        // goes, so it wins over a position saved from an earlier undock.
-        if let pendingPos = self.pendingExternalWindowPosition {
+        // goes, so it wins over a position saved from an earlier undock. The
+        // rule is the core's; the drop point centres the title bar.
+        var px: Double = 0
+        var py: Double = 0
+        switch zonvie_placement_take(&self.externalPlacement, gridId, sessionGeneration, ZonvieCore.monotonicMs(), &px, &py) {
+        case Int32(ZONVIE_PLACEMENT_PENDING):
             let titleBarHeight: CGFloat = 28
-            let x = pendingPos.x - geometry.windowWidth / 2
-            let y = pendingPos.y - geometry.windowHeight - titleBarHeight / 2
-            self.pendingExternalWindowPosition = nil
-            ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position \(pendingPos) (title bar centered)")
+            let x = px - geometry.windowWidth / 2
+            let y = py - geometry.windowHeight - titleBarHeight / 2
+            ZonvieCore.appLog("[external_window] positioned at (\(x),\(y)) from pending position (\(px),\(py)) (title bar centered)")
             return NSRect(x: x, y: y, width: geometry.windowWidth, height: geometry.windowHeight)
-        }
-
-        if let saved = self.savedExternalWindowPositions[gridId],
-           saved.sessionGeneration == sessionGeneration {
-            ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at \(saved.origin)")
-            return NSRect(x: saved.origin.x, y: saved.origin.y, width: geometry.windowWidth, height: geometry.windowHeight)
-        }
-        if self.savedExternalWindowPositions[gridId] != nil {
-            self.savedExternalWindowPositions.removeValue(forKey: gridId)
+        case Int32(ZONVIE_PLACEMENT_SAVED):
+            ZonvieCore.appLog("[external_window] restored saved position for gridId=\(gridId) at (\(px),\(py))")
+            return NSRect(x: px, y: py, width: geometry.windowWidth, height: geometry.windowHeight)
+        default:
+            break
         }
 
         if startRow >= 0 && startCol >= 0, let tvFrame = self.terminalViewScreenFrame() {
@@ -8526,8 +8488,10 @@ final class ZonvieCore {
     ) -> Int32 {
         // NSPasteboard must be accessed from main thread. A timeout is a real
         // callback failure (normally only possible while the main thread is
-        // stopping and joining the RPC thread), not an empty clipboard.
-        guard let pasteboardResult: String? = performMainThreadCallback({
+        // stopping and joining the RPC thread), not an empty clipboard. 5s, as
+        // Windows waits: the 250ms default made a paste empty behind any
+        // main-thread stall (a live resize, a font rebuild).
+        guard let pasteboardResult: String? = performMainThreadCallback(timeout: Self.clipboardMainThreadTimeout, {
             NSPasteboard.general.string(forType: .string)
         }) else {
             outLen.pointee = 0
@@ -8570,7 +8534,7 @@ final class ZonvieCore {
 
         // Keep the synchronous set semantics in normal operation, but fail
         // instead of deadlocking core shutdown if main cannot service it.
-        guard performMainThreadCallback({
+        guard performMainThreadCallback(timeout: Self.clipboardMainThreadTimeout, {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             return pasteboard.setString(content, forType: .string)

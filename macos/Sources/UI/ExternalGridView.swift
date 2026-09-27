@@ -764,10 +764,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         if gridId == ZonvieCore.cmdlineGridId { return true }
         return !isDecoratedSurface && bufferDropInsertsPath
     }
-    private var scrollbarTrackingArea: NSTrackingArea?
-    /// Whether the pointer was last seen over the scrollbar strip.
-    private var pointerOverScrollbarStrip = false
-
     override var tracksURLHover: Bool { !isDecoratedSurface }
 
     override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
@@ -4148,90 +4144,11 @@ extension ExternalGridView {
         }
 
         applyAlwaysScrollbarVisibility()
-        let scrollbarConfig = ZonvieConfig.shared.scrollbar
-        guard scrollbarConfig.enabled && hostsScrollbar else { return }
-
-        if scrollbarConfig.isHover {
-            setupScrollbarHoverTracking()
-        }
     }
 
     override func layout() {
         super.layout()
         layoutScrollbar()
-    }
-
-    private func setupScrollbarHoverTracking() {
-        if let existingArea = scrollbarTrackingArea {
-            removeTrackingArea(existingArea)
-        }
-
-        // No .mouseMoved: the URL area covers the same bounds on every surface
-        // that can hover its scrollbar, and mouseMoved serves both. Two areas
-        // asking for it ran the handler twice per move.
-        let trackingArea = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(trackingArea)
-        scrollbarTrackingArea = trackingArea
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        if hoverScrollbarEnabled {
-            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
-        }
-        super.mouseEntered(with: event)
-    }
-
-    /// Show and hide only on the pointer crossing the strip, and never hide a
-    /// bar "scroll" mode showed: its own delay hides it. Windows'
-    /// scrollbar.hover/leave rule; hiding on every move off the strip faded a
-    /// scroll-shown bar at the first nudge of the mouse.
-    private func updateScrollbarHover(overStrip: Bool) {
-        // Every move over the strip re-shows: a "scroll" mode delay started by
-        // show() would otherwise fade the bar under a pointer resting on it.
-        if overStrip {
-            pointerOverScrollbarStrip = true
-            showScrollbar()
-            return
-        }
-        guard pointerOverScrollbarStrip else { return }
-        pointerOverScrollbarStrip = false
-        if !ZonvieConfig.shared.scrollbar.isScroll {
-            hideScrollbar()
-        }
-    }
-
-    /// Whether this surface shows its scrollbar on hover. Three pointer
-    /// handlers ask it, and a decorated surface — cmdline, popupmenu, message —
-    /// never does.
-    private var hoverScrollbarEnabled: Bool {
-        let config = ZonvieConfig.shared.scrollbar
-        return config.enabled && config.isHover && !isDecoratedSurface
-    }
-
-    /// Whether the pointer is over the strip the scrollbar occupies.
-    private func pointerIsOverScrollbarStrip(_ event: NSEvent) -> Bool {
-        let locationInView = convert(event.locationInWindow, from: nil)
-        let scrollerWidth = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
-        return locationInView.x >= bounds.width - scrollerWidth
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        if hoverScrollbarEnabled {
-            updateScrollbarHover(overStrip: false)
-        }
-        super.mouseExited(with: event)
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        if hoverScrollbarEnabled {
-            updateScrollbarHover(overStrip: pointerIsOverScrollbarStrip(event))
-        }
-        super.mouseMoved(with: event)
     }
 }
 

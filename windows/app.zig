@@ -4740,6 +4740,20 @@ pub fn requestSurfaceFullPaint(app: *App, ws: *WindowSurface) void {
     ws.tbs.requestFullPaint();
 }
 
+/// Make the main window's next paint a full one. `app.mu` held. The row-mode
+/// damage list goes with it: a full paint covers every rect it held.
+pub fn requestMainFullPaintLocked(app: *App) void {
+    app.surf.surface.paint_full = true;
+    app.paint_rects.clearRetainingCapacity();
+}
+
+/// requestMainFullPaintLocked under `app.mu`.
+pub fn requestMainFullPaint(app: *App) void {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    requestMainFullPaintLocked(app);
+}
+
 /// What a surface owns across paints and lends to one row frame: its row VB
 /// array (already sized for the committed row count), its cursor VB, and the
 /// two facts the next paint reads back to place the remembered cursor row.
@@ -5293,7 +5307,6 @@ pub const App = struct {
 
     hwnd: ?c.HWND = null,
     window_wake_cookie: usize = 0,
-    content_hwnd: ?c.HWND = null, // Child window for D3D11 rendering (when ext_tabline enabled)
     corep: ?*zonvie_core = null,
 
     ui_thread_id: u32 = 0,
@@ -5362,12 +5375,9 @@ pub const App = struct {
     external_paint_retry_deadline_ms: u64 = 0,
     device_lost_retry_deadline_ms: u64 = 0,
 
-    // Pending position for next external window (set by tab externalization)
-    pending_external_window_position: ?struct { x: c_int, y: c_int } = null,
-    pending_external_window_position_time: i64 = 0, // Timestamp when position was set (for timeout)
-
-    // Saved positions for external windows (restored on tab switch back)
-    saved_external_window_positions: std.AutoHashMapUnmanaged(i64, struct { x: c_int, y: c_int, session_generation: u64 }) = .{},
+    /// Where the next external window goes: a tab drag's drop point, or the
+    /// origin the grid's window closed at. The rule is the core's.
+    external_placement: core.frontend_rules.PlacementMemory = .{},
     /// Bumped on `restart` and `connect`: Neovim restarts grid ids per
     /// server, so a position saved under the previous one would move an
     /// unrelated window that reuses its id. macOS keeps the same generation.
@@ -6084,7 +6094,6 @@ pub const App = struct {
             pv.deinit(self.alloc);
         }
         self.pending_external_verts.deinit(self.alloc);
-        self.saved_external_window_positions.deinit(self.alloc);
         self.pending_messages.deinit(self.alloc);
         self.display_messages.deinit(self.alloc);
         self.device_lost_recover_grids.deinit(self.alloc);
@@ -6520,9 +6529,7 @@ pub fn getEffectiveContentWidth(app: *App, client_width: u32) u32 {
 /// Terminal content area in pixels (client rect minus sidebar/scrollbar/tabbar chrome).
 pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     var rc: c.RECT = undefined;
-    // When content_hwnd exists, use its client rect (already excludes tabbar area)
-    const target_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-    _ = c.GetClientRect(target_hwnd, &rc);
+    _ = c.GetClientRect(hwnd, &rc);
 
     const client_w: u32 = @intCast(@max(1, rc.right - rc.left));
     const client_h: u32 = @intCast(@max(1, rc.bottom - rc.top));
@@ -6537,10 +6544,9 @@ pub fn contentSizePx(hwnd: c.HWND, app: *App) struct { w: u32, h: u32 } {
     const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
     const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
 
-    // For DWM custom titlebar without content_hwnd: client area includes titlebar,
-    // so subtract tabbar height to get the actual content area for Neovim.
-    // When using content_hwnd, it already has the correct size (excludes tabbar).
-    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+    // The DWM custom titlebar is inside the client area: the tab bar's rows
+    // are not Neovim's.
+    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar)
         @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
     else
         0;
@@ -6607,31 +6613,9 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
 }
 
 pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {
-    var rc: c.RECT = undefined;
-    // When content_hwnd exists, use its client rect (already excludes tabbar area)
-    const target_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-    _ = c.GetClientRect(target_hwnd, &rc);
-
-    const client_w: u32 = @intCast(@max(1, rc.right - rc.left));
-    const client_h: u32 = @intCast(@max(1, rc.bottom - rc.top));
-
-    // Subtract sidebar width for sidebar mode
-    const sidebar_w: u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar)
-        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-    else
-        0;
-
-    // In "always" mode, use effective content width
-    const w_after_scrollbar = getEffectiveContentWidth(app, client_w);
-    const w = if (w_after_scrollbar > sidebar_w) w_after_scrollbar - sidebar_w else 1;
-
-    // Subtract tabbar height when ext_tabline is enabled but content_hwnd doesn't exist
-    // When using content_hwnd, it already has the correct size (excludes tabbar).
-    const tabbar_height: u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
-    else
-        0;
-    const h = if (client_h > tabbar_height) client_h - tabbar_height else 1;
+    const content = contentSizePx(hwnd, app);
+    const w = content.w;
+    const h = content.h;
 
     const cw: u32 = @max(1, app.cell_w_px);
     const ch: u32 = app.rowHeightPx();
@@ -7156,6 +7140,8 @@ test {
     // Message placement rules and the status/confirm stack rules.
     _ = @import("ui/messages.zig");
     _ = @import("ui/scrollbar.zig");
+    // The tab drag threshold rule shared by the titlebar and the sidebar.
+    _ = @import("ui/tabbar.zig");
     // DirectWrite shaping with [font] family features (skips without the font).
     _ = @import("renderer/dwrite_d2d_renderer.zig");
 }

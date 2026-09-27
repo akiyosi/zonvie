@@ -770,9 +770,6 @@ pub const SurfaceOriginInputs = struct {
     style_is_sidebar: bool = false,
     style_is_titlebar: bool = false,
     sidebar_on_right: bool = false,
-    /// A separate child HWND hosts the content, so the tab bar is not inside
-    /// the surface's own client area.
-    has_content_hwnd: bool = false,
     /// Already DPI-scaled.
     sidebar_width_px: i32 = 0,
     /// Already DPI-scaled.
@@ -790,7 +787,7 @@ pub fn surfaceOriginPx(in: SurfaceOriginInputs) SurfaceOrigin {
             in.sidebar_width_px
         else
             0,
-        .y = if (in.ext_tabline_enabled and in.style_is_titlebar and !in.has_content_hwnd)
+        .y = if (in.ext_tabline_enabled and in.style_is_titlebar)
             in.tab_bar_height_px
         else
             0,
@@ -1267,20 +1264,6 @@ pub fn spawnArgQuote(arg: []const u8) ?u8 {
         if (std.mem.indexOfScalar(u8, arg, q) == null and !ends_in_backslash) return q;
     }
     return null;
-}
-
-/// A devcontainer workspace or config path as the devcontainer commands can
-/// quote it: one pair of Explorer "Copy as path" quotes dropped, and trailing
-/// backslashes dropped (`C:\proj\` is `C:\proj`); a root keeps its backslash
-/// and gets a `.` after it (`C:\.`). Inside `"..."` a trailing backslash
-/// escapes the closing quote, and the rest of the command becomes part of
-/// the path.
-pub fn writeDevcontainerPathArg(w: *std.Io.Writer, raw: []const u8) !void {
-    var p = raw;
-    if (p.len >= 2 and p[0] == '"' and p[p.len - 1] == '"') p = p[1 .. p.len - 1];
-    while (p.len > 1 and p[p.len - 1] == '\\' and p[p.len - 2] != ':') p = p[0 .. p.len - 1];
-    try w.writeAll(p);
-    if (p.len > 0 and p[p.len - 1] == '\\') try w.writeByte('.');
 }
 
 pub const RowBand = struct { start: usize, end: usize };

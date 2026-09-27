@@ -293,9 +293,8 @@ fn storeMainSurfaceCursor(
         }
         if (app.hwnd) |hwnd| {
             // Compute viewport-aware cursor rect matching D3D11 viewport.
-            const rect_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
             var rect_client: c.RECT = undefined;
-            _ = c.GetClientRect(rect_hwnd, &rect_client);
+            _ = c.GetClientRect(hwnd, &rect_client);
 
             // The cursor's grid origin on the surface (content viewport plus
             // its layer's), and the core's bounds: the paint driver computes
@@ -2141,8 +2140,7 @@ pub fn onGuiFont(ctx: ?*anyopaque, bytes: ?[*]const u8, len: usize) callconv(.c)
     // flags. Setting them only after InvalidateRect — as the previous code did —
     // left a window in which the UI thread could snapshot new metrics together
     // with stale back_tex_valid=true and preserve a geometrically wrong back_tex.
-    app.surf.surface.paint_full = true;
-    app.paint_rects.clearRetainingCapacity();
+    app_mod.requestMainFullPaintLocked(app);
     app.need_full_seed.store(true, .seq_cst);
     app.seed_pending = true;
     app.seed_clear_pending = true;
@@ -2219,8 +2217,7 @@ pub fn onLineSpace(ctx: ?*anyopaque, linespace_px: i32) callconv(.c) void {
     // app.mu) for the same race-avoidance reason as onGuiFont: a WM_PAINT that
     // observes the new linespace must also see back_tex_valid=false and seed
     // flags, never an interleaved snapshot of new metrics + stale validity.
-    app.surf.surface.paint_full = true;
-    app.paint_rects.clearRetainingCapacity();
+    app_mod.requestMainFullPaintLocked(app);
     app.need_full_seed.store(true, .seq_cst);
     app.seed_pending = true;
     app.seed_clear_pending = true;

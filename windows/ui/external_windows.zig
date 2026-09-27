@@ -197,12 +197,10 @@ fn decoratedContentNdcTransform(
 /// hold app.mu -- this deliberately does not take it, because several window
 /// procedure arms keep the lock past the lookup to read further App state.
 ///
-/// Eight arms of ExternalWndProc and paintExternalWindow walked the map
-/// inline with the same predicate. Four sites deliberately still do not use
-/// this: WM_DPICHANGED and the scrollbar-drag arm do their work inside the
-/// loop rather than extracting a match, the pending-close sweep keys on
-/// is_pending_close and paint_ref_count instead of hwnd, and
-/// collectWindowInfos enumerates rather than looks up.
+/// The arms of ExternalWndProc and paintExternalWindow walked the map inline
+/// with the same predicate. Two sites still do not use this: the
+/// pending-close sweep keys on is_pending_close and paint_ref_count instead
+/// of hwnd, and collectWindowInfos enumerates rather than looks up.
 const ExtWindowHit = struct { grid_id: i64, win: *app_mod.ExternalWindow };
 
 fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
@@ -1411,6 +1409,15 @@ pub fn msgFloatOrigin(app: *App, target_rect: c.RECT, window_w: c_int, history_b
     }, window_w, history_bottom, app.scalePx(msg_float_margin_px), app.scalePx(msg_float_history_gap_px));
 }
 
+/// A `w` x `h` window centred horizontally on `work`, its top `1/y_divisor`
+/// of the free height down: the cmdline and popupmenu fallbacks.
+pub fn centredOnWorkArea(work: c.RECT, w: c_int, h: c_int, y_divisor: c_int) core.frontend_rules.Point {
+    return .{
+        .x = work.left + @divTrunc(work.right - work.left - w, 2),
+        .y = work.top + @divTrunc(work.bottom - work.top - h, y_divisor),
+    };
+}
+
 /// Keep msg_show below msg_history after msg_history is created or changes
 /// size, as macOS's linkedMsgShowFrame does. `app.mu` NOT held.
 pub fn restackMsgShowBelowHistory(app: *App) void {
@@ -1641,33 +1648,17 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     var pos_x: c_int = c.CW_USEDEFAULT;
     var pos_y: c_int = c.CW_USEDEFAULT;
 
-    // Restore saved position from previous tab switch (only for regular external windows)
+    // A tab drag's drop point, else the origin this grid's window closed at
+    // (regular external windows only). The rule is the core's; a drop point
+    // puts the window's top edge at the point, centred on it.
     if (!is_special_window) {
-        const saved_opt = app.saved_external_window_positions.get(req.grid_id);
-        if (saved_opt != null and saved_opt.?.session_generation == req.session_generation) {
-            const saved = saved_opt.?;
-            pos_x = saved.x;
-            pos_y = saved.y;
-            if (applog.isEnabled()) applog.appLog("[win] restored saved position for grid_id={d}: ({d},{d})\n", .{ req.grid_id, pos_x, pos_y });
+        const now_ms: i64 = @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms));
+        if (app.external_placement.take(req.grid_id, req.session_generation, now_ms)) |p| {
+            pos_x = @intFromFloat(p.x);
+            pos_y = @intFromFloat(p.y);
+            if (p.kind == .pending) pos_x -= @divTrunc(window_w, 2);
+            if (applog.isEnabled()) applog.appLog("[win] external window grid_id={d} positioned from {s}: ({d},{d})\n", .{ req.grid_id, @tagName(p.kind), pos_x, pos_y });
         }
-    }
-
-    // Tab externalization: use pending position if set (only for regular external windows, not special windows)
-    // Also check timeout (500ms) to prevent stale position from affecting unrelated windows.
-    const pending_timeout_ms: i64 = 500;
-    const now_ms = @as(i64, @intCast(@divTrunc(core.clock.nowNs(), std.time.ns_per_ms)));
-    const pending_age_ms = now_ms - app.pending_external_window_position_time;
-    if (!is_special_window and app.pending_external_window_position != null and pending_age_ms < pending_timeout_ms) {
-        const pos = app.pending_external_window_position.?;
-        // Position so the window is centered horizontally on cursor, below cursor
-        pos_x = pos.x - @divTrunc(window_w, 2);
-        pos_y = pos.y;
-        app.pending_external_window_position = null; // Clear after use
-        if (applog.isEnabled()) applog.appLog("[win] external window positioned from pending position: ({d},{d}) age={d}ms\n", .{ pos_x, pos_y, pending_age_ms });
-    } else if (app.pending_external_window_position != null and pending_age_ms >= pending_timeout_ms) {
-        // Pending position expired, clear it
-        if (applog.isEnabled()) applog.appLog("[win] clearing stale pending_external_window_position (age={d}ms)\n", .{pending_age_ms});
-        app.pending_external_window_position = null;
     }
 
     if (pos_x != c.CW_USEDEFAULT) {
@@ -1693,9 +1684,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window below message: ({d},{d})\n", .{ pos_x, pos_y });
             } else {
                 // Fallback: center on the main window's monitor
-                const work = app_mod.monitorWorkArea(app.hwnd);
-                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
+                const pos = centredOnWorkArea(app_mod.monitorWorkArea(app.hwnd), window_w, window_h, 3);
+                pos_x = pos.x;
+                pos_y = pos.y;
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window position (fallback): ({d},{d})\n", .{ pos_x, pos_y });
             }
         } else {
@@ -1717,9 +1708,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             } else {
                 // Default: center on the main window's monitor, slightly
                 // above center (1/3 from top)
-                const work = app_mod.monitorWorkArea(app.hwnd);
-                pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-                pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
+                const pos = centredOnWorkArea(app_mod.monitorWorkArea(app.hwnd), window_w, window_h, 3);
+                pos_x = pos.x;
+                pos_y = pos.y;
                 if (applog.isEnabled()) applog.appLog("[win] cmdline window position (default): ({d},{d})\n", .{ pos_x, pos_y });
             }
         }
@@ -1730,9 +1721,9 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             if (applog.isEnabled()) applog.appLog("[win] popupmenu above cmdline: ({d},{d})\n", .{ pos_x, pos_y });
         } else {
             // Fallback: center on the main window's monitor
-            const work = app_mod.monitorWorkArea(app.hwnd);
-            pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-            pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 2);
+            const pos = centredOnWorkArea(app_mod.monitorWorkArea(app.hwnd), window_w, window_h, 2);
+            pos_x = pos.x;
+            pos_y = pos.y;
             if (applog.isEnabled()) applog.appLog("[win] popupmenu fallback center: ({d},{d})\n", .{ pos_x, pos_y });
         }
     } else if (is_msg_history or is_msg_show) {
@@ -2220,30 +2211,10 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
     // positions to the new server's windows that reuse the ids.
     if (app.external_windows.get(grid_id)) |ew| {
         const current_generation = app.external_session_generation.load(.acquire);
-        if (ew.session_generation != current_generation) {
-            _ = app.saved_external_window_positions.remove(grid_id);
-        } else if (ew.hwnd) |hwnd| {
+        if (ew.hwnd) |hwnd| {
             var rect: c.RECT = undefined;
             if (c.GetWindowRect(hwnd, &rect) != 0) {
-                // Evict oldest entry (smallest grid_id) when inserting a new key
-                // to bound memory growth (matches macOS 100-entry cap).
-                if (app.saved_external_window_positions.getPtr(grid_id) == null and
-                    app.saved_external_window_positions.count() > 100)
-                {
-                    var min_key: i64 = std.math.maxInt(i64);
-                    var pos_it = app.saved_external_window_positions.iterator();
-                    while (pos_it.next()) |e| {
-                        if (e.key_ptr.* < min_key) min_key = e.key_ptr.*;
-                    }
-                    if (min_key != std.math.maxInt(i64)) {
-                        _ = app.saved_external_window_positions.remove(min_key);
-                    }
-                }
-                app.saved_external_window_positions.put(app.alloc, grid_id, .{
-                    .x = rect.left,
-                    .y = rect.top,
-                    .session_generation = current_generation,
-                }) catch {};
+                app.external_placement.save(grid_id, @floatFromInt(rect.left), @floatFromInt(rect.top), ew.session_generation, current_generation);
                 if (applog.isEnabled()) applog.appLog("[win] saved position for grid_id={d}: ({d},{d})\n", .{ grid_id, rect.left, rect.top });
             }
         }
@@ -2296,19 +2267,9 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         if (applog.isEnabled()) applog.appLog("[win] destroyed external window hwnd={*}\n", .{ext_win.hwnd});
         app.alloc.destroy(ext_win); // free the heap box itself; deinit() only frees its owned sub-resources
 
-        // msg_show was stacked below msg_history: move it back up.
-        if (grid_id == app_mod.MSG_HISTORY_GRID_ID) {
-            app.mu.lockUncancelable(core.clock.io());
-            const show_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |w| w.hwnd else null;
-            app.mu.unlock(core.clock.io());
-            var show_rect: c.RECT = undefined;
-            if (show_hwnd) |sh| {
-                if (c.GetWindowRect(sh, &show_rect) != 0) {
-                    const pos = msgFloatTopRight(app, false, show_rect.right - show_rect.left);
-                    _ = c.SetWindowPos(sh, null, pos.x, pos.y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
-                }
-            }
-        }
+        // msg_show was stacked below msg_history: with the history entry
+        // gone, the shared re-layout puts it back at the top.
+        if (grid_id == app_mod.MSG_HISTORY_GRID_ID) messages.updateExtFloatPositions(app);
     }
 
     // Note: We intentionally do NOT remove pending_external_verts here because
@@ -2439,22 +2400,15 @@ pub export fn ExternalWndProc(
                 const new_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
                 if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_DPICHANGED hwnd={*} new_dpi={d}\n", .{ hwnd, new_dpi });
 
+                // Update ONLY this window's own scrollbar-geometry DPI. Do
+                // NOT call atlas.updateDpi()/invalidate_glyph_cache here:
+                // app.atlas is a single instance shared by the main window
+                // and every external window (see MED-5 in the fix-plan doc)
+                // -- rescaling it here based on one external window's
+                // monitor would corrupt every other window's glyph
+                // rendering on their next repaint.
                 app.mu.lockUncancelable(core.clock.io());
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    if (entry.value_ptr.*.hwnd == hwnd) {
-                        // Update ONLY this window's own scrollbar-geometry
-                        // DPI. Do NOT call atlas.updateDpi()/
-                        // invalidate_glyph_cache here: app.atlas is a single
-                        // instance shared by the main window and every
-                        // external window (see MED-5 in the fix-plan doc)
-                        // -- rescaling it here based on one external
-                        // window's monitor would corrupt every other
-                        // window's glyph rendering on their next repaint.
-                        entry.value_ptr.*.dpi_scale = new_scale;
-                        break;
-                    }
-                }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.win.dpi_scale = new_scale;
                 app.mu.unlock(core.clock.io());
 
                 // WM_GETDPISCALEDSIZE (below) handed Windows the size to scale
@@ -2509,13 +2463,9 @@ pub export fn ExternalWndProc(
             if (applog.isEnabled()) applog.appLog("[win] ExternalWndProc WM_PAINT hwnd={*}\n", .{hwnd});
             if (app_mod.getApp(hwnd)) |app| {
                 app.mu.lockUncancelable(core.clock.io());
-                var retry_it = app.external_windows.valueIterator();
-                while (retry_it.next()) |ext_win_ptr| {
-                    if (ext_win_ptr.*.hwnd == hwnd) {
-                        ext_win_ptr.*.surf.paint_retry_deadline_ms = 0;
-                        ext_win_ptr.*.surf.paint_retry.paintStarted();
-                        break;
-                    }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    hit.win.surf.paint_retry_deadline_ms = 0;
+                    hit.win.surf.paint_retry.paintStarted();
                 }
                 app.mu.unlock(core.clock.io());
                 if (app.paintReentrancyBlocked()) {
@@ -2776,13 +2726,7 @@ pub export fn ExternalWndProc(
                 // here turns every later hover into a drag.
                 input.cancelMouseButtons(app);
                 app.mu.lockUncancelable(core.clock.io());
-                var it = app.external_windows.iterator();
-                while (it.next()) |entry| {
-                    const ew = entry.value_ptr.*;
-                    if (ew.hwnd != hwnd) continue;
-                    scrollbar.cancelPointer(scrollbar.externalSurface(ew, entry.key_ptr.*));
-                    break;
-                }
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| scrollbar.cancelPointer(scrollbar.externalSurface(hit.win, hit.grid_id));
                 app.mu.unlock(core.clock.io());
             }
             return 0;
@@ -2948,15 +2892,10 @@ pub export fn ExternalWndProc(
                 }
                 var should_invalidate = false;
                 app.mu.lockUncancelable(core.clock.io());
-                var it = app.external_windows.valueIterator();
-                while (it.next()) |ext_win_ptr| {
-                    const ext_win = ext_win_ptr.*;
-                    if (ext_win.hwnd == hwnd and
-                        ext_win.window_wake_cookie == @as(usize, @bitCast(lParam)))
-                    {
-                        should_invalidate = ext_win.surf.paint_retry.timerFired(@intCast(wParam));
-                        if (should_invalidate) ext_win.surf.paint_retry_deadline_ms = 0;
-                        break;
+                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
+                    if (hit.win.window_wake_cookie == @as(usize, @bitCast(lParam))) {
+                        should_invalidate = hit.win.surf.paint_retry.timerFired(@intCast(wParam));
+                        if (should_invalidate) hit.win.surf.paint_retry_deadline_ms = 0;
                     }
                 }
                 app.mu.unlock(core.clock.io());

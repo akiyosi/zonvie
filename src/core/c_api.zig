@@ -1983,6 +1983,37 @@ pub export fn zonvie_core_key_is_special(keycode: u32) callconv(.c) bool {
     return core.Core.specialKeyName(keycode) != null;
 }
 
+pub export fn zonvie_core_mouse_modifiers(mods: u32, out: *[5]u8) callconv(.c) usize {
+    return frontend_rules.mouseModifierString(out, mods).len;
+}
+
+pub export fn zonvie_core_parse_ssh_target(value: ?[*]const u8, len: usize, out_host_len: ?*usize, out_port: ?*i32) callconv(.c) void {
+    const v = value orelse return;
+    const t = frontend_rules.sshTarget(v[0..len]);
+    if (out_host_len) |p| p.* = t.host.len;
+    if (out_port) |p| p.* = if (t.port) |port| port else -1;
+}
+
+pub export fn zonvie_core_cli_next_is_value(next: ?[*]const u8, len: usize) callconv(.c) bool {
+    return frontend_rules.cliNextIsValue(if (next) |n| n[0..len] else null);
+}
+
+pub export fn zonvie_core_devcontainer_exec_cmd(
+    out: ?[*]u8,
+    cap: usize,
+    workspace: ?[*]const u8,
+    workspace_len: usize,
+    config_path: ?[*]const u8,
+    config_len: usize,
+) callconv(.c) usize {
+    const buf = (out orelse return 0)[0..cap];
+    if (cap == 0) return 0;
+    const ws = if (workspace) |w| w[0..workspace_len] else "";
+    const cmd = frontend_rules.devcontainerExecCmd(buf[0 .. cap - 1], ws, if (config_path) |c| c[0..config_len] else null);
+    buf[cmd.len] = 0;
+    return cmd.len;
+}
+
 pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderNeedsAnimation(s[0..len]);
@@ -2001,6 +2032,26 @@ pub export fn zonvie_core_externalize_tab(p: ?*zonvie_core, tab_idx: u32) callco
     var buf: [1024]u8 = undefined;
     const cmd = frontend_rules.externalizeTabCommand(&buf, tab_idx) orelse return;
     box.core.requestCommand(cmd) catch {};
+}
+
+pub const PlacementMemoryC = frontend_rules.PlacementMemory;
+
+pub export fn zonvie_placement_set_pending(m: *PlacementMemoryC, x: f64, y: f64, now_ms: i64) callconv(.c) void {
+    m.setPending(x, y, now_ms);
+}
+
+pub export fn zonvie_placement_save(m: *PlacementMemoryC, grid_id: i64, x: f64, y: f64, generation: u64, current_generation: u64) callconv(.c) void {
+    m.save(grid_id, x, y, generation, current_generation);
+}
+
+pub export fn zonvie_placement_take(m: *PlacementMemoryC, grid_id: i64, generation: u64, now_ms: i64, out_x: ?*f64, out_y: ?*f64) callconv(.c) c_int {
+    const p = m.take(grid_id, generation, now_ms) orelse return 0;
+    if (out_x) |o| o.* = p.x;
+    if (out_y) |o| o.* = p.y;
+    return switch (p.kind) {
+        .pending => 1,
+        .saved => 2,
+    };
 }
 
 pub const BlinkC = frontend_rules.Blink;

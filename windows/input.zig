@@ -45,6 +45,7 @@ fn imeExternalSurfaceLocked(app: *App, grid_id: i64) ?ImeExternalSurface {
 pub const MOD_CTRL = 1 << 0; // same bit layout as header comment
 pub const MOD_ALT = 1 << 1;
 pub const MOD_SHIFT = 1 << 2;
+pub const MOD_SUPER = 1 << 3;
 // Windows has no "Command", leave it unused.
 
 /// Non-blocking cursor position query with cache fallback (mirrors macOS's
@@ -430,7 +431,6 @@ pub fn surfaceOriginPx(app: *App, is_main_window: bool) render_helpers.SurfaceOr
         .style_is_sidebar = app.tabline_style == .sidebar,
         .style_is_titlebar = app.tabline_style == .titlebar,
         .sidebar_on_right = app.sidebar_position_right,
-        .has_content_hwnd = app.content_hwnd != null,
         .sidebar_width_px = @as(i32, app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))),
         .tab_bar_height_px = @as(i32, app.scalePx(app_mod.TablineState.TAB_BAR_HEIGHT)),
     });
@@ -689,24 +689,13 @@ pub fn handleImeChar(app: *App, ch: u16) void {
 }
 
 pub fn buildMouseModifiers(wParam: c.WPARAM) [5]u8 {
-    var mod_buf: [5]u8 = .{ 0, 0, 0, 0, 0 };
-    var mod_len: usize = 0;
-    if ((wParam & c.MK_SHIFT) != 0) {
-        mod_buf[mod_len] = 'S';
-        mod_len += 1;
-    }
-    if ((wParam & c.MK_CONTROL) != 0) {
-        mod_buf[mod_len] = 'C';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_MENU) < 0) {
-        mod_buf[mod_len] = 'A';
-        mod_len += 1;
-    }
-    if (c.GetKeyState(c.VK_LWIN) < 0 or c.GetKeyState(c.VK_RWIN) < 0) {
-        mod_buf[mod_len] = 'D';
-        mod_len += 1;
-    }
+    var mods: u32 = 0;
+    if ((wParam & c.MK_SHIFT) != 0) mods |= MOD_SHIFT;
+    if ((wParam & c.MK_CONTROL) != 0) mods |= MOD_CTRL;
+    if (keyIsDown(c.VK_MENU)) mods |= MOD_ALT;
+    if (keyIsDown(c.VK_LWIN) or keyIsDown(c.VK_RWIN)) mods |= MOD_SUPER;
+    var mod_buf: [5]u8 = undefined;
+    _ = core.frontend_rules.mouseModifierString(&mod_buf, mods);
     return mod_buf;
 }
 
@@ -1204,13 +1193,62 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
     return n;
 }
 
+/// The cursor cell as client points of `coord_hwnd`: the window that shows
+/// the cursor's grid. On an external host that is its client area, the grid's
+/// layer origin plus the decorated content origin; in the main window the
+/// grid's start row/col at the surface origin (below a titlebar tab bar,
+/// right of a left sidebar). `pt_below` is one cell down, for the candidate
+/// list. The candidate window and the preedit overlay both place against
+/// this. Null when no cursor position is known yet (a cold cache under lock
+/// contention yields (-1,-1)).
+const ImeCursorPoint = struct { coord_hwnd: c.HWND, pt_cursor: c.POINT, pt_below: c.POINT };
+
+fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWND, cell_w: u32, cell_h: u32, row_h_px: u32) ?ImeCursorPoint {
+    var row: i32 = 0;
+    var col: i32 = 0;
+    const grid_id = getCursorPositionNonBlocking(app, corep, &row, &col, null);
+    if (row < 0 or col < 0) return null;
+
+    const ext_surface = blk: {
+        app.mu.lockUncancelable(core.clock.io());
+        defer app.mu.unlock(core.clock.io());
+        break :blk imeExternalSurfaceLocked(app, grid_id);
+    };
+    const decorated = imeDecoratedOrigin(app, ext_surface);
+    var coord_hwnd: c.HWND = main_hwnd;
+    var origin_x: c.LONG = decorated[0];
+    var origin_y: c.LONG = decorated[1];
+    if (ext_surface) |es| {
+        coord_hwnd = es.hwnd;
+        origin_x += es.x_px;
+        origin_y += es.y_px;
+    } else {
+        for (app.getVisibleGridsCached(corep)) |grid| {
+            if (grid.grid_id == grid_id) {
+                row += grid.start_row;
+                col += grid.start_col;
+                break;
+            }
+        }
+        const origin = surfaceOriginPx(app, true);
+        origin_x += origin.x;
+        origin_y += origin.y;
+    }
+    const x = origin_x + col * @as(c.LONG, @intCast(cell_w));
+    const y = origin_y + row * @as(c.LONG, @intCast(row_h_px));
+    return .{
+        .coord_hwnd = coord_hwnd,
+        .pt_cursor = .{ .x = x, .y = y },
+        .pt_below = .{ .x = x, .y = y + @as(c.LONG, @intCast(cell_h)) },
+    };
+}
+
 /// Position IME candidate window at cursor location.
 pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const himc = c.ImmGetContext(hwnd);
     if (himc == null) return;
     defer _ = c.ImmReleaseContext(hwnd, himc);
 
-    // Get cursor position and cell metrics from core
     app.mu.lockUncancelable(core.clock.io());
     const corep = app.corep;
     const cell_w = app.cell_w_px;
@@ -1219,108 +1257,29 @@ pub fn positionImeCandidateWindow(hwnd: c.HWND, app: *App) void {
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
-    if (corep == null) return;
-
-    // Row height includes linespace (for row positioning)
-    const row_h: i32 = @intCast(row_h_px);
-
-    var row: i32 = 0;
-    var col: i32 = 0;
-    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
-
-    // A cold cache under lock contention yields (-1,-1); skip positioning
-    // rather than placing the candidate window at negative coordinates
-    // (macOS counterpart checks cursor.row >= 0 the same way).
-    if (row < 0 or col < 0) return;
-
-    // Check if cursor is on an external window's grid (e.g. ext-cmdline).
-    // If so, we need to calculate screen coordinates via that window, then convert
-    // back to the IME hwnd's client coordinates. Otherwise the candidate window
-    // appears behind the topmost external window and is invisible.
-    const ext_surface = blk: {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        break :blk imeExternalSurfaceLocked(app, grid_id);
-    };
-
-    if (ext_surface) |es| {
-        const ehwnd = es.hwnd;
-        // Cursor is on an external grid — position via that window's client area.
-        const decorated_origin = imeDecoratedOrigin(app, es);
-        const cmdline_x_offset: c.LONG = decorated_origin[0];
-        const cmdline_y_offset: c.LONG = decorated_origin[1];
-
-        // Grid-local pixel position within the external window's client
-        // area, plus where a hosted float sits in it.
-        const local_x: c.LONG = es.x_px + col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset;
-        const local_cursor_y: c.LONG = es.y_px + row * row_h + cmdline_y_offset;
-        const local_below_y: c.LONG = local_cursor_y + @as(c.LONG, @intCast(cell_h));
-
-        // Convert external window client coords → screen → IME hwnd client coords
-        var pt_cursor: c.POINT = .{ .x = local_x, .y = local_cursor_y };
-        var pt_below: c.POINT = .{ .x = local_x, .y = local_below_y };
-        _ = c.ClientToScreen(ehwnd, &pt_cursor);
-        _ = c.ClientToScreen(ehwnd, &pt_below);
+    const cp = imeCursorClientPoint(app, corep orelse return, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
+    var pt_cursor = cp.pt_cursor;
+    var pt_below = cp.pt_below;
+    // Into the client area of the window the IME is attached to, which is
+    // another window when the cursor's grid is shown elsewhere; placed in
+    // the external host's coordinates the candidate list sat behind it.
+    if (cp.coord_hwnd != hwnd) {
+        _ = c.ClientToScreen(cp.coord_hwnd, &pt_cursor);
+        _ = c.ClientToScreen(cp.coord_hwnd, &pt_below);
         _ = c.ScreenToClient(hwnd, &pt_cursor);
         _ = c.ScreenToClient(hwnd, &pt_below);
-
-        var cf: c.COMPOSITIONFORM = undefined;
-        cf.dwStyle = c.CFS_POINT;
-        cf.ptCurrentPos = .{ .x = pt_cursor.x, .y = pt_cursor.y };
-        _ = c.ImmSetCompositionWindow(himc, &cf);
-
-        var candidate_form: c.CANDIDATEFORM = undefined;
-        candidate_form.dwIndex = 0;
-        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-        candidate_form.ptCurrentPos = .{ .x = pt_below.x, .y = pt_below.y };
-        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
-    } else {
-        // Cursor is on a main-window grid — use startRow/startCol offset.
-        const cached = app.getVisibleGridsCached(corep.?);
-
-        var screen_row: i32 = row;
-        var screen_col: i32 = col;
-
-        for (cached) |grid| {
-            if (grid.grid_id == grid_id) {
-                screen_row = grid.start_row + row;
-                screen_col = grid.start_col + col;
-                break;
-            }
-        }
-
-        // In the MAIN window's client area: the surface starts below a
-        // titlebar tab bar and right of a left sidebar — the rule the paint
-        // and the mouse use. Adding the tab bar for every tabline style put
-        // the candidate a bar too low under a sidebar and never moved it right.
-        const origin = surfaceOriginPx(app, true);
-        const x: c.LONG = origin.x + @as(c.LONG, @intCast(screen_col * @as(i32, @intCast(cell_w))));
-        const cursor_y: c.LONG = origin.y + @as(c.LONG, @intCast(screen_row * row_h));
-        var pt_cursor: c.POINT = .{ .x = x, .y = cursor_y };
-        var pt_below: c.POINT = .{ .x = x, .y = cursor_y + @as(c.LONG, @intCast(cell_h)) };
-        // Then into the client area of the window IME is attached to, which
-        // is another window when focus sits in an external one: the preedit
-        // overlay converts through the main window too.
-        if (main_hwnd) |mh| {
-            if (mh != hwnd) {
-                _ = c.ClientToScreen(mh, &pt_cursor);
-                _ = c.ClientToScreen(mh, &pt_below);
-                _ = c.ScreenToClient(hwnd, &pt_cursor);
-                _ = c.ScreenToClient(hwnd, &pt_below);
-            }
-        }
-
-        var cf: c.COMPOSITIONFORM = undefined;
-        cf.dwStyle = c.CFS_POINT;
-        cf.ptCurrentPos = pt_cursor;
-        _ = c.ImmSetCompositionWindow(himc, &cf);
-
-        var candidate_form: c.CANDIDATEFORM = undefined;
-        candidate_form.dwIndex = 0;
-        candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
-        candidate_form.ptCurrentPos = pt_below;
-        _ = c.ImmSetCandidateWindow(himc, &candidate_form);
     }
+
+    var cf: c.COMPOSITIONFORM = undefined;
+    cf.dwStyle = c.CFS_POINT;
+    cf.ptCurrentPos = pt_cursor;
+    _ = c.ImmSetCompositionWindow(himc, &cf);
+
+    var candidate_form: c.CANDIDATEFORM = undefined;
+    candidate_form.dwIndex = 0;
+    candidate_form.dwStyle = c.CFS_CANDIDATEPOS;
+    candidate_form.ptCurrentPos = pt_below;
+    _ = c.ImmSetCandidateWindow(himc, &candidate_form);
 }
 
 /// Disable IME input (switch to direct input mode).
@@ -1384,7 +1343,6 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     atlas_ptr = if (app.atlas) |*a| a else null;
     atlas_cell_w = cell_w;
     atlas_cell_h = cell_h;
-    const content_hwnd = app.content_hwnd;
     const main_hwnd = app.hwnd;
     app.mu.unlock(core.clock.io());
 
@@ -1409,52 +1367,9 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
         return;
     }
 
-    // Row height includes linespace
-    const row_h: u32 = row_h_px;
-
-    var row: i32 = 0;
-    var col: i32 = 0;
-    const grid_id = getCursorPositionNonBlocking(app, corep.?, &row, &col, null);
-
-    // The window that shows the cursor's grid, as the candidate window finds
-    // it. This asked whether the window with focus was an external one, so a
-    // float an external window hosts was placed at its grid-local position.
-    const ext_surface = blk: {
-        app.mu.lockUncancelable(core.clock.io());
-        defer app.mu.unlock(core.clock.io());
-        break :blk imeExternalSurfaceLocked(app, grid_id);
-    };
-    const is_external_window = ext_surface != null;
-
-    var screen_row: i32 = row;
-    var screen_col: i32 = col;
-
-    // For external windows, use grid-local coordinates directly
-    // For main window, add start_row/start_col to get screen position
-    if (!is_external_window) {
-        // Get grid info to calculate screen position (non-blocking)
-        const cached = app.getVisibleGridsCached(corep.?);
-
-        for (cached) |grid| {
-            if (grid.grid_id == grid_id) {
-                screen_row = grid.start_row + row;
-                screen_col = grid.start_col + col;
-                break;
-            }
-        }
-    }
-
-    // Hide overlay if no composition text
-    if (comp_str.len == 0) {
-        if (app.ime_overlay_hwnd) |overlay| {
-            _ = c.ShowWindow(overlay, c.SW_HIDE);
-        }
-        return;
-    }
-
-    // A cold cursor-position cache under lock contention yields (-1,-1);
-    // keep the overlay's previous position rather than drawing off-window.
-    if (row < 0 or col < 0) return;
+    // No cursor position yet: keep the overlay's previous position rather
+    // than drawing off-window.
+    const cp = imeCursorClientPoint(app, corep.?, main_hwnd orelse hwnd, cell_w, cell_h, row_h_px) orelse return;
 
     // Create a memory DC and font first to measure actual text width
     const screen_dc = c.GetDC(null);
@@ -1505,36 +1420,10 @@ pub fn updateImePreeditOverlay(hwnd: c.HWND, app: *App) void {
     const overlay_width: i32 = text_size.cx + 4; // Add small padding
     const overlay_height: i32 = @intCast(atlas_cell_h);
 
-    // Convert client position to screen position (use row_h for Y position),
-    // past a decorated surface's icon strip and padding.
-    const decorated_origin = imeDecoratedOrigin(app, ext_surface);
-    const cmdline_x_offset: c.LONG = decorated_origin[0];
-    const cmdline_y_offset: c.LONG = decorated_origin[1];
+    var pt = cp.pt_cursor;
+    _ = c.ClientToScreen(cp.coord_hwnd, &pt);
 
-    var pt: c.POINT = .{
-        .x = screen_col * @as(c.LONG, @intCast(cell_w)) + cmdline_x_offset,
-        .y = screen_row * @as(c.LONG, @intCast(row_h)) + cmdline_y_offset,
-    };
-    // An external window's coordinates are relative to its own client area,
-    // plus where a hosted float sits in it. The main window's start at the
-    // surface origin (below a titlebar tab bar, right of a left sidebar),
-    // or in content_hwnd when a child window hosts the content.
-    var coord_hwnd: c.HWND = hwnd;
-    if (ext_surface) |es| {
-        coord_hwnd = es.hwnd;
-        pt.x += es.x_px;
-        pt.y += es.y_px;
-    } else if (content_hwnd) |ch| {
-        coord_hwnd = ch;
-    } else {
-        if (main_hwnd) |mh| coord_hwnd = mh;
-        const origin = surfaceOriginPx(app, true);
-        pt.x += origin.x;
-        pt.y += origin.y;
-    }
-    _ = c.ClientToScreen(coord_hwnd, &pt);
-
-    if (log_active) applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h });
+    if (log_active) applog.appLog("[IME] overlay pos=({d},{d}) size=({d},{d}) text_w={d} cell=({d},{d}) row_h={d}\n", .{ pt.x, pt.y, overlay_width, overlay_height, text_size.cx, cell_w, cell_h, row_h_px });
 
     // Create overlay window if it doesn't exist (use layered window)
     if (app.ime_overlay_hwnd == null) {

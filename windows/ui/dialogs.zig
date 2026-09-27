@@ -5,7 +5,6 @@ const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const window_mod = @import("../window.zig");
-const render_helpers = @import("../render_pipeline_helpers.zig");
 
 // --- SSH Password Dialog state ---
 
@@ -539,11 +538,11 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
     var writer = std.Io.Writer.fixed(&cmd_buf);
 
     writer.writeAll("cmd /c \"devcontainer up --workspace-folder \"\"") catch {};
-    render_helpers.writeDevcontainerPathArg(&writer, workspace) catch {};
+    core.frontend_rules.writeDevcontainerPath(&writer, workspace) catch {};
     writer.writeAll("\"\"") catch {};
     if (config_path) |cfg| {
         writer.writeAll(" --config \"\"") catch {};
-        render_helpers.writeDevcontainerPathArg(&writer, cfg) catch {};
+        core.frontend_rules.writeDevcontainerPath(&writer, cfg) catch {};
         writer.writeAll("\"\"") catch {};
     }
     writer.writeAll(" --additional-features \"{\"\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\"\":{}}\"") catch {};

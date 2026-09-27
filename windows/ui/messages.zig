@@ -722,9 +722,9 @@ pub fn resizeExternalWindowDeferred(app: *App, grid_id: i64) void {
     if (is_cmdline) {
         // Re-center cmdline on the current monitor after font size change.
         // Preserving the old position caused visible drift on repeated changes.
-        const work = app_mod.monitorWorkArea(ext_hwnd);
-        pos_x = work.left + @divTrunc(work.right - work.left - window_w, 2);
-        pos_y = work.top + @divTrunc(work.bottom - work.top - window_h, 3);
+        const pos = external_windows.centredOnWorkArea(app_mod.monitorWorkArea(ext_hwnd), window_w, window_h, 3);
+        pos_x = pos.x;
+        pos_y = pos.y;
     } else if (grid_id == app_mod.MESSAGE_GRID_ID or grid_id == app_mod.MSG_HISTORY_GRID_ID) {
         // The message floats keep their top-right anchor, as on every other
         // re-layout; the top-left one grew them past the right margin.

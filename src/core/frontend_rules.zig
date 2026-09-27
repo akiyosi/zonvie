@@ -53,6 +53,142 @@ test "externalizing selects the tab by its 1-based number" {
 }
 
 // ---------------------------------------------------------------------------
+// Mouse modifiers
+
+/// The modifier string of nvim_input_mouse ("S", "C", "A", "D" in that
+/// order) for the send_key_event bitmask: 1<<0 Ctrl, 1<<1 Alt, 1<<2 Shift,
+/// 1<<3 Super. NUL-terminated in `buf`.
+pub fn mouseModifierString(buf: *[5]u8, mods: u32) [:0]const u8 {
+    var len: usize = 0;
+    const order = [_]struct { bit: u32, letter: u8 }{
+        .{ .bit = 1 << 2, .letter = 'S' },
+        .{ .bit = 1 << 0, .letter = 'C' },
+        .{ .bit = 1 << 1, .letter = 'A' },
+        .{ .bit = 1 << 3, .letter = 'D' },
+    };
+    for (order) |m| {
+        if (mods & m.bit == 0) continue;
+        buf[len] = m.letter;
+        len += 1;
+    }
+    buf[len] = 0;
+    return buf[0..len :0];
+}
+
+test "mouse modifiers come out as S, C, A, D in that order" {
+    var buf: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("", mouseModifierString(&buf, 0));
+    try std.testing.expectEqualStrings("S", mouseModifierString(&buf, 1 << 2));
+    try std.testing.expectEqualStrings("CA", mouseModifierString(&buf, (1 << 0) | (1 << 1)));
+    try std.testing.expectEqualStrings("SCAD", mouseModifierString(&buf, 0xF));
+    try std.testing.expectEqualStrings("D", mouseModifierString(&buf, (1 << 3) | (1 << 8)));
+}
+
+// ---------------------------------------------------------------------------
+// CLI
+
+pub const SshTarget = struct { host: []const u8, port: ?u16 };
+
+/// `user@host[:port]`: the port is what follows the last colon, and only when
+/// that is a port number; otherwise the whole value is the host.
+pub fn sshTarget(value: []const u8) SshTarget {
+    const colon = std.mem.lastIndexOfScalar(u8, value, ':') orelse return .{ .host = value, .port = null };
+    const port = std.fmt.parseInt(u16, value[colon + 1 ..], 10) catch return .{ .host = value, .port = null };
+    return .{ .host = value[0..colon], .port = port };
+}
+
+/// Whether a bare flag (`--ssh host`) takes the token after it as its value:
+/// only when there is one and it is not itself a flag, so `--ssh --dialog`
+/// does not take "--dialog" as the host.
+pub fn cliNextIsValue(next: ?[]const u8) bool {
+    const n = next orelse return false;
+    return !std.mem.startsWith(u8, n, "-");
+}
+
+/// A devcontainer workspace or config path as the devcontainer commands can
+/// quote it: one pair of Explorer "Copy as path" quotes dropped, and trailing
+/// backslashes dropped (`C:\proj\` is `C:\proj`); a root keeps its backslash
+/// and gets a `.` after it (`C:\.`). Inside `"..."` a trailing backslash
+/// escapes the closing quote, and the rest of the command becomes part of
+/// the path. A POSIX path passes through unchanged.
+pub fn writeDevcontainerPath(w: *std.Io.Writer, raw: []const u8) !void {
+    var p = raw;
+    if (p.len >= 2 and p[0] == '"' and p[p.len - 1] == '"') p = p[1 .. p.len - 1];
+    while (p.len > 1 and p[p.len - 1] == '\\' and p[p.len - 2] != ':') p = p[0 .. p.len - 1];
+    try w.writeAll(p);
+    if (p.len > 0 and p[p.len - 1] == '\\') try w.writeByte('.');
+}
+
+/// The `devcontainer exec ... nvim --embed` command line, as much of it as
+/// fits in `buf`: a truncated command fails at the spawn.
+pub fn devcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]const u8) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll("devcontainer exec --workspace-folder \"") catch {};
+    writeDevcontainerPath(&w, workspace) catch {};
+    w.writeAll("\"") catch {};
+    if (config_path) |cfg| {
+        w.writeAll(" --config \"") catch {};
+        writeDevcontainerPath(&w, cfg) catch {};
+        w.writeAll("\"") catch {};
+    }
+    w.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
+    return buf[0..w.end];
+}
+
+test "a devcontainer path drops what would break the quoted argument" {
+    const cases = [_]struct { raw: []const u8, want: []const u8 }{
+        .{ .raw = ".\\proj\\", .want = ".\\proj" },
+        .{ .raw = "C:\\My Dir\\\\", .want = "C:\\My Dir" },
+        .{ .raw = "\"C:\\proj\"", .want = "C:\\proj" },
+        .{ .raw = "C:\\", .want = "C:\\." },
+        .{ .raw = "\"D:\\\"", .want = "D:\\." },
+        .{ .raw = "/work/app", .want = "/work/app" },
+        .{ .raw = "/work/app/", .want = "/work/app/" },
+        .{ .raw = "\\", .want = "\\." },
+    };
+    for (cases) |case| {
+        var buf: [64]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        try writeDevcontainerPath(&w, case.raw);
+        try std.testing.expectEqualStrings(case.want, buf[0..w.end]);
+    }
+}
+
+test "the devcontainer exec command quotes both paths and embeds nvim" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "devcontainer exec --workspace-folder \"/work/app\" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed",
+        devcontainerExecCmd(&buf, "/work/app", null),
+    );
+    try std.testing.expectEqualStrings(
+        "devcontainer exec --workspace-folder \"C:\\proj\" --config \"C:\\proj\\.devcontainer\\devcontainer.json\" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed",
+        devcontainerExecCmd(&buf, "\"C:\\proj\\\"", "C:\\proj\\.devcontainer\\devcontainer.json"),
+    );
+}
+
+test "an ssh target splits its port off the last colon, only when numeric" {
+    const plain = sshTarget("me@host");
+    try std.testing.expectEqualStrings("me@host", plain.host);
+    try std.testing.expect(plain.port == null);
+    const with_port = sshTarget("me@host:2222");
+    try std.testing.expectEqualStrings("me@host", with_port.host);
+    try std.testing.expectEqual(@as(?u16, 2222), with_port.port);
+    // Not a port: the colon stays in the host.
+    const alias = sshTarget("me@host:dev");
+    try std.testing.expectEqualStrings("me@host:dev", alias.host);
+    try std.testing.expect(alias.port == null);
+    try std.testing.expectEqualStrings("host:", sshTarget("host:").host);
+    try std.testing.expectEqualStrings("host:99999", sshTarget("host:99999").host);
+}
+
+test "a bare flag takes the next token only when it is a value" {
+    try std.testing.expect(cliNextIsValue("me@host"));
+    try std.testing.expect(!cliNextIsValue("--dialog"));
+    try std.testing.expect(!cliNextIsValue("-u"));
+    try std.testing.expect(!cliNextIsValue(null));
+}
+
+// ---------------------------------------------------------------------------
 // Custom shaders
 
 /// Whether a Shadertoy-style shader reads a uniform that changes every frame,
@@ -189,6 +325,140 @@ test "a cmdline taking 90% of the width is centred" {
     const area: Rect = .{ .left = 100, .top = 0, .right = 1100, .bottom = 900 };
     const old: Rect = .{ .left = 150, .top = 280, .right = 550, .bottom = 320 };
     try std.testing.expectEqual(Point{ .x = 150, .y = 280 }, cmdlineOrigin(old, 900, 40, area));
+}
+
+// ---------------------------------------------------------------------------
+// External window placement memory
+
+pub const SavedOrigin = extern struct { grid_id: i64, x: f64, y: f64, generation: u64 };
+
+pub const Placement = struct {
+    kind: enum(u8) { pending, saved },
+    x: f64,
+    y: f64,
+};
+
+/// Where the next external window goes, in the caller's screen units: the
+/// drop point of a tab drag (`pending`, good for 500 ms) beats the origin the
+/// grid's window had when it closed (`saved`), which is kept only for the
+/// session that created it: grid ids restart per server. Holds 100 saved
+/// origins; a new one past that evicts the smallest grid id.
+pub const PlacementMemory = extern struct {
+    pub const cap = 100;
+    pub const pending_timeout_ms: i64 = 500;
+
+    saved: [cap + 1]SavedOrigin = undefined,
+    saved_len: usize = 0,
+    pending_x: f64 = 0,
+    pending_y: f64 = 0,
+    pending_set_ms: i64 = 0,
+    has_pending: bool = false,
+
+    pub fn setPending(self: *PlacementMemory, x: f64, y: f64, now_ms: i64) void {
+        self.pending_x = x;
+        self.pending_y = y;
+        self.pending_set_ms = now_ms;
+        self.has_pending = true;
+    }
+
+    /// The window of `grid_id`, created under `generation`, closed at (x, y).
+    pub fn save(self: *PlacementMemory, grid_id: i64, x: f64, y: f64, generation: u64, current_generation: u64) void {
+        if (generation != current_generation) {
+            self.forget(grid_id);
+            return;
+        }
+        if (self.find(grid_id)) |i| {
+            self.saved[i] = .{ .grid_id = grid_id, .x = x, .y = y, .generation = generation };
+            return;
+        }
+        if (self.saved_len > cap) {
+            var min_i: usize = 0;
+            for (self.saved[0..self.saved_len], 0..) |e, i| {
+                if (e.grid_id < self.saved[min_i].grid_id) min_i = i;
+            }
+            self.removeAt(min_i);
+        }
+        self.saved[self.saved_len] = .{ .grid_id = grid_id, .x = x, .y = y, .generation = generation };
+        self.saved_len += 1;
+    }
+
+    /// The placement for a window of `grid_id` opening under `generation`, or
+    /// null for none. A pending drop point is consumed; a saved origin stays
+    /// for the next reopen; one from another session is dropped.
+    pub fn take(self: *PlacementMemory, grid_id: i64, generation: u64, now_ms: i64) ?Placement {
+        if (self.has_pending) {
+            self.has_pending = false;
+            if (now_ms - self.pending_set_ms < pending_timeout_ms) {
+                return .{ .kind = .pending, .x = self.pending_x, .y = self.pending_y };
+            }
+        }
+        const i = self.find(grid_id) orelse return null;
+        const e = self.saved[i];
+        if (e.generation != generation) {
+            self.removeAt(i);
+            return null;
+        }
+        return .{ .kind = .saved, .x = e.x, .y = e.y };
+    }
+
+    fn forget(self: *PlacementMemory, grid_id: i64) void {
+        if (self.find(grid_id)) |i| self.removeAt(i);
+    }
+
+    fn find(self: *const PlacementMemory, grid_id: i64) ?usize {
+        for (self.saved[0..self.saved_len], 0..) |e, i| {
+            if (e.grid_id == grid_id) return i;
+        }
+        return null;
+    }
+
+    fn removeAt(self: *PlacementMemory, i: usize) void {
+        self.saved_len -= 1;
+        self.saved[i] = self.saved[self.saved_len];
+    }
+};
+
+test "a drop point beats a saved origin and is used once, within 500 ms" {
+    var m: PlacementMemory = .{};
+    m.save(5, 10, 20, 1, 1);
+    m.setPending(300, 400, 1000);
+    const p = m.take(5, 1, 1400).?;
+    try std.testing.expectEqual(@as(f64, 300), p.x);
+    try std.testing.expect(p.kind == .pending);
+    // Consumed: the saved origin is what remains.
+    const s = m.take(5, 1, 1401).?;
+    try std.testing.expect(s.kind == .saved);
+    try std.testing.expectEqual(@as(f64, 10), s.x);
+    try std.testing.expectEqual(@as(f64, 20), s.y);
+    // A stale drop point is dropped, not used.
+    m.setPending(1, 2, 2000);
+    try std.testing.expect(m.take(7, 1, 2500) == null);
+    try std.testing.expect(!m.has_pending);
+}
+
+test "a saved origin belongs to the session that created it" {
+    var m: PlacementMemory = .{};
+    // Closed after a restart: nothing kept.
+    m.save(3, 1, 1, 1, 2);
+    try std.testing.expect(m.take(3, 2, 0) == null);
+    // Kept, then asked for under a later generation: dropped.
+    m.save(3, 1, 1, 2, 2);
+    try std.testing.expect(m.take(3, 2, 0) != null);
+    try std.testing.expect(m.take(3, 3, 0) == null);
+    try std.testing.expectEqual(@as(usize, 0), m.saved_len);
+}
+
+test "the 101st new grid evicts the smallest grid id; a re-save evicts nothing" {
+    var m: PlacementMemory = .{};
+    var g: i64 = 1;
+    while (g <= 101) : (g += 1) m.save(g, @floatFromInt(g), 0, 1, 1);
+    try std.testing.expectEqual(@as(usize, 101), m.saved_len);
+    m.save(50, 0, 0, 1, 1);
+    try std.testing.expectEqual(@as(usize, 101), m.saved_len);
+    m.save(102, 0, 0, 1, 1);
+    try std.testing.expectEqual(@as(usize, 101), m.saved_len);
+    try std.testing.expect(m.take(1, 1, 0) == null);
+    try std.testing.expectEqual(@as(f64, 2), m.take(2, 1, 0).?.x);
 }
 
 // ---------------------------------------------------------------------------
