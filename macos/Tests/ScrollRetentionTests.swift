@@ -477,6 +477,28 @@ private enum ScrollRetentionTests {
         )
     }
 
+    /// A layer's retained rows are drawn only while that layer has an offset,
+    /// the same gate the root uses; otherwise they land unshifted and unclipped.
+    private static func verifyLayerRetainedRowsNeedAnOffset(device: MTLDevice) {
+        let retention = ScrollRetention(device: device)
+        retention.setDepthRows(2)
+        let retained = [
+            makeRow(retention, gridId: 2, targetRow: 0),
+            makeRow(retention, gridId: 3, targetRow: 0),
+        ]
+        var scratch = [Int]()
+        requireEqual(
+            collectSurfaceLayerRetainedRows(gridId: 2, retained: retained, hasScrollOffset: true,
+                                            cellHeightPx: 20, into: &scratch),
+            1, "a displaced layer draws its own retained row")
+        requireEqual(scratch, [0], "the collected index is the layer's row")
+        requireEqual(
+            collectSurfaceLayerRetainedRows(gridId: 2, retained: retained, hasScrollOffset: false,
+                                            cellHeightPx: 20, into: &scratch),
+            0, "a layer with no offset draws no retained row")
+        require(scratch.isEmpty, "the scratch is emptied for a layer with no offset")
+    }
+
     /// The lifetime rule: a published row lives exactly as long as its grid is
     /// displaced. The prune used to run only from the offset rebuild, which the
     /// view skips entirely once nothing is easing, so a grid that scrolled once
@@ -916,6 +938,7 @@ private enum ScrollRetentionTests {
         verifyEvictionIsReported(device: device)
         verifyPrune(device: device)
         verifyUndisplacedPrune(device: device)
+        verifyLayerRetainedRowsNeedAnOffset(device: device)
         verifyDepthClamp(device: device)
         verifyReleaseCoveredPins(device: device)
         print("ScrollRetentionTests: OK")

@@ -450,18 +450,8 @@ final class MetalTerminalView: GridInputView {
 
     // MARK: - Mouse Input
 
-    /// Grid info cached at drag start: dragging a separator resizes the grids,
-    /// so hitTestGrid would return different coordinates for the same pixel
-    /// position part-way through the drag.
-    private struct DragGridCache {
-        var gridId: Int64
-        var startCol: Int32
-        /// The rows the press landed in, so the drag can apply the same
-        /// content-band rule the press did. Carrying only the origin left the
-        /// drag undoing an ease on margin rows that never took one.
-        var band: GridRowBand
-    }
-    private var dragGridCache = SurfacePressPin<DragGridCache>()
+    /// The grid a press claimed, kept for its drag and release.
+    private var pressGridId = SurfacePressPin<Int64>()
 
     /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
 
@@ -475,61 +465,51 @@ final class MetalTerminalView: GridInputView {
         // stay on it: Neovim keeps a drag on the window the press chose, and a
         // release re-resolved under the pointer ended a selection dragged out
         // of a float in the window behind it. The external surface and Windows
-        // pin the same way. The cache also keeps separator drags from
-        // oscillating as the grids resize.
+        // pin the same way.
         if action == "press" {
             let hit = hitTestGrid(at: location)
-            dragGridCache.press(button: button) {
-                core.getVisibleGridsCached().first(where: { $0.gridId == hit.gridId }).map {
-                    DragGridCache(gridId: $0.gridId, startCol: $0.startCol, band: GridRowBand(of: $0))
-                }
+            pressGridId.press(button: button) {
+                core.getVisibleGridsCached().contains { $0.gridId == hit.gridId } ? hit.gridId : nil
             }
             core.sendMouseInput(button: button, action: action, modifier: modifier,
                                 gridId: hit.gridId, row: hit.row, col: hit.col)
             return
         }
-        let pinned = action == "release" ? dragGridCache.release(button: button) : dragGridCache.pinned
-        if let cache = pinned {
-            // The cached grid, but the CURRENT geometry: dragging a separator
-            // resizes the grids, and the cache exists so the coordinates stay
-            // in the grid the press chose, not so they freeze.
+        let pinned = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
+        if let pinned {
             guard let g = pointerGeometry(at: location) else { return }
-            let globalCol = g.globalCol
-
-            let dragOffsetPx = drawnScrollOffsetPx(cache.gridId, cellH: g.cellH)
-
-            // The band the press cached, not the grid as it stands now: a drag
-            // that resizes the grids would otherwise answer a different
-            // question part-way through, which is why the cache exists. A
-            // follower moves bodily, band and all, so it is read where drawn.
+            // The pinned grid closed mid-drag: the surface's root grid in
+            // global cells, as Windows' rebaseToGrid, never the window under
+            // the pointer.
+            guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
+                core.sendMouseInput(button: button, action: action, modifier: modifier,
+                                    gridId: 1, row: g.globalRow, col: g.globalCol)
+                return
+            }
+            // The pinned grid at its CURRENT placement, as the external surface
+            // and Windows rebase: a grid that moves mid-drag keeps receiving the
+            // cells under the pointer.
             let localRow: Int32
-            var startCol = cache.startCol
-            if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[cache.gridId], g.cellH > 0 {
-                // Against the float's placement NOW, not the press's: a
-                // follower is re-placed by Neovim as it scrolls, and the
-                // displacement is measured from the current placement --
-                // both axes of it.
-                let current = core.getVisibleGridsCached().first { $0.gridId == cache.gridId }
-                let startRow = current?.startRow ?? cache.band.startRow
-                startCol = current?.startCol ?? cache.startCol
-                localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - startRow
+            if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[pinned] {
+                // A follower is drawn displaced bodily and has no ease of its
+                // own to undo.
+                localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - current.startRow
             } else {
                 localRow = scrollAdjustedLocalRow(
                     pointPxY: g.pointPx.y,
                     cellHeightPx: g.cellH,
-                    band: cache.band,
-                    scrollOffsetPx: dragOffsetPx
+                    band: GridRowBand(of: current),
+                    scrollOffsetPx: drawnScrollOffsetPx(pinned, cellH: g.cellH)
                 )
             }
-            let localCol = globalCol - startCol
 
             core.sendMouseInput(
                 button: button,
                 action: action,
                 modifier: modifier,
-                gridId: cache.gridId,
+                gridId: pinned,
                 row: localRow,
-                col: localCol
+                col: g.globalCol - current.startCol
             )
         } else {
             let (gridId, row, col) = hitTestGrid(at: location)
@@ -1095,7 +1075,7 @@ final class MetalTerminalView: GridInputView {
         drewWithoutScrollTransform ? 0 : scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
     }
 
-    private func hitTestGrid(at point: CGPoint, adjustForSmoothScroll: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
+    private func hitTestGrid(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
         // Early return when renderer is uninitialized (cellMetrics not yet available).
         guard let g = pointerGeometry(at: point) else { return (1, 0, 0) }
@@ -1144,7 +1124,7 @@ final class MetalTerminalView: GridInputView {
         // on visually-shifted content selects the wrong row.
         let offsetPx = drawnScrollOffsetPx(bestGridId, cellH: cellH)
 
-        if adjustForSmoothScroll, let grid = grids.first(where: { $0.gridId == bestGridId }) {
+        if let grid = grids.first(where: { $0.gridId == bestGridId }) {
             localRow = scrollAdjustedLocalRow(
                 pointPxY: pointPx.y,
                 cellHeightPx: cellH,
@@ -2010,7 +1990,7 @@ extension MetalTerminalView: IMEPreeditHost {
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 
-    func imeSendCommitted(_ text: String) { keyInput?.sendInputKeepingMainAwake(text) }
+    func imeSendCommitted(_ text: String) { keyInput?.sendInput(text, owner: self) }
 }
 
 // MARK: - Preedit Overlay View

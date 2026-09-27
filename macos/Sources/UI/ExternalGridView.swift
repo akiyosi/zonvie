@@ -177,9 +177,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     private var hostedDebtLastLogged: [Int64: Int] = [:]
 
     /// Clear what the bracket staged and mark it closed. Called with `lock`
-    /// held, from both arms of commitFlush: a bracket that rotated buffers and
-    /// one that carried no content leave the same staging behind, and what
-    /// "closed" means must not drift between them.
+    /// held, from both arms of commitFlush and from cancelFlush: what "closed"
+    /// means must not drift between them.
     private func closeFlushBracketLocked() {
         flushChangedRows.removeAll()
         flushGeneratedRows.removeAll()
@@ -658,7 +657,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     // Blur transparency support
     private let blurEnabled: Bool
     private let isDecoratedSurface: Bool
-    private var backgroundAlphaBuffer: MTLBuffer?
 
     // Viewport origin offset (in pixels) for decorated windows where the MTKView
     // fills the full container but grid content is inset by padding.
@@ -671,7 +669,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     private let glowTextures = SurfaceGlowTextures()
 
     // Cursor blink support
-    private var cursorBlinkBuffer: MTLBuffer?
     /// Cursor blink phase and what the last frame drew with. Shared with
     /// GridSurfaceRenderer; see `SurfaceBlinkState`.
     private var blink = SurfaceBlinkState()
@@ -800,8 +797,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     init(gridId: Int64,
           device: MTLDevice,
           commandQueue: MTLCommandQueue,
-          backgroundAlphaBuffer: MTLBuffer,
-          cursorBlinkBuffer: MTLBuffer,
           initialRows: Int,
           atlas: GlyphAtlas,
           shared: SharedRenderResources,
@@ -817,8 +812,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         self.shared = shared
 
         super.init(frame: .zero, device: device)
-        self.backgroundAlphaBuffer = backgroundAlphaBuffer
-        self.cursorBlinkBuffer = cursorBlinkBuffer
 
         let initialFontGeneration = atlas.fontGenerationSnapshot()
         fontResetState = ExternalFontResetState(initialGeneration: initialFontGeneration)
@@ -845,16 +838,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
         registerFileDrops()
 
-        if let buf = self.backgroundAlphaBuffer {
-            var alpha = surfaceBackgroundAlpha()
-            ZonvieCore.appLog("[ExternalGridView] backgroundAlphaBuffer alpha=\(alpha) isDecoratedSurface=\(isDecoratedSurface) gridId=\(gridId)")
-            memcpy(buf.contents(), &alpha, MemoryLayout<Float>.size)
-        }
-
-        if let buf = self.cursorBlinkBuffer {
-            var visible: UInt32 = 1
-            memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
-        }
+        ZonvieCore.appLog("[ExternalGridView] backgroundAlpha=\(surfaceBackgroundAlpha()) isDecoratedSurface=\(isDecoratedSurface) gridId=\(gridId)")
 
         // Initial background: black, and decoratedSurface → alpha=0 so the
         // padding outside the Metal viewport is transparent (container bg
@@ -985,8 +969,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
         backBuffer = nil
         scrollScratch.invalidate()
-        backgroundAlphaBuffer = nil
-        cursorBlinkBuffer = nil
 
         glowTextures.extractTex = nil
         for i in 0..<glowTextures.mipTextures.count {
@@ -1204,15 +1186,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         if bracketOpen, rowWritePrepared, writeSetIndex >= 0 {
             rowSync.abandon(writeSetIndex)
         }
-        rowWritePrepared = false
-        writeSetIndex = -1
+        closeFlushBracketLocked()
         // An abandoned bracket publishes no cursor. The slot it wrote is simply
         // released; the committed one is still whatever was last published.
         cursorWriteSetIndex = -1
-        flushChangedRows.removeAll()
-        flushGeneratedRows.removeAll()
-        flushHasStructuralRowChange = false
-        bracketOpen = false
         lock.unlock()
     }
 
@@ -2655,11 +2632,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
             // The shader chain is not loaded yet when this view is built, so
             // the alpha convention its back texture needs can only be settled
-            // here. Rewritten like cursorBlinkBuffer, per draw.
-            if let alphaBuf = backgroundAlphaBuffer {
-                var alpha = surfaceBackgroundAlpha()
-                memcpy(alphaBuf.contents(), &alpha, MemoryLayout<Float>.size)
-            }
+            // here, per draw.
+            let backgroundAlpha = surfaceBackgroundAlpha()
 
             // The union this surface's scrolled content must not bleed over.
             // Same rule the main renderer applies to its own layers, and it is
@@ -3055,6 +3029,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     let retainedForLayerCount = collectSurfaceLayerRetainedRows(
                         gridId: layer.gridId,
                         retained: retainedSnapshot,
+                        hasScrollOffset: layerOffset != nil,
                         cellHeightPx: Float(cellHi),
                         into: &retainedIndexScratch
                     )
@@ -3172,8 +3147,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     pipeline: pipeline,
                     atlasTexture: atlasTex,
                     sampler: sampler,
-                    backgroundAlphaBuffer: backgroundAlphaBuffer,
-                    cursorBlinkBuffer: cursorBlinkBuffer,
+                    backgroundAlpha: backgroundAlpha,
                     fixedFloatBands: fixedFloatMask.bands,
                     fixedFloatIntervals: fixedFloatMask.intervals,
                     bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: scrollOffsetSnapshot) }
@@ -3282,7 +3256,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                         encoder: enc,
                         atlasTexture: atlasTex,
                         sampler: self.shared.sampler!,
-                        backgroundAlphaBuffer: self.backgroundAlphaBuffer,
+                        backgroundAlpha: backgroundAlpha,
                         bindScrollOffsets: { bindSingleSurfaceScrollOffset(encoder: $0, offset: scrollOffsetSnapshot) }
                     )
 
@@ -3456,8 +3430,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     cursorVertexBuffer: cursorBuf,
                     cursorVertexCount: committedCursor.vertexCount,
                     layerOriginPx: cursorDrawOrigin,
-                    backgroundAlphaBuffer: backgroundAlphaBuffer,
-                    cursorBlinkBuffer: cursorBlinkBuffer,
+                    backgroundAlpha: backgroundAlpha,
                     fixedFloatBands: fixedFloatMask.bands,
                     fixedFloatIntervals: fixedFloatMask.intervals,
                     bindScrollOffsets: { cursorEnc in
@@ -4115,7 +4088,7 @@ extension ExternalGridView: IMEPreeditHost {
         return win.convertToScreen(convert(rectInView, to: nil))
     }
 
-    func imeSendCommitted(_ text: String) { core?.keyInput.sendInputForHeldKey(text) }
+    func imeSendCommitted(_ text: String) { core?.keyInput.sendInput(text, owner: self) }
 }
 
 // MARK: - NSTextInputClient (IME support)

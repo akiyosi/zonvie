@@ -179,7 +179,6 @@ pub const WM_APP_CLOSE_EXTERNAL_WINDOW: c.UINT = c.WM_APP + 4;
 pub const WM_APP_DEFERRED_INIT: c.UINT = c.WM_APP + 5;
 pub const WM_APP_UPDATE_IME_POSITION: c.UINT = c.WM_APP + 6;
 pub const WM_APP_MSG_SHOW: c.UINT = c.WM_APP + 7;
-pub const WM_APP_MSG_CLEAR: c.UINT = c.WM_APP + 8;
 pub const WM_APP_MINI_UPDATE: c.UINT = c.WM_APP + 9;
 pub const WM_APP_CLIPBOARD_GET: c.UINT = c.WM_APP + 10;
 pub const WM_APP_CLIPBOARD_SET: c.UINT = c.WM_APP + 11;
@@ -1562,6 +1561,9 @@ pub const PendingMessageRequest = struct {
     append: u32 = 0, // 1 = append to last message
     view_type: zonvie_msg_view_type = .ext_float, // Routing result
     timeout: f32 = 4.0, // Timeout in seconds
+    /// on_msg_clear, queued in order with the messages: the core resends the
+    /// statuses it holds right after the clear.
+    clear: bool = false,
 };
 
 /// Stored message for display stack (keeps track of multiple messages)
@@ -2509,7 +2511,6 @@ pub const ExternalWindow = struct {
     dpi_scale: f32 = 1.0,
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
     is_float_external: bool = false, // True if float-origin external (nvim_open_win external=true)
-    cursor_blink_state: bool = true, // Cursor blink state (true = visible)
     flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
 

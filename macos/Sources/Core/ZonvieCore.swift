@@ -1811,8 +1811,8 @@ final class ZonvieCore {
             setExtTabline(true)
         }
 
-        // ext_windows: CLI flag or config file
-        let hasExtWindows = args.contains("--extwindows") || ZonvieConfig.shared.windows.external
+        // ext_windows: connection dialog (if any) > CLI flag > config file
+        let hasExtWindows = connectionConfig?.extWindows ?? (args.contains("--extwindows") || ZonvieConfig.shared.windows.external)
         ZonvieCore.appLog("[start] hasExtWindows = \(hasExtWindows) (cli=\(args.contains("--extwindows")), config=\(ZonvieConfig.shared.windows.external))")
 
         if hasExtWindows {
@@ -1996,36 +1996,14 @@ final class ZonvieCore {
             }
             ZonvieCore.appLog("[start] connect mode: attaching to listen_addr=\(addr)")
 
-            // Performance / IME / blur knobs identical to spawn path; the
-            // core only needs them set before the run-thread starts.
-            //
-            // Unconditionally true, independently of `config.window.blur`
-            // (which drives only the renderer's own pipelines and alphas): the
-            // core gates its default-background run on `main_has_layers and
-            // blur_enabled` (flush.zig), so this is what stops grid 1 emitting
-            // a full-width background under every layer. The renderer
-            // compensates by banding a dirty root row before drawing it and
-            // dirtying the layer rows that band crosses.
-            setBlurEnabled(true)
-            setInheritCwd(noforkMode)
-            let perfConfig = config.performance
-            zonvie_core_set_glyph_cache_size(
-                core,
-                UInt32(perfConfig.glyphCacheAsciiSize),
-                UInt32(perfConfig.glyphCacheNonAsciiSize)
-            )
-            zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
-            zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
+            applyCoreStartOptions()
 
             let utf8 = Array(addr.utf8)
             let result = utf8.withUnsafeBufferPointer { buf -> Int32 in
                 guard let base = buf.baseAddress else { return -1 }
                 return zonvie_core_start_connect(core, base, buf.count, rows, cols)
             }
-            zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
-            zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
-            zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
-            zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
+            applyCoreLogOptions()
             return result
         }
 
@@ -2151,20 +2129,7 @@ final class ZonvieCore {
             ZonvieCore.appLog("[start] Added nvim extra args: \(nvimExtraArgs)")
         }
 
-        // Unconditional, independently of `config.window.blur` -- see the
-        // connect-mode path above for what the core keys off blur_enabled.
-        setBlurEnabled(true)
-
-        setInheritCwd(noforkMode)
-
-        let perfConfig = config.performance
-        zonvie_core_set_glyph_cache_size(
-            core,
-            UInt32(perfConfig.glyphCacheAsciiSize),
-            UInt32(perfConfig.glyphCacheNonAsciiSize)
-        )
-        zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
-        zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
+        applyCoreStartOptions()
 
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
@@ -2178,14 +2143,7 @@ final class ZonvieCore {
         // Windows doEarlyCoreInit() / WM_SIZE flow where notify_layout_ready
         // also fires after the actual window dimensions settle.
 
-        // Enable Zig core logging based on app log setting
-        zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
-        // Tier filters apply core-side, before formatting: a line the sink
-        // would drop is then never formatted, crossed over on_log and copied
-        // into Swift strings (the connect path and Windows set them too).
-        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
-        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
-        zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
+        applyCoreLogOptions()
 
         return result
     }
@@ -2496,6 +2454,7 @@ final class ZonvieCore {
 
         ZonvieCore.appLog("[devcontainer] Starting exec: \(cmd)")
 
+        applyCoreStartOptions()
         let cstr = (cmd as NSString).utf8String
         _ = zonvie_core_start(core, cstr, rows, cols)
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
@@ -2506,14 +2465,45 @@ final class ZonvieCore {
         // call is idempotent: first writer wins). Trust the
         // MetalTerminalView path to deliver the actual rows/cols computed
         // from the post-layout drawable size, exactly like the native path.
-        zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
-        // See spawn path above: the tier filters gate at the core.
-        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
-        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
-        zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
+        applyCoreLogOptions()
 
         // Note: Progress dialog will be closed by neovimReadyNotification observer
         // Don't close it here - nvim may not be ready yet
+    }
+
+    /// The options every session start gives the core before its run thread
+    /// starts (connect, spawn and devcontainer alike; the devcontainer start
+    /// used to skip them all).
+    private func applyCoreStartOptions() {
+        guard let core else { return }
+        // Unconditionally true, independently of `config.window.blur` (which
+        // drives only the renderer's own pipelines and alphas): the core gates
+        // its default-background run on `main_has_layers and blur_enabled`
+        // (flush.zig), so this is what stops grid 1 emitting a full-width
+        // background under every layer. The renderer compensates by banding a
+        // dirty root row before drawing it and dirtying the layer rows that
+        // band crosses.
+        setBlurEnabled(true)
+        setInheritCwd(noforkMode)
+        let perfConfig = ZonvieConfig.shared.performance
+        zonvie_core_set_glyph_cache_size(
+            core,
+            UInt32(perfConfig.glyphCacheAsciiSize),
+            UInt32(perfConfig.glyphCacheNonAsciiSize)
+        )
+        zonvie_core_set_atlas_size(core, UInt32(perfConfig.atlasSize))
+        zonvie_core_set_option_as_meta(core, ZonvieConfig.shared.ime.optionAsMeta.rawValue)
+    }
+
+    /// Core logging follows the app's. The tier filters apply core-side,
+    /// before formatting: a line the sink would drop is then never formatted,
+    /// crossed over on_log and copied into Swift strings.
+    private func applyCoreLogOptions() {
+        guard let core else { return }
+        zonvie_core_set_log_enabled(core, ZonvieCore.appLogEnabled ? 1 : 0)
+        zonvie_core_set_log_perf_only(core, ZonvieCore.appLogPerfOnly ? 1 : 0)
+        zonvie_core_set_log_scroll_only(core, ZonvieCore.appLogScrollOnly ? 1 : 0)
+        zonvie_core_set_log_verbose(core, ZonvieCore.appLogVerbose ? 1 : 0)
     }
 
     func sendInput(_ s: String) {
@@ -4976,7 +4966,6 @@ final class ZonvieCore {
                     mainView: mainView,
                     cellW: cellW,
                     cellH: cellH,
-                    scale: scale,
                     geometry: geometry
                 )
                 if let cmdWin = existingWindow as? CmdlineWindow {
@@ -5007,15 +4996,7 @@ final class ZonvieCore {
                 return
             }
 
-            guard let commandQueue = renderer.metalDevice.makeCommandQueue(),
-                  let backgroundAlphaBuffer = renderer.metalDevice.makeBuffer(
-                    length: MemoryLayout<Float>.size,
-                    options: .storageModeShared
-                  ),
-                  let cursorBlinkBuffer = renderer.metalDevice.makeBuffer(
-                    length: MemoryLayout<UInt32>.size,
-                    options: .storageModeShared
-                  ) else {
+            guard let commandQueue = renderer.metalDevice.makeCommandQueue() else {
                 let retryDelay = self.nextExternalResourceRetryDelay(gridId: gridId)
                 ZonvieCore.appLog("[external_window] required Metal resources unavailable; retrying gridId=\(gridId) in \(retryDelay)s")
                 self.queuePendingExternalWindowRequest(
@@ -5054,8 +5035,6 @@ final class ZonvieCore {
                 gridId: gridId,
                 device: renderer.metalDevice,
                 commandQueue: commandQueue,
-                backgroundAlphaBuffer: backgroundAlphaBuffer,
-                cursorBlinkBuffer: cursorBlinkBuffer,
                 initialRows: Int(rows),
                 atlas: renderer.glyphAtlas,
                 shared: renderer.shared,
@@ -5475,6 +5454,14 @@ final class ZonvieCore {
                 }
                 Self.closeRemovedExternalWindow(window)
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
+                // msg_show was stacked below msg_history: move it back up.
+                if gridId == ZonvieCore.msgHistoryGridId,
+                   let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
+                   msgShowWindow.isVisible {
+                    msgShowWindow.setFrame(
+                        self.messageFloatFrame(size: msgShowWindow.frame.size, below: nil),
+                        display: false)
+                }
             }
 
             // Force redraw of main terminal view to clear any residual artifacts
@@ -5974,7 +5961,8 @@ final class ZonvieCore {
 
     /// The borderless text panel the ext-float toast and the confirm prompt
     /// share. Every call applies the current font and colours, so a guifont or
-    /// colorscheme change reaches a panel that already exists.
+    /// colorscheme change reaches a panel that already exists. The caller
+    /// orders it in (orderPanelFront).
     private static func showTextPanel(
         existing: (window: NSWindow, container: NSView, textField: NSTextField)?,
         frame: NSRect,
@@ -5996,14 +5984,13 @@ final class ZonvieCore {
             existing.window.setFrame(frame, display: true)
             existing.container.frame = NSRect(x: 0, y: 0, width: frame.width, height: frame.height)
             existing.textField.frame = textFrame
-            existing.window.orderFront(nil)
             return existing
         }
 
         let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
         // `false` here is what the cmdline window takes deliberately, and
         // it pays for it by following activation with its level (see
-        // setCmdlineWindowActive). Nothing here needs to outlive
+        // floatingPanelLevel). Nothing here needs to outlive
         // deactivation: a config.toml parse error reaches the toast with
         // timeout 0 and no close button, and a `.floating` panel that never
         // hides would sit above every other application.
@@ -6033,7 +6020,6 @@ final class ZonvieCore {
             applyWindowBlur(window: window, radius: ZonvieConfig.shared.window.blurRadius)
         }
 
-        window.orderFront(nil)
         return (window, containerView, textField)
     }
 
@@ -6050,13 +6036,14 @@ final class ZonvieCore {
             window.isMovableByWindowBackground = true
             // Stays visible while another app is frontmost, so a file can be
             // dragged onto it from Finder. The level follows activation
-            // instead (see setCmdlineWindowActive) — a .floating window that
+            // instead (see floatingPanelLevel) — a .floating window that
             // never hides would sit above every other app's windows.
             window.hidesOnDeactivate = false
-            window.level = NSApp.isActive ? .floating : .normal
+            window.level = floatingPanelLevel()
 
         case .popupmenu, .msgShow, .msgHistory:
             Self.applyFloatingPanelSettings(window, hidesOnDeactivate: true)
+            window.level = floatingPanelLevel()
 
         case .normal:
             window.title = "Window \(win)"
@@ -6350,7 +6337,6 @@ final class ZonvieCore {
         mainView: MetalTerminalView,
         cellW: CGFloat,
         cellH: CGFloat,
-        scale: CGFloat,
         windowWidth: CGFloat,
         windowHeight: CGFloat
     ) -> NSRect? {
@@ -6361,43 +6347,23 @@ final class ZonvieCore {
             )
         }
 
-        if win > 0,
-           let anchorWindow = self.externalWindows[win],
-           let anchorContentView = anchorWindow.contentView {
-            anchorContentView.layoutSubtreeIfNeeded()
-            let boundsInWindow = anchorContentView.convert(anchorContentView.bounds, to: nil)
-            let anchorContentFrame = anchorWindow.convertToScreen(boundsInWindow)
-            // The anchor window's own scale: its cells are laid out in
-            // its own points, which differ from the main window's on a
-            // screen of another density.
-            return popupmenuWindowRect(
-                anchorRow: startRow,
-                anchorCol: startCol,
-                windowWidth: windowWidth,
-                windowHeight: windowHeight,
-                cellW: cellW,
-                cellH: cellH,
-                scale: anchorWindow.backingScaleFactor,
-                referenceFrame: anchorContentFrame,
-                screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-            )
+        // The anchor window's own scale: its cells are laid out in its own
+        // points, which differ from another window's on a screen of another
+        // density.
+        guard let anchorWindow = (win > 0 ? self.externalWindows[win] : nil) ?? mainView.window else {
+            return nil
         }
-
-        if let tvFrame = self.terminalViewScreenFrame() {
-            return popupmenuWindowRect(
-                anchorRow: startRow,
-                anchorCol: startCol,
-                windowWidth: windowWidth,
-                windowHeight: windowHeight,
-                cellW: cellW,
-                cellH: cellH,
-                scale: scale,
-                referenceFrame: tvFrame,
-                screenTop: (mainView.window?.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
-            )
-        }
-
-        return nil
+        return popupmenuWindowRect(
+            anchorRow: startRow,
+            anchorCol: startCol,
+            windowWidth: windowWidth,
+            windowHeight: windowHeight,
+            cellW: cellW,
+            cellH: cellH,
+            scale: anchorWindow.backingScaleFactor,
+            referenceFrame: gridContentScreenFrame(of: anchorWindow),
+            screenTop: (anchorWindow.screen ?? NSScreen.main)?.visibleFrame.maxY ?? .greatestFiniteMagnitude
+        )
     }
 
     private func buildInitialDecoratedWindowRect(
@@ -6408,7 +6374,6 @@ final class ZonvieCore {
         mainView: MetalTerminalView,
         cellW: CGFloat,
         cellH: CGFloat,
-        scale: CGFloat,
         containerWidth: CGFloat,
         containerHeight: CGFloat,
         windowWidth: CGFloat,
@@ -6454,7 +6419,7 @@ final class ZonvieCore {
         case .popupmenu:
             if let frame = popupmenuPlacement(
                 win: win, startRow: startRow, startCol: startCol, mainView: mainView,
-                cellW: cellW, cellH: cellH, scale: scale,
+                cellW: cellW, cellH: cellH,
                 windowWidth: windowWidth, windowHeight: windowHeight
             ) {
                 ZonvieCore.appLog("[external_window] popupmenu positioned at (\(frame.origin.x),\(frame.origin.y)) win=\(win) anchor=(\(startRow),\(startCol))")
@@ -6501,7 +6466,6 @@ final class ZonvieCore {
                 mainView: mainView,
                 cellW: cellW,
                 cellH: cellH,
-                scale: scale,
                 containerWidth: geometry.containerWidth,
                 containerHeight: geometry.containerHeight,
                 windowWidth: geometry.windowWidth,
@@ -6615,14 +6579,13 @@ final class ZonvieCore {
         mainView: MetalTerminalView,
         cellW: CGFloat,
         cellH: CGFloat,
-        scale: CGFloat,
         geometry: ExternalWindowGeometry
     ) -> NSRect? {
         switch kind {
         case .popupmenu:
             return popupmenuPlacement(
                 win: win, startRow: startRow, startCol: startCol, mainView: mainView,
-                cellW: cellW, cellH: cellH, scale: scale,
+                cellW: cellW, cellH: cellH,
                 windowWidth: geometry.windowWidth, windowHeight: geometry.windowHeight
             ) ?? existingWindow.frame
 
@@ -6666,7 +6629,7 @@ final class ZonvieCore {
             window.setFrame(preLayoutFrame, display: false)
         }
         updateDecoratedExternalGrid(gridId: gridId, gridView: gridView, bgColor: nil, rows: rows, cols: cols)
-        window.orderFront(nil)
+        orderPanelFront(window)
     }
 
     private func installDecoratedExternalWindowShell(
@@ -6766,15 +6729,42 @@ final class ZonvieCore {
         }
     }
 
-    /// Track app activation for the external cmdline window.
-    ///
-    /// It no longer hides on deactivate (a Finder drag has to be able to reach
-    /// it), so the window level carries that job: .floating while this app is
-    /// frontmost, .normal otherwise so it does not hover above whatever the
-    /// user switched to.
-    func setCmdlineWindowActive(_ active: Bool) {
-        guard let window = self.externalWindows[ZonvieCore.cmdlineGridId] else { return }
-        window.level = active ? .floating : .normal
+    /// The level of this session's floating panels (cmdline, popupmenu,
+    /// message windows, toast, prompt, minis): .floating only while the app
+    /// is frontmost and this session is the front one. The cmdline does not
+    /// hide on deactivate (a Finder drag has to reach it), and no panel hides
+    /// on a switch between sessions, so the level keeps them from hovering
+    /// over another app or another session.
+    private func floatingPanelLevel(appActive: Bool = NSApp.isActive) -> NSWindow.Level {
+        appActive && SessionManager.shared.isFront(self) ? .floating : .normal
+    }
+
+    /// Show a floating panel: to the front for the front session, else just
+    /// above this session's main window, not over the front session.
+    private func orderPanelFront(_ window: NSWindow) {
+        window.level = floatingPanelLevel()
+        if SessionManager.shared.isFront(self) {
+            window.orderFront(nil)
+        } else {
+            window.order(.above, relativeTo: terminalView?.window?.windowNumber ?? 0)
+        }
+    }
+
+    /// Re-level every floating panel after app activation or a session switch.
+    func setFloatingPanelsActive(_ appActive: Bool) {
+        let level = floatingPanelLevel(appActive: appActive)
+        let panels = [ZonvieCore.cmdlineGridId, ZonvieCore.popupmenuGridId,
+                      ZonvieCore.messageGridId, ZonvieCore.msgHistoryGridId].map { self.externalWindows[$0] }
+            + [extFloatWindow, promptWindow] + miniWindows.values.map { $0.window }
+        for case let window? in panels where window.level != level {
+            window.level = level
+            // A background session's window dropped to .normal lands on top
+            // of that level, over the front session's window: keep it with
+            // its own session. The front session's already is the topmost.
+            if level == .normal && window.isVisible && !SessionManager.shared.isFront(self) {
+                window.order(.above, relativeTo: terminalView?.window?.windowNumber ?? 0)
+            }
+        }
     }
 
     /// True while the command line is a separate window. The terminal view uses
@@ -8038,7 +8028,9 @@ final class ZonvieCore {
         }
 
         updateMiniPositions()
-        miniWindows[miniId]?.window?.orderFront(nil)
+        if let window = miniWindows[miniId]?.window {
+            orderPanelFront(window)
+        }
         // Name the window the way the OS window list does, so a harness that
         // observes windows from outside can tell a mini apart from the other
         // message windows the app puts on screen. `windowNumber` IS the
@@ -8427,6 +8419,7 @@ final class ZonvieCore {
         let panel = Self.showTextPanel(
             existing: existing, frame: frame, content: content, font: font,
             fg: fgColor, bg: bgColor, border: borderColor, borderWidth: 1.0, padding: padding)
+        orderPanelFront(panel.window)
         self.extFloatWindow = panel.window
         self.messageContainerView = panel.container
         self.messageTextField = panel.textField
@@ -8506,6 +8499,7 @@ final class ZonvieCore {
         let panel = Self.showTextPanel(
             existing: existing, frame: frame, content: content, font: font,
             fg: fgColor, bg: adjustedBg, border: borderColor, borderWidth: 2.0, padding: padding)
+        orderPanelFront(panel.window)
         self.promptWindow = panel.window
         self.promptContainerView = panel.container
         self.promptTextField = panel.textField

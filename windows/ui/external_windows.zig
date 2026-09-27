@@ -215,6 +215,15 @@ fn findExternalWindowByHwndLocked(app: *App, hwnd: c.HWND) ?ExtWindowHit {
     return null;
 }
 
+/// findExternalWindowByHwndLocked under app.mu, for a WndProc arm that needs
+/// nothing else under it. The pointer outlives the lock: an HWND's entry is
+/// added and removed only on the UI thread.
+fn findExternalWindowByHwnd(app: *App, hwnd: c.HWND) ?ExtWindowHit {
+    app.mu.lockUncancelable(core.clock.io());
+    defer app.mu.unlock(core.clock.io());
+    return findExternalWindowByHwndLocked(app, hwnd);
+}
+
 /// Append the four edge rects that frame a decorated surface, in NDC. The
 /// cmdline and the popupmenu drew this identically; the border width is the
 /// same constant for both.
@@ -401,6 +410,8 @@ fn appendCopyIconVerts(
     return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id, copied);
 }
 
+/// Returns false when the surface has no content dimensions and nothing was
+/// drawn: the caller must not present the stale back buffer.
 fn drawDecoratedExternalSurface(
     kind: ExternalSurfaceKind,
     g: *d3d11.Renderer,
@@ -412,7 +423,7 @@ fn drawDecoratedExternalSurface(
     scratch: *std.ArrayListUnmanaged(app_mod.Vertex),
     glow_enabled: bool,
     glow_intensity: f32,
-) !void {
+) !bool {
     switch (kind) {
         .cmdline => {
             const window_w: f32 = @floatFromInt(g.width);
@@ -435,13 +446,13 @@ fn drawDecoratedExternalSurface(
             const icon_b = app.cmdline_icon_color[2];
             app.mu.unlock(core.clock.io());
 
-            if (content_rows == 0 or content_cols == 0) return;
+            if (content_rows == 0 or content_cols == 0) return false;
 
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
             if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
                 try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
-                return;
+                return true;
             }
 
             const content_origin = decoratedContentOriginPx(app, kind);
@@ -514,7 +525,7 @@ fn drawDecoratedExternalSurface(
             const window_h: f32 = @floatFromInt(g.height);
             if (!(window_w > 0 and window_h > 0)) {
                 try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
-                return;
+                return true;
             }
 
             const extra_verts = 6 + 24;
@@ -598,13 +609,13 @@ fn drawDecoratedExternalSurface(
                 1.0,
             };
             app.mu.unlock(core.clock.io());
-            if (content_rows == 0 or content_cols == 0) return;
+            if (content_rows == 0 or content_cols == 0) return false;
 
             const content_w: f32 = @floatFromInt(content_cols * cell_w);
             const content_h: f32 = @floatFromInt(content_rows * cell_h);
             if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
                 try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
-                return;
+                return true;
             }
 
             const content_origin = decoratedContentOriginPx(app, kind);
@@ -662,6 +673,7 @@ fn drawDecoratedExternalSurface(
         },
         .normal => unreachable,
     }
+    return true;
 }
 
 fn drawNormalExternalSurface(
@@ -1440,14 +1452,6 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     // The monitor the cmdline is on, which keeps it there as it grows (below).
     if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, app_mod.monitorWorkArea(current_hwnd orelse app.hwnd));
 
-    const styles = externalWindowStyles(is_special_window);
-    const style = styles.style;
-    const ex_style = styles.ex_style;
-    var rect: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
-    _ = c.AdjustWindowRectEx(&rect, style, 0, ex_style);
-    const window_w = rect.right - rect.left;
-    const window_h = rect.bottom - rect.top;
-
     app.mu.lockUncancelable(core.clock.io());
     const target_hwnd = if (app.external_windows.get(req.grid_id)) |ext_win| blk: {
         if (ext_win.is_pending_close) break :blk null;
@@ -1457,6 +1461,9 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     } else null;
     app.mu.unlock(core.clock.io());
     const hwnd = target_hwnd orelse return false;
+    const outer = outerSizePx(externalWindowStyles(is_special_window), client_w, client_h, window_mod.GetDpiForWindow(hwnd));
+    const window_w = outer.w;
+    const window_h = outer.h;
 
     var x: c_int = 0;
     var y: c_int = 0;
@@ -1622,15 +1629,11 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const dwStyle = styles.style;
     const dwExStyle = styles.ex_style;
 
-    var rect: c.RECT = .{
-        .left = 0,
-        .top = 0,
-        .right = client_w,
-        .bottom = client_h,
-    };
-    _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-    const window_w: c_int = rect.right - rect.left;
-    const window_h: c_int = rect.bottom - rect.top;
+    // At the main window's DPI, as the insets; re-sized below if it lands elsewhere.
+    const main_dpi: c.UINT = @intFromFloat(@round(app.dpi_scale * 96.0));
+    const outer = outerSizePx(styles, client_w, client_h, main_dpi);
+    const window_w: c_int = outer.w;
+    const window_h: c_int = outer.h;
 
     if (applog.isEnabled()) applog.appLog("[win] external window: content=({d},{d}) client=({d},{d}) window=({d},{d}) is_cmdline={}\n", .{ content_w, content_h, client_w, client_h, window_w, window_h, is_cmdline });
 
@@ -1789,18 +1792,19 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
         window_mod.applyWindowBackdrop(hwnd);
     }
 
-    // The insets above were sized at the main window's DPI, before this
-    // window existed. One created on a monitor of another density gets no
+    // The insets and frame above were sized at the main window's DPI, before
+    // this window existed. One created on a monitor of another density gets no
     // WM_DPICHANGED for it, so its "always" scrollbar strip stayed the wrong
-    // width: covering the last column or leaving a gap.
+    // width (covering the last column or leaving a gap) and its frame the
+    // wrong height.
     {
-        const own_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd))) / 96.0;
+        const own_dpi = window_mod.GetDpiForWindow(hwnd);
+        const own_scale = @as(f32, @floatFromInt(own_dpi)) / 96.0;
         if (own_scale != app.dpi_scale) {
             const own = externalSurfaceInsetsPx(app, req.grid_id, own_scale);
-            if (own.w != insets.w) {
-                var own_rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w + own.w, .bottom = client_h };
-                _ = c.AdjustWindowRectEx(&own_rect, dwStyle, 0, dwExStyle);
-                _ = c.SetWindowPos(hwnd, null, 0, 0, own_rect.right - own_rect.left, own_rect.bottom - own_rect.top, c.SWP_NOMOVE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+            const own_outer = outerSizePx(styles, client_w - insets.w + own.w, client_h, own_dpi);
+            if (own_outer.w != window_w or own_outer.h != window_h) {
+                _ = c.SetWindowPos(hwnd, null, 0, 0, own_outer.w, own_outer.h, c.SWP_NOMOVE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
             }
         }
     }
@@ -2163,13 +2167,35 @@ pub fn closePendingExternalWindowsOnUIThread(app: *App) void {
 /// tool window: an ownerless popup without WS_EX_TOOLWINDOW gets a taskbar
 /// button and an Alt-Tab entry, so typing `:` flashed one up. Always
 /// WS_EX_NOREDIRECTIONBITMAP: all rendering goes via DXGI + DirectComposition.
-fn externalWindowStyles(is_special_window: bool) struct { style: c.DWORD, ex_style: c.DWORD } {
+fn externalWindowStyles(is_special_window: bool) WindowStyles {
     const special_ex: c.DWORD = @intCast(c.WS_EX_TOPMOST | c.WS_EX_TOOLWINDOW);
     return .{
         .style = if (is_special_window) c.WS_POPUP else c.WS_OVERLAPPEDWINDOW,
         .ex_style = (if (is_special_window) special_ex else @as(c.DWORD, 0)) |
             @as(c.DWORD, @intCast(c.WS_EX_NOREDIRECTIONBITMAP)),
     };
+}
+
+const WindowStyles = struct { style: c.DWORD, ex_style: c.DWORD };
+pub const OuterSizePx = struct { w: c_int, h: c_int };
+
+/// The window size whose client area is `client_w` x `client_h` at `dpi`.
+/// Not AdjustWindowRectEx: it measures the frame at the system DPI, short for
+/// a captioned window on a monitor of another density.
+fn outerSizePx(styles: WindowStyles, client_w: c_int, client_h: c_int, dpi: c.UINT) OuterSizePx {
+    var r: c.RECT = .{ .left = 0, .top = 0, .right = client_w, .bottom = client_h };
+    _ = AdjustWindowRectExForDpi(&r, styles.style, 0, styles.ex_style, dpi);
+    return .{ .w = r.right - r.left, .h = r.bottom - r.top };
+}
+
+/// outerSizePx with `hwnd`'s current styles and DPI. GetWindowLongW, not the
+/// Ptr variant: that sign-extends WS_POPUP's bit 31 and @bitCast would not fit.
+pub fn windowOuterSizePx(hwnd: c.HWND, client_w: c_int, client_h: c_int) OuterSizePx {
+    const styles: WindowStyles = .{
+        .style = @bitCast(c.GetWindowLongW(hwnd, c.GWL_STYLE)),
+        .ex_style = @bitCast(c.GetWindowLongW(hwnd, c.GWL_EXSTYLE)),
+    };
+    return outerSizePx(styles, client_w, client_h, window_mod.GetDpiForWindow(hwnd));
 }
 
 pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
@@ -2269,6 +2295,20 @@ pub fn closeExternalWindowOnUIThread(app: *App, grid_id: i64) void {
         ext_win.deinit(app.alloc, &app.row_vb_budget);
         if (applog.isEnabled()) applog.appLog("[win] destroyed external window hwnd={*}\n", .{ext_win.hwnd});
         app.alloc.destroy(ext_win); // free the heap box itself; deinit() only frees its owned sub-resources
+
+        // msg_show was stacked below msg_history: move it back up.
+        if (grid_id == app_mod.MSG_HISTORY_GRID_ID) {
+            app.mu.lockUncancelable(core.clock.io());
+            const show_hwnd: ?c.HWND = if (app.external_windows.get(app_mod.MESSAGE_GRID_ID)) |w| w.hwnd else null;
+            app.mu.unlock(core.clock.io());
+            var show_rect: c.RECT = undefined;
+            if (show_hwnd) |sh| {
+                if (c.GetWindowRect(sh, &show_rect) != 0) {
+                    const pos = msgFloatTopRight(app, false, show_rect.right - show_rect.left);
+                    _ = c.SetWindowPos(sh, null, pos.x, pos.y, 0, 0, c.SWP_NOSIZE | c.SWP_NOZORDER | c.SWP_NOACTIVATE);
+                }
+            }
+        }
     }
 
     // Note: We intentionally do NOT remove pending_external_verts here because
@@ -2443,11 +2483,9 @@ pub export fn ExternalWndProc(
             const app = app_mod.getApp(hwnd) orelse return 0;
             const new_dpi: u32 = @as(u32, @intCast(wParam & 0xFFFF));
             const new_scale = @as(f32, @floatFromInt(new_dpi)) / 96.0;
-            app.mu.lockUncancelable(core.clock.io());
-            const hit = findExternalWindowByHwndLocked(app, hwnd);
+            const hit = findExternalWindowByHwnd(app, hwnd);
             const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
             const old_scale: f32 = if (hit) |h| h.win.dpi_scale else app.dpi_scale;
-            app.mu.unlock(core.clock.io());
             const gid = grid_id orelse return 0;
             var client: c.RECT = undefined;
             if (c.GetClientRect(hwnd, &client) == 0) return 0;
@@ -2527,9 +2565,7 @@ pub export fn ExternalWndProc(
             // back. Decorated windows (cmdline, popupmenu, messages) and a
             // grid with no Neovim window keep the old hide.
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                const grid_id: ?i64 = if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.grid_id else null;
-                app.mu.unlock(core.clock.io());
+                const grid_id: ?i64 = if (findExternalWindowByHwnd(app, hwnd)) |hit| hit.grid_id else null;
                 if (grid_id) |gid| {
                     if (gid >= 0) {
                         if (app.corep) |corep| {
@@ -2655,9 +2691,7 @@ pub export fn ExternalWndProc(
         c.WM_MOUSEWHEEL, c.WM_MOUSEHWHEEL => {
             if (app_mod.getApp(hwnd)) |app| {
                 const horizontal = msg == c.WM_MOUSEHWHEEL;
-                app.mu.lockUncancelable(core.clock.io());
-                const hit = findExternalWindowByHwndLocked(app, hwnd);
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
 
                 if (hit) |h| {
                     // The scroll-mode bar shows from updateScrollbar when the
@@ -2675,14 +2709,9 @@ pub export fn ExternalWndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
+                const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+                const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 if (grid_id != null and ext_window != null) {
                     // The window's own chrome claims the press first, so the
@@ -2722,9 +2751,7 @@ pub export fn ExternalWndProc(
             if (hit_test == c.HTCLIENT) {
                 if (app_mod.getApp(hwnd)) |app| {
                     const p = input.cursorClientPos(hwnd);
-                    app.mu.lockUncancelable(core.clock.io());
-                    const hit = findExternalWindowByHwndLocked(app, hwnd);
-                    app.mu.unlock(core.clock.io());
+                    const hit = findExternalWindowByHwnd(app, hwnd);
                     // Only a real window grid is an editor target (see the
                     // button handler); its layers resolve as a click would.
                     const target: ?input.MouseTarget = if (hit) |h|
@@ -2769,14 +2796,9 @@ pub export fn ExternalWndProc(
 
                 const rel = input.takeButtonRelease(app, msg);
 
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
+                const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+                const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 // ReleaseCapture posts WM_CAPTURECHANGED to this window
                 // synchronously, and that handler drops scrollbar_dragging and
@@ -2840,14 +2862,9 @@ pub export fn ExternalWndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
+                const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+                const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 if (grid_id != null and ext_window != null) {
                     const ext_win = ext_window.?;
@@ -2896,9 +2913,7 @@ pub export fn ExternalWndProc(
             const hDrop: c.HDROP = @ptrFromInt(@as(usize, wParam));
             defer c.DragFinish(hDrop);
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                const is_cmdline = if (findExternalWindowByHwndLocked(app, hwnd)) |hit| hit.grid_id == app_mod.CMDLINE_GRID_ID else false;
-                app.mu.unlock(core.clock.io());
+                const is_cmdline = if (findExternalWindowByHwnd(app, hwnd)) |hit| hit.grid_id == app_mod.CMDLINE_GRID_ID else false;
                 window_mod.handleDroppedFiles(app, hDrop, is_cmdline);
             }
             return 0;
@@ -2906,14 +2921,9 @@ pub export fn ExternalWndProc(
 
         c.WM_MOUSELEAVE => {
             if (app_mod.getApp(hwnd)) |app| {
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
+                const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+                const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 if (ext_window) |ext_win| {
                     setMsgHover(app, ext_win, grid_id.?, false);
@@ -2978,14 +2988,9 @@ pub export fn ExternalWndProc(
                 }
                 if (app.device_lost_recovering) return 0;
 
-                app.mu.lockUncancelable(core.clock.io());
-                var grid_id: ?i64 = null;
-                var ext_window: ?*app_mod.ExternalWindow = null;
-                if (findExternalWindowByHwndLocked(app, hwnd)) |hit| {
-                    grid_id = hit.grid_id;
-                    ext_window = hit.win;
-                }
-                app.mu.unlock(core.clock.io());
+                const hit = findExternalWindowByHwnd(app, hwnd);
+                const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
+                const ext_window: ?*app_mod.ExternalWindow = if (hit) |h| h.win else null;
 
                 if (ext_window) |ext_win| {
                     if (scrollbar.onTimer(app, scrollbar.externalSurface(ext_win, grid_id.?), timer_id)) {
@@ -3168,27 +3173,6 @@ pub fn finishExternalWindowPaint(app: *App, grid_id: i64) void {
     }
 }
 
-fn armExternalPaintRetry(
-    app: *App,
-    hwnd: c.HWND,
-    ext_win: *app_mod.ExternalWindow,
-    ticket: app_mod.PaintRetryState.Ticket,
-) void {
-    ext_win.surf.paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
-    if (app.external_paint_retry_deadline_ms == 0 or
-        ext_win.surf.paint_retry_deadline_ms < app.external_paint_retry_deadline_ms)
-    {
-        app.external_paint_retry_deadline_ms = ext_win.surf.paint_retry_deadline_ms;
-    }
-    if (!window_mod.scheduleReliableWindowMessage(
-        hwnd,
-        app_mod.WM_APP_PAINT_RETRY_FALLBACK,
-        ticket.generation,
-        @bitCast(ext_win.window_wake_cookie),
-        ticket.delay_ms,
-    )) _ = ext_win.surf.paint_retry.timerArmFailed(ticket.generation);
-}
-
 fn scheduleExternalSizeReplay(hwnd: c.HWND, app: *App) void {
     const cookie = externalWakeCookie(hwnd);
     if (cookie == 0) return;
@@ -3247,12 +3231,7 @@ fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
     }
     app.mu.unlock(core.clock.io());
     const ew = ext_win orelse return;
-    const ticket = app_mod.failSurfacePaint(app, &ew.surf, device_lost);
-    if (device_lost) {
-        if (main_hwnd) |target| window_mod.postDeviceLostRecovery(target, app);
-    } else if (ticket) |t| {
-        armExternalPaintRetry(app, hwnd, ew, t);
-    }
+    window_mod.failSurfacePaintAndWake(app, &ew.surf, hwnd, ew.window_wake_cookie, device_lost, main_hwnd, &app.external_paint_retry_deadline_ms);
 }
 
 /// Abandon a paint that has taken its reference but not yet installed the
@@ -3556,7 +3535,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         const cursor_items = render_pipeline_helpers.cursorVertsForFrame(
             app_mod.Vertex,
             tbs_cursor.verts.items,
-            ext_win.cursor_blink_state,
+            app.cursor_blink.visible,
         );
         if (cursor_items.len > 0) {
             ext_win.paint_scratch.ensureUnusedCapacity(app.alloc, cursor_items.len) catch {
@@ -3568,7 +3547,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         vert_count = ext_win.paint_scratch.items.len;
     }
 
-    const cursor_blink_visible = ext_win.cursor_blink_state;
+    const cursor_blink_visible = app.cursor_blink.visible;
     ext_win.needs_redraw = false;
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
@@ -3677,29 +3656,16 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             // by an earlier normal row-mode incarnation of this window.
             ext_win.surf.dropRowVBs(app);
 
-            // cmdline/msg_show/msg_history derive their content dims from
-            // ext_win.surf.surface.rows/cols (same computation as the matching
-            // internal checks inside drawDecoratedExternalSurface). A
-            // transient zero-dimension state there returns a plain success
-            // (not an error), so without this check execution would fall
-            // through to Present() below and show stale back-buffer content
-            // from the previous frame (see LOW-13 in the fix-plan doc).
-            if (surface_kind == .cmdline or surface_kind == .msg_show or surface_kind == .msg_history) {
-                app.mu.lockUncancelable(core.clock.io());
-                const content_rows = ext_win.surf.surface.rows;
-                const content_cols = ext_win.surf.surface.cols;
-                app.mu.unlock(core.clock.io());
-                if (content_rows == 0 or content_cols == 0) {
-                    if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: skipping draw+present for zero-dimension grid_id={d}\n", .{grid_id});
-                    ext_win.surf.completePaintRetry();
-                    return;
-                }
-            }
-            drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.flat_draw_scratch, glow_enabled, glow_intensity) catch |e| {
+            const drawn = drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.flat_draw_scratch, glow_enabled, glow_intensity) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow decorated draw failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
             };
+            if (!drawn) {
+                if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow: skipping present for zero-dimension grid_id={d}\n", .{grid_id});
+                ext_win.surf.completePaintRetry();
+                return;
+            }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
             g.presentFromBackRectsWithCursorNoResize(&.{}, true, null, null) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
