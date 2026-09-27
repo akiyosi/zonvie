@@ -42,18 +42,6 @@ const blink_off_ms = 400;
 /// A quarter of what the interval predicts. The defect produces zero.
 const min_refusals = 5;
 
-fn countMarker(alloc: std.mem.Allocator, marker: []const u8, since_ms: f64) !usize {
-    const lines = try app_log.linesSince(alloc, log_path, marker, since_ms);
-    defer alloc.free(lines);
-    var count: usize = 0;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        count += 1;
-    }
-    return count;
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     std.Io.Dir.cwd().createDirPath(gui_io.io(), "tmp") catch {};
     std.Io.Dir.cwd().deleteFile(gui_io.io(), log_path) catch {};
@@ -101,8 +89,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         "[ext_draw_early_exit] gridId={d} blink-no-cursor",
         .{ext_grid},
     );
-    const refusals = try countMarker(alloc, refused_marker, t0);
-    const toggles = try countMarker(alloc, "[blink] blink toggled to ", t0);
+    const refusals = try app_log.countLinesSince(alloc, log_path, refused_marker, t0);
+    const toggles = try app_log.countLinesSince(alloc, log_path, "[blink] blink toggled to ", t0);
 
     std.debug.print(
         "[gui] extwin blink without cursor: surface={d} toggles={d} refused_frames={d}\n",

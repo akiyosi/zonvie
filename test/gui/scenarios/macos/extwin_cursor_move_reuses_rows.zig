@@ -49,15 +49,7 @@ fn reuseFrames(alloc: std.mem.Allocator, surface: i64, since_ms: f64) !usize {
         "event=retained_content_reuse surface={d} root_row_draws=0",
         .{surface},
     );
-    const lines = try app_log.linesSince(alloc, log_path, marker, since_ms);
-    defer alloc.free(lines);
-    var count: usize = 0;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        if (line.len == 0) continue;
-        count += 1;
-    }
-    return count;
+    return app_log.countLinesSince(alloc, log_path, marker, since_ms);
 }
 
 pub fn run(alloc: std.mem.Allocator) !void {

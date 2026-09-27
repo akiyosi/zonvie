@@ -36,7 +36,6 @@ const grid_cols = 60;
 const scroll_keys = 6;
 /// Long enough for each ease to run out before the next key.
 const key_gap_ms = 300;
-const max_windows = 16;
 
 const Motion = struct {
     /// Rect lines seen (the app logs one per change).
@@ -102,8 +101,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
 
     // The cursor sits mid-buffer, so <C-e> scrolls the view while the cursor
     // keeps its line: the rect moves one row per key and the ease holds it.
@@ -117,7 +115,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
             "vim.api.nvim_win_set_cursor(_G.e2e_extwin, {200, 0}) " ++
             "return 1 end)()')",
     );
-    _ = try driver.waitNewWindow(g.app_pid, before, 150);
+    _ = try driver.waitNewWindow(g.app_pid, before.slice(),150);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
     const t0 = try app_log.nowMs(alloc, log_path);

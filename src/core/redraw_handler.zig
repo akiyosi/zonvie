@@ -184,16 +184,28 @@ fn mapGetStr(m: []mp.Pair, key: []const u8) ?[]const u8 {
 /// mode_change after mode_info_set, so resolving the style only on
 /// mode_change leaves the previous shape on screen until the user happens to
 /// switch modes.
+///
+/// With cursor_style_enabled false (`:set guicursor=`) the UI picks the style:
+/// the default block with no blink, not whatever the last mode left.
 fn applyModeInfo(grid: *Grid, idx: usize) void {
-    if (!grid.cursor_style_enabled) return;
-    if (idx >= grid.mode_infos.items.len) return;
-    const mi = grid.mode_infos.items[idx];
+    const mi: ModeInfo = if (!grid.cursor_style_enabled)
+        .{}
+    else if (idx < grid.mode_infos.items.len)
+        grid.mode_infos.items[idx]
+    else
+        return;
     grid.cursor_shape = mi.shape;
     grid.cursor_cell_percentage = mi.cell_percentage;
     grid.cursor_attr_id = mi.attr_id;
     grid.cursor_blink_wait_ms = mi.blink_wait_ms;
     grid.cursor_blink_on_ms = mi.blink_on_ms;
     grid.cursor_blink_off_ms = mi.blink_off_ms;
+}
+
+/// Modes whose exit may leave a stale showmode, by the first byte of the
+/// mode_change name ("insert", "replace", "terminal").
+fn showmodeModeKeepsStatus(first: u8) bool {
+    return first == 'i' or first == 'r' or first == 't';
 }
 
 fn mapGetBool(m: []mp.Pair, key: []const u8) ?bool {
@@ -271,6 +283,20 @@ pub fn checkedI32(v: i64) ?i32 {
     return @as(i32, @intCast(v));
 }
 
+/// An optional integer event argument: `default` unless it is an int in range.
+fn argU32(v: mp.Value, default: u32) u32 {
+    return if (v == .int) (checkedU32(v.int) orelse default) else default;
+}
+
+fn argI32(v: mp.Value, default: i32) i32 {
+    return if (v == .int) (checkedI32(v.int) orelse default) else default;
+}
+
+/// A cmdline nesting level: 1 unless an int of at least 1.
+fn cmdlineLevel(v: mp.Value) u32 {
+    return if (v == .int and v.int >= 1) (checkedU32(v.int) orelse 1) else 1;
+}
+
 /// Truncate one finite Msgpack float to i64 without letting @intFromFloat
 /// assert on NaN, infinity, or a value outside the integer domain.
 fn checkedFloatToI64(v: f64) ?i64 {
@@ -286,6 +312,31 @@ fn checkedFloatToI64(v: f64) ?i64 {
 fn checkedGridCoord(v: i64) ?u32 {
     if (v < 0 or v > std.math.maxInt(i32)) return null;
     return @intCast(v);
+}
+
+test "a disabled cursor style returns the cursor to the UI default" {
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+
+    grid.cursor_style_enabled = true;
+    try grid.mode_infos.append(grid.alloc, .{
+        .shape = .vertical,
+        .cell_percentage = 25,
+        .attr_id = 7,
+        .blink_wait_ms = 500,
+        .blink_on_ms = 500,
+        .blink_off_ms = 500,
+    });
+    applyModeInfo(&grid, 0);
+    try std.testing.expectEqual(grid_mod.CursorShape.vertical, grid.cursor_shape);
+
+    // `:set guicursor=`
+    grid.cursor_style_enabled = false;
+    applyModeInfo(&grid, 0);
+    try std.testing.expectEqual(grid_mod.CursorShape.block, grid.cursor_shape);
+    try std.testing.expectEqual(@as(u8, 100), grid.cursor_cell_percentage);
+    try std.testing.expectEqual(@as(u32, 0), grid.cursor_attr_id);
+    try std.testing.expectEqual(@as(u32, 0), grid.cursor_blink_on_ms);
 }
 
 test "checked float and grid coordinates reject hostile numeric bounds" {
@@ -1563,70 +1614,28 @@ pub fn handleRedraw(
                     });
                 }
             },
-            .win_move => {
-                // win_move (ext_windows): [win, grid, flags]
-                // flags: 0=below, 1=above, 2=right, 3=left
-                for (tuples) |tv| {
+            .win_move, .win_exchange, .win_rotate => {
+                // ext_windows:
+                //   win_move     [win, grid, flags]  0=below, 1=above, 2=right, 3=left
+                //   win_exchange [win, grid, count]
+                //   win_rotate   [win, grid, direction, count]  0=downward, 1=upward
+                const arity: usize = if (ev_tag == .win_rotate) 4 else 3;
+                tuple: for (tuples) |tv| {
                     if (tv != .arr) continue;
                     const t = tv.arr;
-                    if (t.len < 3) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
+                    if (t.len < arity) continue;
+                    for (t[0..arity]) |arg| if (arg != .int) continue :tuple;
 
                     const win_id = t[0].int;
                     const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const flags = checkedI32(t[2].int) orelse continue;
-                    log.write("[win_move] win={d} grid={d} flags={d}\n", .{ win_id, grid_id, flags });
+                    const arg2 = checkedI32(t[2].int) orelse continue;
+                    const arg3: i32 = if (arity == 4) checkedI32(t[3].int) orelse continue else 0;
+                    log.write("[{s}] win={d} grid={d} args=({d},{d})\n", .{ @tagName(ev_tag), win_id, grid_id, arg2, arg3 });
 
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .move,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .flags_or_direction = flags,
-                    });
-                }
-            },
-            .win_exchange => {
-                // win_exchange (ext_windows): [win, grid, count]
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 3) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int) continue;
-
-                    const win_id = t[0].int;
-                    const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const count = checkedI32(t[2].int) orelse continue;
-                    log.write("[win_exchange] win={d} grid={d} count={d}\n", .{ win_id, grid_id, count });
-
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .exchange,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .count = count,
-                    });
-                }
-            },
-            .win_rotate => {
-                // win_rotate (ext_windows): [win, grid, direction, count]
-                // direction: 0=downward, 1=upward
-                for (tuples) |tv| {
-                    if (tv != .arr) continue;
-                    const t = tv.arr;
-                    if (t.len < 4) continue;
-                    if (t[0] != .int or t[1] != .int or t[2] != .int or t[3] != .int) continue;
-
-                    const win_id = t[0].int;
-                    const grid_id = checkedGridId(t[1].int) orelse continue;
-                    const direction = checkedI32(t[2].int) orelse continue;
-                    const count = checkedI32(t[3].int) orelse continue;
-                    log.write("[win_rotate] win={d} grid={d} direction={d} count={d}\n", .{ win_id, grid_id, direction, count });
-
-                    try grid.pending_win_ops.append(grid.alloc, .{
-                        .op = .rotate,
-                        .win = win_id,
-                        .grid_id = grid_id,
-                        .flags_or_direction = direction,
-                        .count = count,
+                    try grid.pending_win_ops.append(grid.alloc, switch (ev_tag) {
+                        .win_move => .{ .op = .move, .win = win_id, .grid_id = grid_id, .flags_or_direction = arg2 },
+                        .win_exchange => .{ .op = .exchange, .win = win_id, .grid_id = grid_id, .count = arg2 },
+                        else => .{ .op = .rotate, .win = win_id, .grid_id = grid_id, .flags_or_direction = arg2, .count = arg3 },
                     });
                 }
             },
@@ -1738,10 +1747,10 @@ pub fn handleRedraw(
 
                     const grid_id = checkedGridId(t[0].int) orelse continue;
                     // t[1] is win (window handle), not used here
-                    const top = if (t[2] == .int) (checkedU32(t[2].int) orelse 0) else 0;
-                    const bottom = if (t[3] == .int) (checkedU32(t[3].int) orelse 0) else 0;
-                    const left = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
-                    const right = if (t[5] == .int) (checkedU32(t[5].int) orelse 0) else 0;
+                    const top = argU32(t[2], 0);
+                    const bottom = argU32(t[3], 0);
+                    const left = argU32(t[4], 0);
+                    const right = argU32(t[5], 0);
 
                     log.write("[win_viewport_margins] grid_id={d} top={d} bottom={d} left={d} right={d}\n", .{ grid_id, top, bottom, left, right });
                     try grid.setViewportMargins(grid_id, top, bottom, left, right);
@@ -2299,6 +2308,10 @@ pub fn handleRedraw(
                         });
                     }
 
+                    // Whether the mode being left is insert-like, read before
+                    // the name is overwritten below.
+                    const was_insert_mode = showmodeModeKeepsStatus(grid.current_mode_name[0]);
+
                     // Store mode name for external queries (e.g., terminal mode detection)
                     if (t[0] == .str) {
                         const mode_str = t[0].str;
@@ -2308,15 +2321,17 @@ pub fn handleRedraw(
                         grid.current_mode_name[copy_len] = 0; // null terminate
                     }
 
-                    // Clear showmode when exiting insert/replace mode
-                    // Neovim doesn't always send empty msg_showmode on mode exit
+                    // Clear showmode when exiting insert/replace mode:
+                    // Neovim doesn't always send an empty msg_showmode then.
+                    // Only on that exit, and only when this batch sent no
+                    // msg_showmode of its own: every other mode change cleared
+                    // it, which wiped "-- VISUAL --" and "recording @q" that
+                    // arrived just before in the same batch.
                     if (t[0] == .str) {
                         const mode_str = t[0].str;
-                        // Check if mode is NOT insert-related (i, R, Rv, etc.)
-                        const is_insert_mode = mode_str.len > 0 and
-                            (mode_str[0] == 'i' or mode_str[0] == 'R');
+                        const is_insert_mode = mode_str.len > 0 and showmodeModeKeepsStatus(mode_str[0]);
                         const showmode = &grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
-                        if (!is_insert_mode and showmode.items.len > 0) {
+                        if (was_insert_mode and !is_insert_mode and !grid.showmode_set_since_flush and showmode.items.len > 0) {
                             // Clear showmode content
                             try grid.setMsgStatus(.showmode, &.{});
                             if (log.cb != null) log.write("mode_change: cleared showmode (mode={s})\n", .{mode_str});
@@ -2477,12 +2492,12 @@ pub fn handleRedraw(
                         try appendContentChunks(CmdlineChunk, arena, &chunks, t[0].arr, true);
                     }
 
-                    const pos: u32 = if (t[1] == .int) (checkedU32(t[1].int) orelse 0) else 0;
+                    const pos = argU32(t[1], 0);
                     const firstc: u8 = if (t[2] == .str and t[2].str.len > 0) t[2].str[0] else 0;
                     const prompt: []const u8 = if (t[3] == .str) t[3].str else "";
-                    const indent: u32 = if (t[4] == .int) (checkedU32(t[4].int) orelse 0) else 0;
-                    const level: u32 = if (t.len > 5 and t[5] == .int and t[5].int >= 1) (checkedU32(t[5].int) orelse 1) else 1;
-                    const prompt_hl_id: u32 = if (t.len > 6 and t[6] == .int) (checkedU32(t[6].int) orelse 0) else 0;
+                    const indent = argU32(t[4], 0);
+                    const level: u32 = if (t.len > 5) cmdlineLevel(t[5]) else 1;
+                    const prompt_hl_id: u32 = if (t.len > 6) argU32(t[6], 0) else 0;
 
                     try grid.setCmdlineShow(chunks.items, pos, firstc, prompt, indent, level, prompt_hl_id);
                     if (log.cb != null) log.write("cmdline_show pos={d} firstc={c} level={d}\n", .{ pos, firstc, level });
@@ -2494,7 +2509,7 @@ pub fn handleRedraw(
                     if (tv != .arr) continue;
                     const t = tv.arr;
 
-                    const level: u32 = if (t.len >= 1 and t[0] == .int and t[0].int >= 1) (checkedU32(t[0].int) orelse 1) else 1;
+                    const level: u32 = if (t.len >= 1) cmdlineLevel(t[0]) else 1;
 
                     grid.setCmdlineHide(level);
                     if (log.cb != null) log.write("cmdline_hide level={d}\n", .{level});
@@ -2509,7 +2524,7 @@ pub fn handleRedraw(
                     if (t[0] != .int or t[1] != .int) continue;
 
                     const pos: u32 = checkedU32(t[0].int) orelse 0;
-                    const level: u32 = if (t[1].int >= 1) (checkedU32(t[1].int) orelse 1) else 1;
+                    const level = cmdlineLevel(t[1]);
 
                     grid.setCmdlinePos(pos, level);
                     if (log.cb != null) log.write("cmdline_pos pos={d} level={d}\n", .{ pos, level });
@@ -2524,7 +2539,7 @@ pub fn handleRedraw(
 
                     const c: []const u8 = if (t[0] == .str) t[0].str else "";
                     const shift: bool = if (t[1] == .bool) t[1].bool else false;
-                    const level: u32 = if (t[2] == .int and t[2].int >= 1) (checkedU32(t[2].int) orelse 1) else 1;
+                    const level = cmdlineLevel(t[2]);
 
                     grid.setCmdlineSpecialChar(c, shift, level);
                     if (log.cb != null) {
@@ -2614,9 +2629,9 @@ pub fn handleRedraw(
                         }
                     }
 
-                    const selected: i32 = if (t[1] == .int) (checkedI32(t[1].int) orelse -1) else -1;
-                    const row: i32 = if (t[2] == .int) (checkedI32(t[2].int) orelse 0) else 0;
-                    const col: i32 = if (t[3] == .int) (checkedI32(t[3].int) orelse 0) else 0;
+                    const selected = argI32(t[1], -1);
+                    const row = argI32(t[2], 0);
+                    const col = argI32(t[3], 0);
                     const raw_grid_id: i64 = if (t[4] == .int) t[4].int else 1;
                     // -1 is the documented ext_cmdline anchor sentinel. All
                     // real Neovim grid handles must fit the Metal i32 domain.
@@ -2641,7 +2656,7 @@ pub fn handleRedraw(
                     const t = tv.arr;
                     if (t.len < 1) continue;
 
-                    const selected: i32 = if (t[0] == .int) (checkedI32(t[0].int) orelse -1) else -1;
+                    const selected = argI32(t[0], -1);
                     grid.setPopupmenuSelect(selected);
                     if (log.cb != null) log.write("popupmenu_select selected={d}\n", .{selected});
                 }
@@ -2763,6 +2778,7 @@ pub fn handleRedraw(
                         try appendContentChunks(MsgChunk, arena, &chunks, t[0].arr, false);
                     }
                     try grid.setMsgStatus(channel, chunks.items);
+                    if (channel == .showmode) grid.showmode_set_since_flush = true;
                     if (log.cb != null) log.write("{s} chunks={d}\n", .{ @tagName(ev_tag), chunks.items.len });
                 }
             },
@@ -2879,6 +2895,7 @@ pub fn handleRedraw(
                 }
             },
             .flush => {
+                grid.showmode_set_since_flush = false;
                 if (log.cb != null) log.write("flush rows={d} cols={d}\n", .{ grid.rows, grid.cols });
                 if (log.cb != null and grid.input_trace_seq != 0 and grid.input_trace_flush_logged_seq != grid.input_trace_seq) {
                     const now_ns = clock.nowNs();
@@ -3524,5 +3541,83 @@ test "each status event decodes into its own channel slot" {
         try std.testing.expectEqual(@as(usize, 1), slot.items.len);
         try std.testing.expectEqualStrings(case.text, slot.items[0].text);
         try std.testing.expect(grid.message_state.status_dirty[case.channel.index()]);
+    }
+}
+
+fn testModeChange(arena: std.mem.Allocator, mode: []const u8) ![]mp.Value {
+    const t = try arena.alloc(mp.Value, 2);
+    t[0] = .{ .str = mode };
+    t[1] = .{ .int = 0 };
+    return testEvent(arena, "mode_change", t);
+}
+
+test "win_move, win_exchange and win_rotate queue their own fields and drop a short tuple" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+
+    const Case = struct { name: []const u8, args: []const i64 };
+    const cases = [_]Case{
+        .{ .name = "win_move", .args = &.{ 1000, 2, 3 } },
+        .{ .name = "win_exchange", .args = &.{ 1001, 3, 2 } },
+        .{ .name = "win_rotate", .args = &.{ 1002, 4, 1, 5 } },
+        // win_rotate needs four arguments.
+        .{ .name = "win_rotate", .args = &.{ 1003, 5, 1 } },
+    };
+    for (cases) |case| {
+        const t = try arena.alloc(mp.Value, case.args.len);
+        for (case.args, 0..) |a, i| t[i] = .{ .int = a };
+        try runRedrawEvents(&grid, &hl, arena, try testEvent(arena, case.name, t));
+    }
+
+    const ops = grid.pending_win_ops.items;
+    try std.testing.expectEqual(@as(usize, 3), ops.len);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .move, .win = 1000, .grid_id = 2, .flags_or_direction = 3 }, ops[0]);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .exchange, .win = 1001, .grid_id = 3, .count = 2 }, ops[1]);
+    try std.testing.expectEqual(grid_mod.PendingWinOp{ .op = .rotate, .win = 1002, .grid_id = 4, .flags_or_direction = 1, .count = 5 }, ops[2]);
+}
+
+fn testShowmode(arena: std.mem.Allocator, text: []const u8) ![]mp.Value {
+    const content = try arena.alloc(mp.Value, 1);
+    content[0] = try testChunk(arena, 0, text, 2);
+    const t = try arena.alloc(mp.Value, 1);
+    t[0] = .{ .arr = content };
+    return testEvent(arena, "msg_showmode", t);
+}
+
+test "mode_change keeps a showmode the same batch sent, and clears a stale one on leaving insert" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    var hl = Highlights.init(std.testing.allocator);
+    defer hl.deinit();
+    const slot = &grid.message_state.status_content[grid_mod.StatusChannel.showmode.index()];
+
+    // Entering visual: "-- VISUAL --" then mode_change in one batch.
+    try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- VISUAL --"));
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "visual"));
+    try std.testing.expectEqual(@as(usize, 1), slot.items.len);
+
+    // Insert with its showmode, flushed; then leaving insert with no new
+    // msg_showmode clears the stale "-- INSERT --".
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "insert"));
+    try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- INSERT --"));
+    grid.showmode_set_since_flush = false; // the batch's flush event
+    try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "normal"));
+    try std.testing.expectEqual(@as(usize, 0), slot.items.len);
+
+    // Replace and terminal leave the same way (mode names are lowercase).
+    for ([_][]const u8{ "replace", "terminal" }) |mode| {
+        try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, mode));
+        try runRedrawEvents(&grid, &hl, arena, try testShowmode(arena, "-- MODE --"));
+        grid.showmode_set_since_flush = false;
+        try runRedrawEvents(&grid, &hl, arena, try testModeChange(arena, "normal"));
+        try std.testing.expectEqual(@as(usize, 0), slot.items.len);
     }
 }

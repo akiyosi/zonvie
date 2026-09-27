@@ -56,8 +56,6 @@ const min_paint_ratio: f64 = 0.002;
 /// grid scrolled, not on what the rows underneath hold.
 const scrollbar_exclude_px: f64 = 48;
 
-const max_windows = 16;
-
 const Route = enum {
     /// nvim_open_win({external=true}) — external from birth, no win_pos ever.
     born_external,
@@ -106,8 +104,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
     // A blinking cursor alone produces a false diff between two captures.
     try g.exec("execute('set guicursor=a:block-blinkon0')");
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before_windows = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_windows = driver.snapshotWindows(g.app_pid);
     const main_number = (platform.mainWindowForPid(g.app_pid) orelse return error.MainWindowNotFound).number;
 
     // The anchor's buffer: every line differs across the full width, so the
@@ -134,7 +131,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
         },
     }
 
-    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows, 150);
+    const ext_win = try driver.waitNewWindow(g.app_pid, before_windows.slice(),150);
     if (ext_win.number == main_number) return error.CapturedMainWindow;
     try g.exec("execute('normal! 100Gzt0')");
 
@@ -189,7 +186,7 @@ fn runArm(alloc: std.mem.Allocator, route: Route) !Arm {
 
     // Gate four: the float is composited into the anchor rather than given a
     // window of its own, or "invisible in the anchor" is the wrong question.
-    const window_count = platform.windowsForPid(g.app_pid, &before_buf);
+    const window_count = driver.snapshotWindows(g.app_pid).len;
     if (window_count != before_windows.len + 1) {
         std.debug.print(
             "[gui] the anchored float took an OS window of its own ({d} windows, expected {d})\n",

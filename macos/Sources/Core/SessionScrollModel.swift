@@ -214,6 +214,10 @@ final class SessionScrollModel {
     /// Scratch for the per-frame seed drain; kept as a field so the tick does
     /// not allocate a dictionary every frame.
     private var seedScratch: [Int64: Int] = [:]
+    /// Per-tick scratch: the grids the ease may move, and those of them an
+    /// external window draws. Main thread only.
+    private var easeCandidateScratch: [Int64] = []
+    private var externalEaseGridScratch: Set<Int64> = []
     private var lastSmoothScrollTickTime: CFAbsoluteTime = 0
 
     /// Maximum visual overscroll (rubber-band depth), in cells. Shared by the
@@ -1291,6 +1295,25 @@ final class SessionScrollModel {
             || scrollMomentumRunning
             || now - lastPreciseScrollInputTime < Self.smoothScrollGestureGuardSeconds
 
+        // An external window retains rows at its own depth, which it takes from
+        // 'mousescroll' every frame; the main renderer's changes only on
+        // gesture input. Owners are looked up outside the offset lock, which is
+        // never held across the core's surface-owner lock.
+        scrollOffsetLock.lock()
+        easeCandidateScratch.removeAll(keepingCapacity: true)
+        easeCandidateScratch.append(contentsOf: smoothScrollGrids)
+        easeCandidateScratch.append(contentsOf: gestureLookaheadGrids)
+        scrollOffsetLock.unlock()
+        easeCandidateScratch.append(contentsOf: seedScratch.keys)
+        externalEaseGridScratch.removeAll(keepingCapacity: true)
+        if let core {
+            for id in easeCandidateScratch where core.showingSurfaceId(for: id) != 1 {
+                externalEaseGridScratch.insert(id)
+            }
+        }
+        let externalMaxOffsetPx = externalEaseGridScratch.isEmpty ? 0
+            : rowHeightPx * CGFloat(ScrollRetention.depthRows(forBandRows: core?.getMouseScrollVer() ?? 0))
+
         scrollOffsetLock.lock()
         let maxOffsetPx = rowHeightPx * CGFloat(renderer.retentionDepthRows)
         for (gridId, rowsDelta) in seedScratch where rowsDelta != 0 {
@@ -1330,10 +1353,11 @@ final class SessionScrollModel {
         if !smoothScrollGrids.isEmpty {
             let decay = CGFloat(pow(Double(Self.smoothScrollDecayPerFrame), elapsedFrames))
             for gridId in Array(smoothScrollGrids) {
-                // Clamped to what the retention ring can cover: past that the
-                // vacated band has no row to show.
+                // Clamped to what the drawing surface's retention can cover:
+                // past that the vacated band has no row to show.
+                let limitPx = externalEaseGridScratch.contains(gridId) ? externalMaxOffsetPx : maxOffsetPx
                 let decayed = (scrollOffsetPx[gridId] ?? 0) * decay
-                let eased = max(-maxOffsetPx, min(maxOffsetPx, decayed))
+                let eased = max(-limitPx, min(limitPx, decayed))
                 if abs(eased) < Self.scrollOffsetEpsilon {
                     scrollOffsetPx.removeValue(forKey: gridId)
                     smoothScrollGrids.remove(gridId)
@@ -1520,35 +1544,15 @@ final class SessionScrollModel {
         return clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: cellHeightPx)
     }
 
-    /// Scroll offset info for one grid, for an external window's shader update.
-    /// nil when the grid is gone or its offset has settled.
-    func getScrollOffsetInfo(gridId: Int64, drawableHeight: Float, cellHeightPx: Float) -> GridSurfaceRenderer.ScrollOffsetInfo? {
-        guard let core else { return nil }
-
+    /// The clamped offset one grid is drawn at, for an external window's shader
+    /// update; nil once it has settled below the main surface's threshold
+    /// (collectFrameOffsets), so an external surface does not stay in a smooth
+    /// scroll the main surface has already ended.
+    func settledVisualOffsetPx(gridId: Int64, cellHeightPx: Float) -> Float? {
         scrollOffsetLock.lock()
         let offsetPx = clampVisualScrollOffsetPx(scrollOffsetPx[gridId] ?? 0, cellHeightPx: CGFloat(cellHeightPx))
         scrollOffsetLock.unlock()
-        // The main surface's threshold (updateScrollShaderOffset): below it an
-        // offset is settled, and drawing it here kept an external surface in a
-        // smooth scroll the main surface had already ended.
-        if abs(offsetPx) < Self.scrollOffsetEpsilon { return nil }
-
-        // Get grid info for margins (non-blocking)
-        let grids = core.getVisibleGridsCached()
-        guard let info = grids.first(where: { $0.gridId == gridId }) else { return nil }
-
-        let ndcScale: Float = 2.0 / drawableHeight
-        let gridTopPx = Float(info.startRow) * cellHeightPx
-        let gridTopYNDC = 1.0 - gridTopPx * ndcScale
-
-        return GridSurfaceRenderer.ScrollOffsetInfo(
-            gridId: gridId,
-            offsetYPx: Float(offsetPx),
-            gridTopYNDC: gridTopYNDC,
-            gridRows: info.rows,
-            marginTop: info.marginTop,
-            marginBottom: info.marginBottom
-        )
+        return abs(offsetPx) < Self.scrollOffsetEpsilon ? nil : Float(offsetPx)
     }
 
     /// The anchor's landed-rows counter. The main surface does not use this —

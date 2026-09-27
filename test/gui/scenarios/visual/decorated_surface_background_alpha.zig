@@ -34,8 +34,6 @@ const home_dir = "tmp/gui_home_decorated_alpha";
 /// compiled. Without this the arm would pass on a plain blit.
 const shader_loaded_marker = "custom shaders (decorated=1)";
 
-const max_windows = 16;
-
 /// A light theme is the discriminating one: the doubled background pushes
 /// edge pixels brighter than the panel, which "past the background, away
 /// from the text" can detect. On a dark theme the same error moves edges
@@ -229,8 +227,7 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
     try g.exec(hl);
     gui_io.sleepNs(800 * std.time.ns_per_ms);
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     if (before.len == 0) return error.MainWindowNotFound;
 
     try g.remoteSend(":");
@@ -238,7 +235,7 @@ fn measureCmdline(alloc: std.mem.Allocator, config_dir: []const u8, tag: []const
     try g.remoteSend(stems);
     gui_io.sleepNs(1500 * std.time.ns_per_ms);
 
-    const cmd_win = driver.newWindow(g.app_pid, before, 0) orelse return error.CmdlineWindowNotFound;
+    const cmd_win = driver.newWindow(g.app_pid, before.slice(), 0) orelse return error.CmdlineWindowNotFound;
     if (cmd_win.bounds.w < @as(f64, @floatFromInt(x_lo + x_trailing_inset)) or cmd_win.bounds.h < 10) {
         std.debug.print(
             "[gui] {s}: cmdline window too small to measure: {d}x{d}\n",

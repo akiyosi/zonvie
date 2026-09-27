@@ -70,10 +70,17 @@ pub fn capturesScroll(c: anytype) bool {
 /// Neovim resolves the position against the screen instead, so a click on a
 /// message moved the cursor in the buffer behind it and a middle click pasted
 /// there. Windows refused these in its frontend and macOS sent them; the core
-/// refuses them now for both. Wheel events are not asked this: a message
-/// surface scrolls through its sentinel id.
+/// refuses them now for both. Wheel events ask wheelReachesNeovim.
 pub fn buttonReachesNeovim(grid_id: i64) bool {
     return grid_id >= 0;
+}
+
+/// The wheel's version of buttonReachesNeovim, asked after the message grid
+/// has taken its own scroll. -1 is the cursor-grid sentinel the core resolves.
+/// A wheel over the popupmenu or the history panel, forwarded, scrolled
+/// whichever window sat at that position on the screen.
+pub fn wheelReachesNeovim(grid_id: i64) bool {
+    return grid_id >= 0 or grid_id == -1;
 }
 
 /// The grid at (`row`, `col`) of `surface_id`, in that grid's own cells.
@@ -242,6 +249,16 @@ test "a button reaches Neovim for its own grids and never for a surface the core
     try std.testing.expect(buttonReachesNeovim(1000));
     for ([_]i64{ grid_mod.CMDLINE_GRID_ID, grid_mod.POPUPMENU_GRID_ID, grid_mod.MESSAGE_GRID_ID, grid_mod.MSG_HISTORY_GRID_ID }) |id| {
         try std.testing.expect(!buttonReachesNeovim(id));
+    }
+}
+
+test "a wheel reaches Neovim for its own grids and the cursor sentinel only" {
+    const grid_mod = @import("grid.zig");
+    try std.testing.expect(wheelReachesNeovim(-1));
+    try std.testing.expect(wheelReachesNeovim(1));
+    try std.testing.expect(wheelReachesNeovim(1000));
+    for ([_]i64{ grid_mod.CMDLINE_GRID_ID, grid_mod.POPUPMENU_GRID_ID, grid_mod.MSG_HISTORY_GRID_ID }) |id| {
+        try std.testing.expect(!wheelReachesNeovim(id));
     }
 }
 

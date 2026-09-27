@@ -25,7 +25,6 @@ const driver = @import("../../driver.zig");
 const platform = driver.platform;
 const Gui = driver.Gui;
 
-const max_windows = 16;
 const settle_polls = 4; // bounds unchanged for 4 * 250 ms = startup settled
 
 /// Poll until the main-window bounds stop changing, then return them.
@@ -65,8 +64,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
 
     const main_b = try waitStableMainBounds(g);
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before_snap = driver.snapshotWindows(g.app_pid);
+    const before = before_snap.slice();
 
     // 400 lines in one message. Unbounded, this asks AppKit for a window
     // several thousand points tall.
@@ -90,8 +89,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
             return error.Timeout;
         }
 
-        var now_buf: [max_windows]platform.MainWindow = undefined;
-        const now = now_buf[0..platform.windowsForPid(g.app_pid, &now_buf)];
+        const now_snap = driver.snapshotWindows(g.app_pid);
+        const now = now_snap.slice();
 
         // Candidates: windows the bulk echo demonstrably touched — brand new,
         // or pre-existing with a changed height. The main window is excluded

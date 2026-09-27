@@ -36,7 +36,6 @@ const capture = driver.capture;
 const fixture = @import("fixture.zig");
 const gui_io = @import("../../gui_io.zig");
 
-const max_windows = 16;
 const config_dir = "test/gui/fixtures/config_hosted_opaque";
 
 const host_bg = [3]i32{ 0x20, 0x60, 0xa0 };
@@ -232,11 +231,10 @@ fn runExternal(alloc: std.mem.Allocator) !Sample {
     try g.exec("execute('highlight NormalFloat guibg=#2060a0 guifg=#ffffff')");
     try g.exec("execute('highlight ZFloat guibg=#a02060 guifg=#ffffff')");
 
-    var before_buf: [max_windows]platform.MainWindow = undefined;
-    const before = before_buf[0..platform.windowsForPid(g.app_pid, &before_buf)];
+    const before = driver.snapshotWindows(g.app_pid);
     try g.exec("luaeval('(function() " ++ host_lines_lua ++
         "_G.z_anchor = vim.api.nvim_open_win(b, true, {external=true, width=60, height=20})  return 1 end)()')");
-    const ext = try driver.waitNewWindow(g.app_pid, before, 100);
+    const ext = try driver.waitNewWindow(g.app_pid, before.slice(),100);
     gui_io.sleepNs(600 * std.time.ns_per_ms);
 
     // Covers the external window's centre, where the gesture lands.
@@ -245,7 +243,7 @@ fn runExternal(alloc: std.mem.Allocator) !Sample {
         "vim.wo[_G.z_float].winhighlight = \"NormalFloat:ZFloat\" return 1 end)()')");
     gui_io.sleepNs(800 * std.time.ns_per_ms);
     // Hosted, not given a window of its own.
-    if (platform.windowsForPid(g.app_pid, &before_buf) != before.len + 1) return error.FloatGotItsOwnWindow;
+    if (driver.snapshotWindows(g.app_pid).len != before.len + 1) return error.FloatGotItsOwnWindow;
     return glideAndSample(alloc, g, ext, "external");
 }
 

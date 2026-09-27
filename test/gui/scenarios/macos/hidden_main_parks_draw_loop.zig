@@ -21,17 +21,6 @@ const gui_io = @import("../../gui_io.zig");
 const log_path = "tmp/gui_hidden_main_parks.log";
 const hidden_marker = "[dtrace] surface=1 gate=hidden";
 
-fn countSince(alloc: std.mem.Allocator, since_ms: f64) !usize {
-    const lines = try app_log.linesSince(alloc, log_path, hidden_marker, since_ms);
-    defer alloc.free(lines);
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, lines, '\n');
-    while (it.next()) |line| {
-        if (line.len != 0) n += 1;
-    }
-    return n;
-}
-
 pub fn run(alloc: std.mem.Allocator) !void {
     if (!platform.accessibilityTrusted()) {
         std.debug.print("[gui] skipped: not trusted for Accessibility, cannot minimize the main window\n", .{});
@@ -67,11 +56,11 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
     // Gate: the flushes did reach the hidden path, or nothing was exercised.
     gui_io.sleepNs(300 * std.time.ns_per_ms);
-    const woken = try countSince(alloc, t_flush);
+    const woken = try app_log.countLinesSince(alloc, log_path, hidden_marker, t_flush);
 
     const t_quiet = try app_log.nowMs(alloc, log_path);
     gui_io.sleepNs(2000 * std.time.ns_per_ms);
-    const quiet = try countSince(alloc, t_quiet);
+    const quiet = try app_log.countLinesSince(alloc, log_path, hidden_marker, t_quiet);
 
     _ = platform.setWindowMinimizedBySize(g.app_pid, main_b.w, main_b.h, false);
 

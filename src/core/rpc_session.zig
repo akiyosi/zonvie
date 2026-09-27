@@ -523,6 +523,14 @@ fn failRedrawRecovery(self: *Core, reason: anyerror) void {
 
 const max_redraw_recovery_attempts: u8 = 2;
 
+/// The redraw branch's one failure exit. grid_mu is released before the
+/// detach is enqueued: sendRaw takes the writer lock and session
+/// teardown/reset has its own lock ordering.
+fn abandonRedrawBatch(self: *Core, reason: anyerror) void {
+    self.unlockGridAsRedrawOwner();
+    handleRedrawFailure(self, reason);
+}
+
 fn handleRedrawFailure(self: *Core, reason: anyerror) void {
     // Reattaching replays the same authoritative Neovim state. A local hard
     // resource limit therefore cannot be healed by an epoch reset and would
@@ -650,32 +658,14 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
 
     if (handleRedrawRecoveryResponse(self, id, has_err)) return;
 
-    if (has_err) {
-        self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
-        // Clear quit_request_msgid if this was a failed quit request
-        const pending_quit_id = self.quit_request_msgid.load(.acquire);
-        if (pending_quit_id != 0 and id == pending_quit_id) {
-            self.quit_request_msgid.store(0, .release);
-            // On error, still try to quit (fallback)
-            if (self.cb.on_quit_requested) |cb| {
-                cb(self.ctx, 0); // Assume no unsaved on error
-            }
-        }
-        // Glow config request error — decrement retry (next redraw will re-request)
-        const pending_glow_id = self.glow_request_msgid.load(.acquire);
-        if (pending_glow_id != 0 and id == pending_glow_id) {
-            self.glow_request_msgid.store(0, .release);
-            if (self.glow_startup_retries > 0) {
-                self.glow_startup_retries -= 1;
-            }
-        }
-        return;
-    }
+    if (has_err) self.log.write("rpc resp id={d} error={any}\n", .{ id, errv });
 
-    // Check if this is quit request response
-    const pending_quit_id = self.quit_request_msgid.load(.acquire);
-    if (pending_quit_id != 0 and id == pending_quit_id) {
-        self.quit_request_msgid.store(0, .release);
+    if (takeTrackedRequest(&self.quit_request_msgid, id)) {
+        if (has_err) {
+            // On error, still try to quit (fallback): assume no unsaved buffers.
+            if (self.cb.on_quit_requested) |cb| cb(self.ctx, 0);
+            return;
+        }
 
         // Log the response type for debugging
         self.log.write("quit request response: result type={s}\n", .{@tagName(top[3])});
@@ -699,34 +689,36 @@ pub fn handleRpcResponse(self: *Core, top: []mp.Value) void {
         return;
     }
 
-    // Check if this is glow config response
-    const pending_glow_id = self.glow_request_msgid.load(.acquire);
-    if (pending_glow_id != 0 and id == pending_glow_id) {
-        self.glow_request_msgid.store(0, .release);
+    if (takeTrackedRequest(&self.glow_request_msgid, id)) {
+        if (has_err) {
+            // The next redraw re-requests it.
+            if (self.glow_startup_retries > 0) self.glow_startup_retries -= 1;
+            return;
+        }
         self.log.write("glow config response received: type={s}\n", .{@tagName(top[3])});
         applyGlowConfig(self, top[3]);
-        return;
     }
+}
+
+/// Whether `id` answers the request tracked in `slot`, clearing the slot if so.
+fn takeTrackedRequest(slot: *std.atomic.Value(i64), id: i64) bool {
+    const pending = slot.load(.acquire);
+    if (pending == 0 or pending != id) return false;
+    slot.store(0, .release);
+    return true;
 }
 
 /// Force full vertex regeneration (dirty_all + onFlush).
 /// Used when glow state changes to ensure DECO_GLOW flags are set/cleared.
 fn forceGlowFlush(self: *Core) void {
-    // Owner id is set/cleared strictly inside the locked section — see the
-    // matching comment in handleRpcNotification's "redraw" branch for why
-    // (a store before lock or a clear after unlock opens a window where a
-    // different thread, e.g. zonvie_core_retry_flush, can observe/clobber
-    // this id while this thread's critical section is still in progress).
-    self.grid_mu.lockUncancelable(clock.io());
-    self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    self.lockGridAsRedrawOwner();
+    defer self.unlockGridAsRedrawOwner();
     self.grid.markEverySurfaceDirty();
     self.force_ext_cursor_recheck = true;
     var fctx = flush.FlushCtx{ .core = self };
     flush.FlushCtx.onFlush(&fctx, self.grid.rows, self.grid.cols) catch |reason| {
         if (Core.isHardRenderFailure(reason)) self.failHardRender(reason);
     };
-    self.redraw_thread_id.store(0, .seq_cst);
-    self.grid_mu.unlock(clock.io());
 }
 
 /// Disable glow and flush if it was previously enabled (clears DECO_GLOW from vertices).
@@ -1121,25 +1113,31 @@ pub fn setupClipboard(self: *Core) void {
         \\end
         \\if not ch then return end
         \\vim.g.zonvie_channel = ch
+        \\-- The system clipboard holds text only. Like Neovim's own providers,
+        \\-- keep the regtype of the last copy and return it while the clipboard
+        \\-- still holds that copy, so a blockwise yank pastes back as a block.
+        \\local last = {}
+        \\local function copy(reg)
+        \\  return function(lines, regtype)
+        \\    last[reg] = { lines, regtype }
+        \\    return vim.rpcrequest(ch, 'zonvie.set_clipboard', reg, lines)
+        \\  end
+        \\end
+        \\local function paste(reg)
+        \\  return function()
+        \\    local got = vim.rpcrequest(ch, 'zonvie.get_clipboard', reg)
+        \\    local c = last[reg]
+        \\    if c and type(got) == 'table' and vim.deep_equal(got[1], c[1]) then
+        \\      return { got[1], c[2] }
+        \\    end
+        \\    return got
+        \\  end
+        \\end
         \\vim.schedule(function()
         \\  vim.g.clipboard = {
         \\    name = 'zonvie',
-        \\    copy = {
-        \\      ['+'] = function(lines, regtype)
-        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '+', lines)
-        \\      end,
-        \\      ['*'] = function(lines, regtype)
-        \\        return vim.rpcrequest(ch, 'zonvie.set_clipboard', '*', lines)
-        \\      end,
-        \\    },
-        \\    paste = {
-        \\      ['+'] = function()
-        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '+')
-        \\      end,
-        \\      ['*'] = function()
-        \\        return vim.rpcrequest(ch, 'zonvie.get_clipboard', '*')
-        \\      end,
-        \\    },
+        \\    copy = { ['+'] = copy('+'), ['*'] = copy('*') },
+        \\    paste = { ['+'] = paste('+'), ['*'] = paste('*') },
         \\  }
         \\end)
     ;
@@ -1425,11 +1423,10 @@ pub fn setupAgentStatus(self: *Core) void {
 /// Lua fallback is for a missing component, never for an explicit 0.
 /// augroup clear=true keeps re-injection idempotent. Fire-and-forget.
 ///
-/// macOS only: sub-cell trackpad scrolling is a macOS frontend feature, and
-/// the Windows frontend scrolls by whole rows, so injecting the reporter
-/// there would cost an exec_lua and an autocmd for a value nothing reads.
+/// Every platform: the message float's wheel (shared core code) reads it too,
+/// and without the reporter Windows scrolled it 3 lines whatever 'mousescroll'
+/// said, 'ver:0' included.
 pub fn setupMouseScrollReporter(self: *Core) void {
-    if (comptime builtin.os.tag != .macos) return;
     const lua_code =
         \\local function report()
         \\  local ms = vim.o.mousescroll or ''
@@ -1663,20 +1660,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
         // on_linespace, on_external_window*, on_ime_off, on_cursor_grid_changed)
         // execute while grid_mu is held. Callbacks MUST NOT call
         // zonvie_core_get_* or other APIs that acquire grid_mu.
-        self.grid_mu.lockUncancelable(clock.io());
-
-        // Store current thread ID (to detect re-entrant updateLayoutPx calls
-        // from this thread) only AFTER acquiring grid_mu, and clear it
-        // before unlocking below — the owner id must never be visible to
-        // another thread except while grid_mu is actually held by the
-        // thread that set it. Setting it before the lock (or clearing it
-        // after unlocking) opens a window where a different thread — e.g.
-        // zonvie_core_retry_flush on the UI thread — can read/write this
-        // same atomic while this thread is mid-callback (or vice versa),
-        // clobbering the id a re-entrant updateLayoutPx call on the OTHER
-        // thread depends on and causing it to self-deadlock on grid_mu it
-        // already holds.
-        self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+        self.lockGridAsRedrawOwner();
 
         var fctx = flush.FlushCtx{ .core = self };
         var redraw_error: ?anyerror = null;
@@ -1704,12 +1688,8 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
 
         if (redraw_error) |reason| {
             // Do not run UI-extension post-processing and do not present this
-            // partial batch. Release grid_mu before enqueueing detach: sendRaw
-            // takes the writer lock and session teardown/reset has its own
-            // lock ordering.
-            self.redraw_thread_id.store(0, .seq_cst);
-            self.grid_mu.unlock(clock.io());
-            handleRedrawFailure(self, reason);
+            // partial batch.
+            abandonRedrawBatch(self, reason);
             return;
         }
 
@@ -1826,9 +1806,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
 
         if (postprocess_error) |reason| {
             self.log.write("redraw post-processing err: {any}\n", .{reason});
-            self.redraw_thread_id.store(0, .seq_cst);
-            self.grid_mu.unlock(clock.io());
-            handleRedrawFailure(self, reason);
+            abandonRedrawBatch(self, reason);
             return;
         }
 
@@ -1852,12 +1830,7 @@ pub fn handleRpcNotification(self: *Core, arena: std.mem.Allocator, top: []mp.Va
             need_reload_glow_config = true;
         }
 
-        // Clear the owner id while STILL holding grid_mu (see the store
-        // above): only then unlock, so no other thread can ever observe a
-        // stale or cleared owner id while this thread's critical section
-        // is still technically in progress.
-        self.redraw_thread_id.store(0, .seq_cst);
-        self.grid_mu.unlock(clock.io());
+        self.unlockGridAsRedrawOwner();
         if (need_reload_glow_config) {
             self.requestGlowConfig();
         } else if (self.glow_startup_retries > 0 and
@@ -1989,7 +1962,9 @@ pub fn runLoop(self: *Core) void {
         is_cmd or is_shell or is_devcontainer;
 
     // Buffer for parsed arguments
-    var argv_buf: [16][]const u8 = undefined;
+    // Sized for a shell glob of file arguments (`zonvie src/*.c`): a 16-slot
+    // buffer silently opened only the first 13 files.
+    var argv_buf: [256][]const u8 = undefined;
     var argc: usize = 0;
 
     if (is_wsl or is_ssh or is_ssh_askpass or is_cmd or is_devcontainer or is_shell) {
@@ -2025,9 +2000,12 @@ pub fn runLoop(self: *Core) void {
         // e.g., "nvim -u /tmp/init.lua +10 file.txt" → ["nvim", "--embed", "-u", "/tmp/init.lua", "+10", "file.txt"]
         // Reserve the last slot for --embed, which is inserted after the
         // executable below. Passing the shortened slice is what caps the user
-        // tokens at 14; today's argc counts the injected --embed, so the
+        // tokens at 254; today's argc counts the injected --embed, so the
         // budget is one less than it looks.
         argc = tokenizeCommand(nvim_path, argv_buf[0 .. argv_buf.len - 2]);
+        if (argc == argv_buf.len - 2) {
+            self.log.write("Native mode: argument list reached the {d}-token cap; the rest is dropped\n", .{argc});
+        }
         if (argc > 0) {
             // Open a hole at index 1 for --embed.
             var k: usize = argc;

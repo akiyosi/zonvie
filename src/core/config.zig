@@ -17,6 +17,7 @@ pub const RouteOpts = msg_route.RouteOpts;
 pub const RouteResult = msg_route.RouteResult;
 pub const ViewSettings = msg_route.ViewSettings;
 pub const isReturnPrompt = msg_route.isReturnPrompt;
+pub const isInteractivePrompt = msg_route.isInteractivePrompt;
 
 fn levelFromString(s: []const u8) ?MsgLevel {
     if (std.mem.eql(u8, s, "info")) return .info;

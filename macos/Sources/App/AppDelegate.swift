@@ -52,7 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 NSApp.activate(ignoringOtherApps: true)
                 ZonvieCore.appLog("zonvie: window shown after auth")
             }
-            self?.processPendingFiles()
+            self?.processPendingFiles(readyCore: sender)
         }
 
         keyWindowObserver = NotificationCenter.default.addObserver(
@@ -498,15 +498,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         processPendingFiles()
     }
 
-    private func processPendingFiles() {
+    private func processPendingFiles(readyCore: ZonvieCore? = nil) {
         guard !pendingFilesToOpen.isEmpty else { return }
 
-        // Get core from ViewController
-        guard let vc = window?.contentViewController as? ViewController,
-              let core = vc.core else {
-            ZonvieCore.appLog("zonvie: cannot open files - no core available")
+        // The key session first, then any other. A core that has not drawn
+        // yet (a New Session window still on its connection sheet) has no
+        // writer: the send failed silently and the queue was emptied anyway.
+        // Keep the files queued until a session becomes ready.
+        let sessions = SessionManager.shared.sessions
+        let keyCore = (window?.contentViewController as? ViewController)?.core
+        let candidates = [readyCore, keyCore] + sessions.map { $0.viewController?.core }
+        guard let core = candidates.compactMap({ $0 }).first(where: { $0.isNeovimReady }) else {
+            ZonvieCore.appLog("zonvie: cannot open files - no ready session")
             return
         }
+        let targetWindow = sessions.first { $0.viewController?.core === core }?.window ?? window
 
         ZonvieCore.appLog("zonvie: processing \(pendingFilesToOpen.count) pending files")
 
@@ -525,7 +531,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Bring the running instance to the front (file routed from Finder).
         NSApp.activate(ignoringOtherApps: true)
-        window?.makeKeyAndOrderFront(nil)
+        targetWindow?.makeKeyAndOrderFront(nil)
     }
 
 }

@@ -853,24 +853,11 @@ pub const TripleBufferedSurface = struct {
         last_cursor_row: ?u32,
     ) bool {
         if (!self.main_cursor_in_flush) {
-            var picked: ?u8 = null;
-            self.rotation_mu.lockUncancelable(core.clock.io());
-            const ci = self.main_cursor_committed_index;
-            for (0..SET_COUNT) |i| {
-                const idx: u8 = @intCast(i);
-                if (idx != ci and self.main_cursor_ui_read_refcount[i] == 0) {
-                    picked = idx;
-                    break;
-                }
-            }
-            self.rotation_mu.unlock(core.clock.io());
-            if (picked == null) return false;
-
-            const dst = &self.main_cursor_sets[picked.?];
-            dst.verts.ensureTotalCapacity(alloc, verts.len) catch return false;
-            self.main_cursor_write_index = picked.?;
+            const pick = self.pickCursorCandidate() orelse return false;
+            self.main_cursor_sets[pick.picked].verts.ensureTotalCapacity(alloc, verts.len) catch return false;
+            self.main_cursor_write_index = pick.picked;
             self.main_cursor_flush_paint_full = false;
-            self.main_cursor_flush_old_row = self.main_cursor_sets[ci].last_cursor_row;
+            self.main_cursor_flush_old_row = self.main_cursor_sets[pick.committed].last_cursor_row;
             self.main_cursor_in_flush = true;
         } else {
             self.main_cursor_sets[self.main_cursor_write_index].verts.ensureTotalCapacity(alloc, verts.len) catch return false;
@@ -913,21 +900,23 @@ pub const TripleBufferedSurface = struct {
     ) bool {
         var candidate = self.main_cursor_write_index;
         if (!self.main_cursor_in_flush) {
-            var picked: ?u8 = null;
-            self.rotation_mu.lockUncancelable(core.clock.io());
-            const ci = self.main_cursor_committed_index;
-            for (0..SET_COUNT) |i| {
-                const idx: u8 = @intCast(i);
-                if (idx != ci and self.main_cursor_ui_read_refcount[i] == 0) {
-                    picked = idx;
-                    break;
-                }
-            }
-            self.rotation_mu.unlock(core.clock.io());
-            candidate = picked orelse return false;
+            candidate = (self.pickCursorCandidate() orelse return false).picked;
         }
         self.main_cursor_sets[candidate].verts.ensureTotalCapacity(alloc, vert_count) catch return false;
         return true;
+    }
+
+    /// The first cursor set that is neither committed nor held by a UI
+    /// reader, with the committed index read under the same lock.
+    fn pickCursorCandidate(self: *TripleBufferedSurface) ?struct { picked: u8, committed: u8 } {
+        self.rotation_mu.lockUncancelable(core.clock.io());
+        defer self.rotation_mu.unlock(core.clock.io());
+        const ci = self.main_cursor_committed_index;
+        for (0..SET_COUNT) |i| {
+            const idx: u8 = @intCast(i);
+            if (idx != ci and self.main_cursor_ui_read_refcount[i] == 0) return .{ .picked = idx, .committed = ci };
+        }
+        return null;
     }
 
     pub fn markFlushPaintFull(self: *TripleBufferedSurface) void {
@@ -1625,10 +1614,6 @@ pub const MessageWindow = struct {
     hl_id: u32 = 0,
     line_count: u32 = 1,
     is_long_mode: bool = false,
-    // Saved size/mode for return_prompt (preserve confirm dialog layout)
-    saved_width: c_int = 0,
-    saved_height: c_int = 0,
-    saved_is_long_mode: bool = false,
 
     pub fn deinit(self: *MessageWindow) void {
         _ = c.DestroyWindow(self.hwnd);
@@ -1647,8 +1632,7 @@ pub const MessageWindow = struct {
         } else if (std.mem.eql(u8, kind_str, "wmsg")) {
             return c.RGB(255, 217, 102); // Yellow for warnings
         } else if (std.mem.eql(u8, kind_str, "confirm") or
-            std.mem.eql(u8, kind_str, "confirm_sub") or
-            std.mem.eql(u8, kind_str, "return_prompt"))
+            std.mem.eql(u8, kind_str, "confirm_sub"))
         {
             return c.RGB(153, 204, 255); // Light blue for prompts
         } else if (std.mem.eql(u8, kind_str, "search_count")) {
@@ -1682,12 +1666,16 @@ pub const TablineState = struct {
 
     // Drag state for tab reordering
     dragging_tab: ?usize = null, // Index of tab being dragged
+    // Its handle: the release acts on that tab wherever a tabline_update in
+    // between moved it, as macOS does.
+    dragging_tab_handle: i64 = 0,
     drag_start_x: c_int = 0, // Mouse X when drag started
     drag_offset_x: c_int = 0, // Offset from tab left edge to mouse
     drag_current_x: c_int = 0, // Current mouse X during drag
     drop_target_index: ?usize = null, // Where the tab would be dropped
     drag_start_y: c_int = 0, // Mouse Y when drag started (sidebar)
     drag_current_y: c_int = 0, // Current mouse Y during drag (sidebar)
+    drag_offset_y: c_int = 0, // Offset from row top edge to mouse (sidebar)
 
     // External drag state (for tab externalization)
     is_external_drag: bool = false,
@@ -2028,8 +2016,6 @@ pub const SlotPool = struct {
 
 pub const LayerScroll = render_pipeline_helpers.LayerScroll;
 
-/// Legacy combined struct for backward compatibility during migration.
-/// Contains both CPU vertex data and GPU VB resources.
 /// Vertex storage for one grid a surface places as a non-root layer. Layers
 /// other than the root are small and the core regenerates them wholesale, so
 /// they use plain per-row buffers rather than the root grid's slot pool.
@@ -2042,8 +2028,6 @@ pub const LayerScroll = render_pipeline_helpers.LayerScroll;
 /// whole previous frame, and an aborted flush (discardStaged) leaves that
 /// frame untouched for the core's resend to replace.
 pub const LayerGridState = struct {
-    rows: u32 = 0,
-    cols: u32 = 0,
     rows_buf: std.ArrayListUnmanaged(RowVerts) = .empty,
     /// The row each stored array's vertices were built for. A row-shift hint
     /// moves arrays between rows without rewriting their pixels, so the draw
@@ -2139,8 +2123,6 @@ pub const LayerGridState = struct {
         self.staged = .empty;
         self.staged_len = 0;
         self.staged_rows_len = 0;
-        self.rows = 0;
-        self.cols = 0;
     }
 
     /// Rows the arrays will hold once this flush is applied.
@@ -2170,11 +2152,11 @@ pub const LayerGridState = struct {
         total_rows: u32,
         total_cols: u32,
     ) bool {
-        if (rows_delta == 0 or row_end <= row_start) return true;
-        if (row_end > self.plannedRows()) return false;
-        const region_height: u32 = row_end - row_start;
-        const shift: u32 = @intCast(@abs(rows_delta));
-        if (shift == 0 or shift >= region_height) return false;
+        switch (render_pipeline_helpers.checkShift(row_start, row_end, rows_delta, self.plannedRows())) {
+            .noop => return true,
+            .invalid => return false,
+            .fits => {},
+        }
         const op = self.nextOp(alloc) orelse return false;
         // Field-wise, because op.verts owns a buffer this slot keeps.
         op.kind = .shift;
@@ -2229,8 +2211,7 @@ pub const LayerGridState = struct {
             self.dirty_rows.resize(alloc, need, false) catch return false;
         }
         for (self.staged.items[0..self.staged_len]) |op| {
-            if (op.kind == .shift and (op.row_end > need or op.row_start >= op.row_end or
-                @abs(op.rows_delta) >= op.row_end - op.row_start)) return false;
+            if (op.kind == .shift and render_pipeline_helpers.checkShift(op.row_start, op.row_end, op.rows_delta, need) != .fits) return false;
         }
         return true;
     }
@@ -2266,8 +2247,6 @@ pub const LayerGridState = struct {
                     self.mergeShift(op);
                 },
                 .row => {
-                    self.rows = op.total_rows;
-                    self.cols = op.total_cols;
                     const rv = &self.rows_buf.items[@intCast(op.row)];
                     std.mem.swap(std.ArrayListUnmanaged(Vertex), &rv.verts, &op.verts);
                     rv.gen +%= 1;
@@ -2325,12 +2304,12 @@ pub const LayerGridState = struct {
     /// empty for the core to refill. Replay only: stageShift already checked
     /// the region against the length applyStaged resized to.
     fn shiftRows(self: *LayerGridState, row_start: u32, row_end: u32, rows_delta: i32) bool {
-        if (rows_delta == 0 or row_end <= row_start) return true;
-        if (row_end > self.rows_buf.items.len) return false;
-        if (row_end > self.origin_rows.items.len) return false;
-        const region_height: u32 = row_end - row_start;
-        const shift: u32 = @intCast(@abs(rows_delta));
-        if (shift == 0 or shift >= region_height) return false;
+        const len = @min(self.rows_buf.items.len, self.origin_rows.items.len);
+        switch (render_pipeline_helpers.checkShift(row_start, row_end, rows_delta, len)) {
+            .noop => return true,
+            .invalid => return false,
+            .fits => {},
+        }
 
         const rows_buf = self.rows_buf.items;
         const origins = self.origin_rows.items;
@@ -2373,7 +2352,6 @@ pub const PaintRowRange = struct {
     count: usize,
 };
 
-/// External window state for win_external_pos grids
 /// The buffers one surface paints with: per-row GPU vertex buffers, the
 /// cursor and scrollbar overlays, the per-paint lists, and
 /// where the cursor was last painted. The main window and every external
@@ -2481,6 +2459,12 @@ pub const WindowSurface = struct {
         _ = self.paint_retry.succeeded();
     }
 
+    /// Release every row VB, for a paint that draws no rows (flat or
+    /// decorated) after an earlier row-mode frame.
+    pub fn dropRowVBs(self: *WindowSurface, app: *App) void {
+        _ = resizeRowVBsForPaint(app.alloc, &self.paint.row_vbs, &app.row_vb_budget, &self.paint.row_vb_retained_bytes, 0);
+    }
+
     pub const RecoveryVB = struct { buffer: *c.ID3D11Buffer, row_bytes: usize };
 
     /// Detach one of this surface's device-bound buffers without calling COM,
@@ -2512,15 +2496,11 @@ pub const ExternalWindow = struct {
     /// The state every window's surface keeps; see WindowSurface.
     surf: WindowSurface = .{},
 
-
-    // Triple-buffered surface for lock-free vertex handoff (core → UI thread).
-
     needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
     pending_window_w: c_int = 0, // Pending window width for deferred resize
     pending_window_h: c_int = 0, // Pending window height for deferred resize
-    atlas_version: u64 = 0, // Last atlas version uploaded to this window's D3D context
     // DPI scale of the monitor this external window is currently on (may
     // differ from app.dpi_scale on a mixed-DPI multi-monitor setup). Used
     // ONLY for this window's own scrollbar hit-test geometry — NOT for font
@@ -3491,7 +3471,7 @@ pub fn drawExternalSurfaceFlat(
     glow_intensity: f32,
 ) !void {
     const draw_opts: d3d11.Renderer.DrawOpts = .{
-        .present = false, // Caller (paintExternalWindow) handles present via presentOnlyFromBack
+        .present = false, // Caller (paintExternalWindow) presents via presentFromBackRectsWithCursorNoResize
         .glow_enabled = glow_enabled,
         .glow_intensity = glow_intensity,
     };
@@ -3648,11 +3628,9 @@ pub const LayerFramePlanParams = struct {
     content_height: i32,
     row_h_px: i32,
     cell_w_px: i32,
+    /// False whenever the root redraws whole, its paint_full (an atlas reset
+    /// invalidates the layers' glyph UVs too) included.
     preserve_back: bool,
-    /// The root's paint_full. Every other reason the root redraws whole is
-    /// already folded into `preserve_back`; this one is not, and an atlas
-    /// reset invalidates the layers' glyph UVs too.
-    paint_full: bool,
     cursor_grid: i64,
     last_cursor_row: ?u32,
     /// The root grid's rows this paint redraws. Each paints its own band over
@@ -3792,7 +3770,7 @@ pub fn planLayerFrame(
         // the blit's geometry alike, so it belongs with the other full-redraw
         // reasons rather than only in the refusal ladder.
         const row_limit: usize = @min(state.rows_buf.items.len, @as(usize, layer.rows));
-        state.draw_all = grow_failed or !p.preserve_back or p.paint_full or
+        state.draw_all = grow_failed or !p.preserve_back or
             state.needs_full_redraw or row_limit != state.last_drawn_rows;
         state.needs_full_redraw = false;
         state.blit_clear_band = null;
@@ -4747,12 +4725,18 @@ pub fn failSurfacePaint(
     ws: *WindowSurface,
     device_lost: bool,
 ) ?PaintRetryState.Ticket {
+    requestSurfaceFullPaint(app, ws);
+    if (device_lost) return null;
+    return ws.paint_retry.fail();
+}
+
+/// Make the next paint of `ws` a full one. `app.mu` must be free: the surface
+/// flag is taken under it, the TBS flag under rotation_mu, never nested.
+pub fn requestSurfaceFullPaint(app: *App, ws: *WindowSurface) void {
     app.mu.lockUncancelable(core.clock.io());
     ws.surface.paint_full = true;
     app.mu.unlock(core.clock.io());
     ws.tbs.requestFullPaint();
-    if (device_lost) return null;
-    return ws.paint_retry.fail();
 }
 
 /// What a surface owns across paints and lends to one row frame: its row VB
@@ -5064,8 +5048,6 @@ pub const RowPassInput = struct {
     /// The root's row count the scroll shift and its layer reach clamp to.
     total_rows: u32,
     preserve_back: bool,
-    /// What the layer plan counts as the root repainting whole.
-    layer_paint_full: bool,
     cell_w_px: i32,
     layer_present: ?RowPassLayerPresent = null,
     /// The frame, minus what this pass settles: the redraw set, the layers
@@ -5183,7 +5165,6 @@ pub fn drawSurfaceRowPass(
             .row_h_px = p.row_h_px,
             .cell_w_px = in.cell_w_px,
             .preserve_back = in.preserve_back,
-            .paint_full = in.layer_paint_full,
             .cursor_grid = in.snapshot.cursor_layer_grid_id,
             .last_cursor_row = surface.last_painted_cursor_row.*,
             .rows_to_draw = rows_to_draw.items,
@@ -5398,6 +5379,9 @@ pub const App = struct {
     message_window: ?MessageWindow = null,
     pending_messages: std.ArrayListUnmanaged(PendingMessageRequest) = .empty,
     display_messages: std.ArrayListUnmanaged(DisplayMessage) = .empty, // Stack of visible messages
+    /// showmode / showcmd / ruler routed to ext_float, by channel
+    /// (messages.statusChannel). UI thread.
+    status_messages: [3]?DisplayMessage = .{ null, null, null },
 
     // ext_tabline state
     tabline_state: TablineState = .{},
@@ -5600,11 +5584,6 @@ pub const App = struct {
     // one persistent buffer (cleared and re-filled each call) is fine.
     device_lost_recover_grids: std.ArrayListUnmanaged(i64) = .empty,
 
-    // Last-uploaded tabline content signature (renderTablineToD3D change
-    // gate). 0 forces a re-render — reset when the renderer/texture is
-    // recreated (device-loss recovery).
-    tabline_render_sig: u64 = 0,
-    sidebar_render_sig: u64 = 0,
     // Row-mode seed tracking: require a full set of rows before presenting.
     seed_pending: bool = true,
     seed_clear_pending: bool = true,
@@ -5798,14 +5777,19 @@ pub const App = struct {
 
     // Clipboard request state (for cross-thread clipboard operations)
     clipboard_event: c.HANDLE = null, // Manual-reset event for sync
-    // Grown to fit whatever the system clipboard holds. A fixed buffer here
+    // Guards the fields below between the core thread and the UI handler. A
+    // handler acts only while clipboard_active_seq still names its request,
+    // so one that runs after its caller timed out touches nothing.
+    clipboard_mu: std.Io.Mutex = .init,
+    clipboard_seq: u32 = 0,
+    clipboard_active_seq: u32 = 0,
+    // Both directions' payload: a set copies into it before posting. Grown to
+    // fit whatever the system clipboard holds. A fixed buffer here
     // truncated large pastes silently, and the core cannot recover what the
     // UI thread never fetched.
     clipboard_buf: []u8 = &.{},
     clipboard_len: usize = 0,
     clipboard_result: c_int = 0,
-    clipboard_set_data: ?[*]const u8 = null,
-    clipboard_set_len: usize = 0,
 
 
     // SSH auth prompt state (owned copy - core frees original after callback)
@@ -6736,7 +6720,6 @@ test "a layer's cursor row is repainted over the layers above it" {
         .row_h_px = row_h_px,
         .cell_w_px = cell_w_px,
         .preserve_back = true,
-        .paint_full = false,
         .cursor_grid = 2,
         .last_cursor_row = 2,
         .rows_to_draw = &.{},
@@ -6813,7 +6796,6 @@ test "a layer's cursor row reaches a float that only overlaps the float above it
         .row_h_px = row_h_px,
         .cell_w_px = cell_w_px,
         .preserve_back = true,
-        .paint_full = false,
         .cursor_grid = 2,
         .last_cursor_row = 2,
         .rows_to_draw = &.{},
@@ -6849,8 +6831,6 @@ test "a layer plan is refused once the core republishes the rows under it" {
     state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
     state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
     state.last_drawn_rows = 3;
-    state.rows = 3;
-    state.cols = 4;
     state.dirty_rows.set(1);
 
     var app: App = undefined;
@@ -6875,7 +6855,6 @@ test "a layer plan is refused once the core republishes the rows under it" {
         .row_h_px = row_h_px,
         .cell_w_px = cell_w_px,
         .preserve_back = true,
-        .paint_full = false,
         .cursor_grid = 1,
         .last_cursor_row = null,
         .rows_to_draw = &.{},
@@ -7016,8 +6995,6 @@ test "a layer frame is refused once the core republishes the root rows beside it
     state.dirty_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
     state.draw_rows = try std.DynamicBitSetUnmanaged.initEmpty(alloc, 3);
     state.last_drawn_rows = 3;
-    state.rows = 3;
-    state.cols = 4;
 
     var app: App = undefined;
     app.alloc = alloc;
@@ -7142,7 +7119,6 @@ test "a layer frame is refused once the core republishes the root rows beside it
         .row_h_px = row_h_px,
         .cell_w_px = cell_w_px,
         .preserve_back = true,
-        .paint_full = pinned.paint_full,
         .cursor_grid = pinned.cursor_layer_grid_id,
         .last_cursor_row = null,
         .rows_to_draw = &[_]u32{0},
@@ -7178,6 +7154,7 @@ test {
     _ = @import("input.zig");
     // Message placement rules and the status/confirm stack rules.
     _ = @import("ui/messages.zig");
+    _ = @import("ui/scrollbar.zig");
     // DirectWrite shaping with [font] family features (skips without the font).
     _ = @import("renderer/dwrite_d2d_renderer.zig");
 }

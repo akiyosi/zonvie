@@ -53,7 +53,6 @@ pub const default_app_rel_path = switch (builtin.os.tag) {
 extern "kernel32" fn GetProcessId(h: std.os.windows.HANDLE) callconv(.winapi) u32;
 // std.os.windows.WaitForSingleObject was removed in 0.16; declare the raw call.
 extern "kernel32" fn WaitForSingleObject(h: std.os.windows.HANDLE, ms: u32) callconv(.winapi) u32;
-const WAIT_TIMEOUT: u32 = 0x00000102;
 // std.posix.W.NOHANG went with std.posix.waitpid in 0.16 (see appAlive).
 const W_NOHANG: c_int = 1;
 
@@ -429,31 +428,14 @@ pub const Gui = struct {
     /// Cursor blink etc. must be disabled by the scenario first, or the
     /// frames will never settle.
     pub fn captureStable(g: *Gui, crop: ?capture.Crop, timeout_ms: u64) !capture.Image {
-        var timer = gui_io.Timer.start();
-        var prev: ?capture.Image = null;
-        defer if (prev) |*p| p.deinit(g.alloc);
-        while (true) {
-            gui_io.sleepNs(150 * std.time.ns_per_ms);
-            const cur = capture.captureMainWindow(g.alloc, g.app_pid, crop) catch |e| {
-                if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
-                continue;
-            };
-            if (prev) |*p| {
-                if (p.w == cur.w and p.h == cur.h and std.mem.eql(u8, p.rgba, cur.rgba)) {
-                    p.deinit(g.alloc);
-                    prev = null;
-                    return cur;
-                }
-                p.deinit(g.alloc);
-                prev = null;
+        const MainGrab = struct {
+            pid: i32,
+            crop: ?capture.Crop,
+            fn grab(s: @This(), alloc: std.mem.Allocator) !capture.Image {
+                return capture.captureMainWindow(alloc, s.pid, s.crop);
             }
-            prev = cur;
-            if (timer.read() / std.time.ns_per_ms >= timeout_ms) {
-                const out = prev.?;
-                prev = null;
-                return out; // last capture even if not fully settled
-            }
-        }
+        };
+        return captureUntilStable(g.alloc, timeout_ms, MainGrab{ .pid = g.app_pid, .crop = crop });
     }
 
     /// True while the app process is still running. Reaps/observes at most
@@ -502,13 +484,28 @@ pub const Gui = struct {
 
 pub const max_windows = 16;
 
+/// Every on-screen window of a pid at one moment, front to back.
+pub const WindowSnapshot = struct {
+    buf: [max_windows]platform.MainWindow = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const WindowSnapshot) []const platform.MainWindow {
+        return self.buf[0..self.len];
+    }
+};
+
+pub fn snapshotWindows(pid: i32) WindowSnapshot {
+    var s: WindowSnapshot = .{};
+    s.len = platform.windowsForPid(pid, &s.buf);
+    return s;
+}
+
 /// The first window of `pid` absent from `before` whose sides are both at
 /// least `min_side` points. The size floor skips transient helper windows
 /// that would otherwise be taken for the one being waited on.
 pub fn newWindow(pid: i32, before: []const platform.MainWindow, min_side: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    const now = buf[0..platform.windowsForPid(pid, &buf)];
-    outer: for (now) |w| {
+    const now = snapshotWindows(pid);
+    outer: for (now.slice()) |w| {
         for (before) |b| {
             if (b.number == w.number) continue :outer;
         }
@@ -534,8 +531,8 @@ pub fn waitNewWindow(pid: i32, before: []const platform.MainWindow, min_side: f6
 /// The frontmost window of `pid` covering the point, which is the one a posted
 /// event will land on. windowsForPid returns the on-screen list front to back.
 pub fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
-    var buf: [max_windows]platform.MainWindow = undefined;
-    for (buf[0..platform.windowsForPid(pid, &buf)]) |w| {
+    const now = snapshotWindows(pid);
+    for (now.slice()) |w| {
         if (x >= w.bounds.x and x < w.bounds.x + w.bounds.w and
             y >= w.bounds.y and y < w.bounds.y + w.bounds.h) return w;
     }
@@ -546,12 +543,24 @@ pub fn topmostWindowAt(pid: i32, x: f64, y: f64) ?platform.MainWindow {
 /// two consecutive captures are pixel-identical, so a frame caught mid-present
 /// is never what a comparison sees.
 pub fn captureWindowStable(alloc: std.mem.Allocator, window_number: u32, timeout_ms: u64) !capture.Image {
+    const WindowGrab = struct {
+        number: u32,
+        fn grab(s: @This(), a: std.mem.Allocator) !capture.Image {
+            return capture.captureWindow(a, s.number);
+        }
+    };
+    return captureUntilStable(alloc, timeout_ms, WindowGrab{ .number = window_number });
+}
+
+/// Call `grabber.grab(alloc)` until two consecutive captures are
+/// pixel-identical, or return the last capture at timeout.
+fn captureUntilStable(alloc: std.mem.Allocator, timeout_ms: u64, grabber: anytype) !capture.Image {
     var timer = gui_io.Timer.start();
     var prev: ?capture.Image = null;
     defer if (prev) |*p| p.deinit(alloc);
     while (true) {
         gui_io.sleepNs(150 * std.time.ns_per_ms);
-        const cur = capture.captureWindow(alloc, window_number) catch |e| {
+        const cur = grabber.grab(alloc) catch |e| {
             if (timer.read() / std.time.ns_per_ms >= timeout_ms) return e;
             continue;
         };
