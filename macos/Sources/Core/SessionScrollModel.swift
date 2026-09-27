@@ -18,10 +18,14 @@ final class SessionScrollModel {
     /// it holds the main surface's retention and seeds.
     private var renderer: GridSurfaceRenderer? { core?.terminalView?.renderer }
 
-    /// Keep the main surface's draw clock running: the per-frame ticks below
-    /// advance from its pre-draw hook.
-    private func wakeMainDrawLoop() {
-        guard let view = core?.terminalView, view.isPaused else { return }
+    /// Keep the draw clock of the surface showing `gridId` running: the
+    /// per-frame ticks below advance from every surface's pre-draw hook. Waking
+    /// the main window for an external window's ease ran its draw at vsync for
+    /// nothing.
+    private func wakeDrawLoop(showing gridId: Int64) {
+        guard let core else { return }
+        let view: GridInputView? = core.externalViewShowing(gridId: gridId) ?? core.terminalView
+        guard let view, view.isPaused else { return }
         view.activateSurfaceDrawLoop()
     }
     // --- Scroll state for smooth scrolling ---
@@ -749,7 +753,7 @@ final class SessionScrollModel {
             // flushes, so flush-driven activation never fires (a paused loop
             // would freeze the rubber band, e.g. while the finger holds still).
             if abs(newOffset) >= Self.scrollOffsetEpsilon || alreadyPending + scrollCount > 0 {
-                wakeMainDrawLoop()
+                wakeDrawLoop(showing: gridId)
             }
 
             return newOffset
@@ -1371,6 +1375,8 @@ final class SessionScrollModel {
                     scrollOffsetPx[gridId] = eased
                 }
             }
+            // Left holding the grids still easing, for the wake below.
+            easeDecayScratch.removeAll { !smoothScrollGrids.contains($0) }
         }
         let easeActive = !smoothScrollGrids.isEmpty
         // Computed only when the tracer will consume it: the reduction allocates,
@@ -1397,7 +1403,9 @@ final class SessionScrollModel {
         // The last key of a hold produces no further flushes, so the ease
         // needs the draw clock kept alive to settle.
         if easeActive {
-            wakeMainDrawLoop()
+            for gridId in easeDecayScratch {
+                wakeDrawLoop(showing: gridId)
+            }
         }
     }
 

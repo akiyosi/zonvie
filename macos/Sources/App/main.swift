@@ -444,16 +444,12 @@ if connectDialogEnabled {
         // when it is a value, not another flag — otherwise `--ssh --dialog`
         // would grab "--dialog" as the host.
         for (idx, arg) in zonvieArgs.enumerated() {
-            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            let nextIsValue = ZonvieCore.cliNextIsValue(zonvieArgs, after: idx)
             if arg.hasPrefix("--ssh=") || (arg == "--ssh" && nextIsValue) {
                 let value = arg.hasPrefix("--ssh=") ? String(arg.dropFirst("--ssh=".count)) : zonvieArgs[idx + 1]
-                if let lastColon = value.lastIndex(of: ":"),
-                   let portPart = Int(value[value.index(after: lastColon)...]) {
-                    dialogSeedConfig.sshHost = String(value[..<lastColon])
-                    dialogSeedConfig.sshPort = String(portPart)
-                } else {
-                    dialogSeedConfig.sshHost = value
-                }
+                let target = ZonvieCore.sshTarget(value)
+                dialogSeedConfig.sshHost = target.host
+                if let port = target.port { dialogSeedConfig.sshPort = String(port) }
             } else if arg.hasPrefix("--ssh-identity=") {
                 dialogSeedConfig.sshIdentity = String(arg.dropFirst("--ssh-identity=".count))
             } else if arg == "--ssh-identity" && nextIsValue {
@@ -473,7 +469,7 @@ if connectDialogEnabled {
     } else if devcontainerModeEnabled {
         dialogInitialTab = "devcontainer"
         for (idx, arg) in zonvieArgs.enumerated() {
-            let nextIsValue = idx + 1 < zonvieArgs.count && !zonvieArgs[idx + 1].hasPrefix("-")
+            let nextIsValue = ZonvieCore.cliNextIsValue(zonvieArgs, after: idx)
             if arg.hasPrefix("--devcontainer=") {
                 dialogSeedConfig.devcontainerWorkspace = String(arg.dropFirst("--devcontainer=".count))
             } else if arg == "--devcontainer" && nextIsValue {

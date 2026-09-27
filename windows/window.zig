@@ -1579,28 +1579,6 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
 // Creates core, loads config, inits DWrite metrics, spawns nvim, and
 // kicks off D3D11 device creation on a separate thread.
 // =========================================================================
-/// Build the `devcontainer exec ... nvim --embed` command line into `buf` and
-/// return the slice actually written. Both the early and deferred nvim launch
-/// paths built this identically.
-///
-/// Returns a plain slice, not an error union: a truncated command would be
-/// caught downstream when the spawn fails, and the writer's own errors were
-/// already swallowed at both call sites.
-fn buildDevcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]const u8) []const u8 {
-    var w = std.Io.Writer.fixed(buf);
-    const writer = &w;
-    writer.writeAll("devcontainer exec --workspace-folder \"") catch {};
-    render_helpers.writeDevcontainerPathArg(writer, workspace) catch {};
-    writer.writeAll("\"") catch {};
-    if (config_path) |cfg| {
-        writer.writeAll(" --config \"") catch {};
-        render_helpers.writeDevcontainerPathArg(writer, cfg) catch {};
-        writer.writeAll("\"") catch {};
-    }
-    writer.writeAll(" --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed") catch {};
-    return buf[0..w.end];
-}
-
 /// Read the user's config file into the core, then push every option the
 /// frontend owns. Both core-creation paths -- the early init and the
 /// WSL/SSH/devcontainer deferred init -- ran this identically.
@@ -2109,12 +2087,7 @@ pub export fn WndProc(
 
                     // Ensure we get a paint covering the whole surface.
                     _ = c.InvalidateRect(hwnd, null, c.FALSE);
-                    {
-                        app.mu.lockUncancelable(core.clock.io());
-                        app.surf.surface.paint_full = true;
-                        app.paint_rects.clearRetainingCapacity();
-                        app.mu.unlock(core.clock.io());
-                    }
+                    app_mod.requestMainFullPaint(app);
                 }
 
                 // Note: row_mode/rows/main_verts length are logged after snapshotting under lock.
@@ -2223,8 +2196,7 @@ pub export fn WndProc(
                         // pump messages).
                         atlas_reset_consumed = true;
                         app.need_full_seed.store(true, .seq_cst);
-                        app.surf.surface.paint_full = true;
-                        app.paint_rects.clearRetainingCapacity();
+                        app_mod.requestMainFullPaintLocked(app);
                         // The full atlas upload a reset owes is asked below of
                         // the generation the reset bumped.
                     }
@@ -2353,10 +2325,8 @@ pub export fn WndProc(
                     };
 
                     // Calculate content width for "always" scrollbar mode
-                    // When content_hwnd exists, use its size (D3D11 is bound to content_hwnd)
                     var client_for_content: c.RECT = undefined;
-                    const size_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-                    _ = c.GetClientRect(size_hwnd, &client_for_content);
+                    _ = c.GetClientRect(hwnd, &client_for_content);
                     const client_width_u32: u32 = @intCast(@max(1, client_for_content.right - client_for_content.left));
                     const content_width: ?u32 = if (app.config.scrollbar.enabled and app.config.scrollbar.isAlways())
                         getEffectiveContentWidth(app, client_width_u32)
@@ -2590,10 +2560,7 @@ pub export fn WndProc(
                         // If atlas was uploaded but no rows will be drawn in this frame,
                         // request a full repaint so newly uploaded glyphs become visible.
                         if (render_helpers.atlasUploadOwesFullPaint(atlas_uploaded, rows_to_draw.items.len != 0)) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            app.surf.surface.paint_full = true;
-                            app.paint_rects.clearRetainingCapacity();
-                            app.mu.unlock(core.clock.io());
+                            app_mod.requestMainFullPaint(app);
                             app.surf.tbs.requestFullPaint();
                             _ = c.InvalidateRect(hwnd, null, c.FALSE);
                         }
@@ -2632,10 +2599,8 @@ pub export fn WndProc(
                         // Read cursor verts from TBS committed set (refcount-protected, lock-free).
                         const cursor_verts_snapshot: []const core.Vertex = committed_cursor.verts.items;
                         if (log_enabled) applog.appLog("[win] WM_PAINT(row) cursor_verts.len={d}\n", .{cursor_verts_snapshot.len});
-                        // Use content_hwnd size when it exists (D3D11 is bound to content_hwnd)
                         var client: c.RECT = undefined;
-                        const client_hwnd = if (app.content_hwnd) |ch| ch else hwnd;
-                        _ = c.GetClientRect(client_hwnd, &client);
+                        _ = c.GetClientRect(hwnd, &client);
 
                         // Core vertices are grid-local pixels. The root grid's
                         // layer sits at the surface origin, but a cursor in
@@ -3246,8 +3211,7 @@ pub export fn WndProc(
                                 if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
                                     app.mu.lockUncancelable(core.clock.io());
                                     app.seed_pending = false;
-                                    app.surf.surface.paint_full = true;
-                                    app.paint_rects.clearRetainingCapacity();
+                                    app_mod.requestMainFullPaintLocked(app);
                                     app.seed_clear_pending = true;
                                     app.mu.unlock(core.clock.io());
                                     // Also set TBS pending_paint_full for next paint cycle.
@@ -3562,8 +3526,7 @@ pub export fn WndProc(
 
                 // 3) Resize tabline child window if present
                 if (app.tabline_state.hwnd) |tabline_hwnd| {
-                    // Use HWND_TOP to ensure tabline stays above content_hwnd
-                    // (some environments may have Z-order issues with SWP_NOZORDER)
+                    // HWND_TOP: some environments have Z-order issues with SWP_NOZORDER.
                     _ = c.SetWindowPos(
                         tabline_hwnd,
                         c.HWND_TOP,
@@ -3600,12 +3563,7 @@ pub export fn WndProc(
                         }
                     }
                 }
-                {
-                    app.mu.lockUncancelable(core.clock.io());
-                    app.surf.surface.paint_full = true;
-                    app.paint_rects.clearRetainingCapacity();
-                    app.mu.unlock(core.clock.io());
-                }
+                app_mod.requestMainFullPaint(app);
 
                 // 5) repaint
                 _ = c.InvalidateRect(hwnd, null, 0);
@@ -4588,7 +4546,7 @@ pub export fn WndProc(
                             var nvim_cmd_slice: []const u8 = undefined;
 
                             if (app.devcontainer_workspace) |workspace| {
-                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
+                                nvim_cmd_slice = core.frontend_rules.devcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                                 if (applog.isEnabled()) applog.appLog("[win] devcontainer exec command: {s}\n", .{nvim_cmd_slice});
 
                                 // Start nvim
@@ -4982,15 +4940,11 @@ pub export fn WndProc(
                 // visible until the next retry. Everything publishes
                 // together, atomically, only once ALL of device/context/
                 // renderer are known-good (or not at all, on failure).
-                const recover_render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
-                    app.content_hwnd.?
-                else
-                    hwnd;
                 var recovered_gpu: ?d3d11.Renderer = blk: {
                     if (new_d3d_device != null and new_d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, new_d3d_device.?, new_d3d_ctx.?, true) catch null;
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, recover_render_hwnd, app.config.window.opacity, app.config.window.blur) catch null;
+                    break :blk d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch null;
                 };
                 if (recovered_gpu) |*r| {
                     // Complete the generation before publication: shader
@@ -5421,7 +5375,7 @@ pub export fn WndProc(
                                 break :devcontainer_block;
                             } else {
                                 dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
-                                nvim_cmd_slice = buildDevcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
+                                nvim_cmd_slice = core.frontend_rules.devcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                             }
                         } else {
                             nvim_cmd_slice = quoted_nvim;
@@ -5531,20 +5485,16 @@ pub export fn WndProc(
                 }
 
                 // D3D11 GPU renderer
-                const render_hwnd = if (app.ext_tabline_enabled and app.content_hwnd != null)
-                    app.content_hwnd.?
-                else
-                    hwnd;
 
                 if (deferred_log_enabled) _ = c.QueryPerformanceCounter(&t1);
                 const gpu = blk: {
                     if (app.d3d_device != null and app.d3d_ctx != null) {
-                        break :blk d3d11.Renderer.initWithDevice(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
+                        break :blk d3d11.Renderer.initWithDevice(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur, app.d3d_device.?, app.d3d_ctx.?, true) catch |e| {
                             if (deferred_log_enabled) applog.appLog("d3d11.Renderer.initWithDevice failed: {any}\n", .{e});
                             return 0;
                         };
                     }
-                    break :blk d3d11.Renderer.init(app.alloc, render_hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
+                    break :blk d3d11.Renderer.init(app.alloc, hwnd, app.config.window.opacity, app.config.window.blur) catch |e| {
                         if (deferred_log_enabled) applog.appLog("d3d11.Renderer.init failed: {any}\n", .{e});
                         return 0;
                     };

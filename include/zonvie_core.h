@@ -1712,6 +1712,41 @@ ZONVIE_API void zonvie_core_msg_float_origin(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_key_is_special(uint32_t keycode);
 
+/* The modifier string of a mouse event ("S", "C", "A", "D", in that order)
+   for a ZONVIE_MOD_* bitmask, NUL-terminated into out (5 bytes). Returns its
+   length.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_mouse_modifiers(uint32_t mods, char out[5]);
+
+/* Split a `--ssh user@host[:port]` value: the host is value[0..*out_host_len]
+   and *out_port the port after the last colon, or -1 when what follows it is
+   not a port number (the colon then stays in the host).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_parse_ssh_target(
+    const char *value, size_t len, size_t *out_host_len, int32_t *out_port);
+
+/* Whether a bare flag (`--ssh host`) takes the token after it as its value:
+   true for a token that is not itself a flag; false for a flag or for NULL
+   (no next token).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_cli_next_is_value(const char *next, size_t len);
+
+/* The `devcontainer exec --workspace-folder "<workspace>" [--config
+   "<config>"] --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed` command
+   line, NUL-terminated into out (cap bytes); returns its length. Each path
+   loses one pair of surrounding quotes and any trailing backslashes (a drive
+   root becomes `C:\.`), so it survives its own quotes. config_path may be
+   NULL. A command that does not fit is cut short and fails at the spawn.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_devcontainer_exec_cmd(
+    char *out, size_t cap,
+    const char *workspace, size_t workspace_len,
+    const char *config_path, size_t config_len);
+
 /* Whether a custom shader's source reads a uniform that changes every frame
    (iTime, iTimeDelta, iFrame, iFrameRate, iDate), so its surface keeps
    drawing while nothing else changes.
@@ -1727,6 +1762,44 @@ ZONVIE_API bool zonvie_core_tab_move(zonvie_core *core, uint32_t from_idx, uint3
 /* Move the only window of tab tab_idx (0-based) into an external window. A
    tab with a split is refused with a warning from Neovim. */
 ZONVIE_API void zonvie_core_externalize_tab(zonvie_core *core, uint32_t tab_idx);
+
+/* Where the next external window goes, in the frontend's screen units. A tab
+   drag's drop point (set_pending) is good for 500 ms and beats the origin the
+   grid's window had when it closed (save), which is kept only while the
+   session generation that created the window is current: grid ids restart
+   per server. take consumes a pending point, keeps a saved origin for the
+   next reopen, and drops one from another session; it returns
+   ZONVIE_PLACEMENT_NONE, _PENDING or _SAVED and writes the point. 100 saved
+   origins are held; a new one past that evicts the smallest grid id.
+   Zero-initialise the struct and never read its fields.
+
+   Pure — no core pointer, no lock. */
+typedef struct {
+    int64_t grid_id;
+    double x;
+    double y;
+    uint64_t generation;
+} zonvie_saved_origin;
+typedef struct {
+    zonvie_saved_origin saved[101];
+    size_t saved_len;
+    double pending_x;
+    double pending_y;
+    int64_t pending_set_ms;
+    bool has_pending;
+} zonvie_placement_memory;
+enum {
+    ZONVIE_PLACEMENT_NONE = 0,
+    ZONVIE_PLACEMENT_PENDING = 1,
+    ZONVIE_PLACEMENT_SAVED = 2,
+};
+ZONVIE_API void zonvie_placement_set_pending(zonvie_placement_memory *m, double x, double y, int64_t now_ms);
+ZONVIE_API void zonvie_placement_save(
+    zonvie_placement_memory *m, int64_t grid_id, double x, double y,
+    uint64_t generation, uint64_t current_generation);
+ZONVIE_API int zonvie_placement_take(
+    zonvie_placement_memory *m, int64_t grid_id, uint64_t generation, int64_t now_ms,
+    double *out_x, double *out_y);
 
 /* A surface's cursor blink cadence from guicursor's blinkwait/blinkon/blinkoff.
    Blinks when blinkon and blinkoff are both non-zero; a zero blinkwait (what

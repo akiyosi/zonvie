@@ -1323,26 +1323,15 @@ test "a left sidebar shifts the surface right; a right one does not" {
     try std.testing.expectEqual(@as(i32, 0), right.y);
 }
 
-test "a titlebar tabline shifts the surface down, unless a child hwnd hosts it" {
+test "a titlebar tabline shifts the surface down" {
     const inline_bar = helpers.surfaceOriginPx(.{
         .is_main_window = true,
         .ext_tabline_enabled = true,
         .style_is_titlebar = true,
-        .has_content_hwnd = false,
         .tab_bar_height_px = 30,
     });
     try std.testing.expectEqual(@as(i32, 0), inline_bar.x);
     try std.testing.expectEqual(@as(i32, 30), inline_bar.y);
-
-    // With a separate content HWND the tab bar is outside this client area.
-    const child_hosted = helpers.surfaceOriginPx(.{
-        .is_main_window = true,
-        .ext_tabline_enabled = true,
-        .style_is_titlebar = true,
-        .has_content_hwnd = true,
-        .tab_bar_height_px = 30,
-    });
-    try std.testing.expectEqual(@as(i32, 0), child_hosted.y);
 }
 
 test "the two styles are exclusive, so only one axis ever shifts" {
@@ -1392,24 +1381,6 @@ test "spawnArgQuote picks a quote the core's tokenizer gives back unchanged" {
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("it's \"x\""));
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("C:\\My Dir\\"));
     try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote(""));
-}
-
-test "devcontainerPathArg drops what would break the quoted devcontainer argument" {
-    const cases = [_]struct { raw: []const u8, want: []const u8 }{
-        .{ .raw = ".\\proj\\", .want = ".\\proj" },
-        .{ .raw = "C:\\My Dir\\\\", .want = "C:\\My Dir" },
-        .{ .raw = "\"C:\\proj\"", .want = "C:\\proj" },
-        .{ .raw = "C:\\", .want = "C:\\." },
-        .{ .raw = "\"D:\\\"", .want = "D:\\." },
-        .{ .raw = "/work/app", .want = "/work/app" },
-        .{ .raw = "\\", .want = "\\." },
-    };
-    for (cases) |case| {
-        var buf: [64]u8 = undefined;
-        var w = std.Io.Writer.fixed(&buf);
-        try helpers.writeDevcontainerPathArg(&w, case.raw);
-        try std.testing.expectEqualStrings(case.want, buf[0..w.end]);
-    }
 }
 
 test "rotateRegion vacates the whole region when the shift covers it" {
