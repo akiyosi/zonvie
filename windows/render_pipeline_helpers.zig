@@ -1314,3 +1314,19 @@ pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usi
     std.mem.rotate(T, region, region.len - shift);
     return .{ .start = row_start, .end = row_start + shift };
 }
+
+/// Copy `src` into `dst`; when it does not fit, cut at a UTF-8 boundary and
+/// end with '…' so the reader sees text is missing. Returns the bytes written.
+pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
+    if (src.len <= dst.len) {
+        @memcpy(dst[0..src.len], src);
+        return src.len;
+    }
+    const marker = "\u{2026}";
+    if (dst.len < marker.len) return 0;
+    var cut = dst.len - marker.len;
+    while (cut > 0 and (src[cut] & 0xC0) == 0x80) cut -= 1;
+    @memcpy(dst[0..cut], src[0..cut]);
+    @memcpy(dst[cut..][0..marker.len], marker);
+    return cut + marker.len;
+}

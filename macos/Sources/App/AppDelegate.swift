@@ -360,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 (win.contentViewController as? ViewController)?.core?.setFocus(true)
                 focusedSessionWindow = win
             }
+            setFloatingPanelsActiveForAllSessions(NSApp.isActive)
             tabMenuManager?.activeSessionChanged()
         }
     }
@@ -406,17 +407,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for session in SessionManager.shared.sessions where session.window !== window {
             session.viewController?.core?.refreshCursorBlinkGate()
         }
-        setCmdlineWindowActiveForAllSessions(true)
+        setFloatingPanelsActiveForAllSessions(true)
     }
 
-    /// The cmdline window no longer hides on deactivate, so its level is what
-    /// keeps it from hovering above other apps. That has to be applied to
+    /// Panel levels keep a session's floating panels from hovering above
+    /// other apps and above the front session. That has to be applied to
     /// EVERY session: `self.window` tracks only the last key window, and a
-    /// background session's cmdline would otherwise stay at .floating for as
-    /// long as it is open.
-    private func setCmdlineWindowActiveForAllSessions(_ active: Bool) {
+    /// background session's panels would otherwise stay at .floating.
+    private func setFloatingPanelsActiveForAllSessions(_ active: Bool) {
         for session in SessionManager.shared.sessions {
-            session.viewController?.core?.setCmdlineWindowActive(active)
+            session.viewController?.core?.setFloatingPanelsActive(active)
         }
     }
 
@@ -431,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         for session in SessionManager.shared.sessions {
             session.viewController?.core?.stopCursorBlinking()
         }
-        setCmdlineWindowActiveForAllSessions(false)
+        setFloatingPanelsActiveForAllSessions(false)
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {

@@ -724,7 +724,6 @@ const WM_APP_SHOW_CONNECT_DIALOG = app_mod.WM_APP_SHOW_CONNECT_DIALOG;
 
 const WM_APP_UPDATE_IME_POSITION = app_mod.WM_APP_UPDATE_IME_POSITION;
 const WM_APP_MSG_SHOW = app_mod.WM_APP_MSG_SHOW;
-const WM_APP_MSG_CLEAR = app_mod.WM_APP_MSG_CLEAR;
 const WM_APP_MINI_UPDATE = app_mod.WM_APP_MINI_UPDATE;
 const WM_APP_CLIPBOARD_GET = app_mod.WM_APP_CLIPBOARD_GET;
 const WM_APP_CLIPBOARD_SET = app_mod.WM_APP_CLIPBOARD_SET;
@@ -1161,26 +1160,41 @@ fn scheduleMainSizeReplay(hwnd: c.HWND, app: *App) void {
     }
 }
 
-fn armMainPaintRetry(hwnd: c.HWND, app: *App, ticket: app_mod.PaintRetryState.Ticket) void {
-    app.surf.paint_retry_deadline_ms = c.GetTickCount64() + ticket.delay_ms;
+/// Both drivers' wake after a paint that produced no frame: device recovery
+/// through the main window, or a paint retry on `hwnd`. The external driver
+/// also lowers its aggregate retry deadline.
+pub fn failSurfacePaintAndWake(
+    app: *App,
+    ws: *app_mod.WindowSurface,
+    hwnd: c.HWND,
+    wake_cookie: usize,
+    device_lost: bool,
+    recovery_hwnd: ?c.HWND,
+    aggregate_deadline_ms: ?*u64,
+) void {
+    const ticket = app_mod.failSurfacePaint(app, ws, device_lost);
+    if (device_lost) {
+        if (recovery_hwnd) |target| postDeviceLostRecovery(target, app);
+        return;
+    }
+    const t = ticket orelse return;
+    ws.paint_retry_deadline_ms = c.GetTickCount64() + t.delay_ms;
+    if (aggregate_deadline_ms) |agg| {
+        if (agg.* == 0 or ws.paint_retry_deadline_ms < agg.*) agg.* = ws.paint_retry_deadline_ms;
+    }
     if (!scheduleReliableWindowMessage(
         hwnd,
         app_mod.WM_APP_PAINT_RETRY_FALLBACK,
-        ticket.generation,
-        @bitCast(app.window_wake_cookie),
-        ticket.delay_ms,
-    )) _ = app.surf.paint_retry.timerArmFailed(ticket.generation);
+        t.generation,
+        @bitCast(wake_cookie),
+        t.delay_ms,
+    )) _ = ws.paint_retry.timerArmFailed(t.generation);
 }
 
 fn recoverMainPaintFailure(hwnd: c.HWND, app: *App) void {
     var device_lost = false;
     if (app.renderer) |*renderer| device_lost = renderer.device_lost;
-    const ticket = app_mod.failSurfacePaint(app, &app.surf, device_lost);
-    if (device_lost) {
-        postDeviceLostRecovery(hwnd, app);
-    } else if (ticket) |t| {
-        armMainPaintRetry(hwnd, app, t);
-    }
+    failSurfacePaintAndWake(app, &app.surf, hwnd, app.window_wake_cookie, device_lost, hwnd, null);
 }
 
 fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
@@ -2349,19 +2363,12 @@ pub export fn WndProc(
                     else
                         null;
 
-                    // Content Y offset for ext_tabline (pushes content down below tabbar)
-                    // When using content_hwnd (child window for D3D11), offset is 0 because D3D11 renders in child window starting at y=0
-                    // Only applies to titlebar mode (sidebar mode uses standard titlebar)
-                    const content_y_offset: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
-                        @intCast(app.scalePx(TablineState.TAB_BAR_HEIGHT))
-                    else
-                        null;
-
-                    // Content X offset for sidebar mode (pushes content right of sidebar)
-                    const content_x_offset: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and !app.sidebar_position_right)
-                        @intCast(app.scalePx(@as(c_int, @intCast(app.sidebar_width_px))))
-                    else
-                        null;
+                    // Where grid 1 starts: the rule the hit tests and the
+                    // cursor damage rect use. Both chrome sizes are non-zero,
+                    // so a zero offset means no tabbar / left sidebar.
+                    const origin = input.surfaceOriginPx(app, true);
+                    const content_y_offset: ?u32 = if (origin.y > 0) @intCast(origin.y) else null;
+                    const content_x_offset: ?u32 = if (origin.x > 0) @intCast(origin.x) else null;
 
                     // Sidebar right width (reduces content area from right edge)
                     const sidebar_right_width: ?u32 = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
@@ -2374,7 +2381,7 @@ pub export fn WndProc(
                     // update failure). Track the OS light/dark theme cache so
                     // the fallback matches currentTitlebarPalette().bar_bg
                     // (RGB(32,32,32) dark / RGB(240,240,240) light).
-                    const tabbar_bg_color: ?[4]f32 = if (app.ext_tabline_enabled and app.tabline_style == .titlebar and app.content_hwnd == null)
+                    const tabbar_bg_color: ?[4]f32 = if (content_y_offset != null)
                         (if (g_os_dark_theme_cached)
                             [4]f32{ 32.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0, 1.0 }
                         else
@@ -3825,6 +3832,12 @@ pub export fn WndProc(
 
                 // Process each pending message individually based on its view_type
                 for (pending.items) |req| {
+                    if (req.clear) {
+                        // The split view stays until the user closes it, as
+                        // noice.nvim's long_message_to_split.
+                        messages.clearMessagesOnUIThread(app, hwnd);
+                        continue;
+                    }
                     const kind_str = req.kind[0..req.kind_len];
 
                     // Build DisplayMessage for this request
@@ -3953,19 +3966,6 @@ pub export fn WndProc(
                         .none => {},
                     }
                 }
-            }
-            return 0;
-        },
-
-        WM_APP_MSG_CLEAR => {
-            if (applog.isEnabled()) applog.appLog("[win] WM_APP_MSG_CLEAR received\n", .{});
-            if (getApp(hwnd)) |app| {
-                // Kill auto-hide timer
-                _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                messages.hideMessageWindow(app);
-                // Note: Do NOT hide split view on msg_clear.
-                // Split view should remain visible until user manually closes it (Esc/q/Enter/Space).
-                // This matches noice.nvim's long_message_to_split behavior.
             }
             return 0;
         },
@@ -4532,6 +4532,11 @@ pub export fn WndProc(
                         var i: usize = 0;
                         while (i < app.shader_anim_external_renderers.items.len) : (i += 1) {
                             const renderer = app.shader_anim_external_renderers.items[i];
+                            // A minimized external window sits near
+                            // (-32000,-32000): syncing it would re-anchor the
+                            // main renderer's cursor there, and nothing shows
+                            // the frame (paintExternalWindow returns too).
+                            if (c.IsIconic(renderer.hwnd) != 0) continue;
                             external_windows.syncExternalShaderFrame(app, renderer.hwnd, renderer, null);
                             renderer.presentShaderAnimationFrame();
                             anim_dev_lost = anim_dev_lost or renderer.device_lost;
@@ -4551,7 +4556,7 @@ pub export fn WndProc(
                         // main frame drew one tick behind it.
                         // Not while minimized: nothing shows the frame, and
                         // WM_PAINT returns early for an iconic window too. The
-                        // external windows above keep animating.
+                        // visible external windows above keep animating.
                         if (c.IsIconic(hwnd) == 0) {
                             if (app.renderer) |*r| r.presentShaderAnimationFrame();
                         }

@@ -1283,15 +1283,19 @@ func resolveSurfaceRowSlot(
 /// this cell height, and return how many there are. The list is the surface's
 /// persistent scratch, so a layer costs no allocation per frame. A row whose
 /// cell height no longer matches is dropped: a font or linespace change
-/// invalidated the geometry the copy was built with.
+/// invalidated the geometry the copy was built with. A layer with no scroll
+/// offset this frame gets none, as the root does: nothing would shift or clip
+/// them, so they would land at their targetRow over the layer's margin rows.
 @discardableResult
 func collectSurfaceLayerRetainedRows(
     gridId: Int64,
     retained: [RetainedScrollRow],
+    hasScrollOffset: Bool,
     cellHeightPx: Float,
     into scratch: inout [Int]
 ) -> Int {
     scratch.removeAll(keepingCapacity: true)
+    guard hasScrollOffset else { return 0 }
     for (i, r) in retained.enumerated()
     where r.gridId == gridId && r.cellHeightPx == cellHeightPx {
         scratch.append(i)
@@ -3690,26 +3694,21 @@ final class SurfaceFixedFloatMask {
 func bindSurfaceFragmentState(
     encoder: MTLRenderCommandEncoder,
     viewportMetrics: SurfaceViewportMetrics,
-    backgroundAlphaBuffer: MTLBuffer?,
-    cursorBlinkBuffer: MTLBuffer?,
+    backgroundAlpha: Float,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand] = [],
     fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval] = []
 ) {
     var size = DrawableSize(width: viewportMetrics.fragmentWidth, height: viewportMetrics.fragmentHeight)
     encoder.setFragmentBytes(&size, length: MemoryLayout<DrawableSize>.size, index: 0)
 
-    if let alphaBuf = backgroundAlphaBuffer {
-        encoder.setFragmentBuffer(alphaBuf, offset: 0, index: 1)
-    }
+    var alpha = backgroundAlpha
+    encoder.setFragmentBytes(&alpha, length: MemoryLayout<Float>.size, index: 1)
 
-    // Holds 1 from creation and is never rewritten. The shader reads it only
-    // for DECO_CURSOR fragments, which only the cursor overlay draws, and the
-    // overlay is skipped on the CPU while blink is off. Writing the blink
-    // phase here per pass changed nothing visible, and with two frames in
-    // flight a 0 could reach a frame still drawing its cursor.
-    if let blinkBuf = cursorBlinkBuffer {
-        encoder.setFragmentBuffer(blinkBuf, offset: 0, index: 2)
-    }
+    // Always 1. The shader reads it only for DECO_CURSOR fragments, which only
+    // the cursor overlay draws, and the overlay is skipped on the CPU while
+    // blink is off.
+    var blinkVisible: UInt32 = 1
+    encoder.setFragmentBytes(&blinkVisible, length: MemoryLayout<UInt32>.size, index: 2)
 
     // Exact fixed-float union (fragment buffers 3/4/5). Bands and their
     // interval slices are both sorted and disjoint, so each fragment needs
@@ -4060,16 +4059,15 @@ func bindSurfaceGlowExtractState(
     encoder enc: MTLRenderCommandEncoder,
     atlasTexture: MTLTexture?,
     sampler: MTLSamplerState,
-    backgroundAlphaBuffer: MTLBuffer?,
+    backgroundAlpha: Float,
     bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
 ) {
     if let atlasTexture {
         enc.setFragmentTexture(atlasTexture, index: 0)
     }
     enc.setFragmentSamplerState(sampler, index: 0)
-    if let backgroundAlphaBuffer {
-        enc.setFragmentBuffer(backgroundAlphaBuffer, offset: 0, index: 1)
-    }
+    var alpha = backgroundAlpha
+    enc.setFragmentBytes(&alpha, length: MemoryLayout<Float>.size, index: 1)
     bindScrollOffsets(enc)
     var zeroTranslation: Float = 0
     enc.setVertexBytes(&zeroTranslation, length: MemoryLayout<Float>.size, index: 3)
@@ -4144,8 +4142,7 @@ func beginSurfaceRowPass(
     pipeline: MTLRenderPipelineState,
     atlasTexture: MTLTexture?,
     sampler: MTLSamplerState,
-    backgroundAlphaBuffer: MTLBuffer?,
-    cursorBlinkBuffer: MTLBuffer?,
+    backgroundAlpha: Float,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand],
     fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval],
     bindScrollOffsets: (MTLRenderCommandEncoder) -> Void
@@ -4160,8 +4157,7 @@ func beginSurfaceRowPass(
     bindSurfaceFragmentState(
         encoder: enc,
         viewportMetrics: viewportMetrics,
-        backgroundAlphaBuffer: backgroundAlphaBuffer,
-        cursorBlinkBuffer: cursorBlinkBuffer,
+        backgroundAlpha: backgroundAlpha,
         fixedFloatBands: fixedFloatBands,
         fixedFloatIntervals: fixedFloatIntervals
     )
@@ -4223,8 +4219,7 @@ func encodeSurfaceCursorOverlay(
     cursorVertexBuffer: MTLBuffer,
     cursorVertexCount: Int,
     layerOriginPx: simd_float2,
-    backgroundAlphaBuffer: MTLBuffer?,
-    cursorBlinkBuffer: MTLBuffer?,
+    backgroundAlpha: Float,
     fixedFloatBands: [GridSurfaceRenderer.FixedFloatBand],
     fixedFloatIntervals: [GridSurfaceRenderer.FixedFloatInterval],
     prepare: (MTLRenderPassDescriptor) -> Void = { _ in },
@@ -4242,8 +4237,7 @@ func encodeSurfaceCursorOverlay(
         pipeline: pipeline,
         atlasTexture: atlasTexture,
         sampler: sampler,
-        backgroundAlphaBuffer: backgroundAlphaBuffer,
-        cursorBlinkBuffer: cursorBlinkBuffer,
+        backgroundAlpha: backgroundAlpha,
         fixedFloatBands: fixedFloatBands,
         fixedFloatIntervals: fixedFloatIntervals,
         bindScrollOffsets: bindScrollOffsets

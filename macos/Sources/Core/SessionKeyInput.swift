@@ -12,7 +12,7 @@ final class SessionKeyInput {
     weak var core: ZonvieCore?
 
     /// Send committed text to Neovim immediately on the keyDown path, and
-    /// keep the main surface's draw loop awake so the response is drawn
+    /// keep the owning surface's draw loop awake so the response is drawn
     /// promptly.
     /// Why: a prior design buffered repeats in a single-slot `pendingInput`
     /// flushed by displayLink. That added 2-8ms of pre-send latency, which
@@ -20,9 +20,9 @@ final class SessionKeyInput {
     /// one flush (visible as "0-row frame, then 2-row jump" stutter during
     /// held-`j` scrolling), and silently dropped extras when keys arrived
     /// faster than vsync.
-    func sendInputKeepingMainAwake(_ text: String) {
+    func sendInput(_ text: String, owner: KeyRepeatOwner?) {
         sendInputForHeldKey(text)
-        core?.terminalView?.drawLoopIdleCounter.noteActive()
+        (owner as? SurfaceDrawLoopHost)?.drawLoopIdleCounter.noteActive()
     }
 
     /// Send committed text and record it for repeat synthesis. An external
@@ -183,7 +183,7 @@ final class SessionKeyInput {
         }
         switch action {
         case .text(let t):
-            sendInputKeepingMainAwake(t)
+            sendInput(t, owner: heldKeyOwner)
         case .keyEvent(let mods, let chars, let charsIg):
             core?.sendKeyEvent(
                 keyCode: UInt32(code),
@@ -493,8 +493,7 @@ final class SessionKeyInput {
            let ch = event.characters, let swapped = ZonvieConfig.swapColonSemicolon(ch)
         {
             beginHeldKeyCapture(isRepeat: event.isARepeat)
-            // Only this surface's own draw loop is kept awake for the reply.
-            if ownerIsMain { sendInputKeepingMainAwake(swapped) } else { sendInputForHeldKey(swapped) }
+            sendInput(swapped, owner: owner)
             endHeldKeyCapture(owner: owner, code: event.keyCode)
             return
         }

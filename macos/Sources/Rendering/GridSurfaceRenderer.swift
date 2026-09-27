@@ -2114,10 +2114,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
     // --- Blur transparency support ---
     private let blurEnabled: Bool
-    private var backgroundAlphaBuffer: MTLBuffer?
-
-    // --- Cursor blink support for shader ---
-    private var cursorBlinkBuffer: MTLBuffer?
+    private var backgroundAlpha: Float = 1
 
     // --- Post-process bloom (neon glow, Dual Kawase) ---
     // Pipelines and sampler are internal so ExternalGridView can share them.
@@ -2240,23 +2237,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         self.viewForPipeline = view
         shared.buildSampler()
 
-        // Create background alpha buffer for shader
-        backgroundAlphaBuffer = shared.device.makeBuffer(length: MemoryLayout<Float>.size, options: .storageModeShared)
-        if let buf = backgroundAlphaBuffer {
-            var alpha = resolveSurfaceBackgroundAlpha(
-                blurEnabled: blurEnabled,
-                decoratedSurface: false
-            )
-            ZonvieCore.appLog("[Renderer] backgroundAlphaBuffer alpha=\(alpha)")
-            memcpy(buf.contents(), &alpha, MemoryLayout<Float>.size)
-        }
-
-        // Create cursor blink buffer for shader (always visible for main window cursor)
-        cursorBlinkBuffer = shared.device.makeBuffer(length: MemoryLayout<UInt32>.size, options: .storageModeShared)
-        if let buf = cursorBlinkBuffer {
-            var visible: UInt32 = 1
-            memcpy(buf.contents(), &visible, MemoryLayout<UInt32>.size)
-        }
+        backgroundAlpha = resolveSurfaceBackgroundAlpha(
+            blurEnabled: blurEnabled,
+            decoratedSurface: false
+        )
+        ZonvieCore.appLog("[Renderer] backgroundAlpha=\(backgroundAlpha)")
 
         if collectsGpuPerfSamples { gpuSampler.setUp(device: shared.device) }
     }
@@ -3619,6 +3604,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 collectSurfaceLayerRetainedRows(
                     gridId: gridId,
                     retained: retainedSnapshot,
+                    hasScrollOffset: surfaceScrollOffset(gridId: gridId, offsets: scrollSnapshot) != nil,
                     cellHeightPx: Float(cellHi),
                     into: &retainedIndexScratch
                 )
@@ -4067,8 +4053,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 pipeline: shared.pipeline!,
                 atlasTexture: atlasTex,
                 sampler: shared.sampler!,
-                backgroundAlphaBuffer: backgroundAlphaBuffer,
-                cursorBlinkBuffer: cursorBlinkBuffer,
+                backgroundAlpha: backgroundAlpha,
                 fixedFloatBands: fixedFloatBandsSnapshot,
                 fixedFloatIntervals: fixedFloatIntervalsSnapshot,
                 bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: scrollSnapshot) }
@@ -4349,7 +4334,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                         encoder: enc,
                         atlasTexture: atlasTex,
                         sampler: shared.sampler!,
-                        backgroundAlphaBuffer: backgroundAlphaBuffer,
+                        backgroundAlpha: backgroundAlpha,
                         bindScrollOffsets: { bindSurfaceScrollOffsets(encoder: $0, offsets: scrollSnapshot) }
                     )
 
@@ -4617,8 +4602,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     cursorVertexBuffer: cvb,
                     cursorVertexCount: currentCursorCount,
                     layerOriginPx: cursorLayerOriginSnapshot,
-                    backgroundAlphaBuffer: backgroundAlphaBuffer,
-                    cursorBlinkBuffer: cursorBlinkBuffer,
+                    backgroundAlpha: backgroundAlpha,
                     fixedFloatBands: fixedFloatBandsSnapshot,
                     // mask a scrolling cursor under a fixed float
                     fixedFloatIntervals: fixedFloatIntervalsSnapshot,
@@ -4937,7 +4921,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
 
         // Read the scrolling grid's OWN rows: every grid keeps its own buffers
         // and its own row space now, so the bounds above are grid-local.
-        let cs = (gridBuffers.existingSets(for: gridId) ?? bufferSets)[flushSourceSetIndex]
+        guard let sets = gridBuffers.existingSets(for: gridId) else {
+            ZonvieCore.appLog("[retain] skip grid=\(gridId) rowsDelta=\(rowsDelta) no buffer sets on this surface")
+            return
+        }
+        let cs = sets[flushSourceSetIndex]
         // A step is routinely more than one row (a whole wheel event's
         // 'mousescroll' worth, coalesced), but the retention holds only
         // `depthRows` — the offset is clamped to the same reach — so the

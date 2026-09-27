@@ -2333,7 +2333,7 @@ pub export fn zonvie_core_send_mouse_scroll(
     const box = asBox(p.?);
     const dir_str = std.mem.span(direction.?);
     const mod_str = if (modifier) |m| std.mem.span(m) else "";
-    if (grid_id == grid_mod.MESSAGE_GRID_ID) {
+    if (grid_id == grid_mod.MESSAGE_GRID_ID or grid_id == grid_mod.MSG_HISTORY_GRID_ID) {
         box.core.lockGridAsRedrawOwner();
         defer box.core.unlockGridAsRedrawOwner();
         box.core.sendMouseScroll(grid_id, row, col, dir_str, mod_str);

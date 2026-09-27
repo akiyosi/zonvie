@@ -814,11 +814,9 @@ pub fn onVerticesRow(
                 const content_w: c_int = @intCast(total_cols * cell_w);
                 const content_h: c_int = @intCast(total_rows * cell_h);
 
-                // Calculate window size (WS_POPUP has no decorations, so client = window)
-                var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-                _ = c.AdjustWindowRectEx(&rect, c.WS_POPUP, 0, c.WS_EX_TOPMOST);
-                const window_w: c_int = rect.right - rect.left;
-                const window_h: c_int = rect.bottom - rect.top;
+                const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
+                const window_w: c_int = outer.w;
+                const window_h: c_int = outer.h;
 
                 if (log_verbose) applog.appLog("[win] on_vertices_row popupmenu resize pending: content=({d},{d}) window=({d},{d})\n", .{ content_w, content_h, window_w, window_h });
 
@@ -2596,10 +2594,6 @@ pub fn onSSHAuthPrompt(
 /// the cmdline's work-area clamp, so a guifont or linespace change while a
 /// cmdline or message window was open queued it one copy-button width too
 /// narrow for its content -- and, on a narrow monitor, wider than the work area.
-///
-/// AdjustWindowRectEx stays here rather than moving into the shared helper:
-/// this path must read the window's actual style, while the creation path
-/// knows the style it is about to apply.
 pub fn queueExternalWindowResizes(
     app: *App,
     hwnd: ?c.HWND,
@@ -2620,22 +2614,11 @@ pub fn queueExternalWindowResizes(
         const content_h: c_int = @as(c_int, @intCast(ext_win.surf.surface.rows * cell_h)) + insets.h;
         if (grid_id == app_mod.CMDLINE_GRID_ID) content_w = external_windows.clampCmdlineWidthToWorkArea(grid_id, content_w, app_mod.monitorWorkArea(ext_win.hwnd));
 
-        // This window's ACTUAL current style/exstyle: WS_OVERLAPPEDWINDOW has
-        // caption and border non-client area that WS_POPUP does not, and
-        // assuming the wrong one silently shrinks the computed client rect on
-        // every font or linespace change for normal external windows.
-        // GetWindowLongW (not the Ptr variant) + @bitCast matches the existing
-        // GWL_STYLE read idiom at window.zig:201-202 -- GWL_STYLE is a 32-bit
-        // value, and for WS_POPUP windows (bit 31 set) the LONG_PTR-returning
-        // GetWindowLongPtrW would sign-extend to a negative isize, making
-        // @intCast to u32/DWORD panic.
-        const dwStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_STYLE));
-        const dwExStyle: c.DWORD = @bitCast(c.GetWindowLongW(ext_win.hwnd, c.GWL_EXSTYLE));
-        var rect: c.RECT = .{ .left = 0, .top = 0, .right = content_w, .bottom = content_h };
-        _ = c.AdjustWindowRectEx(&rect, dwStyle, 0, dwExStyle);
-
-        ext_win.pending_window_w = rect.right - rect.left;
-        ext_win.pending_window_h = rect.bottom - rect.top;
+        // This window's actual style and DPI: WS_OVERLAPPEDWINDOW has a frame
+        // WS_POPUP does not, and its height depends on the window's monitor.
+        const outer = external_windows.windowOuterSizePx(ext_win.hwnd, content_w, content_h);
+        ext_win.pending_window_w = outer.w;
+        ext_win.pending_window_h = outer.h;
         ext_win.needs_window_resize = true;
         ext_win.needs_renderer_resize = true;
 

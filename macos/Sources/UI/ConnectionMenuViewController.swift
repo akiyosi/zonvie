@@ -23,6 +23,7 @@ struct ConnectionConfig {
     var extPopupmenu: Bool = false
     var extMessages: Bool = false
     var extTabline: Bool = false
+    var extWindows: Bool = false
 
     var envVars: String = ""       // KEY=VALUE per line
 
@@ -58,6 +59,7 @@ final class ConnectionMenuViewController: NSViewController {
     private let extPopupCheck = NSButton(checkboxWithTitle: "ext-popupmenu", target: nil, action: nil)
     private let extMessagesCheck = NSButton(checkboxWithTitle: "ext-messages", target: nil, action: nil)
     private let extTablineCheck = NSButton(checkboxWithTitle: "ext-tabline", target: nil, action: nil)
+    private let extWindowsCheck = NSButton(checkboxWithTitle: "ext-windows", target: nil, action: nil)
     private let envVarsTextView = NSTextView()
 
     // MARK: - SSH controls
@@ -141,7 +143,7 @@ final class ConnectionMenuViewController: NSViewController {
         container.addSubview(checkRow1)
         y -= 24
 
-        let checkRow2 = NSStackView(views: [extMessagesCheck, extTablineCheck])
+        let checkRow2 = NSStackView(views: [extMessagesCheck, extTablineCheck, extWindowsCheck])
         checkRow2.orientation = .horizontal
         checkRow2.spacing = 16
         checkRow2.frame = NSRect(x: margin, y: y - 18, width: fieldWidth, height: 18)
@@ -154,6 +156,8 @@ final class ConnectionMenuViewController: NSViewController {
         extPopupCheck.state = appConfig.popup.external ? .on : .off
         extMessagesCheck.state = appConfig.messages.external ? .on : .off
         extTablineCheck.state = appConfig.tabline.external ? .on : .off
+        // `--dialog --extwindows` kept ext_windows before the dialog had this box.
+        extWindowsCheck.state = appConfig.windows.external || CommandLine.arguments.contains("--extwindows") ? .on : .off
 
         // -- Environment Variables --
         y = addLabel("Environment Variables (KEY=VALUE per line)", to: container, at: y)
@@ -322,6 +326,7 @@ final class ConnectionMenuViewController: NSViewController {
         config.extPopupmenu = extPopupCheck.state == .on
         config.extMessages = extMessagesCheck.state == .on
         config.extTabline = extTablineCheck.state == .on
+        config.extWindows = extWindowsCheck.state == .on
         config.envVars = envVarsTextView.string
 
         // Fill connection-specific fields based on selected tab
