@@ -1803,37 +1803,10 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     // Show window without activating (SW_SHOWNA = 8)
     _ = c.ShowWindow(hwnd, 8);
 
-    // Share the App device: app.layer_grids row buffers are drawn by whichever
-    // surface places the grid. Until it is published, retry rather than open
-    // on a device of our own.
-    var renderer = blk: {
-        const device = app.d3d_device orelse break :blk null;
-        const device_ctx = app.d3d_ctx orelse break :blk null;
-        break :blk d3d11.Renderer.initWithDevice(
-            app.alloc,
-            hwnd,
-            app.config.window.opacity,
-            app.config.window.blur,
-            device,
-            device_ctx,
-            false,
-        ) catch |e| {
-            if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
-            break :blk null;
-        };
-    } orelse {
+    const renderer = newExternalRenderer(app, hwnd) orelse {
         _ = c.DestroyWindow(hwnd);
         return .retry;
     };
-    // Load the same custom post-process shaders the main window uses,
-    // so cmdline/popupmenu/msg/etc. overlay get the same shader effect
-    // applied through their own back_tex.
-    renderer.loadCustomShaderPipelines(&app.config);
-    if (app.corep) |corep| {
-        if (core.zonvie_core_get_glow_enabled(corep)) {
-            _ = renderer.prepareBloomShaders();
-        }
-    }
 
     // Collect SetWindowPos info while holding the lock, then call SetWindowPos after releasing
     // to avoid deadlock (SetWindowPos sends WM_SIZE synchronously, and WM_SIZE handler locks app.mu)
@@ -2527,21 +2500,7 @@ pub export fn ExternalWndProc(
             _ = c.ShowWindow(hwnd, c.SW_HIDE);
             return 0;
         },
-        c.WM_SETTINGCHANGE => {
-            // OS theme toggle — defer to the shared helper, which also
-            // filters out caption-less popups via WS_CAPTION. Non-color
-            // settings broadcasts fall through to DefWindowProcW so the OS
-            // can do its standard handling.
-            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
-        c.WM_THEMECHANGED => {
-            // Best-effort titlebar refresh, then fall through to the OS so
-            // the standard uxtheme handling still runs (and caption-less
-            // popups are not silently swallowed).
-            _ = window_mod.handleThemeChanged(hwnd);
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         c.WM_DESTROY => {
             // Clear userdata
             _ = c.SetWindowLongPtrW(hwnd, c.GWLP_USERDATA, 0);
@@ -3155,6 +3114,33 @@ pub fn serviceDeferredSizeReplays(app: *App) void {
     }
 }
 
+/// An external window's renderer, at creation and at device-loss rebuild. It
+/// shares the App device (app.layer_grids row buffers are drawn by whichever
+/// surface places the grid), so until that is published there is none, and
+/// it loads the main window's custom post-process shaders so overlays get the
+/// same effect through their own back_tex.
+pub fn newExternalRenderer(app: *App, hwnd: c.HWND) ?d3d11.Renderer {
+    const device = app.d3d_device orelse return null;
+    const device_ctx = app.d3d_ctx orelse return null;
+    var renderer = d3d11.Renderer.initWithDevice(
+        app.alloc,
+        hwnd,
+        app.config.window.opacity,
+        app.config.window.blur,
+        device,
+        device_ctx,
+        false,
+    ) catch |e| {
+        if (applog.isEnabled()) applog.appLog("[win] d3d11.Renderer.initWithDevice failed for external window: {any}\n", .{e});
+        return null;
+    };
+    renderer.loadCustomShaderPipelines(&app.config);
+    if (app.corep) |corep| {
+        if (core.zonvie_core_get_glow_enabled(corep)) _ = renderer.prepareBloomShaders();
+    }
+    return renderer;
+}
+
 fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
     var device_lost = false;
     var main_hwnd: ?c.HWND = null;
@@ -3430,24 +3416,22 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const row_h_px_snapshot = app.rowHeightPx();
 
     // Get renderer and atlas
-    const gpu_ptr: ?*d3d11.Renderer = &ext_win.renderer;
+    const g: *d3d11.Renderer = &ext_win.renderer;
     var atlas_ptr: ?*dwrite_d2d.Renderer = null;
     if (app.atlas) |*a| atlas_ptr = a;
 
     // A cursor on this surface is forwarded into the main renderer's shader
     // cursor state (see syncExternalShaderFrame).
-    if (gpu_ptr) |g_sh| {
-        syncExternalShaderFrame(app, hwnd, g_sh, .{
-            .verts = tbs_cursor.verts.items,
-            .content_origin = decoratedContentOriginPx(app, surface_kind),
-            .layer_origin = render_pipeline_helpers.layerOriginPx(
-                app_mod.SurfaceLayer,
-                tbs_snapshot.layers.slice(),
-                tbs_snapshot.cursor_layer_grid_id,
-                grid_id,
-            ),
-        });
-    }
+    syncExternalShaderFrame(app, hwnd, g, .{
+        .verts = tbs_cursor.verts.items,
+        .content_origin = decoratedContentOriginPx(app, surface_kind),
+        .layer_origin = render_pipeline_helpers.layerOriginPx(
+            app_mod.SurfaceLayer,
+            tbs_snapshot.layers.slice(),
+            tbs_snapshot.cursor_layer_grid_id,
+            grid_id,
+        ),
+    });
 
     // Determine rendering mode from TBS committed set.
     const tbs_row_mode = tbs_committed.row_mode;
@@ -3536,7 +3520,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     // Use the per-window scratch buffer (safe: each window has its own)
     const verts = ext_win.paint_scratch.items;
 
-    if (gpu_ptr) |g| {
+    {
         g.lockContext();
         defer g.unlockContext();
         // The blur reads the radius from the renderer. Set once for every
@@ -3697,9 +3681,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         }
         ext_win.surf.completePaintRetry();
-    } else {
-        if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow no gpu_ptr\n", .{});
-        requeueExternalFullPaint(app, grid_id, hwnd);
     }
 }
 

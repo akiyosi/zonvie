@@ -27,30 +27,6 @@ const render_helpers = @import("render_pipeline_helpers.zig");
 /// the other's message rather than running it.
 pub const ZONVIE_COPYDATA_MAGIC: usize = 0x5A4F4E50;
 
-/// Neovim command-line escape for a single byte of a file path. Returns the
-/// escaped multi-byte sequence, or null if the byte needs no escaping. Used for
-/// a drop inserted into the command line; the set matches the macOS
-/// `escapePathForNeovim`. `$` and `` ` `` are included so Neovim does not
-/// perform environment-variable / backtick expansion on a literal path.
-pub fn escapeNeovimByte(ch: u8) ?[]const u8 {
-    return switch (ch) {
-        '\\' => "\\\\",
-        ' ' => "\\ ",
-        '%' => "\\%",
-        '#' => "\\#",
-        '|' => "\\|",
-        '"' => "\\\"",
-        '\'' => "\\'",
-        '[' => "\\[",
-        ']' => "\\]",
-        '{' => "\\{",
-        '}' => "\\}",
-        '$' => "\\$",
-        '`' => "\\`",
-        else => null,
-    };
-}
-
 /// HWND_TOPMOST / HWND_NOTOPMOST are ((HWND)-1) / ((HWND)-2); translate-c's
 /// cast to HWND ([*c]HWND__, align 4) trips Zig's pointer alignment check.
 /// Win32 USER handles are opaque values, never dereferenced, so redeclare
@@ -103,10 +79,9 @@ pub fn dropInsertsPath(app: *app_mod.App, force_cmdline: bool) bool {
     app.mu.lockUncancelable(core.clock.io());
     const has_external_cmdline = app.external_windows.contains(CMDLINE_GRID_ID);
     app.mu.unlock(core.clock.io());
-    if (has_external_cmdline) return false;
 
     const mode_ptr: [*:0]const u8 = app_mod.zonvie_core_get_current_mode(corep);
-    return std.mem.startsWith(u8, std.mem.span(mode_ptr), "cmdline");
+    return core.frontend_rules.dropInsertsPath(std.mem.span(mode_ptr), has_external_cmdline, false);
 }
 
 pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool) void {
@@ -168,27 +143,13 @@ pub fn handleDroppedFiles(app: *app_mod.App, hDrop: c.HDROP, force_cmdline: bool
             continue;
         }
 
-        // Add space separator between paths
-        if (pos > 0) {
-            if (pos < cmd_buf.len) {
-                cmd_buf[pos] = ' ';
-                pos += 1;
-            }
-        }
-
-        // Escape special characters for Neovim
-        for (utf8_path) |ch| {
-            if (pos + 2 > cmd_buf.len) break;
-            if (escapeNeovimByte(ch)) |esc| {
-                if (pos + esc.len <= cmd_buf.len) {
-                    @memcpy(cmd_buf[pos..][0..esc.len], esc);
-                    pos += esc.len;
-                }
-            } else {
-                cmd_buf[pos] = ch;
-                pos += 1;
-            }
-        }
+        // Space separator between paths, committed only with a path that
+        // fits, so a refused path leaves no dangling separator.
+        const sep: usize = if (pos > 0) 1 else 0;
+        if (pos + sep >= cmd_buf.len) break;
+        const esc = core.frontend_rules.escapePathForCmdline(cmd_buf[pos + sep ..], utf8_path, true) orelse break;
+        if (sep == 1) cmd_buf[pos] = ' ';
+        pos += sep + esc.len;
     }
 
     if (!is_cmdline) {
@@ -685,6 +646,20 @@ fn resetGuifontToCurrent(app: *App) void {
 // we'll pick it up; otherwise we rely on the WM_SETTINGCHANGE path.
 //
 // Skips caption-less windows for the same reason as handleImmersiveColorSet().
+/// The WM_SETTINGCHANGE / WM_THEMECHANGED handling every caption-bearing
+/// window procedure shares; null for any other message. Only the color-mode
+/// broadcast is consumed: other WM_SETTINGCHANGE flavours ("intl", "Policy",
+/// ...) and every WM_THEMECHANGED reach DefWindowProcW so the OS's standard
+/// handling still runs, the titlebar attribute re-applied best-effort first.
+pub fn themeMessage(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPARAM) ?c.LRESULT {
+    switch (msg) {
+        c.WM_SETTINGCHANGE => if (handleImmersiveColorSet(hwnd, lParam)) return 0,
+        c.WM_THEMECHANGED => _ = handleThemeChanged(hwnd),
+        else => return null,
+    }
+    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
 pub fn handleThemeChanged(hwnd: c.HWND) bool {
     const style: c.LONG = c.GetWindowLongW(hwnd, c.GWL_STYLE);
     if ((@as(c.DWORD, @bitCast(style)) & c.WS_CAPTION) == 0) return false;
@@ -1549,6 +1524,28 @@ fn showDevcontainerUpFailed(hwnd: c.HWND) void {
     );
 }
 
+/// A synchronous core start failure closes the window; say why first, as
+/// macOS's handleCoreStartFailure alert does.
+fn showCoreStartFailed(hwnd: c.HWND, rc: c_int) void {
+    const reason: []const u8 = switch (rc) {
+        -1 => "Invalid core handle.",
+        -2 => "Could not spawn the RPC run-loop thread.",
+        -3 => "Invalid or unsupported listen address. For --connect-nvim, use a named pipe path on Windows.",
+        else => "Unknown error.",
+    };
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "{s} (rc={d})", .{ reason, rc }) catch reason;
+    var wbuf: [300]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], msg) catch 0;
+    wbuf[wlen] = 0;
+    _ = c.MessageBoxW(
+        hwnd,
+        wbuf[0..wlen :0],
+        std.unicode.utf8ToUtf16LeStringLiteral("Zonvie failed to start"),
+        c.MB_OK | c.MB_ICONERROR,
+    );
+}
+
 // =========================================================================
 // Helper: build native-mode nvim command string
 // =========================================================================
@@ -1680,6 +1677,7 @@ fn doEarlyCoreInit(hwnd: c.HWND, app: *App) !void {
 
     if (start_rc != 0) {
         if (log_enabled) applog.appLog("[win] doEarlyCoreInit: core start failed rc={d}; aborting startup\n", .{start_rc});
+        showCoreStartFailed(hwnd, start_rc);
         // Mark the session as already exited so the WM_CLOSE handler
         // takes the fast path (no quit dialog, no waiting on the core).
         app.neovim_exited.store(true, .release);
@@ -2319,9 +2317,13 @@ pub export fn WndProc(
                     // created left the swapchain at the old size; drawEx then
                     // recreated back_tex mid-paint and kept only the dirty rows
                     // of the new one while still reporting it valid.
-                    const resized_before_draw = app_mod.resizeSurfaceIfNeeded(g, false) catch |e| blk: {
+                    // A failed resize fails the paint, as on the external
+                    // driver: drawing on would retry it inside drawEx and
+                    // report a partial frame over a fresh back_tex valid.
+                    const resized_before_draw = app_mod.resizeSurfaceIfNeeded(g, false) catch |e| {
                         if (applog.isEnabled()) applog.appLog("[win] WM_PAINT pre-draw resize failed: {any}\n", .{e});
-                        break :blk false;
+                        recoverMainPaintFailure(hwnd, app);
+                        return 0;
                     };
 
                     // Calculate content width for "always" scrollbar mode
@@ -3313,25 +3315,7 @@ pub export fn WndProc(
             return 0;
         },
 
-        c.WM_SETTINGCHANGE => {
-            // Only consume the message if it was the color-mode broadcast we
-            // care about. Other WM_SETTINGCHANGE flavours ("intl", "Policy",
-            // "Environment", ...) need to reach DefWindowProcW so the OS can
-            // do its standard handling.
-            if (handleImmersiveColorSet(hwnd, lParam)) return 0;
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
-        c.WM_THEMECHANGED => {
-            // WM_THEMECHANGED covers all visual-style transitions, not just
-            // light/dark color-mode. Re-apply the OS titlebar attribute as
-            // a best-effort addition, then fall through to DefWindowProcW
-            // so the standard uxtheme client-side refresh still runs. This
-            // also means caption-less popups (where handleThemeChanged()
-            // returns false) get their default handling instead of being
-            // silently swallowed.
-            _ = handleThemeChanged(hwnd);
-            return c.DefWindowProcW(hwnd, msg, wParam, lParam);
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return themeMessage(hwnd, msg, wParam, lParam).?,
         WM_APP_THEME_REREAD => {
             // Posted by the registry-watcher worker thread when
             // AppsUseLightTheme changes. Re-apply to every caption-bearing
@@ -3915,8 +3899,15 @@ pub export fn WndProc(
                             }
                         },
                         .split => {
+                            // The view's default timeout is 0 (stays until
+                            // msg_clear); a route's `timeout` overrides it,
+                            // as on macOS.
                             messages.showMessageWindowOnUIThread(app, dm, true);
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
+                            const timeout_ms = messageTimerMilliseconds(dm.timeout);
+                            if (timeout_ms > 0) {
+                                _ = c.SetTimer(hwnd, TIMER_MSG_AUTOHIDE, timeout_ms, null);
+                            }
                         },
                         .notification => {
                             if (app.tray_icon) |*tray| tray.showBalloon("Neovim", dm.text[0..dm.text_len]);
@@ -4404,18 +4395,8 @@ pub export fn WndProc(
                 // redraw path).
                 if (getApp(hwnd)) |app| {
                     app.tabline_state.spinner_frame +%= 1;
-                    var tabline_rect: c.RECT = .{
-                        .left = 0,
-                        .top = 0,
-                        .right = 4096,
-                        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                    };
-                    // In sidebar mode that band is editor content; the
-                    // indicators are in the sidebar strip.
-                    if (app.ext_tabline_enabled and app.tabline_style == .sidebar) {
-                        tabline_rect = tabline_mod.sidebarRectPx(app, hwnd);
-                    }
-                    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+                    const band = tabline_mod.tablineBandRect(app, hwnd);
+                    _ = c.InvalidateRect(hwnd, &band, 0);
                 }
             } else if (wParam == app_mod.TIMER_CUSTOM_SHADER_ANIM) {
                 // Continuous-redraw tick for animated custom shaders.
@@ -4560,6 +4541,7 @@ pub export fn WndProc(
                                     // No run loop exists to report an exit: close
                                     // with code 1, as the deferred path does.
                                     dialogs.hideDevcontainerProgressDialog();
+                                    showCoreStartFailed(hwnd, start_ok);
                                     app.devcontainer_up_pending = false;
                                     app.neovim_exited.store(true, .release);
                                     app_mod.g_exit_code.store(1, .seq_cst);
@@ -4858,20 +4840,13 @@ pub export fn WndProc(
                 var old_main_renderer: ?d3d11.Renderer = null;
                 var old_d3d_ctx: ?*c.ID3D11DeviceContext = null;
                 var old_d3d_device: ?*c.ID3D11Device = null;
-                var old_cursor_vb: ?*c.ID3D11Buffer = null;
-                var old_scrollbar_vb: ?*c.ID3D11Buffer = null;
                 {
                     app.mu.lockUncancelable(core.clock.io());
                     defer app.mu.unlock(core.clock.io());
 
-                    // Detach singleton objects only. Row buffers are detached
-                    // one at a time below so no COM Release runs under app.mu.
-                    old_cursor_vb = app.surf.paint.cursor_vb;
-                    app.surf.paint.cursor_vb = null;
-                    app.surf.paint.cursor_vb_bytes = 0;
-                    old_scrollbar_vb = app.surf.paint.scrollbar_vb;
-                    app.surf.paint.scrollbar_vb = null;
-                    app.surf.paint.scrollbar_vb_bytes = 0;
+                    // Detach singleton objects only. Surface buffers are
+                    // detached one at a time below so no COM Release runs
+                    // under app.mu.
                     old_main_renderer = app.renderer;
                     app.renderer = null;
 
@@ -4882,8 +4857,6 @@ pub export fn WndProc(
                 }
                 _ = releaseSurfaceRecoveryBuffers(app, &app.surf, null);
                 releaseLayerGridRecoveryBuffers(app);
-                if (old_cursor_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
-                if (old_scrollbar_vb) |vb| _ = vb.lpVtbl.*.Release.?(vb);
                 // releaseD2DDeviceObjects drops its own mutex before COM;
                 // call it with no outer app.mu held as well.
                 if (app.atlas) |*a| a.releaseD2DDeviceObjects();
@@ -5102,30 +5075,12 @@ pub export fn WndProc(
                     // deinit leaves the struct undefined, so replacing it
                     // only on success is what prevents a later double-deinit
                     // on garbage COM pointers.
-                    var new_renderer = blk_ext: {
-                        const device = app.d3d_device orelse break :blk_ext null;
-                        const device_ctx = app.d3d_ctx orelse break :blk_ext null;
-                        break :blk_ext d3d11.Renderer.initWithDevice(
-                            app.alloc,
-                            ext_win.hwnd,
-                            app.config.window.opacity,
-                            app.config.window.blur,
-                            device,
-                            device_ctx,
-                            false,
-                        ) catch null;
-                    } orelse {
+                    var new_renderer = external_windows.newExternalRenderer(app, ext_win.hwnd) orelse {
                         if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: external renderer re-init failed (window stays lost)\n", .{});
                         any_ext_failed = true;
                         external_windows.finishExternalWindowPaint(app, grid_id);
                         continue;
                     };
-                    new_renderer.loadCustomShaderPipelines(&app.config);
-                    if (app.corep) |corep| {
-                        if (core.zonvie_core_get_glow_enabled(corep)) {
-                            _ = new_renderer.prepareBloomShaders();
-                        }
-                    }
                     new_renderer.resize() catch {
                         new_renderer.deinit();
                         any_ext_failed = true;
@@ -5360,7 +5315,7 @@ pub export fn WndProc(
                     } else if (app.devcontainer_mode) devcontainer_block: {
                         if (app.devcontainer_workspace) |workspace| {
                             if (app.devcontainer_rebuild) {
-                                dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Building devcontainer..."));
+                                dialogs.showDevcontainerProgressDialog(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Building devcontainer..."));
                                 dialogs.g_devcontainer_up_done.store(false, .seq_cst);
                                 dialogs.g_devcontainer_up_success.store(false, .seq_cst);
                                 const thread = std.Thread.spawn(.{}, dialogs.runDevcontainerUpThread, .{ workspace, app.devcontainer_config, app.alloc }) catch |e| {
@@ -5374,7 +5329,7 @@ pub export fn WndProc(
                                 _ = c.SetTimer(hwnd, TIMER_DEVCONTAINER_POLL, DEVCONTAINER_POLL_INTERVAL, null);
                                 break :devcontainer_block;
                             } else {
-                                dialogs.showDevcontainerProgressDialog(std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
+                                dialogs.showDevcontainerProgressDialog(hwnd, std.unicode.utf8ToUtf16LeStringLiteral("Connecting..."));
                                 nvim_cmd_slice = core.frontend_rules.devcontainerExecCmd(&nvim_cmd_buf, workspace, app.devcontainer_config);
                             }
                         } else {
@@ -5394,6 +5349,7 @@ pub export fn WndProc(
                         const start_rc = core.zonvie_core_start(app.corep, nvim_path_ptr, app.surf.surface.rows, app.surf.surface.cols);
                         if (start_rc != 0) {
                             if (applog.isEnabled()) applog.appLog("[win] devcontainer-up: core start failed rc={d}; aborting\n", .{start_rc});
+                            showCoreStartFailed(hwnd, start_rc);
                             app.neovim_exited.store(true, .release);
                             app_mod.g_exit_code.store(1, .seq_cst);
                             _ = c.PostMessageW(hwnd, c.WM_CLOSE, 0, 0);
@@ -5709,8 +5665,7 @@ pub export fn WndProc(
                             return input.mouseButtonResult(msg);
                         }
                     } else if (app.tabline_style == .sidebar) {
-                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
-                        if (x >= sb_rect.left and x < sb_rect.right) {
+                        if (tabline_mod.pointInSidebar(app, hwnd, @as(c_int, x))) {
                             // Left button: handle sidebar interaction
                             // Right/middle button: consume event to prevent Neovim input
                             if (msg == c.WM_LBUTTONDOWN) {
@@ -5783,8 +5738,7 @@ pub export fn WndProc(
                             return 0;
                         }
                         // Check if event is in sidebar area — consume all buttons
-                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
-                        if (x_up >= sb_rect.left and x_up < sb_rect.right) {
+                        if (tabline_mod.pointInSidebar(app, hwnd, @as(c_int, x_up))) {
                             if (msg == c.WM_LBUTTONUP) {
                                 tabline_mod.handleSidebarMouseUp(app, hwnd, @as(c_int, x_up), @as(c_int, y_up));
                             }
@@ -5854,8 +5808,7 @@ pub export fn WndProc(
                             tabline_mod.clearTablineHover(app, hwnd);
                         }
                     } else if (app.tabline_style == .sidebar) {
-                        const sb_rect = tabline_mod.sidebarRectPx(app, hwnd);
-                        const in_sb3 = x >= sb_rect.left and x < sb_rect.right;
+                        const in_sb3 = tabline_mod.pointInSidebar(app, hwnd, @as(c_int, x));
 
                         // A pressed close/new-tab button keeps getting moves
                         // wherever the pointer goes: its "left the button,
@@ -6172,36 +6125,7 @@ pub export fn WndProc(
                 input.cancelMouseButtons(app);
                 // The scrollbar's drag and track-repeat end the same way.
                 scrollbar.cancelPointer(scrollbar.mainSurface(hwnd, app));
-                if (app.ext_tabline_enabled) {
-                    const had_state = app.tabline_state.dragging_tab != null or
-                        app.tabline_state.close_button_pressed != null or
-                        app.tabline_state.new_tab_button_pressed or
-                        app.tabline_state.pressed_window_btn != null;
-
-                    if (had_state) {
-                        if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
-                        tabline_mod.destroyDragPreviewWindow(app);
-                        app.tabline_state.cancelDrag();
-                        app.tabline_state.close_button_pressed = null;
-                        app.tabline_state.new_tab_button_pressed = false;
-                        app.tabline_state.pressed_window_btn = null;
-                        // Invalidate the relevant tab area
-                        var client_rect: c.RECT = undefined;
-                        _ = c.GetClientRect(hwnd, &client_rect);
-                        if (app.tabline_style == .sidebar) {
-                            const sidebar_rect = tabline_mod.sidebarRectPx(app, hwnd);
-                            _ = c.InvalidateRect(hwnd, &sidebar_rect, 0);
-                        } else {
-                            var tabline_rect: c.RECT = .{
-                                .left = 0,
-                                .top = 0,
-                                .right = client_rect.right,
-                                .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-                            };
-                            _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
-                        }
-                    }
-                }
+                if (app.ext_tabline_enabled) tabline_mod.cancelTablinePointer(app, hwnd);
             }
             return 0;
         },

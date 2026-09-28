@@ -187,6 +187,30 @@ fn forwardFilesToInstance(
     _ = c.SendMessageW(target, c.WM_COPYDATA, 0, @bitCast(@intFromPtr(&cds)));
 }
 
+/// Whether `arg` is an nvim option whose VALUE is the next token (`-u NONE`,
+/// `-c "set nu"`, `--listen addr`): that token is not a file.
+fn nvimOptionTakesValue(arg: []const u8) bool {
+    const opts = [_][]const u8{ "-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime" };
+    for (opts) |o| if (std.mem.eql(u8, arg, o)) return true;
+    return false;
+}
+
+/// A file argument for nvim, absolute against `cwd`. Flags (`-`), commands
+/// (`+`), an option's value (`prev` names the option), drive-relative
+/// (`C:foo`) and already-absolute paths pass through; with no cwd so does
+/// the rest.
+fn absoluteFileArg(alloc: std.mem.Allocator, cwd: ?[]const u8, prev: ?[]const u8, arg: []const u8, after_dash_dash: bool) []const u8 {
+    if (arg.len == 0) return arg;
+    if (std.fs.path.isAbsolute(arg) or (arg.len >= 2 and arg[1] == ':')) return arg;
+    // After `--` every token is a file to nvim, `-` alone being stdin.
+    if (!after_dash_dash) {
+        if (arg[0] == '-' or arg[0] == '+') return arg;
+        if (prev) |p| if (nvimOptionTakesValue(p)) return arg;
+    } else if (std.mem.eql(u8, arg, "-")) return arg;
+    const base = cwd orelse return arg;
+    return std.fs.path.join(alloc, &.{ base, arg }) catch arg;
+}
+
 pub fn main() u8 {
     clock.init();
     defer applog.deinit();
@@ -516,9 +540,13 @@ pub fn main() u8 {
     }
 
     // Collect arguments that are NOT zonvie-specific (these will be passed to nvim)
-    // After "--", all remaining arguments are passed to nvim
+    // After "--", all remaining arguments are passed to nvim. A relative file
+    // argument is made absolute against the shell's cwd here: nvim is spawned
+    // in HOME when that variable is set, so `zonvie foo.txt` opened
+    // %HOME%\foo.txt (macOS resolves the same way before its fork).
     var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
+    const shell_cwd: ?[]const u8 = getCwdUtf8(alloc);
 
     var i: usize = 1; // Skip argv[0] (executable path)
     while (i < args.len) : (i += 1) {
@@ -531,7 +559,7 @@ pub fn main() u8 {
         }
 
         if (pass_all_to_nvim) {
-            nvim_extra_args.append(alloc, arg) catch {};
+            nvim_extra_args.append(alloc, absoluteFileArg(alloc, shell_cwd, null, arg, true)) catch {};
             continue;
         }
 
@@ -654,7 +682,7 @@ pub fn main() u8 {
             // Already handled above, skip
         } else {
             // Not a zonvie argument - pass to nvim
-            nvim_extra_args.append(alloc, arg) catch {};
+            nvim_extra_args.append(alloc, absoluteFileArg(alloc, shell_cwd, if (i > 1) args[i - 1] else null, arg, false)) catch {};
         }
     }
 

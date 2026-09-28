@@ -32,12 +32,6 @@ struct SurfaceIdleTerms {
     /// Committed content this draw has not acknowledged (`commitRevision`).
     var hasNewCommit = false
 
-    /// A cursor submit that has not been published yet. Distinct from
-    /// `hasNewCommit`: it is set inside the flush bracket, before the commit
-    /// that will carry it, and a draw that read and cleared it in between
-    /// would otherwise leave the cursor on the old content.
-    var hasCursorUpdate = false
-
     /// Rows this surface's own grid owes.
     var hasDirtyRows = false
 
@@ -91,7 +85,7 @@ struct SurfaceIdleTerms {
     func traceLine(surface: Int64) -> String {
         "surface=\(surface) gate=idle"
             + " presented=\(hasPresentedOnce ? 1 : 0) rowMode=\(rowModeSatisfied ? 1 : 0)"
-            + " newCommit=\(hasNewCommit ? 1 : 0) cursor=\(hasCursorUpdate ? 1 : 0)"
+            + " newCommit=\(hasNewCommit ? 1 : 0)"
             + " dirty=\(hasDirtyRows ? 1 : 0) rect=\(hasDirtyRect ? 1 : 0)"
             + " layerWork=\(hasLayerWork ? 1 : 0) scroll=\(hasStagedScroll ? 1 : 0)"
             + " scrollOff=\(scrollOffsetChanged ? 1 : 0) smooth=\(isSmoothScrolling ? 1 : 0)"
@@ -109,7 +103,6 @@ struct SurfaceIdleTerms {
             && hasPresentedOnce
             && rowModeSatisfied
             && !hasNewCommit
-            && !hasCursorUpdate
             && !hasDirtyRows
             && !hasDirtyRect
             && !hasLayerWork
@@ -135,7 +128,6 @@ struct SurfaceIdleTerms {
         hasPresentedOnce
             && rowModeSatisfied
             && !hasNewCommit
-            && !hasCursorUpdate
             && !hasDirtyRows
             && !hasDirtyRect
             && !hasLayerWork

@@ -99,51 +99,59 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     _ = c.FreeConsole();
 }
 
-/// Simple password input dialog without username field
-pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16) bool {
-    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonviePasswordDialog");
-
-    // Register window class
+/// A topmost popup dialog: registers `class_name` with `proc`, centres a
+/// `w` x `h` window on the monitor `owner` is on (the primary one with no
+/// owner) and matches the OS titlebar theme. Null when creation failed.
+fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0]const u16, style: c.DWORD, w: i32, h: i32, owner: ?c.HWND) c.HWND {
     var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
     wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = passwordDialogProc;
+    wc.lpfnWndProc = proc;
     wc.hInstance = c.GetModuleHandleW(null);
     wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
     wc.hbrBackground = @ptrFromInt(@as(usize, 16)); // COLOR_BTNFACE + 1
     wc.lpszClassName = class_name;
     _ = c.RegisterClassExW(&wc);
 
-    // Store output pointer
-    g_password_dialog_output = password_out;
-    g_password_dialog_result = false;
-
-    // Create dialog window (centered on screen)
-    const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-    const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-    const dlg_w: i32 = 420;
-    const dlg_h: i32 = 180;
-    const dlg_x = @divTrunc(screen_w - dlg_w, 2);
-    const dlg_y = @divTrunc(screen_h - dlg_h, 2);
-
+    const area = app_mod.monitorWorkArea(owner);
+    const x = area.left + @divTrunc(area.right - area.left - w, 2);
+    const y = area.top + @divTrunc(area.bottom - area.top - h, 2);
     const hwnd = c.CreateWindowExW(
         c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
         class_name,
-        std.unicode.utf8ToUtf16LeStringLiteral("SSH Authentication"),
-        c.WS_POPUP | c.WS_CAPTION | c.WS_SYSMENU,
-        dlg_x,
-        dlg_y,
-        dlg_w,
-        dlg_h,
+        title,
+        style,
+        x,
+        y,
+        w,
+        h,
         null,
         null,
         c.GetModuleHandleW(null),
         null,
     );
+    if (hwnd != null) window_mod.applyOsTitlebarTheme(hwnd);
+    return hwnd;
+}
 
+/// Simple password input dialog without username field. Runs in the
+/// ssh-askpass helper process, which has no app window to centre on.
+pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16) bool {
+    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonviePasswordDialog");
+
+    // Store output pointer
+    g_password_dialog_output = password_out;
+    g_password_dialog_result = false;
+
+    const hwnd = createCenteredDialog(
+        class_name,
+        passwordDialogProc,
+        std.unicode.utf8ToUtf16LeStringLiteral("SSH Authentication"),
+        c.WS_POPUP | c.WS_CAPTION | c.WS_SYSMENU,
+        420,
+        180,
+        null,
+    );
     if (hwnd == null) return false;
-
-    // Match OS light/dark titlebar theme — same as the main window.
-    window_mod.applyOsTitlebarTheme(hwnd);
 
     // Create prompt label
     _ = c.CreateWindowExW(
@@ -273,64 +281,25 @@ fn passwordDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.LPA
             c.PostQuitMessage(0);
             return 0;
         },
-        c.WM_SETTINGCHANGE => {
-            // Only consume the color-mode broadcast; let other
-            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
-            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
-            // Fall through to the default dispatch path below.
-        },
-        c.WM_THEMECHANGED => {
-            // Best-effort titlebar refresh, then fall through so the OS
-            // can run its standard handling for any non-caption surface.
-            _ = window_mod.handleThemeChanged(hwnd);
-            // Fall through to the default dispatch path below.
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-pub fn showDevcontainerProgressDialog(label_text: [*:0]const u16) void {
-    const class_name = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieDevcontainerProgress");
-
-    // Register window class
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = devcontainerDialogProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512)); // IDC_ARROW
-    wc.hbrBackground = @ptrFromInt(@as(usize, 16)); // COLOR_BTNFACE + 1
-    wc.lpszClassName = class_name;
-    _ = c.RegisterClassExW(&wc);
-
-    // Create dialog window (centered on screen)
-    const screen_w = c.GetSystemMetrics(c.SM_CXSCREEN);
-    const screen_h = c.GetSystemMetrics(c.SM_CYSCREEN);
-    const dlg_w: i32 = 300;
-    const dlg_h: i32 = 80;
-    const dlg_x = @divTrunc(screen_w - dlg_w, 2);
-    const dlg_y = @divTrunc(screen_h - dlg_h, 2);
-
-    const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
-        class_name,
+/// `owner` is the main window; the dialog centres on its monitor.
+pub fn showDevcontainerProgressDialog(owner: c.HWND, label_text: [*:0]const u16) void {
+    const hwnd = createCenteredDialog(
+        std.unicode.utf8ToUtf16LeStringLiteral("ZonvieDevcontainerProgress"),
+        devcontainerDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer"),
         c.WS_POPUP | c.WS_CAPTION,
-        dlg_x,
-        dlg_y,
-        dlg_w,
-        dlg_h,
-        null,
-        null,
-        c.GetModuleHandleW(null),
-        null,
+        300,
+        80,
+        owner,
     );
-
     if (hwnd == null) return;
     g_devcontainer_dialog_hwnd = hwnd;
-
-    // Match OS light/dark titlebar theme — same as the main window.
-    window_mod.applyOsTitlebarTheme(hwnd);
 
     // Create label
     g_devcontainer_label_hwnd = c.CreateWindowExW(
@@ -377,18 +346,7 @@ fn devcontainerDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
             g_devcontainer_label_hwnd = null;
             return 0;
         },
-        c.WM_SETTINGCHANGE => {
-            // Only consume the color-mode broadcast; let other
-            // WM_SETTINGCHANGE flavours fall through to DefWindowProcW.
-            if (window_mod.handleImmersiveColorSet(hwnd, lParam)) return 0;
-            // Fall through to the default dispatch path below.
-        },
-        c.WM_THEMECHANGED => {
-            // Best-effort titlebar refresh, then fall through so the OS
-            // can run its standard handling for any non-caption surface.
-            _ = window_mod.handleThemeChanged(hwnd);
-            // Fall through to the default dispatch path below.
-        },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         else => {},
     }
     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -531,6 +489,12 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
         local_app_data[0..local_app_data_len]
     else
         "C:\\Users\\Default\\AppData\\Local";
+    var nvim_config_dir: [640]u8 = undefined;
+    const nvim_config_dir_slice = std.fmt.bufPrint(&nvim_config_dir, "{s}\\nvim", .{nvim_config_path}) catch {
+        g_devcontainer_up_success.store(false, .seq_cst);
+        g_devcontainer_up_done.store(true, .seq_cst);
+        return;
+    };
 
     // Build command: devcontainer up with features and mount
     var cmd_buf: [4096]u8 = undefined;
@@ -545,11 +509,24 @@ pub fn runDevcontainerUpThread(workspace: []const u8, config_path: ?[]const u8, 
         core.frontend_rules.writeDevcontainerPath(&writer, cfg) catch {};
         writer.writeAll("\"\"") catch {};
     }
-    writer.writeAll(" --additional-features \"{\"\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\"\":{}}\"") catch {};
-    writer.writeAll(" --mount type=bind,source=") catch {};
-    writer.writeAll(nvim_config_path) catch {};
-    writer.writeAll("\\nvim,target=/nvim-config/nvim") catch {};
-    writer.writeAll(" --remove-existing-container\"") catch {};
+    // Only reached on a rebuild (see window.zig), so the container is always
+    // replaced. An argument with quotes is quoted for cmd, its own doubled.
+    var args_buf: [1024]u8 = undefined;
+    var args = std.mem.splitScalar(u8, core.frontend_rules.devcontainerUpArgs(&args_buf, nvim_config_dir_slice, true), 0);
+    while (args.next()) |arg| {
+        if (arg.len == 0) continue;
+        writer.writeByte(' ') catch {};
+        if (std.mem.indexOfScalar(u8, arg, '"') == null) {
+            writer.writeAll(arg) catch {};
+            continue;
+        }
+        writer.writeByte('"') catch {};
+        for (arg) |ch| {
+            if (ch == '"') writer.writeAll("\"\"") catch {} else writer.writeByte(ch) catch {};
+        }
+        writer.writeByte('"') catch {};
+    }
+    writer.writeByte('"') catch {};
 
     const cmd_slice = cmd_buf[0..writer.end];
     if (applog.isEnabled()) applog.appLog("[win] devcontainer up command: {s}\n", .{cmd_slice});

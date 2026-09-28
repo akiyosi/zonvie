@@ -40,6 +40,7 @@ pub const zonvie_core_try_get_viewport = core.zonvie_core_try_get_viewport;
 pub const zonvie_core_get_visible_grids = core.zonvie_core_get_visible_grids;
 pub const zonvie_core_try_get_visible_grids_complete = core.zonvie_core_try_get_visible_grids_complete;
 pub const zonvie_core_get_cursor_position = core.zonvie_core_get_cursor_position;
+pub const zonvie_core_msg_anchor = core.zonvie_core_msg_anchor;
 pub const zonvie_core_try_get_cursor_position = core.zonvie_core_try_get_cursor_position;
 pub const zonvie_core_get_win_id = core.zonvie_core_get_win_id;
 pub const zonvie_core_get_current_mode = core.zonvie_core_get_current_mode;
@@ -112,6 +113,7 @@ pub const DECO_CURSOR = core.DECO_CURSOR;
 pub const CmdlineChunk = core.CmdlineChunk;
 pub const BufferEntry = core.BufferEntry;
 pub const GridInfo = core.GridInfo;
+pub const MsgAnchor = core.MsgAnchor;
 pub const MsgHistoryEntry = core.MsgHistoryEntry;
 pub const zonvie_msg_event = core.zonvie_msg_event;
 
