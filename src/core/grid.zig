@@ -935,7 +935,6 @@ pub const GridBuf = struct {
         if (row >= self.rows or col >= self.cols) return false;
         const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
 
-        // Skip if no change (same optimization as global Grid.putCell)
         const old = self.cells[idx];
         if (old.cp == cp and old.hl == hl) return false;
 
@@ -2048,27 +2047,15 @@ pub const Grid = struct {
         return self.sub_grids.getPtr(grid_id);
     }
 
+    /// Whether a grid's cells reach a surface: grid 1 always, a sub-grid once
+    /// placed or made an external root. Grid 1 short-circuits so grid_line on
+    /// it does no hash lookup.
+    fn gridShown(self: *const Grid, grid_id: i64) bool {
+        return grid_id == 1 or self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id);
+    }
+
     pub fn putCell(self: *Grid, row: u32, col: u32, cp: u32, hl: u32) void {
-        if (row >= self.rows or col >= self.cols) return;
-
-        const idx: usize = @as(usize, row) * @as(usize, self.cols) + @as(usize, col);
-
-        // If no actual change, do nothing (avoid increasing dirty state)
-        const old = self.main_buf.cells[idx];
-        if (old.cp == cp and old.hl == hl) return;
-
-        // Apply the change only when it actually differs
-        self.main_buf.cells[idx] = .{ .cp = cp, .hl = hl };
-
-        // Treat only actual changes as dirty
-        self.markDirtyRow(row);
-
-        self.glyph_working_set_rev +%= 1;
-
-        // Advance cursor_rev if cursor is on this cell (to update cursor text)
-        if (self.cursor_grid == 1 and self.cursor_row == row and self.cursor_col == col) {
-            self.cursor_rev +%= 1;
-        }
+        self.putCellBuf(&self.main_buf, 1, row, col, cp, hl);
     }
 
     /// Implements the "grid_scroll" UI event by copying a rectangular region.
@@ -2146,9 +2133,7 @@ pub const Grid = struct {
             const old_surface_vertex_count = sg.surface_vertex_count;
             try sg.resize(self.alloc, rows, cols);
             self.subgrid_surface_vertex_count -|= old_surface_vertex_count;
-            if (shape_changed and (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id))) {
-                self.glyph_working_set_rev +%= 1;
-            }
+            if (shape_changed and self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
             self.total_grid_cells = new_total;
             self.trimOverflowForGrid(grid_id, rows, cols);
 
@@ -2172,9 +2157,7 @@ pub const Grid = struct {
         };
         _ = sg;
         self.total_grid_cells = new_total;
-        if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-            self.glyph_working_set_rev +%= 1;
-        }
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
         self.trimOverflowForGrid(grid_id, rows, cols);
         // The layer's band. A grid appearing as grid 1's FIRST layer also
         // flips `skip_default_bg` for every root row; the flush regenerates
@@ -2194,9 +2177,7 @@ pub const Grid = struct {
         }
         if (self.sub_grids.getPtr(grid_id)) |sg| {
             sg.clear();
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
+            if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
         }
         self.clearOverflowForGrid(grid_id);
 
@@ -2277,54 +2258,29 @@ pub const Grid = struct {
     /// Force-mark a cell's row dirty (for overflow-only changes where putCellGrid
     /// would no-op because cp+hl are unchanged).
     /// Also advances cursor_rev when the cursor is on this cell.
+    /// A layer repaints its own band on both frontends and its root holds
+    /// none of its cells, so a cell change dirties nothing under it; shrink,
+    /// clear and close dirty the band themselves.
     pub fn markDirtyCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32) void {
-        if (grid_id == 1) {
-            self.glyph_working_set_rev +%= 1;
-            self.markDirtyRow(row);
-            if (self.cursor_grid == 1 and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
-            return;
-        }
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-            sg.dirty = true;
-            if (sg.dirty_rows.bit_length > row) {
-                sg.dirty_rows.set(row);
-            }
-            // A layer repaints its own band on both frontends and its root
-            // holds none of its cells, so a cell change dirties nothing under
-            // it; shrink, clear and close dirty the band themselves.
-            if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
+        const buf = self.bufFor(grid_id) orelse return;
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
+        buf.markDirtyRow(row);
+        if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
+            self.cursor_rev +%= 1;
         }
     }
 
     pub fn putCellGrid(self: *Grid, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
-        if (grid_id == 1) {
-            self.putCell(row, col, cp, hl);
-            return;
-        }
-        if (self.sub_grids.getPtr(grid_id)) |sg| {
-            self.putCellSubGrid(sg, grid_id, row, col, cp, hl);
-        }
+        const buf = self.bufFor(grid_id) orelse return;
+        self.putCellBuf(buf, grid_id, row, col, cp, hl);
     }
 
-    fn putCellSubGrid(self: *Grid, sg: *GridBuf, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
-        const changed = sg.putCell(row, col, cp, hl);
-        if (changed) {
-            if (self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) {
-                self.glyph_working_set_rev +%= 1;
-            }
-            // A layer's root holds none of its cells (see markDirtyCellGrid).
-
-            // Advance cursor_rev if cursor is on this cell (to update cursor text)
-            if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
-                self.cursor_rev +%= 1;
-            }
+    fn putCellBuf(self: *Grid, buf: *GridBuf, grid_id: i64, row: u32, col: u32, cp: u32, hl: u32) void {
+        if (!buf.putCell(row, col, cp, hl)) return;
+        if (self.gridShown(grid_id)) self.glyph_working_set_rev +%= 1;
+        // The cursor cell's text changed.
+        if (self.cursor_grid == grid_id and self.cursor_row == row and self.cursor_col == col) {
+            self.cursor_rev +%= 1;
         }
     }
 
@@ -2342,13 +2298,8 @@ pub const Grid = struct {
         hl: u32,
         extras: []const u32,
     ) !void {
-        const sub_grid: ?*GridBuf = if (grid_id == 1)
-            null
-        else
-            self.sub_grids.getPtr(grid_id) orelse return;
-        if (grid_id == 1) {
-            if (row >= self.rows or col >= self.cols) return;
-        } else if (row >= sub_grid.?.rows or col >= sub_grid.?.cols) return;
+        const buf = self.bufFor(grid_id) orelse return;
+        if (row >= buf.rows or col >= buf.cols) return;
 
         const key = OverflowKey{ .grid_id = grid_id, .row = row, .col = col };
         var overflow_changed = false;
@@ -2356,11 +2307,7 @@ pub const Grid = struct {
             const old = self.cell_overflow.getPtr(key);
             const is_new = old == null;
             if (!cellOverflowInsertFits(self.cell_overflow.count(), is_new)) {
-                if (grid_id == 1) {
-                    self.putCell(row, col, 0xFFFD, hl);
-                } else {
-                    self.putCellSubGrid(sub_grid.?, grid_id, row, col, 0xFFFD, hl);
-                }
+                self.putCellBuf(buf, grid_id, row, col, 0xFFFD, hl);
                 return;
             }
             // Reject at the storage boundary too: callers other than redraw
@@ -2384,11 +2331,7 @@ pub const Grid = struct {
             overflow_changed = self.removeOverflowKey(key);
         }
 
-        if (grid_id == 1) {
-            self.putCell(row, col, cp, hl);
-        } else {
-            self.putCellSubGrid(sub_grid.?, grid_id, row, col, cp, hl);
-        }
+        self.putCellBuf(buf, grid_id, row, col, cp, hl);
         if (overflow_changed) self.markDirtyCellGrid(grid_id, row, col);
     }
 
@@ -2422,9 +2365,7 @@ pub const Grid = struct {
         if (rows > height_i32) rows = height_i32;
         if (rows < -height_i32) rows = -height_i32;
 
-        if ((grid_id == 1 or self.win_pos.contains(grid_id) or self.external_grids.contains(grid_id)) and
-            scrollChangesCells(target_rows, target_cols, top, bot, left, right, rows))
-        {
+        if (self.gridShown(grid_id) and scrollChangesCells(target_rows, target_cols, top, bot, left, right, rows)) {
             self.glyph_working_set_rev +%= 1;
         }
 
@@ -5014,4 +4955,85 @@ test "closing or resizing a main-surface layer repaints its band, not the viewpo
     try grid.setWinPos(4, 104, 2, 0);
     try std.testing.expect(!grid.main_buf.dirty_all);
     try std.testing.expect(grid.main_buf.dirty_rows.isSet(2));
+}
+
+test "grid 1 and a sub-grid take the same cell-write path" {
+    // Grid 1 and a placed sub-grid write cells identically; an unplaced
+    // sub-grid changes the same state minus the glyph working-set bump.
+    var grid = Grid.init(std.testing.allocator);
+    defer grid.deinit();
+    try grid.resize(4, 4);
+    try grid.resizeGrid(2, 4, 4);
+    try grid.setWinPos(2, 102, 0, 0);
+    try grid.resizeGrid(3, 4, 4);
+
+    const Expect = struct {
+        fn run(g: *Grid, gid: i64, shown: bool) !void {
+            const buf = g.bufFor(gid).?;
+            buf.clearDirtyContent();
+            g.setCursor(gid, 1, 1);
+            const rev0 = g.glyph_working_set_rev;
+            const cur0 = g.cursor_rev;
+
+            // A changed cell under the cursor: row dirty, both revs advance.
+            g.putCellGrid(gid, 1, 1, 'A', 3);
+            try std.testing.expectEqual(Cell{ .cp = 'A', .hl = 3 }, g.getCellGrid(gid, 1, 1));
+            try std.testing.expect(buf.dirty);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expect(!buf.isRowDirty(2));
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // The same cell again: nothing moves.
+            buf.clearDirtyContent();
+            g.putCellGrid(gid, 1, 1, 'A', 3);
+            try std.testing.expect(!buf.dirty);
+            try std.testing.expect(!buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // Out of range: rejected silently.
+            g.putCellGrid(gid, 4, 0, 'Z', 1);
+            g.putCellGrid(gid, 0, 4, 'Z', 1);
+            try std.testing.expect(!buf.dirty);
+            try std.testing.expectEqual(rev0 +% @intFromBool(shown), g.glyph_working_set_rev);
+
+            // Away from the cursor: no cursor_rev.
+            g.putCellGrid(gid, 2, 0, 'B', 0);
+            try std.testing.expect(buf.isRowDirty(2));
+            try std.testing.expectEqual(rev0 +% (2 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 1, g.cursor_rev);
+
+            // Overflow-only change under the cursor: row forced dirty, both revs.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'A', 3, &.{0xFE0F});
+            try std.testing.expectEqualSlices(u32, &.{0xFE0F}, g.getOverflow(gid, 1, 1).?);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% (3 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 2, g.cursor_rev);
+
+            // Cluster with a changed base and the same extras: one bump each.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'C', 3, &.{0xFE0F});
+            try std.testing.expectEqual(Cell{ .cp = 'C', .hl = 3 }, g.getCellGrid(gid, 1, 1));
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(rev0 +% (4 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+            try std.testing.expectEqual(cur0 +% 3, g.cursor_rev);
+
+            // Cluster out of range: nothing stored.
+            try g.putCellGridCluster(gid, 4, 4, 'D', 3, &.{0xFE0F});
+            try std.testing.expect(g.getOverflow(gid, 4, 4) == null);
+            try std.testing.expectEqual(rev0 +% (4 * @as(u64, @intFromBool(shown))), g.glyph_working_set_rev);
+
+            // Dropping the extras dirties the row even with the base unchanged.
+            buf.clearDirtyContent();
+            try g.putCellGridCluster(gid, 1, 1, 'C', 3, &.{});
+            try std.testing.expect(g.getOverflow(gid, 1, 1) == null);
+            try std.testing.expect(buf.isRowDirty(1));
+            try std.testing.expectEqual(cur0 +% 4, g.cursor_rev);
+        }
+    };
+    try Expect.run(&grid, 1, true);
+    try Expect.run(&grid, 2, true);
+    try Expect.run(&grid, 3, false);
 }

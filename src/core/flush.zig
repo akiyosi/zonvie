@@ -183,41 +183,53 @@ fn clearTouchedVertexBudgetSurfaces(core: *Core) void {
     core.vertex_budget_touched_grid_head = null;
 }
 
-/// Snapshot the main row ledger so a frontend rejection can put the accounting
+/// An invalid ledger is recorded as invalid, not as a reason to fail:
+/// restoring "invalid" is exactly the pre-flush state, and a hidden grid stays
+/// invalid for good, which used to turn every later refusal into a full resend
+/// of every surface.
+fn saveLedger(core: *Core, buf: *const grid_mod.GridBuf, saved: *nvim_core.SavedLedger) bool {
+    saved.ledger_valid = buf.vertex_row_ledger_valid;
+    if (buf.vertex_row_ledger_valid) {
+        saved.counts.ensureTotalCapacity(core.alloc, buf.vertex_row_counts.len) catch return false;
+        saved.counts.items.len = buf.vertex_row_counts.len;
+        @memcpy(saved.counts.items, buf.vertex_row_counts);
+    }
+    saved.surface_vertex_count = buf.surface_vertex_count;
+    saved.live = true;
+    return true;
+}
+
+fn restoreLedger(buf: *grid_mod.GridBuf, saved: *const nvim_core.SavedLedger) void {
+    buf.surface_vertex_count = saved.surface_vertex_count;
+    if (!saved.ledger_valid) {
+        buf.vertex_row_ledger_valid = false;
+    } else if (buf.vertex_row_counts.len == saved.counts.items.len) {
+        @memcpy(buf.vertex_row_counts, saved.counts.items);
+        buf.vertex_row_ledger_valid = true;
+    } else {
+        // Reshaped inside this flush (the popupmenu or cmdline grid, or grid 1
+        // through the re-entrant layout path): its saved rows no longer line
+        // up, so this grid alone is restored invalid and regenerated whole.
+        buf.vertex_row_ledger_valid = false;
+        buf.markAllDirty();
+    }
+}
+
+/// Snapshot every row ledger so a frontend rejection can put the accounting
 /// back exactly as the still-committed frame left it. Returns false when the
 /// snapshot could not be taken, in which case the caller must fall back to the
 /// invalidate-everything recovery.
 fn snapshotVertexRowLedgers(core: *Core) bool {
-    core.flush_row_ledger_snapshot_valid = false;
-    if (!core.grid.main_buf.vertex_row_ledger_valid) return false;
-    const counts = core.grid.main_buf.vertex_row_counts;
-    core.flush_row_counts_snapshot.ensureTotalCapacity(core.alloc, counts.len) catch return false;
-    core.flush_row_counts_snapshot.items.len = counts.len;
-    @memcpy(core.flush_row_counts_snapshot.items, counts);
-    core.flush_main_vertex_count_snapshot = core.grid.main_buf.surface_vertex_count;
-
     // Retire last attempt's entries before recording this one's.
+    core.flush_main_ledger.live = false;
     var stale = core.flush_subgrid_ledgers.valueIterator();
     while (stale.next()) |entry| entry.live = false;
 
     var sg_it = core.grid.sub_grids.iterator();
     while (sg_it.next()) |e| {
-        const buf = e.value_ptr;
         const gop = core.flush_subgrid_ledgers.getOrPut(core.alloc, e.key_ptr.*) catch return false;
         if (!gop.found_existing) gop.value_ptr.* = .{};
-        const saved = gop.value_ptr;
-        // An invalid ledger is recorded as invalid, not as a reason to fail:
-        // restoring "invalid" is exactly the pre-flush state, and a hidden
-        // grid stays invalid for good, which used to turn every later refusal
-        // into a full resend of every surface.
-        saved.ledger_valid = buf.vertex_row_ledger_valid;
-        if (buf.vertex_row_ledger_valid) {
-            saved.counts.ensureTotalCapacity(core.alloc, buf.vertex_row_counts.len) catch return false;
-            saved.counts.items.len = buf.vertex_row_counts.len;
-            @memcpy(saved.counts.items, buf.vertex_row_counts);
-        }
-        saved.surface_vertex_count = buf.surface_vertex_count;
-        saved.live = true;
+        if (!saveLedger(core, e.value_ptr, gop.value_ptr)) return false;
     }
     // Drop entries of destroyed grids. Neovim never reuses a grid handle, so
     // kept entries only grew the map with every float ever opened.
@@ -232,14 +244,12 @@ fn snapshotVertexRowLedgers(core: *Core) bool {
         var kv = core.flush_subgrid_ledgers.fetchRemove(dead_id orelse break).?;
         kv.value.counts.deinit(core.alloc);
     }
-    core.flush_row_ledger_snapshot_valid = true;
-    return true;
+    // Last: its `live` says the whole snapshot was taken.
+    return saveLedger(core, &core.grid.main_buf, &core.flush_main_ledger);
 }
 
 fn restoreVertexRowLedgers(core: *Core) bool {
-    if (!core.flush_row_ledger_snapshot_valid) return false;
-    const saved = core.flush_row_counts_snapshot.items;
-    if (saved.len != core.grid.main_buf.vertex_row_counts.len) return false;
+    if (!core.flush_main_ledger.live) return false;
     // Check every surface before mutating any: a half-applied restore would
     // leave some grids accounted against the committed frame and others not,
     // which is worse than the conservative full invalidation.
@@ -249,27 +259,11 @@ fn restoreVertexRowLedgers(core: *Core) bool {
         if (!core.grid.sub_grids.contains(e.key_ptr.*)) return false;
     }
 
-    @memcpy(core.grid.main_buf.vertex_row_counts, saved);
-    core.grid.main_buf.surface_vertex_count = core.flush_main_vertex_count_snapshot;
-    core.grid.main_buf.vertex_row_ledger_valid = true;
-
+    restoreLedger(&core.grid.main_buf, &core.flush_main_ledger);
     var it = core.flush_subgrid_ledgers.iterator();
     while (it.next()) |e| {
         if (!e.value_ptr.live) continue;
-        const buf = core.grid.sub_grids.getPtr(e.key_ptr.*).?;
-        buf.surface_vertex_count = e.value_ptr.surface_vertex_count;
-        if (!e.value_ptr.ledger_valid) {
-            buf.vertex_row_ledger_valid = false;
-        } else if (buf.vertex_row_counts.len == e.value_ptr.counts.items.len) {
-            @memcpy(buf.vertex_row_counts, e.value_ptr.counts.items);
-            buf.vertex_row_ledger_valid = true;
-        } else {
-            // Reshaped inside this flush (the popupmenu or cmdline grid): its
-            // saved rows no longer line up, so this grid alone is restored
-            // invalid and regenerated whole.
-            buf.vertex_row_ledger_valid = false;
-            buf.markAllDirty();
-        }
+        restoreLedger(core.grid.sub_grids.getPtr(e.key_ptr.*).?, e.value_ptr);
     }
     // Summed rather than taken from the snapshot: a grid created inside the
     // flush (cmdline, popupmenu) has no entry and keeps the rows it charged.
@@ -3456,6 +3450,8 @@ pub const FlushCtx = struct {
         // sendExternalGridVertices (the LIFO-deferred call below) in the same
         // flush; run only after handleRedraw returns (rpc_session.zig), the new
         // msg grid shows a blank window until the next user event.
+        // The anchor first: the frontends place what this sends against it.
+        ctx.core.publishMsgAnchorLocked();
         notifyMessageChanges(ctx.core);
         if (ctx.core.flush_aborted) return;
 
@@ -4080,7 +4076,8 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
             .cols = sg.cols,
             .z = @intCast(self.layout_scratch.items.len),
             .flags = (if (pos.follows_scroll) c_api.LAYER_FOLLOWS_SCROLL else 0) |
-                (if (pos.mouse_enabled) c_api.LAYER_MOUSE_ENABLED else 0),
+                (if (pos.mouse_enabled) c_api.LAYER_MOUSE_ENABLED else 0) |
+                (if (ent.zindex > 0) c_api.LAYER_FLOAT else 0),
         }) catch |err| {
             failSurfaceLayout(self, err);
             return &.{};
@@ -8530,6 +8527,40 @@ test "a refused flush restores reshaped and newly created grids without a full i
     try std.testing.expectEqual(@as(usize, 20), reshaped.surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 7), core.grid.sub_grids.getPtr(4).?.surface_vertex_count);
     try std.testing.expectEqual(@as(usize, 27), core.grid.subgrid_surface_vertex_count);
+}
+
+test "a refused flush restores a reshaped grid 1 alone and keeps the sub-grid ledgers" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    try core.grid.resize(2, 4);
+    try core.grid.resizeGrid(2, 2, 1);
+    try core.grid.putSyntheticExternal(2, .{ .win = 2, .start_row = 0, .start_col = 0 });
+    try beginVertexBudgetTransaction(&core);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 3);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 1, 4);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 10);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 1, 10);
+    try validateCompletedVertexBudget(&core);
+    finishVertexBudgetTransaction(&core, true);
+
+    // Grid 1 reshaped inside the refused attempt (re-entrant layout update).
+    try beginVertexBudgetTransaction(&core);
+    try std.testing.expect(snapshotVertexRowLedgers(&core));
+    try core.grid.resize(3, 4);
+    try replaceGridSurfaceRowVertexCount(&core, 1, core.grid.bufFor(1).?, 0, 1);
+    try replaceGridSurfaceRowVertexCount(&core, 2, core.grid.sub_grids.getPtr(2).?, 0, 5);
+    core.grid.sub_grids.getPtr(2).?.clearDirtyContent();
+    finishVertexBudgetTransactionRestoring(&core, false, true);
+
+    try std.testing.expect(!core.grid.main_buf.vertex_row_ledger_valid);
+    try std.testing.expect(core.grid.main_buf.dirty_all);
+    try std.testing.expectEqual(@as(usize, 7), core.grid.main_buf.surface_vertex_count);
+    const sub = core.grid.sub_grids.getPtr(2).?;
+    try std.testing.expect(sub.vertex_row_ledger_valid);
+    try std.testing.expect(!sub.dirty_all);
+    try std.testing.expectEqualSlices(usize, &.{ 10, 10 }, sub.vertex_row_counts);
+    try std.testing.expectEqual(@as(usize, 20), core.grid.subgrid_surface_vertex_count);
+    try std.testing.expectEqual(@as(usize, 27), core.flush_vertex_count_aggregate);
 }
 
 test "external vertex aggregate follows lifecycle without layout-order scans" {
@@ -14659,6 +14690,10 @@ test "surface layout places splits and floats as ordered layers" {
     try std.testing.expectEqual(@as(i32, 30), state.layers[2].x_px);
     try std.testing.expectEqual(@as(i32, 20), state.layers[2].y_px);
     try std.testing.expectEqual(@as(i32, 2), state.layers[2].z);
+    // Only the float carries LAYER_FLOAT; the split's paint rank is also > 0.
+    try std.testing.expect(state.layers[2].flags & c_api.LAYER_FLOAT != 0);
+    try std.testing.expect(state.layers[1].flags & c_api.LAYER_FLOAT == 0);
+    try std.testing.expect(state.layers[0].flags & c_api.LAYER_FLOAT == 0);
 
     // Hiding the float drops its layer.
     try core.grid.hideWin(3);

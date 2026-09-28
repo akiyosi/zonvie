@@ -499,6 +499,9 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     private var commitRevision: UInt64 = 0        // Protected by lock
     private var lastCommitTime: UInt64 = 0        // Protected by lock — mach_absolute_time of last visual commit
     private var lastDrawnRevision: UInt64 = 0     // Draw only
+    /// Revision whose guard band already ran to its deadline without a commit
+    /// arriving. Draw only.
+    private var guardBandTimedOutRevision: UInt64 = .max
     /// Shared with GridSurfaceRenderer. This surface measures in GRID CELLS:
     /// its window is sized to the grid, so the viewport comes from the row and
     /// column counts. Width is columns, height is rows.
@@ -676,9 +679,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         get { blink.isVisible(lock: lock) }
         set { blink.setVisible(newValue, lock: lock) }
     }
-    // Separate cursor vertex buffer (not part of row buffers, immune to GPU scroll copy).
-    private var cursorDirty: Bool = false
-
     /// One published cursor, independent of the row triple.
     ///
     /// The cursor triple, shared with GridSurfaceRenderer; see
@@ -1215,10 +1215,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             if cursorWriteSetIndex != -1 {
                 committedCursorSetIndex = cursorWriteSetIndex
                 cursorWriteSetIndex = -1
-                // Arm the redraw in the same lock that publishes the slot, the
-                // way flushDirtyRows is re-published for rows; the submit
-                // path (submitLayerCursor) sets no flag of its own.
-                cursorDirty = true
             }
             committedExtent.commit(width: gridCols, height: gridRows)
             cursorOwner.commit()
@@ -1700,7 +1696,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
         let isCursorUpdate = (flags & 2) != 0  // ZONVIE_VERT_UPDATE_CURSOR
         if isCursorUpdate {
-            // commitFlush arms cursorDirty in the lock that publishes the slot.
+            // commitFlush publishes the slot with the commit revision it bumps.
             submitLayerCursor(gridId: gridId, ptr: ptr, count: count, rootRow: rowStart)
             return
         }
@@ -2125,6 +2121,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 return
             }
 
+            GridSurfaceRenderer.waitCommitGuardBand(
+                lock: lock,
+                commitRevision: { self.commitRevision },
+                lastDrawnRevision: lastDrawnRevision,
+                hadRecentCommit: { self.hadRecentCommit(withinNs: $0) },
+                timedOutRevision: &guardBandTimedOutRevision,
+                seq: UInt32(truncatingIfNeeded: gridId)
+            )
+
             // GPU back-pressure: non-blocking tryWait, so the main thread
             // (which also runs input handling) never blocks on GPU completion.
             // GridSurfaceRenderer.draw() uses the same pattern.
@@ -2159,7 +2164,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             var submittedDirtyRows: [Int] = []
 
             let snappedCommittedExtent: SurfaceCommittedExtent
-            let cursorDirtySnapshot: Bool
             let lastKnownCursorRowSnapshot: Int
             let cursorBlinkStateSnapshot: Bool
             let committedFontIsCurrent: Bool
@@ -2261,8 +2265,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             submittedDirtyRows.removeAll(keepingCapacity: true)
             submittedDirtyRows.append(contentsOf: pendingDirtyRows)
             pendingDirtyRows.removeAll()
-            cursorDirtySnapshot = cursorDirty
-            cursorDirty = false
             lastKnownCursorRowSnapshot = cursorOwner.committedRootRow
             cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
             cursorBlinkStateSnapshot = blink.visibleLocked
@@ -2394,9 +2396,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 // a bail path that already failed to acquire what it needed.
                 for r in submittedDirtyRows { pendingDirtyRows.insert(r) }
                 if layoutDamageSnapshot { pendingLayoutDamage = true }
-                if cursorDirtySnapshot {
-                    cursorDirty = true
-                }
                 if restoreScroll, let scroll = pendingScroll {
                     if let existing = pendingScrollAccum,
                        existing.rowStart == scroll.rowStart,
@@ -2507,19 +2506,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             let smoothScrolling = scrollOffsetLatch.isSmoothScrolling
             lock.unlock()
 
-            // Early exit: nothing changed.
-            // cursorDirty alone races commitFlush(): a draw() call can read
-            // and clear it for an in-bracket cursor submit that hasn't been
-            // published yet (commitFlush runs later, from on_flush_end), so
-            // by the time the NEW committed cursor becomes visible the flag
-            // is already false and nothing else signals a redraw — the
-            // cursor stays on the old committed content until an unrelated
-            // dirty event happens to fire. hasNewCommit (commitRevision,
-            // bumped atomically with committedSetIndex under
-            // lock in commitFlush) closes that gap: any commit
-            // this draw call hasn't seen yet also forces a cursor recheck,
-            // independent of whether cursorDirty already got consumed early.
-            // Both go into SurfaceIdleTerms below.
+            // Early exit: nothing changed. A cursor submit is published by a
+            // commit, and every commit bumps commitRevision under the lock,
+            // so hasNewCommit alone forces the cursor recheck (a separate
+            // cursor flag could only ever be true alongside it).
 
             // Animation exception mirrors GridSurfaceRenderer: when a
             // loaded custom shader references iTime / iFrame / etc., we
@@ -2550,13 +2540,11 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // Shared with GridSurfaceRenderer: SurfaceIdleTerms holds every
             // term either surface has, and this surface's missing ones (a
             // dirty rect, per-layer work) stay at defaults that cannot block a
-            // skip. `hasCursorUpdate` is passed as its two sources rather than
-            // as the OR: !(a || b) == !a && !b.
+            // skip.
             let idleTerms = SurfaceIdleTerms(
                 hasPresentedOnce: hasPresentedOnce,
                 rowModeSatisfied: rowMode,
                 hasNewCommit: hasNewCommit,
-                hasCursorUpdate: cursorDirtySnapshot,
                 hasDirtyRows: hasDirtyContent,
                 // Layout damage is the whole surface owing a redraw that no
                 // row expresses. It came only with a commit until a
@@ -2636,26 +2624,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // only meaningful while a scroll is easing — with no offset there is
             // nothing displaced to discard. A layer's originPx is already
             // surface-absolute, so the rectangle needs no further placement.
-            fixedFloatRectsScratch.removeAll(keepingCapacity: true)
-            if smoothScrolling {
-                let cellW = Float(shared.cellWidthPx)
-                let cellH = Float(ch)
-                for entry in layerSnapshot
-                where entry.layer.z > 0 && entry.layer.gridId != gridId
-                    && !entry.layer.followsScroll {
-                    let layer = entry.layer
-                    guard GridSurfaceRenderer.FixedFloatRect.append(
-                        originPx: layer.originPx, cols: layer.cols, rows: layer.rows, z: layer.z,
-                        cellW: cellW, cellH: cellH,
-                        into: &fixedFloatRectsScratch
-                    ) else { break }
-                }
-            }
-            // An unrepresentable union already dropped the transform in the
-            // committed snapshot above; the mask is emptied to match.
-            if !fixedFloatMask.update(fixedFloatRectsScratch) {
-                fixedFloatMask.update([])
-            }
+            fixedFloatMask.rebuild(
+                layers: layerSnapshot, rootGridId: gridId, floatFlagOnly: false, smoothScrolling: smoothScrolling,
+                cellW: Float(shared.cellWidthPx), cellH: Float(ch), scratch: &fixedFloatRectsScratch
+            )
 
             // Glow disables partial-redraw optimizations to prevent additive
             // bloom composite from accumulating brightness. It is also disabled
@@ -3438,8 +3410,8 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                     gpuSubmitted = true
                     hasPresentedOnce = false
                     // Main/back-buffer and scroll work is now submitted, so
-                    // do not queue the pixel shift a second time. Restored rows,
-                    // cursorDirty and revision state produce a complete retry.
+                    // do not queue the pixel shift a second time. Restored rows
+                    // and revision state produce a complete retry.
                     bailWithoutSubmit("cursor encoder creation failed", restoreScroll: false)
                     return
                 }
@@ -3844,7 +3816,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// float's own placement has already performed. Both hit-test sites
     /// transcribed the first term and dropped the second, so for as long as a
     /// float carried debt a press landed whole ROWS from where the float is
-    /// drawn -- and rebaseToPressGrid's comment already claimed it used the
+    /// drawn -- and rebaseToPinnedGrid's comment already claimed it used the
     /// drawn origin.
     private func hostedLayerDrawOriginY(
         _ layer: SurfaceLayer,
@@ -3893,20 +3865,20 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         )
     }
 
-    /// The grid a press claimed. Neovim keeps a drag on the window the press
-    /// chose, so re-resolving mid-drag switches coordinate spaces and jumps the
-    /// selection by the float's placement; the release must not re-choose it
-    /// either, or letting go outside the float ends the selection in the window
-    /// behind it. Windows keeps the same pin (app.mouse_press_grid_id).
-    private var pressGridId = SurfacePressPin<Int64>()
+    override func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
+        // A float this surface hosts is drawn above the root, so a press inside
+        // it has to name that grid; naming the root applies the press to the
+        // window underneath instead.
+        resolveInputTarget(pointPx: surfacePointPx(event), requireScrollable: requireScrollable)
+    }
 
-    /// Rebase a surface point into the grid a press already chose, using that
-    /// layer's CURRENT drawn origin so a float that moves mid-drag keeps
+    /// The layer's CURRENT drawn origin, so a float that moves mid-drag keeps
     /// receiving the right cells. A layer that has gone falls back to this
     /// surface's own grid rather than re-resolving.
-    private func rebaseToPressGrid(pointPx: CGPoint, pressed: Int64)
-        -> (gridId: Int64, row: Int32, col: Int32)
+    override func rebaseToPinnedGrid(_ event: NSEvent, pinned pressed: Int64)
+        -> (gridId: Int64, row: Int32, col: Int32)?
     {
+        let pointPx = surfacePointPx(event)
         guard let scroll = core?.scrollModel, pressed != gridId else {
             return resolveRootTarget(pointPx: pointPx)
         }
@@ -3947,37 +3919,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 Int32((pointPx.x / cellW).rounded(.down)))
     }
 
-    override func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
-        guard let core else { return }
-
-        let pointPx = surfacePointPx(event)
-        // A float this surface hosts is drawn above the root, so a press inside
-        // it has to name that grid; naming the root applies the press to the
-        // window underneath instead. The drag and release that follow stay on
-        // the grid the press chose -- see pressGridId.
-        let target: (gridId: Int64, row: Int32, col: Int32)
-        let pressed = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
-        if action == "press" {
-            let hit = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
-            target = hit
-            pressGridId.press(button: button) { hit.gridId }
-        } else if let pressed {
-            target = rebaseToPressGrid(pointPx: pointPx, pressed: pressed)
-        } else {
-            target = resolveInputTarget(pointPx: pointPx, requireScrollable: false)
-        }
-
-        // The formatter itself, not a copy of it. `scrollWheel` in this file
-        // has always called it; this one carried its own transcription under a
-        // comment saying it matched.
-        let modStr = neovimModifierString(event.modifierFlags)
-
-        ZonvieCore.appLog("[ExternalGridView mouseEvent] button=\(button) action=\(action) gridId=\(target.gridId) row=\(target.row) col=\(target.col)")
-
-        core.sendMouseInput(button: button, action: action, modifier: modStr,
-                            gridId: target.gridId, row: target.row, col: target.col)
-    }
-
     // MARK: - Scroll Event Handling
 
     private var scrollTargetLock = ScrollTargetLock()
@@ -3989,24 +3930,35 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         scroll.handleGridScrollWheel(
             event, lock: &scrollTargetLock, scale: scale, logTag: "ExternalGridView scroll",
             resolve: { resolveInputTarget(pointPx: pointPx, requireScrollable: $0) },
-            afterPrecise: { newOffset in
-                scroll.serviceFrame()
-                updateScrollShaderOffset()
-                requestRedraw()
-                // Keep this view's draw clock running while a sub-cell offset
-                // is showing: at a buffer edge there are no flushes to
-                // activate it, and the edge bounce advances on draw ticks.
-                if isPaused && newOffset != 0 {
-                    activateSurfaceDrawLoop()
-                }
-            })
+            // The draw re-runs serviceFrame and updateScrollShaderOffset
+            // (settleSurfaceAgainstOwnCommit), and handleScrollInput wakes
+            // the draw loop of the view showing the target grid.
+            afterPrecise: { _ in requestRedraw() })
     }
 
+    /// Cursor is grid-local; viewportOriginPx adds a decorated surface's inset
+    /// (e.g. the cmdline icon/padding).
+    override func imeCursorRectInView() -> NSRect? {
+        guard let core = core else { return nil }
+        let cursor = core.getCursorPositionNonBlocking()
+        guard cursor.row >= 0, cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) else { return nil }
+        let cell = imePreeditCellSize
+        return NSRect(x: viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width,
+                      y: imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height,
+                      width: cell.width, height: cell.height)
+    }
+
+    override func imeFallbackRectInView() -> NSRect {
+        let cell = imePreeditCellSize
+        return NSRect(x: viewportOriginPx.x,
+                      y: imeContentTopPt(rowHeightPt: cell.height) - cell.height,
+                      width: cell.width, height: cell.height)
+    }
 }
 
 // MARK: - IME host
 
-extension ExternalGridView: IMEPreeditHost {
+extension ExternalGridView {
     /// Where the cursor's grid sits in this view, in points from the top-left:
     /// zero for this window's root, the layer origin for a float it hosts,
     /// nil when the cursor is on another surface. The IME answered only for
@@ -4039,59 +3991,9 @@ extension ExternalGridView: IMEPreeditHost {
         return viewportOriginPx.y + CGFloat(rows) * rowHeightPt
     }
 
-    /// The cursor's cell in view points, or nil when the cursor is on another
-    /// surface. Cursor is grid-local; viewportOriginPx adds a decorated
-    /// surface's inset (e.g. the cmdline icon/padding). The overlay and the
-    /// candidate window both come from here.
-    private func imeCursorRectInView() -> NSRect? {
-        guard let core = core else { return nil }
-        let cursor = core.getCursorPositionNonBlocking()
-        guard cursor.row >= 0, cursor.col >= 0, let origin = imeCursorGridOriginPt(cursor.gridId) else { return nil }
-        let cell = imePreeditCellSize
-        return NSRect(x: viewportOriginPx.x + origin.x + CGFloat(cursor.col) * cell.width,
-                      y: imeContentTopPt(rowHeightPt: cell.height) - origin.y - CGFloat(cursor.row + 1) * cell.height,
-                      width: cell.width, height: cell.height)
-    }
-
-    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
-        if let rect = imeCursorRectInView() { return rect.origin }
-        let cell = imePreeditCellSize
-        return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
-    }
-
-    func imeFirstRect() -> NSRect {
-        guard let win = window else { return .zero }
-        if let rect = imeCursorRectInView() {
-            return win.convertToScreen(convert(rect, to: nil))
-        }
-        if let core {
-            let cursor = core.getCursorPositionNonBlocking()
-            if cursor.row >= 0 && cursor.col >= 0 {
-                // The cursor is on another surface -- this window became key
-                // by Cmd-` or its title bar, which does not move Neovim's
-                // cursor. Ask the surface showing it, as the main window asks
-                // an external one. Not this view again: the owner map can
-                // name it before its layout commits.
-                let showing = core.externalViewShowing(gridId: cursor.gridId)
-                if let showing, showing !== self { return showing.imeFirstRect() }
-                if showing == nil, let main = core.terminalView { return main.imeFirstRect() }
-            }
-        }
-        let cell = imePreeditCellSize
-        let rectInView = NSRect(x: viewportOriginPx.x,
-                                y: imeContentTopPt(rowHeightPt: cell.height) - cell.height,
-                                width: cell.width, height: cell.height)
-        return win.convertToScreen(convert(rectInView, to: nil))
-    }
-
-    func imeSendCommitted(_ text: String) { core?.keyInput.sendInput(text, owner: self) }
 }
 
-// MARK: - NSTextInputClient (IME support)
 extension ExternalGridView {
-
-    // MARK: - Scrollbar
-
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
 
@@ -4142,13 +4044,6 @@ extension ExternalGridView {
                 })
             }
         }
-
-        applyAlwaysScrollbarVisibility()
-    }
-
-    override func layout() {
-        super.layout()
-        layoutScrollbar()
     }
 }
 

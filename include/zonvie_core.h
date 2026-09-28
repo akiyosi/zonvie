@@ -341,6 +341,10 @@ typedef void (*zonvie_on_external_window_close_fn)(
    Neovim rejects an event addressed to such a window and does not re-resolve
    against what is behind it, so choosing it swallows the click. */
 #define ZONVIE_LAYER_MOUSE_ENABLED (1u << 1)
+/* This layer is a floating window (Neovim zindex > 0), not a split. `z` is
+   the paint rank and is >= 1 for every hosted layer, so it cannot tell them
+   apart; a fixed-float mask over scrolled content wants only these. */
+#define ZONVIE_LAYER_FLOAT (1u << 2)
 
 typedef struct zonvie_layer {
     int64_t  grid_id;
@@ -1437,6 +1441,27 @@ typedef struct zonvie_grid_info {
     uint64_t draw_order;
 } zonvie_grid_info;
 
+/* Where message boxes (ext-float messages, the toast, the minis) are placed.
+   Surfaces are 1 for the main window, else an external window's root grid id.
+   `cursor_surface` draws the cursor's grid (msg_pos = window). The anchor is
+   the cursor's grid walked out of floats to the window it hangs off, grid 1
+   when that chain breaks; its cells are on `anchor_surface` (msg_pos = grid). */
+typedef struct zonvie_msg_anchor {
+    int64_t cursor_surface;
+    int64_t anchor_surface;
+    int64_t anchor_grid;
+    int32_t start_row;
+    int32_t start_col;
+    int32_t rows;
+    int32_t cols;
+} zonvie_msg_anchor;
+
+/* The anchor the last flush published, from the state that flush held, so a
+   message is placed against the layout it was sent with. Takes a lock of its
+   own, never the grid lock: safe from the UI thread while a flush runs.
+   False before the first flush of a session. */
+ZONVIE_API bool zonvie_core_msg_anchor(zonvie_core *core, zonvie_msg_anchor *out);
+
 /* Where a pointer lands, filled by zonvie_core_resolve_pointer_grid. `row`
    and `col` are in the named grid's own cells. */
 typedef struct zonvie_pointer_hit {
@@ -1746,6 +1771,39 @@ ZONVIE_API size_t zonvie_core_devcontainer_exec_cmd(
     char *out, size_t cap,
     const char *workspace, size_t workspace_len,
     const char *config_path, size_t config_len);
+
+/* The `devcontainer up` arguments that follow `--workspace-folder` and
+   `--config`: `--additional-features <neovim feature json>`, `--mount
+   type=bind,source=<nvim_config_dir>,target=/nvim-config/nvim` and, with
+   rebuild, `--remove-existing-container`. Each argument is written to out
+   NUL-terminated, in order, for the caller's own shell quoting; returns the
+   total length. A list that does not fit in cap is cut short.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_devcontainer_up_args(
+    char *out, size_t cap,
+    const char *nvim_config_dir, size_t dir_len, bool rebuild);
+
+/* Whether a file drop inserts the path into the command line rather than
+   opening the file: always on the external cmdline window itself (force);
+   never on a buffer surface while the cmdline has its own window
+   (has_external_cmdline); otherwise while mode (zonvie_core_get_current_mode)
+   starts with "cmdline".
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_drop_inserts_path(const char *mode, size_t len, bool has_external_cmdline, bool force);
+
+/* path (len bytes) escaped as Neovim's fnameescape() escapes a `:e`
+   argument: space, tab, newline and `*?[{`$\%#'"|!<` backslashed, plus a
+   leading `>`, `+` or lone `-`. With backslash_is_separator (a Windows
+   server) `$`, `\`, `[`, `{` and `!` are plain path bytes. Written to out,
+   NOT NUL-terminated; returns the length, or 0 when cap is too small (cap >=
+   2 * len + 1 always fits) or the path is empty.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_escape_path_for_cmdline(
+    const char *path, size_t len, bool backslash_is_separator,
+    char *out, size_t cap);
 
 /* Whether a custom shader's source reads a uniform that changes every frame
    (iTime, iTimeDelta, iFrame, iFrameRate, iDate), so its surface keeps

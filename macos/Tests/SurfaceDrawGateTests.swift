@@ -84,14 +84,10 @@ private enum SurfaceDrawGateTests {
     ///
     ///     let idleGateSkips = rowMode && hasPresentedOnce && !blinkStateChanged
     ///         && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged
-    ///         && !scrollOffsetChanged && !hasCursorUpdate && !smoothScrolling
+    ///         && !scrollOffsetChanged && !hasNewCommit && !smoothScrolling
     ///         && !shaderAnimates
-    ///
-    /// `hasCursorUpdate` is itself `cursorDirtySnapshot || hasNewCommit`, so it
-    /// is enumerated as its two independent sources: `!(a || b) == !a && !b`,
-    /// which is the shape the shared predicate takes.
     private static func verifyExternalSurface() {
-        for mask in 0..<(1 << 10) {
+        for mask in 0..<(1 << 9) {
             let rowMode = bit(mask, 0)
             let presented = bit(mask, 1)
             let blink = bit(mask, 2)
@@ -99,20 +95,17 @@ private enum SurfaceDrawGateTests {
             let pendingScroll = bit(mask, 4)
             let sizeChg = bit(mask, 5)
             let scrollOff = bit(mask, 6)
-            let cursorDirty = bit(mask, 7)
-            let newCommit = bit(mask, 8)
-            let smooth = bit(mask, 9)
+            let newCommit = bit(mask, 7)
+            let smooth = bit(mask, 8)
 
-            let hasCursorUpdate = cursorDirty || newCommit
             let original = rowMode && presented && !blink
                 && !dirty && !pendingScroll && !sizeChg
-                && !scrollOff && !hasCursorUpdate && !smooth
+                && !scrollOff && !newCommit && !smooth
 
             let shared = SurfaceIdleTerms(
                 hasPresentedOnce: presented,
                 rowModeSatisfied: rowMode,
                 hasNewCommit: newCommit,
-                hasCursorUpdate: cursorDirty,
                 hasDirtyRows: dirty,
                 hasStagedScroll: pendingScroll,
                 scrollOffsetChanged: scrollOff,
@@ -137,7 +130,7 @@ private enum SurfaceDrawGateTests {
     ///     blinkStateChanged && !layoutDamage && layerSnapshot.isEmpty
     ///         && !hasDirtyContent && !hasPendingScroll && !drawableSizeChanged
     ///         && !scrollOffsetChanged && !smoothScrolling && hasPresentedOnce
-    ///         && !(cursorDirty || hasNewCommit) && vertexCount == 0
+    ///         && !hasNewCommit && vertexCount == 0
     ///         && !shaderAnimates
     ///
     /// The shared predicate is main's exactly. For the external surface it
@@ -174,7 +167,7 @@ private enum SurfaceDrawGateTests {
             ).skipsBlinkWithNoCursor(cursorVertexCount: noCursor ? 0 : 1)
             check(mainShared, mainOriginal && !shaderCur, "main blink mask=\(mask)")
         }
-        for mask in 0..<(1 << 12) {
+        for mask in 0..<(1 << 11) {
             let rowMode = bit(mask, 0)
             let presented = bit(mask, 1)
             let blink = bit(mask, 2)
@@ -182,19 +175,17 @@ private enum SurfaceDrawGateTests {
             let pendingScroll = bit(mask, 4)
             let sizeChg = bit(mask, 5)
             let scrollOff = bit(mask, 6)
-            let cursorDirty = bit(mask, 7)
-            let newCommit = bit(mask, 8)
-            let smooth = bit(mask, 9)
-            let rect = bit(mask, 10)
-            let noCursor = bit(mask, 11)
+            let newCommit = bit(mask, 7)
+            let smooth = bit(mask, 8)
+            let rect = bit(mask, 9)
+            let noCursor = bit(mask, 10)
             let externalOriginal = blink && !rect && !dirty && !pendingScroll
                 && !sizeChg && !scrollOff && !smooth && presented
-                && !(cursorDirty || newCommit) && noCursor
+                && !newCommit && noCursor
             let externalShared = SurfaceIdleTerms(
                 hasPresentedOnce: presented,
                 rowModeSatisfied: rowMode,
                 hasNewCommit: newCommit,
-                hasCursorUpdate: cursorDirty,
                 hasDirtyRows: dirty,
                 hasDirtyRect: rect,
                 hasStagedScroll: pendingScroll,

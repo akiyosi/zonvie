@@ -8,24 +8,7 @@ const dwrite_d2d = app_mod.dwrite_d2d;
 const core = @import("zonvie_core");
 const external_windows = @import("external_windows.zig");
 const input = @import("../input.zig");
-const callbacks = @import("../callbacks.zig");
 const render_helpers = @import("../render_pipeline_helpers.zig");
-
-/// The grid a `.grid`-anchored message box hangs off: the cursor's, or, for a
-/// cursor inside a float (a telescope prompt), the window the float is
-/// anchored to. Grid 1 when the chain dead-ends. macOS's cursorAnchorGrid.
-fn cursorAnchorGridId(grids: []const app_mod.GridInfo, cursor_grid: i64) i64 {
-    var current: i64 = cursor_grid;
-    var hops: u32 = 0;
-    while (hops < 8) : (hops += 1) {
-        const g = for (grids) |g| {
-            if (g.grid_id == current) break g;
-        } else return 1;
-        if (g.zindex <= 0) return g.grid_id;
-        current = g.anchor_grid;
-    }
-    return 1;
-}
 
 /// The main window's grid area in screen pixels: the client rect less its
 /// chrome (a titlebar tabline, a sidebar on either side). macOS measures
@@ -39,15 +22,15 @@ fn mainSurfaceRect(client_screen: c.RECT, origin_x: c_int, origin_y: c_int, righ
     };
 }
 
-/// A grid's cell rect on a surface whose cell (0,0) is `surface`'s top-left.
-fn gridCellRect(surface: c.RECT, g: app_mod.GridInfo, cell_w: u32, cell_h: u32) c.RECT {
+/// The anchor's cell rect on a surface whose cell (0,0) is `surface`'s top-left.
+fn anchorCellRect(surface: c.RECT, a: app_mod.MsgAnchor, cell_w: u32, cell_h: u32) c.RECT {
     const cw: c_int = @intCast(cell_w);
     const ch: c_int = @intCast(cell_h);
     return .{
-        .left = surface.left + g.start_col * cw,
-        .top = surface.top + g.start_row * ch,
-        .right = surface.left + (g.start_col + g.cols) * cw,
-        .bottom = surface.top + (g.start_row + g.rows) * ch,
+        .left = surface.left + a.start_col * cw,
+        .top = surface.top + a.start_row * ch,
+        .right = surface.left + (a.start_col + a.cols) * cw,
+        .bottom = surface.top + (a.start_row + a.rows) * ch,
     };
 }
 
@@ -55,29 +38,20 @@ fn gridCellRect(surface: c.RECT, g: app_mod.GridInfo, cell_w: u32, cell_h: u32) 
 /// (.display), the window showing the cursor grid (.window), or the window
 /// grid the cursor is in, walked out of floats (.grid). The one rule for the
 /// ext-float create/update/reposition paths, the toast and the minis;
-/// macOS's getExtFloatTargetFrame. Takes `app.mu` itself, so call it with the
+/// macOS's msgTargetFrame. The core answers which surface and cells
+/// (zonvie_core_msg_anchor, from the flush that sent the message); this only
+/// maps a surface to its window. Takes `app.mu` itself, so call it with the
 /// lock NOT held, on the UI thread.
 pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
     const main_hwnd = app.hwnd orelse return app_mod.monitorWorkArea(null);
     if (mode == .display) return app_mod.monitorWorkArea(main_hwnd);
 
-    // The live cursor grid: app.last_cursor_grid is updated only through
-    // posted messages and can still name the previous grid (a closing
-    // cmdline) when a message placed in the same flush is laid out.
-    const cursor_grid: i64 = if (app.corep) |cp|
-        app_mod.zonvie_core_get_cursor_position(cp, null, null)
-    else
-        app.last_cursor_grid;
-    const grids: []const app_mod.GridInfo = if (mode == .grid)
-        (if (app.corep) |cp| app.getVisibleGridsCached(cp) else &.{})
-    else
-        &.{};
-    const anchor_grid = if (mode == .grid) cursorAnchorGridId(grids, cursor_grid) else cursor_grid;
+    var anchor: app_mod.MsgAnchor = undefined;
+    const have_anchor = if (app.corep) |cp| app_mod.zonvie_core_msg_anchor(cp, &anchor) else false;
+    const surface_id: i64 = if (!have_anchor) 1 else if (mode == .window) anchor.cursor_surface else anchor.anchor_surface;
 
     app.mu.lockUncancelable(core.clock.io());
-    // Who draws the grid, not whether it is a window of its own: a float an
-    // external window hosts has no entry in external_windows.
-    const host_hwnd: ?c.HWND = if (callbacks.externalWindowShowingGridLocked(app, anchor_grid)) |shown| shown.win.hwnd else null;
+    const host_hwnd: ?c.HWND = if (surface_id != 1) (if (app.external_windows.get(surface_id)) |w| w.hwnd else null) else null;
     const origin = input.surfaceOriginPx(app, true);
     const right_chrome_px: c_int = if (app.ext_tabline_enabled and app.tabline_style == .sidebar and app.sidebar_position_right)
         app.scalePx(@as(c_int, @intCast(app.sidebar_width_px)))
@@ -87,20 +61,17 @@ pub fn msgTargetRect(app: *App, mode: app_mod.config_mod.MsgPosition) c.RECT {
     const cell_h = app.rowHeightPx();
     app.mu.unlock(core.clock.io());
 
-    // Its client area, as the main window below and macOS's contentLayoutRect:
-    // the outer rect of a captioned external window holds the title bar and
-    // the invisible resize borders.
-    if (host_hwnd) |hwnd| {
-        if (clientScreenRect(hwnd)) |rect| return rect;
-    }
-
-    const client = clientScreenRect(main_hwnd) orelse return app_mod.monitorWorkArea(main_hwnd);
-    const surface = mainSurfaceRect(client, origin.x, origin.y, right_chrome_px);
-    if (mode == .grid) {
-        for (grids) |g| {
-            if (g.grid_id == anchor_grid) return gridCellRect(surface, g, cell_w, cell_h);
+    // An external window's client area, as the main window's below and
+    // macOS's contentLayoutRect: its outer rect holds the title bar and the
+    // invisible resize borders.
+    const surface: c.RECT = blk: {
+        if (host_hwnd) |hwnd| {
+            if (clientScreenRect(hwnd)) |rect| break :blk rect;
         }
-    }
+        const client = clientScreenRect(main_hwnd) orelse return app_mod.monitorWorkArea(main_hwnd);
+        break :blk mainSurfaceRect(client, origin.x, origin.y, right_chrome_px);
+    };
+    if (mode == .grid and have_anchor) return anchorCellRect(surface, anchor, cell_w, cell_h);
     return surface;
 }
 
@@ -1092,34 +1063,22 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     if (applog.isEnabled()) applog.appLog("[win] paintMiniWindow done\n", .{});
 }
 
-fn testGrid(grid_id: i64, zindex: i64, anchor_grid: i64, start_row: i32, start_col: i32, rows: i32, cols: i32) app_mod.GridInfo {
-    var g = std.mem.zeroes(app_mod.GridInfo);
-    g.grid_id = grid_id;
-    g.zindex = zindex;
-    g.anchor_grid = anchor_grid;
-    g.start_row = start_row;
-    g.start_col = start_col;
-    g.rows = rows;
-    g.cols = cols;
-    return g;
-}
-
-test "msg target: a .grid box hangs off the split the float is anchored to, in surface space" {
-    const grids = [_]app_mod.GridInfo{
-        testGrid(1, 0, 0, 0, 0, 40, 120),
-        testGrid(2, 0, 0, 0, 0, 40, 60),
-        testGrid(3, 0, 0, 0, 61, 40, 59),
-        // A telescope prompt anchored to the right split.
-        testGrid(9, 50, 3, 5, 70, 1, 30),
+test "msg target: a .grid box covers the anchor's cells in surface space" {
+    // The core's anchor for a telescope prompt anchored to the right split.
+    const anchor: app_mod.MsgAnchor = .{
+        .cursor_surface = 1,
+        .anchor_surface = 1,
+        .anchor_grid = 3,
+        .start_row = 0,
+        .start_col = 61,
+        .rows = 40,
+        .cols = 59,
     };
-    const anchor = cursorAnchorGridId(&grids, 9);
-    try std.testing.expectEqual(@as(i64, 3), anchor);
-    try std.testing.expectEqual(@as(i64, 1), cursorAnchorGridId(&grids, 77));
 
     // Left sidebar 200px, titlebar-free; client at screen (100, 50), 1400x900.
     const surface = mainSurfaceRect(.{ .left = 100, .top = 50, .right = 1500, .bottom = 950 }, 200, 0, 0);
     try std.testing.expectEqual(@as(c_int, 300), surface.left);
-    const r = gridCellRect(surface, grids[2], 10, 20);
+    const r = anchorCellRect(surface, anchor, 10, 20);
     try std.testing.expectEqual(@as(c_int, 300 + 61 * 10), r.left);
     try std.testing.expectEqual(@as(c_int, 300 + 120 * 10), r.right);
     try std.testing.expectEqual(@as(c_int, 50), r.top);

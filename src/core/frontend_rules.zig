@@ -135,6 +135,39 @@ pub fn devcontainerExecCmd(buf: []u8, workspace: []const u8, config_path: ?[]con
     return buf[0..w.end];
 }
 
+/// The `devcontainer up` arguments after the workspace and config paths, each
+/// NUL-terminated in `buf` so the frontends can apply their own shell quoting
+/// per argument: the Neovim feature pinned to its stable release (nightly
+/// builds with assertions on and aborts in msg_scroll_flush; the pin also
+/// changes the feature hash, so a rebuild drops a cached nightly layer), the
+/// bind mount of the user's nvim config where devcontainerExecCmd's
+/// XDG_CONFIG_HOME finds it, and the rebuild flag.
+pub fn devcontainerUpArgs(buf: []u8, nvim_config_dir: []const u8, rebuild: bool) []const u8 {
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll("--additional-features\x00{\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\":{\"version\":\"stable\"}}\x00") catch {};
+    w.writeAll("--mount\x00type=bind,source=") catch {};
+    w.writeAll(nvim_config_dir) catch {};
+    w.writeAll(",target=/nvim-config/nvim\x00") catch {};
+    if (rebuild) w.writeAll("--remove-existing-container\x00") catch {};
+    return buf[0..w.end];
+}
+
+test "the devcontainer up arguments pin the stable feature and mount the nvim config" {
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "--additional-features\x00{\"ghcr.io/duduribeiro/devcontainer-features/neovim:1\":{\"version\":\"stable\"}}\x00" ++
+            "--mount\x00type=bind,source=/home/me/.config/nvim,target=/nvim-config/nvim\x00--remove-existing-container\x00",
+        devcontainerUpArgs(&buf, "/home/me/.config/nvim", true),
+    );
+    // Without a rebuild the existing container is kept.
+    const keep = devcontainerUpArgs(&buf, "C:\\Users\\me\\AppData\\Local\\nvim", false);
+    try std.testing.expect(std.mem.indexOf(u8, keep, "--remove-existing-container") == null);
+    try std.testing.expect(std.mem.indexOf(u8, keep, "source=C:\\Users\\me\\AppData\\Local\\nvim,target=/nvim-config/nvim\x00") != null);
+    // The mount lands where the exec command's XDG_CONFIG_HOME looks.
+    var exec_buf: [256]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, devcontainerExecCmd(&exec_buf, "/w", null), "XDG_CONFIG_HOME=/nvim-config ") != null);
+}
+
 test "a devcontainer path drops what would break the quoted argument" {
     const cases = [_]struct { raw: []const u8, want: []const u8 }{
         .{ .raw = ".\\proj\\", .want = ".\\proj" },
@@ -186,6 +219,84 @@ test "a bare flag takes the next token only when it is a value" {
     try std.testing.expect(!cliNextIsValue("--dialog"));
     try std.testing.expect(!cliNextIsValue("-u"));
     try std.testing.expect(!cliNextIsValue(null));
+}
+
+// ---------------------------------------------------------------------------
+// File drops
+
+/// Whether a drop inserts the path into the command line rather than opening
+/// the file: always on the external cmdline window itself (`force`); never on
+/// a buffer surface while the cmdline has its own window; otherwise while the
+/// built-in cmdline is up.
+pub fn dropInsertsPath(mode: []const u8, has_external_cmdline: bool, force: bool) bool {
+    if (force) return true;
+    if (has_external_cmdline) return false;
+    return std.mem.startsWith(u8, mode, "cmdline");
+}
+
+/// `path` as Neovim's fnameescape() writes it for a `:e`-style argument: its
+/// PATH_ESC_CHARS backslashed, plus a leading `>`, `+` or lone `-`, which are
+/// special at the start of :edit/:write/:cd. With `backslash_is_separator`
+/// (a Windows server) `$` and `\` are plain path bytes and `[{!` are in the
+/// default 'isfname', so none of them is escaped. Needs
+/// `out.len >= 2 * path.len + 1`; null when the result does not fit.
+pub fn escapePathForCmdline(out: []u8, path: []const u8, backslash_is_separator: bool) ?[]const u8 {
+    const special: []const u8 = if (backslash_is_separator) " \t\n*?`%#'\"|<" else " \t\n*?[{`$\\%#'\"|!<";
+    var n: usize = 0;
+    if (path.len > 0 and (path[0] == '>' or path[0] == '+' or (path[0] == '-' and path.len == 1))) {
+        if (n >= out.len) return null;
+        out[n] = '\\';
+        n += 1;
+    }
+    for (path) |ch| {
+        if (std.mem.indexOfScalar(u8, special, ch) != null) {
+            if (n >= out.len) return null;
+            out[n] = '\\';
+            n += 1;
+        }
+        if (n >= out.len) return null;
+        out[n] = ch;
+        n += 1;
+    }
+    return out[0..n];
+}
+
+test "a drop inserts the path only onto a command line" {
+    try std.testing.expect(dropInsertsPath("cmdline_normal", false, false));
+    try std.testing.expect(!dropInsertsPath("cmdline_normal", true, false));
+    try std.testing.expect(dropInsertsPath("normal", true, true));
+    try std.testing.expect(!dropInsertsPath("normal", false, false));
+    try std.testing.expect(!dropInsertsPath("", false, false));
+}
+
+test "a cmdline path is escaped as fnameescape escapes it" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("a\\*b\\ c\\?.txt", escapePathForCmdline(&buf, "a*b c?.txt", false).?);
+    try std.testing.expectEqualStrings(
+        "\\%\\#\\|\\\"\\'\\[\\{\\$\\`\\!\\<\\\\\\\t\\\n",
+        escapePathForCmdline(&buf, "%#|\"'[{$`!<\\\t\n", false).?,
+    );
+    // `]` and `}` are not special; `>`, `+` and a lone `-` only lead.
+    try std.testing.expectEqualStrings("a]}>+-", escapePathForCmdline(&buf, "a]}>+-", false).?);
+    try std.testing.expectEqualStrings("\\+x", escapePathForCmdline(&buf, "+x", false).?);
+    try std.testing.expectEqualStrings("\\>x", escapePathForCmdline(&buf, ">x", false).?);
+    try std.testing.expectEqualStrings("\\-", escapePathForCmdline(&buf, "-", false).?);
+    try std.testing.expectEqualStrings("-x", escapePathForCmdline(&buf, "-x", false).?);
+    try std.testing.expectEqualStrings("", escapePathForCmdline(&buf, "", false).?);
+}
+
+test "a Windows server keeps backslashes, dollars and the isfname brackets" {
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "C:\\Users\\me\\[a]\\ $b\\*!.txt",
+        escapePathForCmdline(&buf, "C:\\Users\\me\\[a] $b*!.txt", true).?,
+    );
+}
+
+test "a cmdline path that does not fit is refused, not cut" {
+    var buf: [3]u8 = undefined;
+    try std.testing.expect(escapePathForCmdline(&buf, "a b", false) == null);
+    try std.testing.expectEqualStrings("a\\ ", escapePathForCmdline(&buf, "a ", false).?);
 }
 
 // ---------------------------------------------------------------------------

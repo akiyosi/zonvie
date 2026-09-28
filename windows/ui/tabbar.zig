@@ -53,6 +53,15 @@ fn extractTabDisplayName(tab: *const TabEntry, out_buf: *[256]u8) usize {
     }
 }
 
+/// Draw a tab's display name into `rect`: one line, vertically centred,
+/// ellipsised; `h_align` is DT_LEFT or DT_CENTER. The text colour is the
+/// caller's. A name is at most 255 bytes, so at most 255 UTF-16 units.
+fn drawTabLabel(hdc: c.HDC, name: []const u8, rect: *c.RECT, h_align: c.UINT) void {
+    var wide_buf: [256]u16 = undefined;
+    const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, name) catch 0;
+    _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), rect, h_align | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+}
+
 // AI-agent spinner glyphs (single glyph, no trailing space; drawn centered in a
 // fixed-width indicator cell). Claude's official thinking sequence is
 // · ✢ ✳ ✶ ✻ ✽ (120ms/frame); Codex and generic agents animate the standard
@@ -476,6 +485,12 @@ fn trackExternalDrag(app: *App, hwnd: c.HWND, strip: c.RECT, x: c_int, y: c_int)
     if (st.is_external_drag) updateDragPreviewPosition(app, screen_pt.x, screen_pt.y);
 }
 
+/// Whether client x is in the sidebar strip.
+pub fn pointInSidebar(app: *App, hwnd: c.HWND, x: c_int) bool {
+    const r = sidebarRectPx(app, hwnd);
+    return x >= r.left and x < r.right;
+}
+
 /// The main window's sidebar strip, in client pixels.
 pub fn sidebarRectPx(app: *App, hwnd: c.HWND) c.RECT {
     var client: c.RECT = std.mem.zeroes(c.RECT);
@@ -512,17 +527,34 @@ pub fn clearTablineHover(app: *App, hwnd: c.HWND) void {
     app.tabline_state.hovered_close = null;
     app.tabline_state.hovered_window_btn = null;
     app.tabline_state.hovered_new_tab_btn = false;
-    // The caption buttons sit at the client's right edge; a fixed 4096 px
-    // band left them lit on a wider client.
+    const band = tablineBandRect(app, hwnd);
+    _ = c.InvalidateRect(hwnd, &band, 0);
+}
+
+/// The strip the tabs are drawn in, in client pixels: the titlebar band
+/// across the whole client width (the caption buttons sit at its right edge;
+/// a fixed 4096 px band left them stale on a wider client) or the sidebar.
+pub fn tablineBandRect(app: *App, hwnd: c.HWND) c.RECT {
+    if (app.tabline_style == .sidebar) return sidebarRectPx(app, hwnd);
     var client: c.RECT = undefined;
     _ = c.GetClientRect(hwnd, &client);
-    var tabline_rect: c.RECT = .{
-        .left = 0,
-        .top = 0,
-        .right = client.right,
-        .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT),
-    };
-    _ = c.InvalidateRect(hwnd, &tabline_rect, 0);
+    return .{ .left = 0, .top = 0, .right = client.right, .bottom = app.scalePx(TablineState.TAB_BAR_HEIGHT) };
+}
+
+/// Drop any tab-strip press or drag when the capture is lost, and repaint
+/// the strip.
+pub fn cancelTablinePointer(app: *App, hwnd: c.HWND) void {
+    const st = &app.tabline_state;
+    if (st.dragging_tab == null and st.close_button_pressed == null and
+        !st.new_tab_button_pressed and st.pressed_window_btn == null) return;
+    if (applog.isEnabled()) applog.appLog("[tabline] WM_CAPTURECHANGED (parent): cancelling drag/button!\n", .{});
+    destroyDragPreviewWindow(app);
+    st.cancelDrag();
+    st.close_button_pressed = null;
+    st.new_tab_button_pressed = false;
+    st.pressed_window_btn = null;
+    const band = tablineBandRect(app, hwnd);
+    _ = c.InvalidateRect(hwnd, &band, 0);
 }
 
 pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
@@ -634,6 +666,43 @@ pub fn handleTablineMouseMoveInChild(app: *App, hwnd: c.HWND, x: c_int, y: c_int
     }
 }
 
+const PressedTab = struct { hit: TablineHit, handle: i64, tab_count: usize };
+
+/// Resolve a tab-strip press from its hit: the core thread rewrites tabs[]
+/// and tab_count under app.mu, so the hit, the pressed tab's handle and the
+/// count are read in one hold. A close button is pressable only where it is
+/// drawn (selected or hovered); elsewhere the press is on the tab. Caller
+/// holds app.mu.
+fn pressedTabHit(st: *const TablineState, hit: TablineHit) PressedTab {
+    var out: PressedTab = .{ .hit = hit, .handle = 0, .tab_count = st.tab_count };
+    if (hit == .close) {
+        const i = hit.close;
+        if (st.tabs[i].handle != st.current_tab and st.hovered_tab != i) out.hit = .{ .tab = i };
+    }
+    switch (out.hit) {
+        .close, .tab => |i| out.handle = st.tabs[i].handle,
+        else => {},
+    }
+    return out;
+}
+
+test "tab press: close is pressable only on the selected or hovered tab; the handle is the hit tab's" {
+    var st: TablineState = .{};
+    st.tabs[0] = .{ .handle = 11 };
+    st.tabs[1] = .{ .handle = 22 };
+    st.tab_count = 2;
+    st.current_tab = 11;
+    const on_selected = pressedTabHit(&st, .{ .close = 0 });
+    try std.testing.expect(on_selected.hit == .close);
+    try std.testing.expectEqual(@as(i64, 11), on_selected.handle);
+    const on_other = pressedTabHit(&st, .{ .close = 1 });
+    try std.testing.expect(on_other.hit == .tab and on_other.hit.tab == 1);
+    try std.testing.expectEqual(@as(i64, 22), on_other.handle);
+    st.hovered_tab = 1;
+    try std.testing.expect(pressedTabHit(&st, .{ .close = 1 }).hit == .close);
+    try std.testing.expectEqual(@as(usize, 2), pressedTabHit(&st, .new_tab).tab_count);
+}
+
 /// Handle mouse down on tabline - start potential drag
 pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
     if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: x={d} y={d}\n", .{ x, y });
@@ -644,13 +713,10 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
 
     // Buttons record their pressed state and act on mouseUp; capture so the
     // mouseUp arrives even if the pointer leaves.
-    var hit = tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y);
-    // A close button is pressable only where it is drawn (selected or hovered),
-    // as in the sidebar.
-    if (hit == .close) {
-        const i = hit.close;
-        if (app.tabline_state.tabs[i].handle != app.tabline_state.current_tab and app.tabline_state.hovered_tab != i) hit = .{ .tab = i };
-    }
+    app.mu.lockUncancelable(core.clock.io());
+    const pressed = pressedTabHit(&app.tabline_state, tablineHitTest(app, client_width, app.tabline_state.tab_count, x, y));
+    app.mu.unlock(core.clock.io());
+    const hit = pressed.hit;
     switch (hit) {
         .window_button => |b| {
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: window button {d} pressed\n", .{b});
@@ -661,19 +727,19 @@ pub fn handleTablineMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         .close => |i| {
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: close button pressed on tab {d}\n", .{i});
             app.tabline_state.close_button_pressed = i;
-            app.tabline_state.close_button_pressed_handle = app.tabline_state.tabs[i].handle;
+            app.tabline_state.close_button_pressed_handle = pressed.handle;
             _ = c.SetCapture(hwnd);
             _ = c.InvalidateRect(hwnd, null, 0); // Redraw for pressed state
         },
         .tab => |i| {
             // Start potential drag - first select this tab
             if (applog.isEnabled()) applog.appLog("[tabline] mouseDown: starting drag on tab {d}\n", .{i});
-            const tab_width = tabWidthPx(app, client_width, @intCast(app.tabline_state.tab_count));
+            const tab_width = tabWidthPx(app, client_width, @intCast(pressed.tab_count));
             app.tabline_state.drag_start_x = x;
             app.tabline_state.drag_offset_x = x - tabLeftPx(app, tab_width, i);
             app.tabline_state.drag_current_x = x;
             app.tabline_state.dragging_tab = i;
-            app.tabline_state.dragging_tab_handle = app.tabline_state.tabs[i].handle;
+            app.tabline_state.dragging_tab_handle = pressed.handle;
             app.tabline_state.drop_target_index = i;
 
             // Select the tab being dragged so :tabmove works on it
@@ -884,38 +950,15 @@ pub fn dragPreviewWndProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c
                         app.mu.lockUncancelable(core.clock.io());
                         defer app.mu.unlock(core.clock.io());
                         const drag_idx = draggedTabIndexNow(&app.tabline_state) orelse break :blk null;
-                        const tab = &app.tabline_state.tabs[drag_idx];
-                        break :blk if (tab.name_len > 0) extractTabDisplayName(tab, &name_buf) else 0;
+                        break :blk extractTabDisplayName(&app.tabline_state.tabs[drag_idx], &name_buf);
                     };
                     if (name_len) |len| {
-                        if (len > 0) {
-                            const display_name = name_buf[0..len];
-
-                            // Draw text
-                            var text_rect = rect;
-                            text_rect.left += text_pad;
-                            text_rect.right -= text_pad;
-                            _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                            _ = c.SetTextColor(hdc, preview_pal.text_selected);
-
-                            // Convert UTF-8 to UTF-16. A tab name is up to
-                            // 255 bytes, so up to 255 UTF-16 units: 128 was
-                            // written past on a long ASCII name.
-                            var wide_buf: [256]u16 = undefined;
-                            const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name) catch 0;
-                            if (wide_len > 0) {
-                                _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER | c.DT_END_ELLIPSIS);
-                            }
-                        } else {
-                            // No name
-                            const no_name = [_]u16{ '[', 'N', 'o', ' ', 'N', 'a', 'm', 'e', ']', 0 };
-                            var text_rect = rect;
-                            text_rect.left += text_pad;
-                            text_rect.right -= text_pad;
-                            _ = c.SetBkMode(hdc, c.TRANSPARENT);
-                            _ = c.SetTextColor(hdc, preview_pal.text_normal);
-                            _ = c.DrawTextW(hdc, &no_name, 9, &text_rect, c.DT_SINGLELINE | c.DT_VCENTER | c.DT_CENTER);
-                        }
+                        var text_rect = rect;
+                        text_rect.left += text_pad;
+                        text_rect.right -= text_pad;
+                        _ = c.SetBkMode(hdc, c.TRANSPARENT);
+                        _ = c.SetTextColor(hdc, preview_pal.text_selected);
+                        drawTabLabel(hdc, name_buf[0..len], &text_rect, c.DT_CENTER);
                     }
 
                     _ = c.SelectObject(hdc, old_font);
@@ -1392,12 +1435,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
         // Display name = basename only (indicator drawn separately above).
         var base_buf: [256]u8 = undefined;
         const base_len = extractTabDisplayName(tab, &base_buf);
-
-        // Convert to wide string
-        var wide_buf: [320]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, base_buf[0..base_len]) catch 0;
-
-        _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+        drawTabLabel(hdc, base_buf[0..base_len], &text_rect, c.DT_LEFT);
 
         // Close button (X) - show on selected or hovered tabs
         if (is_selected or is_hovered) {
@@ -1537,10 +1575,7 @@ pub fn drawTablineContent(app: *App, hdc: c.HDC, client_width: c_int) void {
 
             var float_display_name: [256]u8 = undefined;
             const float_display_len = extractTabDisplayName(tab, &float_display_name);
-
-            var float_wide_buf: [256]u16 = undefined;
-            const float_wide_len = std.unicode.utf8ToUtf16Le(&float_wide_buf, float_display_name[0..float_display_len]) catch 0;
-            _ = c.DrawTextW(hdc, &float_wide_buf, @intCast(float_wide_len), &float_text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+            drawTabLabel(hdc, float_display_name[0..float_display_len], &float_text_rect, c.DT_LEFT);
         }
     }
 }
@@ -1865,9 +1900,6 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
         var display_name: [256]u8 = undefined;
         const display_len = extractTabDisplayName(tab, &display_name);
 
-        var wide_buf: [256]u16 = undefined;
-        const wide_len = std.unicode.utf8ToUtf16Le(&wide_buf, display_name[0..display_len]) catch 0;
-
         const text_left: c_int = if (is_selected) padding + indicator_w else padding;
         const close_space: c_int = if (is_selected or is_hovered) close_size + app.scalePx(8) else 0;
         var text_rect = c.RECT{
@@ -1884,7 +1916,7 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
             drawAgentIndicator(app, hdc, a_state, text_rect.left, text_rect.top, text_rect.bottom, y + @divTrunc(row_h - ind_px, 2), ind_px);
             text_rect.left += ind_px + gap;
         }
-        _ = c.DrawTextW(hdc, &wide_buf, @intCast(wide_len), &text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+        drawTabLabel(hdc, display_name[0..display_len], &text_rect, c.DT_LEFT);
 
         // Close button (X) on selected or hovered tabs
         if ((is_selected or is_hovered) and !is_being_dragged) {
@@ -2017,17 +2049,13 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
                     var float_display_name: [256]u8 = undefined;
                     const float_display_len = extractTabDisplayName(drag_tab, &float_display_name);
-
-                    var float_wide_buf: [256]u16 = undefined;
-                    const float_wide_len = std.unicode.utf8ToUtf16Le(&float_wide_buf, float_display_name[0..float_display_len]) catch 0;
-
                     var float_text_rect = c.RECT{
                         .left = padding + 2,
                         .top = float_y,
                         .right = width - sep_w - padding - 2,
                         .bottom = float_y + row_h,
                     };
-                    _ = c.DrawTextW(hdc, &float_wide_buf, @intCast(float_wide_len), &float_text_rect, c.DT_LEFT | c.DT_VCENTER | c.DT_SINGLELINE | c.DT_END_ELLIPSIS);
+                    drawTabLabel(hdc, float_display_name[0..float_display_len], &float_text_rect, c.DT_LEFT);
                 }
             }
         }
@@ -2036,12 +2064,10 @@ pub fn drawSidebarContent(app: *App, hdc: c.HDC, width: c_int, height: c_int) vo
 
 /// Handle mouse down in sidebar area
 pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void {
-    var hit = sidebarHitTest(app, hwnd, app.tabline_state.tab_count, x, y);
-    // A close button is pressable only where it is drawn (selected or hovered).
-    if (hit == .close) {
-        const i = hit.close;
-        if (app.tabline_state.tabs[i].handle != app.tabline_state.current_tab and app.tabline_state.hovered_tab != i) hit = .{ .tab = i };
-    }
+    app.mu.lockUncancelable(core.clock.io());
+    const pressed = pressedTabHit(&app.tabline_state, sidebarHitTest(app, hwnd, app.tabline_state.tab_count, x, y));
+    app.mu.unlock(core.clock.io());
+    const hit = pressed.hit;
     switch (hit) {
         .new_tab => {
             app.tabline_state.new_tab_button_pressed = true;
@@ -2050,7 +2076,7 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
         },
         .close => |i| {
             app.tabline_state.close_button_pressed = i;
-            app.tabline_state.close_button_pressed_handle = app.tabline_state.tabs[i].handle;
+            app.tabline_state.close_button_pressed_handle = pressed.handle;
             _ = c.SetCapture(hwnd);
             _ = c.InvalidateRect(hwnd, null, 0);
         },
@@ -2063,7 +2089,7 @@ pub fn handleSidebarMouseDown(app: *App, hwnd: c.HWND, x: c_int, y: c_int) void 
             }
 
             app.tabline_state.dragging_tab = i;
-            app.tabline_state.dragging_tab_handle = app.tabline_state.tabs[i].handle;
+            app.tabline_state.dragging_tab_handle = pressed.handle;
             app.tabline_state.drag_start_x = x;
             app.tabline_state.drag_current_x = x;
             app.tabline_state.drag_offset_y = y - @as(c_int, @intCast(i)) * app.scalePx(TablineState.SIDEBAR_ROW_HEIGHT);

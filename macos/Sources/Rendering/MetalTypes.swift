@@ -1165,6 +1165,9 @@ struct SurfaceLayer {
     /// Neovim refuses an event addressed to such a window rather than passing
     /// it to what is behind, so targeting one swallows the event.
     var mouseEnabled: Bool = true
+    /// A floating window (Neovim zindex > 0), not a split; `z` is the paint
+    /// rank and is > 0 for both.
+    var isFloat: Bool = false
 }
 
 /// One published cursor, and the buffers the frames reading it need.
@@ -3639,17 +3642,53 @@ final class SurfaceFixedFloatMask {
     /// buffers.
     static let maxRects = 16
 
+    /// Whether `layer` is a fixed float scrolled content must not bleed over.
+    /// An external surface hosts nothing but floats, so every hosted layer
+    /// (paint rank > 0) counts; the main surface hosts splits too and keeps
+    /// only the layers the core flagged as floats.
+    static func masks(_ layer: SurfaceLayer, rootGridId: Int64, floatFlagOnly: Bool) -> Bool {
+        (floatFlagOnly ? layer.isFloat : layer.z > 0) && layer.gridId != rootGridId && !layer.followsScroll
+    }
+
     /// Whether a surface's committed layers hold more fixed floats than a
     /// mask can represent: the rects `update` would be handed while a scroll
     /// eases are exactly these. Answerable before any offset is applied, so a
     /// surface can drop its transform in the same snapshot that latches it.
-    static func overflows(layers: [SurfaceLayer], rootGridId: Int64) -> Bool {
+    static func overflows(layers: [SurfaceLayer], rootGridId: Int64, floatFlagOnly: Bool = false) -> Bool {
         var count = 0
-        for layer in layers where layer.z > 0 && layer.gridId != rootGridId && !layer.followsScroll {
+        for layer in layers where masks(layer, rootGridId: rootGridId, floatFlagOnly: floatFlagOnly) {
             count += 1
             if count > maxRects { return true }
         }
         return false
+    }
+
+    /// Rebuild the mask from `layers` for a frame that eases a scroll, or
+    /// clear it for one that does not. `scratch` is the caller's persistent
+    /// rect buffer. Draw thread only.
+    func rebuild(
+        layers: [SurfaceLayerFrame], rootGridId: Int64, floatFlagOnly: Bool, smoothScrolling: Bool,
+        cellW: Float, cellH: Float, scratch: inout [GridSurfaceRenderer.FixedFloatRect]
+    ) {
+        scratch.removeAll(keepingCapacity: true)
+        if smoothScrolling {
+            for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId, floatFlagOnly: floatFlagOnly) {
+                let layer = entry.layer
+                scratch.append(GridSurfaceRenderer.FixedFloatRect(
+                    x0: layer.originPx.x,
+                    x1: layer.originPx.x + Float(layer.cols) * cellW,
+                    top: layer.originPx.y,
+                    bottom: layer.originPx.y + Float(layer.rows) * cellH,
+                    zindex: Int32(clamping: layer.z)
+                ))
+                // One rect past the representable count is enough to select
+                // the cell-aligned fallback; stop rather than grow the scratch.
+                if scratch.count > Self.maxRects { break }
+            }
+        }
+        // An unrepresentable union already dropped the transform in the
+        // committed snapshot; the mask is emptied to match.
+        if !update(scratch) { update([]) }
     }
 
     private(set) var bands: [GridSurfaceRenderer.FixedFloatBand] = []

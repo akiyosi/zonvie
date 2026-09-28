@@ -296,7 +296,11 @@ pub fn setLogPath(path: ?[]const u8) void {
 
     if (path) |p| {
         if (p.len > 0) {
-            g_log_file = std.Io.Dir.createFileAbsolute(clock.io(), p, .{ .truncate = true }) catch null;
+            // Append, as macOS does, so a restart keeps the previous session's log.
+            const io = clock.io();
+            const f = std.Io.Dir.createFileAbsolute(io, p, .{ .truncate = false }) catch return;
+            if (f.length(io)) |len| io.vtable.fileSeekTo(io.userdata, f, len) catch {} else |_| {}
+            g_log_file = f;
         }
     }
 }

@@ -479,11 +479,11 @@ pub const RedrawRecoveryState = enum {
     await_attach,
 };
 
-/// One sub-grid's vertex row ledger as it stood when a flush attempt began.
+/// One surface's vertex row ledger as it stood when a flush attempt began.
 /// `live` is cleared at the start of every snapshot, so an entry left stale
 /// belongs to a grid destroyed since and is not restored onto a replacement
 /// that reuses the id.
-pub const SubGridLedgerSnapshot = struct {
+pub const SavedLedger = struct {
     counts: std.ArrayListUnmanaged(usize) = .empty,
     surface_vertex_count: usize = 0,
     /// An invalid ledger (a hidden grid, one just repositioned) is restored
@@ -591,6 +591,13 @@ pub const Core = struct {
 
     // Mutex to protect grid state access from concurrent RPC and UI threads.
     grid_mu: std.Io.Mutex = .init,
+
+    // The message anchor each flush publishes (publishMsgAnchorLocked) for
+    // the frontends' message placement. Its own lock, never held with any
+    // other taken after it: a frontend reads it without grid_mu, which a
+    // flush on another thread may hold. Null until the first flush.
+    msg_anchor_mu: std.Io.Mutex = .init,
+    msg_anchor: ?c_api.MsgAnchor = null,
 
     // Mutex to protect stdin_file close-and-null (POSIX socket transport
     // aliases stdin/stdout on one fd). Prevents race between stop() and
@@ -721,19 +728,14 @@ pub const Core = struct {
     /// so the retry only owes the rows this attempt consumed — restoring
     /// this is what keeps a rejection from costing a whole-viewport resend.
     flush_dirty_snapshot: grid_mod.DirtySnapshot = .{},
-    /// Main row ledger as it stood when the current flush started, paired with
+    /// Row ledgers as they stood when the current flush started, paired with
     /// flush_dirty_snapshot. Restoring both makes the core's accounting match
     /// the frame the frontend still has on screen after it declined to commit.
-    flush_row_counts_snapshot: std.ArrayListUnmanaged(usize) = .empty,
-    flush_main_vertex_count_snapshot: usize = 0,
-    flush_row_ledger_snapshot_valid: bool = false,
-    /// The same ledger, per sub-grid. Only the main grid used to be remembered,
-    /// so a rejection invalidated every sub-grid's accounting and forced a full
-    /// reshape of each — and under ext_multigrid the sub-grids hold every
-    /// window while grid 1 is only a container, so the exact restore protected
-    /// the cheapest surface. Entries and their buffers are reused across
-    /// flushes; a steady-state flush allocates nothing here.
-    flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SubGridLedgerSnapshot) = .empty,
+    /// `live` on the main entry says the whole snapshot was taken. Entries and
+    /// their buffers are reused across flushes; a steady-state flush allocates
+    /// nothing here.
+    flush_main_ledger: SavedLedger = .{},
+    flush_subgrid_ledgers: std.AutoHashMapUnmanaged(i64, SavedLedger) = .empty,
     /// False when aborting cannot be healed by retrying the same state (for
     /// example, a fixed resource budget was exceeded).
     flush_retryable: bool = true,
@@ -1231,7 +1233,7 @@ pub const Core = struct {
         self.cursor_verts.deinit(self.alloc);
         self.row_verts.deinit(self.alloc);
         self.flush_dirty_snapshot.deinit(self.alloc);
-        self.flush_row_counts_snapshot.deinit(self.alloc);
+        self.flush_main_ledger.counts.deinit(self.alloc);
         var subgrid_ledger_it = self.flush_subgrid_ledgers.valueIterator();
         while (subgrid_ledger_it.next()) |entry| entry.counts.deinit(self.alloc);
         self.flush_subgrid_ledgers.deinit(self.alloc);
@@ -1579,6 +1581,10 @@ pub const Core = struct {
         // Composited / multigrid layout, ext UI overlays, cursor state.
         // See doc comment on this function for the full rationale.
         self.grid.resetForNewSession();
+        // The old session's windows are gone; its anchor with them.
+        self.msg_anchor_mu.lockUncancelable(clock.io());
+        self.msg_anchor = null;
+        self.msg_anchor_mu.unlock(clock.io());
         self.hl.reset();
 
         // Frontend overlay teardown for paths not covered by the external
@@ -3447,29 +3453,7 @@ pub const Core = struct {
 
         // Always include global grid first
         if (written < out.len) {
-            const m1 = self.grid.getViewportMargins(1);
-            out[written] = .{
-                .grid_id = 1,
-                .zindex = 0, // global grid has lowest zindex
-                .start_row = 0,
-                .start_col = 0,
-                .rows = grid_mod.saturatingI32FromU32(self.grid.rows),
-                .cols = grid_mod.saturatingI32FromU32(self.grid.cols),
-                .margin_top = grid_mod.saturatingI32FromU32(m1.top),
-                .margin_bottom = grid_mod.saturatingI32FromU32(m1.bottom),
-                .margin_left = grid_mod.saturatingI32FromU32(m1.left),
-                .margin_right = grid_mod.saturatingI32FromU32(m1.right),
-                .line_count = if (self.grid.getViewport(1)) |vp| vp.line_count else 0,
-                .anchor_grid = 1,
-                .follows_scroll = 0,
-                .is_external = 0,
-                // The container grid always accepts the mouse, belongs to the
-                // main surface, and sits behind everything drawn on it.
-                .mouse_enabled = 1,
-                .placed_by_surface = 1,
-                .compindex = 0,
-                .draw_order = 0,
-            };
+            out[written] = self.gridInfoLocked(1, self.grid.rows, self.grid.cols, null, false);
             written += 1;
         }
         total += 1;
@@ -3481,45 +3465,9 @@ pub const Core = struct {
             const gid = entry.key_ptr.*;
             if (gid == 1) continue; // skip global grid (already added)
 
-            const pos = entry.value_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
             if (written < out.len) {
-                // In the space of the surface that places it, as the header
-                // promises: a float an external window hosts is stored in
-                // global units.
-                const placed = self.grid.surfacePlacement(pos);
-                const layer = self.grid.win_layer.get(gid) orelse @import("grid.zig").WinLayer{
-                    .zindex = 0,
-                    .compindex = 0,
-                    .order = 0,
-                };
-                const margins = self.grid.getViewportMargins(gid);
-
-                out[written] = .{
-                    .grid_id = gid,
-                    .zindex = layer.zindex,
-                    .start_row = if (placed) |p| std.math.lossyCast(i32, p.row) else grid_mod.saturatingI32FromU32(pos.row),
-                    .start_col = if (placed) |p| std.math.lossyCast(i32, p.col) else grid_mod.saturatingI32FromU32(pos.col),
-                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
-                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
-                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
-                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
-                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
-                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
-                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                    .anchor_grid = pos.anchor_grid,
-                    .follows_scroll = if (pos.follows_scroll) 1 else 0,
-                    .is_external = 0,
-                    .mouse_enabled = if (pos.mouse_enabled) 1 else 0,
-                    // The same answer flush.collectSurfaceLayerEntries uses to
-                    // decide whose layer list this grid belongs in; 0 when no
-                    // surface draws it (broken or cyclic anchor chain, or a
-                    // surface with no buffer yet). `orelse 1` named the main
-                    // surface for a grid the flush drew nowhere.
-                    .placed_by_surface = flush.placedSurfaceForGrid(&self.grid, gid) orelse 0,
-                    .compindex = layer.compindex,
-                    .draw_order = layer.order,
-                };
+                out[written] = self.gridInfoLocked(gid, sg.rows, sg.cols, entry.value_ptr.*, false);
                 written += 1;
             }
             total += 1;
@@ -3532,29 +3480,7 @@ pub const Core = struct {
             const gid = key_ptr.*;
             const sg = self.grid.sub_grids.get(gid) orelse continue;
             if (written < out.len) {
-                const margins = self.grid.getViewportMargins(gid);
-
-                out[written] = .{
-                    .grid_id = gid,
-                    .zindex = 0, // External grids have their own window, zindex doesn't apply
-                    .start_row = 0, // External grids start at (0,0) in their own window
-                    .start_col = 0,
-                    .rows = grid_mod.saturatingI32FromU32(sg.rows),
-                    .cols = grid_mod.saturatingI32FromU32(sg.cols),
-                    .margin_top = grid_mod.saturatingI32FromU32(margins.top),
-                    .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
-                    .margin_left = grid_mod.saturatingI32FromU32(margins.left),
-                    .margin_right = grid_mod.saturatingI32FromU32(margins.right),
-                    .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
-                    .anchor_grid = 1,
-                    .follows_scroll = 0,
-                    .is_external = 1,
-                    // An external grid is the root of its own surface.
-                    .mouse_enabled = 1,
-                    .placed_by_surface = gid,
-                    .compindex = 0,
-                    .draw_order = 0,
-                };
+                out[written] = self.gridInfoLocked(gid, sg.rows, sg.cols, null, true);
                 written += 1;
             }
             total += 1;
@@ -3562,6 +3488,109 @@ pub const Core = struct {
         }
 
         return .{ .written = written, .total = total };
+    }
+
+    /// The GridInfo getVisibleGridsSnapshotLocked reports for `gid`, or null
+    /// when it reports none (the same order: placed grids before external
+    /// roots).
+    fn visibleGridInfoLocked(self: *Core, gid: i64) ?c_api.GridInfo {
+        if (gid == 1) return self.gridInfoLocked(1, self.grid.rows, self.grid.cols, null, false);
+        const sg = self.grid.sub_grids.get(gid) orelse return null;
+        if (self.grid.win_pos.get(gid)) |pos| return self.gridInfoLocked(gid, sg.rows, sg.cols, pos, false);
+        if (self.grid.external_grids.contains(gid)) return self.gridInfoLocked(gid, sg.rows, sg.cols, null, true);
+        return null;
+    }
+
+    /// Where message boxes go, answered once per flush from the state the
+    /// flush holds. Both frontends placed them from a try-lock snapshot taken
+    /// whenever they got round to it, and a flush holding grid_mu at that
+    /// moment served a stale one: a float the cursor had just entered was
+    /// missing, and the box landed on the main window. Caller holds grid_mu.
+    pub fn publishMsgAnchorLocked(self: *Core) void {
+        const surfaceOf = struct {
+            fn f(info: ?c_api.GridInfo) i64 {
+                const i = info orelse return 1;
+                return if (i.placed_by_surface > 0) i.placed_by_surface else 1;
+            }
+        }.f;
+        const cursor_info = self.visibleGridInfoLocked(self.grid.cursor_grid);
+        // Walk out of floats (a telescope prompt anchors to its window); a
+        // broken or cyclic chain falls back to grid 1.
+        var anchor = cursor_info;
+        var hops: u32 = 0;
+        while (anchor) |a| : (hops += 1) {
+            if (a.zindex <= 0) break;
+            if (hops >= 8) {
+                anchor = null;
+                break;
+            }
+            anchor = self.visibleGridInfoLocked(a.anchor_grid);
+        }
+        const a = anchor orelse self.visibleGridInfoLocked(1).?;
+        const next: c_api.MsgAnchor = .{
+            .cursor_surface = surfaceOf(cursor_info),
+            .anchor_surface = surfaceOf(a),
+            .anchor_grid = a.grid_id,
+            .start_row = a.start_row,
+            .start_col = a.start_col,
+            .rows = a.rows,
+            .cols = a.cols,
+        };
+        self.msg_anchor_mu.lockUncancelable(clock.io());
+        self.msg_anchor = next;
+        self.msg_anchor_mu.unlock(clock.io());
+    }
+
+    pub fn msgAnchor(self: *Core) ?c_api.MsgAnchor {
+        self.msg_anchor_mu.lockUncancelable(clock.io());
+        defer self.msg_anchor_mu.unlock(clock.io());
+        return self.msg_anchor;
+    }
+
+    /// One GridInfo. A surface root (grid 1, or an external grid with
+    /// `is_external`) always accepts the mouse, is placed by itself and sits
+    /// at its origin behind its layers; a grid with a `pos` reports its
+    /// win_pos placement instead.
+    fn gridInfoLocked(self: *Core, gid: i64, rows: u32, cols: u32, pos: ?grid_mod.GridPos, is_external: bool) c_api.GridInfo {
+        const margins = self.grid.getViewportMargins(gid);
+        var info: c_api.GridInfo = .{
+            .grid_id = gid,
+            .zindex = 0,
+            .start_row = 0,
+            .start_col = 0,
+            .rows = grid_mod.saturatingI32FromU32(rows),
+            .cols = grid_mod.saturatingI32FromU32(cols),
+            .margin_top = grid_mod.saturatingI32FromU32(margins.top),
+            .margin_bottom = grid_mod.saturatingI32FromU32(margins.bottom),
+            .margin_left = grid_mod.saturatingI32FromU32(margins.left),
+            .margin_right = grid_mod.saturatingI32FromU32(margins.right),
+            .line_count = if (self.grid.getViewport(gid)) |vp| vp.line_count else 0,
+            .anchor_grid = 1,
+            .follows_scroll = 0,
+            .is_external = @intFromBool(is_external),
+            .mouse_enabled = 1,
+            .placed_by_surface = gid,
+            .compindex = 0,
+            .draw_order = 0,
+        };
+        const p = pos orelse return info;
+        // In the space of the surface that places it, as the header promises:
+        // a float an external window hosts is stored in global units.
+        const placed = self.grid.surfacePlacement(p);
+        const layer = self.grid.win_layer.get(gid) orelse grid_mod.WinLayer{ .zindex = 0, .compindex = 0, .order = 0 };
+        info.zindex = layer.zindex;
+        info.start_row = if (placed) |sp| std.math.lossyCast(i32, sp.row) else grid_mod.saturatingI32FromU32(p.row);
+        info.start_col = if (placed) |sp| std.math.lossyCast(i32, sp.col) else grid_mod.saturatingI32FromU32(p.col);
+        info.anchor_grid = p.anchor_grid;
+        info.follows_scroll = @intFromBool(p.follows_scroll);
+        info.mouse_enabled = @intFromBool(p.mouse_enabled);
+        // The same answer flush.collectSurfaceLayerEntries uses to decide
+        // whose layer list this grid belongs in; 0 when no surface draws it
+        // (broken or cyclic anchor chain, or a surface with no buffer yet).
+        info.placed_by_surface = flush.placedSurfaceForGrid(&self.grid, gid) orelse 0;
+        info.compindex = layer.compindex;
+        info.draw_order = layer.order;
+        return info;
     }
 
     pub const CursorPosition = struct {
@@ -7337,6 +7366,42 @@ test "complete visible-grid snapshot reports truncation from one lock state" {
     try std.testing.expect(core.tryGetVisibleGridsComplete(&out) == null);
 }
 
+test "the message anchor walks the cursor's float to the window it hangs off" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+
+    try std.testing.expectEqual(@as(?c_api.MsgAnchor, null), core.msgAnchor());
+    try core.grid.resizeGrid(1, 20, 40);
+    // External window 3, float 4 inside it anchored to it (as above).
+    try core.grid.resizeGrid(3, 10, 30);
+    _ = try core.grid.setWinExternalPosAt(3, 43, 5, 7);
+    try core.grid.resizeGrid(4, 3, 10);
+    try core.grid.setWinFloatPos(4, 44, 5 + 2, 7 + 1, 50, 0, 3, true);
+
+    // Cursor in the float: both the cursor and the anchor are drawn by
+    // window 3, and the anchor is that window's root at its origin.
+    core.grid.cursor_grid = 4;
+    core.publishMsgAnchorLocked();
+    const a = core.msgAnchor().?;
+    try std.testing.expectEqual(@as(i64, 3), a.cursor_surface);
+    try std.testing.expectEqual(@as(i64, 3), a.anchor_surface);
+    try std.testing.expectEqual(@as(i64, 3), a.anchor_grid);
+    try std.testing.expectEqual(@as(i32, 0), a.start_row);
+    try std.testing.expectEqual(@as(i32, 10), a.rows);
+    try std.testing.expectEqual(@as(i32, 30), a.cols);
+
+    // Cursor in the main grid; an unknown grid falls back to it too.
+    core.grid.cursor_grid = 1;
+    core.publishMsgAnchorLocked();
+    try std.testing.expectEqual(@as(i64, 1), core.msgAnchor().?.anchor_surface);
+    core.grid.cursor_grid = 99;
+    core.publishMsgAnchorLocked();
+    const u = core.msgAnchor().?;
+    try std.testing.expectEqual(@as(i64, 1), u.cursor_surface);
+    try std.testing.expectEqual(@as(i64, 1), u.anchor_grid);
+    try std.testing.expectEqual(@as(i32, 20), u.rows);
+}
+
 test "a float an external window hosts is reported in that window's cells" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
@@ -7352,15 +7417,35 @@ test "a float an external window hosts is reported in that window's cells" {
 
     var out: [4]c_api.GridInfo = undefined;
     const count = core.getVisibleGrids(&out);
-    var found = false;
+    var found: u8 = 0;
     for (out[0..count]) |g| {
-        if (g.grid_id != 4) continue;
-        found = true;
-        try std.testing.expectEqual(@as(i64, 3), g.placed_by_surface);
-        try std.testing.expectEqual(@as(i32, 2), g.start_row);
-        try std.testing.expectEqual(@as(i32, 1), g.start_col);
+        switch (g.grid_id) {
+            4 => {
+                try std.testing.expectEqual(@as(i64, 3), g.placed_by_surface);
+                try std.testing.expectEqual(@as(i32, 2), g.start_row);
+                try std.testing.expectEqual(@as(i32, 1), g.start_col);
+                try std.testing.expectEqual(@as(i64, 3), g.anchor_grid);
+                try std.testing.expectEqual(@as(i32, 0), g.is_external);
+            },
+            // The window's root: placed by itself at its own origin.
+            3 => {
+                try std.testing.expectEqual(@as(i64, 3), g.placed_by_surface);
+                try std.testing.expectEqual(@as(i32, 0), g.start_row);
+                try std.testing.expectEqual(@as(i32, 0), g.start_col);
+                try std.testing.expectEqual(@as(i32, 10), g.rows);
+                try std.testing.expectEqual(@as(i32, 1), g.is_external);
+                try std.testing.expectEqual(@as(i32, 1), g.mouse_enabled);
+            },
+            1 => {
+                try std.testing.expectEqual(@as(i64, 1), g.placed_by_surface);
+                try std.testing.expectEqual(@as(i32, 20), g.rows);
+                try std.testing.expectEqual(@as(i32, 0), g.is_external);
+            },
+            else => continue,
+        }
+        found += 1;
     }
-    try std.testing.expect(found);
+    try std.testing.expectEqual(@as(u8, 3), found);
 }
 
 test "the main scrollbar keeps its window while the cursor is on the message grid" {

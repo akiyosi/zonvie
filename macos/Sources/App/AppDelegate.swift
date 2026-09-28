@@ -1,14 +1,6 @@
 import Cocoa
 import MetalKit
 
-// Private macOS API for controlling window blur radius
-// Used by iTerm2, ghostty, wezterm, etc.
-@_silgen_name("CGSSetWindowBackgroundBlurRadius")
-private func CGSSetWindowBackgroundBlurRadius(_ connection: UInt, _ windowNumber: Int, _ radius: Int) -> Int32
-
-@_silgen_name("CGSMainConnectionID")
-private func CGSMainConnectionID() -> UInt
-
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
     // OS/UI-specific: persist window geometry across launches.
@@ -279,7 +271,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         // Apply blur using private API if blur is enabled
         if config.blurEnabled {
-            applyWindowBlur(window: win, radius: config.window.blurRadius)
+            ZonvieCore.applyWindowBlur(window: win, radius: config.window.blurRadius)
             // Shadow invalidation is now handled in GridSurfaceRenderer after first present
         }
 
@@ -296,23 +288,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// App menu "New Session" target: open a fresh session in its own window.
     @objc func newSession(_ sender: Any?) {
         createAndShowWindow(forceDialog: true)
-    }
-
-    /// Apply blur effect to window using private macOS API (CGSSetWindowBackgroundBlurRadius)
-    /// This provides more control over blur radius than NSVisualEffectView
-    private func applyWindowBlur(window: NSWindow, radius: Int) {
-        // DEBUG: Log blur application from AppDelegate
-        ZonvieCore.appLog("[DEBUG-BLUR-APPDELEGATE] applyWindowBlur: window=\(window.windowNumber) radius=\(radius) isOpaque=\(window.isOpaque)")
-
-        let connection = CGSMainConnectionID()
-        let windowNumber = window.windowNumber  // Already Int (NSInteger)
-
-        let result = CGSSetWindowBackgroundBlurRadius(connection, windowNumber, radius)
-        if result == 0 {
-            ZonvieCore.appLog("[Blur] Applied blur radius=\(radius) to window \(windowNumber)")
-        } else {
-            ZonvieCore.appLog("[Blur] Failed to apply blur, error=\(result)")
-        }
     }
 
     // MARK: - NSWindowDelegate
@@ -534,31 +509,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         targetWindow?.makeKeyAndOrderFront(nil)
     }
 
-}
-
-/// Escape file path for Neovim command line.
-/// Shared across AppDelegate (Finder open) and MetalTerminalView (drag & drop).
-func escapePathForNeovim(_ path: String) -> String {
-    var result = ""
-    for char in path {
-        switch char {
-        case "\\": result += "\\\\"
-        case " ": result += "\\ "
-        case "%": result += "\\%"
-        case "#": result += "\\#"
-        case "|": result += "\\|"
-        case "\"": result += "\\\""
-        case "'": result += "\\'"
-        case "[": result += "\\["
-        case "]": result += "\\]"
-        case "{": result += "\\{"
-        case "}": result += "\\}"
-        case "$": result += "\\$"
-        case "`": result += "\\`"
-        default: result.append(char)
-        }
-    }
-    return result
 }
 
 /// Drag feedback shared by the terminal view and the external cmdline window.
