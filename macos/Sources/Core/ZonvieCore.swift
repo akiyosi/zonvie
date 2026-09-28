@@ -1407,6 +1407,11 @@ final class ZonvieCore {
                 if let colors = me.pendingDefaultColors {
                     me.pendingDefaultColors = nil
                     DispatchQueue.main.async {
+                        // What the toast, prompt and minis paint with, as
+                        // Windows' colorscheme_fg/bg: Normal arrives here, not
+                        // in the core's hl_group_set name table.
+                        if colors.bg != 0xFFFF_FFFF { me.defaultColors.bg = colors.bg }
+                        if colors.fg != 0xFFFF_FFFF { me.defaultColors.fg = colors.fg }
                         NotificationCenter.default.post(
                             name: ZonvieCore.colorschemeDidChangeNotification,
                             object: me,
@@ -1612,7 +1617,8 @@ final class ZonvieCore {
                         cols: Int(l.cols),
                         z: Int(l.z),
                         followsScroll: (l.flags & UInt32(ZONVIE_LAYER_FOLLOWS_SCROLL)) != 0,
-                        mouseEnabled: (l.flags & UInt32(ZONVIE_LAYER_MOUSE_ENABLED)) != 0
+                        mouseEnabled: (l.flags & UInt32(ZONVIE_LAYER_MOUSE_ENABLED)) != 0,
+                        isFloat: (l.flags & UInt32(ZONVIE_LAYER_FLOAT)) != 0
                     ))
                 }
                 me.onSurfaceLayout(
@@ -2293,15 +2299,8 @@ final class ZonvieCore {
     }
 
     private func runDevcontainerUp(workspace: String, configPath: String?, rebuild: Bool, rows: UInt32, cols: UInt32) {
-        // Pin the stable release. The feature builds tagged/stable versions with
-        // CMAKE_BUILD_TYPE=Release (assertions OFF); "nightly" builds with
-        // assertions ON, which abort (SIGABRT) on nvim's internal
-        // msg_scroll_flush `row >= 0` edge case. Pinning also changes the feature
-        // config hash, busting any stale/nightly nvim layer cached in the image
-        // so a Rebuild reinstalls a fresh Release nvim.
-        let neovimFeature = #"{"ghcr.io/duduribeiro/devcontainer-features/neovim:1":{"version":"stable"}}"#
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
-        let nvimConfigPath = "\(homeDir)/.config/nvim"
+        let upArgs = ZonvieCore.devcontainerUpArgs(nvimConfigDir: "\(homeDir)/.config/nvim", rebuild: rebuild)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -2324,16 +2323,6 @@ final class ZonvieCore {
                 self?.updateProgressLabel("Building devcontainer...")
             }
 
-            var args = ["up", "--workspace-folder", workspace]
-            if let config = configPath {
-                args += ["--config", config]
-            }
-            args += ["--additional-features", neovimFeature]
-            args += ["--mount", "type=bind,source=\(nvimConfigPath),target=/nvim-config/nvim"]
-            if rebuild {
-                args += ["--remove-existing-container"]
-            }
-
             // Marker files for completion detection
             let tempDir = FileManager.default.temporaryDirectory.path
             let doneFile = "\(tempDir)/devcontainer_done_\(ProcessInfo.processInfo.processIdentifier)"
@@ -2349,8 +2338,6 @@ final class ZonvieCore {
             // Use environment variables to pass arguments (avoids shell escaping issues)
             var env = ProcessInfo.processInfo.environment
             env["DC_WORKSPACE"] = workspace
-            env["DC_FEATURES"] = neovimFeature
-            env["DC_MOUNT"] = "type=bind,source=\(nvimConfigPath),target=/nvim-config/nvim"
             env["DC_DONE"] = doneFile
             env["DC_FAIL"] = failFile
             env["DC_LOG"] = upLogFile
@@ -2359,12 +2346,13 @@ final class ZonvieCore {
             }
 
             var shellCmd = "script -q /dev/null sh -c '"
-            shellCmd += "devcontainer up --workspace-folder \"$DC_WORKSPACE\" --additional-features \"$DC_FEATURES\" --mount \"$DC_MOUNT\""
+            shellCmd += "devcontainer up --workspace-folder \"$DC_WORKSPACE\""
             if configPath != nil {
                 shellCmd += " --config \"$DC_CONFIG\""
             }
-            if rebuild {
-                shellCmd += " --remove-existing-container"
+            for (i, arg) in upArgs.enumerated() {
+                env["DC_ARG\(i)"] = arg
+                shellCmd += " \"$DC_ARG\(i)\""
             }
             shellCmd += " && touch \"$DC_DONE\" || touch \"$DC_FAIL\"' > \"$DC_LOG\" 2>&1 &"
 
@@ -2861,6 +2849,31 @@ final class ZonvieCore {
     static func cliNextIsValue(_ args: [String], after idx: Int) -> Bool {
         guard idx + 1 < args.count else { return false }
         return args[idx + 1].withCString { zonvie_core_cli_next_is_value($0, strlen($0)) }
+    }
+
+    /// The `devcontainer up` arguments after the workspace and config paths,
+    /// one shell word each.
+    static func devcontainerUpArgs(nvimConfigDir: String, rebuild: Bool) -> [String] {
+        var out = [UInt8](repeating: 0, count: 2048)
+        let n = nvimConfigDir.withCString { dir in
+            out.withUnsafeMutableBufferPointer {
+                zonvie_core_devcontainer_up_args($0.baseAddress, $0.count, dir, strlen(dir), rebuild)
+            }
+        }
+        return out[0..<n].split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+    }
+
+    /// `path` escaped for insertion into the command line, as fnameescape()
+    /// would escape it for a `:e` argument.
+    static func escapePathForCmdline(_ path: String) -> String {
+        var bytes = Array(path.utf8)
+        var out = [UInt8](repeating: 0, count: bytes.count * 2 + 1)
+        let n = bytes.withUnsafeMutableBufferPointer { src in
+            out.withUnsafeMutableBufferPointer { dst in
+                zonvie_core_escape_path_for_cmdline(src.baseAddress, src.count, false, dst.baseAddress, dst.count)
+            }
+        }
+        return String(decoding: out[0..<n], as: UTF8.self)
     }
 
     func sendKeyEvent(
@@ -4696,6 +4709,16 @@ final class ZonvieCore {
             liveResizeEndedAt = ProcessInfo.processInfo.systemUptime
         }
 
+        // The msg timer's gate counts external windows, so their Dock state
+        // must re-evaluate it as the main window's does (AppDelegate).
+        func windowDidMiniaturize(_ notification: Notification) {
+            core?.scheduleMsgTimer()
+        }
+
+        func windowDidDeminiaturize(_ notification: Notification) {
+            core?.scheduleMsgTimer()
+        }
+
         func windowDidMove(_ notification: Notification) {
             // Keep previousFrame fresh so the first live-resize event after a
             // title-bar drag compares against the post-move frame.
@@ -5090,7 +5113,10 @@ final class ZonvieCore {
 
             self.applyPendingExternalState(gridId: gridId, window: window, gridView: gridView)
 
-            self.repositionMessageShowBelowHistoryWindowIfNeeded(gridId: gridId, historyWindow: window)
+            // msg_show stacks below the msg_history just shown.
+            if gridId == ZonvieCore.msgHistoryGridId {
+                self.repositionMessageFloats()
+            }
 
             if ZonvieConfig.shared.blurEnabled, let mainWindow = self.terminalView?.window {
                 ZonvieCore.appLog("[DEBUG-BLUR-REFRESH] Re-applying blur to main window after external window shown")
@@ -5415,12 +5441,8 @@ final class ZonvieCore {
                 Self.closeRemovedExternalWindow(window)
                 ZonvieCore.appLog("[external_window] closed window for gridId=\(gridId)")
                 // msg_show was stacked below msg_history: move it back up.
-                if gridId == ZonvieCore.msgHistoryGridId,
-                   let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
-                   msgShowWindow.isVisible {
-                    msgShowWindow.setFrame(
-                        self.messageFloatFrame(size: msgShowWindow.frame.size, below: nil),
-                        display: false)
+                if gridId == ZonvieCore.msgHistoryGridId {
+                    self.repositionMessageFloats()
                 }
             }
 
@@ -5581,8 +5603,10 @@ final class ZonvieCore {
     /// the core/RPC thread wait forever. During teardown the main thread can be
     /// blocked in zonvie_core_stop/destroy while that thread is inside a
     /// callback; DispatchQueue.main.sync would then deadlock the join.
-    /// Clipboard get/set wait, the same 5s as Windows' clipboard bridge.
-    nonisolated private static let clipboardMainThreadTimeout: DispatchTimeInterval = .seconds(5)
+    /// Callbacks Neovim blocks on (clipboard get/set, win_move_cursor) wait
+    /// the same 5s as Windows' clipboard bridge; Windows answers them without
+    /// a UI-thread hop, so a main-thread stall must not turn into "none".
+    nonisolated private static let blockingMainThreadTimeout: DispatchTimeInterval = .seconds(5)
 
     nonisolated private func performMainThreadCallback<T>(
         timeout: DispatchTimeInterval = .milliseconds(250),
@@ -5657,7 +5681,7 @@ final class ZonvieCore {
             return targetWin
         }
 
-        let targetWin = performMainThreadCallback(work) ?? 0
+        let targetWin = performMainThreadCallback(timeout: Self.blockingMainThreadTimeout, work) ?? 0
 
         ZonvieCore.appLog("[ext_win] handleWinMoveCursor: direction=\(direction) count=\(count) -> win=\(targetWin)")
         return targetWin
@@ -5920,6 +5944,12 @@ final class ZonvieCore {
     private static func panelBackground(_ background: NSColor) -> CGColor {
         guard ZonvieConfig.shared.blurEnabled else { return background.cgColor }
         return background.withAlphaComponent(CGFloat(ZonvieConfig.shared.backgroundAlpha)).cgColor
+    }
+
+    /// The mini windows' variant: a shade more translucent than the toast.
+    private static func miniPanelBackground(_ background: NSColor) -> CGColor {
+        guard ZonvieConfig.shared.blurEnabled else { return background.withAlphaComponent(0.9).cgColor }
+        return background.withAlphaComponent(CGFloat(ZonvieConfig.shared.backgroundAlpha) * 0.8).cgColor
     }
 
     /// The borderless text panel the ext-float toast and the confirm prompt
@@ -6189,16 +6219,6 @@ final class ZonvieCore {
             zonvie_core_force_resend(corePtr)
             self.scheduleFlushRetry()
         }
-    }
-
-    private func repositionMessageShowBelowHistoryWindowIfNeeded(gridId: Int64, historyWindow: NSWindow) {
-        guard gridId == ZonvieCore.msgHistoryGridId,
-              let msgShowWindow = self.externalWindows[ZonvieCore.messageGridId],
-              msgShowWindow.isVisible else { return }
-
-        let frame = messageFloatFrame(size: msgShowWindow.frame.size, below: historyWindow.frame)
-        msgShowWindow.setFrame(frame, display: false)
-        ZonvieCore.appLog("[external_window] repositioned msg_show below new msg_history at (\(frame.origin.x),\(frame.origin.y))")
     }
 
     /// Where msg_show or msg_history of `size` goes: the core's top-right rule
@@ -6770,13 +6790,7 @@ final class ZonvieCore {
             // "Normal": Neovim sends it as the default colours, not as a
             // named group, and the lookup reports it missing.
             _ = gridId
-            bg = zonvie_core_get_default_bg(corePtr)
-            return NSColor(
-                red: CGFloat((bg >> 16) & 0xFF) / 255.0,
-                green: CGFloat((bg >> 8) & 0xFF) / 255.0,
-                blue: CGFloat(bg & 0xFF) / 255.0,
-                alpha: 1.0
-            )
+            return Self.rgbColor(zonvie_core_get_default_bg(corePtr))
         case .cmdline, .msgShow, .msgHistory:
             name = "MsgArea"
         case .popupmenu:
@@ -6785,10 +6799,7 @@ final class ZonvieCore {
         guard let name else { return nil }
         let found = zonvie_core_get_hl_by_name(corePtr, name, nil, &bg)
         if found == 0 { return nil }
-        let r = CGFloat((bg >> 16) & 0xFF) / 255.0
-        let g = CGFloat((bg >> 8) & 0xFF) / 255.0
-        let b = CGFloat(bg & 0xFF) / 255.0
-        return NSColor(red: r, green: g, blue: b, alpha: 1.0)
+        return Self.rgbColor(bg)
     }
 
     /// Resolve an external window's background — the 8-bit colour and the clear
@@ -6801,12 +6812,17 @@ final class ZonvieCore {
     ) -> (rgb: UInt32, clearAlpha: Double) {
         let bgColor = resolveHlGroupBgColor(kind: kind, gridId: gridId) ?? vertexBgColor
         let clearAlpha = ZonvieConfig.shared.blurEnabled ? Double(ZonvieConfig.shared.backgroundAlpha) : 1.0
-        if let bgColor, let srgb = bgColor.usingColorSpace(.sRGB) {
-            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-            srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
-            return (packSurfaceBgRGB(red: Double(r), green: Double(g), blue: Double(b)), clearAlpha)
-        }
-        return (0, clearAlpha)
+        return (bgColor.map(Self.packSurfaceBg) ?? 0, clearAlpha)
+    }
+
+    /// An NSColor as the surface clear colour, read in sRGB: the space the
+    /// cell vertices are recoloured in, so a decorated margin matches its
+    /// cells on a non-sRGB display too.
+    private static func packSurfaceBg(_ color: NSColor) -> UInt32 {
+        guard let srgb = color.usingColorSpace(.sRGB) else { return 0 }
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        srgb.getRed(&r, green: &g, blue: &b, alpha: &a)
+        return packSurfaceBgRGB(red: Double(r), green: Double(g), blue: Double(b))
     }
 
     private func updateDecoratedExternalGrid(
@@ -6873,15 +6889,7 @@ final class ZonvieCore {
             blurEnabled: ZonvieConfig.shared.blurEnabled,
             decoratedSurface: true
         )
-        let clearRgb = marginBg.usingColorSpace(.deviceRGB)
-        gridView.setGridBackground(
-            rgb: packSurfaceBgRGB(
-                red: Double(clearRgb?.redComponent ?? 0),
-                green: Double(clearRgb?.greenComponent ?? 0),
-                blue: Double(clearRgb?.blueComponent ?? 0)
-            ),
-            clearAlpha: Double(marginAlpha)
-        )
+        gridView.setGridBackground(rgb: Self.packSurfaceBg(marginBg), clearAlpha: Double(marginAlpha))
     }
 
     private func updateDecoratedWindowChrome(kind: ExternalGridKind, context: DecoratedGridContext) {
@@ -7255,84 +7263,46 @@ final class ZonvieCore {
         )
     }
 
+    /// A highlight group's foreground or background, `fallback` when the
+    /// group is undefined.
+    private func hlColor(_ name: String, foreground: Bool, fallback: NSColor) -> NSColor {
+        guard let corePtr = self.core else { return fallback }
+        var fg: UInt32 = 0
+        var bg: UInt32 = 0
+        guard zonvie_core_get_hl_by_name(corePtr, name, &fg, &bg) != 0 else { return fallback }
+        return Self.rgbColor(foreground ? fg : bg)
+    }
+
     /// Get the Search highlight color (background) for cmdline border.
     private func getSearchHighlightColor() -> NSColor {
-        guard let corePtr = self.core else {
-            return NSColor.yellow  // Fallback
-        }
-
-        var fg: UInt32 = 0
-        var bg: UInt32 = 0
-        let found = zonvie_core_get_hl_by_name(corePtr, "Search", &fg, &bg)
-
-        if found != 0 {
-            let r = CGFloat((bg >> 16) & 0xFF) / 255.0
-            let g = CGFloat((bg >> 8) & 0xFF) / 255.0
-            let b = CGFloat(bg & 0xFF) / 255.0
-            return NSColor(red: r, green: g, blue: b, alpha: 1.0)
-        } else {
-            return NSColor.yellow
-        }
+        hlColor("Search", foreground: false, fallback: .yellow)
     }
 
-    /// Get the Normal highlight background color for message window.
+    /// The published default_colors_set pair; 0xFFFFFFFF is the only "unset"
+    /// value (0 is a black Normal colour). Main thread.
+    private var defaultColors: (fg: UInt32, bg: UInt32) = (0xFFFF_FFFF, 0xFFFF_FFFF)
+
+    private static func rgbColor(_ rgb: UInt32) -> NSColor {
+        NSColor(red: CGFloat((rgb >> 16) & 0xFF) / 255.0,
+                green: CGFloat((rgb >> 8) & 0xFF) / 255.0,
+                blue: CGFloat(rgb & 0xFF) / 255.0, alpha: 1.0)
+    }
+
+    /// The Normal background for the message panels, from default_colors_set.
     private func getNormalBackgroundColor() -> NSColor {
-        guard let corePtr = self.core else {
-            return NSColor.black  // Fallback
-        }
-
-        var fg: UInt32 = 0
-        var bg: UInt32 = 0
-        let found = zonvie_core_get_hl_by_name(corePtr, "Normal", &fg, &bg)
-
-        if found != 0 && bg != 0 {
-            let r = CGFloat((bg >> 16) & 0xFF) / 255.0
-            let g = CGFloat((bg >> 8) & 0xFF) / 255.0
-            let b = CGFloat(bg & 0xFF) / 255.0
-            return NSColor(red: r, green: g, blue: b, alpha: 1.0)
-        } else {
-            return NSColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 1.0)
-        }
+        defaultColors.bg == 0xFFFF_FFFF
+            ? NSColor(red: 0.1, green: 0.1, blue: 0.15, alpha: 1.0)
+            : Self.rgbColor(defaultColors.bg)
     }
 
-    /// Get the Normal highlight foreground color for message text.
+    /// The Normal foreground for the message panels, from default_colors_set.
     private func getNormalForegroundColor() -> NSColor {
-        guard let corePtr = self.core else {
-            return NSColor.white  // Fallback
-        }
-
-        var fg: UInt32 = 0
-        var bg: UInt32 = 0
-        let found = zonvie_core_get_hl_by_name(corePtr, "Normal", &fg, &bg)
-
-        if found != 0 && fg != 0 {
-            let r = CGFloat((fg >> 16) & 0xFF) / 255.0
-            let g = CGFloat((fg >> 8) & 0xFF) / 255.0
-            let b = CGFloat(fg & 0xFF) / 255.0
-            return NSColor(red: r, green: g, blue: b, alpha: 1.0)
-        } else {
-            return NSColor.white
-        }
+        defaultColors.fg == 0xFFFF_FFFF ? NSColor.white : Self.rgbColor(defaultColors.fg)
     }
 
     /// Get the Comment highlight color (foreground) for cmdline icon.
     private func getCommentHighlightColor() -> NSColor {
-        guard let corePtr = self.core else {
-            return NSColor.gray  // Fallback
-        }
-
-        var fg: UInt32 = 0
-        var bg: UInt32 = 0
-        let found = zonvie_core_get_hl_by_name(corePtr, "Comment", &fg, &bg)
-
-        if found != 0 {
-            let r = CGFloat((fg >> 16) & 0xFF) / 255.0
-            let g = CGFloat((fg >> 8) & 0xFF) / 255.0
-            let b = CGFloat(fg & 0xFF) / 255.0
-            return NSColor(red: r, green: g, blue: b, alpha: 1.0)
-        } else {
-            return NSColor.gray
-        }
+        hlColor("Comment", foreground: true, fallback: .gray)
     }
 
     // MARK: - ext_cmdline callbacks
@@ -7626,10 +7596,7 @@ final class ZonvieCore {
         // This runs on the core thread; store it thread-safely so the
         // main-thread container bg update can read it.
         if let c = colors?.pointee {
-            let r = CGFloat((c.pmenu_bg >> 16) & 0xFF) / 255.0
-            let g = CGFloat((c.pmenu_bg >> 8) & 0xFF) / 255.0
-            let b = CGFloat(c.pmenu_bg & 0xFF) / 255.0
-            self.popupmenuBgColor = NSColor(red: r, green: g, blue: b, alpha: 1.0)
+            self.popupmenuBgColor = Self.rgbColor(c.pmenu_bg)
             ZonvieCore.appLog("[popupmenu] pmenu_bg=\(String(format: "#%06X", c.pmenu_bg)) pmenu_sel_bg=\(String(format: "#%06X", c.pmenu_sel_bg))")
         }
 
@@ -7964,12 +7931,7 @@ final class ZonvieCore {
             miniWindows[miniId] = state
 
             if let containerView = window.contentView {
-                if ZonvieConfig.shared.blurEnabled {
-                    let opacity = ZonvieConfig.shared.backgroundAlpha
-                    containerView.layer?.backgroundColor = normalBg.withAlphaComponent(CGFloat(opacity) * 0.8).cgColor
-                } else {
-                    containerView.layer?.backgroundColor = normalBg.withAlphaComponent(0.9).cgColor
-                }
+                containerView.layer?.backgroundColor = Self.miniPanelBackground(normalBg)
             }
 
             let size = miniWindowSize(
@@ -8061,13 +8023,7 @@ final class ZonvieCore {
 
         let containerView = NSView(frame: NSRect(origin: .zero, size: windowRect.size))
         containerView.wantsLayer = true
-
-        if ZonvieConfig.shared.blurEnabled {
-            let opacity = ZonvieConfig.shared.backgroundAlpha
-            containerView.layer?.backgroundColor = bgColor.withAlphaComponent(CGFloat(opacity) * 0.8).cgColor
-        } else {
-            containerView.layer?.backgroundColor = bgColor.withAlphaComponent(0.9).cgColor
-        }
+        containerView.layer?.backgroundColor = Self.miniPanelBackground(bgColor)
 
         // Label (left-aligned, multi-line capable so explicit \n shows all lines)
         let label = NSTextField(labelWithString: content)
@@ -8181,62 +8137,6 @@ final class ZonvieCore {
         )
     }
 
-    /// The external window that composites `grid`, or nil when the main window
-    /// does — which is also the answer for a grid that is not placed at all.
-    ///
-    /// Both message-placement branches had this written out, as copies of each
-    /// other — the comment on the second said so — and they asked `isExternal`,
-    /// which answers "is this grid a window of its own" rather than "who draws
-    /// it". The two differ only for a grid an external surface places without
-    /// being, and the anchor walk above always lands on an external ROOT, so no
-    /// reachable state was measured where the answers differ: this is one
-    /// question in one place, not a behaviour change.
-    private func windowCompositing(_ grid: GridInfo?) -> NSWindow? {
-        guard let grid else { return nil }
-        return externalWindows[showingSurfaceId(for: grid.gridId)]
-    }
-
-    /// The window that actually composites the grid the cursor is on.
-    ///
-    /// "Is this a float" is not that question, and answering it instead put an
-    /// ext-message on the MAIN window whenever the cursor was in a float an
-    /// EXTERNAL window hosts — the one surface that float is certainly not
-    /// drawn in. `showingSurfaceId` answers who draws it, and covers a grid an
-    /// external window merely contains as well as one it is.
-    private func windowCompositingCursorGrid(_ mainWindow: NSWindow) -> NSWindow {
-        let cursorGrid = getCursorPositionNonBlocking().gridId
-        return externalWindows[showingSurfaceId(for: cursorGrid)] ?? mainWindow
-    }
-
-
-    /// The grid an ext-UI element should be measured against: the one the
-    /// cursor is in, or — when that is a float — the window grid the float
-    /// hangs off. Grid 1 when neither is found.
-    private func cursorAnchorGrid(in grids: [GridInfo]) -> GridInfo? {
-        let cursorGridId = getCursorPositionNonBlocking().gridId
-        var target = grids.first { $0.gridId == cursorGridId }
-        // Cursor inside a float (e.g. telescope prompt): anchor to the
-        // non-float grid the float hangs off instead of the float itself.
-        if let g = target, g.zindex > 0 {
-            target = resolveNonFloatAnchorGrid(of: g, in: grids)
-        }
-        return target ?? grids.first { $0.gridId == 1 }
-    }
-
-    /// Walk anchorGrid links from a float until a non-float grid is reached.
-    /// Returns nil when the chain dead-ends or exceeds the hop guard, so
-    /// callers fall back to the global grid.
-    private func resolveNonFloatAnchorGrid(of float: GridInfo, in grids: [GridInfo]) -> GridInfo? {
-        var current: GridInfo? = float
-        var hops = 0
-        while let g = current, g.zindex > 0, hops < 8 {
-            current = grids.first { $0.gridId == g.anchorGrid }
-            hops += 1
-        }
-        if let g = current, g.zindex <= 0 { return g }
-        return nil
-    }
-
     /// Get target frame for ext-float positioning based on config
     private func getExtFloatTargetFrame() -> NSRect {
         return msgTargetFrame(ZonvieConfig.shared.messages.extFloatPos)
@@ -8245,41 +8145,35 @@ final class ZonvieCore {
 
     /// The screen rect minis and ext-float messages are placed against (the
     /// macOS side of Windows msgTargetRect). Nil without a main window.
+    ///
+    /// The core answers which surface and cells (zonvie_core_msg_anchor), from
+    /// the flush that sent the message; this only maps a surface to its window.
     private func msgTargetFrame(_ mode: ZonvieConfig.MsgPosition) -> NSRect? {
         guard let mainView = self.terminalView, let mainWindow = mainView.window else { return nil }
-
-        switch mode {
-        case .display:
+        if mode == .display {
             return (mainWindow.screen ?? NSScreen.main)?.visibleFrame ?? mainWindow.frame
-
-        case .window:
-            // The window that composites the cursor grid. A float grid (e.g.
-            // telescope prompt) is not a window of its own.
-            return gridContentScreenFrame(of: windowCompositingCursorGrid(mainWindow))
-
-        case .grid:
-            // An external grid is reported at (0,0) with no placement inside the
-            // main window (include/zonvie_core.h), so it is measured against the
-            // window that composites it, which for an external root is its own.
-            let targetGrid = cursorAnchorGrid(in: getVisibleGridsCached())
-            let anchorWindow = windowCompositing(targetGrid) ?? mainWindow
-            let content = gridContentScreenFrame(of: anchorWindow)
-            guard let grid = targetGrid, let renderer = mainView.renderer else { return content }
-
-            // The anchor window's own scale: an external window lays out its
-            // cells with it, as resizeExternalWindows does.
-            let scale = anchorWindow.backingScaleFactor
-            let cellW_pt = CGFloat(renderer.cellWidthPx) / scale
-            let cellH_pt = CGFloat(renderer.cellHeightPx) / scale
-            let width_pt = CGFloat(grid.cols) * cellW_pt
-            let height_pt = CGFloat(grid.rows) * cellH_pt
-            return NSRect(
-                x: content.minX + CGFloat(grid.startCol) * cellW_pt,
-                y: content.maxY - CGFloat(grid.startRow) * cellH_pt - height_pt,
-                width: width_pt,
-                height: height_pt
-            )
         }
+        var anchor = zonvie_msg_anchor()
+        guard let core, zonvie_core_msg_anchor(core, &anchor) else {
+            return gridContentScreenFrame(of: mainWindow)
+        }
+        let surface = mode == .window ? anchor.cursor_surface : anchor.anchor_surface
+        let window = externalWindows[surface] ?? mainWindow
+        let content = gridContentScreenFrame(of: window)
+        guard mode == .grid, let renderer = mainView.renderer else { return content }
+
+        // The anchor window's own scale: an external window lays out its
+        // cells with it, as resizeExternalWindows does.
+        let scale = window.backingScaleFactor
+        let cellW_pt = CGFloat(renderer.cellWidthPx) / scale
+        let cellH_pt = CGFloat(renderer.cellHeightPx) / scale
+        let height_pt = CGFloat(anchor.rows) * cellH_pt
+        return NSRect(
+            x: content.minX + CGFloat(anchor.start_col) * cellW_pt,
+            y: content.maxY - CGFloat(anchor.start_row) * cellH_pt - height_pt,
+            width: CGFloat(anchor.cols) * cellW_pt,
+            height: height_pt
+        )
     }
 
     private func showMessageWindow(kind: String, content: String, hlId: Int32 = 0, timeoutMs: UInt32 = 0) {
@@ -8491,7 +8385,7 @@ final class ZonvieCore {
         // stopping and joining the RPC thread), not an empty clipboard. 5s, as
         // Windows waits: the 250ms default made a paste empty behind any
         // main-thread stall (a live resize, a font rebuild).
-        guard let pasteboardResult: String? = performMainThreadCallback(timeout: Self.clipboardMainThreadTimeout, {
+        guard let pasteboardResult: String? = performMainThreadCallback(timeout: Self.blockingMainThreadTimeout, {
             NSPasteboard.general.string(forType: .string)
         }) else {
             outLen.pointee = 0
@@ -8534,7 +8428,7 @@ final class ZonvieCore {
 
         // Keep the synchronous set semantics in normal operation, but fail
         // instead of deadlocking core shutdown if main cannot service it.
-        guard performMainThreadCallback(timeout: Self.clipboardMainThreadTimeout, {
+        guard performMainThreadCallback(timeout: Self.blockingMainThreadTimeout, {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             return pasteboard.setString(content, forType: .string)

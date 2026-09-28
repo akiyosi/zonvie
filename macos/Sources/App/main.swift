@@ -42,6 +42,24 @@ let connectDialogEnabled = zonvieArgs.contains("--dialog")
 // After "--", all remaining arguments are passed to nvim
 var cliNvimPath: String? = nil
 var nvimExtraArgs: [String] = []
+/// argv indices of the nvim file arguments, for the fork parent below.
+var nvimFileArgIndices = Set<Int>()
+/// nvim options whose VALUE is the next token (`-u NONE`, `-c "set nu"`,
+/// `--listen addr`): that token is not a file.
+let nvimOptionsTakingValue: Set<String> = ["-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime"]
+/// A file argument for nvim, absolute against the shell's cwd. Flags (`-`),
+/// commands (`+`), an option's value (`prev` names the option) and absolute
+/// paths pass through. The fork parent chdirs to $HOME before spawning the
+/// child, and nvim then inherits that cwd, so `zonvie README.md` opened
+/// ~/README.md (Windows resolves the same way).
+func absoluteFileArg(_ arg: String, prev: String?, afterDashDash: Bool = false) -> String {
+    if arg.isEmpty || arg.hasPrefix("/") { return arg }
+    // After `--` every token is a file to nvim, `-` alone being stdin.
+    if afterDashDash { return arg == "-" ? arg : (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(arg) }
+    if arg.hasPrefix("-") || arg.hasPrefix("+") { return arg }
+    if let prev, nvimOptionsTakingValue.contains(prev) { return arg }
+    return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(arg)
+}
 do {
     var i = 1  // Skip argv[0] (executable path)
     var passAllToNvim = false
@@ -56,7 +74,8 @@ do {
         }
 
         if passAllToNvim {
-            nvimExtraArgs.append(arg)
+            nvimExtraArgs.append(absoluteFileArg(arg, prev: nil, afterDashDash: true))
+            nvimFileArgIndices.insert(i)
             i += 1
             continue
         }
@@ -106,7 +125,8 @@ do {
             }
         } else {
             // Not a zonvie argument - pass to nvim
-            nvimExtraArgs.append(arg)
+            nvimExtraArgs.append(absoluteFileArg(arg, prev: args[i - 1]))
+            nvimFileArgIndices.insert(i)
             i += 1
         }
     }
@@ -557,7 +577,10 @@ if !noforkMode && !launchedFromFinder {
         var newArgs = ["--nofork"]
         for i in 1..<args.count {
             if args[i] != "--nofork" {  // Don't duplicate --nofork
-                newArgs.append(args[i])
+                // File arguments absolute: the child parses them after this
+                // parent's chdir($HOME).
+                let afterDashDash = args.firstIndex(of: "--").map { i > $0 } ?? false
+                newArgs.append(nvimFileArgIndices.contains(i) ? absoluteFileArg(args[i], prev: args[i - 1], afterDashDash: afterDashDash) : args[i])
             }
         }
 

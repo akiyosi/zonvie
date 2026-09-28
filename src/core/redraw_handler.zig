@@ -1994,16 +1994,9 @@ pub fn handleRedraw(
                     if (rows == 0) continue;
 
                     if (log.cb != null) {
-                        var target_rows: u32 = grid.rows;
-                        var target_cols: u32 = grid.cols;
-                        if (grid_id != 1) {
-                            if (grid.sub_grids.getPtr(grid_id)) |sg| {
-                                target_rows = sg.rows;
-                                target_cols = sg.cols;
-                            }
-                        }
+                        const target = grid.bufForConst(grid_id) orelse &grid.main_buf;
                         log.write("[scroll_debug] grid_scroll grid={d} top={d} bot={d} left={d} right={d} rows={d} cols={d} target_rows={d} target_cols={d}\n", .{
-                            grid_id, top, bot, left, right, rows, cols, target_rows, target_cols,
+                            grid_id, top, bot, left, right, rows, cols, target.rows, target.cols,
                         });
                         if (grid.input_trace_seq != 0 and grid.input_trace_first_grid_event_logged_seq != grid.input_trace_seq) {
                             const now_ns = clock.nowNs();

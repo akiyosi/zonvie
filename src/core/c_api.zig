@@ -52,6 +52,7 @@ pub const DECO_SOLID_GLYPH: u32 = 1 << 11;
 /// include/zonvie_core.h.
 pub const LAYER_FOLLOWS_SCROLL: u32 = 1 << 0;
 pub const LAYER_MOUSE_ENABLED: u32 = 1 << 1;
+pub const LAYER_FLOAT: u32 = 1 << 2;
 
 pub const Layer = extern struct {
     grid_id: i64,
@@ -226,6 +227,19 @@ pub const OnVerticesRowFn = *const fn (
     total_rows: u32,
     total_cols: u32,
 ) callconv(.c) void;
+
+/// Where a message box is placed: the cursor's surface, and the grid the
+/// cursor is in walked out of floats with its cells on its own surface.
+/// Surfaces are 1 for the main window, else an external window's root grid.
+pub const MsgAnchor = extern struct {
+    cursor_surface: i64,
+    anchor_surface: i64,
+    anchor_grid: i64,
+    start_row: i32,
+    start_col: i32,
+    rows: i32,
+    cols: i32,
+};
 
 /// Grid info for hit-testing (smooth scroll support)
 pub const GridInfo = extern struct {
@@ -2014,6 +2028,35 @@ pub export fn zonvie_core_devcontainer_exec_cmd(
     return cmd.len;
 }
 
+pub export fn zonvie_core_devcontainer_up_args(
+    out: ?[*]u8,
+    cap: usize,
+    nvim_config_dir: ?[*]const u8,
+    dir_len: usize,
+    rebuild: bool,
+) callconv(.c) usize {
+    const buf = (out orelse return 0)[0..cap];
+    const dir = if (nvim_config_dir) |d| d[0..dir_len] else "";
+    return frontend_rules.devcontainerUpArgs(buf, dir, rebuild).len;
+}
+
+pub export fn zonvie_core_drop_inserts_path(mode: ?[*]const u8, len: usize, has_external_cmdline: bool, force: bool) callconv(.c) bool {
+    return frontend_rules.dropInsertsPath(if (mode) |m| m[0..len] else "", has_external_cmdline, force);
+}
+
+pub export fn zonvie_core_escape_path_for_cmdline(
+    path: ?[*]const u8,
+    len: usize,
+    backslash_is_separator: bool,
+    out: ?[*]u8,
+    cap: usize,
+) callconv(.c) usize {
+    const p = path orelse return 0;
+    const buf = (out orelse return 0)[0..cap];
+    const esc = frontend_rules.escapePathForCmdline(buf, p[0..len], backslash_is_separator) orelse return 0;
+    return esc.len;
+}
+
 pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderNeedsAnimation(s[0..len]);
@@ -2159,6 +2202,14 @@ pub export fn zonvie_core_try_get_visible_grids_complete(
     const snapshot = box.core.tryGetVisibleGridsComplete(out) orelse return -1;
     out_total_count.?.* = snapshot.total;
     return @intCast(snapshot.written);
+}
+
+/// The message anchor the last flush published. Never takes grid_mu.
+pub export fn zonvie_core_msg_anchor(p: ?*zonvie_core, out: ?*MsgAnchor) callconv(.c) bool {
+    const o = out orelse return false;
+    const a = asBox(p orelse return false).core.msgAnchor() orelse return false;
+    o.* = a;
+    return true;
 }
 
 /// Get viewport info for a specific grid (for scrollbar rendering).
@@ -3077,17 +3128,9 @@ pub export fn zonvie_core_try_get_grid_text(
     defer box.core.grid_mu.unlock(clock.io());
 
     const g = &box.core.grid;
-    var rows: u32 = 0;
-    var cols: u32 = 0;
-    if (grid_id == 1) {
-        rows = g.rows;
-        cols = g.cols;
-    } else if (g.sub_grids.getPtr(grid_id)) |sg| {
-        rows = sg.rows;
-        cols = sg.cols;
-    } else {
-        return 0;
-    }
+    const buf = g.bufForConst(grid_id) orelse return 0;
+    const rows = buf.rows;
+    const cols = buf.cols;
 
     // `needed` counts the full text; `written` only what fit in out_buf, so
     // a caller with a too-small buffer learns the exact size to retry with.

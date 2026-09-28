@@ -1627,6 +1627,63 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return min(us, 8_000) * 1_000
     }()
 
+    /// Continuous-scroll guard band, shared by both surfaces' draws.
+    ///
+    /// Traced measurement (Release, held-key scroll): every dropped frame was
+    /// a near miss. The commit landed 0.07-1.1ms (median ~0.2ms) after the
+    /// draw had already concluded "nothing changed" and bailed, so the content
+    /// sat until the next vsync — the 33ms on-glass gap that reads as a
+    /// stutter. A draw spends ~0.3ms of the 16.67ms budget, so the slack to
+    /// absorb this is already there.
+    ///
+    /// Only a frame that would otherwise be dropped can wait, and only while a
+    /// scroll is actually in progress, so a genuinely idle screen still bails
+    /// immediately. The wait ends the moment the commit lands; the bound only
+    /// caps a genuinely late producer. `lock` is held only for each revision
+    /// read, never across the sleep.
+    static func waitCommitGuardBand(
+        lock: NSLock,
+        commitRevision: () -> UInt64,
+        lastDrawnRevision: UInt64,
+        hadRecentCommit: (UInt64) -> Bool,
+        timedOutRevision: inout UInt64,
+        seq: UInt32 = 0
+    ) {
+        guard commitGuardBandNs > 0 else { return }
+        lock.lock()
+        var revision = commitRevision()
+        lock.unlock()
+        guard revision == lastDrawnRevision, revision != timedOutRevision,
+              hadRecentCommit(50_000_000) else { return }
+        let start = FrameTracer.nowNs()
+        let deadline = start + commitGuardBandNs
+        while FrameTracer.nowNs() < deadline {
+            // Short enough to catch a ~200us miss, long enough not to spin
+            // the main thread hot.
+            usleep(100)
+            lock.lock()
+            revision = commitRevision()
+            lock.unlock()
+            if revision != lastDrawnRevision { break }
+        }
+        if revision == lastDrawnRevision {
+            // The band ran out with no commit, so the producer is not merely
+            // a few hundred microseconds late. hadRecentCommit is a trailing
+            // window, so without this every frame for the rest of it would
+            // burn the full band for nothing — ~3 frames after each scroll
+            // stop at 60Hz.
+            timedOutRevision = revision
+        }
+        if FrameTracer.enabled {
+            FrameTracer.trace(
+                .commitGuardBand,
+                a: revision != lastDrawnRevision ? 1 : 0,
+                b: FrameTracer.nowNs() - start,
+                seq: seq
+            )
+        }
+    }
+
     private var commitRevision: UInt64 = 0   // Protected by lock
     private var lastCommitTime: UInt64 = 0   // Protected by lock — mach_absolute_time() of last commit
     private var lastDrawnRevision: UInt64 = 0 // Render thread only
@@ -1796,9 +1853,14 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     // Exact union of fixed, non-following float rects, represented as disjoint
     // horizontal intervals inside disjoint vertical bands. The fragment shader
     // binary-searches both levels instead of scanning every float per pixel.
-    /// This surface's fixed-float mask. Shared with the external surfaces,
-    /// which own one each; see SurfaceFixedFloatMask.
+    /// This surface's fixed-float mask, rebuilt in draw from the committed
+    /// layer snapshot as the external surfaces rebuild theirs; see
+    /// SurfaceFixedFloatMask. Draw thread only.
     private let fixedFloatMask = SurfaceFixedFloatMask()
+    private var fixedFloatRectsScratch: [FixedFloatRect] = []
+    /// The last frame dropped the scroll transform: more fixed floats than
+    /// the mask can hold. Draw thread only; the view reads it for hit tests.
+    private(set) var drewWithoutScrollTransform = false
 
     /// On by default, with `ZONVIE_SMOOTH_SCROLL=0` as the way back out without
     /// a rebuild. Two earlier attempts at hiding the row quantisation measured
@@ -1868,24 +1930,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         var top: Float
         var bottom: Float
         var zindex: Int32
-
-        /// Append the rect of a float at `originPx` to a surface's mask
-        /// scratch. Returns false once the scratch holds one rect past what
-        /// the mask can represent: that is enough to select the cell-aligned
-        /// fallback, so the caller stops rather than grow the scratch.
-        static func append(
-            originPx: simd_float2, cols: Int, rows: Int, z: Int, cellW: Float, cellH: Float,
-            into rects: inout [FixedFloatRect]
-        ) -> Bool {
-            rects.append(FixedFloatRect(
-                x0: originPx.x,
-                x1: originPx.x + Float(cols) * cellW,
-                top: originPx.y,
-                bottom: originPx.y + Float(rows) * cellH,
-                zindex: Int32(clamping: z)
-            ))
-            return rects.count <= SurfaceFixedFloatMask.maxRects
-        }
     }
 
     // Matches Shaders.metal. Bands are sorted from top to bottom; intervals
@@ -1903,21 +1947,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // Max zindex of the fixed floats covering this segment; overlapping
         // rects are split at their x edges so one value is always exact.
         var z: Float = 0
-    }
-
-    /// Set the fixed (non-following) float rects used by the fragment shader to
-    /// keep scrolled content from bleeding over them. Called from the main thread.
-    /// Builds the exact rectangle union once per scroll-state update. Returns
-    /// false when the exact union cannot be represented by setFragmentBytes;
-    /// callers must then disable the scroll transform rather than use a
-    /// semantically truncated mask. Persistent arrays retain capacity; COW
-    /// only detaches when a draw snapshot is still in flight.
-    @discardableResult
-    func updateFixedFloatRects(_ rects: [FixedFloatRect]) -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-
-        return fixedFloatMask.update(rects)
     }
 
     // (rowVertexBuffers/rowVertexCounts/usingRowBuffers moved into BufferSet for triple buffering)
@@ -2803,8 +2832,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // of building a fresh array via offsets.map and assigning it: this
         // only allocates when draw(in:)'s scrollSnapshot from an in-flight
         // frame still holds this buffer's previous storage (a genuine,
-        // unavoidable thread-safety copy — see updateFixedFloatRects for
-        // the same reasoning), not unconditionally on every scrolled frame.
+        // unavoidable thread-safety copy), not unconditionally on every
+        // scrolled frame.
         scrollOffsetData.removeAll(keepingCapacity: true)
         scrollOffsetData.reserveCapacity(offsets.count)
         scrollDebtAnchorRowsUp.removeAll(keepingCapacity: true)
@@ -3026,53 +3055,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 return
             }
 
-            // Continuous-scroll guard band.
-            //
-            // Traced measurement (Release, held-key scroll): every dropped
-            // frame was a near miss. The commit landed 0.07-1.1ms (median
-            // ~0.2ms) after this draw had already concluded "nothing changed"
-            // and bailed, so the content sat until the next vsync — the 33ms
-            // on-glass gap that reads as a stutter. draw(in:) spends ~0.3ms of
-            // the 16.67ms budget, so the slack to absorb this is already there.
-            //
-            // Only a frame that would otherwise be dropped can wait, and only
-            // while a scroll is actually in progress, so a genuinely idle
-            // screen still bails immediately. The wait ends the moment the
-            // commit lands; the bound only caps a genuinely late producer.
-            if Self.commitGuardBandNs > 0 {
-                lock.lock()
-                var revision = commitRevision
-                lock.unlock()
-                if revision == lastDrawnRevision, revision != guardBandTimedOutRevision,
-                   hadRecentCommit(withinNs: 50_000_000) {
-                    let start = FrameTracer.nowNs()
-                    let deadline = start + Self.commitGuardBandNs
-                    while FrameTracer.nowNs() < deadline {
-                        // Short enough to catch a ~200us miss, long enough not
-                        // to spin the main thread hot.
-                        usleep(100)
-                        lock.lock()
-                        revision = commitRevision
-                        lock.unlock()
-                        if revision != lastDrawnRevision { break }
-                    }
-                    if revision == lastDrawnRevision {
-                        // The band ran out with no commit, so the producer is not
-                        // merely a few hundred microseconds late. hadRecentCommit
-                        // is a trailing window, so without this every frame for
-                        // the rest of it would burn the full band for nothing —
-                        // ~3 frames after each scroll stop at 60Hz.
-                        guardBandTimedOutRevision = revision
-                    }
-                    if FrameTracer.enabled {
-                        FrameTracer.trace(
-                            .commitGuardBand,
-                            a: revision != lastDrawnRevision ? 1 : 0,
-                            b: FrameTracer.nowNs() - start
-                        )
-                    }
-                }
-            }
+            Self.waitCommitGuardBand(
+                lock: lock,
+                commitRevision: { self.commitRevision },
+                lastDrawnRevision: lastDrawnRevision,
+                hadRecentCommit: { self.hadRecentCommit(withinNs: $0) },
+                timedOutRevision: &guardBandTimedOutRevision
+            )
 
             // Acquire the GPU slot BEFORE marking gpuInFlightCount, or a
             // slot-blocked draw() inflates it and beginFlush() sees every set as
@@ -3174,9 +3163,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Extend smoothScrolling one frame past the offset reaching zero:
             // the back buffer still holds pixels rendered with a non-zero shader
             // offset, and blitting those again is a 1-row jitter.
-            hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive
+            // More fixed floats than the mask can hold drops the whole scroll
+            // transform for the frame, as the external surface does: a partial
+            // mask lets shifted content bleed through an omitted float. Only
+            // the layers the core flagged as floats count; under ext_multigrid
+            // every split is a hosted layer too.
+            let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(
+                layers: committedSurfaceLayers, rootGridId: 1, floatFlagOnly: true)
+            drewWithoutScrollTransform = fixedFloatOverflow
+            hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive && !fixedFloatOverflow
             smoothScrolling = scrollOffsetLatch.isSmoothScrolling
-            scrollSnapshot = scrollOffsetData  // Value-type copy (safe across frames)
+            scrollSnapshot = fixedFloatOverflow ? [] : scrollOffsetData  // Value-type copy (safe across frames)
             cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
             applyFloatScrollDebt(to: &scrollSnapshot)
             // The one evaluation of the shader cursor this frame, against the
@@ -3204,8 +3201,6 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // an ease that has committed but not been spent keeps its band.
             retention.pruneUndisplaced(offsets: scrollOffsetData, seedGrids: smoothScrollSeeds)
             retainedSnapshot = retention.snapshotPublished()
-            fixedFloatBandsSnapshot = fixedFloatMask.bands  // Value-type copies (safe across frames)
-            fixedFloatIntervalsSnapshot = fixedFloatMask.intervals
             rowLogicalToSlotSnapshot = bufferSets[csi].rowLogicalToSlot
             rowSlotSourceRowsSnapshot = bufferSets[csi].rowSlotSourceRows
             layerSnapshot.removeAll(keepingCapacity: true)
@@ -3238,6 +3233,16 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             snappedBgRGB = surfaceBgRGB
             snappedCommittedExtent = committedExtent
             lock.unlock()
+
+            // The union scrolled content must not bleed over, from the same
+            // layer snapshot this frame draws, so placement and mask cannot
+            // skew by a commit.
+            fixedFloatMask.rebuild(
+                layers: layerSnapshot, rootGridId: 1, floatFlagOnly: true, smoothScrolling: smoothScrolling,
+                cellW: cellWidthPx, cellH: cellHeightPx, scratch: &fixedFloatRectsScratch
+            )
+            fixedFloatBandsSnapshot = fixedFloatMask.bands  // Value-type copies (safe across frames)
+            fixedFloatIntervalsSnapshot = fixedFloatMask.intervals
 
             defer {
                 dirtyRows.removeAll(keepingCapacity: true)

@@ -251,15 +251,11 @@ final class MetalTerminalView: GridInputView {
     // (compactMap/etc.) every call — this runs in the pre-draw path on
     // every scrolled frame.
     private var scrollOffsetInfoScratch: [GridSurfaceRenderer.ScrollOffsetInfo] = []
-    /// Set when the last offset update dropped the scroll transform (fixed-float
-    /// mask or offset set overflowed), so the frame is cell-aligned. Main thread.
+    /// Set when the last offset update dropped the scroll transform (offset
+    /// set overflowed), so the frame is cell-aligned. Main thread.
     private var drewWithoutScrollTransform = false
     private var gridInfoMapScratch: [Int64: ZonvieCore.GridInfo] = [:]
     private var visibleGridIdsScratch: Set<Int64> = []
-    // Reused by the fixedRects collection below; updateFixedFloatRects()
-    // copies elements into the renderer's own storage rather than aliasing
-    // this buffer, so reusing it here doesn't force a COW detach there.
-    private var fixedFloatRectsScratch: [GridSurfaceRenderer.FixedFloatRect] = []
     // Tracks whether the previous updateScrollShaderOffset call had any
     // offsets, so the idle (empty) case can skip rebuilding the
     // Dictionary/Set/array below every frame while still running the one
@@ -282,8 +278,6 @@ final class MetalTerminalView: GridInputView {
             ZonvieCore.appLog(msg())
         }
     }
-
-    private var keyInput: SessionKeyInput? { core?.keyInput }
 
     /// Called after actual drawing runs in MTKViewDelegate.draw(in:)
     func didDrawFrame() {
@@ -432,8 +426,6 @@ final class MetalTerminalView: GridInputView {
         window?.makeFirstResponder(self)
         needsLayout = true
 
-        applyAlwaysScrollbarVisibility()
-
         if window != nil {
             window?.acceptsMouseMovedEvents = true
 
@@ -446,91 +438,64 @@ final class MetalTerminalView: GridInputView {
 
     // MARK: - Mouse Input
 
-    /// The grid a press claimed, kept for its drag and release.
-    private var pressGridId = SurfacePressPin<Int64>()
+    override func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
+        hitTestGrid(at: convert(event.locationInWindow, from: nil))
+    }
 
-    /// Map NSEvent.buttonNumber to Neovim button name for "other" mouse buttons.
-
-    override func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
-        guard let core else { return }
-
-        let location = convert(event.locationInWindow, from: nil)
-        let modifier = neovimModifierString(event.modifierFlags)
-
-        // The press claims its grid, and the drag and release that follow
-        // stay on it: Neovim keeps a drag on the window the press chose, and a
-        // release re-resolved under the pointer ended a selection dragged out
-        // of a float in the window behind it. The external surface and Windows
-        // pin the same way.
-        if action == "press" {
-            let hit = hitTestGrid(at: location)
-            pressGridId.press(button: button) {
-                core.getVisibleGridsCached().contains { $0.gridId == hit.gridId } ? hit.gridId : nil
-            }
-            core.sendMouseInput(button: button, action: action, modifier: modifier,
-                                gridId: hit.gridId, row: hit.row, col: hit.col)
-            return
+    override func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64) -> (gridId: Int64, row: Int32, col: Int32)? {
+        guard let core, let g = pointerGeometry(at: convert(event.locationInWindow, from: nil)) else { return nil }
+        // The pinned grid closed mid-drag: the surface's root grid in
+        // global cells, as Windows' rebaseToGrid, never the window under
+        // the pointer.
+        guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
+            return (1, g.globalRow, g.globalCol)
         }
-        let pinned = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
-        if let pinned {
-            guard let g = pointerGeometry(at: location) else { return }
-            // The pinned grid closed mid-drag: the surface's root grid in
-            // global cells, as Windows' rebaseToGrid, never the window under
-            // the pointer.
-            guard let current = core.getVisibleGridsCached().first(where: { $0.gridId == pinned }) else {
-                core.sendMouseInput(button: button, action: action, modifier: modifier,
-                                    gridId: 1, row: g.globalRow, col: g.globalCol)
-                return
-            }
-            // The pinned grid at its CURRENT placement, as the external surface
-            // and Windows rebase: a grid that moves mid-drag keeps receiving the
-            // cells under the pointer.
-            let localRow: Int32
-            if let followerOffsetPx = renderer?.drawnFollowerOffsetsPx()[pinned] {
-                // A follower is drawn displaced bodily and has no ease of its
-                // own to undo.
-                localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - current.startRow
-            } else {
-                localRow = scrollAdjustedLocalRow(
-                    pointPxY: g.pointPx.y,
-                    cellHeightPx: g.cellH,
-                    band: GridRowBand(of: current),
-                    scrollOffsetPx: drawnScrollOffsetPx(pinned, cellH: g.cellH)
-                )
-            }
-
-            core.sendMouseInput(
-                button: button,
-                action: action,
-                modifier: modifier,
-                gridId: pinned,
-                row: localRow,
-                col: g.globalCol - current.startCol
-            )
+        let localRow: Int32
+        if let followerOffsetPx = drawnFollowerOffsetsPx()[pinned] {
+            // A follower is drawn displaced bodily and has no ease of its
+            // own to undo.
+            localRow = Int32(((g.pointPx.y - followerOffsetPx) / g.cellH).rounded(.down)) - current.startRow
         } else {
-            let (gridId, row, col) = hitTestGrid(at: location)
-            core.sendMouseInput(
-                button: button,
-                action: action,
-                modifier: modifier,
-                gridId: gridId,
-                row: row,
-                col: col
+            localRow = scrollAdjustedLocalRow(
+                pointPxY: g.pointPx.y,
+                cellHeightPx: g.cellH,
+                band: GridRowBand(of: current),
+                scrollOffsetPx: drawnScrollOffsetPx(pinned, cellH: g.cellH)
             )
         }
+        return (pinned, localRow, g.globalCol - current.startCol)
     }
 
     override func layout() {
         super.layout()
         ZonvieCore.appLog("[DEBUG-LAYOUT] bounds=\(bounds) drawableSize=\(drawableSize)")
         updateDrawableSizeIfPossible()
-        layoutScrollbar()
     }
 
     // The cell a click here would name, ease undone: hovering read the drawn
     // row, so mid-ease the hand showed over a row a click missed.
     override func urlHoverCell(at location: CGPoint) -> (gridId: Int64, row: Int32, col: Int32)? {
         hitTestGrid(at: location)
+    }
+
+    /// Another surface's start_row and start_col are in that surface's space,
+    /// so only a cursor this window draws has a rect here.
+    override func imeCursorRectInView() -> NSRect? {
+        guard let core else { return nil }
+        let cursor = core.getCursorPositionNonBlocking()
+        guard cursor.row >= 0, cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 else { return nil }
+        // Cursor is grid-local; add the grid's screen offset.
+        var screenRow = Int(cursor.row)
+        var screenCol = Int(cursor.col)
+        for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
+            screenRow = Int(grid.startRow) + Int(cursor.row)
+            screenCol = Int(grid.startCol) + Int(cursor.col)
+            break
+        }
+        let cell = imePreeditCellSize
+        return NSRect(x: CGFloat(screenCol) * cell.width,
+                      y: bounds.height - CGFloat(screenRow + 1) * cell.height,
+                      width: cell.width, height: cell.height)
     }
 
     private func updateDrawableSizeIfPossible() {
@@ -883,41 +848,14 @@ final class MetalTerminalView: GridInputView {
             ndcScale: ndcScale
         )
 
-        // Collect fixed (non-following) floats so the fragment shader can discard
-        // scrolled content that would otherwise bleed over them while an adjacent
-        // row is shifted. Only relevant while a smooth scroll is active.
-        fixedFloatRectsScratch.removeAll(keepingCapacity: true)
-        if scrollOffsetsComplete && !scrollOffsetInfoScratch.isEmpty {
-            let cellW = Float(renderer.cellWidthPx)
-            for g in grids
-                where g.zindex > 0 && g.gridId != 1 && !g.followsScroll && mainSurfaceDraws(g)
-            {
-                // A directly-scrolled float stays in the mask: the z-aware
-                // guard compares its own zindex against the mask segment's, so
-                // it cannot self-discard, while lower-z content scrolled in
-                // the same frame is still masked under it.
-                guard GridSurfaceRenderer.FixedFloatRect.append(
-                    originPx: simd_float2(Float(g.startCol) * cellW, Float(g.startRow) * cellHeightPx),
-                    cols: Int(g.cols), rows: Int(g.rows), z: Int(clamping: g.zindex),
-                    cellW: cellW, cellH: cellHeightPx,
-                    into: &fixedFloatRectsScratch
-                ) else { break }
-            }
-        }
-        let fixedFloatMaskRepresentable = renderer.updateFixedFloatRects(fixedFloatRectsScratch)
-
-        // A partial transform is visibly wrong: it can split related windows
-        // or let shifted content bleed through an omitted fixed float. Fall
-        // back to the committed, cell-aligned frame when either constant
-        // buffer would overflow instead of truncating semantic state.
+        // A partial transform is visibly wrong: it can split related windows.
+        // Fall back to the committed, cell-aligned frame when the offset
+        // buffer would overflow instead of truncating semantic state. The
+        // fixed-float mask is the renderer's, built in draw from its layers.
         drewWithoutScrollTransform = false
-        if !fixedFloatMaskRepresentable {
+        if !scrollOffsetsComplete || scrollOffsetInfoScratch.count > Self.maxScrollOffsets {
             drewWithoutScrollTransform = true
             scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
-        } else if !scrollOffsetsComplete || scrollOffsetInfoScratch.count > Self.maxScrollOffsets {
-            drewWithoutScrollTransform = true
-            scrollOffsetInfoScratch.removeAll(keepingCapacity: true)
-            renderer.updateFixedFloatRects([])
         }
 
         if FrameTracer.enabled {
@@ -1014,7 +952,16 @@ final class MetalTerminalView: GridInputView {
     /// The ease offset the last frame drew `grid` with: none at all on a frame
     /// that dropped the scroll transform, as on the external surface.
     private func drawnScrollOffsetPx(_ grid: Int64, cellH: CGFloat) -> CGFloat {
-        drewWithoutScrollTransform ? 0 : scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
+        if drewWithoutScrollTransform || renderer.drewWithoutScrollTransform { return 0 }
+        return scrollModel?.visualScrollOffsetPx(gridId: grid, cellHeightPx: cellH) ?? 0
+    }
+
+    /// The renderer's follower map, skipped while nothing is displaced: the
+    /// answer would be empty, and asking costs its lock and a Dictionary on
+    /// every pointer move.
+    private func drawnFollowerOffsetsPx() -> [Int64: CGFloat] {
+        guard scrollModel?.hasOffsets == true, let renderer else { return [:] }
+        return renderer.drawnFollowerOffsetsPx()
     }
 
     private func hitTestGrid(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
@@ -1053,7 +1000,7 @@ final class MetalTerminalView: GridInputView {
             cellHeightPx: cellH,
             globalCol: globalCol,
             staticGridId: bestGridId,
-            followers: renderer?.drawnFollowerOffsetsPx() ?? [:],
+            followers: drawnFollowerOffsetsPx(),
             zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
             resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: false) }
         ) {
@@ -1121,7 +1068,7 @@ final class MetalTerminalView: GridInputView {
             cellHeightPx: geo.cellH,
             globalCol: globalCol,
             staticGridId: target?.gridId ?? 1,
-            followers: renderer?.drawnFollowerOffsetsPx() ?? [:],
+            followers: drawnFollowerOffsetsPx(),
             zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
             resolve: { row, col in
                 self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable)
@@ -1313,7 +1260,7 @@ struct ScrollTargetLock {
 /// and first-responder acceptance. It is a class, not a protocol extension,
 /// because the ObjC runtime never sees a Swift default implementation.
 /// Subclasses supply the view-specific half as an IMEPreeditHost.
-class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
+class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreeditHost {
     /// The session this surface serves: input, scrollbar and IME all route
     /// through it. The views kept three names for it (core, scrollbarCore,
     /// imeCore).
@@ -1346,6 +1293,41 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     }
 
     var imePreeditContainer: NSView { self }
+
+    /// The cursor's cell in view points, or nil when this surface does not
+    /// draw the cursor. The overlay and the candidate window both come from
+    /// here, so they cannot disagree about whose cursor it is.
+    func imeCursorRectInView() -> NSRect? { nil }
+
+    /// The candidate-window cell when the cursor is not on this surface.
+    func imeFallbackRectInView() -> NSRect {
+        let cell = imePreeditCellSize
+        return NSRect(x: 0, y: bounds.height - cell.height, width: cell.width, height: cell.height)
+    }
+
+    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
+        if let rect = imeCursorRectInView() { return rect.origin }
+        let cell = imePreeditCellSize
+        return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
+    }
+
+    /// A grid another surface shows is placed by that surface, in its own
+    /// coordinates, hosted float included: ask it. An external window made key
+    /// by Cmd-` does not move Neovim's cursor, so the answer may be the main
+    /// window's.
+    func imeFirstRect() -> NSRect {
+        guard let win = window else { return .zero }
+        if let core {
+            let cursor = core.getCursorPositionNonBlocking()
+            let showing: GridInputView? = core.externalViewShowing(gridId: cursor.gridId) ?? core.terminalView
+            if cursor.row >= 0, cursor.col >= 0, let showing, showing !== self {
+                return showing.imeFirstRect()
+            }
+        }
+        return win.convertToScreen(convert(imeCursorRectInView() ?? imeFallbackRectInView(), to: nil))
+    }
+
+    func imeSendCommitted(_ text: String) { core?.keyInput.sendInput(text, owner: self) }
 
     // MARK: - Redraw
 
@@ -1412,9 +1394,15 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     // running.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        applyAlwaysScrollbarVisibility()
         guard window == nil else { return }
         deactivateSurfaceDrawLoop()
         core?.keyInput.disarmIfHeld(by: self, reason: "view detached from window")
+    }
+
+    override func layout() {
+        super.layout()
+        layoutScrollbar()
     }
 
     // MARK: - Pointer
@@ -1503,8 +1491,10 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
     /// it is drawn in the main window ([cmdline] external = false) does a drop
     /// while it is up insert.
     final var bufferDropInsertsPath: Bool {
-        guard let core, !core.hasExternalCmdlineWindow else { return false }
-        return core.getCurrentMode().hasPrefix("cmdline")
+        guard let core else { return false }
+        return core.getCurrentMode().withCString {
+            zonvie_core_drop_inserts_path($0, strlen($0), core.hasExternalCmdlineWindow, false)
+        }
     }
 
     func registerFileDrops() {
@@ -1537,19 +1527,14 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
               let core
         else { return false }
         if dropInsertsPath {
-            core.sendInput(urls.map { escapePathForNeovim($0.path) }.joined(separator: " "))
+            core.sendInput(urls.map { ZonvieCore.escapePathForCmdline($0.path) }.joined(separator: " "))
         } else {
             core.dropPaths(urls.map { $0.path }, tabPerFile: false)
         }
         return true
     }
 
-    private lazy var ime: IMEPreeditController = {
-        guard let host = self as? IMEPreeditHost else {
-            preconditionFailure("GridInputView subclasses must be IMEPreeditHosts")
-        }
-        return IMEPreeditController(host: host)
-    }()
+    private lazy var ime = IMEPreeditController(host: self)
     private var _inputContext: NSTextInputContext?
 
     // Nonisolated so the subclasses' nonisolated deinits have one to
@@ -1596,9 +1581,43 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost {
 
     // MARK: - Mouse buttons
 
-    /// Send one button event to Neovim, resolved against this surface's grids.
-    /// Each surface resolves the grid a point names its own way.
-    func sendGridMouseEvent(button: String, action: String, event: NSEvent) {}
+    /// The grid a press claimed, kept for its drag and release: Neovim keeps a
+    /// drag on the window the press chose, so re-resolving mid-drag switches
+    /// coordinate spaces, and a release re-resolved under the pointer ended a
+    /// selection dragged out of a float in the window behind it. Windows pins
+    /// the same way (app.mouse_press_grid_id).
+    private var pressGridId = SurfacePressPin<Int64>()
+
+    /// The grid an event's point names, resolved this surface's way.
+    func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
+        (surfaceId, 0, 0)
+    }
+
+    /// The pinned grid at its CURRENT placement, so a grid that moves
+    /// mid-drag keeps receiving the cells under the pointer; nil sends nothing.
+    func rebaseToPinnedGrid(_ event: NSEvent, pinned: Int64) -> (gridId: Int64, row: Int32, col: Int32)? {
+        resolvePointerTarget(event, requireScrollable: false)
+    }
+
+    /// Send one button event to Neovim: a press resolves and pins its grid,
+    /// the drag and release that follow stay on it.
+    func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
+        guard let core else { return }
+        let target: (gridId: Int64, row: Int32, col: Int32)
+        let pinned = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
+        if action == "press" {
+            let hit = resolvePointerTarget(event, requireScrollable: false)
+            pressGridId.press(button: button) { hit.gridId }
+            target = hit
+        } else if let pinned {
+            guard let rebased = rebaseToPinnedGrid(event, pinned: pinned) else { return }
+            target = rebased
+        } else {
+            target = resolvePointerTarget(event, requireScrollable: false)
+        }
+        core.sendMouseInput(button: button, action: action, modifier: neovimModifierString(event.modifierFlags),
+                            gridId: target.gridId, row: target.row, col: target.col)
+    }
 
     // Every press takes first responder, so keys follow the grid clicked;
     // the main surface used to take it on the left button only.
@@ -1932,57 +1951,6 @@ final class IMEPreeditController {
         if let a = string as? NSAttributedString { return NSMutableAttributedString(attributedString: a) }
         return NSMutableAttributedString()
     }
-}
-
-// MARK: - MetalTerminalView IME host
-
-extension MetalTerminalView: IMEPreeditHost {
-    /// The cursor's cell in view points, or nil when this window does not
-    /// draw it: another surface's start_row and start_col are in that
-    /// surface's space. The overlay and the candidate window both come from
-    /// here, so they cannot disagree about whose cursor it is.
-    private func imeCursorRectInView() -> NSRect? {
-        guard let core else { return nil }
-        let cursor = core.getCursorPositionNonBlocking()
-        guard cursor.row >= 0, cursor.col >= 0, core.showingSurfaceId(for: cursor.gridId) == 1 else { return nil }
-        // Cursor is grid-local; add the grid's screen offset.
-        var screenRow = Int(cursor.row)
-        var screenCol = Int(cursor.col)
-        for grid in core.getVisibleGridsCached() where grid.gridId == cursor.gridId {
-            screenRow = Int(grid.startRow) + Int(cursor.row)
-            screenCol = Int(grid.startCol) + Int(cursor.col)
-            break
-        }
-        let cell = imePreeditCellSize
-        return NSRect(x: CGFloat(screenCol) * cell.width,
-                      y: bounds.height - CGFloat(screenRow + 1) * cell.height,
-                      width: cell.width, height: cell.height)
-    }
-
-    func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint {
-        if let rect = imeCursorRectInView() { return rect.origin }
-        let cell = imePreeditCellSize
-        return CGPoint(x: cell.width, y: bounds.height - cell.height - preeditHeight)
-    }
-
-    func imeFirstRect() -> NSRect {
-        guard let win = window else { return .zero }
-        if let core {
-            let cursor = core.getCursorPositionNonBlocking()
-            // A grid an external window shows is placed by that window, in its
-            // own coordinates, hosted float included: ask it.
-            if cursor.row >= 0 && cursor.col >= 0,
-               let showing = core.externalViewShowing(gridId: cursor.gridId) {
-                return showing.imeFirstRect()
-            }
-        }
-        let cell = imePreeditCellSize
-        let rectInView = imeCursorRectInView()
-            ?? NSRect(x: 0, y: bounds.height - cell.height, width: cell.width, height: cell.height)
-        return win.convertToScreen(convert(rectInView, to: nil))
-    }
-
-    func imeSendCommitted(_ text: String) { keyInput?.sendInput(text, owner: self) }
 }
 
 // MARK: - Preedit Overlay View
