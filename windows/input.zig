@@ -710,7 +710,7 @@ pub fn mousePosFromLParam(lParam: c.LPARAM) struct { x: i32, y: i32 } {
 }
 
 /// The name Neovim knows a held button by, from the code stored in
-/// `App.mouse_button_held`. Null for "no button held", which is what tells a
+/// `App.press_claim.owner`. Null for "no button held", which is what tells a
 /// move it is not a drag.
 pub fn heldMouseButtonName(held: u8) ?[*:0]const u8 {
     return switch (held) {
@@ -864,12 +864,9 @@ pub fn mouseButtonResult(msg: c.UINT) c.LRESULT {
 /// Capture held with no editor button down belongs to a scrollbar or tab
 /// drag: another button then stays out of the editor, as it would its release.
 pub fn pressEditorButton(app: *App, hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, target: MouseTarget) void {
-    if (uiOwnsCapture(app.mouse_button_held, msg, c.GetCapture() == hwnd)) return;
+    if (uiOwnsCapture(app.press_claim.owner, msg, c.GetCapture() == hwnd)) return;
     const b = mouseButton(msg, wParam);
-    if (app.mouse_button_held != 1) {
-        app.mouse_button_held = b.code;
-        app.mouse_press_grid_id = target.grid_id;
-    }
+    if (app.press_claim.press(b.code)) app.mouse_press_grid_id = target.grid_id;
     if (c.GetCapture() != hwnd) _ = c.SetCapture(hwnd);
     sendMouseButton(app, target.grid_id, b.name, .press, target.x, target.y, wParam);
 }
@@ -878,11 +875,10 @@ pub const ButtonRelease = struct {
     /// The grid the press chose; 0 when the press never reached the editor
     /// (chrome, scrollbar, copy button), which then gets no release either.
     press_grid: i64,
-    /// A button other than the one holding the claim let go (mid left-drag,
-    /// or right under a middle press): the claim, its capture and its own
-    /// release still belong to that button. Also true for a non-left release
-    /// with no editor button held: any capture is a scrollbar or tab drag's,
-    /// and releasing it would cancel that drag.
+    /// Another button is still held (frontend_rules.PressClaim): the claim
+    /// and its capture go on. Also true for a non-left release the editor
+    /// never saw: any capture is a scrollbar or tab drag's, and releasing it
+    /// would cancel that drag.
     left_drag_continues: bool,
 };
 
@@ -896,15 +892,13 @@ pub fn uiOwnsCapture(mouse_button_held: u8, msg: c.UINT, window_has_capture: boo
 /// branch that returned first left a button held, and every later
 /// WM_MOUSEMOVE then dragged with no button down.
 pub fn takeButtonRelease(app: *App, msg: c.UINT, wParam: c.WPARAM) ButtonRelease {
-    const held = app.mouse_button_held;
+    const r = app.press_claim.release(mouseButton(msg, wParam).code);
     const rel: ButtonRelease = .{
-        .press_grid = app.mouse_press_grid_id,
-        .left_drag_continues = if (held == 0) msg != c.WM_LBUTTONUP else mouseButton(msg, wParam).code != held,
+        .press_grid = if (r.send) app.mouse_press_grid_id else 0,
+        // An unsent release keeps the capture while an editor press still holds it.
+        .left_drag_continues = if (r.send) !r.ends else (!r.ends or msg != c.WM_LBUTTONUP),
     };
-    if (!rel.left_drag_continues) {
-        app.mouse_button_held = 0;
-        app.mouse_press_grid_id = 0;
-    }
+    if (r.ends) app.mouse_press_grid_id = 0;
     return rel;
 }
 
@@ -918,7 +912,7 @@ pub fn releaseEditorButton(app: *App, msg: c.UINT, wParam: c.WPARAM, rel: Button
 /// Capture was taken away: no button-up will arrive, and it is the only
 /// place the held state ends.
 pub fn cancelMouseButtons(app: *App) void {
-    app.mouse_button_held = 0;
+    app.press_claim = .{};
     app.mouse_press_grid_id = 0;
 }
 
@@ -1589,12 +1583,12 @@ fn killBlinkTimer(hwnd: c.HWND, app: *App) void {
     }
 }
 
-/// Repaint the main window's cursor, when it holds one. No rect means the
-/// cursor is in an external window, where a toggle changes no pixel here; a
-/// whole-window invalidate would present the full frame.
+/// Repaint the main window's cursor, when it holds one: the same question the
+/// external windows ask. With no rect nothing is invalidated; a whole-window
+/// invalidate would present the full frame.
 fn invalidateMainCursor(hwnd: c.HWND, app: *App) void {
     app.mu.lockUncancelable(core.clock.io());
-    const cursor_rect = app.last_cursor_rect_px;
+    const cursor_rect = if (app.surf.has_committed_cursor) app.last_cursor_rect_px else null;
     app.mu.unlock(core.clock.io());
     if (cursor_rect) |rect| _ = c.InvalidateRect(hwnd, &rect, c.FALSE);
 }
@@ -1727,10 +1721,8 @@ pub fn updateExternalWindowsBlinkState(app: *App) void {
         // Paint reads app.cursor_blink.visible directly. Only the surface that actually holds a cursor repaints. A toggle
         // changes no pixel on the others, and the whole-window invalidate cost
         // each of them a no-op WM_PAINT — app.mu, a layer scan and a snapshot
-        // acquire/release — twice a second, scaling with the window count. The
-        // main window has always skipped its own invalidate the same way, on a
-        // null `last_cursor_rect_px`.
-        if (!ext_win.has_committed_cursor) continue;
+        // acquire/release — twice a second, scaling with the window count.
+        if (!ext_win.surf.has_committed_cursor) continue;
         if (ext_win.hwnd) |ext_hwnd| {
             _ = c.InvalidateRect(ext_hwnd, null, c.FALSE);
         }

@@ -153,9 +153,11 @@ final class ViewController: NSViewController {
     /// Start the core: a remote session on main (its auth dialogs need the
     /// RunLoop), a local one off it.
     private func dispatchStart(nvimPath: String, remote: Bool, context: String) {
+        core.startRequested = true
         let queue = remote ? DispatchQueue.main : DispatchQueue.global(qos: .userInitiated)
         queue.async { [weak self] in
-            guard let self = self else { return }
+            // A remote start runs on main, where the cancel flag may be read.
+            guard let self = self, !(remote && self.core.startCancelled) else { return }
             let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
             if rc != 0 { self.handleCoreStartFailure(rc: rc, context: context) }
         }

@@ -121,47 +121,8 @@ pub const zonvie_msg_event = core.zonvie_msg_event;
 // Small shared text helpers
 // =========================================================================
 
-/// Length of the longest prefix of `s` that fits in `max_bytes` without
-/// splitting a UTF-8 codepoint. Used to truncate user text before copying into
-/// a fixed buffer so later UTF-16 conversion can't see a partial codepoint.
-pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
-    var n = @min(s.len, max_bytes);
-    // Back up off any UTF-8 continuation byte (0b10xxxxxx) so we end on a
-    // codepoint boundary.
-    while (n > 0 and (s[n - 1] & 0xC0) == 0x80) n -= 1;
-    return n;
-}
-
-/// The longest valid UTF-8 prefix of `s` that converts to at most
-/// `max_utf16` UTF-16 units. utf8ToUtf16Le rejects invalid input and does not
-/// bound its destination.
-pub fn utf8ValidPrefix(s: []const u8, max_utf16: usize) []const u8 {
-    var i: usize = 0;
-    var units: usize = 0;
-    while (i < s.len) {
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
-        if (n > s.len - i) break;
-        _ = std.unicode.utf8Decode(s[i..][0..n]) catch break;
-        const w: usize = if (n == 4) 2 else 1;
-        if (units + w > max_utf16) break;
-        units += w;
-        i += n;
-    }
-    return s[0..i];
-}
-
-test "utf8ValidPrefix stops at the UTF-16 bound and at invalid UTF-8" {
-    try std.testing.expectEqualStrings("abc", utf8ValidPrefix("abc", 8));
-    // Counted in UTF-16 units, not bytes: "あい" is 6 bytes but 2 units.
-    try std.testing.expectEqualStrings("あい", utf8ValidPrefix("あい", 2));
-    try std.testing.expectEqualStrings("あ", utf8ValidPrefix("あい", 1));
-    // A supplementary character takes two units and is not split.
-    try std.testing.expectEqualStrings("a", utf8ValidPrefix("a\u{1F600}", 2));
-    try std.testing.expectEqualStrings("ab", utf8ValidPrefix("ab\xffcd", 8));
-    // A latin1 "é" (0xE9) starts a 3-byte sequence it does not complete.
-    try std.testing.expectEqualStrings("caf", utf8ValidPrefix("caf\xe9.txt", 16));
-    try std.testing.expectEqualStrings("", utf8ValidPrefix("\x80", 4));
-}
+pub const utf8TruncLen = render_pipeline_helpers.utf8TruncLen;
+pub const utf8ValidPrefix = render_pipeline_helpers.utf8ValidPrefix;
 
 /// Basename of a path-like name: the part after the last '/' or '\\',
 /// ignoring trailing separators as macOS's lastPathComponent does, so
@@ -184,10 +145,7 @@ pub fn baseName(name: []const u8) []const u8 {
 /// drew no label at all.
 pub fn tabNameForStorage(name: []const u8, cap: usize) []const u8 {
     const base = baseName(name);
-    if (base.len <= cap) return base;
-    var end = cap;
-    while (end > 0 and (base[end] & 0xC0) == 0x80) end -= 1;
-    return base[0..end];
+    return base[0..utf8TruncLen(base, cap)];
 }
 
 test "tabNameForStorage keeps the basename of a name longer than the cap" {
@@ -1556,20 +1514,14 @@ pub const TrayIcon = struct {
         self.nid.uFlags = c.NIF_INFO;
         self.nid.dwInfoFlags = c.NIIF_INFO;
 
-        // Title -> szInfoTitle (proper UTF-8 -> UTF-16; byte-copy garbles non-ASCII).
-        // utf8ToUtf16Le does NOT bounds-check its destination, so the source must
-        // be truncated to fit first. Each UTF-8 codepoint yields <= as many UTF-16
-        // units as bytes, so bounding the source to the dest u16 capacity (minus
-        // the null terminator slot) guarantees the conversion stays in bounds.
+        // Bounded in UTF-16 units before converting (one slot kept for the
+        // null), as onSetTitle does.
         const title_cap = self.nid.szInfoTitle.len - 1;
-        const tt = title[0..utf8TruncLen(title, title_cap)];
-        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..title_cap], tt) catch 0;
+        const tn = std.unicode.utf8ToUtf16Le(self.nid.szInfoTitle[0..title_cap], utf8ValidPrefix(title, title_cap)) catch 0;
         self.nid.szInfoTitle[tn] = 0;
 
-        // Message -> szInfo (proper UTF-8 -> UTF-16, same bounding rule).
         const msg_cap = self.nid.szInfo.len - 1;
-        const mt = msg_text[0..utf8TruncLen(msg_text, msg_cap)];
-        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..msg_cap], mt) catch 0;
+        const mn = std.unicode.utf8ToUtf16Le(self.nid.szInfo[0..msg_cap], utf8ValidPrefix(msg_text, msg_cap)) catch 0;
         self.nid.szInfo[mn] = 0;
 
         _ = c.Shell_NotifyIconW(c.NIM_MODIFY, &self.nid);
@@ -2460,11 +2412,16 @@ pub const WindowSurface = struct {
     /// This flush owes the window an invalidate. Set under `app.mu` by work
     /// that joins the open flush (core callbacks, and a window seeding its
     /// write set mid-flush), cleared only by onFlushEnd or a failed flush —
-    /// never by paint: `needs_redraw` is also cleared by paint, and a paint
-    /// landing mid-flush erased the request before onFlushEnd read it,
-    /// leaving the window a flush behind.
+    /// never by paint: a paint landing mid-flush would erase the request
+    /// before onFlushEnd read it, leaving the window a flush behind.
 
     flush_needs_invalidate: bool = false,
+    /// Whether the committed cursor set holds any vertices, recorded by paint
+    /// under `app.mu`: whether a blink toggle changes a pixel here. Committed,
+    /// not staged, state: a cancelled flush never reaches the screen.
+    /// `last_painted_cursor_row` cannot answer it, being cleared on every
+    /// blink-off.
+    has_committed_cursor: bool = true,
     paint_retry: PaintRetryState = .{},
     paint_retry_deadline_ms: u64 = 0,
     // The App's atlas_upload_seq this window's last paint saw (syncSharedAtlas).
@@ -2516,7 +2473,6 @@ pub const ExternalWindow = struct {
     /// The state every window's surface keeps; see WindowSurface.
     surf: WindowSurface = .{},
 
-    needs_redraw: bool = false,
     needs_renderer_resize: bool = false, // Deferred renderer resize (to avoid deadlock)
     needs_window_resize: bool = false, // Deferred window resize (to avoid deadlock with WM_SIZE)
     pending_window_w: c_int = 0, // Pending window width for deferred resize
@@ -2545,20 +2501,6 @@ pub const ExternalWindow = struct {
     // DXGI operations can pump Win32 messages, so close could be triggered during paint.
     // This counter ensures ext_win isn't freed until all paint operations complete.
     paint_ref_count: u32 = 0,
-
-    /// Whether this surface's committed cursor set holds any vertices, recorded
-    /// at paint. The blink timer needs to know whether a toggle changes a pixel
-    /// here, and `last_painted_cursor_row` cannot answer that: it is cleared on
-    /// every blink-off, so gating on it would leave the cursor off for good.
-    /// Vertex presence is independent of blink state, which is what makes it
-    /// the right gate. The main window answers the same question with
-    /// `App.last_cursor_rect_px`.
-    ///
-    /// Defaults to true and is only ever narrowed by the normal row-mode paint:
-    /// a decorated surface (cmdline, msg_show, msg_history) draws through
-    /// `drawDecoratedExternalSurface`, which never reaches that point, so it
-    /// keeps the unconditional behaviour rather than silently losing its blink.
-    has_committed_cursor: bool = true,
 
     // Pointer is over the decorated surface's copy-content button.
     copy_button_hover: bool = false,
@@ -5577,9 +5519,9 @@ pub const App = struct {
     // Timestamp of last WM_SIZE (ns since epoch).
     last_resize_ns: i128 = 0,
 
-    // Mouse button tracking for drag events
-    // 0 = none, 1 = left, 2 = right, 3 = middle, 4 = x1, 5 = x2
-    mouse_button_held: u8 = 0,
+    /// Which buttons' presses reached the editor, and the one drags are
+    /// reported as (owner: 0 none, 1 left, 2 right, 3 middle, 4 x1, 5 x2).
+    press_claim: core.frontend_rules.PressClaim = .{},
     /// The grid the press resolved to, held for the drag and release that
     /// follow it. Re-resolving per event would retarget a selection the
     /// moment the pointer leaves the float it started in. Zero means the

@@ -4864,9 +4864,8 @@ fn cmdlineGridWidth(g: *const grid_mod.Grid, line_width: u32) u32 {
     const min_width: u32 = if (g.cmdline_default_cols > 0)
         g.cmdline_default_cols
     else if (g.cols > 0) g.cols else 80;
-    const max_width: u32 = if (g.screen_cols > 0)
-        g.screen_cols
-    else if (g.cols > 0) g.cols else min_width;
+    const max_cols = g.cmdlineMaxCols();
+    const max_width: u32 = if (max_cols > 0) max_cols else min_width;
     return @min(@max(line_width + 1, min_width), max_width); // +1 for the cursor
 }
 
@@ -6526,9 +6525,7 @@ pub fn renderMsgGridFromCache(self: *Core, scroll_offset: u32) bool {
 /// the way could leave committed vertex UVs pointing at an atlas
 /// generation the frontend never swapped to.
 /// Returns true if the scroll was actually committed. False means the
-/// caller must NOT clear msg_scroll_pending / advance msg_scroll_last_send
-/// — the scroll still needs to be retried once a full flush has resent
-/// everything (see the atlas-reset branch below).
+/// caller must keep msg_scroll_pending set so the scroll is retried.
 fn runMsgGridScrollFlush(self: *Core, offset: u32) bool {
     const perf_enabled = self.log.cb != null;
     const perf_start_ns = if (perf_enabled) clock.nowNs() else 0;
@@ -6641,18 +6638,8 @@ pub fn handleMsgGridScroll(self: *Core, direction: []const u8) void {
 
     if (new_offset != self.msg_scroll_offset) {
         self.msg_scroll_offset = new_offset;
-
-        const now = clock.nowNs();
-        if (now - self.msg_scroll_last_send >= msg_scroll_throttle_ns) {
-            self.log.write("[msg] handleMsgGridScroll: {s} offset {d} (send)\n", .{ direction, new_offset });
-            // An aborted attempt (e.g. atlas reset mid-bracket) counts too:
-            // its retry is due a throttle window later, not at once.
-            self.msg_scroll_last_send = now;
-            self.msg_scroll_pending = !runMsgGridScrollFlush(self, new_offset);
-        } else {
-            // Mark pending - will be processed on next throttle window or flush
-            self.msg_scroll_pending = true;
-        }
+        self.msg_scroll_pending = true;
+        processPendingMsgScroll(self);
     }
 }
 
@@ -6682,23 +6669,31 @@ pub fn handleMsgHistoryScroll(self: *Core, direction: []const u8) void {
 /// deadline the frontends' one message timer serves.
 pub const msg_scroll_throttle_ns: i128 = 16 * std.time.ns_per_ms;
 
-/// Process pending scroll update (called from flush or timer).
+/// Send the pending msg float scroll once its deadline is due. Called from
+/// the wheel handler and the message tick.
 pub fn processPendingMsgScroll(self: *Core) void {
     if (!self.msg_scroll_pending) return;
     if (!self.grid.external_grids.contains(grid_mod.MESSAGE_GRID_ID)) {
         // There is nothing left to scroll: the view was hidden while the
-        // retry was outstanding. Returning without clearing left the flag
-        // set forever, and the frontends read it as "retry needed" and
-        // re-armed a 50ms timer on every tick, each one taking grid_mu.
+        // retry was outstanding. Left set, the flag keeps a deadline armed.
         self.msg_scroll_pending = false;
         return;
     }
+    const now = clock.nowNs();
+    if (now - self.msg_scroll_last_send < msg_scroll_throttle_ns) return;
 
     self.log.write("[msg] processPendingMsgScroll: offset {d}\n", .{self.msg_scroll_offset});
-    // Aborted: still pending, and due again a throttle window after this
-    // attempt, so the message timer does not re-arm at 0 ms.
-    self.msg_scroll_last_send = clock.nowNs();
-    self.msg_scroll_pending = !runMsgGridScrollFlush(self, self.msg_scroll_offset);
+    self.msg_scroll_last_send = now;
+    if (runMsgGridScrollFlush(self, self.msg_scroll_offset)) {
+        self.msg_scroll_pending = false;
+        self.msg_scroll_retry_delay_ns = msg_scroll_throttle_ns;
+    } else {
+        // Still pending, due after its own doubling backoff (capped at 1 s,
+        // as the other retries) so a sustained abort does not retry at 60 Hz.
+        // Its own: the msg_show delay other aborts inflate is not this one's.
+        self.msg_scroll_last_send = now + self.msg_scroll_retry_delay_ns - msg_scroll_throttle_ns;
+        self.msg_scroll_retry_delay_ns = @min(self.msg_scroll_retry_delay_ns * 2, std.time.ns_per_s);
+    }
 }
 
 /// Hide msg_show external grid.
@@ -6713,6 +6708,7 @@ pub fn hideMsgShow(self: *Core) void {
     self.msg_total_lines = 0;
     self.msg_cached_max_width = 0;
     self.msg_scroll_pending = false;
+    self.msg_scroll_retry_delay_ns = msg_scroll_throttle_ns;
     self.msg_show_retry_at = null;
     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
     self.msg_line_cache.clearRetainingCapacity();
@@ -11858,6 +11854,35 @@ test "a throttled msg float scroll is a deadline one throttle window after the l
     // Nothing left to scroll: the retry clears the flag, and the deadline goes.
     processPendingMsgScroll(&core);
     try std.testing.expect(nextMsgTimeoutNs(&core) == null);
+}
+
+test "a repeatedly aborted msg float scroll backs off from one throttle window" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    try appendTestMessage(&core, 1, "echo", "readable");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+    AbortProbe.target = &core;
+    defer AbortProbe.target = null;
+    core.cb.on_flush_begin = AbortProbe.onBegin;
+
+    // A msg_show backoff other aborts inflated is not the scroll's: its first
+    // retry is one throttle window out.
+    core.msg_show_retry_delay_ns = std.time.ns_per_s;
+    core.msg_scroll_pending = true;
+    core.msg_scroll_last_send = 0;
+    processPendingMsgScroll(&core);
+    const after_first_ns = clock.nowNs();
+    try std.testing.expect(core.flush_aborted and core.msg_scroll_pending);
+    try std.testing.expect(nextMsgTimeoutNs(&core).? <= after_first_ns + msg_scroll_throttle_ns);
+
+    // Emulate the tick firing at the deadline.
+    core.msg_scroll_last_send -= std.time.ns_per_s;
+    processPendingMsgScroll(&core);
+    const after_second_ns = clock.nowNs();
+    try std.testing.expect(core.flush_aborted and core.msg_scroll_pending);
+    try std.testing.expect(nextMsgTimeoutNs(&core).? > after_second_ns + msg_scroll_throttle_ns);
 }
 
 test "hiding the history grid drops its retry deadline" {

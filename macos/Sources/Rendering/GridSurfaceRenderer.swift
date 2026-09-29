@@ -1828,6 +1828,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// Cell height in drawable pixel coordinates, `linespace` included.
     var cellHeightPx: Float { shared.cellHeightPx }
 
+    /// The integer cell size the core lays out with and the window snaps to.
+    var coreCellPx: (w: Int, h: Int) {
+        (max(1, Int(cellWidthPx.rounded(.toNearestOrAwayFromZero))),
+         max(1, Int(cellHeightPx.rounded(.toNearestOrAwayFromZero))))
+    }
+
 
     var currentFontName: String { shared.atlas.currentFontName }
 
@@ -2059,11 +2065,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         return result
     }
 
-    /// A committed layer's paint rank, for the pointer.
-    func paintRank(gridId: Int64) -> Int? {
+    /// Every committed layer's paint rank, for the pointer, under one lock.
+    func paintRanks() -> [Int64: Int] {
         lock.lock()
         defer { lock.unlock() }
-        return committedSurfaceLayers.first { $0.gridId == gridId }?.z
+        var ranks: [Int64: Int] = [:]
+        for layer in committedSurfaceLayers where ranks[layer.gridId] == nil { ranks[layer.gridId] = layer.z }
+        return ranks
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk

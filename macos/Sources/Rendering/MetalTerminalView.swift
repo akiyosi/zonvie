@@ -549,8 +549,7 @@ final class MetalTerminalView: GridInputView {
     private func maybeResizeCoreGrid() {
         guard let core else { return }
 
-        let cellWi = max(1, Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-        let cellHi = max(1, Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let (cellWi, cellHi) = renderer.coreCellPx
 
         let pxWi = max(1, Int(drawableSize.width))
         let pxHi = max(1, Int(drawableSize.height))
@@ -985,14 +984,15 @@ final class MetalTerminalView: GridInputView {
         // offset of its own for the correction below: during an ease or a held
         // bounce a press landed rows from where it is drawn, or in the window
         // behind. See resolveDisplacedFollowerHit.
+        let followers = drawnFollowerOffsetsPx()
+        let ranks = followers.isEmpty ? [:] : (renderer?.paintRanks() ?? [:])
         switch resolveDisplacedFollowerHit(
             pointPxY: pointPx.y,
             cellHeightPx: cellH,
             globalCol: globalCol,
             staticGridId: bestGridId,
-            followers: drawnFollowerOffsetsPx(),
-            paintRankOf: { id in self.renderer?.paintRank(gridId: id) },
-            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable) },
+            followers: followers,
+            paintRankOf: { ranks[$0] },
             resolveExcluding: { row, col, excluded in
                 core.resolvePointerGrid(surfaceId: 1, row: row, col: col,
                                         requireScrollable: requireScrollable, excluding: excluded)
@@ -1321,6 +1321,12 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
         requestRedraw()
     }
 
+    /// Only a window covering all of this one can hide it; holding the frames
+    /// on every activation stalled the surface at each `:`.
+    func markOcclusionSuspect(ifCoveredBy front: NSWindow) {
+        if let frame = window?.frame, front.frame.contains(frame) { markOcclusionSuspect() }
+    }
+
     enum VisibilityGate { case draw, unsettled, hidden }
 
     /// Whether this surface may draw now. `.unsettled` is checked first: during
@@ -1600,8 +1606,20 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// drag on the window the press chose, so re-resolving mid-drag switches
     /// coordinate spaces, and a release re-resolved under the pointer ended a
     /// selection dragged out of a float in the window behind it. Windows pins
-    /// the same way (app.mouse_press_grid_id).
-    private var pressGridId = SurfacePressPin<Int64>()
+    /// the same way (app.mouse_press_grid_id). Which presses were sent and
+    /// when the claim ends is the core's rule (zonvie_press_claim).
+    private var pressClaim = zonvie_press_claim()
+    private var pressGridId: Int64?
+
+    private static func pressButtonCode(_ button: String) -> UInt8 {
+        switch button {
+        case "left": return 1
+        case "right": return 2
+        case "middle": return 3
+        case "x1": return 4
+        default: return 5
+        }
+    }
 
     /// The grid an event's point names, resolved this surface's way.
     func resolvePointerTarget(_ event: NSEvent, requireScrollable: Bool) -> (gridId: Int64, row: Int32, col: Int32) {
@@ -1619,17 +1637,21 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     func sendGridMouseEvent(button: String, action: String, event: NSEvent) {
         guard let core else { return }
         let target: (gridId: Int64, row: Int32, col: Int32)
-        let pinned = action == "release" ? pressGridId.release(button: button) : pressGridId.pinned
+        let code = Self.pressButtonCode(button)
         if action == "press" {
             let hit = resolvePointerTarget(event, requireScrollable: false)
-            pressGridId.press(button: button) { hit.gridId }
+            if zonvie_core_press_claim_press(&pressClaim, code) { pressGridId = hit.gridId }
             target = hit
-        } else if let pinned {
-            guard let rebased = rebaseToPinnedGrid(event, pinned: pinned) else { return }
-            target = rebased
         } else {
-            // No press claimed it: Neovim never saw one, as on Windows.
-            return
+            var pinned = pressGridId
+            if action == "release" {
+                let r = UInt32(zonvie_core_press_claim_release(&pressClaim, code))
+                if r & ZONVIE_PRESS_RELEASE_ENDS != 0 { pressGridId = nil }
+                // Its press never reached Neovim.
+                if r & ZONVIE_PRESS_RELEASE_SEND == 0 { pinned = nil }
+            }
+            guard let pinned, let rebased = rebaseToPinnedGrid(event, pinned: pinned) else { return }
+            target = rebased
         }
         core.sendMouseInput(button: button, action: action, modifier: neovimModifierString(event.modifierFlags),
                             gridId: target.gridId, row: target.row, col: target.col)

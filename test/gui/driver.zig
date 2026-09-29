@@ -192,6 +192,12 @@ pub const Gui = struct {
         try argv.append(alloc, try alloc.dupe(u8, app_path));
         try argv.append(alloc, try std.fmt.allocPrint(alloc, "--connect-nvim={s}", .{g.listen_addr}));
         for (opts.app_args) |a| try argv.append(alloc, try alloc.dupe(u8, a));
+        // AppKit window restoration lives in the real user's Saved
+        // Application State, like the frame autosave below: never read it.
+        if (builtin.os.tag == .macos) {
+            try argv.append(alloc, try alloc.dupe(u8, "-ApplePersistenceIgnoreState"));
+            try argv.append(alloc, try alloc.dupe(u8, "YES"));
+        }
         g.app_argv = try argv.toOwnedSlice(alloc);
 
         // Isolate from the user's real config: point the platform config
@@ -210,9 +216,12 @@ pub const Gui = struct {
         // Home isolation (persisted app state, frame autosave). A scenario
         // may name the dir, for relaunch comparisons; otherwise every Gui
         // gets a fresh one of its own. On macOS the app restores its window
-        // frame from NSUserDefaults, which live under HOME, so a scenario
-        // that did not isolate it ran at whatever frame the user's own
-        // zonvie — or the previous scenario's app — saved last. Two
+        // frame from NSUserDefaults, which do NOT follow HOME (or
+        // CFFIXED_USER_HOME): cfprefs keeps them in the real user's domain.
+        // So every scenario ran at whatever frame the user's own zonvie last
+        // saved, and wrote its own back over it. ZONVIE_FRAME_AUTOSAVE_NAME
+        // keeps the app off the user's key: none for a fresh home, and one
+        // of its own for a named home, whose relaunches compare frames. Two
         // scenarios that assumed a geometry (a float under the window's
         // centre, a margin band with no sub-cell remainder) failed or flaked
         // on that alone. Windows keeps the opt-in: its persisted state under
@@ -230,6 +239,16 @@ pub const Gui = struct {
             const home_abs = try std.Io.Dir.cwd().realPathFileAlloc(gui_io.io(), home, alloc);
             defer alloc.free(home_abs);
             try g.app_env.put(if (builtin.os.tag == .windows) "USERPROFILE" else "HOME", home_abs);
+            if (builtin.os.tag == .macos) {
+                var name_buf: [160]u8 = undefined;
+                // Per run too: the key outlives the home dir the scenario
+                // deletes, and a first launch must start from no frame.
+                const name = if (opts.home_dir) |h|
+                    try std.fmt.bufPrint(&name_buf, "zonvie.gui_test.{s}.{d}", .{ std.fs.path.basename(h), currentPid() })
+                else
+                    "";
+                try g.app_env.put("ZONVIE_FRAME_AUTOSAVE_NAME", name);
+            }
         }
 
         try g.launchApp();

@@ -697,31 +697,3 @@ struct SurfaceBlinkState {
         lock.unlock()
     }
 }
-
-/// The grid a press claimed, kept for its drag and release, on both macOS
-/// surfaces. Another button pressed mid left-drag leaves the claim to the
-/// left button, and its release does not end it: taking it re-pinned the drag
-/// under the pointer and the second release cleared it. Windows' rule
-/// (pressEditorButton/takeButtonRelease).
-struct SurfacePressPin<Pin> {
-    private(set) var pinned: Pin?
-    private var owner = ""
-
-    /// `pin` runs only when this press takes the claim; a left press keeps it.
-    mutating func press(button: String, pin: () -> Pin?) {
-        guard owner != "left" else { return }
-        owner = button
-        pinned = pin()
-    }
-
-    /// The pin this release is addressed to; only the button that took the
-    /// claim ends it, so an overlapped press still gets its own release.
-    mutating func release(button: String) -> Pin? {
-        let released = pinned
-        if button == owner {
-            owner = ""
-            pinned = nil
-        }
-        return released
-    }
-}

@@ -1423,3 +1423,57 @@ test "clampMiniContent keeps ten lines, or nine and a summary, as macOS" {
     try std.testing.expect(std.mem.endsWith(u8, out, "\n\u{2026}(2 more lines)"));
     try std.testing.expect(std.mem.startsWith(u8, out, "a"));
 }
+
+test "utf8TruncLen never keeps a lead byte without its continuation bytes" {
+    // A text ending in a multibyte character that fits is kept whole.
+    try std.testing.expectEqual(@as(usize, 3), helpers.utf8TruncLen("あ", 8));
+    try std.testing.expectEqual(@as(usize, 3), helpers.utf8TruncLen("あ", 3));
+    try std.testing.expectEqual(@as(usize, 0), helpers.utf8TruncLen("あ", 2));
+    try std.testing.expectEqual(@as(usize, 0), helpers.utf8TruncLen("あ", 1));
+    try std.testing.expectEqual(@as(usize, 6), helpers.utf8TruncLen("あい", 6));
+    try std.testing.expectEqual(@as(usize, 3), helpers.utf8TruncLen("あい", 5));
+    try std.testing.expectEqual(@as(usize, 3), helpers.utf8TruncLen("あい", 4));
+    try std.testing.expectEqual(@as(usize, 3), helpers.utf8TruncLen("あい", 3));
+    try std.testing.expectEqual(@as(usize, 6), helpers.utf8TruncLen("保存しました", 8));
+    try std.testing.expectEqual(@as(usize, 2), helpers.utf8TruncLen("ab\u{2713}", 4));
+    try std.testing.expectEqual(@as(usize, 5), helpers.utf8TruncLen("ab\u{2713}", 5));
+    try std.testing.expectEqual(@as(usize, 2), helpers.utf8TruncLen("abc", 2));
+}
+
+test "utf8ValidPrefix stops at the UTF-16 bound and at invalid UTF-8" {
+    try std.testing.expectEqualStrings("abc", helpers.utf8ValidPrefix("abc", 8));
+    // Counted in UTF-16 units, not bytes: "あい" is 6 bytes but 2 units.
+    try std.testing.expectEqualStrings("あい", helpers.utf8ValidPrefix("あい", 2));
+    try std.testing.expectEqualStrings("あ", helpers.utf8ValidPrefix("あい", 1));
+    try std.testing.expectEqualStrings("あ", helpers.utf8ValidPrefix("あ", 8));
+    try std.testing.expectEqualStrings("", helpers.utf8ValidPrefix("あ", 0));
+    // A supplementary character takes two units and is not split.
+    try std.testing.expectEqualStrings("a", helpers.utf8ValidPrefix("a\u{1F600}", 2));
+    try std.testing.expectEqualStrings("ab", helpers.utf8ValidPrefix("ab\xffcd", 8));
+    // A latin1 "é" (0xE9) starts a 3-byte sequence it does not complete.
+    try std.testing.expectEqualStrings("caf", helpers.utf8ValidPrefix("caf\xe9.txt", 16));
+    try std.testing.expectEqualStrings("", helpers.utf8ValidPrefix("\x80", 4));
+}
+
+test "nextEnvAssignment cuts KEY=VALUE lines in place" {
+    const text = std.unicode.utf8ToUtf16LeStringLiteral("A=1\r\n  B = x \n=bad\nnoeq\n\nC=\nPATH=C:\\あ;D:\\x");
+    var buf: [text.len + 1]u16 = undefined;
+    @memcpy(buf[0..text.len], text);
+    var pos: usize = 0;
+    const want = [_][2][]const u8{
+        .{ "A", "1" },
+        .{ "B ", " x" },
+        .{ "C", "" },
+        .{ "PATH", "C:\\あ;D:\\x" },
+    };
+    for (want) |kv| {
+        const a = helpers.nextEnvAssignment(&buf, text.len, &pos).?;
+        var k: [64]u8 = undefined;
+        var v: [64]u8 = undefined;
+        const key = std.mem.sliceTo(buf[a.key..], 0);
+        const value = std.mem.sliceTo(buf[a.value..], 0);
+        try std.testing.expectEqualStrings(kv[0], k[0..try std.unicode.utf16LeToUtf8(&k, key)]);
+        try std.testing.expectEqualStrings(kv[1], v[0..try std.unicode.utf16LeToUtf8(&v, value)]);
+    }
+    try std.testing.expect(helpers.nextEnvAssignment(&buf, text.len, &pos) == null);
+}
