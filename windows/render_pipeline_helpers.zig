@@ -1290,3 +1290,58 @@ pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usi
 pub const copyUtf8Truncated = core.frontend_rules.copyUtf8Truncated;
 pub const mini_max_lines = core.frontend_rules.mini_max_lines;
 pub const clampMiniContent = core.frontend_rules.clampMiniContent;
+
+/// Length of the longest prefix of `s` that fits in `max_bytes` without
+/// splitting a UTF-8 codepoint: the cut backs off while the first EXCLUDED
+/// byte is a continuation byte.
+pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
+    if (s.len <= max_bytes) return s.len;
+    var n = max_bytes;
+    while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+/// The longest valid UTF-8 prefix of `s` that converts to at most
+/// `max_utf16` UTF-16 units. utf8ToUtf16Le rejects invalid input and does not
+/// bound its destination.
+pub fn utf8ValidPrefix(s: []const u8, max_utf16: usize) []const u8 {
+    var i: usize = 0;
+    var units: usize = 0;
+    while (i < s.len) {
+        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
+        if (n > s.len - i) break;
+        _ = std.unicode.utf8Decode(s[i..][0..n]) catch break;
+        const w: usize = if (n == 4) 2 else 1;
+        if (units + w > max_utf16) break;
+        units += w;
+        i += n;
+    }
+    return s[0..i];
+}
+
+/// Where one KEY=VALUE line of wide text starts its key and its value. Both
+/// are NUL-terminated in the buffer by the call.
+pub const EnvAssignment = struct { key: usize, value: usize };
+
+/// The next KEY=VALUE line of `buf[0..len]` at or after `pos.*`, cut in place:
+/// the line is trimmed of spaces, tabs and CRs, its first '=' and the unit
+/// after the value become NULs, so neither side has a length limit. A line
+/// with no '=' or an empty key is skipped. `buf` needs one unit past `len`.
+pub fn nextEnvAssignment(buf: []u16, len: usize, pos: *usize) ?EnvAssignment {
+    std.debug.assert(len < buf.len);
+    const blank = [_]u16{ ' ', '\t', '\r' };
+    while (pos.* < len) {
+        const end = std.mem.indexOfScalarPos(u16, buf[0..len], pos.*, '\n') orelse len;
+        var start = pos.*;
+        var stop = end;
+        pos.* = end + 1;
+        while (start < stop and std.mem.indexOfScalar(u16, &blank, buf[start]) != null) start += 1;
+        while (stop > start and std.mem.indexOfScalar(u16, &blank, buf[stop - 1]) != null) stop -= 1;
+        const eq = std.mem.indexOfScalarPos(u16, buf[0..stop], start, '=') orelse continue;
+        if (eq == start) continue;
+        buf[eq] = 0;
+        buf[stop] = 0;
+        return .{ .key = start, .value = eq + 1 };
+    }
+    return null;
+}

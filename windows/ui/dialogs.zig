@@ -5,6 +5,7 @@ const App = app_mod.App;
 const c = app_mod.c;
 const applog = app_mod.applog;
 const window_mod = @import("../window.zig");
+const render_helpers = @import("../render_pipeline_helpers.zig");
 
 // --- SSH Password Dialog state ---
 
@@ -886,9 +887,10 @@ fn createRadio(parent: c.HWND, text: [*:0]const u16, x: c_int, y: c_int, w: c_in
 fn setEditTextUtf8(hwnd_opt: ?c.HWND, text: []const u8) void {
     const hwnd = hwnd_opt orelse return;
     if (text.len == 0) return;
-    var wide: [1024]u16 = std.mem.zeroes([1024]u16);
-    const wl = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
-    wide[@min(wl, wide.len - 1)] = 0;
+    var wide: [1024]u16 = undefined;
+    const cap = wide.len - 1;
+    const wl = std.unicode.utf8ToUtf16Le(wide[0..cap], app_mod.utf8ValidPrefix(text, cap)) catch return;
+    wide[wl] = 0;
     _ = c.SetWindowTextW(hwnd, &wide);
 }
 
@@ -1069,7 +1071,7 @@ fn cancelConnectionDialog(hwnd: c.HWND) void {
 /// starts nvim. Dialog-provided strings are duped from app.alloc; they live
 /// for the process lifetime (single startup, freed on exit).
 fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
-    var nvim_buf: [512]u8 = undefined;
+    var nvim_buf: [field_utf8_max]u8 = undefined;
     var nvim_path = readWindowTextUtf8(g_conn_nvim_hwnd, &nvim_buf);
     // Explorer's "Copy as path" wraps the path in double quotes; one pair
     // around the whole path is dropped. The spawn command's quoting cannot
@@ -1097,22 +1099,22 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
     if (is_ssh) {
         app.ssh_mode = true;
         app.devcontainer_mode = false;
-        var host_buf: [256]u8 = undefined;
+        var host_buf: [field_utf8_max]u8 = undefined;
         const host = readWindowTextUtf8(g_conn_ssh_host_hwnd, &host_buf);
         app.ssh_host = if (host.len != 0) (app.alloc.dupe(u8, host) catch null) else null;
         var port_buf: [32]u8 = undefined;
         const port_text = readWindowTextUtf8(g_conn_ssh_port_hwnd, &port_buf);
         app.ssh_port = if (port_text.len != 0) (std.fmt.parseInt(u16, port_text, 10) catch null) else null;
-        var id_buf: [512]u8 = undefined;
+        var id_buf: [field_utf8_max]u8 = undefined;
         const identity = readWindowTextUtf8(g_conn_ssh_identity_hwnd, &id_buf);
         app.ssh_identity = if (identity.len != 0) (app.alloc.dupe(u8, identity) catch null) else null;
     } else if (is_devcontainer) {
         app.devcontainer_mode = true;
         app.ssh_mode = false;
-        var ws_buf: [512]u8 = undefined;
+        var ws_buf: [field_utf8_max]u8 = undefined;
         const ws = readWindowTextUtf8(g_conn_devcontainer_workspace_hwnd, &ws_buf);
         app.devcontainer_workspace = if (ws.len != 0) (app.alloc.dupe(u8, ws) catch null) else null;
-        var cfg_buf: [512]u8 = undefined;
+        var cfg_buf: [field_utf8_max]u8 = undefined;
         const cfg = readWindowTextUtf8(g_conn_devcontainer_config_hwnd, &cfg_buf);
         app.devcontainer_config = if (cfg.len != 0) (app.alloc.dupe(u8, cfg) catch null) else null;
         app.devcontainer_rebuild = isChecked(g_conn_devcontainer_rebuild_hwnd);
@@ -1130,7 +1132,7 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
     app.ext_tabline_enabled = isChecked(g_conn_ext_tabline_hwnd);
     app.ext_windows_enabled = isChecked(g_conn_ext_windows_hwnd);
 
-    applyConnectionEnvVars();
+    applyConnectionEnvVars(app.alloc);
 
     if (applog.isEnabled()) applog.appLog("[win] connection dialog: connect ssh={} devcontainer={}\n", .{ app.ssh_mode, app.devcontainer_mode });
 
@@ -1142,36 +1144,34 @@ fn applyConnectionAndStart(app: *App, owner: c.HWND, dialog: c.HWND) void {
 
 /// Parse the env-vars edit (KEY=VALUE per line) and apply to the process
 /// environment so the spawned nvim inherits them. Mirrors the macOS setenv
-/// loop; SetEnvironmentVariableW is process-wide (startup one-shot).
-fn applyConnectionEnvVars() void {
+/// loop; SetEnvironmentVariableW is process-wide (startup one-shot). The text
+/// is read whole and stays UTF-16, so no line has a length limit.
+fn applyConnectionEnvVars(alloc: std.mem.Allocator) void {
     const hwnd = g_conn_env_hwnd orelse return;
-    var wide: [4096]u16 = std.mem.zeroes([4096]u16);
-    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    const text_len = c.GetWindowTextLengthW(hwnd);
+    if (text_len <= 0) return;
+    const buf = alloc.alloc(u16, @as(usize, @intCast(text_len)) + 1) catch return;
+    defer alloc.free(buf);
+    const len = c.GetWindowTextW(hwnd, buf.ptr, @intCast(buf.len));
     if (len <= 0) return;
-    var utf8_buf: [8192]u8 = undefined;
-    const utf8_len = std.unicode.utf16LeToUtf8(&utf8_buf, wide[0..@intCast(len)]) catch return;
-    var it = std.mem.splitScalar(u8, utf8_buf[0..utf8_len], '\n');
-    while (it.next()) |raw_line| {
-        const line = std.mem.trim(u8, raw_line, " \t\r");
-        if (line.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
-        const key = line[0..eq];
-        if (key.len == 0) continue;
-        const val = line[eq + 1 ..];
-        var key_w: [256]u16 = std.mem.zeroes([256]u16);
-        var val_w: [1024]u16 = std.mem.zeroes([1024]u16);
-        const kl = std.unicode.utf8ToUtf16Le(&key_w, key) catch continue;
-        key_w[@min(kl, key_w.len - 1)] = 0;
-        const vl = std.unicode.utf8ToUtf16Le(&val_w, val) catch continue;
-        val_w[@min(vl, val_w.len - 1)] = 0;
-        _ = c.SetEnvironmentVariableW(&key_w, &val_w);
+    var pos: usize = 0;
+    while (render_helpers.nextEnvAssignment(buf, @intCast(len), &pos)) |a| {
+        if (c.SetEnvironmentVariableW(&buf[a.key], &buf[a.value]) == 0) {
+            if (applog.isEnabled()) applog.appLog("[win] connection dialog: SetEnvironmentVariableW failed err={d}\n", .{c.GetLastError()});
+        }
     }
 }
 
+/// UTF-8 room for the longest text readWindowTextUtf8 reads (511 units).
+const field_utf8_max = 3 * 511;
+
+/// A UTF-16 unit converts to at most 3 UTF-8 bytes (a surrogate pair to 4),
+/// so reading at most `dest.len / 3` units always fits `dest`.
 fn readWindowTextUtf8(hwnd_opt: ?c.HWND, dest: []u8) []const u8 {
     const hwnd = hwnd_opt orelse return "";
-    var wide: [512]u16 = std.mem.zeroes([512]u16);
-    const len = c.GetWindowTextW(hwnd, &wide, wide.len);
+    var wide: [512]u16 = undefined;
+    const max_units = @min(wide.len - 1, dest.len / 3);
+    const len = c.GetWindowTextW(hwnd, &wide, @intCast(max_units + 1));
     if (len <= 0) return "";
     const slice = wide[0..@intCast(len)];
     const utf8_len = std.unicode.utf16LeToUtf8(dest, slice) catch return "";

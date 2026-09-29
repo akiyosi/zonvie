@@ -3176,6 +3176,12 @@ pub const Grid = struct {
     // ext_cmdline methods
     // =========================================================================
 
+    /// Widest the cmdline may grow: screen_cols, else the main grid's cols;
+    /// 0 while neither is known.
+    pub fn cmdlineMaxCols(self: *const Grid) u32 {
+        return if (self.screen_cols != 0) self.screen_cols else self.cols;
+    }
+
     /// Handle cmdline_show event.
     pub fn setCmdlineShow(
         self: *Grid,
@@ -3233,12 +3239,8 @@ pub const Grid = struct {
         }
         state.prompt = new_prompt;
 
-        const indent_limit = if (self.screen_cols != 0)
-            @min(self.screen_cols, MAX_GRID_COLS)
-        else if (self.cols != 0)
-            @min(self.cols, MAX_GRID_COLS)
-        else
-            MAX_GRID_COLS;
+        const max_cols = self.cmdlineMaxCols();
+        const indent_limit = if (max_cols != 0) @min(max_cols, MAX_GRID_COLS) else MAX_GRID_COLS;
         state.indent = @min(indent, indent_limit);
         state.level = level;
         state.prompt_hl_id = prompt_hl_id;
@@ -3556,7 +3558,17 @@ pub const Grid = struct {
             }
 
             if (msg_to_replace) |msg| {
+                // The replacement is routed by its own kind: a search_count
+                // replacing its search_cmd went to the search_cmd's view.
+                const new_kind: ?[]const u8 = if (std.mem.eql(u8, msg.kind, kind))
+                    null
+                else if (kind.len > 0) try self.alloc.dupe(u8, kind) else "";
+                errdefer if (new_kind) |k| if (k.len > 0) self.alloc.free(k);
                 try setMessageContentBounded(msg, self.alloc, content, false);
+                if (new_kind) |k| {
+                    if (msg.kind.len > 0) self.alloc.free(msg.kind);
+                    msg.kind = k;
+                }
                 msg.history = history;
                 msg.append = append;
                 self.message_state.msg_dirty = true;
@@ -3943,6 +3955,22 @@ test "message singleton replacement OOM preserves the previous visible message" 
         checkMessageSingletonReplacementAllocationFailure,
         .{},
     );
+}
+
+fn checkReplaceLastTakesItsKind(alloc: std.mem.Allocator) !void {
+    var grid = Grid.init(alloc);
+    defer grid.deinit();
+    try grid.setMsgShow("search_cmd", &.{.{ .hl_id = 0, .text = "/zonvie" }}, false, false, false, 1);
+    grid.setMsgShow("search_count", &.{.{ .hl_id = 0, .text = "[1/2]" }}, true, false, false, 2) catch |err| {
+        try std.testing.expectEqualStrings("search_cmd", grid.message_state.messages.items[0].kind);
+        return err;
+    };
+    try std.testing.expectEqual(@as(usize, 1), grid.message_state.messages.items.len);
+    try std.testing.expectEqualStrings("search_count", grid.message_state.messages.items[0].kind);
+}
+
+test "a replace_last message is routed by its own kind, and OOM keeps the old one" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReplaceLastTakesItsKind, .{});
 }
 
 fn checkMessageEvictionAllocationFailure(alloc: std.mem.Allocator) !void {

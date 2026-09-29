@@ -79,6 +79,10 @@ pub fn run(alloc: std.mem.Allocator) !void {
     defer g.deinit();
     g.activateApp();
 
+    // The rect is measured in the main drawable, so the float is parked
+    // over the main window, wherever that opened.
+    const main_b = platform.mainWindowBoundsForPid(g.app_pid) orelse return error.MainWindowNotFound;
+
     // Open an external float; the cursor goes into it, which is what makes
     // this view the one publishing the shader cursor rect.
     const before = driver.snapshotWindows(g.app_pid);
@@ -90,8 +94,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
     const float_win = try driver.waitNewWindow(g.app_pid, before.slice(),100);
 
     // Park it somewhere known and fully on screen before measuring.
-    const start_x: f64 = 80;
-    const start_y: f64 = 80;
+    const start_x: f64 = main_b.x + 80;
+    const start_y: f64 = main_b.y + 80;
     if (!platform.moveWindowBySize(g.app_pid, float_win.bounds.w, float_win.bounds.h, start_x, start_y)) {
         return error.MoveFailed;
     }

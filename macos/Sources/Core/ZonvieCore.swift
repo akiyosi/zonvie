@@ -1768,9 +1768,30 @@ final class ZonvieCore {
         return zonvie_core_try_next_msg_timeout_ms(core)
     }
 
-    /// Neovim was spawned or connected; a picker that never started has no
-    /// nvim to ask before quitting.
+    /// Neovim was spawned or connected: there is an nvim to ask before
+    /// quitting. Main thread only.
     private(set) var didStart = false
+    /// The session asked to start (main thread only). Between this and
+    /// didStart a close cancels the start instead of asking nvim.
+    var startRequested = false
+    /// Set by cancelPendingStart; main thread only.
+    private(set) var startCancelled = false
+
+    /// A local start runs off main; the flag is main-thread state.
+    private func noteStarted(_ ok: Bool) {
+        if Thread.isMainThread { didStart = ok; return }
+        DispatchQueue.main.async { [weak self] in self?.didStart = ok }
+    }
+
+    /// Close a session whose start was requested but whose nvim cannot answer
+    /// yet: a pending devcontainer exec is dropped, and deinit stops anything
+    /// already spawned once the window releases the ViewController.
+    func cancelPendingStart(window win: NSWindow) {
+        startCancelled = true
+        progressWindow?.close()
+        progressWindow = nil
+        closeSessionWindow(win)
+    }
 
     func start(nvimPath: String, rows: UInt32, cols: UInt32) -> Int32 {
         guard let core else { return -1 }
@@ -2006,7 +2027,7 @@ final class ZonvieCore {
                 return zonvie_core_start_connect(core, base, buf.count, rows, cols)
             }
             applyCoreLogOptions()
-            didStart = result == 0
+            noteStarted(result == 0)
             return result
         }
 
@@ -2084,9 +2105,10 @@ final class ZonvieCore {
                 // rebuilds the container — installing nvim via the injected
                 // feature — then execs into it.
                 DispatchQueue.main.async { [weak self] in
-                    self?.showDevcontainerProgress()
-                    self?.updateProgressLabel("Rebuilding devcontainer...")
-                    self?.runDevcontainerUp(workspace: workspace, configPath: configArg, rebuild: true, rows: rows, cols: cols)
+                    guard let self, !self.startCancelled else { return }
+                    self.showDevcontainerProgress()
+                    self.updateProgressLabel("Rebuilding devcontainer...")
+                    self.runDevcontainerUp(workspace: workspace, configPath: configArg, rebuild: true, rows: rows, cols: cols)
                 }
                 // Return early - core is started after devcontainer up completes.
                 return 0
@@ -2098,9 +2120,10 @@ final class ZonvieCore {
                 // which is slow and can fail. Use "Rebuild on start" to build /
                 // (re)start a container that isn't up yet.
                 DispatchQueue.main.async { [weak self] in
-                    self?.showDevcontainerProgress()
-                    self?.updateProgressLabel("Connecting...")
-                    self?.startDevcontainerExec(workspace: workspace, configPath: configArg, rows: rows, cols: cols)
+                    guard let self, !self.startCancelled else { return }
+                    self.showDevcontainerProgress()
+                    self.updateProgressLabel("Connecting...")
+                    self.startDevcontainerExec(workspace: workspace, configPath: configArg, rows: rows, cols: cols)
                 }
                 return 0
             }
@@ -2136,7 +2159,7 @@ final class ZonvieCore {
 
         let cstr = (finalPath as NSString).utf8String
         let result = Int32(zonvie_core_start(core, cstr, rows, cols))
-        didStart = result == 0
+        noteStarted(result == 0)
 
         // NOTE: zonvie_core_notify_layout_ready() is intentionally NOT called
         // here. The RPC thread blocks on the core's layout-ready wait
@@ -2408,7 +2431,7 @@ final class ZonvieCore {
                     ZonvieCore.appLog("[devcontainer] up failed. Output tail:\n\(tail)")
 
                     DispatchQueue.main.async { [weak self] in
-                        guard let self = self else { return }
+                        guard let self = self, !self.startCancelled else { return }
                         self.hideDevcontainerProgress()
                         let alert = NSAlert()
                         alert.messageText = "Devcontainer failed to start"
@@ -2429,7 +2452,7 @@ final class ZonvieCore {
     }
 
     private func startDevcontainerExec(workspace: String, configPath: String?, rows: UInt32, cols: UInt32) {
-        guard let core = core else { return }
+        guard let core = core, !startCancelled else { return }
 
         var cmd = [CChar](repeating: 0, count: 4096)
         let ws = Array(workspace.utf8)
@@ -2816,12 +2839,39 @@ final class ZonvieCore {
         discard.keyEquivalent = ""
         discard.hasDestructiveAction = true
 
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            confirmQuit(force: true)
-        }
+        presentQuitAlert(alert) { [weak self] in self?.confirmQuit(force: true) }
         // Cancel -> do nothing
     }
+
+    /// Cmd+Q asks every session at once, so each alert is a sheet on its own
+    /// session's window and names the session when there are several.
+    private func presentQuitAlert(_ alert: NSAlert, onFirstButton: @escaping () -> Void) {
+        guard let win = terminalView?.window, win.isVisible else {
+            if alert.runModal() == .alertFirstButtonReturn { onFirstButton() }
+            return
+        }
+        win.makeKeyAndOrderFront(nil)
+        let sessions = SessionManager.shared.sessions
+        if sessions.count > 1, let name = sessions.first(where: { $0.window === win })?.name {
+            alert.messageText += " (\(name))"
+        }
+        if let sheet = win.attachedSheet {
+            // An earlier quit alert is stale once a new answer arrives (a
+            // "Not Responding" nvim that then replied); another sheet cannot
+            // be stacked on, so the question is asked app-modally.
+            guard sheet === quitAlertSheet else {
+                if alert.runModal() == .alertFirstButtonReturn { onFirstButton() }
+                return
+            }
+            win.endSheet(sheet, returnCode: .cancel)
+        }
+        quitAlertSheet = alert.window
+        alert.beginSheetModal(for: win) { response in
+            if response == .alertFirstButtonReturn { onFirstButton() }
+        }
+    }
+
+    private weak var quitAlertSheet: NSWindow?
 
     /// Show dialog when Neovim is not responding to quit request.
     private func showNotRespondingDialog() {
@@ -2832,14 +2882,16 @@ final class ZonvieCore {
         alert.addButton(withTitle: "Force Quit")
         alert.addButton(withTitle: "Wait")
 
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
+        presentQuitAlert(alert) { [weak self] in
+            guard let self else { return }
             ZonvieCore.appLog("[showNotRespondingDialog] user chose Force Quit")
             if SessionManager.shared.sessions.count <= 1 {
                 AppDelegate.terminateApp()
-            } else if let win = terminalView?.window {
-                stop()
-                closeSessionWindow(win)
+            } else if let win = self.terminalView?.window {
+                // No stop() here: it frees the grid while this window's timers
+                // and queued callbacks can still reach it. Closing releases the
+                // ViewController, and deinit stops and destroys the core.
+                self.closeSessionWindow(win)
             }
         }
         // Wait -> do nothing, user can try closing again later
@@ -3869,7 +3921,7 @@ final class ZonvieCore {
         pendingGuiFontPayload = nil
         pendingGuiFontLock.unlock()
 
-        applyGuiFontPayload(name: name, size: size, features: features, view: view, alreadyHoldingGridMu: true)
+        applyGuiFontPayload(name: name, size: size, features: features, view: view)
     }
 
     /// Apply a guifont payload: rebuild atlas, push new cell metrics into
@@ -3881,17 +3933,11 @@ final class ZonvieCore {
     /// MUST run while grid_mu is held so the RPC thread cannot run a
     /// handleRedraw cycle in between and observe a partially-updated state
     /// (atlas reset but core caches still pointing to old UVs, or cell
-    /// metrics changed but glyph cache stale, etc.). When this is invoked
-    /// from inside onGuiFont we are already on the RPC thread under
-    /// grid_mu (via handleRedraw), so we can call the locked variants
-    /// directly. When this is invoked from markFirstPresentDone (a
-    /// deferred payload from a different thread), we acquire grid_mu via
-    /// zonvie_core_lock_grid() to obtain the same atomicity.
-    private func applyGuiFontPayload(name: String, size: Double, features: String, view: MetalTerminalView, alreadyHoldingGridMu: Bool) {
+    /// metrics changed but glyph cache stale, etc.). The caller holds it:
+    /// onGuiFont via handleRedraw, markFirstPresentDone via
+    /// zonvie_core_lock_grid, which then publishes with retry_flush.
+    private func applyGuiFontPayload(name: String, size: Double, features: String, view: MetalTerminalView) {
         guard let c = core else { return }
-        if !alreadyHoldingGridMu {
-            zonvie_core_lock_grid(c)
-        }
 
         // atlas.setFont() is thread-safe (protected by os_unfair_lock) and
         // is safe to call regardless of who holds grid_mu.
@@ -3906,11 +3952,9 @@ final class ZonvieCore {
         let externalViews = stageFontGenerationOnExternalSurfaces(fontGeneration)
 
         // Notify core of new cell dimensions so vertex positions match
-        // the new glyph metrics. We hold grid_mu either via handleRedraw
-        // or via zonvie_core_lock_grid above, so use the *_locked variant
-        // to skip the regular wrapper's grid_mu acquisition.
-        let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-        let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        // the new glyph metrics. The caller holds grid_mu, so use the
+        // *_locked variant.
+        let (cw, ch) = view.renderer.coreCellPx
         let ds = view.currentDrawableSize
         let dw = max(1, Int(ds.width))
         let dh = max(1, Int(ds.height))
@@ -3923,14 +3967,6 @@ final class ZonvieCore {
         // zonvie_core_invalidate_glyph_cache mutates grid state and assumes
         // its caller holds grid_mu — both call paths satisfy this.
         zonvie_core_invalidate_glyph_cache(c)
-
-        if !alreadyHoldingGridMu {
-            zonvie_core_unlock_grid(c)
-            // A deferred guifont apply has no surrounding Neovim redraw
-            // bracket. Publish all regenerated core vertices after the
-            // font/layout/cache mutation becomes visible atomically.
-            zonvie_core_retry_flush(c)
-        }
 
         // GUI-only updates (redraw, external window notify) can be async.
         // Window content size snap also runs here so it executes after the
@@ -4027,8 +4063,7 @@ final class ZonvieCore {
         guard let view = terminalView else { return }
         guard let window = view.window else { return }
         guard let renderer = view.renderer else { return }
-        let cellWPx = max(1, Int(renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-        let cellHPx = max(1, Int(renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let (cellWPx, cellHPx) = renderer.coreCellPx
         let scale = window.backingScaleFactor
         guard scale > 0 else { return }
 
@@ -4141,9 +4176,7 @@ final class ZonvieCore {
             return
         }
         Self.appLog("[markFirstPresentDone] applying deferred guifont '\(pending.name)' size=\(pending.size)")
-        // grid_mu is already held by us — call the inline (already-locked)
-        // path so applyGuiFontPayload doesn't try to re-acquire it.
-        applyGuiFontPayload(name: pending.name, size: pending.size, features: pending.features, view: view, alreadyHoldingGridMu: true)
+        applyGuiFontPayload(name: pending.name, size: pending.size, features: pending.features, view: view)
         zonvie_core_unlock_grid(c)
 
         // This deferred path has no surrounding redraw batch. Publish the
@@ -4159,8 +4192,7 @@ final class ZonvieCore {
         view.renderer.setLineSpace(px: px)
 
         // Notify core of new cell dimensions (cell height includes linespace).
-        let cw = max(1, Int(view.renderer.cellWidthPx.rounded(.toNearestOrAwayFromZero)))
-        let ch = max(1, Int(view.renderer.cellHeightPx.rounded(.toNearestOrAwayFromZero)))
+        let (cw, ch) = view.renderer.coreCellPx
         let ds = view.currentDrawableSize
         let dw = max(1, Int(ds.width))
         let dh = max(1, Int(ds.height))
@@ -4240,12 +4272,6 @@ final class ZonvieCore {
             // Force Quit already closed this session.
             if self.sessionWindowClosed { return }
 
-            // Force-flush this window's frame to UserDefaults (setFrameAutosaveName
-            // writes are in-memory; shutdown may bypass AppKit's natural flush).
-            if let win = self.terminalView?.window, !win.frameAutosaveName.isEmpty {
-                win.saveFrame(usingName: win.frameAutosaveName)
-            }
-
             // Multi-session: if other sessions remain, close ONLY this session's
             // window. The last session instead
             // stops the run loop so app.run() returns to main.swift's
@@ -4257,6 +4283,7 @@ final class ZonvieCore {
                 return
             }
 
+            if let win = self.terminalView?.window { Self.saveWindowFrame(win) }
             // Last session (or headless): stop the run loop directly so
             // app.run() returns to main.swift for Darwin.exit(exitCode).
             NSApp.stop(nil)
@@ -4277,10 +4304,17 @@ final class ZonvieCore {
 
     private var sessionWindowClosed = false
 
+    /// Force-flush the window's frame to UserDefaults (setFrameAutosaveName
+    /// writes are in-memory; shutdown may bypass AppKit's natural flush).
+    private static func saveWindowFrame(_ win: NSWindow) {
+        if !win.frameAutosaveName.isEmpty { win.saveFrame(usingName: win.frameAutosaveName) }
+    }
+
     /// Ends this session while other sessions keep the app running. close()
     /// bypasses windowShouldClose, so no quit request is re-triggered.
     private func closeSessionWindow(_ win: NSWindow) {
         sessionWindowClosed = true
+        Self.saveWindowFrame(win)
         // The core sends no external-window close on exit, and the
         // app outlives this session, so its external windows would
         // stay on screen with a dead core behind them.
@@ -7202,19 +7236,16 @@ final class ZonvieCore {
             // frames back would freeze the surface that just took focus.
             let suspects = self.externalGridViews.filter { $0.key != surfaceId }.map { $0.value }
             self.externalGridViewsLock.unlock()
-            for view in suspects { view.markOcclusionSuspect() }
             if let extWindow = self.externalWindows[surfaceId] {
-                // Only a window covering all of it can hide the main window;
-                // holding its frames on every activation stalled it at each `:`.
-                if let mainFrame = self.terminalView?.window?.frame, extWindow.frame.contains(mainFrame) {
-                    self.terminalView?.markOcclusionSuspect()
-                }
+                self.terminalView?.markOcclusionSuspect(ifCoveredBy: extWindow)
+                for view in suspects { view.markOcclusionSuspect(ifCoveredBy: extWindow) }
                 extWindow.makeKeyAndOrderFront(nil)
                 if let gridView = self.externalGridViews[surfaceId] {
                     extWindow.makeFirstResponder(gridView)
                 }
                 ZonvieCore.appLog("[cursor_grid_changed] activated external window for gridId=\(gridId) surface=\(surfaceId)")
             } else if self.classifyExternalGridKind(gridId) != .normal {
+                for view in suspects { view.markOcclusionSuspect() }
                 // Cursor moved onto a synthetic decorated grid (cmdline /
                 // popupmenu / message) whose host window is not registered yet:
                 // its creation runs in a later main-queue block and makes itself
@@ -7223,6 +7254,7 @@ final class ZonvieCore {
                 // cmdline is being shown.
                 ZonvieCore.appLog("[cursor_grid_changed] special grid \(gridId) not yet registered; skip main activation")
             } else {
+                for view in suspects { view.markOcclusionSuspect() }
                 if let mainWindow = self.terminalView?.window {
                     mainWindow.makeKeyAndOrderFront(nil)
                     ZonvieCore.appLog("[cursor_grid_changed] activated main window (cursor on gridId=\(gridId) surface=\(surfaceId))")

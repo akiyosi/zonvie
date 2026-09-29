@@ -2123,6 +2123,7 @@ pub export fn WndProc(
 
                 // Step 2: UI metadata snapshot (app.mu short lock).
                 app.mu.lockUncancelable(core.clock.io());
+                app.surf.has_committed_cursor = committed_cursor.verts.items.len > 0;
                 if (app.surf.surface.rows == 0) {
                     updateRowsColsFromClient(hwnd, app);
                 }
@@ -5028,7 +5029,6 @@ pub export fn WndProc(
                     // Force full content reseed on the fresh device.
                     ext_win.dpi_scale = @as(f32, @floatFromInt(ext_dpi)) / 96.0;
                     ext_win.surf.surface.paint_full = true;
-                    ext_win.needs_redraw = true;
                     app.mu.unlock(core.clock.io());
                     // The old renderer's COM objects are solely owned by this
                     // local copy now; releasing them needs no lock.
@@ -5695,7 +5695,7 @@ pub export fn WndProc(
                 // release ahead of the chrome branches): the chrome neither
                 // consumes the move nor lights a hover under it.
                 const editor_drag = app.surf.scrollbar.dragging or
-                    (app.mouse_button_held != 0 and app.mouse_press_grid_id != 0);
+                    (app.press_claim.owner != 0 and app.mouse_press_grid_id != 0);
                 if (app.ext_tabline_enabled) {
                     if (app.tabline_style == .titlebar) {
                         if (app.tabline_state.dragging_tab != null or (!editor_drag and y < app.scalePx(TablineState.TAB_BAR_HEIGHT))) {
@@ -5740,7 +5740,7 @@ pub export fn WndProc(
                 }
 
                 // Only send drag events if a button is held
-                const button = input.heldMouseButtonName(app.mouse_button_held) orelse
+                const button = input.heldMouseButtonName(app.press_claim.owner) orelse
                     return c.DefWindowProcW(hwnd, msg, wParam, lParam);
 
                 const drag_target = input.rebaseMainWindowTarget(app, app.mouse_press_grid_id, @as(i32, x), @as(i32, y));

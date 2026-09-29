@@ -79,6 +79,10 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     /// Track if we've presented at least once (for loadAction optimization)
     private var hasPresentedOnce = false
+    /// Unlike `hasPresentedOnce`, never reset by a font change, resize or bail:
+    /// the visibility gate asks whether this window has been on screen, not
+    /// whether the back buffer is valid. Cleared only on a move to a new window.
+    private var hasEverPresented = false
 
     /// The GPU objects every surface shares, handed in at construction. Before
     /// this, these were copied in one by one and the rest were reached through
@@ -2021,7 +2025,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // brand-new cmdline or popupmenu panel empty until the
             // notification lands, and a window with nothing on screen yet
             // has no stale content worth protecting.
-            switch visibilityGate(unpresentedMayDraw: !hasPresentedOnce) {
+            switch visibilityGate(unpresentedMayDraw: !hasEverPresented) {
             case .draw:
                 break
             case .unsettled:
@@ -3371,6 +3375,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             markScrollOffsetStatePresented()
             if !hasPresentedOnce { recalculateSurfaceShadowAfterFirstPresent(self) }
             hasPresentedOnce = true
+            hasEverPresented = true
             redrawScheduler.didDrawFrame()
             finishedRedraw = true
 
@@ -3689,7 +3694,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             staticGridId: hit?.gridId ?? gridId,
             followers: followers,
             paintRankOf: { id in layers.first { $0.gridId == id }?.z },
-            resolve: resolve,
             resolveExcluding: { r, c, excluded in
                 core.resolvePointerGrid(surfaceId: self.gridId, row: r, col: c,
                                         requireScrollable: requireScrollable, excluding: excluded)
@@ -3906,6 +3910,7 @@ extension ExternalGridView {
 extension ExternalGridView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        hasEverPresented = false
 
         // draw() parks the loop while this window is invisible, so a window
         // that becomes visible again with no Neovim traffic behind it would
