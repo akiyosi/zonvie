@@ -2513,8 +2513,8 @@ pub fn onSurfaceLayout(
 
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
-    const tbs = if (surface_id == 1) &app.surf.tbs else if (app.external_windows.get(surface_id)) |ext_win|
-        &ext_win.surf.tbs
+    const surf: *app_mod.WindowSurface = if (surface_id == 1) &app.surf else if (app.external_windows.get(surface_id)) |ext_win|
+        &ext_win.surf
     else {
         traceRender(app, "event=layout_defer surface={d} reason=host_not_registered\n", .{surface_id});
         // The core must retain dirty rows and invalidate its layout signature
@@ -2522,6 +2522,7 @@ pub fn onSurfaceLayout(
         failFlush(app);
         return;
     };
+    const tbs = &surf.tbs;
     var staged = tbs.prepareLayers(app.alloc, &app.layout_budget, count) catch |err| {
         traceRender(app, "event=layout_failed surface={d} layers={d} reason={s} metadata_bytes={d}\n", .{ surface_id, count, @errorName(err), app.layout_budget.live_bytes.load(.monotonic) });
         if (err == error.LayoutBudgetExceeded) core.zonvie_core_fail_render_budget(app.corep);
@@ -2563,11 +2564,7 @@ pub fn onSurfaceLayout(
     // visual change on the main window, and the flag drives a whole-main-window
     // InvalidateRect; the external ROW path has always kept out of it for the
     // same reason.
-    if (app.external_windows.get(surface_id)) |ext_win| {
-        ext_win.surf.flush_needs_invalidate = true;
-    } else {
-        app.surf.flush_needs_invalidate = true;
-    }
+    surf.flush_needs_invalidate = true;
 }
 
 /// Run after row publication and before placement publication, under app.mu.

@@ -3762,9 +3762,7 @@ pub const Core = struct {
         // This ensures cell dimensions are updated BEFORE the flush generates vertices.
         // We compare thread IDs to avoid the UI thread incorrectly skipping the lock
         // when the RPC thread is in handleRedraw (which would cause a data race).
-        const current_tid: usize = @intCast(std.Thread.getCurrentId());
-        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
-        if (redraw_tid != 0 and redraw_tid == current_tid) {
+        if (self.onRedrawThread()) {
             _ = self.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
             return false;
         }
@@ -3785,6 +3783,13 @@ pub const Core = struct {
     pub fn lockGridAsRedrawOwner(self: *Core) void {
         self.grid_mu.lockUncancelable(clock.io());
         self.redraw_thread_id.store(@intCast(std.Thread.getCurrentId()), .seq_cst);
+    }
+
+    /// Whether this thread holds grid_mu as the redraw owner (a callback
+    /// re-entering from handleRedraw): lock-taking entry points skip the lock.
+    pub fn onRedrawThread(self: *Core) bool {
+        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
+        return redraw_tid != 0 and redraw_tid == @as(usize, @intCast(std.Thread.getCurrentId()));
     }
 
     pub fn unlockGridAsRedrawOwner(self: *Core) void {
@@ -3863,16 +3868,17 @@ pub const Core = struct {
     /// Uses the same thread-ID check as updateLayoutPx to avoid deadlock
     /// when called from within redraw callbacks (where grid_mu is already held).
     pub fn setScreenCols(self: *Core, cols: u32) void {
-        const current_tid: usize = @intCast(std.Thread.getCurrentId());
-        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
-        if (redraw_tid != 0 and redraw_tid == current_tid) {
-            // Already holding grid_mu on this thread (inside handleRedraw).
-            self.setScreenColsLocked(cols);
+        self.storeGridCols(&self.grid.screen_cols, cols);
+    }
+
+    fn storeGridCols(self: *Core, field: *u32, cols: u32) void {
+        if (self.onRedrawThread()) {
+            field.* = cols;
             return;
         }
         self.grid_mu.lockUncancelable(clock.io());
         defer self.grid_mu.unlock(clock.io());
-        self.setScreenColsLocked(cols);
+        field.* = cols;
     }
 
     /// 0 withdraws the frontend's value; the main grid's cols stand in.
@@ -3883,15 +3889,7 @@ pub const Core = struct {
     /// Set the cmdline's default width in cells. Same re-entrancy rules as
     /// setScreenCols: the redraw thread already owns grid_mu.
     pub fn setCmdlineDefaultCols(self: *Core, cols: u32) void {
-        const current_tid: usize = @intCast(std.Thread.getCurrentId());
-        const redraw_tid = self.redraw_thread_id.load(.seq_cst);
-        if (redraw_tid != 0 and redraw_tid == current_tid) {
-            self.grid.cmdline_default_cols = cols;
-            return;
-        }
-        self.grid_mu.lockUncancelable(clock.io());
-        defer self.grid_mu.unlock(clock.io());
-        self.grid.cmdline_default_cols = cols;
+        self.storeGridCols(&self.grid.cmdline_default_cols, cols);
     }
 
     // ---- Key event encoding (OS trap -> Zig common encode) ----

@@ -1841,6 +1841,31 @@ ZONVIE_API bool zonvie_core_nvim_arg_is_file(const char *prev, size_t prev_len,
                                              const char *arg, size_t arg_len,
                                              bool after_dash_dash);
 
+/* The cells UTF-8 `text` takes on the grid: 2 per wide (CJK, Hangul,
+   fullwidth) character and per emoji cluster, 2 per control character (^X),
+   1 otherwise. The rule the core lays out the cmdline and messages with.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API uint32_t zonvie_core_display_width(const char *text, size_t len);
+
+/* How one argument goes into the command string zonvie_core_start takes, so
+   its tokenizer hands it back unchanged: 0 bare, else the quote character
+   (' or ") to wrap it in; -1 when it needs quoting (a space or a leading
+   quote) and neither quote can carry it (empty, both quote kinds, or a
+   trailing backslash that would escape the closing quote).
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API int32_t zonvie_core_spawn_arg_quote(const char *arg, size_t len);
+
+/* The CONFIG section of `--help` (every key this platform reads, with its
+   defaults; lines indented four spaces) and the commented-out config.toml
+   `--install` writes (each value this platform's default). Static,
+   NUL-terminated.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API const char *zonvie_core_config_help(void);
+ZONVIE_API const char *zonvie_core_default_config_toml(void);
+
 /* The `devcontainer exec --workspace-folder "<workspace>" [--config
    "<config>"] --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed` command
    line, NUL-terminated into out (cap bytes); returns its length. Each path

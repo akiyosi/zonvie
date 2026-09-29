@@ -1480,9 +1480,7 @@ pub export fn zonvie_core_try_update_layout_px(
     const cp = &box.core;
     if (cp.stop_flag.load(.acquire)) return true;
 
-    const current_tid: usize = @intCast(std.Thread.getCurrentId());
-    const redraw_tid = cp.redraw_thread_id.load(.seq_cst);
-    if (redraw_tid != 0 and redraw_tid == current_tid) {
+    if (cp.onRedrawThread()) {
         // Re-entrant redraw callback: grid_mu is already held by this thread
         // and the in-progress batch publishes the result. Do NOT retry the
         // flush here -- that would re-acquire the non-recursive grid_mu this
@@ -2078,6 +2076,25 @@ pub export fn zonvie_core_nvim_arg_is_file(
 ) callconv(.c) bool {
     const a = arg orelse return false;
     return frontend_rules.nvimArgIsFile(if (prev) |p| p[0..prev_len] else null, a[0..arg_len], after_dash_dash);
+}
+
+pub export fn zonvie_core_display_width(text: ?[*]const u8, len: usize) callconv(.c) u32 {
+    const t = text orelse return 0;
+    return flush_mod.countDisplayWidth(t[0..len]);
+}
+
+pub export fn zonvie_core_spawn_arg_quote(arg: ?[*]const u8, len: usize) callconv(.c) i32 {
+    const a = arg orelse return -1;
+    const q = frontend_rules.spawnArgQuote(a[0..len]) orelse return -1;
+    return q;
+}
+
+pub export fn zonvie_core_config_help() callconv(.c) [*:0]const u8 {
+    return config.config_help.ptr;
+}
+
+pub export fn zonvie_core_default_config_toml() callconv(.c) [*:0]const u8 {
+    return config.default_config_toml.ptr;
 }
 
 pub export fn zonvie_core_devcontainer_exec_cmd(

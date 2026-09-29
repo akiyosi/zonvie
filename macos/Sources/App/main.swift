@@ -215,50 +215,7 @@ if zonvieArgs.contains("--help") || zonvieArgs.contains("-h") {
             Configuration file: ~/.config/zonvie/config.toml
             (or $XDG_CONFIG_HOME/zonvie/config.toml)
 
-            [neovim]
-                path            Path to Neovim executable
-                ssh             Enable SSH mode (true/false)
-                ssh_host        SSH host (user@host format)
-                ssh_port        SSH port number
-                ssh_identity    Path to SSH private key
-
-            [font]
-                family          Font family name
-                size            Font size in points
-                linespace       Extra line spacing in pixels
-
-            [window]
-                blur            Enable blur effect (true/false)
-                opacity         Background opacity (0.0-1.0, when blur=true)
-                blur_radius     Blur radius (1-100, when blur=true)
-
-            [cmdline]
-                external        Enable external command line UI
-
-            [popup]
-                external        Enable external popup menu UI
-
-            [messages]
-                external        Enable external messages UI
-
-            [tabline]
-                external            Enable external tabline UI
-                style               Display style: "titlebar", "menu", "sidebar" (default: "titlebar")
-                sidebar_position    Sidebar position: "left" or "right" (default: "left")
-                sidebar_width       Sidebar width in pixels (100-500, default: 200)
-
-            [windows]
-                external        Enable external windows
-
-            [log]
-                enabled         Enable logging (true/false)
-                path            Log file path
-
-            [performance]
-                glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
-                glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                hl_cache_size               Highlight cache size (64-2048, default: 2048)
-
+        \(String(cString: zonvie_core_config_help()))
         For more information, visit: https://github.com/akiyosi/zonvie
         """
     print(help)
@@ -292,28 +249,7 @@ if zonvieArgs.contains("--install") {
             exit(1)
         }
 
-        let defaultConfig = """
-            # Zonvie configuration file
-            # See `zonvie --help` for all available options.
-
-            [font]
-            # family = "SF Mono"
-            # size = 14.0
-            # linespace = 0
-
-            [neovim]
-            # path = "nvim"
-
-            [window]
-            # opacity = 1.0
-            # blur = false
-            # blur_radius = 20
-
-            [server]
-            # open_mode = "tab"   # "tab" (new tab) or "current" (replace current window)
-            # single_instance is Windows-only (macOS routes file opens via the OS).
-
-            """
+        let defaultConfig = String(cString: zonvie_core_default_config_toml())
         do {
             try defaultConfig.write(toFile: configPath, atomically: true, encoding: .utf8)
             print("Default config.toml created: \(configPath)")

@@ -2452,8 +2452,10 @@ pub export fn ExternalWndProc(
                     // The window's own chrome claims the press first, so the
                     // copy button's release is not interpreted as a scrollbar
                     // or grid interaction. Left button only: the others have
-                    // no chrome meaning and go straight to the editor.
-                    if (msg == c.WM_LBUTTONDOWN) {
+                    // no chrome meaning and go straight to the editor. Mid
+                    // editor drag the press is the editor's too (see the main
+                    // window's press handler).
+                    if (msg == c.WM_LBUTTONDOWN and app.press_claim.held_mask == 0) {
                         ext_window.?.copy_button_pressed = hitTestCopyButton(hwnd, app, grid_id.?, x, y);
                         if (ext_window.?.copy_button_pressed) return 0;
                         if (scrollbar.mouseDown(app, scrollbar.externalSurface(ext_window.?, grid_id.?), x, y)) {
