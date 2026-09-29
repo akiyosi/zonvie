@@ -1238,23 +1238,6 @@ pub fn shiftRowBits(
     }
 }
 
-/// How one argument goes into a spawn command so the core's tokenizer
-/// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
-/// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote
-/// as grouping, never unescapes, and ends a quoted token at its quote (or at
-/// a backslash-quote pair). Null when neither quote can carry the argument
-/// (an empty one, or one with a space and both quote kinds).
-pub fn spawnArgQuote(arg: []const u8) ?u8 {
-    if (arg.len == 0) return null;
-    const needs_quote = std.mem.indexOfScalar(u8, arg, ' ') != null or arg[0] == '"' or arg[0] == '\'';
-    if (!needs_quote) return 0;
-    const ends_in_backslash = arg[arg.len - 1] == '\\';
-    for ([_]u8{ '"', '\'' }) |q| {
-        if (std.mem.indexOfScalar(u8, arg, q) == null and !ends_in_backslash) return q;
-    }
-    return null;
-}
-
 pub const RowBand = struct { start: usize, end: usize };
 
 pub const ShiftCheck = enum { noop, fits, invalid };
@@ -1291,15 +1274,7 @@ pub const copyUtf8Truncated = core.frontend_rules.copyUtf8Truncated;
 pub const mini_max_lines = core.frontend_rules.mini_max_lines;
 pub const clampMiniContent = core.frontend_rules.clampMiniContent;
 
-/// Length of the longest prefix of `s` that fits in `max_bytes` without
-/// splitting a UTF-8 codepoint: the cut backs off while the first EXCLUDED
-/// byte is a continuation byte.
-pub fn utf8TruncLen(s: []const u8, max_bytes: usize) usize {
-    if (s.len <= max_bytes) return s.len;
-    var n = max_bytes;
-    while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
-    return n;
-}
+pub const utf8TruncLen = core.frontend_rules.utf8PrefixLen;
 
 /// The longest valid UTF-8 prefix of `s` that converts to at most
 /// `max_utf16` UTF-16 units. utf8ToUtf16Le rejects invalid input and does not

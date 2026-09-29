@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import os
 import Metal
 import UserNotifications
 import Carbon.HIToolbox
@@ -1565,26 +1566,10 @@ final class ZonvieCore {
                 }
             },
             on_restart: { ctx, addrPtr, addrLen in
-                guard let ctx else { return }
-                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                let addr: String
-                if let p = addrPtr, addrLen > 0 {
-                    addr = String(decoding: UnsafeBufferPointer(start: p, count: addrLen), as: UTF8.self)
-                } else {
-                    addr = ""
-                }
-                core.handleRestartEvent(listenAddr: addr)
+                ZonvieCore.handleSessionSwap(ctx, "restart: reconnecting to listen_addr", addrPtr, addrLen)
             },
             on_connect: { ctx, addrPtr, addrLen in
-                guard let ctx else { return }
-                let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
-                let addr: String
-                if let p = addrPtr, addrLen > 0 {
-                    addr = String(decoding: UnsafeBufferPointer(start: p, count: addrLen), as: UTF8.self)
-                } else {
-                    addr = ""
-                }
-                core.handleConnectEvent(serverAddr: addr)
+                ZonvieCore.handleSessionSwap(ctx, "connect: hot-swap to server_addr", addrPtr, addrLen)
             },
             on_agent_status: { ctx, tabHandle, state, titlePtr, titleLen in
                 guard let ctx else { return }
@@ -1652,6 +1637,7 @@ final class ZonvieCore {
     }
 
     deinit {
+        startCancelledFlag.withLock { $0 = true }
         // Remove notification observer to prevent orphaned observer accumulation.
         if let observer = sshNotificationObserver {
             NotificationCenter.default.removeObserver(observer)
@@ -1774,8 +1760,10 @@ final class ZonvieCore {
     /// The session asked to start (main thread only). Between this and
     /// didStart a close cancels the start instead of asking nvim.
     var startRequested = false
-    /// Set by cancelPendingStart; main thread only.
-    private(set) var startCancelled = false
+    /// Set by cancelPendingStart or deinit; read from any thread (a local
+    /// start and the devcontainer poller run off main).
+    private let startCancelledFlag = OSAllocatedUnfairLock(initialState: false)
+    var startCancelled: Bool { startCancelledFlag.withLock { $0 } }
 
     /// A local start runs off main; the flag is main-thread state.
     private func noteStarted(_ ok: Bool) {
@@ -1784,13 +1772,23 @@ final class ZonvieCore {
     }
 
     /// Close a session whose start was requested but whose nvim cannot answer
-    /// yet: a pending devcontainer exec is dropped, and deinit stops anything
-    /// already spawned once the window releases the ViewController.
+    /// yet: a queued start or devcontainer exec is dropped, a devcontainer
+    /// poll stops waiting (its `devcontainer up` runs on), and deinit stops
+    /// anything already spawned once the window releases the ViewController.
     func cancelPendingStart(window win: NSWindow) {
-        startCancelled = true
+        startCancelledFlag.withLock { $0 = true }
         progressWindow?.close()
         progressWindow = nil
         closeSessionWindow(win)
+    }
+
+    /// One argument as the core's command tokenizer hands it back unchanged.
+    nonisolated private static func spawnArgQuoted(_ arg: String) -> String {
+        var q = arg.withCString { zonvie_core_spawn_arg_quote($0, strlen($0)) }
+        if q == 0 { return arg }
+        if q < 0 { q = 0x22 }
+        let quote = String(UnicodeScalar(UInt8(q)))
+        return quote + arg + quote
     }
 
     func start(nvimPath: String, rows: UInt32, cols: UInt32) -> Int32 {
@@ -2031,13 +2029,7 @@ final class ZonvieCore {
             return result
         }
 
-        // Build final command path (quote if path contains spaces for Zig parser)
-        var finalPath: String
-        if nvimPath.contains(" ") {
-            finalPath = "'" + nvimPath + "'"
-        } else {
-            finalPath = nvimPath
-        }
+        var finalPath = ZonvieCore.spawnArgQuoted(nvimPath)
         if let host = sshHost {
             // Create SSH_ASKPASS script that shows dialog on demand
             // This handles both password auth and key passphrase
@@ -2132,25 +2124,7 @@ final class ZonvieCore {
         // Append extra arguments for nvim (collected in main.swift)
         // Only for native mode (not SSH/devcontainer - local file paths don't make sense on remote)
         if sshHost == nil && !isDevcontainerMode && !nvimExtraArgs.isEmpty {
-            // Escape arguments for Zig shell-split parser.
-            // The Zig parser treats ' and " as quote delimiters and \' or \" as
-            // escaped quotes inside the corresponding quote type.
-            // POSIX-style '\'' does NOT work with the Zig parser.
-            let escapedArgs = nvimExtraArgs.map { arg -> String in
-                let hasSingle = arg.contains("'")
-                let hasDouble = arg.contains("\"")
-                let hasSpace = arg.contains(" ")
-                if hasSingle && !hasDouble {
-                    return "\"" + arg + "\""
-                } else if (hasSpace || hasDouble) && !hasSingle {
-                    return "'" + arg + "'"
-                } else if hasSingle && hasDouble {
-                    return "\"" + arg.replacingOccurrences(of: "\"", with: "\\\"") + "\""
-                } else if hasSpace {
-                    return "'" + arg + "'"
-                }
-                return arg
-            }
+            let escapedArgs = nvimExtraArgs.map(ZonvieCore.spawnArgQuoted)
             finalPath += " " + escapedArgs.joined(separator: " ")
             ZonvieCore.appLog("[start] Added nvim extra args: \(nvimExtraArgs)")
         }
@@ -2264,7 +2238,7 @@ final class ZonvieCore {
     }
 
     /// Check if Docker is running by executing `docker info`
-    private func isDockerRunning() -> Bool {
+    private static func isDockerRunning() -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/local/bin/docker")
         process.arguments = ["info"]
@@ -2293,7 +2267,7 @@ final class ZonvieCore {
     }
 
     /// Start Docker Desktop and wait until it's ready
-    private func ensureDockerRunning(updateLabel: @escaping (String) -> Void) -> Bool {
+    private static func ensureDockerRunning(isCancelled: () -> Bool, updateLabel: @escaping (String) -> Void) -> Bool {
         if isDockerRunning() {
             ZonvieCore.appLog("[devcontainer] Docker is already running")
             return true
@@ -2316,6 +2290,7 @@ final class ZonvieCore {
         let maxWaitSeconds = 60
         for i in 0..<maxWaitSeconds {
             Thread.sleep(forTimeInterval: 1.0)
+            if isCancelled() { return false }
             if isDockerRunning() {
                 ZonvieCore.appLog("[devcontainer] Docker started successfully after \(i+1) seconds")
                 return true
@@ -2331,14 +2306,19 @@ final class ZonvieCore {
         let homeDir = FileManager.default.homeDirectoryForCurrentUser.path
         let upArgs = ZonvieCore.devcontainerUpArgs(nvimConfigDir: "\(homeDir)/.config/nvim", rebuild: rebuild)
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
+        // Held instead of self, so a closed session is released (on main)
+        // while `devcontainer up` still runs.
+        let cancelled = startCancelledFlag
+        let isCancelled = { cancelled.withLock { $0 } }
+        let token = "\(ProcessInfo.processInfo.processIdentifier)_\(instanceId)"
 
-            let dockerReady = self.ensureDockerRunning { [weak self] text in
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let dockerReady = ZonvieCore.ensureDockerRunning(isCancelled: isCancelled) { text in
                 DispatchQueue.main.async {
                     self?.updateProgressLabel(text)
                 }
             }
+            if isCancelled() { return }
 
             if !dockerReady {
                 DispatchQueue.main.async { [weak self] in
@@ -2354,11 +2334,11 @@ final class ZonvieCore {
 
             // Marker files for completion detection
             let tempDir = FileManager.default.temporaryDirectory.path
-            let doneFile = "\(tempDir)/devcontainer_done_\(ProcessInfo.processInfo.processIdentifier)"
-            let failFile = "\(tempDir)/devcontainer_fail_\(ProcessInfo.processInfo.processIdentifier)"
+            let doneFile = "\(tempDir)/devcontainer_done_\(token)"
+            let failFile = "\(tempDir)/devcontainer_fail_\(token)"
             // Capture `devcontainer up` output so a failure reason is visible
             // (it used to be discarded to /dev/null, which made failures opaque).
-            let upLogFile = "\(tempDir)/devcontainer_up_\(ProcessInfo.processInfo.processIdentifier).log"
+            let upLogFile = "\(tempDir)/devcontainer_up_\(token).log"
 
             try? FileManager.default.removeItem(atPath: doneFile)
             try? FileManager.default.removeItem(atPath: failFile)
@@ -2409,6 +2389,10 @@ final class ZonvieCore {
             ZonvieCore.appLog("[devcontainer] Polling for completion...")
             while true {
                 Thread.sleep(forTimeInterval: 1.0)
+                if isCancelled() {
+                    ZonvieCore.appLog("[devcontainer] start cancelled; stop polling")
+                    break
+                }
 
                 if FileManager.default.fileExists(atPath: doneFile) {
                     try? FileManager.default.removeItem(atPath: doneFile)
@@ -2846,15 +2830,16 @@ final class ZonvieCore {
     /// Cmd+Q asks every session at once, so each alert is a sheet on its own
     /// session's window and names the session when there are several.
     private func presentQuitAlert(_ alert: NSAlert, onFirstButton: @escaping () -> Void) {
-        guard let win = terminalView?.window, win.isVisible else {
+        let win = terminalView?.window
+        let sessions = SessionManager.shared.sessions
+        if sessions.count > 1, let win, let name = sessions.first(where: { $0.window === win })?.name {
+            alert.messageText += " (\(name))"
+        }
+        guard let win, win.isVisible else {
             if alert.runModal() == .alertFirstButtonReturn { onFirstButton() }
             return
         }
         win.makeKeyAndOrderFront(nil)
-        let sessions = SessionManager.shared.sessions
-        if sessions.count > 1, let name = sessions.first(where: { $0.window === win })?.name {
-            alert.messageText += " (\(name))"
-        }
         if let sheet = win.attachedSheet {
             // An earlier quit alert is stale once a new answer arrives (a
             // "Not Responding" nvim that then replied); another sheet cannot
@@ -2883,18 +2868,23 @@ final class ZonvieCore {
         alert.addButton(withTitle: "Wait")
 
         presentQuitAlert(alert) { [weak self] in
-            guard let self else { return }
             ZonvieCore.appLog("[showNotRespondingDialog] user chose Force Quit")
-            if SessionManager.shared.sessions.count <= 1 {
-                AppDelegate.terminateApp()
-            } else if let win = self.terminalView?.window {
-                // No stop() here: it frees the grid while this window's timers
-                // and queued callbacks can still reach it. Closing releases the
-                // ViewController, and deinit stops and destroys the core.
-                self.closeSessionWindow(win)
-            }
+            self?.endSession()
         }
         // Wait -> do nothing, user can try closing again later
+    }
+
+    /// Ends this session without asking nvim: the app for the last session,
+    /// else only its window.
+    private func endSession() {
+        if SessionManager.shared.sessions.count <= 1 {
+            AppDelegate.terminateApp()
+        } else if let win = terminalView?.window {
+            // No stop() here: it frees the grid while this window's timers
+            // and queued callbacks can still reach it. Closing releases the
+            // ViewController, and deinit stops and destroys the core.
+            closeSessionWindow(win)
+        }
     }
 
     /// The drop point for the next external window created via
@@ -2956,69 +2946,17 @@ final class ZonvieCore {
     ) {
         guard let core else { return }
 
-        let charsData = characters?.data(using: .utf8)
-        let ignData = charactersIgnoringModifiers?.data(using: .utf8)
-
-        let charsBytes: UnsafePointer<UInt8>? = charsData?.withUnsafeBytes { raw in
-            raw.bindMemory(to: UInt8.self).baseAddress
+        // The pointers are valid only inside the closure: the Data stays alive
+        // across the C call.
+        func withBytes(_ d: Data?, _ body: (UnsafePointer<UInt8>?, Int32) -> Void) {
+            guard let d else { return body(nil, 0) }
+            d.withUnsafeBytes { body($0.bindMemory(to: UInt8.self).baseAddress, Int32(d.count)) }
         }
-        let ignBytes: UnsafePointer<UInt8>? = ignData?.withUnsafeBytes { raw in
-            raw.bindMemory(to: UInt8.self).baseAddress
-        }
-
-        // NOTE: We must keep the Data alive across the C call; do nested closures.
-        if let charsData, let ignData {
-            charsData.withUnsafeBytes { cRaw in
-                ignData.withUnsafeBytes { iRaw in
-                    let cBase = cRaw.bindMemory(to: UInt8.self).baseAddress
-                    let iBase = iRaw.bindMemory(to: UInt8.self).baseAddress
-                    zonvie_core_send_key_event(
-                        core,
-                        keyCode,
-                        mods,
-                        cBase,
-                        Int32(charsData.count),
-                        iBase,
-                        Int32(ignData.count)
-                    )
-                }
+        withBytes(characters?.data(using: .utf8)) { cBase, cLen in
+            withBytes(charactersIgnoringModifiers?.data(using: .utf8)) { iBase, iLen in
+                zonvie_core_send_key_event(core, keyCode, mods, cBase, cLen, iBase, iLen)
             }
-            return
         }
-
-        if let charsData {
-            charsData.withUnsafeBytes { cRaw in
-                let cBase = cRaw.bindMemory(to: UInt8.self).baseAddress
-                zonvie_core_send_key_event(
-                    core,
-                    keyCode,
-                    mods,
-                    cBase,
-                    Int32(charsData.count),
-                    ignBytes,
-                    Int32(ignData?.count ?? 0)
-                )
-            }
-            return
-        }
-
-        if let ignData {
-            ignData.withUnsafeBytes { iRaw in
-                let iBase = iRaw.bindMemory(to: UInt8.self).baseAddress
-                zonvie_core_send_key_event(
-                    core,
-                    keyCode,
-                    mods,
-                    charsBytes,
-                    Int32(charsData?.count ?? 0),
-                    iBase,
-                    Int32(ignData.count)
-                )
-            }
-            return
-        }
-
-        zonvie_core_send_key_event(core, keyCode, mods, nil, 0, nil, 0)
     }
 
     func resize(rows: UInt32, cols: UInt32) {
@@ -4222,24 +4160,16 @@ final class ZonvieCore {
         }
     }
 
-    /// Receive the `restart` UI event from the core. Informational only —
-    /// the core handles the actual reconnect (TCP / Unix-socket connect to
-    /// listen_addr) transparently while the GUI continues running. The
-    /// matching `on_exit` is suppressed inside the core, so this is the
-    /// only signal a frontend gets that nvim swapped underneath.
-    fileprivate func handleRestartEvent(listenAddr: String) {
-        advanceExternalWindowSessionGeneration()
-        resetCoreReportedCursorGrid()
-        ZonvieCore.appLog("restart: reconnecting to listen_addr=\(listenAddr)")
-    }
-
-    /// Receive the `connect` UI event (`:connect <addr>`). Same flicker-free
-    /// reconnect as restart; the only difference is that the previous
-    /// server keeps running headless instead of dying.
-    fileprivate func handleConnectEvent(serverAddr: String) {
-        advanceExternalWindowSessionGeneration()
-        resetCoreReportedCursorGrid()
-        ZonvieCore.appLog("connect: hot-swap to server_addr=\(serverAddr)")
+    /// The `restart` or `connect` UI event: the core reconnects transparently
+    /// while the GUI keeps running, and suppresses the matching `on_exit`, so
+    /// this is the only signal that nvim swapped underneath.
+    fileprivate static func handleSessionSwap(_ ctx: UnsafeMutableRawPointer?, _ label: String, _ addrPtr: UnsafePointer<UInt8>?, _ addrLen: Int) {
+        guard let ctx else { return }
+        let core = Unmanaged<ZonvieCore>.fromOpaque(ctx).takeUnretainedValue()
+        let addr = addrPtr.map { String(decoding: UnsafeBufferPointer(start: $0, count: addrLen), as: UTF8.self) } ?? ""
+        core.advanceExternalWindowSessionGeneration()
+        core.resetCoreReportedCursorGrid()
+        ZonvieCore.appLog("\(label)=\(addr)")
     }
 
     /// The new session's grid ids restart and the core forgets its last cursor
@@ -5808,47 +5738,22 @@ final class ZonvieCore {
         // For popupmenu, the container bg color comes from the core callback
         // (on_popupmenu_show delivers resolved Pmenu bg). We do NOT inspect
         // vertex colors because the grid is sent row-by-row and the selected
-        // row's PmenuSel would be mistaken for the dominant color.
-        // Vertex alpha adjustment is still applied so Pmenu bg cells become
-        // transparent and blur shows through, while PmenuSel cells keep
-        // their opaque bg (the shader alpha override in ExternalGridView
-        // ensures this works).
-        if kind == .popupmenu {
-            let bgColor = self.popupmenuBgColor
-            guard let bgColor else { return (vertices, nil) }
-
-            var adjustedVertices = vertices
-            // Under a shader, skip the +0.05 lightening (keep the raw Pmenu color)
-            // and force the default cells fully transparent (alpha 0) so a
-            // luminance-keyed shader draws through them exactly as it does on the
-            // cmdline / main window — otherwise the opaque Pmenu bg (alpha 1)
-            // stays above the shader's background cutoff and tints the effect.
-            // PmenuSel cells do not match origBg, so they stay opaque (selection
-            // remains visible over the shader).
-            let adjustedBg = shaderActive ? bgColor : bgColor.adjustedForCmdlineBackground()
-            var adjR: CGFloat = 0, adjG: CGFloat = 0, adjB: CGFloat = 0, adjA: CGFloat = 0
-            adjustedBg.usingColorSpace(.sRGB)?.getRed(&adjR, green: &adjG, blue: &adjB, alpha: &adjA)
-            adjA = (shaderActive || ZonvieConfig.shared.blurEnabled) ? 0.0 : 1.0
-
-            var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
-            bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
-
-            ZonvieCore.replaceDecoratedBackgroundColor(
-                in: &adjustedVertices,
-                from: (origR, origG, origB),
-                to: (adjR, adjG, adjB, adjA)
-            )
-            return (adjustedVertices, bgColor)
+        // row's PmenuSel would be mistaken for the dominant color. Cmdline and
+        // msg grids use their first bg vertex.
+        guard let bgColor = kind == .popupmenu ? self.popupmenuBgColor : firstBg else {
+            return (vertices, nil)
         }
 
-        // Non-popupmenu decorated grids (cmdline, msg): use first bg vertex
-        guard let bgColor = firstBg else { return (vertices, nil) }
-
+        // Only the popupmenu gets here under a shader: skip the +0.05 lightening
+        // and force the default cells fully transparent (alpha 0) so a
+        // luminance-keyed shader draws through them exactly as it does on the
+        // cmdline / main window. PmenuSel cells do not match origBg, so they
+        // stay opaque (selection remains visible over the shader).
         var adjustedVertices = vertices
-        let adjustedBg = bgColor.adjustedForCmdlineBackground()
+        let adjustedBg = shaderActive ? bgColor : bgColor.adjustedForCmdlineBackground()
         var adjR: CGFloat = 0, adjG: CGFloat = 0, adjB: CGFloat = 0, adjA: CGFloat = 0
         adjustedBg.usingColorSpace(.sRGB)?.getRed(&adjR, green: &adjG, blue: &adjB, alpha: &adjA)
-        adjA = ZonvieConfig.shared.blurEnabled ? 0.0 : 1.0
+        adjA = (shaderActive || ZonvieConfig.shared.blurEnabled) ? 0.0 : 1.0
 
         var origR: CGFloat = 0, origG: CGFloat = 0, origB: CGFloat = 0, origA: CGFloat = 0
         bgColor.usingColorSpace(.sRGB)?.getRed(&origR, green: &origG, blue: &origB, alpha: &origA)
@@ -5858,7 +5763,6 @@ final class ZonvieCore {
             from: (origR, origG, origB),
             to: (adjR, adjG, adjB, adjA)
         )
-
         return (adjustedVertices, bgColor)
     }
 
@@ -7254,8 +7158,8 @@ final class ZonvieCore {
                 // cmdline is being shown.
                 ZonvieCore.appLog("[cursor_grid_changed] special grid \(gridId) not yet registered; skip main activation")
             } else {
-                for view in suspects { view.markOcclusionSuspect() }
                 if let mainWindow = self.terminalView?.window {
+                    for view in suspects { view.markOcclusionSuspect(ifCoveredBy: mainWindow) }
                     mainWindow.makeKeyAndOrderFront(nil)
                     ZonvieCore.appLog("[cursor_grid_changed] activated main window (cursor on gridId=\(gridId) surface=\(surfaceId))")
                 }
@@ -8742,7 +8646,7 @@ final class ZonvieCore {
             }
         } else {
             ZonvieCore.appLog("[SSH] Password dialog cancelled")
-            self.stop()
+            endSession()
         }
     }
 }

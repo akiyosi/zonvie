@@ -2945,11 +2945,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 FrameTracer.trace(.drawEnd)
             }
         }
+        let host = view as? MetalTerminalView
         // Drive key-repeat synthesis off the render clock (main thread; 60Hz
         // while the continuous draw loop is active). No-op unless armed.
-        (view as? MetalTerminalView)?.core?.keyInput.tickKeyRepeatSynthesis()
+        host?.core?.keyInput.tickKeyRepeatSynthesis()
         if ZonvieCore.appLogEnabled,
-           let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
+           let inputTrace = host?.core?.currentInputTraceSnapshot(),
            inputTrace.seq != 0,
            inputTrace.sentNs != 0,
            inputTrace.lastDrawStartLoggedSeq != inputTrace.seq
@@ -2957,7 +2958,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let nowNs = zonvie_core_perf_now_ns()
             let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
             ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_start delta_us=\(deltaUs)")
-            (view as? MetalTerminalView)?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
+            host?.core?.markInputTraceDrawStartLogged(seq: inputTrace.seq)
         }
         // Skip all rendering while this window is not on screen.
         // Metal's currentDrawable blocks/crashes when the window is in the
@@ -2970,7 +2971,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // first measured at ~1s per attempt. Unlike it, not exempt before the
         // first present.
         let gate = (view as? GridInputView)?.visibilityGate(unpresentedMayDraw: false) ?? .draw
-        if gate == .unsettled, let terminalView = view as? MetalTerminalView {
+        if gate == .unsettled, let terminalView = host {
             ZonvieCore.drawTrace("surface=1 gate=occlusion_unsettled")
             terminalView.didDrawFrame()
             terminalView.requestRedraw()
@@ -2993,12 +2994,12 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // for an hour with a background :terminal scrolling would leave an
             // unbounded array and an O(external x N) scan for the first frame
             // back. Lock and dictionary work, not GPU work.
-            (view as? MetalTerminalView)?.core?.scrollModel.processPendingScrollClears()
-            (view as? MetalTerminalView)?.didDrawFrame()
+            host?.core?.scrollModel.processPendingScrollClears()
+            host?.didDrawFrame()
             // Park the loop: this path skips the idle count, and every flush
             // from any surface re-activates it, so a hidden main woke at vsync
             // until it was shown again.
-            (view as? MetalTerminalView)?.parkDrawLoopWhenHidden()
+            host?.parkDrawLoopWhenHidden()
             return
         }
 
@@ -3022,8 +3023,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 if let error = shared.initializationError {
                     ZonvieCore.appLog("[draw] Skipping render due to initialization error: \(error)")
                 }
-                (view as? MetalTerminalView)?.notifyDrawIdle()
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.notifyDrawIdle()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3031,11 +3032,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // animation-driving uniforms (iTime etc.). A missing pipeline must
             // not reset the idle counter every frame.
             if shared.anyCustomShaderNeedsAnimation {
-                (view as? MetalTerminalView)?.activateSurfaceDrawLoop()
+                host?.activateSurfaceDrawLoop()
             }
 
             if view.drawableSize.width <= 0 || view.drawableSize.height <= 0 {
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3045,7 +3046,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // committed/dirty snapshots below so no render state is consumed;
             // viewDidEndLiveResize requests one exact-size full redraw.
             if view.inLiveResize, backBuffer != nil, backBufferSize != view.drawableSize {
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3068,8 +3069,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if inflightSemaphore.wait(timeout: .now()) != .success {
                 FrameTracer.trace(.drawSkipSemaphore)
                 ZonvieCore.appLogPerf("[perf] draw_semaphore_busy skip=true")
-                (view as? MetalTerminalView)?.didDrawFrame()
-                (view as? MetalTerminalView)?.requestRedraw()
+                host?.didDrawFrame()
+                host?.requestRedraw()
                 return
             }
 
@@ -3131,11 +3132,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 lock.unlock()
                 FrameTracer.trace(.drawSkipRowCapacity)
                 inflightSemaphore.signal()
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.didDrawFrame()
                 // A hard failure is terminal and never cleared, so re-requesting
                 // a draw only spins the display link without ever presenting.
                 if !terminal {
-                    (view as? MetalTerminalView)?.requestRedraw()
+                    host?.requestRedraw()
                 }
                 return
             }
@@ -3330,7 +3331,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Before the first row lands there is only the cursor to draw.
             if !rowMode && currentCursorCount <= 0 {
                 FrameTracer.trace(.drawSkipNoChange, a: 1)
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3391,8 +3392,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if idleGateSkips {
                 // Still reset redrawPending so future redraws are not blocked.
                 FrameTracer.trace(.drawSkipNoChange, a: 2)
-                (view as? MetalTerminalView)?.notifyDrawIdle()
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.notifyDrawIdle()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3404,8 +3405,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 blink.lastRendered = cursorBlinkStateSnapshot
                 FrameTracer.trace(.drawSkipNoChange, a: 4)
                 ZonvieCore.appLog("[draw] skipFrame=true (blink toggle with no cursor; draw cycle skipped)")
-                (view as? MetalTerminalView)?.notifyDrawIdle()
-                (view as? MetalTerminalView)?.didDrawFrame()
+                host?.notifyDrawIdle()
+                host?.didDrawFrame()
                 return
             }
 
@@ -3419,7 +3420,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // for those vertices — both compute (drawable / cell) * cell.
 
             // Rendering will proceed — reset active draw loop idle counter.
-            (view as? MetalTerminalView)?.notifyDrawActive()
+            host?.notifyDrawActive()
 
             // Snapshot pre-frame skip-gate state so an acquisition failure
             // below (bailWithoutSubmit) can un-consume it for retry.
@@ -3464,7 +3465,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // Glow must be checked early — it disables partial-redraw
             // optimizations, because additive bloom accumulates brightness when
             // the back buffer preserves previous glow.
-            let configuredGlowEnabled = (view as? MetalTerminalView)?.core?.isGlowEnabled() ?? false
+            let configuredGlowEnabled = host?.core?.isGlowEnabled() ?? false
             let glowEnabled = SurfaceFixedFloatMask.permitsGlow(
                 configured: configuredGlowEnabled, smoothScrolling: smoothScrolling,
                 bands: fixedFloatBandsSnapshot)
@@ -3558,8 +3559,8 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 lastDrawnRevision = prevDrawnRevision
                 scrollOffsetLatch.restore(previousFrameWasActive: prevDrawnHadActiveScrollOffset)
                 blink.lastRendered = prevRenderedBlinkState
-                (view as? MetalTerminalView)?.didDrawFrame()
-                (view as? MetalTerminalView)?.requestRedraw()
+                host?.didDrawFrame()
+                host?.requestRedraw()
             }
 
             // Ensure persistent back buffer matches current drawable size.
@@ -4321,9 +4322,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 viewportMetrics: viewportMetrics,
                 drawableSize: view.drawableSize,
                 glowTextures: glowTextures,
-                intensity: (view as? MetalTerminalView)?.core?.getGlowIntensity() ?? 0.8,
+                intensity: host?.core?.getGlowIntensity() ?? 0.8,
                 // One read, for both the chain's depth and the taps' reach.
-                radiusScale: (view as? MetalTerminalView)?.core?.getGlowRadiusScale() ?? 1.0
+                radiusScale: host?.core?.getGlowRadiusScale() ?? 1.0
             ) { enc, extractPipe in
                     // Extract vertices: atlas + scroll offsets + row/main + cursor
                     bindSurfaceGlowExtractState(
@@ -4833,7 +4834,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 let t_draw_end = CFAbsoluteTimeGetCurrent()
                 let draw_ms = (t_draw_end - t_draw_start) * 1000.0
                 ZonvieCore.appLogPerf("[perf] draw_total rowMode=\(rowMode) dirtyRows=\(dirtyRows.count) ms=\(String(format: "%.2f", draw_ms))")
-                if let inputTrace = (view as? MetalTerminalView)?.core?.currentInputTraceSnapshot(),
+                if let inputTrace = host?.core?.currentInputTraceSnapshot(),
                    inputTrace.seq != 0,
                    inputTrace.sentNs != 0,
                    inputTrace.lastDrawLoggedSeq != inputTrace.seq
@@ -4841,11 +4842,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                     let nowNs = zonvie_core_perf_now_ns()
                     let deltaUs = max(Int64(0), (nowNs - inputTrace.sentNs) / 1_000)
                     ZonvieCore.appLogPerf("[perf_input] seq=\(inputTrace.seq) stage=draw_end delta_us=\(deltaUs) rowMode=\(rowMode) dirtyRows=\(dirtyRows.count)")
-                    (view as? MetalTerminalView)?.core?.markInputTraceDrawLogged(seq: inputTrace.seq)
+                    host?.core?.markInputTraceDrawLogged(seq: inputTrace.seq)
                 }
             }
 
-            (view as? MetalTerminalView)?.didDrawFrame()
+            host?.didDrawFrame()
         }
     }
 

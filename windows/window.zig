@@ -1045,8 +1045,10 @@ fn armFlushRetryWake(hwnd: c.HWND, app: *App) void {
     _ = c.InvalidateRect(hwnd, null, c.FALSE);
 }
 
-/// True when a message-driven flush retry must be deferred. consumeFlushRetryWake
-/// takes grid_mu and runs a complete onFlush, which publishes vertices through
+/// True while an operation that owns the D3D context or pumps messages is on
+/// this thread; a flush retry, glow prepare, shader-animation tick or WM_SIZE
+/// must wait. For the flush retry: consumeFlushRetryWake takes grid_mu and
+/// runs a complete onFlush, which publishes vertices through
 /// app.mu-taking callbacks. Any operation that pumps messages (device-loss
 /// recovery runs its rebuild unlocked precisely because DXGI/DComposition pump;
 /// Present pumps too) can therefore dispatch a WM_TIMER or the fallback message
@@ -1058,7 +1060,7 @@ fn armFlushRetryWake(hwnd: c.HWND, app: *App) void {
 /// deferred_ui_service_in_progress is deliberately NOT included: the polled
 /// deadline in serviceDeferredUiRetries runs with that flag set, and it is the
 /// path that picks the retry back up after this returns true.
-fn flushRetryReentrancyBlocked(app: *const App) bool {
+fn d3dOperationBlocked(app: *const App) bool {
     return app.paintReentrancyBlocked() or app.external_window_create_in_progress;
 }
 
@@ -1175,14 +1177,7 @@ fn prepareGlowShadersOnUiThread(hwnd: c.HWND, app: *App) void {
         app.glow_prepare_posted.store(false, .release);
         return;
     }
-    if (app.wm_paint_in_progress or
-        app.in_present_shader_animation_frame or
-        app.device_lost_recovering or
-        app.external_window_create_in_progress or
-        app.main_resize_in_progress or
-        app.main_dpi_change_in_progress or
-        app.glow_prepare_in_progress)
-    {
+    if (d3dOperationBlocked(app)) {
         // The normal request is queued before InvalidateRect, so this only
         // happens through a nested message pump. Let the next flush retry.
         app.glow_prepare_posted.store(false, .release);
@@ -1557,7 +1552,7 @@ fn buildNativeNvimCmd(app: *App, buf: []u8) []const u8 {
     for (app.nvim_extra_args.items) |arg| {
         writer.writeByte(' ') catch {};
         // An argument no quote can carry keeps the old double quotes.
-        const q = render_helpers.spawnArgQuote(arg) orelse '"';
+        const q = core.frontend_rules.spawnArgQuote(arg) orelse '"';
         if (q != 0) writer.writeByte(q) catch {};
         writer.writeAll(arg) catch {};
         if (q != 0) writer.writeByte(q) catch {};
@@ -2664,13 +2659,13 @@ pub export fn WndProc(
 
                         // Reserve every rect this paint can add: one span per
                         // dirty row, the copied paint damage, one per layer,
-                        // and nine singletons — restored and captured
+                        // and eight singletons — restored and captured
                         // scrollbar, rcPaint, gutter, cursor, three chrome
-                        // strips, scroll damage.
+                        // strips.
                         var present = app_mod.PresentRectBuilder.begin(
                             &app.surf.paint.present_rects,
                             app.alloc,
-                            rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 9,
+                            rows_to_draw.items.len + paint_rects_snapshot.items.len + tbs_snapshot.layers.len + 8,
                         );
                         const present_rects = present.list;
 
@@ -3374,7 +3369,7 @@ pub export fn WndProc(
                 // here would self-deadlock. Replay the complete WM_SIZE path
                 // after recovery: rebuilding the swapchain from GetClientRect
                 // fixes GPU size, but does not resend rows/cols to Neovim.
-                if (app.paintReentrancyBlocked() or app.external_window_create_in_progress) {
+                if (d3dOperationBlocked(app)) {
                     app.main_size_replay_needed = true;
                     if (app.device_lost_recovering) scheduleMainSizeReplay(hwnd, app);
                     return 0;
@@ -4273,7 +4268,7 @@ pub export fn WndProc(
                     // runs from main()'s loop, the very loop that is not
                     // turning inside a modal drag. consumeFlushRetryWake kills
                     // the timer itself once it actually services the retry.
-                    if (!flushRetryReentrancyBlocked(app)) {
+                    if (!d3dOperationBlocked(app)) {
                         consumeFlushRetryWake(hwnd, app);
                     }
                 } else {
@@ -4318,14 +4313,7 @@ pub export fn WndProc(
                     // immediate-context state or using a renderer while it is
                     // being prepared, replaced, or published. The next tick
                     // (~16ms later) retries.
-                    if (app.in_present_shader_animation_frame or
-                        app.wm_paint_in_progress or
-                        app.glow_prepare_in_progress or
-                        app.device_lost_recovering or
-                        app.external_window_create_in_progress or
-                        app.main_resize_in_progress or
-                        app.main_dpi_change_in_progress)
-                    {
+                    if (d3dOperationBlocked(app)) {
                         if (applog.isEnabled()) applog.appLog("[win] presentShaderAnimationFrame: re-entrant/busy call skipped\n", .{});
                     } else {
                         app.in_present_shader_animation_frame = true;
@@ -4520,7 +4508,7 @@ pub export fn WndProc(
                 if (@as(usize, @bitCast(lParam)) == app.window_wake_cookie and
                     @as(u32, @intCast(wParam & 0xFFFF_FFFF)) == app.flush_retry_wake_generation)
                 {
-                    if (flushRetryReentrancyBlocked(app)) {
+                    if (d3dOperationBlocked(app)) {
                         // Unlike TIMER_FLUSH_RETRY this delivery is one-shot,
                         // so deferring it would destroy the only wake. Release
                         // the armed state so the next armFlushRetryWake issues
@@ -4627,12 +4615,8 @@ pub export fn WndProc(
                     if (applog.isEnabled()) applog.appLog("[win] device-lost recovery: reentrant call rejected\n", .{});
                     return 0;
                 }
-                if (app.wm_paint_in_progress or
-                    app.in_present_shader_animation_frame or
-                    app.glow_prepare_in_progress or
-                    app.main_resize_in_progress or
-                    app.main_dpi_change_in_progress)
-                {
+                // device_lost_recovering was rejected above.
+                if (app.paintReentrancyBlocked()) {
                     // An outer paint, shader-animation Present, or glow
                     // warm-up is currently using the renderer/device state
                     // this recovery is about to tear down and release. If a
@@ -5547,36 +5531,40 @@ pub export fn WndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                // Check tabline/sidebar area first (when ext_tabline enabled).
-                // X buttons too: they had a handler of their own that skipped
-                // the chrome and the scrollbar and reached Neovim at a clamped
-                // cell under the tab bar.
-                if (app.ext_tabline_enabled) {
-                    if (app.tabline_style == .titlebar) {
-                        // Every button, as the sidebar does: a right press on
-                        // a tab reached Neovim as a click on row 0.
-                        if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
-                            if (msg == c.WM_LBUTTONDOWN) {
-                                tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                // Mid editor drag the press is the editor's, as on macOS: the
+                // chrome's own ReleaseCapture would cancel the held button's claim.
+                if (app.press_claim.held_mask == 0) {
+                    // Check tabline/sidebar area first (when ext_tabline enabled).
+                    // X buttons too: they had a handler of their own that skipped
+                    // the chrome and the scrollbar and reached Neovim at a clamped
+                    // cell under the tab bar.
+                    if (app.ext_tabline_enabled) {
+                        if (app.tabline_style == .titlebar) {
+                            // Every button, as the sidebar does: a right press on
+                            // a tab reached Neovim as a click on row 0.
+                            if (y < app.scalePx(TablineState.TAB_BAR_HEIGHT)) {
+                                if (msg == c.WM_LBUTTONDOWN) {
+                                    tabline_mod.handleTablineMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                                }
+                                return input.mouseButtonResult(msg);
                             }
-                            return input.mouseButtonResult(msg);
-                        }
-                    } else if (app.tabline_style == .sidebar) {
-                        if (tabline_mod.pointInSidebar(app, hwnd, @as(c_int, x))) {
-                            // Left button: handle sidebar interaction
-                            // Right/middle button: consume event to prevent Neovim input
-                            if (msg == c.WM_LBUTTONDOWN) {
-                                tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                        } else if (app.tabline_style == .sidebar) {
+                            if (tabline_mod.pointInSidebar(app, hwnd, @as(c_int, x))) {
+                                // Left button: handle sidebar interaction
+                                // Right/middle button: consume event to prevent Neovim input
+                                if (msg == c.WM_LBUTTONDOWN) {
+                                    tabline_mod.handleSidebarMouseDown(app, hwnd, @as(c_int, x), @as(c_int, y));
+                                }
+                                return input.mouseButtonResult(msg);
                             }
-                            return input.mouseButtonResult(msg);
                         }
                     }
-                }
 
-                // Check scrollbar hit first (left button only)
-                if (msg == c.WM_LBUTTONDOWN) {
-                    if (scrollbar.mouseDown(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
-                        return 0; // Handled by scrollbar
+                    // Check scrollbar hit first (left button only)
+                    if (msg == c.WM_LBUTTONDOWN) {
+                        if (scrollbar.mouseDown(app, scrollbar.mainSurface(hwnd, app), @as(i32, x), @as(i32, y))) {
+                            return 0; // Handled by scrollbar
+                        }
                     }
                 }
 
@@ -5814,6 +5802,16 @@ pub export fn WndProc(
                         return 0;
                     }
                     if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: tray icon unavailable, proceeding with quit\n", .{});
+                }
+                // `devcontainer up` still running: the core was never started,
+                // so no nvim can answer a quit. Cancel the pending start (only
+                // the poll timer can start it) and close, as macOS does.
+                if (app.devcontainer_up_pending) {
+                    if (applog.isEnabled()) applog.appLog("[win] WM_CLOSE: cancelling pending devcontainer start\n", .{});
+                    _ = c.KillTimer(hwnd, TIMER_DEVCONTAINER_POLL);
+                    dialogs.hideDevcontainerProgressDialog();
+                    app.devcontainer_up_pending = false;
+                    return c.DefWindowProcW(hwnd, msg, wParam, lParam);
                 }
                 // If already waiting for quit, don't send another request
                 if (app.quit_pending) {

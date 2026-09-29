@@ -80,6 +80,7 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
 
     // Read password
     var password_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &password_buf);
     var read: c.DWORD = 0;
     _ = c.ReadConsoleA(hConsoleIn, &password_buf, 255, &read, null);
 

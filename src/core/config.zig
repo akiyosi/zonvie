@@ -938,6 +938,174 @@ const TomlServer = struct {
     open_mode: ?[]const u8 = null,
 };
 
+// -- text the frontends print ------------------------------------------------
+
+const is_windows = builtin.os.tag == .windows;
+const defaults = Config{};
+
+/// The CONFIG part of `--help`: every section and key this platform reads,
+/// with the defaults above. Indented four spaces, as the help around it.
+pub const config_help: [:0]const u8 = std.fmt.comptimePrint(
+    \\    [neovim]
+    \\        path            Path to Neovim executable
+    ++ (if (is_windows)
+    \\
+    \\        wsl             Enable WSL mode (true/false)
+    \\        wsl_distro      WSL distribution name
+else "") ++
+    \\
+    \\        ssh             Enable SSH mode (true/false)
+    \\        ssh_host        SSH host (user@host format)
+    \\        ssh_port        SSH port number
+    \\        ssh_identity    Path to SSH private key
+    \\
+    \\    [font]
+    \\        family          Font family list, guifont syntax (default: "{s}")
+    \\        size            Font size in points (default: {d:.1})
+    \\        linespace       Extra line spacing in pixels
+    \\
+    \\    [window]
+    \\        blur            Enable blur effect (default: {})
+    \\        opacity         Background opacity (0.0-1.0, default: {d:.1})
+    ++ (if (is_windows) "" else std.fmt.comptimePrint(
+    "\n        blur_radius     Blur radius (0-100, default: {d})", .{defaults.window.blur_radius})) ++
+    \\
+    \\
+    \\    [scrollbar]
+    \\        enabled         Show the scrollbar (default: true)
+    \\        show_mode       "always", "hover", "scroll" or a combination (default: "scroll")
+    \\        opacity         Scrollbar opacity (0.0-1.0)
+    \\        delay           Seconds before hiding in "scroll" mode
+    \\
+    \\    [cmdline]
+    \\        external        Enable external command line UI
+    \\        copy_button     Copy button on the external cmdline (default: true)
+    \\
+    \\    [popup]
+    \\        external        Enable external popup menu UI
+    \\
+    \\    [messages]
+    \\        external        Enable external messages UI
+    \\        copy_button     Copy button on message windows (default: true)
+    \\        view, view_error, view_warn, view_history, view_search, msg_pos,
+    \\        [[messages.routes]]   Message routing (see the README)
+    \\
+    \\    [tabline]
+    \\        external            Enable external tabline UI
+    \\        style               "titlebar", "menu" or "sidebar" (default: "titlebar")
+    \\        sidebar_position    "left" or "right" (default: "left")
+    \\        sidebar_width       Sidebar width in pixels (100-500, default: 200)
+    \\        agent_indicator     AI-agent status icon on terminal tabs (default: true)
+    \\        agent_notification  Notify when an AI agent finishes (default: true)
+    \\
+    \\    [windows]
+    \\        external        Each Neovim window as its own OS window
+    \\
+    \\    [input]
+    \\        swap_colon_semicolon        Swap the : and ; keys
+    ++ (if (is_windows) "" else
+    \\
+    \\        option_as_meta              "both", "none", "only_left", "only_right"
+) ++
+    \\
+    \\        ime_disable_on_activate     Turn the IME off when the app activates
+    \\        ime_disable_on_modechange   Turn the IME off on a mode change
+    \\        ime_preedit_mode            "overlay" or "inline"
+    \\
+    \\    [server]
+    ++ (if (is_windows)
+    \\
+    \\        single_instance Route `zonvie <file>` to a running instance
+    \\        close_to_tray   Close button hides to the notification area
+else "") ++
+    \\
+    \\        open_mode       "tab" or "current" (default: "tab")
+    \\
+    \\    [shaders]
+    \\        enabled, paths, post_process, preserve_alpha   (see the README)
+    \\
+    \\    [log]
+    \\        enabled         Enable logging (true/false)
+    \\        path            Log file path
+    \\
+    \\    [performance]
+    \\        glyph_cache_ascii_size      ASCII glyph cache size ({d}-{d}, default: {d})
+    \\        glyph_cache_non_ascii_size  Non-ASCII glyph cache size ({d}-{d}, default: {d})
+    \\        hl_cache_size               Highlight cache size (64-2048, default: {d})
+    \\        shape_cache_size            Shape cache size (512-65536, default: {d})
+    \\        atlas_size                  Glyph atlas size ({d}-{d}, default: {d})
+    \\
+, .{
+    defaults.font.family,                          defaults.font.size,
+    defaults.window.blur,                          defaults.window.opacity,
+    glyph_cache_ascii_min,
+    glyph_cache_ascii_max,                         defaults.performance.glyph_cache_ascii_size,
+    glyph_cache_non_ascii_min,                     glyph_cache_non_ascii_max,
+    defaults.performance.glyph_cache_non_ascii_size, defaults.performance.hl_cache_size,
+    defaults.performance.shape_cache_size,         atlas_size_min,
+    atlas_size_max,                                defaults.performance.atlas_size,
+});
+
+/// The commented-out config.toml `--install` writes: each value is this
+/// platform's default, so uncommenting one changes nothing.
+pub const default_config_toml: [:0]const u8 = std.fmt.comptimePrint(
+    \\# Zonvie configuration file
+    \\# See `zonvie --help` for all available options.
+    \\
+    \\[font]
+    \\# family = "{s}"
+    \\# size = {d:.1}
+    \\# linespace = 0
+    \\
+    \\[neovim]
+    \\# path = "nvim"
+    \\
+    \\[window]
+    \\# opacity = {d:.1}
+    \\# blur = {}
+    ++ (if (is_windows) "" else std.fmt.comptimePrint("\n# blur_radius = {d}", .{defaults.window.blur_radius})) ++
+    \\
+    \\
+    \\[server]
+    \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
+    ++ (if (is_windows)
+    \\
+    \\# single_instance = false   # route `zonvie <file>` to a running instance
+    \\# close_to_tray = false     # close button hides to the notification area instead of quitting
+else "") ++
+    \\
+    \\
+, .{
+    defaults.font.family,     defaults.font.size,
+    defaults.window.opacity,  defaults.window.blur,
+});
+
+test "the default config.toml parses to the defaults once uncommented" {
+    var src: [default_config_toml.len]u8 = undefined;
+    @memcpy(&src, default_config_toml);
+    // Uncomment every `# key = value` line, dropping trailing comments.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    var it = std.mem.splitScalar(u8, &src, '\n');
+    while (it.next()) |line| {
+        var l = line;
+        if (std.mem.startsWith(u8, l, "# ") and std.mem.indexOfScalar(u8, l, '=') != null) {
+            l = l[2..];
+            if (std.mem.indexOf(u8, l, "   #")) |c| l = l[0..c];
+        } else if (std.mem.startsWith(u8, l, "#")) continue;
+        try out.appendSlice(std.testing.allocator, l);
+        try out.append(std.testing.allocator, '\n');
+    }
+    var cfg = try parseForTest(std.testing.allocator, out.items);
+    defer cfg.deinit();
+    try std.testing.expect(cfg.parse_error == null);
+    try std.testing.expectEqualStrings(defaults.font.family, cfg.font.family);
+    try std.testing.expectEqual(defaults.font.size, cfg.font.size);
+    try std.testing.expectEqual(defaults.window.opacity, cfg.window.opacity);
+    try std.testing.expectEqual(defaults.window.blur, cfg.window.blur);
+    try std.testing.expectEqual(defaults.window.blur_radius, cfg.window.blur_radius);
+}
+
 // -- message routing config tests --------------------------------------------
 
 fn parseForTest(alloc: std.mem.Allocator, toml_src: []const u8) !Config {

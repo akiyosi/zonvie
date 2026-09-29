@@ -1,6 +1,7 @@
 const std = @import("std");
 const clock = @import("zonvie_core").clock;
 const frontend_rules = @import("zonvie_core").frontend_rules;
+const core_config = @import("zonvie_core").config;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const c = app_mod.c;
@@ -425,42 +426,8 @@ pub fn main() u8 {
                     \\    Configuration file: %APPDATA%\zonvie\config.toml
                     \\    (or %USERPROFILE%\.config\zonvie\config.toml)
                     \\
-                    \\    [neovim]
-                    \\        path            Path to Neovim executable
-                    \\        wsl             Enable WSL mode (true/false)
-                    \\        wsl_distro      WSL distribution name
-                    \\        ssh             Enable SSH mode (true/false)
-                    \\        ssh_host        SSH host (user@host format)
-                    \\        ssh_port        SSH port number
-                    \\        ssh_identity    Path to SSH private key
                     \\
-                    \\    [font]
-                    \\        family          Font family name
-                    \\        size            Font size in points
-                    \\        linespace       Extra line spacing in pixels
-                    \\
-                    \\    [cmdline]
-                    \\        external        Enable external command line UI
-                    \\
-                    \\    [popup]
-                    \\        external        Enable external popup menu UI
-                    \\
-                    \\    [messages]
-                    \\        external        Enable external messages UI
-                    \\
-                    \\    [tabline]
-                    \\        external        Enable external tabline UI
-                    \\
-                    \\    [log]
-                    \\        enabled         Enable logging (true/false)
-                    \\        path            Log file path
-                    \\
-                    \\    [performance]
-                    \\        glyph_cache_ascii_size      ASCII glyph cache size (128-512, default: 512)
-                    \\        glyph_cache_non_ascii_size  Non-ASCII glyph cache size (64-262144, default: 16384)
-                    \\        hl_cache_size               Highlight cache size (64-2048, default: 2048)
-                    \\        shape_cache_size            Shape cache size (512-65536, default: 4096)
-                    \\        atlas_size                  Glyph atlas texture size (1024-4096, default: 2048)
+                ++ core_config.config_help ++
                     \\
                     \\For more information, visit: https://github.com/akiyosi/zonvie
                     \\
@@ -473,7 +440,9 @@ pub fn main() u8 {
         if (std.mem.eql(u8, arg, "--install")) {
             const file_assoc = @import("file_assoc.zig");
             const icon_ok = file_assoc.registerAppIcon();
-            const config_result2 = createDefaultConfig(alloc);
+            // A config at any load location counts: an APPDATA template
+            // would shadow one under %USERPROFILE%\.config.
+            const config_result2: ConfigCreateResult = if (config_result.path != null) .already_exists else createDefaultConfig(alloc);
             const has_error = !icon_ok or config_result2 == .err;
 
             _ = c.AttachConsole(ATTACH_PARENT_PROCESS);
@@ -1061,28 +1030,7 @@ fn createDefaultConfig(alloc: std.mem.Allocator) ConfigCreateResult {
     // Write default config
     const file = std.Io.Dir.createFileAbsolute(clock.io(), file_path, .{}) catch return .err;
     defer file.close(clock.io());
-    file.writeStreamingAll(clock.io(), default_config_toml) catch return .err;
+    file.writeStreamingAll(clock.io(), core_config.default_config_toml) catch return .err;
     return .created;
 }
 
-const default_config_toml =
-    \\# Zonvie configuration file
-    \\# See `zonvie.exe --help` for all available options.
-    \\
-    \\[font]
-    \\# family = "Consolas"
-    \\# size = 18.0
-    \\# linespace = 0
-    \\
-    \\[neovim]
-    \\# path = "nvim"
-    \\
-    \\[window]
-    \\# opacity = 1.0
-    \\
-    \\[server]
-    \\# single_instance = false   # route `zonvie <file>` to a running instance (Windows only)
-    \\# open_mode = "tab"         # "tab" (new tab) or "current" (replace current window)
-    \\# close_to_tray = false     # close button hides to the notification area instead of quitting (Windows only)
-    \\
-;

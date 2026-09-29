@@ -110,20 +110,21 @@ fn updateMiniWindow(app: *App, mini_id: app_mod.MiniWindowId, text: []const u8) 
     }
 }
 
-/// Append one chunk's text to `buf` at `len`, clamped to what is left, and
-/// return the new length. Once the buffer is full it copies nothing more.
-fn appendChunkText(buf: []u8, len: usize, chunk: app_mod.MsgChunk) usize {
-    if (chunk.text_len == 0) return len;
+/// Append one chunk's text to `buf` at `len.*`, cut at a UTF-8 boundary to
+/// what is left. False once a chunk did not fit: later chunks must not follow
+/// the gap.
+fn appendChunkText(buf: []u8, len: *usize, chunk: app_mod.MsgChunk) bool {
+    if (chunk.text_len == 0) return true;
     const text = chunk.text[0..chunk.text_len];
-    const copy_len = @min(text.len, buf.len - len);
-    @memcpy(buf[len..][0..copy_len], text[0..copy_len]);
-    return len + copy_len;
+    const copy_len = render_helpers.utf8TruncLen(text, buf.len - len.*);
+    @memcpy(buf[len.*..][0..copy_len], text[0..copy_len]);
+    len.* += copy_len;
+    return copy_len == text.len;
 }
 
 /// Decode UTF-8 into UTF-16 for the GDI text calls, tolerating a malformed or
-/// mid-codepoint-truncated tail. The message buffers are filled by byte-count
-/// clamped memcpy, so the tail can be a partial sequence; Utf8View.initUnchecked
-/// traps on that. Undecodable bytes become U+FFFD. Returns the UTF-16 length.
+/// mid-codepoint-truncated tail; Utf8View.initUnchecked traps on that.
+/// Undecodable bytes become U+FFFD. Returns the UTF-16 length.
 fn utf8ToUtf16Lossy(dst: []u16, src: []const u8) usize {
     var out: usize = 0;
     var i: usize = 0;
@@ -179,8 +180,7 @@ pub fn onMsgShow(
     var primary_hl_id: u32 = 0;
     for (chunks[0..chunk_count]) |chunk| {
         if (primary_hl_id == 0) primary_hl_id = chunk.hl_id;
-        msg_len = appendChunkText(msg_text, msg_len, chunk);
-        if (msg_len >= msg_text.len) break;
+        if (!appendChunkText(msg_text, &msg_len, chunk)) break;
     }
 
     // Convert timeout from milliseconds to seconds
@@ -260,8 +260,7 @@ pub fn handleMsgMiniOrExtFloat(
     var text_buf: [256]u8 = undefined;
     var text_len: usize = 0;
     for (chunks[0..chunk_count]) |chunk| {
-        text_len = appendChunkText(&text_buf, text_len, chunk);
-        if (text_len >= text_buf.len) break;
+        if (!appendChunkText(&text_buf, &text_len, chunk)) break;
     }
 
     if (applog.isEnabled()) applog.appLog("[win] on_msg_{s}: chunks={d} text=\"{s}\" view={d}\n", .{ kind_str, chunk_count, text_buf[0..text_len], @intFromEnum(view) });

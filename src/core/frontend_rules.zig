@@ -107,7 +107,7 @@ test "mouse modifiers come out as S, C, A, D in that order" {
 
 /// The pointer claim of a surface: which buttons have had a press sent to the
 /// editor, and which one's press chose the grid every release and drag goes
-/// to. Buttons are 1 left, 2 right, 3 middle, 4 x1, 5 x2 (ZONVIE_MOUSE_*).
+/// to. Buttons are 1 left, 2 right, 3 middle, 4 x1, 5 x2 (as in zonvie_core.h).
 /// A left press takes the claim; another button's takes it unless left holds
 /// it. Every sent press gets its release, to the claim's grid, whatever the
 /// order they are let go in; the claim ends with the last held button.
@@ -190,6 +190,25 @@ pub fn cliNextIsValue(next: ?[]const u8) bool {
     return !std.mem.startsWith(u8, n, "-");
 }
 
+/// The longest prefix of `bytes` at most `max` long that does not end inside a
+/// UTF-8 sequence, for copies into fixed-size message buffers. A cut in the
+/// middle of a character left a truncated sequence that macOS decodes as an
+/// empty string.
+pub fn utf8PrefixLen(bytes: []const u8, max: usize) usize {
+    if (bytes.len <= max) return bytes.len;
+    var n = max;
+    while (n > 0 and (bytes[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
+test "utf8PrefixLen never cuts a character" {
+    const s = "a\u{3042}b"; // 'a', 3-byte hiragana, 'b'
+    try std.testing.expectEqual(@as(usize, 1), utf8PrefixLen(s, 2));
+    try std.testing.expectEqual(@as(usize, 1), utf8PrefixLen(s, 3));
+    try std.testing.expectEqual(@as(usize, 4), utf8PrefixLen(s, 4));
+    try std.testing.expectEqual(s.len, utf8PrefixLen(s, 99));
+}
+
 /// Copy `src` into `dst`; when it does not fit, cut at a UTF-8 boundary and
 /// end with '…' so the reader sees text is missing. Returns the bytes written.
 pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
@@ -199,8 +218,7 @@ pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
     }
     const marker = "\u{2026}";
     if (dst.len < marker.len) return 0;
-    var cut = dst.len - marker.len;
-    while (cut > 0 and (src[cut] & 0xC0) == 0x80) cut -= 1;
+    const cut = utf8PrefixLen(src, dst.len - marker.len);
     @memcpy(dst[0..cut], src[0..cut]);
     @memcpy(dst[cut..][0..marker.len], marker);
     return cut + marker.len;
@@ -251,6 +269,36 @@ test "panelBg moves brightness toward the middle and keeps hue and saturation" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.95), light[0], tol);
     const black = panelBg(0, 0, 0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.05), black[1], tol);
+}
+
+/// How one argument goes into a spawn command so the core's tokenizer
+/// (rpc_session.zig tokenizeCommand) hands it back unchanged: 0 bare, or the
+/// quote to wrap it in. The tokenizer splits on spaces, takes a leading quote
+/// as grouping, never unescapes, and ends a quoted token at its quote (or at
+/// a backslash-quote pair). Null when neither quote can carry the argument
+/// (an empty one, or one with a space and both quote kinds).
+pub fn spawnArgQuote(arg: []const u8) ?u8 {
+    if (arg.len == 0) return null;
+    const needs_quote = std.mem.indexOfScalar(u8, arg, ' ') != null or arg[0] == '"' or arg[0] == '\'';
+    if (!needs_quote) return 0;
+    const ends_in_backslash = arg[arg.len - 1] == '\\';
+    for ([_]u8{ '"', '\'' }) |q| {
+        if (std.mem.indexOfScalar(u8, arg, q) == null and !ends_in_backslash) return q;
+    }
+    return null;
+}
+
+test "spawnArgQuote picks a quote the core's tokenizer gives back unchanged" {
+    try std.testing.expectEqual(@as(?u8, 0), spawnArgQuote("notes.txt"));
+    try std.testing.expectEqual(@as(?u8, 0), spawnArgQuote("a\"b"));
+    try std.testing.expectEqual(@as(?u8, '"'), spawnArgQuote("my notes.txt"));
+    // `-c "echo \"hi there\""` arrives as `echo "hi there"`: double quotes
+    // would end the token at the first inner one.
+    try std.testing.expectEqual(@as(?u8, '\''), spawnArgQuote("echo \"hi there\""));
+    try std.testing.expectEqual(@as(?u8, '"'), spawnArgQuote("'quoted'"));
+    try std.testing.expectEqual(@as(?u8, null), spawnArgQuote("it's \"x\""));
+    try std.testing.expectEqual(@as(?u8, null), spawnArgQuote("C:\\My Dir\\"));
+    try std.testing.expectEqual(@as(?u8, null), spawnArgQuote(""));
 }
 
 /// Whether `arg` is a file argument to nvim: not a flag (`-`), not a command

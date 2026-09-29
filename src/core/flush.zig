@@ -6394,13 +6394,6 @@ pub fn buildMsgLineCache(self: *Core) bool {
 /// character left a truncated sequence for the width scan.
 const utf8PrefixLen = grid_mod.utf8PrefixLen;
 
-test "utf8PrefixLen never cuts a character" {
-    const s = "a\u{3042}b"; // 'a', 3-byte hiragana, 'b'
-    try std.testing.expectEqual(@as(usize, 1), utf8PrefixLen(s, 2));
-    try std.testing.expectEqual(@as(usize, 1), utf8PrefixLen(s, 3));
-    try std.testing.expectEqual(@as(usize, 4), utf8PrefixLen(s, 4));
-    try std.testing.expectEqual(s.len, utf8PrefixLen(s, 99));
-}
 
 /// Widest a message panel may grow, in cells.
 const msg_panel_max_width: u32 = 80;
@@ -6708,6 +6701,8 @@ pub fn hideMsgShow(self: *Core) void {
     self.msg_total_lines = 0;
     self.msg_cached_max_width = 0;
     self.msg_scroll_pending = false;
+    // An abort backoff dates last_send into the future; the next float starts clean.
+    self.msg_scroll_last_send = 0;
     self.msg_scroll_retry_delay_ns = msg_scroll_throttle_ns;
     self.msg_show_retry_at = null;
     self.msg_show_retry_delay_ns = 16 * std.time.ns_per_ms;
@@ -11883,6 +11878,38 @@ test "a repeatedly aborted msg float scroll backs off from one throttle window" 
     const after_second_ns = clock.nowNs();
     try std.testing.expect(core.flush_aborted and core.msg_scroll_pending);
     try std.testing.expect(nextMsgTimeoutNs(&core).? > after_second_ns + msg_scroll_throttle_ns);
+}
+
+test "a hidden msg float does not hand its scroll backoff to the next one" {
+    var core = Core.initForTest(std.testing.allocator);
+    defer core.deinitForTest();
+    core.ext_messages_enabled = true;
+    try appendTestMessage(&core, 1, "echo", "first");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+    AbortProbe.target = &core;
+    defer AbortProbe.target = null;
+    core.cb.on_flush_begin = AbortProbe.onBegin;
+
+    // Two aborts push the next attempt past a throttle window.
+    core.msg_scroll_pending = true;
+    core.msg_scroll_last_send = 0;
+    processPendingMsgScroll(&core);
+    core.msg_scroll_last_send -= std.time.ns_per_s;
+    processPendingMsgScroll(&core);
+    try std.testing.expect(core.msg_scroll_last_send > clock.nowNs());
+
+    hideMsgShow(&core);
+    core.cb.on_flush_begin = null;
+    core.flush_aborted = false;
+    try appendTestMessage(&core, 2, "echo", "second");
+    _ = sendMsgShow(&core);
+    core.grid.message_state.msg_dirty = false;
+
+    // The new float's first wheel scroll goes out at once.
+    core.msg_scroll_pending = true;
+    processPendingMsgScroll(&core);
+    try std.testing.expect(!core.msg_scroll_pending);
 }
 
 test "hiding the history grid drops its retry deadline" {
