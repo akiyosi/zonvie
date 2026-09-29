@@ -395,9 +395,6 @@ pub const CMDLINE_ICON_MARGIN_RIGHT: u32 = 14; // Right margin for icon (pixels)
 pub const CMDLINE_BORDER_WIDTH: u32 = 1; // Border width (pixels)
 pub const CMDLINE_CORNER_RADIUS: f32 = 8.0; // Corner radius for rounded rect
 pub const CMDLINE_SCREEN_MARGIN: u32 = 40; // Margin from screen edges (matching macOS cmdlineScreenMargin)
-/// Percent of the main window's width the cmdline window spans before its
-/// content needs more room. Applies to the whole window, chrome included.
-pub const CMDLINE_DEFAULT_WINDOW_PERCENT: u32 = 95;
 
 // --- Msg_show window styling constants ---
 pub const MSG_PADDING: u32 = 8; // Padding around content (pixels)
@@ -509,7 +506,6 @@ pub const SurfaceLayer = struct {
 pub const SurfaceLayers = core.render_layout.List(SurfaceLayer);
 
 pub const SurfaceState = struct {
-    verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_verts: std.ArrayListUnmanaged(RowVerts) = .empty,
     cursor_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
@@ -535,7 +531,6 @@ pub const SurfaceState = struct {
     /// window struct and must be released separately.
     pub fn deinitCpuState(self: *SurfaceState, alloc: std.mem.Allocator) void {
         self.cursor_verts.deinit(alloc);
-        self.verts.deinit(alloc);
         for (self.row_verts.items) |*rv| {
             rv.verts.deinit(alloc);
         }
@@ -552,7 +547,6 @@ pub const SurfaceState = struct {
 /// Row data is accessed via row_map → SlotPool indirection (COW shared slots).
 pub const VertexSet = struct {
     row_map: std.ArrayListUnmanaged(RowMapping) = .empty, // logical row → physical slot index
-    flat_verts: std.ArrayListUnmanaged(Vertex) = .empty,
     row_mode: bool = false,
     rows: u32 = 0,
     cols: u32 = 0,
@@ -596,7 +590,6 @@ pub const VertexSet = struct {
     /// Free VertexSet-owned arrays. Slot memory is owned by SlotPool.
     /// Caller must releaseAllSlots before calling this.
     pub fn deinitCpu(self: *VertexSet, alloc: std.mem.Allocator) void {
-        self.flat_verts.deinit(alloc);
         self.row_map.deinit(alloc);
     }
 };
@@ -1333,16 +1326,7 @@ pub const TripleBufferedSurface = struct {
             return true;
         }
 
-        // Reserve payload arrays before mutating any mapping, preserving the
-        // existing all-or-nothing beginFlush failure contract.
-        if (!src.row_mode) {
-            dst.flat_verts.ensureTotalCapacity(alloc, src.flat_verts.items.len) catch return false;
-        }
         self.applySparseRowSync(alloc, dst_idx, src_idx);
-        if (!src.row_mode) {
-            dst.flat_verts.clearRetainingCapacity();
-            dst.flat_verts.appendSliceAssumeCapacity(src.flat_verts.items);
-        }
         return true;
     }
 
@@ -1358,9 +1342,6 @@ pub const TripleBufferedSurface = struct {
         // set intact so a later retry can safely reuse it.
         const src_len = src.row_map.items.len;
         dst.row_map.ensureTotalCapacity(alloc, src_len) catch return false;
-        if (!src.row_mode) {
-            dst.flat_verts.ensureTotalCapacity(alloc, src.flat_verts.items.len) catch return false;
-        }
 
         // All remaining operations are infallible.
         dst.releaseAllSlots(alloc, &self.pool);
@@ -1378,14 +1359,6 @@ pub const TripleBufferedSurface = struct {
         // Retain all slot references for dst.
         for (dst.row_map.items) |m| {
             self.pool.retain(m.slot);
-        }
-
-        // Flat verts are irrelevant in row mode. Avoid copying an old flat
-        // payload on a row-mode barrier/catch-up; a transition back to flat
-        // mode publishes a complete replacement payload.
-        if (!src.row_mode) {
-            dst.flat_verts.clearRetainingCapacity();
-            dst.flat_verts.appendSliceAssumeCapacity(src.flat_verts.items);
         }
 
         return true;
@@ -1604,7 +1577,8 @@ pub const ShaderCarry = struct {
 
 pub const MiniWindowState = struct {
     hwnd: ?c.HWND = null,
-    text: [256]u8 = undefined,
+    /// Ten lines (render_helpers.clampMiniContent) of a msg_history dump.
+    text: [2048]u8 = undefined,
     text_len: usize = 0,
 };
 
@@ -1626,23 +1600,13 @@ pub const MessageWindow = struct {
     /// Get text color based on message kind; ordinary kinds use the Normal
     /// foreground `normal_fg`, as on macOS.
     pub fn getTextColor(self: *const MessageWindow, normal_fg: c.COLORREF) c.COLORREF {
-        const kind_str = self.kind[0..self.kind_len];
-        if (std.mem.eql(u8, kind_str, "emsg") or
-            std.mem.eql(u8, kind_str, "echoerr") or
-            std.mem.eql(u8, kind_str, "lua_error") or
-            std.mem.eql(u8, kind_str, "rpc_error"))
-        {
-            return c.RGB(255, 102, 102); // Red for errors
-        } else if (std.mem.eql(u8, kind_str, "wmsg")) {
-            return c.RGB(255, 217, 102); // Yellow for warnings
-        } else if (std.mem.eql(u8, kind_str, "confirm") or
-            std.mem.eql(u8, kind_str, "confirm_sub"))
-        {
-            return c.RGB(153, 204, 255); // Light blue for prompts
-        } else if (std.mem.eql(u8, kind_str, "search_count")) {
-            return c.RGB(153, 255, 153); // Light green for search count
-        }
-        return normal_fg;
+        return switch (core.config.toneForKind(self.kind[0..self.kind_len])) {
+            .err => c.RGB(255, 102, 102),
+            .warn => c.RGB(255, 217, 102),
+            .prompt => c.RGB(153, 204, 255),
+            .search => c.RGB(153, 255, 153),
+            .normal => normal_fg,
+        };
     }
 };
 
@@ -2512,7 +2476,6 @@ pub const ExternalWindow = struct {
     // (see ExternalWndProc's WM_DPICHANGED case for why).
     dpi_scale: f32 = 1.0,
     cached_bg_color: ?[3]f32 = null, // Cached background color for cmdline (persists across redraws)
-    is_float_external: bool = false, // True if float-origin external (nvim_open_win external=true)
     flat_draw_scratch: std.ArrayListUnmanaged(Vertex) = .empty, // Scratch buffer for flat-mode drawing (cursor filter + scrollbar)
 
 
@@ -2661,7 +2624,7 @@ pub fn cursorRowFromVerts(verts: []const Vertex, row_h_px: i32) u32 {
 }
 
 /// Flatten a committed set into `scratch` for a surface drawn as one list
-/// (decorated and flat-mode windows). The committed set, not the per-row
+/// (decorated windows). The committed set, not the per-row
 /// mirror the core thread writes one callback at a time: a paint landing
 /// between two rows of a flush showed new and old rows together, and a
 /// cancelled flush left its partial rows on screen until the resend.
@@ -2675,11 +2638,6 @@ pub fn snapshotSetRows(
 ) bool {
     scratch.clearRetainingCapacity();
     row_ranges.clearRetainingCapacity();
-    if (!set.row_mode) {
-        scratch.ensureTotalCapacity(alloc, set.flat_verts.items.len) catch return false;
-        scratch.appendSliceAssumeCapacity(set.flat_verts.items);
-        return true;
-    }
     scratch.ensureTotalCapacity(alloc, set.recomputeVertCount(pool)) catch return false;
     row_ranges.ensureTotalCapacity(alloc, set.row_map.items.len) catch return false;
     var start: usize = 0;
@@ -3158,7 +3116,6 @@ pub fn drawRowModeSetupAndRowsFromSlots(
         &[_]Vertex{},
         null,
         .{
-            .present = false,
             .preserve_on_null_dirty = params.preserve_back,
             .content_height = params.content_height,
             .content_width = params.content_width,
@@ -3454,60 +3411,6 @@ pub fn snappedContentHeight(client_h: u32, cell_total_h_px: u32, y_offset: u32) 
     const drawable_h: u32 = if (client_h > y_offset) client_h - y_offset else 0;
     const snapped: u32 = (drawable_h / safe_cell_h) * safe_cell_h;
     return @max(snapped, safe_cell_h);
-}
-
-/// Draw external surface in flat (non-row) mode using gpu.draw().
-/// Filters out cursor vertices when cursor_visible=false.
-/// Appends scrollbar_verts if non-empty.
-/// Uses caller-provided scratch buffer to avoid per-paint heap allocation.
-/// IMPORTANT: scratch must NOT alias verts (e.g. do not pass paint_scratch
-/// if verts points into paint_scratch.items).
-pub fn drawExternalSurfaceFlat(
-    gpu: *d3d11.Renderer,
-    scratch: *std.ArrayListUnmanaged(Vertex),
-    alloc: std.mem.Allocator,
-    verts: []const Vertex,
-    vert_count: usize,
-    cursor_visible: bool,
-    scrollbar_verts: []const Vertex,
-    glow_enabled: bool,
-    glow_intensity: f32,
-) !void {
-    const draw_opts: d3d11.Renderer.DrawOpts = .{
-        .present = false, // Caller (paintExternalWindow) presents via presentFromBackRectsWithCursorNoResize
-        .glow_enabled = glow_enabled,
-        .glow_intensity = glow_intensity,
-    };
-
-    const needs_filter = !cursor_visible;
-    const needs_scrollbar = scrollbar_verts.len > 0;
-
-    if (!needs_filter and !needs_scrollbar) {
-        try gpu.drawEx(verts[0..vert_count], &[_]Vertex{}, null, draw_opts);
-        return;
-    }
-
-    scratch.clearRetainingCapacity();
-    scratch.ensureTotalCapacity(alloc, vert_count + scrollbar_verts.len) catch {
-        try gpu.drawEx(verts[0..vert_count], &[_]Vertex{}, null, draw_opts);
-        return;
-    };
-
-    if (needs_filter) {
-        for (verts[0..vert_count]) |v| {
-            if ((v.deco_flags & DECO_CURSOR) == 0) {
-                scratch.appendAssumeCapacity(v);
-            }
-        }
-    } else {
-        scratch.appendSliceAssumeCapacity(verts[0..vert_count]);
-    }
-
-    if (needs_scrollbar) {
-        scratch.appendSliceAssumeCapacity(scrollbar_verts);
-    }
-
-    try gpu.drawEx(scratch.items, &[_]Vertex{}, null, draw_opts);
 }
 
 /// The non-root layers a surface places, plus the App that owns their row
@@ -4487,14 +4390,6 @@ pub fn drawCursorOverlay(g: *d3d11.Renderer, p: CursorOverlayParams) !void {
     }
 }
 
-/// Draw scrollbar overlay into the current render target.
-/// Uploads scrollbar vertices to a dedicated VB and draws them at full viewport.
-/// Used by both main window and external window paint paths after row/flat drawing.
-/// Save the clean, fully composited track strip, then draw the alpha-blended
-/// overlay over it, so the next fade tick restores the copy instead of
-/// clearing and regenerating the row set. Returns the strip's rect for the
-/// present damage, or null when the track clamps away. Both drivers did the
-/// two steps in this order.
 /// A paint's retained-back damage, built the same way by both drivers:
 /// reserved up front, row runs as spans, then single rects, clamped to the
 /// back buffer and compacted. A rect that cannot be added makes the frame
@@ -4940,7 +4835,7 @@ pub fn drawSurfaceRowFrame(
             // it keeps the flag and is presented by the next paint. The clear
             // stays inside the same lock as the draw so a store landing
             // between the two cannot be dropped; a present that then fails
-            // re-arms these flags.
+            // requeues a full paint, which redraws and presents every layer.
             for (in.layers[1..]) |layer| {
                 const state = app.layer_grids.get(layer.grid_id) orelse continue;
                 if (state.paint_has_present_rect) state.dirty = false;
@@ -5401,7 +5296,6 @@ pub const App = struct {
 
     // Mini view state (showmode/showcmd/ruler)
     mini_windows: [4]MiniWindowState = .{ .{}, .{}, .{}, .{} },
-    last_mouse_grid_id: i64 = 1,
 
     owned_by_hwnd: bool = false, //
 
@@ -6169,66 +6063,8 @@ pub fn setApp(hwnd: c.HWND, app_ptr: *App) void {
 // Render helpers (shared by main.zig and external_windows.zig)
 // =========================================================================
 
-/// Adjust brightness for cmdline background visibility (same as macOS).
-/// Dark colors become slightly lighter (+0.05), light colors become slightly darker (-0.05).
-/// Uses RGB to HSB conversion.
-pub fn adjustBrightnessForCmdline(r: f32, g: f32, b: f32) [3]f32 {
-    // Convert RGB to HSB (same as HSV)
-    const max_c = @max(r, @max(g, b));
-    const min_c = @min(r, @min(g, b));
-    const delta = max_c - min_c;
-
-    // Brightness (V in HSV)
-    var brightness = max_c;
-
-    // Saturation
-    var saturation: f32 = 0.0;
-    if (max_c > 0) {
-        saturation = delta / max_c;
-    }
-
-    // Hue (not needed for adjustment but kept for completeness)
-    var hue: f32 = 0.0;
-    if (delta > 0) {
-        if (max_c == r) {
-            hue = (g - b) / delta;
-            if (hue < 0) hue += 6.0;
-        } else if (max_c == g) {
-            hue = 2.0 + (b - r) / delta;
-        } else {
-            hue = 4.0 + (r - g) / delta;
-        }
-        hue /= 6.0;
-    }
-
-    // Adjust brightness: if dark (b < 0.5), lighten; if light, darken
-    if (brightness < 0.5) {
-        brightness = @min(brightness + 0.05, 1.0);
-    } else {
-        brightness = @max(brightness - 0.05, 0.0);
-    }
-
-    // Convert HSB back to RGB
-    if (saturation == 0) {
-        return .{ brightness, brightness, brightness };
-    }
-
-    const h_sector = hue * 6.0;
-    const sector = @as(u32, @intFromFloat(h_sector)) % 6;
-    const f = h_sector - @as(f32, @floatFromInt(sector));
-    const p = brightness * (1.0 - saturation);
-    const q = brightness * (1.0 - saturation * f);
-    const t = brightness * (1.0 - saturation * (1.0 - f));
-
-    return switch (sector) {
-        0 => .{ brightness, t, p },
-        1 => .{ q, brightness, p },
-        2 => .{ p, brightness, t },
-        3 => .{ p, q, brightness },
-        4 => .{ t, p, brightness },
-        else => .{ brightness, p, q },
-    };
-}
+/// The panel background rule (frontend_rules.panelBg), as macOS uses it.
+pub const adjustBrightnessForCmdline = core.frontend_rules.panelBg;
 
 /// Add rectangle vertices (2 triangles = 6 vertices)
 pub fn addRectVerts(
@@ -6571,11 +6407,9 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         "[win] updateLayoutToCore px=({d},{d}) cell=({d},{d})\n",
         .{ w, h, cw, ch },
     );
-    core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
 
-    // Override screen_cols with monitor work area minus margin (matching macOS).
-    // updateLayoutPxLocked sets screen_cols = drawable_cols, but for cmdline
-    // max width we want the screen-based value with margin subtracted.
+    // The cmdline's width budget goes in first so the flush the layout update
+    // retries already sizes the cmdline with it.
     if (app.hwnd) |main_hwnd| {
         const copy_button_w: u32 = if (app.config.cmdline.copy_button)
             @intCast(@max(0, app.scalePx(@as(c_int, COPY_BUTTON_MARGIN_LEFT + COPY_BUTTON_SIZE + COPY_BUTTON_MARGIN_RIGHT))))
@@ -6586,32 +6420,22 @@ pub fn updateLayoutToCore(hwnd: c.HWND, app: *App) void {
         const cmdline_chrome_w: u32 = @as(u32, @intCast(@max(0, app.scalePx(@as(c_int, CMDLINE_PADDING)) * 2 +
             app.scalePx(@as(c_int, CMDLINE_ICON_MARGIN_LEFT + CMDLINE_ICON_SIZE + CMDLINE_ICON_MARGIN_RIGHT))))) + copy_button_w;
 
-        const monitor = c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST);
-        if (monitor) |mon| {
+        var work_w: u32 = 0;
+        if (c.MonitorFromWindow(main_hwnd, c.MONITOR_DEFAULTTONEAREST)) |mon| {
             var mi: c.MONITORINFO = std.mem.zeroes(c.MONITORINFO);
             mi.cbSize = @sizeOf(c.MONITORINFO);
-            if (c.GetMonitorInfoW(mon, &mi) != 0) {
-                const work_w: u32 = @intCast(@max(1, mi.rcWork.right - mi.rcWork.left));
-                const overhead: u32 = cmdline_chrome_w + CMDLINE_SCREEN_MARGIN;
-                const available_w: u32 = if (work_w > overhead) work_w - overhead else 1;
-                const screen_cols: u32 = @max(40, available_w / cw);
-                core.zonvie_core_set_screen_cols(app.corep, screen_cols);
-            }
+            if (c.GetMonitorInfoW(mon, &mi) != 0) work_w = @intCast(@max(1, mi.rcWork.right - mi.rcWork.left));
         }
-
-        // Default cmdline width: the cmdline WINDOW spans
-        // CMDLINE_DEFAULT_WINDOW_PERCENT of the main window, so the chrome
-        // comes off before converting to cells. Without this the core falls
-        // back to the main grid's cols, which makes the cmdline window wider
-        // than the main window by exactly the chrome.
+        var main_w: u32 = 0;
         var wr: c.RECT = undefined;
-        if (c.GetWindowRect(main_hwnd, &wr) != 0) {
-            const main_w: u32 = @intCast(@max(1, wr.right - wr.left));
-            const target_w: u32 = main_w * CMDLINE_DEFAULT_WINDOW_PERCENT / 100;
-            const content_w: u32 = if (target_w > cmdline_chrome_w) target_w - cmdline_chrome_w else 1;
-            core.zonvie_core_set_cmdline_default_cols(app.corep, @max(20, content_w / cw));
-        }
+        if (c.GetWindowRect(main_hwnd, &wr) != 0) main_w = @intCast(@max(1, wr.right - wr.left));
+
+        const budget = core.frontend_rules.cmdlineCols(work_w, main_w, cmdline_chrome_w, CMDLINE_SCREEN_MARGIN, cw);
+        if (budget.screen_cols != 0) core.zonvie_core_set_screen_cols(app.corep, budget.screen_cols);
+        if (budget.default_cols != 0) core.zonvie_core_set_cmdline_default_cols(app.corep, budget.default_cols);
     }
+
+    core.zonvie_core_update_layout_px(app.corep, w, h, cw, ch);
 }
 
 pub fn updateRowsColsFromClientForce(hwnd: c.HWND, app: *App) void {

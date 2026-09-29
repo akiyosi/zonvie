@@ -99,10 +99,11 @@ pub fn handleSSHAuthPromptOnUIThread(app: *App) void {
     _ = c.FreeConsole();
 }
 
-/// A topmost popup dialog: registers `class_name` with `proc`, centres a
-/// `w` x `h` window on the monitor `owner` is on (the primary one with no
-/// owner) and matches the OS titlebar theme. Null when creation failed.
-fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0]const u16, style: c.DWORD, w: i32, h: i32, owner: ?c.HWND) c.HWND {
+/// A dialog: registers `class_name` with `proc`, centres a `w` x `h` window
+/// on the monitor `owner` is on (the primary one with no owner) and matches
+/// the OS titlebar theme. `parent` and `create_param` go to CreateWindowExW.
+/// Null when creation failed.
+fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0]const u16, style: c.DWORD, ex_style: c.DWORD, w: i32, h: i32, owner: ?c.HWND, parent: c.HWND, create_param: ?*anyopaque) c.HWND {
     var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
     wc.cbSize = @sizeOf(c.WNDCLASSEXW);
     wc.lpfnWndProc = proc;
@@ -116,7 +117,7 @@ fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0
     const x = area.left + @divTrunc(area.right - area.left - w, 2);
     const y = area.top + @divTrunc(area.bottom - area.top - h, 2);
     const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
+        ex_style,
         class_name,
         title,
         style,
@@ -124,10 +125,10 @@ fn createCenteredDialog(class_name: [*:0]const u16, proc: c.WNDPROC, title: [*:0
         y,
         w,
         h,
-        null,
+        parent,
         null,
         c.GetModuleHandleW(null),
-        null,
+        create_param,
     );
     if (hwnd != null) window_mod.applyOsTitlebarTheme(hwnd);
     return hwnd;
@@ -147,8 +148,11 @@ pub fn showPasswordInputDialog(prompt: *const [256]u16, password_out: *[256]u16)
         passwordDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("SSH Authentication"),
         c.WS_POPUP | c.WS_CAPTION | c.WS_SYSMENU,
+        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
         420,
         180,
+        null,
+        null,
         null,
     );
     if (hwnd == null) return false;
@@ -294,9 +298,12 @@ pub fn showDevcontainerProgressDialog(owner: c.HWND, label_text: [*:0]const u16)
         devcontainerDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("Devcontainer"),
         c.WS_POPUP | c.WS_CAPTION,
+        c.WS_EX_DLGMODALFRAME | c.WS_EX_TOPMOST,
         300,
         80,
         owner,
+        null,
+        null,
     );
     if (hwnd == null) return;
     g_devcontainer_dialog_hwnd = hwnd;
@@ -800,27 +807,16 @@ pub fn showConnectionDialog(app: *App, owner: c.HWND) void {
         return;
     }
 
-    var wc: c.WNDCLASSEXW = std.mem.zeroes(c.WNDCLASSEXW);
-    wc.cbSize = @sizeOf(c.WNDCLASSEXW);
-    wc.lpfnWndProc = connectionDialogProc;
-    wc.hInstance = c.GetModuleHandleW(null);
-    wc.hCursor = c.LoadCursorW(null, @ptrFromInt(32512));
-    wc.hbrBackground = c.GetSysColorBrush(c.COLOR_BTNFACE);
-    wc.lpszClassName = std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectDialogWin");
-    _ = c.RegisterClassExW(&wc);
-
-    const hwnd = c.CreateWindowExW(
-        c.WS_EX_DLGMODALFRAME,
-        wc.lpszClassName,
+    const hwnd = createCenteredDialog(
+        std.unicode.utf8ToUtf16LeStringLiteral("ZonvieConnectDialogWin"),
+        connectionDialogProc,
         std.unicode.utf8ToUtf16LeStringLiteral("Connect"),
         c.WS_OVERLAPPED | c.WS_CAPTION | c.WS_SYSMENU,
-        c.CW_USEDEFAULT,
-        c.CW_USEDEFAULT,
+        c.WS_EX_DLGMODALFRAME,
         546,
         640,
         owner,
-        null,
-        wc.hInstance,
+        owner,
         app,
     );
     if (hwnd == null) return;
@@ -1029,6 +1025,7 @@ fn connectionDialogProc(hwnd: c.HWND, msg: c.UINT, wParam: c.WPARAM, lParam: c.L
             cancelConnectionDialog(hwnd);
             return 0;
         },
+        c.WM_SETTINGCHANGE, c.WM_THEMECHANGED => return window_mod.themeMessage(hwnd, msg, wParam, lParam).?,
         c.WM_DESTROY => {
             g_connection_dialog_hwnd = null;
             g_conn_name_hwnd = null;

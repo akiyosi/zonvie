@@ -44,20 +44,19 @@ var cliNvimPath: String? = nil
 var nvimExtraArgs: [String] = []
 /// argv indices of the nvim file arguments, for the fork parent below.
 var nvimFileArgIndices = Set<Int>()
-/// nvim options whose VALUE is the next token (`-u NONE`, `-c "set nu"`,
-/// `--listen addr`): that token is not a file.
-let nvimOptionsTakingValue: Set<String> = ["-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime"]
-/// A file argument for nvim, absolute against the shell's cwd. Flags (`-`),
-/// commands (`+`), an option's value (`prev` names the option) and absolute
-/// paths pass through. The fork parent chdirs to $HOME before spawning the
-/// child, and nvim then inherits that cwd, so `zonvie README.md` opened
-/// ~/README.md (Windows resolves the same way).
+/// A file argument for nvim (zonvie_core_nvim_arg_is_file), absolute against
+/// the shell's cwd; anything else and absolute paths pass through. The fork
+/// parent chdirs to $HOME before spawning the child, and nvim then inherits
+/// that cwd, so `zonvie README.md` opened ~/README.md (Windows resolves the
+/// same way).
 func absoluteFileArg(_ arg: String, prev: String?, afterDashDash: Bool = false) -> String {
-    if arg.isEmpty || arg.hasPrefix("/") { return arg }
-    // After `--` every token is a file to nvim, `-` alone being stdin.
-    if afterDashDash { return arg == "-" ? arg : (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(arg) }
-    if arg.hasPrefix("-") || arg.hasPrefix("+") { return arg }
-    if let prev, nvimOptionsTakingValue.contains(prev) { return arg }
+    if arg.hasPrefix("/") { return arg }
+    let isFile = arg.withCString { a in
+        (prev ?? "").withCString { p in
+            zonvie_core_nvim_arg_is_file(prev == nil ? nil : p, strlen(p), a, strlen(a), afterDashDash)
+        }
+    }
+    if !isFile { return arg }
     return (FileManager.default.currentDirectoryPath as NSString).appendingPathComponent(arg)
 }
 do {
@@ -102,9 +101,10 @@ do {
             // Skip --log and its value
             i += 2
         } else if arg == "--ssh" || arg == "--ssh-identity" ||
-                  arg == "--devcontainer" || arg == "--devcontainer-config" ||
-                  arg == "--connect-nvim" || arg == "--remote-ui" {
-            // Skip space-separated value arguments (--ssh host, --devcontainer path, etc.)
+                  arg == "--devcontainer" || arg == "--devcontainer-config" {
+            // Optional value: take the next token only when it is one, as ZonvieCore.start does.
+            i += ZonvieCore.cliNextIsValue(args, after: i) ? 2 : 1
+        } else if arg == "--connect-nvim" || arg == "--remote-ui" {
             i += 2
         } else if arg.hasPrefix("--ssh=") || arg.hasPrefix("--ssh-identity=") ||
                   arg.hasPrefix("--devcontainer=") || arg.hasPrefix("--devcontainer-config=") ||

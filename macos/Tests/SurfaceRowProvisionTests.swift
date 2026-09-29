@@ -1,5 +1,6 @@
 import Foundation
 import Metal
+import simd
 
 // Minimal collaborators required when MetalTypes.swift is compiled as a
 // standalone test executable.
@@ -373,6 +374,35 @@ private enum SurfaceRowProvisionTests {
         return (bands, intervals)
     }
 
+    // The main mask is built from committed layers, ranked by paint order; a
+    // fixed float whose Neovim zindex is below its rank must not mask itself
+    // while it scrolls, and a split under it must still be masked.
+    private static func verifyMaskAndOffsetsShareOneScale() {
+        let split = SurfaceLayer(gridId: 2, anchorGrid: 1, originPx: .zero, rows: 30, cols: 100, z: 1, followsScroll: false)
+        var float = SurfaceLayer(gridId: 5, anchorGrid: 2, originPx: simd_float2(100, 100), rows: 10, cols: 40, z: 2, followsScroll: false)
+        float.isFloat = true
+        let layers = [split, float].map { SurfaceLayerFrame(layer: $0, set: nil, state: nil) }
+
+        let mask = SurfaceFixedFloatMask()
+        var scratch: [GridSurfaceRenderer.FixedFloatRect] = []
+        mask.rebuild(layers: layers, rootGridId: 1, smoothScrolling: true,
+                     cellW: 10, cellH: 20, scratch: &scratch)
+
+        // Offsets as the view fills them: Neovim zindex (the float's is 1).
+        var offsets = [
+            GridSurfaceRenderer.ScrollOffset(grid_id: 2, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 0),
+            GridSurfaceRenderer.ScrollOffset(grid_id: 5, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 1),
+            GridSurfaceRenderer.ScrollOffset(grid_id: 1, offset_y: 0, content_top_y: 0, content_bottom_y: 0, zindex: 7),
+        ]
+        SurfaceFixedFloatMask.rankOffsets(&offsets, layers: [split, float])
+        require(offsets.map { $0.zindex } == [1, 2, 0], "offsets must carry the layers' paint ranks, got \(offsets.map { $0.zindex })")
+
+        require(!maskCoversAbove(bands: mask.bands, intervals: mask.intervals, x: 300, y: 200, scrollZ: Float(offsets[1].zindex)),
+                "a scrolled fixed float must not be masked inside its own rect")
+        require(maskCoversAbove(bands: mask.bands, intervals: mask.intervals, x: 300, y: 200, scrollZ: Float(offsets[0].zindex)),
+                "the split under the fixed float must be masked")
+    }
+
     private static func verifyFixedFloatMaskZOrder() {
         // Lazy layout: full-screen backdrop (z49) under an inner float (z50).
         let backdrop = GridSurfaceRenderer.FixedFloatRect(x0: 0, x1: 1000, top: 0, bottom: 600, zindex: 49)
@@ -664,6 +694,7 @@ private enum SurfaceRowProvisionTests {
 
         verifyLayerGrowthWithoutRetry(device: device)
         verifyFixedFloatMaskZOrder()
+        verifyMaskAndOffsetsShareOneScale()
         verifyRowCapacityDemandAndSlotPredicate(device: device)
         verifyRowCapacityVerdictIsOneRuleForBothSurfaces(device: device)
 

@@ -175,16 +175,7 @@ fn newCmdlineWorkArea(app: *App) c.RECT {
 /// whole array is submitted under the identity layer transform.
 const ContentNdcTransform = struct { scale_x: f32, scale_y: f32, offset_x: f32, offset_y: f32 };
 
-fn decoratedContentNdcTransform(
-    content_left: f32,
-    content_top: f32,
-    content_w: f32,
-    content_h: f32,
-    window_w: f32,
-    window_h: f32,
-) ContentNdcTransform {
-    _ = content_w;
-    _ = content_h;
+fn decoratedContentNdcTransform(content_left: f32, content_top: f32, window_w: f32, window_h: f32) ContentNdcTransform {
     return .{
         .scale_x = 2.0 / window_w,
         .scale_y = -2.0 / window_h,
@@ -408,6 +399,40 @@ fn appendCopyIconVerts(
     return app_mod.addCopyIconVerts(verts, next, x_ndc, y_ndc, w_ndc, h_ndc, color, grid_id, copied);
 }
 
+/// Copy core content into `dst` at `start` through `ndc`. A bg quad within
+/// 0.005 of `match_bg` turns transparent so the window's own bg rect (blur, a
+/// shader) shows through; cursor quads are exempt, and `hide_cursor` hides
+/// them. Returns the index after the copy.
+fn appendDecoratedContent(
+    dst: []app_mod.Vertex,
+    start: usize,
+    verts: []const app_mod.Vertex,
+    ndc: ContentNdcTransform,
+    match_bg: ?[3]f32,
+    hide_cursor: bool,
+) usize {
+    const tolerance: f32 = 0.005;
+    for (verts, start..) |v, i| {
+        const d = &dst[i];
+        d.* = v;
+        d.position[0] = v.position[0] * ndc.scale_x + ndc.offset_x;
+        d.position[1] = v.position[1] * ndc.scale_y + ndc.offset_y;
+        if ((v.deco_flags & core.DECO_CURSOR) != 0) {
+            if (hide_cursor) d.color[3] = 0.0;
+            continue;
+        }
+        const bg = match_bg orelse continue;
+        if (v.texCoord[0] < 0 and
+            @abs(v.color[0] - bg[0]) < tolerance and
+            @abs(v.color[1] - bg[1]) < tolerance and
+            @abs(v.color[2] - bg[2]) < tolerance)
+        {
+            d.color[3] = 0.0;
+        }
+    }
+    return start + verts.len;
+}
+
 /// Returns false when the surface has no content dimensions and nothing was
 /// drawn: the caller must not present the stale back buffer.
 fn drawDecoratedExternalSurface(
@@ -422,11 +447,11 @@ fn drawDecoratedExternalSurface(
     glow_enabled: bool,
     glow_intensity: f32,
 ) !bool {
-    switch (kind) {
-        .cmdline => {
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
-
+    const content = verts[0..vert_count];
+    const window_w: f32 = @floatFromInt(g.width);
+    const window_h: f32 = @floatFromInt(g.height);
+    const total: usize = switch (kind) {
+        .cmdline, .msg_show, .msg_history => blk: {
             app.mu.lockUncancelable(core.clock.io());
             const ext_win_relookup = app.external_windows.get(grid_id);
             const content_rows = if (ext_win_relookup) |ew| ew.surf.surface.rows else 0;
@@ -435,106 +460,58 @@ fn drawDecoratedExternalSurface(
             const copy_copied = if (ext_win_relookup) |ew| ew.copy_button_copied else false;
             const cell_w = app.cell_w_px;
             const cell_h = app.rowHeightPx();
-            const hide_cursor_for_ime = app.ime_composing;
-            const border_r = app.cmdline_border_color[0];
-            const border_g = app.cmdline_border_color[1];
-            const border_b = app.cmdline_border_color[2];
-            const icon_r = app.cmdline_icon_color[0];
-            const icon_g = app.cmdline_icon_color[1];
-            const icon_b = app.cmdline_icon_color[2];
+            const hide_cursor_for_ime = kind == .cmdline and app.ime_composing;
+            const border_color: [4]f32 = .{ app.cmdline_border_color[0], app.cmdline_border_color[1], app.cmdline_border_color[2], 1.0 };
+            const icon_color: [4]f32 = .{ app.cmdline_icon_color[0], app.cmdline_icon_color[1], app.cmdline_icon_color[2], 1.0 };
             app.mu.unlock(core.clock.io());
 
             if (content_rows == 0 or content_cols == 0) return false;
-
-            const content_w: f32 = @floatFromInt(content_cols * cell_w);
-            const content_h: f32 = @floatFromInt(content_rows * cell_h);
-            if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
-                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
+            if (!(window_w > 0 and window_h > 0 and cell_w > 0 and cell_h > 0)) {
+                try g.drawEx(content, &[_]app_mod.Vertex{}, null, .{});
                 return true;
             }
 
             const content_origin = decoratedContentOriginPx(app, kind);
-            const content_left: f32 = content_origin.x;
-            const content_top: f32 = content_origin.y;
-            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
-            const scale_x = ndc.scale_x;
-            const scale_y = ndc.scale_y;
-            const offset_x = ndc.offset_x;
-            const offset_y = ndc.offset_y;
+            const ndc = decoratedContentNdcTransform(content_origin.x, content_origin.y, window_w, window_h);
 
-            const extra_verts = 6 + 24 + 20 + app_mod.COPY_ICON_VERTS;
+            const extra_verts: usize = if (kind == .cmdline) 6 + 24 + 20 + app_mod.COPY_ICON_VERTS else 6 + app_mod.COPY_ICON_VERTS;
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + extra_verts);
-            const cmdline_verts = scratch.items;
+            const out = scratch.items;
 
-            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
-            const orig_bg_r = bg.orig[0];
-            const orig_bg_g = bg.orig[1];
-            const orig_bg_b = bg.orig[2];
-            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
-            const bg_tex: [2]f32 = .{ -1.0, -1.0 };
-            var bg_idx: usize = 0;
-            bg_idx = app_mod.addRectVerts(cmdline_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
+            const bg = resolveDecoratedBgColor(app, grid_id, content);
+            var idx = app_mod.addRectVerts(out, 0, -1.0, 1.0, 2.0, 2.0, .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity }, .{ -1.0, -1.0 }, grid_id);
+            idx = appendDecoratedContent(out, idx, content, ndc, bg.orig, hide_cursor_for_ime);
 
-            const tolerance: f32 = 0.005;
-            for (verts[0..vert_count], 0..) |v, i| {
-                const dest_idx = bg_idx + i;
-                cmdline_verts[dest_idx] = v;
-                cmdline_verts[dest_idx].position[0] = v.position[0] * scale_x + offset_x;
-                cmdline_verts[dest_idx].position[1] = v.position[1] * scale_y + offset_y;
-                if ((v.deco_flags & core.DECO_CURSOR) != 0) {
-                    if (hide_cursor_for_ime) cmdline_verts[dest_idx].color[3] = 0.0;
-                    continue;
-                }
-                if (v.texCoord[0] < 0) {
-                    const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
-                        @abs(v.color[1] - orig_bg_g) < tolerance and
-                        @abs(v.color[2] - orig_bg_b) < tolerance;
-                    if (matches_bg) cmdline_verts[dest_idx].color[3] = 0.0;
+            if (kind == .cmdline) {
+                idx = appendDecoratedBorderVerts(out, idx, window_w, window_h, border_color, grid_id);
+                const icon_x_px: f32 = @floatFromInt(cmdlinePaddingPx(app) + app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT)));
+                const icon_size_px: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_SIZE)));
+                const icon_y_px: f32 = (window_h - icon_size_px) / 2.0;
+                const icon_x_ndc: f32 = icon_x_px / (window_w / 2.0) - 1.0;
+                const icon_y_ndc: f32 = 1.0 - icon_y_px / (window_h / 2.0);
+                const icon_w_ndc: f32 = icon_size_px / (window_w / 2.0);
+                const icon_h_ndc: f32 = icon_size_px / (window_h / 2.0);
+                if (cmdline_firstc == '/' or cmdline_firstc == '?') {
+                    idx = app_mod.addSearchIconVerts(out, idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
+                } else {
+                    idx = app_mod.addChevronIconVerts(out, idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
                 }
             }
-
-            var extra_idx: usize = bg_idx + vert_count;
-            extra_idx = appendDecoratedBorderVerts(cmdline_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
-
-            const icon_color: [4]f32 = .{ icon_r, icon_g, icon_b, 1.0 };
-            const icon_x_px: f32 = @floatFromInt(cmdlinePaddingPx(app) + app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_MARGIN_LEFT)));
-            const icon_size_px: f32 = @floatFromInt(app.scalePx(@as(c_int, app_mod.CMDLINE_ICON_SIZE)));
-            const icon_y_px: f32 = (window_h - icon_size_px) / 2.0;
-            const icon_x_ndc: f32 = icon_x_px / (window_w / 2.0) - 1.0;
-            const icon_y_ndc: f32 = 1.0 - icon_y_px / (window_h / 2.0);
-            const icon_w_ndc: f32 = icon_size_px / (window_w / 2.0);
-            const icon_h_ndc: f32 = icon_size_px / (window_h / 2.0);
-            if (cmdline_firstc == '/' or cmdline_firstc == '?') {
-                extra_idx = app_mod.addSearchIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
-            } else {
-                extra_idx = app_mod.addChevronIconVerts(cmdline_verts, extra_idx, icon_x_ndc, icon_y_ndc, icon_w_ndc, icon_h_ndc, icon_color, grid_id);
-            }
-
-            extra_idx = appendCopyIconVerts(app, kind, grid_id, cmdline_verts, extra_idx, window_w, window_h, icon_color, copy_hover, copy_copied);
-
-            try g.drawEx(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, null, .{ .present = false });
-            if (glow_enabled) {
-                g.drawBloomFromVerts(cmdline_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
-            }
+            break :blk appendCopyIconVerts(app, kind, grid_id, out, idx, window_w, window_h, icon_color, copy_hover, copy_copied);
         },
-        .popupmenu => {
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
+        .popupmenu => blk: {
             if (!(window_w > 0 and window_h > 0)) {
-                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
+                try g.drawEx(content, &[_]app_mod.Vertex{}, null, .{});
                 return true;
             }
 
-            const extra_verts = 6 + 24;
             scratch.clearRetainingCapacity();
-            try scratch.resize(app.alloc, vert_count + extra_verts);
-            const pum_verts = scratch.items;
+            try scratch.resize(app.alloc, vert_count + 6 + 24);
+            const out = scratch.items;
 
             app.mu.lockUncancelable(core.clock.io());
-            const border_r = app.cmdline_border_color[0];
-            const border_g = app.cmdline_border_color[1];
-            const border_b = app.cmdline_border_color[2];
+            const border_color: [4]f32 = .{ app.cmdline_border_color[0], app.cmdline_border_color[1], app.cmdline_border_color[2], 1.0 };
             // The Pmenu bg from on_popupmenu_show, not the first bg quad: that
             // can be the PmenuSel row.
             const pmenu_rgb: u32 = if (app.popupmenu_bg_rgb != 0xFFFFFFFF) app.popupmenu_bg_rgb else app.cached_pmenu_bg;
@@ -546,7 +523,7 @@ fn drawDecoratedExternalSurface(
             // made transparent, so blur and shaders show through them. Other
             // cells (PmenuSel, the scrollbar) stay opaque.
             var pmenu_orig: ?[3]f32 = null;
-            var bg_idx: usize = 0;
+            var idx: usize = 0;
             if (pmenu_rgb != 0xFFFFFFFF) {
                 const orig: [3]f32 = .{
                     @as(f32, @floatFromInt((pmenu_rgb >> 16) & 0xFF)) / 255.0,
@@ -555,121 +532,20 @@ fn drawDecoratedExternalSurface(
                 };
                 pmenu_orig = orig;
                 const adjusted = if (shader_active) orig else app_mod.adjustBrightnessForCmdline(orig[0], orig[1], orig[2]);
-                bg_idx = app_mod.addRectVerts(pum_verts, 0, -1.0, 1.0, 2.0, 2.0, .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity }, .{ -1.0, -1.0 }, grid_id);
+                idx = app_mod.addRectVerts(out, 0, -1.0, 1.0, 2.0, 2.0, .{ adjusted[0], adjusted[1], adjusted[2], app.config.window.opacity }, .{ -1.0, -1.0 }, grid_id);
             }
 
-            // Core vertices are grid-local pixels, and this draw path binds
-            // the identity transform for the frontend's own clip-space
-            // chrome (the border appended below). Map them here as the
-            // cmdline and message branches do; the popupmenu has no insets,
-            // so its content starts at the window's top-left.
-            const ndc = decoratedContentNdcTransform(0, 0, window_w, window_h, window_w, window_h);
-            const tolerance: f32 = 0.005;
-            for (verts[0..vert_count], 0..) |v, i| {
-                const dst = &pum_verts[bg_idx + i];
-                dst.* = v;
-                dst.position[0] = v.position[0] * ndc.scale_x + ndc.offset_x;
-                dst.position[1] = v.position[1] * ndc.scale_y + ndc.offset_y;
-                const orig = pmenu_orig orelse continue;
-                if (v.texCoord[0] < 0 and (v.deco_flags & core.DECO_CURSOR) == 0 and
-                    @abs(v.color[0] - orig[0]) < tolerance and
-                    @abs(v.color[1] - orig[1]) < tolerance and
-                    @abs(v.color[2] - orig[2]) < tolerance)
-                {
-                    dst.color[3] = 0.0;
-                }
-            }
-
-            var extra_idx: usize = bg_idx + vert_count;
-            extra_idx = appendDecoratedBorderVerts(pum_verts, extra_idx, window_w, window_h, .{ border_r, border_g, border_b, 1.0 }, grid_id);
-
-            try g.drawEx(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, null, .{ .present = false });
-            if (glow_enabled) {
-                g.drawBloomFromVerts(pum_verts[0..extra_idx], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
-            }
-        },
-        .msg_show, .msg_history => {
-            const window_w: f32 = @floatFromInt(g.width);
-            const window_h: f32 = @floatFromInt(g.height);
-
-            app.mu.lockUncancelable(core.clock.io());
-            const ext_win_relookup2 = app.external_windows.get(grid_id);
-            const content_rows = if (ext_win_relookup2) |ew| ew.surf.surface.rows else 0;
-            const content_cols = if (ext_win_relookup2) |ew| ew.surf.surface.cols else 0;
-            const copy_hover = if (ext_win_relookup2) |ew| ew.copy_button_hover else false;
-            const copy_copied = if (ext_win_relookup2) |ew| ew.copy_button_copied else false;
-            const cell_w = app.cell_w_px;
-            const cell_h = app.rowHeightPx();
-            const icon_color: [4]f32 = .{
-                app.cmdline_icon_color[0],
-                app.cmdline_icon_color[1],
-                app.cmdline_icon_color[2],
-                1.0,
-            };
-            app.mu.unlock(core.clock.io());
-            if (content_rows == 0 or content_cols == 0) return false;
-
-            const content_w: f32 = @floatFromInt(content_cols * cell_w);
-            const content_h: f32 = @floatFromInt(content_rows * cell_h);
-            if (!(window_w > 0 and window_h > 0 and content_w > 0 and content_h > 0)) {
-                try g.drawEx(verts[0..vert_count], &[_]app_mod.Vertex{}, null, .{ .present = false });
-                return true;
-            }
-
-            const content_origin = decoratedContentOriginPx(app, kind);
-            const content_left: f32 = content_origin.x;
-            const content_top: f32 = content_origin.y;
-            const ndc = decoratedContentNdcTransform(content_left, content_top, content_w, content_h, window_w, window_h);
-            const scale_x = ndc.scale_x;
-            const scale_y = ndc.scale_y;
-            const offset_x = ndc.offset_x;
-            const offset_y = ndc.offset_y;
-
-            scratch.clearRetainingCapacity();
-            try scratch.resize(app.alloc, vert_count + 6 + app_mod.COPY_ICON_VERTS);
-            const msg_verts = scratch.items;
-
-            const bg = resolveDecoratedBgColor(app, grid_id, verts[0..vert_count]);
-            const orig_bg_r = bg.orig[0];
-            const orig_bg_g = bg.orig[1];
-            const orig_bg_b = bg.orig[2];
-            const bg_color: [4]f32 = .{ bg.adjusted[0], bg.adjusted[1], bg.adjusted[2], app.config.window.opacity };
-            const bg_tex: [2]f32 = .{ -1.0, -1.0 };
-            var bg_idx: usize = 0;
-            bg_idx = app_mod.addRectVerts(msg_verts, bg_idx, -1.0, 1.0, 2.0, 2.0, bg_color, bg_tex, grid_id);
-
-            const tolerance: f32 = 0.005;
-            for (verts[0..vert_count], 0..) |v, i| {
-                msg_verts[bg_idx + i] = v;
-                msg_verts[bg_idx + i].position[0] = v.position[0] * scale_x + offset_x;
-                msg_verts[bg_idx + i].position[1] = v.position[1] * scale_y + offset_y;
-                if ((v.deco_flags & core.DECO_CURSOR) != 0) continue;
-                if (v.texCoord[0] < 0) {
-                    const matches_bg = @abs(v.color[0] - orig_bg_r) < tolerance and
-                        @abs(v.color[1] - orig_bg_g) < tolerance and
-                        @abs(v.color[2] - orig_bg_b) < tolerance;
-                    if (matches_bg) msg_verts[bg_idx + i].color[3] = 0.0;
-                }
-            }
-
-            const msg_total = appendCopyIconVerts(
-                app,
-                kind,
-                grid_id,
-                msg_verts,
-                bg_idx + vert_count,
-                window_w,
-                window_h,
-                icon_color,
-                copy_hover,
-                copy_copied,
-            );
-            try g.drawEx(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, null, .{ .present = false });
-            if (glow_enabled) {
-                g.drawBloomFromVerts(msg_verts[0..msg_total], &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
-            }
+            // The popupmenu has no insets: its content starts at the window's
+            // top-left.
+            idx = appendDecoratedContent(out, idx, content, decoratedContentNdcTransform(0, 0, window_w, window_h), pmenu_orig, false);
+            break :blk appendDecoratedBorderVerts(out, idx, window_w, window_h, border_color, grid_id);
         },
         .normal => unreachable,
+    };
+    const drawn = scratch.items[0..total];
+    try g.drawEx(drawn, &[_]app_mod.Vertex{}, null, .{});
+    if (glow_enabled) {
+        g.drawBloomFromVerts(drawn, &[_]app_mod.Vertex{}, glow_intensity, 0, 0, g.width, g.height);
     }
     return true;
 }
@@ -681,8 +557,6 @@ fn drawNormalExternalSurface(
     tbs_committed: *const app_mod.VertexSet,
     tbs_cursor: *const app_mod.CursorSet,
     grid_id: i64,
-    verts: []const app_mod.Vertex,
-    vert_count: usize,
     cursor_blink_visible: bool,
     scrollbar_alpha: f32,
     dirty_row_keys: []u32,
@@ -691,13 +565,12 @@ fn drawNormalExternalSurface(
     tbs_snap: app_mod.PaintSnapshot,
     row_h_px_snapshot: u32,
 ) !ExternalPresentFacts {
-    const log_enabled = applog.isEnabled();
     ext_win.surf.paint.present_rects.clearRetainingCapacity();
-    // The flat path redraws every row; the row path narrows this.
+    // The pre-commit path redraws every row; the row path narrows this.
     ext_win.paint_drew_root_rows = true;
 
-    // All normal modes share the same retained back_tex. Restore a prior
-    // row/flat scrollbar before either path mutates or clears it.
+    // Both paths share the same retained back_tex. Restore a prior
+    // scrollbar before either path mutates or clears it.
     const restored_scrollbar_rect = try g.restoreScrollbarUnderlay();
 
     // Row-mode path: use per-row VB rendering with scissor (same as main window).
@@ -720,26 +593,11 @@ fn drawNormalExternalSurface(
         );
     }
 
-    // Flat-mode fallback: snapshot-based flat draw (decorated surfaces or non-row-mode).
+    // Before the first row commit: background and chrome only.
     ext_win.surf.dropRowVBs(app);
-    if (log_enabled) applog.appLog("[win] drawNormalExternalSurface: flat mode grid_id={d}\n", .{grid_id});
-
-    try app_mod.drawExternalSurfaceFlat(
-        g,
-        &ext_win.flat_draw_scratch,
-        app.alloc,
-        verts,
-        vert_count,
-        cursor_blink_visible,
-        &[_]app_mod.Vertex{},
-        glow.enabled,
-        glow.intensity,
-    );
-
-    // Keep the alpha overlay out of the full-content draw so flat↔row mode
-    // transitions use the same clean-underlay contract.
+    try g.drawEx(&.{}, &.{}, null, .{ .glow_enabled = glow.enabled, .glow_intensity = glow.intensity });
     _ = try scrollbar.drawOverlay(app, g, scrollbar.externalSurface(ext_win, grid_id), scrollbar_alpha, @intCast(g.width), @intCast(g.height), &ext_win.surf.paint.scrollbar_vb, &ext_win.surf.paint.scrollbar_vb_bytes);
-    // Flat drawEx redraws/clears the complete retained back texture.
+    // drawEx redraws/clears the complete retained back texture.
     return .{ .force_full_rows = true };
 }
 
@@ -1307,8 +1165,6 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
             const slot = ext_win.surf.tbs.pool.slotPtr(mapping.slot);
             slot.verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
         }
-    } else {
-        cs.flat_verts.ensureTotalCapacity(app.alloc, pv.surface.verts.items.len) catch return false;
     }
     if (!ext_win.surf.tbs.reserveMainCursorCapacity(app.alloc, pv.surface.cursor_verts.items.len)) return false;
 
@@ -1326,7 +1182,6 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     cs.cols = pv.surface.cols;
     cs.metrics_gen = pv.metrics_gen;
     if (pv.surface.row_mode) {
-        cs.flat_verts.clearRetainingCapacity();
         for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
             const slot = ext_win.surf.tbs.pool.slotPtr(cs.row_map.items[row_idx].slot);
             slot.verts.clearRetainingCapacity();
@@ -1345,8 +1200,6 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     } else {
         cs.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
         cs.row_map.clearRetainingCapacity();
-        cs.flat_verts.clearRetainingCapacity();
-        cs.flat_verts.appendSliceAssumeCapacity(pv.surface.verts.items);
     }
     if (!ext_win.surf.tbs.storeMainCursor(
         app.alloc,
@@ -1819,10 +1672,6 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     };
     var deferred_setpos_cmdline: ?DeferredSetWindowPos = null;
 
-    // Determine if this is a float-origin external window (nvim_open_win external=true)
-    // vs a regular split externalized by ext_windows. Query core before acquiring app.mu.
-    const is_float = if (app.corep) |cp| core.zonvie_core_is_float_external(cp, req.grid_id) != 0 else false;
-
     app.mu.lockUncancelable(core.clock.io());
 
     // Revalidate the lifecycle entry immediately before publication. Core
@@ -1899,7 +1748,6 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
             .surface = .{ .rows = req.rows, .cols = req.cols },
             .tbs = .{ .root_grid_id = req.grid_id },
         },
-        .is_float_external = is_float,
         // WM_DPICHANGED only reports a later move; the scrollbar strip and
         // resize insets read this from the first resize on.
         .dpi_scale = @as(f32, @floatFromInt(window_mod.GetDpiForWindow(hwnd.?))) / 96.0,
@@ -2275,18 +2123,8 @@ pub fn onCursorGridChanged(ctx: ?*anyopaque, grid_id: i64) callconv(.c) void {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (applog.isEnabled()) applog.appLog("[win] on_cursor_grid_changed: grid_id={d}\n", .{grid_id});
 
-    // Update last_cursor_grid synchronously so position calculations done by
-    // other posted messages (e.g. WM_APP_MSG_SHOW -> updateMiniWindows) see
-    // the new value even if those messages are processed by the UI thread
-    // before WM_APP_CURSOR_GRID_CHANGED. Without this, a typical
-    // `:echo` from cmdline produces this race:
-    //   1. cmdline_hide moves cursor from grid -100 (cmdline) to grid 2
-    //   2. msg_show fires on_msg_show -> Windows posts WM_APP_MSG_SHOW
-    //   3. UI thread runs WM_APP_MSG_SHOW -> updateMiniWindows reads
-    //      app.last_cursor_grid (still -100) -> anchors mini to the
-    //      closing cmdline ext_win's rect
-    //   4. on_cursor_grid_changed fires -> posts WM_APP_CURSOR_GRID_CHANGED
-    //   5. UI thread updates app.last_cursor_grid = 2 (too late)
+    // last_cursor_grid is written here, not when WM_APP_CURSOR_GRID_CHANGED
+    // runs, so cursorBlinkAllowed sees the new grid while that is queued.
     app.mu.lockUncancelable(core.clock.io());
     // Compared with what the core last reported, not with last_cursor_grid,
     // which window creation also writes for a window the cursor may not have
@@ -3437,11 +3275,10 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const tbs_row_mode = tbs_committed.row_mode;
     const is_row_mode_normal = tbs_row_mode and surface_kind == .normal;
 
-    // Snapshot vertex data. Row-mode normal surfaces draw the TBS committed
-    // set in place; decorated and flat-mode surfaces draw it flattened.
-    // Only the flattened (decorated and flat) paths draw a vertex count.
+    // Snapshot vertex data. Normal surfaces draw the TBS committed set in
+    // place; decorated surfaces draw it flattened.
     var vert_count: usize = 0;
-    if (!is_row_mode_normal) {
+    if (surface_kind != .normal) {
         if (!app_mod.snapshotSetRows(
             app.alloc,
             &ext_win.paint_scratch,
@@ -3590,7 +3427,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
                 return;
             }
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow draw succeeded, presenting\n", .{});
-            g.presentFromBackRectsWithCursorNoResize(&.{}, true, null, null) catch |e| {
+            g.presentFromBack(&.{}, true) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow present failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;
@@ -3611,8 +3448,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             tbs_committed,
             tbs_cursor,
             grid_id,
-            verts,
-            vert_count,
             cursor_blink_visible,
             scrollbar_alpha,
             dirty_row_keys.items,
@@ -3666,12 +3501,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
             return;
         }
 
-        g.presentFromBackRectsWithCursorNoResize(
-            ext_win.surf.paint.present_rects.items,
-            present_gate.full,
-            null,
-            null,
-        ) catch |e| {
+        g.presentFromBack(ext_win.surf.paint.present_rects.items, present_gate.full) catch |e| {
             if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow partial present failed: {any}\n", .{e});
             requeueExternalFullPaint(app, grid_id, hwnd);
             return;

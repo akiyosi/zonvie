@@ -18,6 +18,8 @@ pub const RouteResult = msg_route.RouteResult;
 pub const ViewSettings = msg_route.ViewSettings;
 pub const isReturnPrompt = msg_route.isReturnPrompt;
 pub const isInteractivePrompt = msg_route.isInteractivePrompt;
+pub const MsgTone = msg_route.MsgTone;
+pub const toneForKind = msg_route.toneForKind;
 
 fn levelFromString(s: []const u8) ?MsgLevel {
     if (std.mem.eql(u8, s, "info")) return .info;
