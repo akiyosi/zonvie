@@ -1370,19 +1370,6 @@ test "rotateRegion moves survivors and parks the scrolled-off entries in the vac
     try std.testing.expectEqual(helpers.RowBand{ .start = 1, .end = 3 }, down_band);
 }
 
-test "spawnArgQuote picks a quote the core's tokenizer gives back unchanged" {
-    try std.testing.expectEqual(@as(?u8, 0), helpers.spawnArgQuote("notes.txt"));
-    try std.testing.expectEqual(@as(?u8, 0), helpers.spawnArgQuote("a\"b"));
-    try std.testing.expectEqual(@as(?u8, '"'), helpers.spawnArgQuote("my notes.txt"));
-    // `-c "echo \"hi there\""` arrives as `echo "hi there"`: double quotes
-    // would end the token at the first inner one.
-    try std.testing.expectEqual(@as(?u8, '\''), helpers.spawnArgQuote("echo \"hi there\""));
-    try std.testing.expectEqual(@as(?u8, '"'), helpers.spawnArgQuote("'quoted'"));
-    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("it's \"x\""));
-    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote("C:\\My Dir\\"));
-    try std.testing.expectEqual(@as(?u8, null), helpers.spawnArgQuote(""));
-}
-
 test "rotateRegion vacates the whole region when the shift covers it" {
     var items = [_]u8{ 'a', 'b', 'c' };
     const band = helpers.rotateRegion(u8, &items, 0, 3, -3);

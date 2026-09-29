@@ -802,8 +802,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             self.layer?.backgroundColor = NSColor.black.cgColor
         }
 
-        buildShaderBuffers()
-
         registerFileDrops()
 
         ZonvieCore.appLog("[ExternalGridView] backgroundAlpha=\(surfaceBackgroundAlpha()) isDecoratedSurface=\(isDecoratedSurface) gridId=\(gridId)")
@@ -954,10 +952,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     /// A decorated surface (cmdline, popupmenu, messages) has no scrollbar.
     override var hostsScrollbar: Bool { !isDecoratedSurface }
-
-    private func buildShaderBuffers() {
-        // (scroll offset / drawable size buffers removed: now passed via setVertexBytes/setFragmentBytes)
-    }
 
     required init(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
@@ -1892,8 +1886,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         }
     }
 
-    /// Allocate the two ping-pong textures used by multi-pass custom
-    /// shader chains applied to this external view's backTex.
     /// Shift the back texture's pixels for a committed row scroll, and report
     /// the band to clear plus the rows the caller must redraw. The arithmetic
     /// and its texture clamps are `RowScrollBlitPlan`'s, shared with the main

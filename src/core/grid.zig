@@ -296,16 +296,7 @@ fn utf8TailStart(text: []const u8, requested_start: usize) usize {
     return start;
 }
 
-/// The longest prefix of `bytes` at most `max` long that does not end inside a
-/// UTF-8 sequence, for copies into fixed-size message buffers. A cut in the
-/// middle of a character left a truncated sequence that macOS decodes as an
-/// empty string.
-pub fn utf8PrefixLen(bytes: []const u8, max: usize) usize {
-    if (bytes.len <= max) return bytes.len;
-    var n = max;
-    while (n > 0 and (bytes[n] & 0xC0) == 0x80) n -= 1;
-    return n;
-}
+pub const utf8PrefixLen = @import("frontend_rules.zig").utf8PrefixLen;
 
 fn collectMessageTailRef(
     refs_reversed: *[MAX_MESSAGE_CHUNKS]MessageTailRef,

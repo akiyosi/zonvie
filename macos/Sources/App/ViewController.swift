@@ -156,8 +156,10 @@ final class ViewController: NSViewController {
         core.startRequested = true
         let queue = remote ? DispatchQueue.main : DispatchQueue.global(qos: .userInitiated)
         queue.async { [weak self] in
-            // A remote start runs on main, where the cancel flag may be read.
-            guard let self = self, !(remote && self.core.startCancelled) else { return }
+            guard let self = self else { return }
+            // A closed session's ViewController and core must deinit on main.
+            defer { DispatchQueue.main.async { withExtendedLifetime(self) {} } }
+            guard !self.core.startCancelled else { return }
             let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
             if rc != 0 { self.handleCoreStartFailure(rc: rc, context: context) }
         }

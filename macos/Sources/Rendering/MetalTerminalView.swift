@@ -901,22 +901,18 @@ final class MetalTerminalView: GridInputView {
 
     /// Where a view point lands in the core's cell grid.
     ///
-    /// Written out twice before — once for the hit test, once for the drag —
-    /// and the two diverged: the drag rounded the cell size to NEAREST while
-    /// the hit test and the core's `updateLayoutPx` round UP, so a press and
-    /// the drag that followed it disagreed about the column of the same pixel
-    /// whenever the fractional part was below a half.
+    /// Shared by the hit test and the drag, so a press and the drag that
+    /// follows it agree about the column of the same pixel.
     ///
     /// nil before the renderer has cell metrics, which is what both call sites
     /// bailed on separately.
     private func pointerGeometry(at point: CGPoint) -> PointerGeometry? {
         guard renderer.cellWidthPx > 0, renderer.cellHeightPx > 0 else { return nil }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
-        // Integer-rounded to match the core's grid math exactly: it receives
-        // these values through updateLayoutPx and uses them for row/col
-        // computation and vertex positioning.
-        let cellW = max(1.0, CGFloat(Int(renderer.cellWidthPx.rounded(.up))))
-        let cellH = max(1.0, CGFloat(Int(renderer.cellHeightPx.rounded(.up))))
+        // The integer cell size the core receives through updateLayoutPx.
+        let (cellWi, cellHi) = renderer.coreCellPx
+        let cellW = CGFloat(cellWi)
+        let cellH = CGFloat(cellHi)
         // From the current bounds, the same formula updateDrawableSizeIfPossible
         // uses: the stored drawableSize can lag behind bounds during a resize.
         let drawableH = CGFloat(max(1, Int((bounds.height * scale).rounded(.toNearestOrAwayFromZero))))
@@ -2014,6 +2010,9 @@ final class PreeditOverlayView: NSView {
 
     /// Underline segment info (character range -> isThick)
     private var underlineSegments: [(range: NSRange, isThick: Bool)] = []
+    /// X of each UTF-16 offset of `text`, plus the end: the IME's ranges are
+    /// UTF-16.
+    private var utf16XOffsets: [CGFloat] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2038,6 +2037,7 @@ final class PreeditOverlayView: NSView {
         attributedText = nil
         selectedRange = NSRange(location: NSNotFound, length: 0)
         underlineSegments.removeAll()
+        utf16XOffsets.removeAll()
         needsDisplay = true
     }
 
@@ -2057,15 +2057,19 @@ final class PreeditOverlayView: NSView {
 
         parseUnderlineSegments(attributedText: attributedText, selectedRange: selectedRange)
 
-        var totalCells = 0
+        // Each character takes the cells the core lays it out in, so the text
+        // lines up with the grid beneath.
+        utf16XOffsets.removeAll(keepingCapacity: true)
+        var x: CGFloat = 0
         for char in text {
-            totalCells += PreeditOverlayView.cellWidth(for: char)
+            let width = String(char).withCString { zonvie_core_display_width($0, strlen($0)) }
+            let cells = CGFloat(min(2, max(1, width)))
+            for _ in 0..<char.utf16.count { utf16XOffsets.append(x) }
+            x += cellWidth * cells
         }
+        utf16XOffsets.append(x)
 
-        let width = cellWidth * CGFloat(totalCells)
-        let height = cellHeight
-
-        frame.size = NSSize(width: max(1, width), height: max(1, height))
+        frame.size = NSSize(width: max(1, x), height: max(1, cellHeight))
         needsDisplay = true
     }
 
@@ -2135,30 +2139,22 @@ final class PreeditOverlayView: NSView {
             .foregroundColor: NSColor.textColor
         ]
 
-        var charXOffsets: [CGFloat] = []
-        var xOffset: CGFloat = 0
+        guard utf16XOffsets.count == text.utf16.count + 1 else { return }
+        var u16 = 0
         for char in text {
-            charXOffsets.append(xOffset)
-            let cellCount = PreeditOverlayView.cellWidth(for: char)
-            xOffset += cellWidth * CGFloat(cellCount)
-        }
-        charXOffsets.append(xOffset)  // End position
-
-        for (index, char) in text.enumerated() {
-            let charStr = String(char)
-            let point = NSPoint(x: charXOffsets[index], y: 0)
-            charStr.draw(at: point, withAttributes: attrs)
+            String(char).draw(at: NSPoint(x: utf16XOffsets[u16], y: 0), withAttributes: attrs)
+            u16 += char.utf16.count
         }
 
         NSColor.textColor.setStroke()
         for segment in underlineSegments {
-            let startCharIndex = segment.range.location
-            let endCharIndex = min(segment.range.location + segment.range.length, charXOffsets.count - 1)
+            let startIndex = segment.range.location
+            let endIndex = min(segment.range.location + segment.range.length, utf16XOffsets.count - 1)
 
-            guard startCharIndex < charXOffsets.count && endCharIndex <= charXOffsets.count else { continue }
+            guard startIndex < utf16XOffsets.count else { continue }
 
-            let startX = charXOffsets[startCharIndex]
-            let endX = charXOffsets[endCharIndex]
+            let startX = utf16XOffsets[startIndex]
+            let endX = utf16XOffsets[endIndex]
 
             let underlinePath = NSBezierPath()
             underlinePath.lineWidth = segment.isThick ? 2.0 : 1.0
@@ -2167,33 +2163,6 @@ final class PreeditOverlayView: NSView {
             underlinePath.line(to: NSPoint(x: endX, y: yPos))
             underlinePath.stroke()
         }
-    }
-
-    /// Returns the cell width (1 or 2) for a character based on East Asian Width.
-    static func cellWidth(for char: Character) -> Int {
-        guard let scalar = char.unicodeScalars.first else { return 1 }
-        let value = scalar.value
-
-        // East Asian Wide (W) and Fullwidth (F) characters take 2 cells
-        if (0x1100...0x115F).contains(value) ||   // Hangul Jamo
-           (0x2E80...0x9FFF).contains(value) ||   // CJK radicals, symbols, ideographs
-           (0xAC00...0xD7AF).contains(value) ||   // Hangul syllables
-           (0xF900...0xFAFF).contains(value) ||   // CJK compatibility ideographs
-           (0xFE10...0xFE1F).contains(value) ||   // Vertical forms
-           (0xFE30...0xFE6F).contains(value) ||   // CJK compatibility forms
-           (0xFF00...0xFF60).contains(value) ||   // Fullwidth forms
-           (0xFFE0...0xFFE6).contains(value) ||   // Fullwidth symbols
-           (0x20000...0x2FFFF).contains(value) || // CJK Extension B and beyond
-           (0x30000...0x3FFFF).contains(value) {  // CJK Extension G and beyond
-            return 2
-        }
-
-        // Hiragana and Katakana (3040-30FF)
-        if (0x3040...0x30FF).contains(value) {
-            return 2
-        }
-
-        return 1
     }
 }
 
