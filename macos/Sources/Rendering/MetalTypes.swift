@@ -3302,8 +3302,10 @@ func scrollAdjustedLocalRow(
 /// of their own for `scrollAdjustedLocalRow` to undo.
 ///
 /// Each follower is tested where it is drawn: the pixel is moved back by its
-/// displacement and `resolve` — the core's resolver — is asked about the cell
-/// it came from, so the core's rules (mouse_enabled, order) still decide. The
+/// displacement and the core's resolver, with every other grid left out, is
+/// asked about the cell it came from, so the core's rules (mouse_enabled,
+/// bounds) still decide. A float over that source cell is not drawn at the
+/// point, so it must not hide the follower. The
 /// follower drawn in front (paint rank, then grid id) wins over the static hit
 /// if it is drawn above it. A static hit that names a follower which has moved
 /// off the cell is re-resolved with the displaced followers left out, which is
@@ -3318,7 +3320,6 @@ func resolveDisplacedFollowerHit(
     staticGridId: Int64,
     followers: [Int64: CGFloat],
     paintRankOf: (Int64) -> Int?,
-    resolve: (Int32, Int32) -> (gridId: Int64, row: Int32, col: Int32)?,
     resolveExcluding: (Int32, Int32, (Int64) -> Bool) -> (gridId: Int64, row: Int32, col: Int32)?
 ) -> DisplacedFollowerHit? {
     guard cellHeightPx > 0, !followers.isEmpty else { return nil }
@@ -3327,7 +3328,8 @@ func resolveDisplacedFollowerHit(
     for (followerId, offsetPx) in followers where abs(offsetPx) >= minDisplacementPx {
         guard let rank = paintRankOf(followerId) else { continue }
         let sourceRow = Int32(((pointPxY - offsetPx) / cellHeightPx).rounded(.down))
-        guard let hit = resolve(sourceRow, globalCol), hit.gridId == followerId else { continue }
+        guard let hit = resolveExcluding(sourceRow, globalCol, { $0 != followerId }),
+              hit.gridId == followerId else { continue }
         if let b = best, (rank, followerId) <= (b.rank, b.gridId) { continue }
         best = (followerId, hit.row, hit.col, rank)
     }

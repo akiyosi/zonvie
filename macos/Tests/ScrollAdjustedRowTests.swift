@@ -98,13 +98,12 @@ private func verifyDisplacedFollowerHit() {
         if row == 4, !excluded(9) { return (9, row - 4, col) }
         return (2, row, col)
     }
-    let resolve: (Int32, Int32) -> Hit? = { resolveExcluding($0, $1) { _ in false } }
     let rankOf: (Int64) -> Int? = { [7: 5, 9: 3, 2: 1][$0] }
 
     // Row 7 on screen is where float row 1 is drawn now.
     let drawn = resolveDisplacedFollowerHit(
         pointPxY: 150, cellHeightPx: cell, globalCol: 3, staticGridId: 2, followers: [7: 40],
-        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+        paintRankOf: rankOf, resolveExcluding: resolveExcluding)
     expect(Int32(followerId(drawn)), 7, "a press where the follower is drawn names it")
     if case let .follower(_, row, _)? = drawn { expect(row, 1, "at the row that pixel came from") }
 
@@ -112,19 +111,19 @@ private func verifyDisplacedFollowerHit() {
     // static float under it is what is drawn there now, not grid 1.
     let vacated = resolveDisplacedFollowerHit(
         pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 40],
-        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+        paintRankOf: rankOf, resolveExcluding: resolveExcluding)
     expect(Int32(uncoveredId(vacated)), 9, "the vacated placement goes to the float behind it")
 
     // Row 5, also vacated: nothing but the window behind.
     let vacatedSplit = resolveDisplacedFollowerHit(
         pointPxY: 110, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 40],
-        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+        paintRankOf: rankOf, resolveExcluding: resolveExcluding)
     expect(Int32(uncoveredId(vacatedSplit)), 2, "then the window behind")
 
     // Not displaced: the static answer stands.
     let still = resolveDisplacedFollowerHit(
         pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 0.1],
-        paintRankOf: rankOf, resolve: resolve, resolveExcluding: resolveExcluding)
+        paintRankOf: rankOf, resolveExcluding: resolveExcluding)
     expect(still == nil ? 1 : 0, 1, "an undisplaced follower leaves the static hit alone")
 
     // Equal Neovim zindex, different paint rank: follower 8 is drawn in front
@@ -138,7 +137,7 @@ private func verifyDisplacedFollowerHit() {
     let overlapRank: (Int64) -> Int? = { [8: 4, 9: 3, 2: 1][$0] }
     let front = resolveDisplacedFollowerHit(
         pointPxY: 110, cellHeightPx: cell, globalCol: 3, staticGridId: 9, followers: [8: 20],
-        paintRankOf: overlapRank, resolve: { overlap($0, $1) { _ in false } }, resolveExcluding: overlap)
+        paintRankOf: overlapRank, resolveExcluding: overlap)
     expect(Int32(followerId(front)), 8, "the follower drawn in front takes the press")
 
     // Two followers drawn over the same pixel: the higher paint rank wins,
@@ -149,10 +148,22 @@ private func verifyDisplacedFollowerHit() {
     for _ in 0..<8 {
         let pick = resolveDisplacedFollowerHit(
             pointPxY: 90, cellHeightPx: cell, globalCol: 3, staticGridId: 2, followers: [10: 40, 11: 20],
-            paintRankOf: { [10: 6, 11: 7, 2: 1][$0] }, resolve: both,
+            paintRankOf: { [10: 6, 11: 7, 2: 1][$0] },
             resolveExcluding: { r, c, _ in both(r, c) })
         expect(Int32(followerId(pick)), 11, "the follower painted in front wins")
     }
+
+    // A fixed float 12 (rank 8) covers row 5 only, the source cell of float
+    // 7 drawn a row lower. It is not drawn at row 6, so it must not hide 7.
+    let over: (Int32, Int32, (Int64) -> Bool) -> Hit? = { row, col, excluded in
+        if row == 5, !excluded(12) { return (12, 0, col) }
+        if (4...6).contains(row), !excluded(7) { return (7, row - 4, col) }
+        return (2, row, col)
+    }
+    let hidden = resolveDisplacedFollowerHit(
+        pointPxY: 130, cellHeightPx: cell, globalCol: 3, staticGridId: 7, followers: [7: 20],
+        paintRankOf: { [7: 5, 12: 8, 2: 1][$0] }, resolveExcluding: over)
+    expect(Int32(followerId(hidden)), 7, "a float over the source cell does not hide the follower")
 }
 
 /// Horizontal input was read only to drop an all-zero event and never sent,

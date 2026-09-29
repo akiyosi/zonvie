@@ -741,45 +741,6 @@ private enum SurfaceDrawGateTests {
         expect(fastScrollThresholdPt(rowHeightPx: 40, rowsPerWheelEvent: 0, maxEventsPerInput: 3, scale: 2), 20, "ver=0 falls back to one row")
     }
 
-    /// A second button mid left-drag must neither take the left drag's pin
-    /// nor end it on its release; Windows' pressEditorButton/takeButtonRelease.
-    private static func verifyPressPin() {
-        func expect(_ actual: Int64?, _ expected: Int64?, _ what: String) {
-            if actual != expected {
-                failures += 1
-                print("FAIL press pin \(what): got \(String(describing: actual)) expected \(String(describing: expected))")
-            }
-        }
-        var pin = SurfacePressPin<Int64>()
-        pin.press(button: "left") { 5 }
-        pin.press(button: "right") { 1 }
-        expect(pin.pinned, 5, "right press mid left-drag")
-        expect(pin.release(button: "right"), 5, "right release is addressed to the left drag's pin")
-        expect(pin.pinned, 5, "right release mid left-drag keeps the pin")
-        expect(pin.release(button: "left"), 5, "left release")
-        expect(pin.pinned, nil, "left release ends the claim")
-
-        // A left press while another button holds the claim takes it over,
-        // as on Windows; that button's release then leaves it alone.
-        pin.press(button: "right") { 2 }
-        pin.press(button: "left") { 3 }
-        expect(pin.pinned, 3, "left press takes over a right claim")
-        _ = pin.release(button: "right")
-        expect(pin.pinned, 3, "right release after a left takeover")
-        _ = pin.release(button: "left")
-        pin.press(button: "middle") { 4 }
-        expect(pin.release(button: "middle"), 4, "lone middle release")
-        expect(pin.pinned, nil, "lone middle release ends the claim")
-
-        // Right, then middle (which re-pins): the right release must not end
-        // the middle's claim, or the middle release is dropped.
-        pin.press(button: "right") { 6 }
-        pin.press(button: "middle") { 7 }
-        expect(pin.release(button: "right"), 7, "right release under a middle claim")
-        expect(pin.release(button: "middle"), 7, "middle release keeps its pin")
-        expect(pin.pinned, nil, "middle release ends the claim")
-    }
-
     /// SurfaceScrollBlitGate against both hand-written originals, over every
     /// assignment of its seven terms.
     ///
@@ -856,7 +817,6 @@ private enum SurfaceDrawGateTests {
         verifyMainRowPass()
         verifyExternalRowPass()
         verifyFastScrollThreshold()
-        verifyPressPin()
 
         // A term a surface does not have must never block its skip. The main
         // surface has no staged scroll, no scroll-offset latch and no cursor

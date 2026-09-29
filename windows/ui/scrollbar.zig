@@ -84,8 +84,6 @@ pub const Surface = struct {
     /// window does not; the two look different, and making them agree is a
     /// visual decision, not a side effect of sharing code.
     knob_inset_px: f32,
-    /// An external window repaints only on its needs_redraw flag.
-    ext_win: ?*app_mod.ExternalWindow = null,
 };
 
 pub fn mainSurface(hwnd: c.HWND, app: *App) Surface {
@@ -115,7 +113,6 @@ pub fn externalSurface(ext_win: *app_mod.ExternalWindow, grid_id: i64) Surface {
         .dpi_scale = ext_win.dpi_scale,
         .top_offset_px = 0,
         .knob_inset_px = 1,
-        .ext_win = ext_win,
     };
 }
 
@@ -134,17 +131,6 @@ fn invalidateTrack(sf: Surface) void {
     } else {
         _ = c.InvalidateRect(sf.hwnd, null, c.FALSE);
     }
-}
-
-/// Row-mode paint restores the narrow saved scrollbar underlay before drawing
-/// the new alpha; an external window paints only when told to.
-fn repaintTrack(app: *App, sf: Surface) void {
-    if (sf.ext_win) |ew| {
-        app.mu.lockUncancelable(core.clock.io());
-        ew.needs_redraw = true;
-        app.mu.unlock(core.clock.io());
-    }
-    invalidateTrack(sf);
 }
 
 pub fn geometry(app: *App, sf: Surface, client_width: i32, client_height: i32) app_mod.ScrollbarGeometry {
@@ -567,7 +553,7 @@ pub fn hide(app: *App, sf: Surface) void {
 }
 
 /// One fade step, from the fade timer.
-pub fn fade(app: *App, sf: Surface) void {
+pub fn fade(sf: Surface) void {
     const step: f32 = 0.15;
     const st = sf.state;
     var changed = false;
@@ -586,14 +572,14 @@ pub fn fade(app: *App, sf: Surface) void {
             changed = true;
         }
     }
-    if (changed) repaintTrack(app, sf);
+    if (changed) invalidateTrack(sf);
 }
 
 /// The scrollbar's timers. Returns false for any other timer id.
 pub fn onTimer(app: *App, sf: Surface, timer_id: usize) bool {
     const st = sf.state;
     if (timer_id == app_mod.TIMER_SCROLLBAR_FADE) {
-        fade(app, sf);
+        fade(sf);
     } else if (timer_id == app_mod.TIMER_SCROLLBAR_REPEAT) {
         if (st.repeat_dir != 0) {
             pageScroll(app, sf, st.repeat_dir);
@@ -676,5 +662,5 @@ fn updateSurface(retry_hwnd: c.HWND, app: *App, sf: Surface) void {
         return;
     }
     if (app.config.scrollbar.isScroll() or app.config.scrollbar.isAlways()) show(app, sf);
-    repaintTrack(app, sf);
+    invalidateTrack(sf);
 }

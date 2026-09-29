@@ -542,7 +542,8 @@ typedef void (*zonvie_on_msg_clear_fn)(void* ctx);
 
 /* Called when mode info should be shown (e.g., "-- INSERT --", recording).
    view: routed view type from config
-   content: array of highlighted chunks (empty to hide) */
+   content: array of highlighted chunks (empty to hide; a notification view
+   never receives the empty call) */
 typedef void (*zonvie_on_msg_showmode_fn)(
     void* ctx,
     zonvie_msg_view_type view,
@@ -551,7 +552,8 @@ typedef void (*zonvie_on_msg_showmode_fn)(
 
 /* Called when showcmd info should be shown.
    view: routed view type from config
-   content: array of highlighted chunks (empty to hide) */
+   content: array of highlighted chunks (empty to hide; a notification view
+   never receives the empty call) */
 typedef void (*zonvie_on_msg_showcmd_fn)(
     void* ctx,
     zonvie_msg_view_type view,
@@ -560,7 +562,8 @@ typedef void (*zonvie_on_msg_showcmd_fn)(
 
 /* Called when ruler info should be shown.
    view: routed view type from config
-   content: array of highlighted chunks (empty to hide) */
+   content: array of highlighted chunks (empty to hide; a notification view
+   never receives the empty call) */
 typedef void (*zonvie_on_msg_ruler_fn)(
     void* ctx,
     zonvie_msg_view_type view,
@@ -958,7 +961,8 @@ void zonvie_core_set_ext_tabline(zonvie_core *core, int enabled);
  * When enabled, Neovim external windows are rendered as separate OS windows. */
 ZONVIE_API void zonvie_core_set_ext_windows(zonvie_core *core, int enabled);
 
-/* Process due message timeouts and render-maintenance retries. Frontends
+/* Process due message timeouts (including the throttled message float scroll)
+ * and render-maintenance retries. Frontends
  * normally drive this from the one-shot deadline returned below so messages
  * and transient glyph failures recover while Neovim is idle. */
 void zonvie_core_tick_msg_throttle(zonvie_core *core);
@@ -1771,6 +1775,29 @@ ZONVIE_API void zonvie_core_parse_ssh_target(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_cli_next_is_value(const char *next, size_t len);
 
+/* A surface's pointer claim: which buttons have had a press sent, and which
+   one's press chose the grid every release and drag goes to. Buttons are 1
+   left, 2 right, 3 middle, 4 x1, 5 x2. A left press takes the claim, another
+   button's unless left holds it; every sent press gets its release, to the
+   claim's grid, in any release order; the claim ends with the last held
+   button. `owner` is the button drags are reported as, 0 when none. Zero it
+   to start (or when the platform cancels the capture).
+
+   Pure — no core pointer, no lock. */
+typedef struct zonvie_press_claim {
+    uint8_t held_mask;
+    uint8_t owner;
+} zonvie_press_claim;
+
+/* Records a sent press; true when it takes the claim (pin its grid). */
+ZONVIE_API bool zonvie_core_press_claim_press(zonvie_press_claim *claim, uint8_t button);
+
+#define ZONVIE_PRESS_RELEASE_SEND 1u
+#define ZONVIE_PRESS_RELEASE_ENDS 2u
+/* A release: SEND when its press was sent (send it to the claim's grid),
+   ENDS when no button is held after it. */
+ZONVIE_API uint8_t zonvie_core_press_claim_release(zonvie_press_claim *claim, uint8_t button);
+
 /* Mini window content as shown: a trailing newline dropped, and past ten
    lines the first nine plus a "…(N more lines)" line. Written to `out`
    (UTF-8, not NUL-terminated), cut at a UTF-8 boundary with '…' when it does
@@ -2140,7 +2167,10 @@ ZONVIE_API bool zonvie_core_try_get_cursor_blink(
 /* Send mouse scroll event to Neovim.
    direction: "up", "down", "left", or "right"
    modifier: "" or combination of "S" (shift), "C" (ctrl), "A" (alt), "D" (super/command)
-   grid_id: target grid (1 = global grid)
+   grid_id: target grid (1 = global grid). Grids -102 and -103 (the message
+   floats) are scrolled by the core, not sent. A -102 scroll can be throttled
+   into a message deadline, so re-arm the one-shot timer from
+   zonvie_core_try_next_msg_timeout_ms afterwards.
    row, col: position within the grid */
 ZONVIE_API void zonvie_core_send_mouse_scroll(
     zonvie_core *core,
@@ -2172,10 +2202,9 @@ ZONVIE_API void zonvie_core_page_scroll(
     bool forward
 );
 
-/* Process pending message scroll update (for throttled scroll).
-   Call this after scroll events stop to ensure final position is rendered.
-   Returns true while an aborted/throttled update still needs another
-   frontend timer retry. */
+/* Legacy: the message float scroll retry is a core deadline served by
+   zonvie_core_tick_msg_throttle, and frontends no longer call this.
+   Sends the pending scroll if due; returns true while one is still pending. */
 ZONVIE_API bool zonvie_core_process_pending_msg_scroll_retry_needed(
     zonvie_core *core
 );

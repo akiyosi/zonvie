@@ -1660,11 +1660,7 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     box.core.lockGridAsRedrawOwner();
     defer box.core.unlockGridAsRedrawOwner();
 
-    if (box.core.msg_scroll_pending and
-        clock.nowNs() - box.core.msg_scroll_last_send >= flush_mod.msg_scroll_throttle_ns)
-    {
-        box.core.processPendingMsgScroll();
-    }
+    box.core.processPendingMsgScroll();
 
     // The timeout can create/remove external grids. onFlush runs vertex
     // generation and external-window lifecycle notification inside the same
@@ -2027,6 +2023,16 @@ pub export fn zonvie_core_parse_ssh_target(value: ?[*]const u8, len: usize, out_
 
 pub export fn zonvie_core_cli_next_is_value(next: ?[*]const u8, len: usize) callconv(.c) bool {
     return frontend_rules.cliNextIsValue(if (next) |n| n[0..len] else null);
+}
+
+pub export fn zonvie_core_press_claim_press(claim: ?*frontend_rules.PressClaim, button: u8) callconv(.c) bool {
+    return (claim orelse return false).press(button);
+}
+
+/// Bit 0: send this release; bit 1: it ends the claim.
+pub export fn zonvie_core_press_claim_release(claim: ?*frontend_rules.PressClaim, button: u8) callconv(.c) u8 {
+    const r = (claim orelse return 0).release(button);
+    return @as(u8, @intFromBool(r.send)) | (@as(u8, @intFromBool(r.ends)) << 1);
 }
 
 pub export fn zonvie_core_clamp_mini_content(
@@ -2545,9 +2551,9 @@ pub export fn zonvie_core_page_scroll(
     box.core.pageScroll(grid_id, forward);
 }
 
-/// Process pending message scroll update (for throttled scroll).
-/// Call this after scroll events stop to ensure final position is rendered.
-/// Returns true when a scroll is still pending and the caller should retry.
+/// Legacy: the msg float scroll retry is a core deadline served by
+/// zonvie_core_tick_msg_throttle, and no frontend calls this. Sends the
+/// pending scroll if due; returns true while one is still pending.
 ///
 /// Acquires grid_mu — same rationale as zonvie_core_send_mouse_scroll:
 /// processPendingMsgScroll mutates the same Grid/vertex/atlas-scratch state

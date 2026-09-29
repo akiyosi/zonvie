@@ -598,7 +598,7 @@ pub fn onVerticesRow(
                 // The layer's own dirty flag and present rect carry the frame.
                 // Only for a main-window layer: a float an external window
                 // hosts already asked its host (storeMainSurfaceLayerRowLocked
-                // sets needs_redraw), and the main flag drives a whole-window
+                // sets its flag), and the main flag drives a whole-window
                 // InvalidateRect — the row-scroll path makes the same split.
                 switch (row_route) {
                     .main_root, .main_layer, .unplaced => app.surf.flush_needs_invalidate = true,
@@ -693,7 +693,6 @@ pub fn onVerticesRow(
                     return;
                 }
                 ext_win.surf.tbs.stageCursorLayerGrid(grid_id);
-                ext_win.needs_redraw = true;
                 ext_win.surf.flush_needs_invalidate = true;
                 // InvalidateRect deferred to onFlushEnd.
                 return;
@@ -739,7 +738,6 @@ pub fn onVerticesRow(
             }
             ext_win.surf.surface.rows = total_rows;
             ext_win.surf.surface.cols = total_cols;
-            ext_win.needs_redraw = true;
             ext_win.surf.flush_needs_invalidate = true;
             if (size_changed) {
                 ext_win.surf.surface.paint_full = true;
@@ -751,9 +749,6 @@ pub fn onVerticesRow(
             if (row_count == 1) {
                 // TBS: COW detach + write to slot, mark dirty.
                 if (ext_win.surf.tbs.is_in_flush) {
-                    const ws = ext_win.surf.tbs.writeSet();
-                    ws.rows = total_rows;
-                    ws.cols = total_cols;
                     // External windows own a separate pool, so they need the
                     // same layout/peak observations as the main grid above.
                     ext_win.surf.tbs.pool.noteLayoutWidth(total_cols);
@@ -1135,7 +1130,7 @@ pub fn onGridRowScroll(
                 failFlush(app);
             } else {
                 // onFlushEnd invalidates an external HWND exclusively from its
-                // own needs_redraw, so a float this surface hosts that only
+                // own flush_needs_invalidate, so a float this surface hosts that only
                 // SHIFTS rows scheduled a repaint of the main window and none
                 // of its actual host. The row-store route one function away has
                 // always set it. Usually masked, because the core sends the
@@ -1146,7 +1141,6 @@ pub fn onGridRowScroll(
                 // InvalidateRect.
                 switch (row_route) {
                     .external_layer => |host| {
-                        host.needs_redraw = true;
                         host.surf.flush_needs_invalidate = true;
                     },
                     .main_root, .main_layer, .unplaced => app.surf.flush_needs_invalidate = true,
@@ -1352,7 +1346,6 @@ pub fn onGridRowScroll(
         ext_win.surf.tbs.flush_scroll_row_end = row_end;
     }
 
-    ext_win.needs_redraw = true;
     ext_win.surf.flush_needs_invalidate = true;
     // InvalidateRect deferred to onFlushEnd for coalescing.
 }
@@ -1580,7 +1573,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     // Coalesce all per-callback dirty state into a single InvalidateRect per
     // window.  Individual vertex callbacks (onVerticesRow, storeMainSurfaceCursor,
     // onGridRowScroll) no longer call InvalidateRect directly; they only
-    // accumulate dirty state (dirty_rows, paint_full, needs_redraw,
+    // accumulate dirty state (dirty_rows, paint_full,
     // flush_needs_invalidate).  This prevents mid-flush WM_PAINT from drawing
     // incomplete frames, and skips InvalidateRect entirely for flushes that
     // carry no visual changes (e.g. msg_showcmd-only flushes).
@@ -1594,7 +1587,7 @@ pub fn onFlushEnd(ctx: ?*anyopaque) callconv(.c) void {
     var ext_hwnd_count: usize = 0;
     var it = app.external_windows.iterator();
     while (it.next()) |entry| {
-        const ext_dirty = entry.value_ptr.*.surf.flush_needs_invalidate or entry.value_ptr.*.needs_redraw;
+        const ext_dirty = entry.value_ptr.*.surf.flush_needs_invalidate;
         entry.value_ptr.*.surf.flush_needs_invalidate = false;
         if (ext_dirty or atlas_reset_committed) {
             if (entry.value_ptr.*.hwnd) |ext_hwnd| {
@@ -2569,9 +2562,8 @@ pub fn onSurfaceLayout(
     // the surface the layout belongs to. An external surface's layout is not a
     // visual change on the main window, and the flag drives a whole-main-window
     // InvalidateRect; the external ROW path has always kept out of it for the
-    // same reason. Grid 1 has no needs_redraw of its own, so it uses the flag.
+    // same reason.
     if (app.external_windows.get(surface_id)) |ext_win| {
-        ext_win.needs_redraw = true;
         ext_win.surf.flush_needs_invalidate = true;
     } else {
         app.surf.flush_needs_invalidate = true;
@@ -2730,7 +2722,6 @@ fn storeMainSurfaceLayerRowLocked(
     };
     traceRender(app, "event=row_route surface={d} grid={d} row={d} vertices={d} rows={d} cols={d}\n", .{ if (ext) |host| traceExternalSurfaceId(host, grid_id) else @as(i64, 1), grid_id, row, verts.len, total_rows, total_cols });
     if (ext) |host| {
-        host.needs_redraw = true;
         host.surf.flush_needs_invalidate = true;
     }
 

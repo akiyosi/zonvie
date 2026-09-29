@@ -1166,9 +1166,8 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     // while app.mu still excludes core vertex callbacks.
     ext_win.surf.surface.rows = pv.surface.rows;
     ext_win.surf.surface.cols = pv.surface.cols;
-    ext_win.needs_redraw = true;
     // Joined the open flush above: onFlushEnd owes this window the
-    // invalidate, and the paint that follows clears needs_redraw.
+    // invalidate. Outside a flush the caller invalidates it.
     if (ext_win.surf.tbs.is_in_flush) ext_win.surf.flush_needs_invalidate = true;
 
     cs.row_mode = true;
@@ -2628,7 +2627,7 @@ pub export fn ExternalWndProc(
                     // editor's own selection -- on a real window grid only,
                     // for the reason the press gate states.
                     if (classifyExternalSurface(grid_id.?) == .normal) {
-                        if (input.heldMouseButtonName(app.mouse_button_held)) |button| {
+                        if (input.heldMouseButtonName(app.press_claim.owner)) |button| {
                             const drag_target = input.rebaseSurfaceTarget(app, &ext_win.surf.tbs, grid_id.?, false, app.mouse_press_grid_id, x, y);
                             input.sendMouseButton(app, drag_target.grid_id, button, .drag, drag_target.x, drag_target.y, wParam);
                         }
@@ -2972,10 +2971,8 @@ fn requeueExternalFullPaint(app: *App, grid_id: i64, hwnd: c.HWND) void {
     var main_hwnd: ?c.HWND = null;
     app.mu.lockUncancelable(core.clock.io());
     const ext_win = app.external_windows.get(grid_id);
-    // No needs_redraw here: onFlushEnd reads it on every flush and nothing
-    // but a paint clears it, so the failing window was invalidated at flush
-    // rate and never waited for the retry below. The retry timer, or device
-    // recovery, is what wakes it -- as it is for the main window.
+    // The retry timer, or device recovery, is what wakes the failing
+    // window -- as it is for the main window.
     if (ext_win) |ew| {
         device_lost = ew.renderer.device_lost;
         main_hwnd = app.hwnd;
@@ -3232,7 +3229,7 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     const tbs_cursor = &ext_win.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
     // For the blink timer, on every kind, before any early-out: a toggle
     // must not invalidate a surface whose pixels it cannot change.
-    ext_win.has_committed_cursor = tbs_cursor.verts.items.len > 0;
+    ext_win.surf.has_committed_cursor = tbs_cursor.verts.items.len > 0;
     // Shared font/cell/linespace metrics are protected by app.mu. Pair the
     // snapshot with the generation stored alongside the committed row
     // vertices so an old vertex set is never drawn using new scissor/row
@@ -3295,7 +3292,6 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     }
 
     const cursor_blink_visible = app.cursor_blink.visible;
-    ext_win.needs_redraw = false;
 
     // Dirty state snapshot from TBS (row-mode normal windows only).
     const dirty_row_keys = &ext_win.surf.paint.dirty_row_keys;

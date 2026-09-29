@@ -3,8 +3,11 @@ import MetalKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var window: NSWindow?
-    // OS/UI-specific: persist window geometry across launches.
-    private let windowFrameAutosaveName = "zonvie.mainWindow.frame"
+    // OS/UI-specific: persist window geometry across launches. The frame
+    // lives in the real user's defaults whatever HOME says, so gui-test
+    // names its own key (empty: none) instead of moving the user's window.
+    private let windowFrameAutosaveName =
+        ProcessInfo.processInfo.environment["ZONVIE_FRAME_AUTOSAVE_NAME"] ?? "zonvie.mainWindow.frame"
 
     // Files to open from Finder (queued until Neovim is ready)
     private var pendingFilesToOpen: [String] = []
@@ -225,11 +228,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let vc = ViewController()
         vc.forceConnectDialog = forceDialog
         win.contentViewController = vc
+        // With no saved frame to restore, a first launch kept that ~400x300.
+        win.setContentSize(rect.size)
 
         // Persist/restore window geometry (AppKit feature). One window at a
         // time can hold the name: a second session opened on top of the first
         // and its frame was never saved. It cascades from the key session.
-        if win.setFrameAutosaveName(windowFrameAutosaveName) {
+        if !windowFrameAutosaveName.isEmpty, win.setFrameAutosaveName(windowFrameAutosaveName) {
             // If there is a saved frame from the last session, use it.
             // Otherwise keep the computed default rect (centered 800x600-ish).
             if !win.setFrameUsingName(windowFrameAutosaveName) {
@@ -297,9 +302,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // A core that never started (the connection picker) has no nvim to
         // ask; asking timed out into "Neovim Not Responding".
         if let vc = sender.contentViewController as? ViewController,
-           let core = vc.core, core.didStart {
-            ZonvieCore.appLog("[windowShouldClose] requesting quit via core")
-            core.requestQuit()
+           let core = vc.core, core.startRequested {
+            if core.didStart {
+                ZonvieCore.appLog("[windowShouldClose] requesting quit via core")
+                core.requestQuit()
+            } else {
+                // Start in flight (e.g. `devcontainer up`): nothing to ask yet.
+                core.cancelPendingStart(window: sender)
+            }
             return false  // Don't close yet - wait for quit confirmation
         }
         // If no core, allow normal close
@@ -382,12 +392,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// closes as its nvim exits and the last one stops the run loop.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if quitDecided { return .terminateNow }
-        // A session still at its picker has no nvim to answer the request:
-        // its window just closes.
+        // A session still at its picker, or whose start is still in flight,
+        // has no nvim to answer the request: it just closes.
         let sessions = SessionManager.shared.sessions
         let cores = sessions.compactMap { $0.viewController?.core }.filter { $0.didStart }
         if cores.isEmpty { return .terminateNow }
-        for s in sessions where s.viewController?.core?.didStart != true { s.window?.close() }
+        for s in sessions where s.viewController?.core?.didStart != true {
+            if let core = s.viewController?.core, core.startRequested, let win = s.window {
+                core.cancelPendingStart(window: win)
+            } else {
+                s.window?.close()
+            }
+        }
         ZonvieCore.appLog("[applicationShouldTerminate] requesting quit for \(cores.count) session(s)")
         for core in cores { core.requestQuit() }
         return .terminateCancel

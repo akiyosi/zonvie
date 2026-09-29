@@ -105,6 +105,70 @@ test "mouse modifiers come out as S, C, A, D in that order" {
     try std.testing.expectEqualStrings("D", mouseModifierString(&buf, (1 << 3) | (1 << 8)));
 }
 
+/// The pointer claim of a surface: which buttons have had a press sent to the
+/// editor, and which one's press chose the grid every release and drag goes
+/// to. Buttons are 1 left, 2 right, 3 middle, 4 x1, 5 x2 (ZONVIE_MOUSE_*).
+/// A left press takes the claim; another button's takes it unless left holds
+/// it. Every sent press gets its release, to the claim's grid, whatever the
+/// order they are let go in; the claim ends with the last held button.
+pub const PressClaim = extern struct {
+    held_mask: u8 = 0,
+    /// The button drags are reported as; 0 once nothing is held.
+    owner: u8 = 0,
+
+    pub const Release = struct { send: bool, ends: bool };
+
+    fn bit(button: u8) u8 {
+        return @as(u8, 1) << @intCast(button & 7);
+    }
+
+    /// Whether this press takes the claim (the caller pins its grid).
+    pub fn press(self: *PressClaim, button: u8) bool {
+        self.held_mask |= bit(button);
+        if (self.owner == 1 and button != 1) return false;
+        self.owner = button;
+        return true;
+    }
+
+    /// Whether to send this release (to the claim's grid), and whether it
+    /// ends the claim. A release whose press was never sent is dropped.
+    pub fn release(self: *PressClaim, button: u8) Release {
+        if (self.held_mask & bit(button) == 0) return .{ .send = false, .ends = self.held_mask == 0 };
+        self.held_mask &= ~bit(button);
+        if (self.held_mask == 0) {
+            self.owner = 0;
+        } else if (button == self.owner) {
+            self.owner = @ctz(self.held_mask); // bit n is button n
+        }
+        return .{ .send = true, .ends = self.held_mask == 0 };
+    }
+};
+
+test "every sent press gets its release, in any release order" {
+    var c = PressClaim{};
+    // Right, then middle (which takes the claim), let go last-in first-out.
+    try std.testing.expect(c.press(2));
+    try std.testing.expect(c.press(3));
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = false }, c.release(3));
+    try std.testing.expectEqual(@as(u8, 2), c.owner);
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = true }, c.release(2));
+    // Left holds the claim against a right press; left let go first.
+    try std.testing.expect(c.press(1));
+    try std.testing.expect(!c.press(2));
+    try std.testing.expectEqual(@as(u8, 1), c.owner);
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = false }, c.release(1));
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = true }, c.release(2));
+    // A left press takes over a right claim; the right release keeps it.
+    try std.testing.expect(c.press(2));
+    try std.testing.expect(c.press(1));
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = false }, c.release(2));
+    try std.testing.expectEqual(@as(u8, 1), c.owner);
+    try std.testing.expectEqual(PressClaim.Release{ .send = true, .ends = true }, c.release(1));
+    // A release whose press never reached the editor is not sent.
+    try std.testing.expectEqual(PressClaim.Release{ .send = false, .ends = true }, c.release(3));
+    try std.testing.expectEqual(@as(u8, 0), c.held_mask);
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 
