@@ -1916,9 +1916,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // stretch paints the edge row's background over the retained row's own,
         // so the band shows one row's glyphs on its neighbour's background.
         var pin_edges: Int32 = 1
-        // The scrolled grid's zindex (0 for windows, > 0 for floats). The
-        // fragment guard only discards scrolled content under a STRICTLY
-        // higher-z fixed float — see Shaders.metal insideFixedFloatAbove.
+        // The scrolled grid's paint rank on the surface's layer list (0 =
+        // root). The fragment guard only discards scrolled content under a
+        // STRICTLY higher-ranked fixed float — see Shaders.metal
+        // insideFixedFloatAbove.
         var zindex: Int32 = 0
     }
 
@@ -2056,6 +2057,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             if px.isFinite { result[Int64(entry.grid_id)] = CGFloat(px) }
         }
         return result
+    }
+
+    /// A committed layer's paint rank, for the pointer.
+    func paintRank(gridId: Int64) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        return committedSurfaceLayers.first { $0.gridId == gridId }?.z
     }
 
     /// Scratch for commitFlush's per-layer merge; reused so the per-flush walk
@@ -2772,10 +2780,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // (frame + content) by the underlying window's sub-cell scroll offset,
         // rather than scroll their content within a fixed frame.
         var clipToContent: Bool = true
-        // The scrolled grid's zindex (0 for windows, > 0 for floats). The
-        // fixed-float guard only discards this grid's scrolled content under
-        // fixed floats with a STRICTLY higher zindex, so a float scrolling
-        // above its own backdrop keeps drawing.
+        // The scrolled grid's paint rank on the surface's layer list (0 =
+        // root). The fixed-float guard only discards this grid's scrolled
+        // content under fixed floats ranked STRICTLY higher, so a float
+        // scrolling above its own backdrop keeps drawing. The main surface
+        // writes it at draw (rankOffsets).
         var zindex: Int32 = 0
         // Rows the anchor this float follows has landed, for the float debt
         // (see applyFloatScrollDebt). Non-nil only for a following float, and
@@ -2952,7 +2961,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // ExternalGridView.draw carries the same gate, where the block was
         // first measured at ~1s per attempt. Unlike it, not exempt before the
         // first present.
-        let gate = (view as? GridInputView)?.visibilityGate() ?? .draw
+        let gate = (view as? GridInputView)?.visibilityGate(unpresentedMayDraw: false) ?? .draw
         if gate == .unsettled, let terminalView = view as? MetalTerminalView {
             ZonvieCore.drawTrace("surface=1 gate=occlusion_unsettled")
             terminalView.didDrawFrame()
@@ -2978,16 +2987,10 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // back. Lock and dictionary work, not GPU work.
             (view as? MetalTerminalView)?.core?.scrollModel.processPendingScrollClears()
             (view as? MetalTerminalView)?.didDrawFrame()
-            // Park the loop, as the external surface does: this path skips the
-            // idle count, and every flush from any surface re-activates it, so
-            // a hidden main woke at vsync until it was shown again. Not while a
-            // synthesized key repeat is armed: its safety tick is the top of
-            // this function. Showing the window repaints it (occlusion and
-            // deminiaturize handlers), which re-activates the loop as needed.
-            if let terminalView = view as? MetalTerminalView,
-               terminalView.core?.keyInput.synthesisHeld(by: terminalView) != true {
-                terminalView.deactivateSurfaceDrawLoop()
-            }
+            // Park the loop: this path skips the idle count, and every flush
+            // from any surface re-activates it, so a hidden main woke at vsync
+            // until it was shown again.
+            (view as? MetalTerminalView)?.parkDrawLoopWhenHidden()
             return
         }
 
@@ -3452,13 +3455,11 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             let safeRowCount = rowMode ? rowLogicalToSlotSnapshot.count : 0
             // Glow must be checked early — it disables partial-redraw
             // optimizations, because additive bloom accumulates brightness when
-            // the back buffer preserves previous glow. It is also disabled for
-            // transient smooth-scroll frames: the bloom pass blurs a flattened
-            // surface and cannot keep the z-order boundary between shifted
-            // content and a fixed float.
+            // the back buffer preserves previous glow.
             let configuredGlowEnabled = (view as? MetalTerminalView)?.core?.isGlowEnabled() ?? false
-            let glowEnabled = configuredGlowEnabled
-                && !(smoothScrolling && !fixedFloatBandsSnapshot.isEmpty)
+            let glowEnabled = SurfaceFixedFloatMask.permitsGlow(
+                configured: configuredGlowEnabled, smoothScrolling: smoothScrolling,
+                bands: fixedFloatBandsSnapshot)
 
             func resolvedRowState(_ logicalRow: Int) -> (vc: Int, vb: MTLBuffer, translationY: Float)? {
                 guard logicalRow < safeRowCount else { return nil }

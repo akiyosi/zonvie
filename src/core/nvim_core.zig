@@ -714,10 +714,6 @@ pub const Core = struct {
     drawable_h_px: u32 = 1,
     cell_w_px: u32 = 1,
     cell_h_px: u32 = 1,
-    /// Cmdline max width the frontend supplied (zonvie_core_set_screen_cols,
-    /// try_update_layout_px); 0 = none yet. Window-derived, so it outlives a
-    /// session. Guarded by grid_mu.
-    frontend_screen_cols: u32 = 0,
 
     /// Extra pixels between lines (Neovim 'linespace').
     linespace_px: i32 = 0,
@@ -942,7 +938,7 @@ pub const Core = struct {
     // Config error notification: true after first notification attempt (prevents retry)
     config_error_sent: bool = false,
 
-    // Blur transparency enabled (config window.blur, both frontends)
+    // Windows: config window.blur; macOS: always true. See zonvie_core_set_blur_enabled.
     blur_enabled: bool = false,
 
     // Inherit CWD from parent process (when true, don't set child cwd to $HOME)
@@ -3835,10 +3831,6 @@ pub const Core = struct {
         // Keep global grid (id=1) cell metrics for future per-grid font metrics.
         self.grid.setGridMetricsPx(1, cw, ch) catch {};
 
-        // The cmdline's max width: the frontend's monitor-derived count once
-        // it has supplied one, else the drawable's columns.
-        self.grid.screen_cols = if (self.frontend_screen_cols != 0) self.frontend_screen_cols else cols;
-
         if (vertex_content_changed) {
             self.grid.markAllDirty();
             // Cursor geometry is submitted independently of row vertices.
@@ -3881,10 +3873,8 @@ pub const Core = struct {
         self.setScreenColsLocked(cols);
     }
 
-    /// 0 withdraws the frontend's value; the next layout update falls back
-    /// to the drawable's columns.
+    /// 0 withdraws the frontend's value; the main grid's cols stand in.
     pub fn setScreenColsLocked(self: *Core, cols: u32) void {
-        self.frontend_screen_cols = cols;
         self.grid.screen_cols = cols;
     }
 
@@ -7787,9 +7777,8 @@ test "a layout update keeps the cmdline max width the frontend supplied" {
     var core = Core.initForTest(std.testing.allocator);
     defer core.deinitForTest();
 
-    // Before the frontend supplies one, the drawable's columns stand in.
     _ = core.updateLayoutPxLocked(160, 8, 2, 2);
-    try std.testing.expectEqual(@as(u32, 80), core.grid.screen_cols);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.screen_cols);
 
     // A linespace-only layout update (same drawable, same cells) used to
     // shrink the monitor-derived width back to the main window's 80.
@@ -7801,7 +7790,7 @@ test "a layout update keeps the cmdline max width the frontend supplied" {
 
     core.setScreenColsLocked(0);
     _ = core.updateLayoutPxLocked(120, 8, 2, 2);
-    try std.testing.expectEqual(@as(u32, 60), core.grid.screen_cols);
+    try std.testing.expectEqual(@as(u32, 0), core.grid.screen_cols);
 }
 
 test "a window close asked by the frontend names that window and tolerates it being gone" {

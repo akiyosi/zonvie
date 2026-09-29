@@ -146,19 +146,18 @@ final class ViewController: NSViewController {
         // the post-layout drawable size, so nvim_ui_attach is sent with the
         // correct dimensions on the first try.
         let nvimPath = cliNvimPath ?? config.neovim.path
-        let sshEnabled = sshModeEnabled || config.neovim.ssh
-        if sshEnabled || devcontainerModeEnabled {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "ssh/devcontainer") }
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "native") }
-            }
+        let remote = sshModeEnabled || config.neovim.ssh || devcontainerModeEnabled
+        dispatchStart(nvimPath: nvimPath, remote: remote, context: remote ? "ssh/devcontainer" : "native")
+    }
+
+    /// Start the core: a remote session on main (its auth dialogs need the
+    /// RunLoop), a local one off it.
+    private func dispatchStart(nvimPath: String, remote: Bool, context: String) {
+        let queue = remote ? DispatchQueue.main : DispatchQueue.global(qos: .userInitiated)
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
+            if rc != 0 { self.handleCoreStartFailure(rc: rc, context: context) }
         }
     }
 
@@ -185,7 +184,7 @@ final class ViewController: NSViewController {
             } else {
                 // The user launched the picker deliberately and declined: quit.
                 ZonvieCore.appLog("[ViewController] --dialog: dialog cancelled, terminating")
-                NSApp.terminate(nil)
+                AppDelegate.terminateApp()
             }
         }
         presentAsSheet(menu)
@@ -238,21 +237,9 @@ final class ViewController: NSViewController {
 
         ZonvieCore.appLog("[ViewController] --dialog: starting core name=\(cfg.name) isSSH=\(cfg.isSSH) isDevcontainer=\(cfg.isDevcontainer)")
 
-        // SSH/devcontainer modes need the main RunLoop for their auth dialogs
-        // (same rationale as viewDidLoad); local connections start off-main.
-        if cfg.isSSH || cfg.isDevcontainer {
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog ssh/devcontainer") }
-            }
-        } else {
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
-                let rc = self.core.start(nvimPath: nvimPath, rows: 1, cols: 1)
-                if rc != 0 { self.handleCoreStartFailure(rc: rc, context: "connect-dialog native") }
-            }
-        }
+        let remote = cfg.isSSH || cfg.isDevcontainer
+        dispatchStart(nvimPath: nvimPath, remote: remote,
+                      context: remote ? "connect-dialog ssh/devcontainer" : "connect-dialog native")
     }
 
     /// Menu-bar label for a session's connection config.
@@ -318,7 +305,7 @@ final class ViewController: NSViewController {
         // core.stop() is unnecessary for all termination paths:
         //   - Normal close: windowShouldClose → requestQuit → Neovim exits
         //     → onExitFromNvim → Darwin.exit() (process terminates).
-        //   - Timeout: showNotRespondingDialog → confirmQuit → Darwin.exit().
+        //   - Timeout: showNotRespondingDialog → Force Quit ends this session.
         //   - No core: windowShouldClose returns true, nothing to stop.
         //
         // ASSUMPTION: The current UI uses a single main window with one

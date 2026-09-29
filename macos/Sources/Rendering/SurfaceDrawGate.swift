@@ -705,21 +705,21 @@ struct SurfaceBlinkState {
 /// (pressEditorButton/takeButtonRelease).
 struct SurfacePressPin<Pin> {
     private(set) var pinned: Pin?
-    private var leftOwns = false
+    private var owner = ""
 
-    /// `pin` runs only when this press takes the claim.
+    /// `pin` runs only when this press takes the claim; a left press keeps it.
     mutating func press(button: String, pin: () -> Pin?) {
-        guard !leftOwns else { return }
-        leftOwns = button == "left"
+        guard owner != "left" else { return }
+        owner = button
         pinned = pin()
     }
 
-    /// The pin this release is addressed to; ends the claim unless a left
-    /// drag continues past it.
+    /// The pin this release is addressed to; only the button that took the
+    /// claim ends it, so an overlapped press still gets its own release.
     mutating func release(button: String) -> Pin? {
         let released = pinned
-        if !leftOwns || button == "left" {
-            leftOwns = false
+        if button == owner {
+            owner = ""
             pinned = nil
         }
         return released

@@ -1287,44 +1287,6 @@ pub fn rotateRegion(comptime T: type, items: []T, row_start: usize, row_end: usi
     return .{ .start = row_start, .end = row_start + shift };
 }
 
-/// Copy `src` into `dst`; when it does not fit, cut at a UTF-8 boundary and
-/// end with '…' so the reader sees text is missing. Returns the bytes written.
-pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
-    if (src.len <= dst.len) {
-        @memcpy(dst[0..src.len], src);
-        return src.len;
-    }
-    const marker = "\u{2026}";
-    if (dst.len < marker.len) return 0;
-    var cut = dst.len - marker.len;
-    while (cut > 0 and (src[cut] & 0xC0) == 0x80) cut -= 1;
-    @memcpy(dst[0..cut], src[0..cut]);
-    @memcpy(dst[cut..][0..marker.len], marker);
-    return cut + marker.len;
-}
-
-/// Lines a mini window shows; noice.nvim's views.mini max_height, and macOS's
-/// clampMiniContent.
-pub const mini_max_lines = 10;
-
-/// Copy mini content into `dst`: a trailing newline dropped, and past
-/// `mini_max_lines` lines the first nine plus a "…(N more lines)" summary
-/// line. Content past `dst` is cut by copyUtf8Truncated. Returns the bytes
-/// written.
-pub fn clampMiniContent(dst: []u8, content: []const u8) usize {
-    const src = if (content.len > 0 and content[content.len - 1] == '\n') content[0 .. content.len - 1] else content;
-    const lines = std.mem.count(u8, src, "\n") + 1;
-    if (lines <= mini_max_lines) return copyUtf8Truncated(dst, src);
-    const kept = mini_max_lines - 1;
-    var head_end: usize = 0;
-    for (0..kept) |n| {
-        const nl = std.mem.indexOfScalarPos(u8, src, head_end, '\n').?;
-        head_end = if (n + 1 == kept) nl else nl + 1;
-    }
-    var summary_buf: [48]u8 = undefined;
-    const summary = std.fmt.bufPrint(&summary_buf, "\n\u{2026}({d} more lines)", .{lines - kept}) catch unreachable;
-    if (dst.len < summary.len) return copyUtf8Truncated(dst, src[0..head_end]);
-    const head_len = copyUtf8Truncated(dst[0 .. dst.len - summary.len], src[0..head_end]);
-    @memcpy(dst[head_len..][0..summary.len], summary);
-    return head_len + summary.len;
-}
+pub const copyUtf8Truncated = core.frontend_rules.copyUtf8Truncated;
+pub const mini_max_lines = core.frontend_rules.mini_max_lines;
+pub const clampMiniContent = core.frontend_rules.clampMiniContent;

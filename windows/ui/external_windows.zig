@@ -129,11 +129,16 @@ pub fn decoratedContentOriginPx(app: *App, kind: ExternalSurfaceKind) DecoratedC
     };
 }
 
+/// The cmdline's margin from the work-area edge, DPI-scaled like its chrome.
+pub fn cmdlineScreenMarginPx(app: *const App) c_int {
+    return app.scalePx(@as(c_int, app_mod.CMDLINE_SCREEN_MARGIN));
+}
+
 /// The cmdline may not grow past the work area of the monitor it is on
-/// (`work`). Other surfaces are returned unchanged.
-pub fn clampCmdlineWidthToWorkArea(grid_id: i64, client_w: c_int, work: c.RECT) c_int {
+/// (`work`) less `margin_px`. Other surfaces are returned unchanged.
+pub fn clampCmdlineWidthToWorkArea(grid_id: i64, client_w: c_int, work: c.RECT, margin_px: c_int) c_int {
     if (classifyExternalSurface(grid_id) != .cmdline) return client_w;
-    return @min(client_w, work.right - work.left - @as(c_int, @intCast(app_mod.CMDLINE_SCREEN_MARGIN)));
+    return @min(client_w, work.right - work.left - margin_px);
 }
 
 fn monitorWorkAreaAtPoint(pt: c.POINT) c.RECT {
@@ -433,8 +438,9 @@ fn appendDecoratedContent(
     return start + verts.len;
 }
 
-/// Returns false when the surface has no content dimensions and nothing was
-/// drawn: the caller must not present the stale back buffer.
+/// Returns false when the surface, its window or the cell metrics have no
+/// size and nothing was drawn: the caller must not present the stale back
+/// buffer.
 fn drawDecoratedExternalSurface(
     kind: ExternalSurfaceKind,
     g: *d3d11.Renderer,
@@ -466,10 +472,7 @@ fn drawDecoratedExternalSurface(
             app.mu.unlock(core.clock.io());
 
             if (content_rows == 0 or content_cols == 0) return false;
-            if (!(window_w > 0 and window_h > 0 and cell_w > 0 and cell_h > 0)) {
-                try g.drawEx(content, &[_]app_mod.Vertex{}, null, .{});
-                return true;
-            }
+            if (!(window_w > 0 and window_h > 0 and cell_w > 0 and cell_h > 0)) return false;
 
             const content_origin = decoratedContentOriginPx(app, kind);
             const ndc = decoratedContentNdcTransform(content_origin.x, content_origin.y, window_w, window_h);
@@ -501,10 +504,7 @@ fn drawDecoratedExternalSurface(
             break :blk appendCopyIconVerts(app, kind, grid_id, out, idx, window_w, window_h, icon_color, copy_hover, copy_copied);
         },
         .popupmenu => blk: {
-            if (!(window_w > 0 and window_h > 0)) {
-                try g.drawEx(content, &[_]app_mod.Vertex{}, null, .{});
-                return true;
-            }
+            if (!(window_w > 0 and window_h > 0)) return false;
 
             scratch.clearRetainingCapacity();
             try scratch.resize(app.alloc, vert_count + 6 + 24);
@@ -731,10 +731,6 @@ fn drawNormalExternalSurfaceRowMode(
     );
 
     const has_cursor = tbs_cursor.verts.items.len > 0;
-    // Publish it for the blink timer, which must not invalidate a surface whose
-    // pixels a toggle cannot change. Recorded before the early-out below so a
-    // surface that just lost its cursor stops being invalidated immediately.
-    ext_win.has_committed_cursor = has_cursor;
     const has_scrollbar_work = scrollbar_alpha > 0.001 or
         restored_scrollbar_rect != null or
         g.hasScrollbarUnderlay();
@@ -1153,18 +1149,16 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
         if (!ext_win.surf.tbs.prepareRowSyncTracking(app.alloc, row_count)) return false;
         ext_win.surf.tbs.requireFullRowSync();
     }
-    if (pv.surface.row_mode) {
-        if (row_count != 0 and !cs.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
-        for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            const mapping = &cs.row_map.items[row_idx];
-            if (mapping.slot == app_mod.SLOT_NONE) {
-                const new_idx = ext_win.surf.tbs.pool.acquireSlot(app.alloc) orelse return false;
-                mapping.slot = new_idx;
-                ext_win.surf.tbs.pool.retain(new_idx);
-            }
-            const slot = ext_win.surf.tbs.pool.slotPtr(mapping.slot);
-            slot.verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
+    if (row_count != 0 and !cs.ensureRowStorage(app.alloc, @intCast(row_count - 1))) return false;
+    for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
+        const mapping = &cs.row_map.items[row_idx];
+        if (mapping.slot == app_mod.SLOT_NONE) {
+            const new_idx = ext_win.surf.tbs.pool.acquireSlot(app.alloc) orelse return false;
+            mapping.slot = new_idx;
+            ext_win.surf.tbs.pool.retain(new_idx);
         }
+        const slot = ext_win.surf.tbs.pool.slotPtr(mapping.slot);
+        slot.verts.ensureTotalCapacity(app.alloc, src_row.verts.items.len) catch return false;
     }
     if (!ext_win.surf.tbs.reserveMainCursorCapacity(app.alloc, pv.surface.cursor_verts.items.len)) return false;
 
@@ -1177,29 +1171,24 @@ fn applyPendingExternalVerticesLocked(app: *App, grid_id: i64, ext_win: *app_mod
     // invalidate, and the paint that follows clears needs_redraw.
     if (ext_win.surf.tbs.is_in_flush) ext_win.surf.flush_needs_invalidate = true;
 
-    cs.row_mode = pv.surface.row_mode;
+    cs.row_mode = true;
     cs.rows = pv.surface.rows;
     cs.cols = pv.surface.cols;
     cs.metrics_gen = pv.metrics_gen;
-    if (pv.surface.row_mode) {
-        for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
-            const slot = ext_win.surf.tbs.pool.slotPtr(cs.row_map.items[row_idx].slot);
-            slot.verts.clearRetainingCapacity();
-            slot.verts.appendSliceAssumeCapacity(src_row.verts.items);
-            slot.origin_row = src_row.origin_row;
-            slot.ver = src_row.gen;
+    for (pv.surface.row_verts.items, 0..) |src_row, row_idx| {
+        const slot = ext_win.surf.tbs.pool.slotPtr(cs.row_map.items[row_idx].slot);
+        slot.verts.clearRetainingCapacity();
+        slot.verts.appendSliceAssumeCapacity(src_row.verts.items);
+        slot.origin_row = src_row.origin_row;
+        slot.ver = src_row.gen;
+    }
+    var extra = row_count;
+    while (extra < cs.row_map.items.len) : (extra += 1) {
+        const mapping = &cs.row_map.items[extra];
+        if (mapping.slot != app_mod.SLOT_NONE) {
+            ext_win.surf.tbs.pool.release(app.alloc, mapping.slot);
+            mapping.slot = app_mod.SLOT_NONE;
         }
-        var extra = row_count;
-        while (extra < cs.row_map.items.len) : (extra += 1) {
-            const mapping = &cs.row_map.items[extra];
-            if (mapping.slot != app_mod.SLOT_NONE) {
-                ext_win.surf.tbs.pool.release(app.alloc, mapping.slot);
-                mapping.slot = app_mod.SLOT_NONE;
-            }
-        }
-    } else {
-        cs.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
-        cs.row_map.clearRetainingCapacity();
     }
     if (!ext_win.surf.tbs.storeMainCursor(
         app.alloc,
@@ -1310,7 +1299,7 @@ pub fn updateExternalWindowGeometryOnUIThread(app: *App, req: app_mod.PendingExt
     var client_w: c_int = @as(c_int, @intCast(req.cols * cell_w)) + insets.w;
     const client_h: c_int = @as(c_int, @intCast(req.rows * cell_h)) + insets.h;
     // The monitor the cmdline is on, which keeps it there as it grows (below).
-    if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, app_mod.monitorWorkArea(current_hwnd orelse app.hwnd));
+    if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, app_mod.monitorWorkArea(current_hwnd orelse app.hwnd), cmdlineScreenMarginPx(app));
 
     app.mu.lockUncancelable(core.clock.io());
     const target_hwnd = if (app.external_windows.get(req.grid_id)) |ext_win| blk: {
@@ -1480,7 +1469,7 @@ pub fn createExternalWindowOnUIThread(app: *App, req: app_mod.PendingExternalWin
     const insets = externalSurfaceInsetsPx(app, req.grid_id, app.dpi_scale);
     var client_w: c_int = content_w + insets.w;
     const client_h: c_int = content_h + insets.h;
-    if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, newCmdlineWorkArea(app));
+    if (is_cmdline) client_w = clampCmdlineWidthToWorkArea(req.grid_id, client_w, newCmdlineWorkArea(app), cmdlineScreenMarginPx(app));
 
     // Window style: borderless popup for cmdline, popupmenu, and msg_history, normal for others
     // Note: WS_VISIBLE is NOT included - we use ShowWindow(SW_SHOWNA) to show without activating
@@ -2535,7 +2524,7 @@ pub export fn ExternalWndProc(
                 const x = pos.x;
                 const y = pos.y;
 
-                const rel = input.takeButtonRelease(app, msg);
+                const rel = input.takeButtonRelease(app, msg, wParam);
 
                 const hit = findExternalWindowByHwnd(app, hwnd);
                 const grid_id: ?i64 = if (hit) |h| h.grid_id else null;
@@ -2849,8 +2838,7 @@ pub export fn ExternalWndProc(
 /// float-origin window used to clear with NormalFloat, which painted its
 /// Normal cells (`winhighlight=NormalFloat:Normal`) in the wrong colour; its
 /// NormalFloat cells arrive as explicit quads anyway. Same rule as macOS.
-fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind, ext_win: *const app_mod.ExternalWindow) void {
-    _ = ext_win;
+fn setExternalWindowClearColor(g: *d3d11.Renderer, app: *App, kind: ExternalSurfaceKind) void {
     app.mu.lockUncancelable(core.clock.io());
     const cached_bg: u32 = switch (kind) {
         .normal => 0xFFFFFFFF,
@@ -3242,9 +3230,8 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
     };
     const tbs_committed = &ext_win.surf.tbs.sets[tbs_snapshot.committed_index];
     const tbs_cursor = &ext_win.surf.tbs.main_cursor_sets[tbs_snapshot.cursor_index];
-    // For the blink timer, on every kind: the normal row path re-records it
-    // below, but a decorated surface kept the initial `true` and repainted
-    // on every blink tick with no cursor to toggle.
+    // For the blink timer, on every kind, before any early-out: a toggle
+    // must not invalidate a surface whose pixels it cannot change.
     ext_win.has_committed_cursor = tbs_cursor.verts.items.len > 0;
     // Shared font/cell/linespace metrics are protected by app.mu. Pair the
     // snapshot with the generation stored alongside the committed row
@@ -3408,15 +3395,14 @@ pub fn paintExternalWindow(hwnd: c.HWND, app: *App) void {
         }
 
         // Set clear color from cached highlight group bg colors (no grid_mu acquisition).
-        // NormalFloat for float-origin externals, MsgArea for cmdline/messages, Pmenu for popupmenu.
-        setExternalWindowClearColor(g, app, surface_kind, ext_win);
+        setExternalWindowClearColor(g, app, surface_kind);
 
         if (surface_kind != .normal) {
             // Decorated surfaces never consume row VBs. Release buffers left
             // by an earlier normal row-mode incarnation of this window.
             ext_win.surf.dropRowVBs(app);
 
-            const drawn = drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.flat_draw_scratch, glow_enabled, glow_intensity) catch |e| {
+            const drawn = drawDecoratedExternalSurface(surface_kind, g, app, grid_id, verts, vert_count, cmdline_firstc, &ext_win.decorated_scratch, glow_enabled, glow_intensity) catch |e| {
                 if (applog.isEnabled()) applog.appLog("[win] paintExternalWindow decorated draw failed: {any}\n", .{e});
                 requeueExternalFullPaint(app, grid_id, hwnd);
                 return;

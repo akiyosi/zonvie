@@ -878,10 +878,11 @@ pub const ButtonRelease = struct {
     /// The grid the press chose; 0 when the press never reached the editor
     /// (chrome, scrollbar, copy button), which then gets no release either.
     press_grid: i64,
-    /// Another button let go mid left-drag: the drag, its capture and its
-    /// release still belong to the left button. Also true for a non-left
-    /// release with no editor button held: any capture is a scrollbar or tab
-    /// drag's, and releasing it would cancel that drag.
+    /// A button other than the one holding the claim let go (mid left-drag,
+    /// or right under a middle press): the claim, its capture and its own
+    /// release still belong to that button. Also true for a non-left release
+    /// with no editor button held: any capture is a scrollbar or tab drag's,
+    /// and releasing it would cancel that drag.
     left_drag_continues: bool,
 };
 
@@ -894,10 +895,11 @@ pub fn uiOwnsCapture(mouse_button_held: u8, msg: c.UINT, window_has_capture: boo
 /// Read and clear the press state before anything can return early: a
 /// branch that returned first left a button held, and every later
 /// WM_MOUSEMOVE then dragged with no button down.
-pub fn takeButtonRelease(app: *App, msg: c.UINT) ButtonRelease {
+pub fn takeButtonRelease(app: *App, msg: c.UINT, wParam: c.WPARAM) ButtonRelease {
+    const held = app.mouse_button_held;
     const rel: ButtonRelease = .{
         .press_grid = app.mouse_press_grid_id,
-        .left_drag_continues = msg != c.WM_LBUTTONUP and (app.mouse_button_held == 1 or app.mouse_button_held == 0),
+        .left_drag_continues = if (held == 0) msg != c.WM_LBUTTONUP else mouseButton(msg, wParam).code != held,
     };
     if (!rel.left_drag_continues) {
         app.mouse_button_held = 0;
@@ -1128,10 +1130,10 @@ pub fn handleMouseWheel(
     // scrolls proportionally faster.
     app_mod.zonvie_core_send_mouse_scroll(corep, target_grid_id, target_row, target_col, direction, @as([*:0]const u8, @ptrCast(&mod_buf)));
 
+    // A throttled msg float scroll is a core deadline (nextMsgTimeoutNs) with
+    // no flush to re-arm the message timer after it.
     if (target_grid_id == app_mod.MESSAGE_GRID_ID) {
-        if (app.hwnd) |main_hwnd| {
-            _ = c.SetTimer(main_hwnd, app_mod.TIMER_MSG_SCROLL_RETRY, app_mod.MSG_SCROLL_RETRY_INTERVAL_MS, null);
-        }
+        callbacks.postCoalesced(app, &app.msg_throttle_arm_posted, app_mod.WM_APP_MSG_THROTTLE_ARM);
     }
 }
 
@@ -1192,7 +1194,7 @@ pub fn utf16PrefixUtf8Len(units: []const u16, unit_count: usize) usize {
 /// The cursor cell as client points of `coord_hwnd`: the window that shows
 /// the cursor's grid. On an external host that is its client area, the grid's
 /// layer origin plus the decorated content origin; in the main window the
-/// grid's start row/col at the surface origin (below a titlebar tab bar,
+/// grid's layer origin plus the surface origin (below a titlebar tab bar,
 /// right of a left sidebar). `pt_below` is one cell down, for the candidate
 /// list. The candidate window and the preedit overlay both place against
 /// this. Null when no cursor position is known yet (a cold cache under lock
@@ -1205,10 +1207,13 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
     const grid_id = getCursorPositionNonBlocking(app, corep, &row, &col, null);
     if (row < 0 or col < 0) return null;
 
+    var main_layer: [2]i32 = .{ 0, 0 };
     const ext_surface = blk: {
         app.mu.lockUncancelable(core.clock.io());
         defer app.mu.unlock(core.clock.io());
-        break :blk imeExternalSurfaceLocked(app, grid_id);
+        const es = imeExternalSurfaceLocked(app, grid_id);
+        if (es == null) main_layer = render_helpers.layerOriginPx(app_mod.SurfaceLayer, app.surf.tbs.committed_layers.slice(), grid_id, 1);
+        break :blk es;
     };
     const decorated = imeDecoratedOrigin(app, ext_surface);
     var coord_hwnd: c.HWND = main_hwnd;
@@ -1219,16 +1224,9 @@ fn imeCursorClientPoint(app: *App, corep: *app_mod.zonvie_core, main_hwnd: c.HWN
         origin_x += es.x_px;
         origin_y += es.y_px;
     } else {
-        for (app.getVisibleGridsCached(corep)) |grid| {
-            if (grid.grid_id == grid_id) {
-                row += grid.start_row;
-                col += grid.start_col;
-                break;
-            }
-        }
         const origin = surfaceOriginPx(app, true);
-        origin_x += origin.x;
-        origin_y += origin.y;
+        origin_x += origin.x + main_layer[0];
+        origin_y += origin.y + main_layer[1];
     }
     const x = origin_x + col * @as(c.LONG, @intCast(cell_w));
     const y = origin_y + row * @as(c.LONG, @intCast(row_h_px));

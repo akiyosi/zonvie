@@ -294,8 +294,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         // Intercept window close to check for unsaved buffers
+        // A core that never started (the connection picker) has no nvim to
+        // ask; asking timed out into "Neovim Not Responding".
         if let vc = sender.contentViewController as? ViewController,
-           let core = vc.core {
+           let core = vc.core, core.didStart {
             ZonvieCore.appLog("[windowShouldClose] requesting quit via core")
             core.requestQuit()
             return false  // Don't close yet - wait for quit confirmation
@@ -364,6 +366,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true
+    }
+
+    /// Set by terminateApp once the quit is decided.
+    private var quitDecided = false
+
+    /// The app's own terminate, after the quit is decided: skips the
+    /// per-session quit request below.
+    static func terminateApp() {
+        (NSApp.delegate as? AppDelegate)?.quitDecided = true
+        NSApp.terminate(nil)
+    }
+
+    /// Cmd+Q asks every session the way closing its window does; each window
+    /// closes as its nvim exits and the last one stops the run loop.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitDecided { return .terminateNow }
+        // A session still at its picker has no nvim to answer the request:
+        // its window just closes.
+        let sessions = SessionManager.shared.sessions
+        let cores = sessions.compactMap { $0.viewController?.core }.filter { $0.didStart }
+        if cores.isEmpty { return .terminateNow }
+        for s in sessions where s.viewController?.core?.didStart != true { s.window?.close() }
+        ZonvieCore.appLog("[applicationShouldTerminate] requesting quit for \(cores.count) session(s)")
+        for core in cores { core.requestQuit() }
+        return .terminateCancel
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {

@@ -42,8 +42,8 @@ let connectDialogEnabled = zonvieArgs.contains("--dialog")
 // After "--", all remaining arguments are passed to nvim
 var cliNvimPath: String? = nil
 var nvimExtraArgs: [String] = []
-/// argv indices of the nvim file arguments, for the fork parent below.
-var nvimFileArgIndices = Set<Int>()
+/// argv index -> the argument as forwarded to nvim, for the fork parent below.
+var nvimForwardedArgs: [Int: String] = [:]
 /// A file argument for nvim (zonvie_core_nvim_arg_is_file), absolute against
 /// the shell's cwd; anything else and absolute paths pass through. The fork
 /// parent chdirs to $HOME before spawning the child, and nvim then inherits
@@ -74,7 +74,7 @@ do {
 
         if passAllToNvim {
             nvimExtraArgs.append(absoluteFileArg(arg, prev: nil, afterDashDash: true))
-            nvimFileArgIndices.insert(i)
+            nvimForwardedArgs[i] = nvimExtraArgs[nvimExtraArgs.count - 1]
             i += 1
             continue
         }
@@ -126,7 +126,7 @@ do {
         } else {
             // Not a zonvie argument - pass to nvim
             nvimExtraArgs.append(absoluteFileArg(arg, prev: args[i - 1]))
-            nvimFileArgIndices.insert(i)
+            nvimForwardedArgs[i] = nvimExtraArgs[nvimExtraArgs.count - 1]
             i += 1
         }
     }
@@ -579,8 +579,7 @@ if !noforkMode && !launchedFromFinder {
             if args[i] != "--nofork" {  // Don't duplicate --nofork
                 // File arguments absolute: the child parses them after this
                 // parent's chdir($HOME).
-                let afterDashDash = args.firstIndex(of: "--").map { i > $0 } ?? false
-                newArgs.append(nvimFileArgIndices.contains(i) ? absoluteFileArg(args[i], prev: args[i - 1], afterDashDash: afterDashDash) : args[i])
+                newArgs.append(nvimForwardedArgs[i] ?? args[i])
             }
         }
 
