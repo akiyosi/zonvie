@@ -3386,6 +3386,49 @@ func floatDebtRowsUp(
     (anchorRowsUp - baseline.anchorRowsUp) - (placementRowsUp - baseline.placementRowsUp)
 }
 
+/// One surface's float-debt ledger: each float's zero and the last debt
+/// logged. Only the draw seeds (`seeding`): the frame that first shows a float
+/// following defines its zero, and a reader arriving before it gets 0. The
+/// caller holds the lock that guards it. `log`, when logging is on, gets one
+/// `[float_debt]` line per change of a grid's debt.
+struct SurfaceFloatDebtLedger {
+    private var baselines: [Int64: FloatDebtBaseline] = [:]
+    private var lastLogged: [Int64: Int] = [:]
+
+    mutating func rows(
+        gridId: Int64,
+        anchorGridId: Int64,
+        anchorRowsUp: Int,
+        placementRowsUp: Int,
+        seeding: Bool,
+        surfaceId: Int64,
+        log: ((String) -> Void)?
+    ) -> Int {
+        let resolved = floatDebtBaselineFollowing(
+            anchorGridId: anchorGridId,
+            stored: baselines[gridId],
+            anchorRowsUp: anchorRowsUp,
+            placementRowsUp: placementRowsUp
+        )
+        if resolved.seeded {
+            if seeding { baselines[gridId] = resolved.baseline }
+            return 0
+        }
+        let base = resolved.baseline
+        let rows = floatDebtRowsUp(anchorRowsUp: anchorRowsUp, placementRowsUp: placementRowsUp, baseline: base)
+        if seeding, let log, lastLogged[gridId] != rows {
+            lastLogged[gridId] = rows
+            log("[float_debt] surface=\(surfaceId) gridId=\(gridId) rows=\(rows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=(\(base.anchorRowsUp),\(base.placementRowsUp))")
+        }
+        return rows
+    }
+
+    mutating func prune(to staged: [SurfaceLayer]) {
+        pruneSurfaceLayerLedger(&baselines, to: staged)
+        pruneSurfaceLayerLedger(&lastLogged, to: staged)
+    }
+}
+
 /// Clip a layer rect to the render target. Returns nil when nothing of it is
 /// visible, so the caller can skip the draw entirely.
 func clampScissor(
@@ -3643,20 +3686,30 @@ final class SurfaceFixedFloatMask {
     static let maxRects = 16
 
     /// Whether `layer` is a fixed float scrolled content must not bleed over.
-    /// An external surface hosts nothing but floats, so every hosted layer
-    /// (paint rank > 0) counts; the main surface hosts splits too and keeps
-    /// only the layers the core flagged as floats.
-    static func masks(_ layer: SurfaceLayer, rootGridId: Int64, floatFlagOnly: Bool) -> Bool {
-        (floatFlagOnly ? layer.isFloat : layer.z > 0) && layer.gridId != rootGridId && !layer.followsScroll
+    static func masks(_ layer: SurfaceLayer, rootGridId: Int64) -> Bool {
+        layer.isFloat && layer.gridId != rootGridId && !layer.followsScroll
     }
 
     /// Whether a surface's committed layers hold more fixed floats than a
     /// mask can represent: the rects `update` would be handed while a scroll
     /// eases are exactly these. Answerable before any offset is applied, so a
     /// surface can drop its transform in the same snapshot that latches it.
-    static func overflows(layers: [SurfaceLayer], rootGridId: Int64, floatFlagOnly: Bool = false) -> Bool {
+    /// Put `offsets` on the mask's scale: each grid's paint rank among
+    /// `layers`, 0 for a grid that is not one (the root). The shader drops a
+    /// scrolled fragment under an interval with a strictly higher z, so a
+    /// float left at its Neovim zindex below its own rank masks itself.
+    /// Writes only a changed entry, so a ranked array is not copied again.
+    static func rankOffsets(_ offsets: inout [GridSurfaceRenderer.ScrollOffset], layers: [SurfaceLayer]) {
+        for i in offsets.indices {
+            let gridId = Int64(offsets[i].grid_id)
+            let rank = Int32(clamping: layers.first { $0.gridId == gridId }?.z ?? 0)
+            if offsets[i].zindex != rank { offsets[i].zindex = rank }
+        }
+    }
+
+    static func overflows(layers: [SurfaceLayer], rootGridId: Int64) -> Bool {
         var count = 0
-        for layer in layers where masks(layer, rootGridId: rootGridId, floatFlagOnly: floatFlagOnly) {
+        for layer in layers where masks(layer, rootGridId: rootGridId) {
             count += 1
             if count > maxRects { return true }
         }
@@ -3667,12 +3720,12 @@ final class SurfaceFixedFloatMask {
     /// clear it for one that does not. `scratch` is the caller's persistent
     /// rect buffer. Draw thread only.
     func rebuild(
-        layers: [SurfaceLayerFrame], rootGridId: Int64, floatFlagOnly: Bool, smoothScrolling: Bool,
+        layers: [SurfaceLayerFrame], rootGridId: Int64, smoothScrolling: Bool,
         cellW: Float, cellH: Float, scratch: inout [GridSurfaceRenderer.FixedFloatRect]
     ) {
         scratch.removeAll(keepingCapacity: true)
         if smoothScrolling {
-            for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId, floatFlagOnly: floatFlagOnly) {
+            for entry in layers where Self.masks(entry.layer, rootGridId: rootGridId) {
                 let layer = entry.layer
                 scratch.append(GridSurfaceRenderer.FixedFloatRect(
                     x0: layer.originPx.x,

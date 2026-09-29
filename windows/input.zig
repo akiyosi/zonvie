@@ -1020,9 +1020,6 @@ pub fn sendMouseButton(
     const cell = clientPxToCell(app, false, x, y, cell_w, row_h, drag);
     const mod_buf = buildMouseModifiers(wParam);
 
-    // Where the mini window anchors itself next.
-    app.last_mouse_grid_id = grid_id;
-
     core.zonvie_core_send_mouse_input(
         app.corep,
         button,
@@ -1082,8 +1079,7 @@ pub fn handleMouseWheel(
     // Resolve the scroll target on the main window: hit-test visible grids so
     // a wheel event over a composited grid (float/split) targets that grid
     // with grid-local coordinates, matching the URL-hover hit-test and macOS
-    // resolveScrollTarget. An external window resolves against its own layer
-    // list instead, below. Uses the non-blocking cached query, so no lock
+    // resolveScrollTarget. Uses the non-blocking cached query, so no lock
     // contention is added to the input path.
     var target_grid_id: i64 = grid_id;
     var target_row: i32 = row;

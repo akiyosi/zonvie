@@ -744,17 +744,6 @@ pub fn shouldRetireSlotBacking(capacity: usize, layout_peak_verts: usize) bool {
     return capacity > layout_peak_verts * 2;
 }
 
-/// Sort rectangles in place, then merge overlapping or edge-adjacent entries.
-/// The merge may enlarge damage to a bounding rectangle, but never drops
-/// damaged pixels. This keeps the paint path allocation-free and O(n log n).
-/// What a paint driver has to decide before it draws: whether every row must
-/// be redrawn, and whether the previous frame in `back_tex` may be kept.
-///
-/// Both drivers derived these separately and reached different answers. The
-/// terms they already shared — a cursor that changed grid, glow, and a
-/// translucent window — are the whole of `force_full_rows` here; everything
-/// surface-specific is folded into `force_full` by the caller, which is where
-/// the main driver's seed state and an external window's `paint_full` live.
 /// Where a window's SURFACE begins inside its client area -- grid 1's cell
 /// (0,0). Only the main window draws chrome inside its own client rect, so the
 /// offset is zero for every other window, which is why an external window can
@@ -1312,4 +1301,30 @@ pub fn copyUtf8Truncated(dst: []u8, src: []const u8) usize {
     @memcpy(dst[0..cut], src[0..cut]);
     @memcpy(dst[cut..][0..marker.len], marker);
     return cut + marker.len;
+}
+
+/// Lines a mini window shows; noice.nvim's views.mini max_height, and macOS's
+/// clampMiniContent.
+pub const mini_max_lines = 10;
+
+/// Copy mini content into `dst`: a trailing newline dropped, and past
+/// `mini_max_lines` lines the first nine plus a "…(N more lines)" summary
+/// line. Content past `dst` is cut by copyUtf8Truncated. Returns the bytes
+/// written.
+pub fn clampMiniContent(dst: []u8, content: []const u8) usize {
+    const src = if (content.len > 0 and content[content.len - 1] == '\n') content[0 .. content.len - 1] else content;
+    const lines = std.mem.count(u8, src, "\n") + 1;
+    if (lines <= mini_max_lines) return copyUtf8Truncated(dst, src);
+    const kept = mini_max_lines - 1;
+    var head_end: usize = 0;
+    for (0..kept) |n| {
+        const nl = std.mem.indexOfScalarPos(u8, src, head_end, '\n').?;
+        head_end = if (n + 1 == kept) nl else nl + 1;
+    }
+    var summary_buf: [48]u8 = undefined;
+    const summary = std.fmt.bufPrint(&summary_buf, "\n\u{2026}({d} more lines)", .{lines - kept}) catch unreachable;
+    if (dst.len < summary.len) return copyUtf8Truncated(dst, src[0..head_end]);
+    const head_len = copyUtf8Truncated(dst[0 .. dst.len - summary.len], src[0..head_end]);
+    @memcpy(dst[head_len..][0..summary.len], summary);
+    return head_len + summary.len;
 }

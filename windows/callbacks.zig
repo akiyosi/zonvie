@@ -787,20 +787,13 @@ pub fn onVerticesRow(
                         }
                     }
                 }
-            } else {
-                // TBS: write flat verts to write set.
+            } else if (row_count == 0) {
+                // A zero-cell layout (zonvie_core.h): no row content survives.
                 if (ext_win.surf.tbs.is_in_flush) {
                     const ws = ext_win.surf.tbs.writeSet();
-                    ws.row_mode = false;
+                    ws.row_mode = true;
                     ext_win.surf.tbs.requireFullRowSync();
-                    ws.rows = total_rows;
-                    ws.cols = total_cols;
-                    if (row_start == 0) {
-                        ws.flat_verts.clearRetainingCapacity();
-                    }
-                    if (verts_ptr != null and vert_count != 0) {
-                        ws.flat_verts.appendSlice(app.alloc, verts_ptr.?[0..vert_count]) catch failFlush(app);
-                    }
+                    ws.releaseAllSlots(app.alloc, &ext_win.surf.tbs.pool);
                     ext_win.surf.tbs.flush_paint_full = true;
                 }
             }
@@ -893,9 +886,11 @@ pub fn onVerticesRow(
                 // AFTER the content update succeeds — the keep-old failure
                 // paths below must not pair the old capture with new dims.
                 const pv = &app.pending_external_verts.items[idx];
-                if (row_count == 1) {
-                    pv.surface.row_mode = true;
-                    pv.surface.verts.clearRetainingCapacity();
+                pv.surface.row_mode = true;
+                if (row_count == 0) {
+                    // A zero-cell layout: no row content survives.
+                    _ = pv.surface.truncateRows(app.alloc, 0);
+                } else if (row_count == 1) {
                     _ = pv.surface.truncateRows(app.alloc, total_rows);
                     if (!storeSurfaceRowVerts(app.alloc, &pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
                         // OOM mid-frame: rows updated earlier this flush mix
@@ -910,31 +905,6 @@ pub fn onVerticesRow(
                         failFlush(app);
                         return;
                     }
-                } else {
-                    pv.surface.row_mode = false;
-                    if (verts_ptr != null and vert_count != 0) {
-                        // Reserve BEFORE the row_start==0 clear so an OOM on
-                        // a frame-start update keeps the old capture intact.
-                        const base_len: usize = if (row_start == 0) 0 else pv.surface.verts.items.len;
-                        pv.surface.verts.ensureTotalCapacity(app.alloc, base_len + vert_count) catch {
-                            if (row_start == 0) {
-                                // Nothing overwritten yet: keep the old frame.
-                                failFlush(app);
-                                return;
-                            }
-                            // Mid-frame append failed: the entry holds a
-                            // truncated new frame — discard it (see the
-                            // row-mode branch above for the rationale).
-                            var dropped = app.pending_external_verts.swapRemove(idx);
-                            dropped.deinit(app.alloc);
-                            failFlush(app);
-                            return;
-                        };
-                        if (row_start == 0) pv.surface.verts.clearRetainingCapacity();
-                        pv.surface.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
-                    } else if (row_start == 0) {
-                        pv.surface.verts.clearRetainingCapacity();
-                    }
                 }
                 pv.surface.rows = total_rows;
                 pv.surface.cols = total_cols;
@@ -948,8 +918,8 @@ pub fn onVerticesRow(
                     .metrics_gen = app.shared_metrics_gen,
                     .surface = .{ .rows = total_rows, .cols = total_cols },
                 };
+                new_pv.surface.row_mode = true;
                 if (row_count == 1) {
-                    new_pv.surface.row_mode = true;
                     if (!storeSurfaceRowVerts(app.alloc, &new_pv.surface.row_verts, row_start, verts_ptr, vert_count)) {
                         // Free the partially built entry (row storage may
                         // have been resized before the failure).
@@ -957,13 +927,6 @@ pub fn onVerticesRow(
                         failFlush(app);
                         return;
                     }
-                } else if (verts_ptr != null and vert_count != 0) {
-                    new_pv.surface.verts.ensureTotalCapacity(app.alloc, vert_count) catch {
-                        new_pv.deinit(app.alloc);
-                        failFlush(app);
-                        return;
-                    };
-                    new_pv.surface.verts.appendSliceAssumeCapacity(verts_ptr.?[0..vert_count]);
                 }
                 app.pending_external_verts.append(app.alloc, new_pv) catch {
                     // The freshly built pending entry is dropped — release

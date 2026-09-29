@@ -1985,20 +1985,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// protected by `lock` and consumed in `applyFloatScrollDebt`.
     private var scrollDebtAnchorRowsUp: [Int32: Int32] = [:]
     private var scrollDebtAnchorGridId: [Int32: Int64] = [:]
-    private var scrollDebtBaseline: [Int32: FloatDebtBaseline] = [:]
+    private var floatDebtLedger = SurfaceFloatDebtLedger()
     /// A cell's height in the NDC the offsets above were built in, so the
     /// debt, which is counted in rows, can be paid in them.
     private var scrollDebtCellHeightNDC: Float = 0
     /// The viewport height those NDC were built against. Written under `lock`
     /// with them; draw recovers the shader cursor's pixels from it.
     private var scrollOffsetViewportHeight: Float = 0
-    /// Last debt logged per grid. The ledger had no logging at all, and the
-    /// `[renderer] scroll offset` line reports the offset BEFORE the debt is
-    /// paid, so a float held by the ledger looked identical to one that was
-    /// not. One line per transition rather than per frame: a run holds a
-    /// handful of distinct debts, and a per-frame line changes the very
-    /// timing this pays for.
-    private var scrollDebtLastLogged: [Int32: Int32] = [:]
     /// Last value `[main_visibility]` reported, so the line is a transition.
     private var lastWindowHiddenLogged = false
 
@@ -2036,30 +2029,15 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
     /// its zero, and a reader arriving before it must not.
     private func floatDebtRows(for gid: Int32, seeding: Bool) -> Int32 {
         guard let anchorRowsUp = scrollDebtAnchorRowsUp[gid] else { return 0 }
-        let placementRowsUp = layerPlacementRowsUp[Int64(gid)] ?? 0
-        let resolved = floatDebtBaselineFollowing(
+        return Int32(clamping: floatDebtLedger.rows(
+            gridId: Int64(gid),
             anchorGridId: scrollDebtAnchorGridId[gid] ?? 0,
-            stored: scrollDebtBaseline[gid],
             anchorRowsUp: Int(anchorRowsUp),
-            placementRowsUp: placementRowsUp
-        )
-        if resolved.seeded {
-            if seeding { scrollDebtBaseline[gid] = resolved.baseline }
-            return 0
-        }
-        let baseline = resolved.baseline
-        // The one definition of this subtraction, the one ScrollRetentionTests
-        // pins. Two more had grown beside it.
-        let debtRows = Int32(clamping: floatDebtRowsUp(
-            anchorRowsUp: Int(anchorRowsUp),
-            placementRowsUp: placementRowsUp,
-            baseline: baseline
+            placementRowsUp: layerPlacementRowsUp[Int64(gid)] ?? 0,
+            seeding: seeding,
+            surfaceId: 1,
+            log: ZonvieCore.appLogEnabled ? { ZonvieCore.appLog($0) } : nil
         ))
-        if seeding, ZonvieCore.appLogEnabled, scrollDebtLastLogged[gid] != debtRows {
-            scrollDebtLastLogged[gid] = debtRows
-            ZonvieCore.appLog("[float_debt] gridId=\(gid) rows=\(debtRows) anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp) base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))")
-        }
-        return debtRows
     }
 
     /// How far each float that moves bodily with a scroll is drawn from its
@@ -2595,8 +2573,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             committedSurfaceLayers = staged
             pendingSurfaceLayers = nil
             pruneSurfaceLayerLedger(&layerPlacementRowsUp, to: staged)
-            pruneSurfaceLayerLedger(&scrollDebtBaseline, to: staged)
-            pruneSurfaceLayerLedger(&scrollDebtLastLogged, to: staged)
+            floatDebtLedger.prune(to: staged)
         }
         if didCursorWrite {
             cursorOwner.commit()
@@ -2972,11 +2949,17 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
         // it stops being composited, so its layer never recovers the
         // drawables it presented — and an animating custom shader keeps
         // asking for a frame every vsync regardless of visibility.
-        // ExternalGridView.draw carries the same guard, where the block was
-        // first measured at ~1s per attempt.
-        let windowIsHidden = view.window.map {
-            $0.isMiniaturized || !$0.occlusionState.contains(.visible)
-        } ?? false
+        // ExternalGridView.draw carries the same gate, where the block was
+        // first measured at ~1s per attempt. Unlike it, not exempt before the
+        // first present.
+        let gate = (view as? GridInputView)?.visibilityGate() ?? .draw
+        if gate == .unsettled, let terminalView = view as? MetalTerminalView {
+            ZonvieCore.drawTrace("surface=1 gate=occlusion_unsettled")
+            terminalView.didDrawFrame()
+            terminalView.requestRedraw()
+            return
+        }
+        let windowIsHidden = gate == .hidden
         if windowIsHidden != lastWindowHiddenLogged {
             lastWindowHiddenLogged = windowIsHidden
             // A transition, not a frame: this path returns before
@@ -3169,10 +3152,13 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // the layers the core flagged as floats count; under ext_multigrid
             // every split is a hosted layer too.
             let fixedFloatOverflow = SurfaceFixedFloatMask.overflows(
-                layers: committedSurfaceLayers, rootGridId: 1, floatFlagOnly: true)
+                layers: committedSurfaceLayers, rootGridId: 1)
             drewWithoutScrollTransform = fixedFloatOverflow
             hadActiveScrollOffsetThisFrame = scrollOffsetLatch.isActive && !fixedFloatOverflow
             smoothScrolling = scrollOffsetLatch.isSmoothScrolling
+            // Ranked in place (the mask below is built from these layers):
+            // writing the frame's copy instead would copy it every frame.
+            SurfaceFixedFloatMask.rankOffsets(&scrollOffsetData, layers: committedSurfaceLayers)
             scrollSnapshot = fixedFloatOverflow ? [] : scrollOffsetData  // Value-type copy (safe across frames)
             cursorShaderRawSnapshot = shared.shaderCursor.rawSnapshot()
             applyFloatScrollDebt(to: &scrollSnapshot)
@@ -3238,7 +3224,7 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
             // layer snapshot this frame draws, so placement and mask cannot
             // skew by a commit.
             fixedFloatMask.rebuild(
-                layers: layerSnapshot, rootGridId: 1, floatFlagOnly: true, smoothScrolling: smoothScrolling,
+                layers: layerSnapshot, rootGridId: 1, smoothScrolling: smoothScrolling,
                 cellW: cellWidthPx, cellH: cellHeightPx, scratch: &fixedFloatRectsScratch
             )
             fixedFloatBandsSnapshot = fixedFloatMask.bands  // Value-type copies (safe across frames)
@@ -4036,13 +4022,9 @@ final class GridSurfaceRenderer: NSObject, MTKViewDelegate {
                 // the present is missing, which is why the external surface
                 // leaves its own copy of that one alone too.
                 //
-                // Under the lock, unlike ExternalGridView's copies of this: the
-                // GPU completion handler writes this flag from its own thread
-                // (:4805, :4814) and an earlier frame's can still be in flight
-                // behind the semaphore, so an unlocked `false` here races it and
-                // can be lost. The external surface's flag is main-thread
-                // confined — its completion handler hops to the main queue
-                // first — which is why its writes need no lock and this one does.
+                // Under the lock: the GPU completion handler writes this flag
+                // from its own thread, and an earlier frame's can still be in
+                // flight behind the semaphore.
                 lock.lock()
                 invalidatePresentedLocked()
                 lock.unlock()

@@ -1458,8 +1458,8 @@ pub export fn zonvie_core_update_layout_px(
 /// unlike a read-only trace this is a write that must not be dropped.
 ///
 /// `screen_cols` folds zonvie_core_set_screen_cols into the same critical
-/// section: pass 0 to keep the drawable-width-derived value that
-/// updateLayoutPxLocked computes, or a display-derived count to override it.
+/// section: pass 0 to keep the value last supplied, or a display-derived
+/// count to replace it.
 /// Taking grid_mu a second time via the blocking set_screen_cols would negate
 /// the whole point of this entry point. `cmdline_default_cols` folds
 /// zonvie_core_set_cmdline_default_cols in for the same reason; 0 keeps the
@@ -1488,7 +1488,7 @@ pub export fn zonvie_core_try_update_layout_px(
         // flush here -- that would re-acquire the non-recursive grid_mu this
         // thread already owns. Same reasoning as the blocking twin above.
         _ = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
-        if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+        if (screen_cols != 0) cp.setScreenColsLocked(screen_cols);
         if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
         return true;
     }
@@ -1498,7 +1498,7 @@ pub export fn zonvie_core_try_update_layout_px(
     if (!acquired) return false;
     defer cp.grid_mu.unlock(clock.io());
     const changed = cp.updateLayoutPxLocked(drawable_w_px, drawable_h_px, cell_w_px, cell_h_px);
-    if (screen_cols != 0) cp.grid.screen_cols = screen_cols;
+    if (screen_cols != 0) cp.setScreenColsLocked(screen_cols);
     if (cmdline_default_cols != 0) cp.grid.cmdline_default_cols = cmdline_default_cols;
     if (changed) {
         // Standalone layout changes must publish main and external vertices
@@ -1510,11 +1510,8 @@ pub export fn zonvie_core_try_update_layout_px(
     return true;
 }
 
-/// Set screen width in cells (for cmdline max width).
-/// This should be called when screen size or cell size changes.
-/// Note: On Windows, this is now handled automatically inside updateLayoutPxLocked
-/// to avoid deadlock when called from redraw callbacks. macOS still uses this API
-/// since it sets screen_cols based on NSScreen width rather than window width.
+/// Set screen width in cells (for cmdline max width). Kept across layout
+/// updates; 0 lets the main grid's cols stand in again.
 pub export fn zonvie_core_set_screen_cols(p: ?*zonvie_core, cols: u32) callconv(.c) void {
     if (p == null) return;
     const box = asBox(p.?);
@@ -1969,6 +1966,20 @@ pub export fn zonvie_core_cmdline_origin(
     if (out_y) |p| p.* = o.y;
 }
 
+pub export fn zonvie_core_cmdline_cols(
+    work_w_px: u32,
+    main_w_px: u32,
+    chrome_px: u32,
+    margin_px: u32,
+    cell_w_px: u32,
+    out_screen_cols: ?*u32,
+    out_default_cols: ?*u32,
+) callconv(.c) void {
+    const r = frontend_rules.cmdlineCols(work_w_px, main_w_px, chrome_px, margin_px, cell_w_px);
+    if (out_screen_cols) |p| p.* = r.screen_cols;
+    if (out_default_cols) |p| p.* = r.default_cols;
+}
+
 pub export fn zonvie_core_msg_float_origin(
     target_left: i32,
     target_top: i32,
@@ -2010,6 +2021,26 @@ pub export fn zonvie_core_parse_ssh_target(value: ?[*]const u8, len: usize, out_
 
 pub export fn zonvie_core_cli_next_is_value(next: ?[*]const u8, len: usize) callconv(.c) bool {
     return frontend_rules.cliNextIsValue(if (next) |n| n[0..len] else null);
+}
+
+pub export fn zonvie_core_panel_bg(r: f32, g: f32, b: f32, out: ?*[3]f32) callconv(.c) void {
+    (out orelse return).* = frontend_rules.panelBg(r, g, b);
+}
+
+pub export fn zonvie_core_msg_kind_tone(kind: ?[*]const u8, len: usize) callconv(.c) u8 {
+    const k = kind orelse return @intFromEnum(config.MsgTone.normal);
+    return @intFromEnum(config.toneForKind(k[0..len]));
+}
+
+pub export fn zonvie_core_nvim_arg_is_file(
+    prev: ?[*]const u8,
+    prev_len: usize,
+    arg: ?[*]const u8,
+    arg_len: usize,
+    after_dash_dash: bool,
+) callconv(.c) bool {
+    const a = arg orelse return false;
+    return frontend_rules.nvimArgIsFile(if (prev) |p| p[0..prev_len] else null, a[0..arg_len], after_dash_dash);
 }
 
 pub export fn zonvie_core_devcontainer_exec_cmd(
@@ -2060,6 +2091,10 @@ pub export fn zonvie_core_escape_path_for_cmdline(
 pub export fn zonvie_core_shader_needs_animation(source: ?[*]const u8, len: usize) callconv(.c) bool {
     const s = source orelse return false;
     return frontend_rules.shaderNeedsAnimation(s[0..len]);
+}
+
+pub export fn zonvie_core_tab_drop_index(pos: f64, count: u32, origin: f64, stride: f64, size: f64) callconv(.c) u32 {
+    return frontend_rules.tabDropIndex(pos, count, origin, stride, size);
 }
 
 pub export fn zonvie_core_tab_move(p: ?*zonvie_core, from_idx: u32, drop_idx: u32, tab_count: u32) callconv(.c) bool {
@@ -2350,7 +2385,7 @@ pub export fn zonvie_core_get_option_as_meta(p: ?*zonvie_core) callconv(.c) u8 {
 }
 
 /// Rows one wheel event scrolls: the 'ver' component of 'mousescroll'.
-/// Reported by the auto-injected reporter (macOS only) and refreshed when the
+/// Reported by the auto-injected reporter (every platform) and refreshed when the
 /// option changes. Returns 0 for 'ver:0', which disables mouse scrolling in
 /// Neovim rather than making it page-relative. Lock-free atomic read.
 pub export fn zonvie_core_get_mousescroll_ver(p: ?*zonvie_core) callconv(.c) u32 {

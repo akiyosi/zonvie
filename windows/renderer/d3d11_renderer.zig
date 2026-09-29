@@ -1057,8 +1057,6 @@ pub const Renderer = struct {
     }
 
     pub const DrawOpts = struct {
-        present: bool = true,
-
         // If dirty_rect == null but we are doing partial redraw into a persistent back buffer,
         // we must NOT clear. (Row-mode present step uses this.)
         preserve_on_null_dirty: bool = false,
@@ -1287,21 +1285,6 @@ pub const Renderer = struct {
             self.drawBloomFromVerts(main, cursor, opts.glow_intensity, viewport_x_offset, viewport_y_offset, viewport_width, viewport_height);
         }
 
-        // The custom shader pass runs in the present path, once the whole
-        // frame is in back_tex; row mode draws its rows after drawEx returns.
-        if (opts.present) {
-            var dirty_rects: [1]c.RECT = undefined;
-            if (effective_dirty) |r| dirty_rects[0] = r;
-            const present_result = self.presentFromBackRectsWithCursorNoResize(
-                dirty_rects[0..@intFromBool(effective_dirty != null)],
-                effective_dirty == null,
-                null,
-                null,
-            );
-            if (applog.isEnabled()) self.dumpInfoQueue("after Present");
-            try present_result;
-        }
-
         // Performance log: draw_total
         if (applog.isEnabled() and t_draw_start != 0) {
             const t_draw_end = core.clock.nowNs();
@@ -1331,13 +1314,7 @@ pub const Renderer = struct {
         _ = self.presentSwapchain(sc, &params);
     }
 
-    pub fn presentFromBackRectsWithCursorNoResize(
-        self: *Renderer,
-        rects: []const c.RECT,
-        force_full_copy: bool,
-        scroll_rect: ?*const c.RECT,
-        scroll_offset: ?*const c.POINT,
-    ) !void {
+    pub fn presentFromBack(self: *Renderer, rects: []const c.RECT, force_full_copy: bool) !void {
         if (!self.resourcesReady()) return error.RenderResourcesUnavailable;
         const ctx = self.ctx orelse return error.NoContext;
         const sc = self.swapchain orelse return error.NoSwapchain;
@@ -1349,7 +1326,6 @@ pub const Renderer = struct {
         var did_full_copy: bool = false;
         var t0_ns: i128 = 0;
         var t_copy_ns: i128 = 0;
-        var t_cursor_ns: i128 = 0;
         if (log_enabled) {
             t0_ns = core.clock.nowNs();
         }
@@ -1384,24 +1360,20 @@ pub const Renderer = struct {
             t_copy_ns = core.clock.nowNs();
         }
 
-        if (log_enabled) {
-            t_cursor_ns = core.clock.nowNs();
-        }
-
         // When the custom shader pass wrote the full frame, every pixel
         // of the bb was touched — passing the old partial dirty-rect
         // list to Present1 would hint DWM that only part of the
         // backbuffer changed and could leave shader output on pixels
         // outside the dirty set stale. Treat shader-handled frames as
-        // full-present (no dirty rects, no scroll hint).
+        // full-present (no dirty rects).
         const present_full_frame = force_full_copy_effective or shader_handled or copied_damage.full;
         const present_dirty_rects = copied_rects[0..copied_damage.rect_count];
 
         // Validate everything Present1 will read BEFORE the call — an out-of-bounds
-        // dirty rect or scroll rect/offset causes Present1 to return E_INVALIDARG,
+        // dirty rect causes Present1 to return E_INVALIDARG,
         // which today permanently disables the swapchain1 fast path for the rest of
         // the Renderer's lifetime (see bug 2 below). On any invalid input, fall back
-        // to a full-frame Present1 (no dirty rects, no scroll hint) instead of risking
+        // to a full-frame Present1 (no dirty rects) instead of risking
         // that — the current buffer copy above is complete for all accumulated
         // damage, so a full-frame present is always safe.
         var present1_full_frame = present_full_frame;
@@ -1419,44 +1391,15 @@ pub const Renderer = struct {
                 }
             }
         }
-        if (!present1_full_frame) {
-            const w_i32: i32 = @intCast(self.width);
-            const h_i32: i32 = @intCast(self.height);
-            if (scroll_rect) |sr| {
-                var scroll_valid = sr.left >= 0 and sr.top >= 0 and
-                    sr.right <= w_i32 and sr.bottom <= h_i32 and
-                    sr.right > sr.left and sr.bottom > sr.top;
-                if (scroll_valid) {
-                    if (scroll_offset) |so| {
-                        // A scroll offset shifts the whole rect; validate the
-                        // shifted position stays in bounds too.
-                        if (sr.left + so.x < 0 or sr.top + so.y < 0 or
-                            sr.right + so.x > w_i32 or sr.bottom + so.y > h_i32)
-                        {
-                            scroll_valid = false;
-                        }
-                    } else {
-                        // A scroll rect without an offset is meaningless to Present1.
-                        scroll_valid = false;
-                    }
-                }
-                if (!scroll_valid) present1_full_frame = true;
-            } else if (scroll_offset != null) {
-                // An offset without a rect is equally meaningless.
-                present1_full_frame = true;
-            }
-        }
-
         var params: c.DXGI_PRESENT_PARAMETERS = std.mem.zeroes(c.DXGI_PRESENT_PARAMETERS);
         if (!present1_full_frame) {
             if (present_dirty_rects.len != 0) {
                 params.DirtyRectsCount = @intCast(present_dirty_rects.len);
                 params.pDirtyRects = @constCast(present_dirty_rects.ptr);
             }
-            if (scroll_rect) |sr| params.pScrollRect = @constCast(sr);
-            if (scroll_offset) |so| params.pScrollOffset = @constCast(so);
         }
         const presented = self.presentSwapchain(sc, &params);
+        if (log_enabled) self.dumpInfoQueue("after Present");
 
         if (log_enabled and did_full_copy) {
             applog.appLog("[d3d] presentFromBackRects: full copy fallback\n", .{});
@@ -1464,12 +1407,10 @@ pub const Renderer = struct {
         if (log_enabled) {
             const t_done_ns: i128 = core.clock.nowNs();
             const copy_us: u64 = @intCast(@divTrunc(@max(0, t_copy_ns - t0_ns), 1000));
-            const cursor_us: u64 = @intCast(@divTrunc(@max(0, t_cursor_ns - t_copy_ns), 1000));
-            const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_cursor_ns), 1000));
-            const total_us: u64 = copy_us + cursor_us + present_us;
+            const present_us: u64 = @intCast(@divTrunc(@max(0, t_done_ns - t_copy_ns), 1000));
             applog.appLog(
-                "[perf] present_detail rects={d} copy_us={d} cursor_us={d} present_us={d} total_us={d}\n",
-                .{ rects.len, copy_us, cursor_us, present_us, total_us },
+                "[perf] present_detail rects={d} copy_us={d} present_us={d} total_us={d}\n",
+                .{ rects.len, copy_us, present_us, copy_us + present_us },
             );
         }
         if (!presented) return error.PresentFailed;

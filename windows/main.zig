@@ -8,6 +8,7 @@ const applog = app_mod.applog;
 const config_mod = app_mod.config_mod;
 const dialogs = @import("ui/dialogs.zig");
 const window = @import("window.zig");
+const render_helpers = @import("render_pipeline_helpers.zig");
 
 pub const std_options = std.Options{
     .log_level = .debug,
@@ -130,10 +131,10 @@ fn getCwdUtf8(alloc: std.mem.Allocator) ?[]u8 {
 /// Single-instance mode: forward file arguments to an already-running instance
 /// via WM_COPYDATA, then let the caller exit. The payload is a tab-per-file
 /// flag -- '0' only for a single file when [server] open_mode == "current",
-/// the macOS rule -- then the absolute paths (the running instance may have a
-/// different working directory), NUL-separated and unescaped: the receiver
-/// hands them to zonvie_core_drop_paths. An empty path list sends an empty
-/// payload, which just brings the existing window to the front.
+/// the macOS rule -- then the paths (already absolute, see absoluteFileArg),
+/// NUL-separated and unescaped: the receiver hands them to
+/// zonvie_core_drop_paths. An empty path list sends an empty payload, which
+/// just brings the existing window to the front.
 fn forwardFilesToInstance(
     alloc: std.mem.Allocator,
     target: c.HWND,
@@ -146,26 +147,9 @@ fn forwardFilesToInstance(
     if (paths.len > 0) {
         const use_current = paths.len == 1 and std.mem.eql(u8, cfg.server.open_mode, "current");
         buf.append(alloc, if (use_current) '0' else '1') catch return;
-
-        const cwd = getCwdUtf8(alloc);
-        defer if (cwd) |w| alloc.free(w);
-
         for (paths, 0..) |p, i| {
             if (i > 0) buf.append(alloc, 0) catch return;
-
-            // Resolve to an absolute path against this process's cwd so the
-            // running instance opens the file the user meant. Does not require
-            // the file to exist (supports opening a new file).
-            const abs: []const u8 = blk: {
-                if (std.fs.path.isAbsolute(p)) break :blk p;
-                if (cwd) |w| {
-                    if (std.fs.path.join(alloc, &.{ w, p })) |joined| break :blk joined else |_| {}
-                }
-                break :blk p;
-            };
-            defer if (abs.ptr != p.ptr) alloc.free(abs);
-
-            buf.appendSlice(alloc, abs) catch return;
+            buf.appendSlice(alloc, p) catch return;
         }
     }
 
@@ -187,28 +171,33 @@ fn forwardFilesToInstance(
     _ = c.SendMessageW(target, c.WM_COPYDATA, 0, @bitCast(@intFromPtr(&cds)));
 }
 
-/// Whether `arg` is an nvim option whose VALUE is the next token (`-u NONE`,
-/// `-c "set nu"`, `--listen addr`): that token is not a file.
-fn nvimOptionTakesValue(arg: []const u8) bool {
-    const opts = [_][]const u8{ "-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime" };
-    for (opts) |o| if (std.mem.eql(u8, arg, o)) return true;
-    return false;
-}
-
-/// A file argument for nvim, absolute against `cwd`. Flags (`-`), commands
-/// (`+`), an option's value (`prev` names the option), drive-relative
-/// (`C:foo`) and already-absolute paths pass through; with no cwd so does
-/// the rest.
-fn absoluteFileArg(alloc: std.mem.Allocator, cwd: ?[]const u8, prev: ?[]const u8, arg: []const u8, after_dash_dash: bool) []const u8 {
-    if (arg.len == 0) return arg;
+/// A file argument (frontend_rules.nvimArgIsFile) made absolute against
+/// `cwd`. Drive-relative (`C:foo`) and already-absolute paths pass through;
+/// with no cwd so does the rest.
+fn absoluteFileArg(alloc: std.mem.Allocator, cwd: ?[]const u8, arg: []const u8) []const u8 {
     if (std.fs.path.isAbsolute(arg) or (arg.len >= 2 and arg[1] == ':')) return arg;
-    // After `--` every token is a file to nvim, `-` alone being stdin.
-    if (!after_dash_dash) {
-        if (arg[0] == '-' or arg[0] == '+') return arg;
-        if (prev) |p| if (nvimOptionTakesValue(p)) return arg;
-    } else if (std.mem.eql(u8, arg, "-")) return arg;
     const base = cwd orelse return arg;
     return std.fs.path.join(alloc, &.{ base, arg }) catch arg;
+}
+
+/// Append one nvim argument; a file argument goes in absolute and is also
+/// recorded in `files`, the list single-instance mode forwards.
+fn appendNvimArg(
+    alloc: std.mem.Allocator,
+    args: *std.ArrayListUnmanaged([]const u8),
+    files: *std.ArrayListUnmanaged([]const u8),
+    cwd: ?[]const u8,
+    prev: ?[]const u8,
+    arg: []const u8,
+    after_dash_dash: bool,
+) void {
+    if (!frontend_rules.nvimArgIsFile(prev, arg, after_dash_dash)) {
+        args.append(alloc, arg) catch {};
+        return;
+    }
+    const abs = absoluteFileArg(alloc, cwd, arg);
+    args.append(alloc, abs) catch {};
+    files.append(alloc, abs) catch {};
 }
 
 pub fn main() u8 {
@@ -545,6 +534,7 @@ pub fn main() u8 {
     // in HOME when that variable is set, so `zonvie foo.txt` opened
     // %HOME%\foo.txt (macOS resolves the same way before its fork).
     var nvim_extra_args: std.ArrayListUnmanaged([]const u8) = .empty;
+    var nvim_file_args: std.ArrayListUnmanaged([]const u8) = .empty;
     var pass_all_to_nvim = false;
     const shell_cwd: ?[]const u8 = getCwdUtf8(alloc);
 
@@ -559,7 +549,7 @@ pub fn main() u8 {
         }
 
         if (pass_all_to_nvim) {
-            nvim_extra_args.append(alloc, absoluteFileArg(alloc, shell_cwd, null, arg, true)) catch {};
+            appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, null, arg, true);
             continue;
         }
 
@@ -682,7 +672,7 @@ pub fn main() u8 {
             // Already handled above, skip
         } else {
             // Not a zonvie argument - pass to nvim
-            nvim_extra_args.append(alloc, absoluteFileArg(alloc, shell_cwd, if (i > 1) args[i - 1] else null, arg, false)) catch {};
+            appendNvimArg(alloc, &nvim_extra_args, &nvim_file_args, shell_cwd, if (i > 1) args[i - 1] else null, arg, false);
         }
     }
 
@@ -788,7 +778,7 @@ pub fn main() u8 {
                 }
             }
             if (existing != null) {
-                forwardFilesToInstance(alloc, existing.?, &config, nvim_extra_args.items);
+                forwardFilesToInstance(alloc, existing.?, &config, nvim_file_args.items);
                 return 0;
             }
             // Still no window (owning instance headless or stuck). Fall through

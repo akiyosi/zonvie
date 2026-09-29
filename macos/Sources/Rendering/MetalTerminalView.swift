@@ -555,37 +555,27 @@ final class MetalTerminalView: GridInputView {
         let pxWi = max(1, Int(drawableSize.width))
         let pxHi = max(1, Int(drawableSize.height))
 
-        // Screen width in cells for cmdline max width. Must match the
-        // contentWidth constraint in buildDecoratedCmdlineLayout to keep NDC
-        // viewport == drawable size. Computed before the core call so it can
-        // ride the same grid_mu acquisition instead of locking twice.
-        // TODO: Use window?.screen instead of NSScreen.main for multi-display correctness.
-        //       All cmdline NSScreen.main usage (here and in ZonvieCore.swift) should be
-        //       migrated to window?.screen in a coordinated change.
+        // The cmdline's width budget in cells. Must match the contentWidth
+        // constraint in buildDecoratedCmdlineLayout to keep NDC viewport ==
+        // drawable size. Computed before the core call so it can ride the same
+        // grid_mu acquisition instead of locking twice.
         let scale = window?.backingScaleFactor ?? 2.0
         // Chrome that sits beside the cmdline grid inside its own window.
         let copyButtonPt = ZonvieConfig.shared.cmdline.copyButton ? ZonvieConfig.copyButtonTotalWidth : 0.0
         let cmdlineChromePt = ZonvieConfig.cmdlinePadding * 2 + ZonvieConfig.cmdlineIconTotalWidth + copyButtonPt
-
+        let workWidthPt = (window?.screen ?? NSScreen.main)?.visibleFrame.width ?? 0
+        let mainWidthPt = window?.frame.width ?? 0
         var screenCols: UInt32 = 0
-        if let screen = NSScreen.main {
-            let cmdlineOverheadPt = cmdlineChromePt + ZonvieConfig.cmdlineScreenMargin
-            let availableWidthPt = screen.visibleFrame.width - cmdlineOverheadPt
-            let availableWidthPx = availableWidthPt * scale
-            screenCols = UInt32(max(40, availableWidthPx / CGFloat(cellWi)))
-        }
-
-        // Default cmdline width: the cmdline WINDOW spans
-        // cmdlineDefaultWindowFraction of the main window, so the chrome comes
-        // off before converting to cells. Without this the core falls back to
-        // the main grid's cols, which makes the cmdline window wider than the
-        // main window by exactly the chrome.
         var cmdlineDefaultCols: UInt32 = 0
-        if let mainWidthPt = window?.frame.width, mainWidthPt > 0 {
-            let targetPt = mainWidthPt * ZonvieConfig.cmdlineDefaultWindowFraction - cmdlineChromePt
-            let targetPx = targetPt * scale
-            cmdlineDefaultCols = UInt32(max(20, targetPx / CGFloat(cellWi)))
-        }
+        zonvie_core_cmdline_cols(
+            UInt32(max(0, workWidthPt * scale)),
+            UInt32(max(0, mainWidthPt * scale)),
+            UInt32(cmdlineChromePt * scale),
+            UInt32(ZonvieConfig.cmdlineScreenMargin * scale),
+            UInt32(cellWi),
+            &screenCols,
+            &cmdlineDefaultCols
+        )
 
         // Move rows/cols decision + suppression to Zig core (shared logic).
         // Non-blocking: a live-resize drag calls this many times per second
@@ -741,7 +731,7 @@ final class MetalTerminalView: GridInputView {
         let location = convert(event.locationInWindow, from: nil)
         scrollModel?.handleGridScrollWheel(
             event, lock: &scrollTargetLock, scale: window?.backingScaleFactor ?? 2.0, logTag: "scroll",
-            resolve: { resolveScrollTarget(at: location, requireScrollable: $0) },
+            resolve: { hitTestGrid(at: location, requireScrollable: $0) },
             // Shader uniforms are propagated in onPreDraw (which always runs
             // updateScrollShaderOffset before draw); calling it here too would
             // re-do the same work and fire markAllRowsDirty twice per input.
@@ -823,9 +813,8 @@ final class MetalTerminalView: GridInputView {
                 grid: info,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
-                // The z-aware guard only discards this grid's scrolled content
-                // under STRICTLY higher fixed floats, so a directly-scrolled
-                // float keeps drawing above its own backdrop.
+                // Replaced by the layer's paint rank at draw, the scale the
+                // fixed-float mask is built on.
                 zindex: Int32(clamping: info.zindex)
             ))
         }
@@ -964,7 +953,9 @@ final class MetalTerminalView: GridInputView {
         return renderer.drawnFollowerOffsetsPx()
     }
 
-    private func hitTestGrid(at point: CGPoint) -> (gridId: Int64, row: Int32, col: Int32) {
+    /// `requireScrollable`: a non-scrollable float is transparent to a wheel,
+    /// which falls through to the scrollable grid beneath it.
+    private func hitTestGrid(at point: CGPoint, requireScrollable: Bool = false) -> (gridId: Int64, row: Int32, col: Int32) {
         guard let core else { return (1, 0, 0) }
         // Early return when renderer is uninitialized (cellMetrics not yet available).
         guard let g = pointerGeometry(at: point) else { return (1, 0, 0) }
@@ -985,7 +976,7 @@ final class MetalTerminalView: GridInputView {
         var localRow: Int32 = globalRow
         var localCol: Int32 = globalCol
 
-        if let hit = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: false) {
+        if let hit = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: requireScrollable) {
             bestGridId = hit.gridId
             localRow = hit.row
             localCol = hit.col
@@ -1002,7 +993,7 @@ final class MetalTerminalView: GridInputView {
             staticGridId: bestGridId,
             followers: drawnFollowerOffsetsPx(),
             zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
-            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: false) }
+            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable) }
         ) {
             ZonvieCore.appLog("[hitTest] result: displaced follower gridId=\(displaced.gridId) row=\(displaced.row) col=\(displaced.col)")
             return displaced
@@ -1046,38 +1037,6 @@ final class MetalTerminalView: GridInputView {
             col: globalCol,
             requireScrollable: requireScrollable
         )
-    }
-
-    /// Resolve which grid a scroll at `point` should target. A non-scrollable
-    /// float overlay is transparent to scrolling, so the scroll falls through to
-    /// the topmost window beneath it (req #1). Returns grid-local row/col.
-    private func resolveScrollTarget(at point: CGPoint, requireScrollable: Bool = true) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let core, let geo = pointerGeometry(at: point) else { return (1, 0, 0) }
-        let globalRow = geo.globalRow
-        let globalCol = geo.globalCol
-        // Non-scrollable floats are transparent to scrolling, so a scrollable
-        // grid directly beneath one — another float or the base window — shows
-        // through (req #1).
-        let grids = core.getVisibleGridsCached()
-        let target = pointerTargetGrid(globalRow: globalRow, globalCol: globalCol, requireScrollable: requireScrollable)
-        // A follower drawn displaced by an ease is found where it is drawn,
-        // as hitTestGrid finds it for a click and the external surface finds
-        // it for a wheel: otherwise a wheel over it scrolled the window behind.
-        if let displaced = resolveDisplacedFollowerHit(
-            pointPxY: geo.pointPx.y,
-            cellHeightPx: geo.cellH,
-            globalCol: globalCol,
-            staticGridId: target?.gridId ?? 1,
-            followers: drawnFollowerOffsetsPx(),
-            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
-            resolve: { row, col in
-                self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable)
-            }
-        ) {
-            return displaced
-        }
-        guard let t = target else { return (1, globalRow, globalCol) }
-        return (t.gridId, t.row, t.col)
     }
 
     /// Give float windows the sub-cell scroll offset of the window they sit over,
@@ -1314,15 +1273,19 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     /// A grid another surface shows is placed by that surface, in its own
     /// coordinates, hosted float included: ask it. An external window made key
     /// by Cmd-` does not move Neovim's cursor, so the answer may be the main
-    /// window's.
+    /// window's. The candidate window and the preedit overlay both go there.
+    var imeShowingHost: IMEPreeditHost {
+        guard let core else { return self }
+        let cursor = core.getCursorPositionNonBlocking()
+        let showing: GridInputView? = core.externalViewShowing(gridId: cursor.gridId) ?? core.terminalView
+        guard cursor.row >= 0, cursor.col >= 0, let showing else { return self }
+        return showing
+    }
+
     func imeFirstRect() -> NSRect {
         guard let win = window else { return .zero }
-        if let core {
-            let cursor = core.getCursorPositionNonBlocking()
-            let showing: GridInputView? = core.externalViewShowing(gridId: cursor.gridId) ?? core.terminalView
-            if cursor.row >= 0, cursor.col >= 0, let showing, showing !== self {
-                return showing.imeFirstRect()
-            }
+        if let showing = imeShowingHost as? GridInputView, showing !== self {
+            return showing.imeFirstRect()
         }
         return win.convertToScreen(convert(imeCursorRectInView() ?? imeFallbackRectInView(), to: nil))
     }
@@ -1330,6 +1293,33 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     func imeSendCommitted(_ text: String) { core?.keyInput.sendInput(text, owner: self) }
 
     // MARK: - Redraw
+
+    /// Until this moment, `occlusionState` may still describe this window as
+    /// it stood BEFORE the app ordered another window in front of it.
+    private var occlusionSuspectUntil: CFAbsoluteTime = 0
+
+    /// The app just ordered some window in front; this one may now be covered
+    /// and does not know it yet. `occlusionState` is published asynchronously
+    /// (measured 25-36ms), and meanwhile `currentDrawable` on a covered window
+    /// burns its one-second timeout on the MAIN thread
+    /// (extfloat_resize_shader_stall). Frames in the next 100ms are skipped
+    /// rather than guessed at; a window still visible loses at most that much
+    /// animation on a focus change.
+    func markOcclusionSuspect() {
+        occlusionSuspectUntil = CFAbsoluteTimeGetCurrent() + 0.1
+        // The frames skipped are frames the animation still owes.
+        requestRedraw()
+    }
+
+    enum VisibilityGate { case draw, unsettled, hidden }
+
+    /// Whether this surface may draw now. `.unsettled` is checked first: during
+    /// it the state `.hidden` reads is the stale one.
+    func visibilityGate() -> VisibilityGate {
+        if CFAbsoluteTimeGetCurrent() < occlusionSuspectUntil { return .unsettled }
+        if let win = window, win.isMiniaturized || !win.occlusionState.contains(.visible) { return .hidden }
+        return .draw
+    }
 
     /// DrawLoopIdleCounter counts idle frames, SurfaceDrawLoopHost switches
     /// the mode; each surface decides when a frame was idle.
@@ -1846,6 +1836,8 @@ protocol IMEPreeditHost: AnyObject {
     /// Overlay frame origin (container-local). `preeditHeight` is the overlay's
     /// own height, for the top-left fallback when no cursor position is known.
     func imePreeditOrigin(preeditHeight: CGFloat) -> CGPoint
+    /// The host whose surface shows Neovim's cursor; the overlay is placed there.
+    var imeShowingHost: IMEPreeditHost { get }
     /// Candidate-window rect in screen coordinates.
     func imeFirstRect() -> NSRect
     /// Send committed (final) IME text to Neovim.
@@ -1920,7 +1912,11 @@ final class IMEPreeditController {
     // MARK: Overlay
 
     private func showOverlay(selectedRange: NSRange) {
-        guard let host else { return }
+        guard let host = host?.imeShowingHost else { return }
+        // Moving the overlay to the showing view takes it off the key view.
+        if preeditView.superview !== host.imePreeditContainer {
+            host.imePreeditContainer.addSubview(preeditView)
+        }
         let cell = host.imePreeditCellSize
         preeditView.configure(
             attributedText: markedText,
@@ -2152,7 +2148,7 @@ final class PreeditOverlayView: NSView {
 /// The band a grid's sub-row ease actually moves, from the grid the core
 /// reports. Lives here rather than beside GridRowBand because MetalTypes.swift
 /// is compiled standalone by the Swift test steps and must not name ZonvieCore.
-private extension GridRowBand {
+extension GridRowBand {
     init(of grid: ZonvieCore.GridInfo) {
         self.init(
             startRow: grid.startRow,

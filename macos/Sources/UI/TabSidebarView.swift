@@ -556,17 +556,9 @@ final class TabSidebarView: NSView {
                     // Internal reorder drag
                     dragCurrentY = location.y
 
-                    // Calculate drop target from Y position
-                    var targetIdx = 0
-                    for i in 0..<tabs.count {
-                        let rowCenterY = CGFloat(i) * tabRowHeight + tabRowHeight / 2
-                        if location.y < rowCenterY {
-                            targetIdx = i
-                            break
-                        }
-                        targetIdx = i + 1
-                    }
-                    dropTargetIndex = min(targetIdx, tabs.count)
+                    dropTargetIndex = Int(zonvie_core_tab_drop_index(
+                        Double(location.y), UInt32(tabs.count), 0,
+                        Double(tabRowHeight), Double(tabRowHeight)))
                 }
                 needsDisplay = true
 

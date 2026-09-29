@@ -2798,8 +2798,12 @@ final class ZonvieCore {
         alert.messageText = "Unsaved Changes"
         alert.informativeText = "You have unsaved changes. Do you want to discard them and quit?"
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "Discard and Quit")
+        let discard = alert.addButton(withTitle: "Discard and Quit")
         alert.addButton(withTitle: "Cancel")
+        // Return must not discard (Windows defaults to Cancel); discarding
+        // needs a click. "Cancel" keeps NSAlert's Escape equivalent.
+        discard.keyEquivalent = ""
+        discard.hasDestructiveAction = true
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
@@ -4239,12 +4243,11 @@ final class ZonvieCore {
                 // app outlives this session, so its external windows would
                 // stay on screen with a dead core behind them.
                 self.pendingExternalWindowRequests.removeAll()
-                for window in self.externalWindows.values {
-                    window.delegate = nil
-                    window.contentView = nil
-                    window.close()
+                for gridId in Array(self.externalWindows.keys) {
+                    if let window = self.removeInstalledExternalWindow(gridId: gridId) {
+                        Self.closeRemovedExternalWindow(window)
+                    }
                 }
-                self.externalWindows.removeAll()
                 // Its message, prompt and mini panels are floating windows
                 // of their own and would outlive it the same way.
                 self.hideMessageWindow()
@@ -4890,8 +4893,6 @@ final class ZonvieCore {
     /// Tracks which grid the popupmenu is anchored to (set during popupmenu_show, cleared on hide)
     /// Used to prevent main window activation when popupmenu is on an external window
     private var popupmenuAnchorGrid: Int64? = nil
-    private var popupmenuAnchorRow: Int32? = nil
-    private var popupmenuAnchorCol: Int32? = nil
 
     /// Pmenu background color delivered by the core via on_popupmenu_show.
     /// Used as the container background for the popupmenu external grid view
@@ -5478,16 +5479,15 @@ final class ZonvieCore {
     }
 
     /// Collect layout info for all visible windows. Must be called on main thread.
-    /// `includeMainWindow`: all ext_windows operations pass true. Parameter retained for future use.
     /// Entries are OS windows, keyed by the surface id: the main window is 1
     /// whatever grids it holds, an external window its own root grid. It used
     /// to be registered as grid 2, which is only the main window's grid until
     /// that window is externalized — then two entries shared the id and a
     /// direction search from either one skipped both.
-    private func allWindowLayoutInfos(includeMainWindow: Bool = true) -> [WindowLayoutInfo] {
+    private func allWindowLayoutInfos() -> [WindowLayoutInfo] {
         var result: [WindowLayoutInfo] = []
 
-        if includeMainWindow, let mainWindow = terminalView?.window {
+        if let mainWindow = terminalView?.window {
             result.append(WindowLayoutInfo(gridId: 1, winId: mainWindowTargetWinId(), frame: mainWindow.frame, window: mainWindow))
         }
 
@@ -5557,7 +5557,7 @@ final class ZonvieCore {
     /// direction search, reading order, swap, rotation and averaging were
     /// written out here and again on Windows, and had drifted.
     private func planAndApplyWindowLayout(op: Int32, arg: Int32, count: Int32, sourceGridId: Int64?, name: String) {
-        let infos = allWindowLayoutInfos(includeMainWindow: true)
+        let infos = allWindowLayoutInfos()
         var frames = layoutFrames(infos)
         var sourceIndex: Int64 = 0
         if let gridId = sourceGridId {
@@ -5648,7 +5648,7 @@ final class ZonvieCore {
     private func handleWinMoveCursor(direction: Int32, count: Int32) -> Int64 {
         let work = { [weak self] () -> Int64 in
             guard let self else { return 0 }
-            let infos = allWindowLayoutInfos(includeMainWindow: true)
+            let infos = allWindowLayoutInfos()
             var targetWin: Int64 = 0
 
             // Find current cursor grid
@@ -6062,7 +6062,7 @@ final class ZonvieCore {
         let shadowMargin: CGFloat = kind == .cmdline ? 150.0 : 0.0
         let cmdlineIconTotalWidth: CGFloat = kind == .cmdline ? ZonvieConfig.cmdlineIconTotalWidth : 0.0
 
-        if kind == .cmdline, let screen = NSScreen.main {
+        if kind == .cmdline, let screen = terminalView?.window?.screen ?? NSScreen.main {
             let maxContentWidth = screen.visibleFrame.width - (cmdlinePadding * 2) - cmdlineIconTotalWidth - copyButtonReservedWidth(for: kind) - ZonvieConfig.cmdlineScreenMargin
             contentWidth = min(contentWidth, maxContentWidth)
         }
@@ -6639,8 +6639,6 @@ final class ZonvieCore {
             containerView = NSView(frame: containerFrame)
         }
         containerView.wantsLayer = true
-        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
-        containerView.layer?.cornerCurve = .continuous
         containerView.layer?.masksToBounds = true
 
         if ZonvieConfig.shared.blurEnabled {
@@ -6650,10 +6648,7 @@ final class ZonvieCore {
             containerView.layer?.backgroundColor = NSColor.black.cgColor
         }
 
-        if kind == .cmdline || kind == .popupmenu {
-            let borderColor = self.getSearchHighlightColor()
-            self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
-        }
+        updateDecoratedWindowChrome(kind: kind, containerView: containerView)
 
         if kind == .cmdline {
             let iconView = NSImageView(frame: NSRect(
@@ -6839,7 +6834,7 @@ final class ZonvieCore {
         updateDecoratedBackground(kind: kind, gridId: gridId, context: context, gridView: gridView, bgColor: bgColor)
         updateDecoratedLayout(kind: kind, context: context, gridView: gridView, rows: rows, cols: cols)
         // Chrome must be updated AFTER layout so border uses the new layer.bounds
-        updateDecoratedWindowChrome(kind: kind, context: context)
+        updateDecoratedWindowChrome(kind: kind, containerView: context.containerView)
     }
 
     private func makeDecoratedGridContext(gridId: Int64) -> DecoratedGridContext? {
@@ -6892,14 +6887,14 @@ final class ZonvieCore {
         gridView.setGridBackground(rgb: Self.packSurfaceBg(marginBg), clearAlpha: Double(marginAlpha))
     }
 
-    private func updateDecoratedWindowChrome(kind: ExternalGridKind, context: DecoratedGridContext) {
-        context.containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
-        context.containerView.layer?.cornerCurve = .continuous
+    private func updateDecoratedWindowChrome(kind: ExternalGridKind, containerView: NSView) {
+        containerView.layer?.cornerRadius = Self.specialWindowCornerRadius
+        containerView.layer?.cornerCurve = .continuous
 
         switch kind {
         case .cmdline, .popupmenu:
             let borderColor = self.getSearchHighlightColor()
-            self.updateSpecialWindowBorder(containerView: context.containerView, borderColor: borderColor, lineWidth: 1.0)
+            self.updateSpecialWindowBorder(containerView: containerView, borderColor: borderColor, lineWidth: 1.0)
         case .msgShow, .msgHistory, .normal:
             break
         }
@@ -7604,8 +7599,6 @@ final class ZonvieCore {
             guard let self = self else { return }
 
             self.popupmenuAnchorGrid = gridId
-            self.popupmenuAnchorRow = row
-            self.popupmenuAnchorCol = col
         }
     }
 
@@ -7614,8 +7607,6 @@ final class ZonvieCore {
         self.popupmenuBgColor = nil
         DispatchQueue.main.async { [weak self] in
             self?.popupmenuAnchorGrid = nil
-            self?.popupmenuAnchorRow = nil
-            self?.popupmenuAnchorCol = nil
             ZonvieCore.appLog("[popupmenu] anchor_grid cleared")
         }
     }
@@ -7721,8 +7712,7 @@ final class ZonvieCore {
                 // geometry; excluding it gave a blocking prompt the narrower
                 // non-confirm layout. The core pins every interactive prompt
                 // to this view, so there is no configuration that avoids it.
-                let isConfirm = kindStr == "confirm" || kindStr == "confirm_sub" ||
-                    kindStr == "number_prompt"
+                let isConfirm = self.messageTone(kindStr) == ZONVIE_MSG_TONE_PROMPT
                 self.showPromptWindow(content: contentStr, hlId: primaryHlId, isConfirm: isConfirm)
             } else if isMini {
                 self.updateMini(.custom, content: contentStr, timeout: timeoutSec)
@@ -7740,12 +7730,8 @@ final class ZonvieCore {
                     self.pendingMessages.append((kind: kindStr, content: contentStr, hlId: primaryHlId))
                 }
                 self.pendingMessages.removeFirst(min(evict, self.pendingMessages.count))
-
-                let displayContent = self.pendingMessages.map { $0.content }.joined(separator: "\n")
-                let displayKind = self.pendingMessages.last?.kind ?? kindStr
-                let displayHlId = self.pendingMessages.last?.hlId ?? primaryHlId
-
-                self.showMessageWindow(kind: displayKind, content: displayContent, hlId: displayHlId, timeoutMs: timeoutMs)
+                self.armMessageAutoHide(timeoutMs: timeoutMs)
+                self.showToastOrHide()
             }
         }
     }
@@ -7764,18 +7750,35 @@ final class ZonvieCore {
         }
     }
 
-    /// The latest non-empty text of each status routed to ext_float. They
-    /// share the toast with msg_show.
+    /// The latest non-empty text of each status routed to ext_float.
     private var extFloatStatus: [MiniWindowId: String] = [:]
 
-    private func showExtFloatStatusOrHide() {
+    /// The toast, as on Windows: the msg_show stack, then the non-empty
+    /// statuses. Statuses never enter or clear the stack; the window hides
+    /// only when both are empty.
+    private func showToastOrHide() {
         let channels = MiniWindowId.allCases.filter { extFloatStatus[$0] != nil }
-        guard let last = channels.last else {
+        let lines = pendingMessages.map { $0.content } + channels.compactMap { extFloatStatus[$0] }
+        guard !lines.isEmpty else {
             hideMessageWindow()
             return
         }
-        let content = channels.compactMap { extFloatStatus[$0] }.joined(separator: "\n")
-        showMessageWindow(kind: last.rawValue, content: content)
+        let kind = pendingMessages.last?.kind ?? channels.last?.rawValue ?? ""
+        showMessageWindow(kind: kind, content: lines.joined(separator: "\n"), hlId: pendingMessages.last?.hlId ?? 0)
+    }
+
+    /// timeout_ms=0 means no auto-hide (e.g. errors). The timer belongs to
+    /// the stack: it empties it and leaves the statuses showing.
+    private func armMessageAutoHide(timeoutMs: UInt32) {
+        messageAutoHideWorkItem?.cancel()
+        messageAutoHideWorkItem = nil
+        guard timeoutMs > 0 else { return }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.pendingMessages.removeAll()
+            self?.showToastOrHide()
+        }
+        messageAutoHideWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Double(timeoutMs) / 1000.0, execute: workItem)
     }
 
     /// showmode, showcmd and ruler are one status message under three
@@ -7807,7 +7810,7 @@ final class ZonvieCore {
                 // ext_float: state-driven (no timeout; each channel is cleared
                 // when Neovim sends it empty), as Windows status_messages.
                 self.extFloatStatus[miniId] = contentStr.isEmpty ? nil : contentStr
-                self.showExtFloatStatusOrHide()
+                self.showToastOrHide()
             case ZONVIE_MSG_VIEW_NOTIFICATION:
                 self.showOSNotification(title: "Neovim", body: contentStr)
             default:
@@ -8081,20 +8084,17 @@ final class ZonvieCore {
     }
 
     /// Get color for message kind (error=red, warning=yellow, etc.)
+    private func messageTone(_ kind: String) -> UInt32 {
+        UInt32(kind.withCString { zonvie_core_msg_kind_tone($0, strlen($0)) })
+    }
+
     private func getColorForMessageKind(_ kind: String, hlId: Int32) -> NSColor {
-        switch kind {
-        case "emsg", "echoerr", "lua_error", "rpc_error":
-            return NSColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1.0)  // Red for errors
-        case "wmsg":
-            return NSColor(red: 1.0, green: 0.85, blue: 0.4, alpha: 1.0) // Yellow for warnings
-        case "confirm", "confirm_sub", "return_prompt":
-            return NSColor(red: 0.6, green: 0.8, blue: 1.0, alpha: 1.0)  // Light blue for prompts
-        case "search_count":
-            return NSColor(red: 0.6, green: 1.0, blue: 0.6, alpha: 1.0)  // Light green for search
-        default:
-            // For other kinds, use normal foreground color
-            // Note: hl_id based coloring could be added with zonvie_core_get_hl_by_id API
-            return self.getNormalForegroundColor()
+        switch messageTone(kind) {
+        case ZONVIE_MSG_TONE_ERROR: return NSColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1.0)
+        case ZONVIE_MSG_TONE_WARN: return NSColor(red: 1.0, green: 0.85, blue: 0.4, alpha: 1.0)
+        case ZONVIE_MSG_TONE_PROMPT: return NSColor(red: 0.6, green: 0.8, blue: 1.0, alpha: 1.0)
+        case ZONVIE_MSG_TONE_SEARCH: return NSColor(red: 0.6, green: 1.0, blue: 0.6, alpha: 1.0)
+        default: return self.getNormalForegroundColor()
         }
     }
 
@@ -8176,7 +8176,7 @@ final class ZonvieCore {
         )
     }
 
-    private func showMessageWindow(kind: String, content: String, hlId: Int32 = 0, timeoutMs: UInt32 = 0) {
+    private func showMessageWindow(kind: String, content: String, hlId: Int32) {
         guard let mainView = self.terminalView,
               let renderer = mainView.renderer,
               let screen = NSScreen.main else {
@@ -8194,12 +8194,12 @@ final class ZonvieCore {
         let adjustedBg = normalBg.adjustedForCmdlineBackground()
         let borderColor: NSColor
 
-        switch kind {
-        case "emsg", "echoerr", "lua_error", "rpc_error":
+        switch messageTone(kind) {
+        case ZONVIE_MSG_TONE_ERROR:
             borderColor = NSColor(red: 1.0, green: 0.3, blue: 0.3, alpha: 1.0)
-        case "wmsg":
+        case ZONVIE_MSG_TONE_WARN:
             borderColor = NSColor(red: 1.0, green: 0.8, blue: 0.3, alpha: 1.0)
-        case "confirm", "confirm_sub", "return_prompt":
+        case ZONVIE_MSG_TONE_PROMPT:
             borderColor = NSColor(red: 0.3, green: 0.6, blue: 1.0, alpha: 1.0)
         default:
             borderColor = self.getSearchHighlightColor()
@@ -8220,22 +8220,6 @@ final class ZonvieCore {
             padding: padding,
             targetFrame: targetFrame
         )
-
-        // Start auto-hide timer for external window
-        // timeout_ms=0 means no auto-hide (e.g. errors), manual dismiss only
-        messageAutoHideWorkItem?.cancel()
-        messageAutoHideWorkItem = nil
-        if timeoutMs > 0 {
-            let workItem = DispatchWorkItem { [weak self] in
-                // The messages the user watched go are gone from the stack
-                // too, as on Windows: a later replace_last or push shows only
-                // what is new, not these again.
-                self?.pendingMessages.removeAll()
-                self?.hideMessageWindow()
-            }
-            messageAutoHideWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + Double(timeoutMs) / 1000.0, execute: workItem)
-        }
     }
 
     private func showShortMessageWindow(
@@ -8765,22 +8749,10 @@ extension NSColor {
     /// Adjusts brightness for cmdline background visibility.
     /// Dark colors become lighter, light colors become darker.
     func adjustedForCmdlineBackground() -> NSColor {
-        var h: CGFloat = 0
-        var s: CGFloat = 0
-        var b: CGFloat = 0
-        var a: CGFloat = 0
-
-        guard let rgbColor = self.usingColorSpace(.sRGB) else { return self }
-        rgbColor.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
-
-        let adjustedB: CGFloat
-        if b < 0.5 {
-            adjustedB = min(b + 0.05, 1.0)
-        } else {
-            adjustedB = max(b - 0.05, 0.0)
-        }
-
-        return NSColor(hue: h, saturation: s, brightness: adjustedB, alpha: a)
+        guard let rgb = self.usingColorSpace(.sRGB) else { return self }
+        var out: [Float] = [0, 0, 0]
+        zonvie_core_panel_bg(Float(rgb.redComponent), Float(rgb.greenComponent), Float(rgb.blueComponent), &out)
+        return NSColor(srgbRed: CGFloat(out[0]), green: CGFloat(out[1]), blue: CGFloat(out[2]), alpha: rgb.alphaComponent)
     }
 }
 

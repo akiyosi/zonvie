@@ -309,13 +309,14 @@ pub fn handleMsgMiniOrExtFloat(
     }
 }
 
-/// Update mini window text directly (for UI thread usage). Under app.mu: the
-/// core thread writes the same buffer in updateMiniWindow.
+/// Update mini window text directly (for UI thread usage), bounded as macOS
+/// bounds it. Under app.mu: the core thread writes the same buffer in
+/// updateMiniWindow.
 pub fn updateMiniText(app: *App, id: app_mod.MiniWindowId, text: []const u8) void {
     const idx = @intFromEnum(id);
     app.mu.lockUncancelable(core.clock.io());
     defer app.mu.unlock(core.clock.io());
-    app.mini_windows[idx].text_len = render_helpers.copyUtf8Truncated(&app.mini_windows[idx].text, text);
+    app.mini_windows[idx].text_len = render_helpers.clampMiniContent(&app.mini_windows[idx].text, text);
 }
 
 /// The kinds Neovim blocks on (confirm, confirm_sub, number_prompt): centred
@@ -341,6 +342,7 @@ pub fn statusChannel(kind: []const u8) ?usize {
 
 /// Bytes the message window keeps; one UTF-16 unit per byte decodes all of it.
 const message_text_capacity = @typeInfo(@FieldType(app_mod.MessageWindow, "text")).array.len;
+const mini_text_capacity = @typeInfo(@FieldType(app_mod.MiniWindowState, "text")).array.len;
 /// Inset of the message window's text from each edge, before DPI scaling.
 const message_text_pad_px: c_int = 12;
 
@@ -439,38 +441,56 @@ fn wrappedTextHeightPx(hwnd: c.HWND, font_px: c_int, text: []const u8, width_px:
     return size.h;
 }
 
+/// Append `line` to the toast text at `len`, after a '\n' when it is not the
+/// first, clamped to the buffer. Returns the new length.
+fn appendToastLine(buf: []u8, len: usize, line: []const u8) usize {
+    var n = len;
+    if (n > 0 and n < buf.len) {
+        buf[n] = '\n';
+        n += 1;
+    }
+    const copy_len = @min(line.len, buf.len - n);
+    @memcpy(buf[n..][0..copy_len], line[0..copy_len]);
+    return n + copy_len;
+}
+
+/// Re-show the toast from the stack and the statuses, or hide it when both
+/// are empty. Statuses never enter or clear the stack. A blocking dialog
+/// stays.
+pub fn refreshToast(app: *App) void {
+    if (messageWindowIsConfirm(app)) return;
+    // The window takes its kind (colour) from the last stacked message, else
+    // from the last status.
+    var shown: ?*const app_mod.DisplayMessage = null;
+    for (&app.status_messages) |*entry| {
+        if (entry.*) |*m| shown = m;
+    }
+    const stack = app.display_messages.items;
+    if (stack.len > 0) shown = &stack[stack.len - 1];
+    if (shown) |m| showMessageWindowOnUIThread(app, m.*, false) else hideMessageWindow(app);
+}
+
 pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, include_msg: bool) void {
     if (applog.isEnabled()) applog.appLog("[win] showMessageWindowOnUIThread: text_len={d} kind={s}\n", .{ msg.text_len, msg.kind[0..msg.kind_len] });
 
     const kind_str = msg.kind[0..msg.kind_len];
     const is_confirm = isConfirmKind(kind_str);
 
-    // Build combined content from display_messages stack. A confirm dialog
-    // shows only its own text: the stack holds toasts (a config error, status).
+    // The toast is the stack's lines followed by the non-empty status lines,
+    // macOS's rule. A confirm dialog shows only its own text.
     var combined_text: [16384]u8 = undefined;
     var combined_len: usize = 0;
     const stack: []const app_mod.DisplayMessage = if (is_confirm) &.{} else app.display_messages.items;
-    for (stack) |dm| {
-        if (combined_len > 0 and combined_len < combined_text.len - 1) {
-            combined_text[combined_len] = '\n';
-            combined_len += 1;
-        }
-        const copy_len = @min(dm.text_len, combined_text.len - combined_len);
-        @memcpy(combined_text[combined_len..][0..copy_len], dm.text[0..copy_len]);
-        combined_len += copy_len;
-    }
+    for (stack) |*dm| combined_len = appendToastLine(&combined_text, combined_len, dm.text[0..dm.text_len]);
     // Allocation failure while extending display_messages must not make the
     // current message disappear. The caller requests this fixed-buffer
-    // fallback when the append failed (and for confirm and split messages,
-    // which are not stored in the display stack at all).
-    if (include_msg and combined_len < combined_text.len) {
-        if (combined_len > 0 and combined_len < combined_text.len - 1) {
-            combined_text[combined_len] = '\n';
-            combined_len += 1;
+    // fallback when the append failed (and for confirm messages, which are
+    // not stored in the display stack at all).
+    if (include_msg) combined_len = appendToastLine(&combined_text, combined_len, msg.text[0..msg.text_len]);
+    if (!is_confirm) {
+        for (&app.status_messages) |*entry| {
+            if (entry.*) |*m| combined_len = appendToastLine(&combined_text, combined_len, m.text[0..m.text_len]);
         }
-        const copy_len = @min(msg.text_len, combined_text.len - combined_len);
-        @memcpy(combined_text[combined_len..][0..copy_len], msg.text[0..copy_len]);
-        combined_len += copy_len;
     }
 
     // Count lines for display calculation
@@ -492,11 +512,14 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     _ = c.GetWindowRect(main_hwnd, &app_rect);
     const app_width = app_rect.right - app_rect.left;
     const app_height = app_rect.bottom - app_rect.top;
+    const target: c.RECT = if (is_confirm) app_rect else msgTargetRect(app, app.config.messages.msg_pos.ext_float);
 
     // Calculate window size based on message type
     var window_width: c_int = undefined;
     var window_height: c_int = undefined;
     const line_height: c_int = @as(c_int, @intCast(cell_h)) + app.scalePx(4);
+    const text_pad = app.scalePx(message_text_pad_px);
+    const stored = combined_text[0..@min(combined_len, message_text_capacity)];
 
     if (is_confirm) {
         // For confirm dialogs (like E325), use larger fixed width and calculate height
@@ -506,27 +529,28 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
         var calc_height: c_int = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
         // The paint word-wraps, so long E325 lines take several rows: measured
         // as the paint draws them, or the choice line falls off the bottom.
-        const text_pad = app.scalePx(message_text_pad_px);
-        const stored = combined_text[0..@min(combined_len, message_text_capacity)];
         if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
             calc_height = @max(calc_height, text_h + 2 * text_pad);
         }
         window_height = @max(app.scalePx(200), @min(calc_height, app_height - app.scalePx(100)));
         if (applog.isEnabled()) applog.appLog("[win] confirm dialog: line_count={d} calc_height={d} window_height={d}\n", .{ line_count, calc_height, window_height });
     } else {
-        // For regular messages, use text-based width calculation
-        const text_len_int: c_int = @intCast(combined_len);
-        const estimated_width: c_int = @intCast(@as(u32, @intCast(text_len_int)) * (cell_h / 2) + @as(u32, @intCast(padding * 2)));
-        const max_width = app.scalePx(600);
-        window_width = @max(app.scalePx(100), @min(estimated_width, max_width));
+        // The widest line in the paint font, capped at min(80% of the
+        // target, 600px) as macOS's toast.
+        var utf16: [message_text_capacity]u16 = undefined;
+        const utf16_len = utf8ToUtf16Lossy(&utf16, stored);
+        const text_w: c_int = if (measureTextPx(main_hwnd, @intCast(app.cell_h_px), utf16[0..utf16_len], 0, c.DT_LEFT | c.DT_TOP)) |size| size.w else 0;
+        const natural_width = text_w + 2 * padding;
+        const max_width = @min(@divTrunc((target.right - target.left) * 4, 5), app.scalePx(600));
+        window_width = @max(app.scalePx(100), @min(natural_width, max_width));
         window_height = @intCast(@as(u32, @intCast(line_height)) * line_count + @as(u32, @intCast(padding * 2)));
         // Text wider than the cap wraps, and the box grows to hold it: measured
         // in the paint font, as macOS measures its toast. A single line was
         // drawn DT_SINGLELINE and cut at the right edge.
-        if (estimated_width > max_width) {
-            is_long_mode = true;
-            const text_pad = app.scalePx(message_text_pad_px);
-            const stored = combined_text[0..@min(combined_len, message_text_capacity)];
+        // Several lines are measured too: line_height follows linespace, the
+        // paint font does not, so a negative linespace undercounts them.
+        if (natural_width > window_width) is_long_mode = true;
+        if (is_long_mode or line_count > 1) {
             if (wrappedTextHeightPx(main_hwnd, @intCast(app.cell_h_px), stored, window_width - 2 * text_pad)) |text_h| {
                 window_height = @max(window_height, text_h + 2 * text_pad);
             }
@@ -559,7 +583,7 @@ pub fn showMessageWindowOnUIThread(app: *App, msg: app_mod.DisplayMessage, inclu
     } else {
         // Regular messages: top-right of msg_pos.ext_float's target, as
         // msg_show and macOS's toast.
-        const pos = external_windows.msgFloatOrigin(app, msgTargetRect(app, app.config.messages.msg_pos.ext_float), window_width, null);
+        const pos = external_windows.msgFloatOrigin(app, target, window_width, null);
         window_x = pos.x;
         window_y = pos.y;
     }
@@ -814,8 +838,11 @@ pub fn updateMiniWindows(app: *App) void {
     const font_px = miniFontPx(app);
     app.mu.unlock(core.clock.io());
 
-    // Minis stack upward from the target's bottom-right corner.
+    // Minis stack upward from the target's bottom-right corner, no wider than
+    // the main window (macOS's miniWindowSize).
     const target = msgTargetRect(app, mini_pos_mode);
+    var main_rect: c.RECT = undefined;
+    const max_width_px: c_int = if (c.GetWindowRect(main_hwnd, &main_rect) != 0) main_rect.right - main_rect.left else std.math.maxInt(c_int);
     const anchor_x: c_int = target.right;
     const anchor_y: c_int = target.bottom;
 
@@ -824,7 +851,7 @@ pub fn updateMiniWindows(app: *App) void {
     for (0..app.mini_windows.len) |idx| {
         app.mu.lockUncancelable(core.clock.io());
         const text_len = app.mini_windows[idx].text_len;
-        var text_buf: [256]u8 = undefined;
+        var text_buf: [mini_text_capacity]u8 = undefined;
         if (text_len > 0) {
             @memcpy(text_buf[0..text_len], app.mini_windows[idx].text[0..text_len]);
         }
@@ -847,11 +874,11 @@ pub fn updateMiniWindows(app: *App) void {
         // Sized from the text in the font paintMiniWindow draws it in; editor
         // cell metrics clipped it under a negative linespace or a font
         // narrower than Consolas. Lines break at '\n' only.
-        var text_utf16: [256]u16 = undefined;
+        var text_utf16: [mini_text_capacity]u16 = undefined;
         const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
         const text_size = measureTextPx(main_hwnd, font_px, text_utf16[0..text_utf16_len], 0, mini_draw_flags) orelse
             TextSizePx{ .w = 0, .h = font_px };
-        const window_width: c_int = @max(app.scalePx(40), text_size.w + 2 * app.scalePx(mini_text_pad_px));
+        const window_width: c_int = @min(max_width_px, @max(app.scalePx(40), text_size.w + 2 * app.scalePx(mini_text_pad_px)));
         const window_height: c_int = text_size.h;
 
         // Position: right edge of target area, stacking upward from bottom
@@ -995,7 +1022,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
 
     // Find which mini window this is
     app.mu.lockUncancelable(core.clock.io());
-    var text_buf: [256]u8 = undefined;
+    var text_buf: [mini_text_capacity]u8 = undefined;
     var text_len: usize = 0;
     inline for ([_]app_mod.MiniWindowId{ .showmode, .showcmd, .ruler, .custom }) |id| {
         const idx = @intFromEnum(id);
@@ -1046,7 +1073,7 @@ pub fn paintMiniWindow(hwnd: c.HWND, app: *App) void {
     // Convert text to UTF-16
     // Decoded, not byte-zero-extended: showmode/showcmd/ruler carry non-ASCII
     // (e.g. "-- 挿入 --"), which zero-extension renders as mojibake.
-    var text_utf16: [256]u16 = undefined;
+    var text_utf16: [mini_text_capacity]u16 = undefined;
     const text_utf16_len = utf8ToUtf16Lossy(&text_utf16, text_buf[0..text_len]);
 
     // Draw text centered

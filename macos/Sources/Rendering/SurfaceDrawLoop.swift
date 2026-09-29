@@ -8,7 +8,6 @@ import MetalKit
 /// down but not enforced, so a change to one would have left the other behind.
 protocol SurfaceDrawLoopHost: MTKView {
     /// How many consecutive frames this surface has had nothing to draw.
-    /// Owned by the host because the two surfaces run different thresholds.
     var drawLoopIdleCounter: DrawLoopIdleCounter { get set }
 
     /// Named in the `[drawloop]` trace lines, so a capture says which surface

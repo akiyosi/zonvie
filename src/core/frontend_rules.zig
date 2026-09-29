@@ -22,6 +22,27 @@ pub fn tabMoveCommand(buf: []u8, from_idx: u32, drop_idx: u32, tab_count: u32) ?
     return std.fmt.bufPrint(buf, "{d}tabnext | tabmove {d}", .{ from_idx + 1, pos }) catch null;
 }
 
+/// The insertion index a tab drag at `pos` drops on: the first of `count`
+/// equal tabs (tab i starts at origin + i*stride and is `size` long) whose
+/// centre is past `pos`, else `count`. One axis: x on a tab bar, y down a
+/// sidebar.
+pub fn tabDropIndex(pos: f64, count: u32, origin: f64, stride: f64, size: f64) u32 {
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        if (pos < origin + @as(f64, @floatFromInt(i)) * stride + size / 2) return i;
+    }
+    return count;
+}
+
+test "tabDropIndex is the first tab whose centre is past the pointer" {
+    // Tabs at 10, 110, 210, each 90 long: centres 55, 155, 255.
+    try std.testing.expectEqual(@as(u32, 0), tabDropIndex(54, 3, 10, 100, 90));
+    try std.testing.expectEqual(@as(u32, 1), tabDropIndex(55, 3, 10, 100, 90));
+    try std.testing.expectEqual(@as(u32, 2), tabDropIndex(200, 3, 10, 100, 90));
+    try std.testing.expectEqual(@as(u32, 3), tabDropIndex(900, 3, 10, 100, 90));
+    try std.testing.expectEqual(@as(u32, 0), tabDropIndex(0, 0, 10, 100, 90));
+}
+
 /// The command that moves the only window of tab `tab_idx` (0-based) into an
 /// external window, leaving a scratch buffer in the tab. Refuses a tab with a
 /// split. nvim_open_win rather than a split: under ext_windows a split would
@@ -103,6 +124,54 @@ pub fn sshTarget(value: []const u8) SshTarget {
 pub fn cliNextIsValue(next: ?[]const u8) bool {
     const n = next orelse return false;
     return !std.mem.startsWith(u8, n, "-");
+}
+
+/// A message or cmdline panel's background from Normal's (sRGB 0..1): HSB
+/// brightness moved 0.05 toward the middle, hue and saturation kept. With
+/// both kept, that is RGB scaled by the brightness ratio.
+pub fn panelBg(r: f32, g: f32, b: f32) [3]f32 {
+    const v = @max(r, @max(g, b));
+    const v2 = if (v < 0.5) @min(v + 0.05, 1.0) else @max(v - 0.05, 0.0);
+    if (v == 0) return .{ v2, v2, v2 };
+    const k = v2 / v;
+    return .{ r * k, g * k, b * k };
+}
+
+test "panelBg moves brightness toward the middle and keeps hue and saturation" {
+    const tol = 1e-6;
+    const dark = panelBg(0.1, 0.2, 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), dark[2], tol);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35) / 3.0, dark[0], tol);
+    const light = panelBg(1.0, 1.0, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.95), light[0], tol);
+    const black = panelBg(0, 0, 0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), black[1], tol);
+}
+
+/// Whether `arg` is a file argument to nvim: not a flag (`-`), not a command
+/// (`+`), not the value of the option `prev` names (`-u NONE`). After `--`
+/// every token but `-` (stdin) is a file.
+pub fn nvimArgIsFile(prev: ?[]const u8, arg: []const u8, after_dash_dash: bool) bool {
+    if (arg.len == 0) return false;
+    if (after_dash_dash) return !std.mem.eql(u8, arg, "-");
+    if (arg[0] == '-' or arg[0] == '+') return false;
+    const takes_value = [_][]const u8{ "-u", "-i", "-c", "-S", "-s", "-w", "-W", "-l", "--cmd", "--listen", "--server", "--startuptime" };
+    if (prev) |p| for (takes_value) |o| if (std.mem.eql(u8, p, o)) return false;
+    return true;
+}
+
+test "nvimArgIsFile keeps flags, commands and option values out of the file list" {
+    try std.testing.expect(nvimArgIsFile(null, "foo.txt", false));
+    try std.testing.expect(nvimArgIsFile("-p", "foo.txt", false));
+    try std.testing.expect(nvimArgIsFile(null, "C:foo.txt", false));
+    try std.testing.expect(!nvimArgIsFile(null, "-p", false));
+    try std.testing.expect(!nvimArgIsFile(null, "+10", false));
+    try std.testing.expect(!nvimArgIsFile("-u", "NONE", false));
+    try std.testing.expect(!nvimArgIsFile("--cmd", "set nu", false));
+    try std.testing.expect(!nvimArgIsFile(null, "", false));
+    try std.testing.expect(nvimArgIsFile(null, "-u", true));
+    try std.testing.expect(nvimArgIsFile(null, "+10", true));
+    try std.testing.expect(!nvimArgIsFile(null, "-", true));
 }
 
 /// A devcontainer workspace or config path as the devcontainer commands can
@@ -436,6 +505,32 @@ test "a cmdline taking 90% of the width is centred" {
     const area: Rect = .{ .left = 100, .top = 0, .right = 1100, .bottom = 900 };
     const old: Rect = .{ .left = 150, .top = 280, .right = 550, .bottom = 320 };
     try std.testing.expectEqual(Point{ .x = 150, .y = 280 }, cmdlineOrigin(old, 900, 40, area));
+}
+
+pub const CmdlineCols = extern struct { screen_cols: u32, default_cols: u32 };
+
+/// The cmdline's width budget in cells, from widths in the frontend's pixels.
+/// `screen_cols` caps its growth: the work area less the chrome beside the
+/// grid and `margin_px`, at least 40. `default_cols` is its width before the
+/// content needs more: the cmdline window spans 95% of the main window, chrome
+/// included, at least 20. A zero width gives 0, "not supplied" to the core.
+pub fn cmdlineCols(work_w_px: u32, main_w_px: u32, chrome_px: u32, margin_px: u32, cell_w_px: u32) CmdlineCols {
+    const cw = @max(1, cell_w_px);
+    const target_w_px: u32 = @intCast(@as(u64, main_w_px) * 95 / 100);
+    return .{
+        .screen_cols = if (work_w_px == 0) 0 else @max(40, (work_w_px -| (chrome_px +| margin_px)) / cw),
+        .default_cols = if (main_w_px == 0) 0 else @max(20, (target_w_px -| chrome_px) / cw),
+    };
+}
+
+test "the cmdline grows to the work area less chrome and margin, from 95% of the main window" {
+    // 2000 - 64 - 40 = 1896 / 8 = 237; 1000 * 95% = 950 - 64 = 886 / 8 = 110.
+    try std.testing.expectEqual(CmdlineCols{ .screen_cols = 237, .default_cols = 110 }, cmdlineCols(2000, 1000, 64, 40, 8));
+}
+
+test "a narrow screen or window still gives the cmdline 40 and 20 cells" {
+    try std.testing.expectEqual(CmdlineCols{ .screen_cols = 40, .default_cols = 20 }, cmdlineCols(50, 50, 64, 40, 8));
+    try std.testing.expectEqual(CmdlineCols{ .screen_cols = 0, .default_cols = 0 }, cmdlineCols(0, 0, 64, 40, 8));
 }
 
 // ---------------------------------------------------------------------------

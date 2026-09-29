@@ -79,15 +79,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
 
     /// Track if we've presented at least once (for loadAction optimization)
     private var hasPresentedOnce = false
-    /// Until this moment, `occlusionState` may still describe this window as it
-    /// stood BEFORE the app itself ordered another window in front of it. See
-    /// markOcclusionSuspect.
-    private var occlusionSuspectUntil: CFAbsoluteTime = 0
-    /// Measured at 25-36ms — about two vsyncs — between the app ordering a
-    /// window in front and the server publishing the occlusion that follows
-    /// from it. 100ms leaves margin without being long enough to be seen: the
-    /// window it holds back has just lost focus.
-    private static let occlusionSuspectSeconds: CFTimeInterval = 0.1
 
     /// The GPU objects every surface shares, handed in at construction. Before
     /// this, these were copied in one by one and the rest were reached through
@@ -169,12 +160,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// the ledger's two halves are compared against. Both are drawn-thread
     /// state, filled under `lock` alongside `layerSnapshot`.
     private var placementRowsUpSnapshot: [Int64: Int] = [:]
-    private var floatDebtBaselineSnapshot: [Int64: FloatDebtBaseline] = [:]
-    /// Last debt reported per layer, so `[float_debt]` is a transition line
-    /// rather than a per-frame one. The main surface keeps the same map; this
-    /// surface had the ledger and not the line, which is why the window a
-    /// float carries debt in could not be measured here.
-    private var hostedDebtLastLogged: [Int64: Int] = [:]
+    private var floatDebtLedger = SurfaceFloatDebtLedger()
 
     /// Clear what the bracket staged and mark it closed. Called with `lock`
     /// held, from both arms of commitFlush and from cancelFlush: what "closed"
@@ -220,35 +206,16 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         // thread under it, and this runs on the main thread. Unlocked, the two
         // mutated one Swift dictionary at once.
         lock.lock()
-        let placementRowsUp = (seedingBaseline ? placementRowsUpSnapshot[gridId] : layerPlacementRowsUp[gridId]) ?? 0
-        let resolved = floatDebtBaselineFollowing(
+        let rows = floatDebtLedger.rows(
+            gridId: gridId,
             anchorGridId: anchorGridId,
-            stored: floatDebtBaselineSnapshot[gridId],
             anchorRowsUp: anchorRowsUp,
-            placementRowsUp: placementRowsUp
+            placementRowsUp: (seedingBaseline ? placementRowsUpSnapshot[gridId] : layerPlacementRowsUp[gridId]) ?? 0,
+            seeding: seedingBaseline,
+            surfaceId: self.gridId,
+            log: ZonvieCore.appLogEnabled ? { ZonvieCore.appLog($0) } : nil
         )
-        if resolved.seeded {
-            if seedingBaseline { floatDebtBaselineSnapshot[gridId] = resolved.baseline }
-            lock.unlock()
-            return 0
-        }
-        let baseline = resolved.baseline
-        let rows = floatDebtRowsUp(
-            anchorRowsUp: anchorRowsUp,
-            placementRowsUp: placementRowsUp,
-            baseline: baseline
-        )
-        // The draw's reading is the surface's state; the hit test only reads it.
-        let logChanged = seedingBaseline && ZonvieCore.appLogEnabled && hostedDebtLastLogged[gridId] != rows
-        if logChanged { hostedDebtLastLogged[gridId] = rows }
         lock.unlock()
-        if logChanged {
-            ZonvieCore.appLog(
-                "[float_debt] surface=\(self.gridId) gridId=\(gridId) rows=\(rows)"
-                    + " anchorUp=\(anchorRowsUp) placeUp=\(placementRowsUp)"
-                    + " base=(\(baseline.anchorRowsUp),\(baseline.placementRowsUp))"
-            )
-        }
         // The displacement the debt adds to the drawn origin, +y down. A float
         // whose placement ran `rows` ahead of its anchor (rows < 0 when it
         // moved up first) is held where it was drawn by moving it back down,
@@ -261,12 +228,15 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     /// The same debt, read with `lock` already held and the anchor's count
     /// taken before it. Never seeds: the draw's body call defines the zero.
     private func hostedFloatDebtPxLocked(gridId: Int64, anchorRowsUp: Int, cellHeightPx: Float) -> Float {
-        guard cellHeightPx > 0, let baseline = floatDebtBaselineSnapshot[gridId],
-              baseline.anchorGridId == self.gridId else { return 0 }
-        let rows = floatDebtRowsUp(
+        guard cellHeightPx > 0 else { return 0 }
+        let rows = floatDebtLedger.rows(
+            gridId: gridId,
+            anchorGridId: self.gridId,
             anchorRowsUp: anchorRowsUp,
             placementRowsUp: placementRowsUpSnapshot[gridId] ?? 0,
-            baseline: baseline
+            seeding: false,
+            surfaceId: self.gridId,
+            log: nil
         )
         return -Float(rows) * cellHeightPx
     }
@@ -1234,8 +1204,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
                 committedSurfaceLayers = staged
                 pendingSurfaceLayers = nil
                 pruneSurfaceLayerLedger(&layerPlacementRowsUp, to: staged)
-                pruneSurfaceLayerLedger(&floatDebtBaselineSnapshot, to: staged)
-                pruneSurfaceLayerLedger(&hostedDebtLastLogged, to: staged)
+                floatDebtLedger.prune(to: staged)
                 // Removing the last child must erase its old pixels too.
                 pendingLayoutDamage = true
             }
@@ -1778,29 +1747,6 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
         return
     }
 
-    /// Request a redraw after vertices are submitted.
-    /// The app just ordered some window in front; this one may now be covered
-    /// and does not know it yet.
-    ///
-    /// `occlusionState` is published asynchronously by the window server, so
-    /// for a frame or two after a window is covered it still reports
-    /// `.visible` — while its layer has already stopped being composited, so
-    /// `currentDrawable` has no drawable to return and burns its full
-    /// one-second timeout on the MAIN thread. Every run of
-    /// extfloat_resize_shader_stall shows one or two such frames right after
-    /// `[cursor_grid_changed] activated main window`, and the runs that fail
-    /// are the ones where one of them had to pay: the nine recorded failures
-    /// stall 1008-1018ms, which is that timeout and nothing else.
-    ///
-    /// The app knows it ordered the window in front — that is not asynchronous
-    /// — so the frames in between are skipped rather than guessed at. A window
-    /// that turns out to still be visible loses at most 100ms of animation on
-    /// a focus change.
-    func markOcclusionSuspect() {
-        occlusionSuspectUntil = CFAbsoluteTimeGetCurrent() + Self.occlusionSuspectSeconds
-        // The frames skipped below are frames the animation still owes.
-        requestRedraw()
-    }
 
     // MARK: - MTKViewDelegate
 
@@ -2079,18 +2025,14 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // popupmenu panel empty until the notification lands — and a
             // window with nothing on screen yet has no stale content worth
             // protecting, so it is allowed to pay the acquire once.
-            // Ahead of the guard below, because the state that guard reads is
-            // the stale one during this window. hasPresentedOnce for the same
-            // reason the guard has it: a window with nothing on screen yet has
-            // nothing to protect and must be allowed to draw its first frame.
-            if hasPresentedOnce, CFAbsoluteTimeGetCurrent() < occlusionSuspectUntil {
+            switch hasPresentedOnce ? visibilityGate() : .draw {
+            case .draw:
+                break
+            case .unsettled:
                 ZonvieCore.appLog("[ext_draw_defer] gridId=\(gridId) occlusion not settled yet; skipping frame")
                 requestRedraw()
                 return
-            }
-
-            if hasPresentedOnce, let win = view.window,
-               win.isMiniaturized || !win.occlusionState.contains(.visible) {
+            case .hidden:
                 ZonvieCore.appLog("[ext_draw_skip] gridId=\(gridId) window not visible; skipping frame")
                 deactivateSurfaceDrawLoop()
                 return
@@ -2625,7 +2567,7 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
             // nothing displaced to discard. A layer's originPx is already
             // surface-absolute, so the rectangle needs no further placement.
             fixedFloatMask.rebuild(
-                layers: layerSnapshot, rootGridId: gridId, floatFlagOnly: false, smoothScrolling: smoothScrolling,
+                layers: layerSnapshot, rootGridId: gridId, smoothScrolling: smoothScrolling,
                 cellW: Float(shared.cellWidthPx), cellH: Float(ch), scratch: &fixedFloatRectsScratch
             )
 
@@ -3718,92 +3660,85 @@ final class ExternalGridView: GridInputView, MTKViewDelegate {
     }
 
     /// Which grid a pointer event at `pointPx` (surface content pixels,
-    /// top-origin) targets, and the point in that grid's own cells. A float
-    /// this surface hosts sits above the root, so it takes the event wherever
-    /// it covers the point; `requireScrollable` drops floats that already show
-    /// all of their content, which stay transparent to scrolling the way the
-    /// main window's resolution does.
-    ///
-    /// Two corrections the static layer geometry does not carry, both on the
-    /// rule the main window's hit test uses -- displayed Y == static Y +
-    /// offsetPx:
-    ///  - a layer that follows its anchor is DRAWN at an origin the root's
-    ///    offset displaced (drawHostedLayers shifts it bodily), so the
-    ///    containment test has to use the displaced origin;
-    ///  - a grid easing in its own right has its ROWS displaced inside a frame
-    ///    that stays put, so the row a pixel names is the one the ease moved
-    ///    there.
+    /// top-origin) targets, and the point in that grid's own cells. The grid
+    /// is the core's answer (`zonvie_core_resolve_pointer_grid`) with the two
+    /// corrections the main window's hit test applies: a follower is found
+    /// where it is DRAWN (resolveDisplacedFollowerHit), and a grid easing in
+    /// its own right has its ease undone (scrollAdjustedLocalRow).
     private func resolveInputTarget(
         pointPx: CGPoint,
         requireScrollable: Bool
     ) -> (gridId: Int64, row: Int32, col: Int32) {
-        guard let scroll = core?.scrollModel else { return (gridId, 0, 0) }
+        guard let core else { return (gridId, 0, 0) }
+        let scroll = core.scrollModel
         let cellW = CGFloat(shared.cellWidthPx)
         let cellH = CGFloat(shared.cellHeightPx)
         guard cellW > 0, cellH > 0 else { return (gridId, 0, 0) }
 
-        let grids = core?.getVisibleGridsCached() ?? []
-        let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
-
-        lock.lock()
-        let layers = committedSurfaceLayers
-        lock.unlock()
-
-        var best: (gridId: Int64, row: Int32, col: Int32)?
-        for layer in layers where layer.gridId != gridId {
-            // A float that refuses the mouse is not a target and does not
-            // shadow one: Neovim rejects an event addressed to it without
-            // re-resolving, so picking it would swallow the event instead of
-            // letting it through to the window it is drawn over.
-            guard layer.mouseEnabled else { continue }
-            guard let local = layerLocalPoint(layer, pointPx: pointPx, rootOffsetPx: rootOffsetPx,
-                                              cellW: cellW, cellH: cellH, scroll: scroll)
-            else { continue }
-            let info = grids.first { $0.gridId == layer.gridId }
-            if requireScrollable {
-                // The rule is the core's (`zonvie_core_captures_scroll`); this
-                // file had it written out in Swift. This resolver works in
-                // drawn pixels rather than cell positions, which is why it
-                // asks for the predicate instead of the whole resolve.
-                guard let info,
-                      zonvie_core_captures_scroll(
-                          info.rows, info.marginTop, info.marginBottom, info.lineCount) != 0
-                else { continue }
-            }
-            // `layers` is the core's back-to-front order (zindex, compindex,
-            // draw_order, grid_id), the order zonvie_core_resolve_pointer_grid
-            // ranks by; the last layer holding the point is the front-most.
-            // A strict `z >` kept the FIRST of equal zindex, the one drawn
-            // behind — a third rule beside the core's and Windows'.
-            best = (
-                layer.gridId,
-                scrolledRow(local.y, offsetPx: local.ownOffsetPx, cellH: cellH, info: info),
-                Int32((local.x / cellW).rounded(.down))
-            )
+        // Refreshes the snapshot resolvePointerGrid reads.
+        let grids = core.getVisibleGridsCached()
+        let row = Int32((pointPx.y / cellH).rounded(.down))
+        let col = Int32((pointPx.x / cellW).rounded(.down))
+        let resolve = { (r: Int32, c: Int32) in
+            core.resolvePointerGrid(surfaceId: self.gridId, row: r, col: c, requireScrollable: requireScrollable)
         }
-        return best ?? resolveRootTarget(pointPx: pointPx)
-    }
+        let hit = resolve(row, col)
 
-    /// A surface point inside one layer, as that layer's own pixels, or nil
-    /// when the point is outside the rectangle the layer is DRAWN in.
-    private func layerLocalPoint(
-        _ layer: SurfaceLayer,
-        pointPx: CGPoint,
-        rootOffsetPx: CGFloat,
-        cellW: CGFloat,
-        cellH: CGFloat,
-        scroll: SessionScrollModel
-    ) -> (x: CGFloat, y: CGFloat, ownOffsetPx: CGFloat)? {
-        let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH, scroll: scroll)
-        let originY = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
-                                             rootOffsetPx: rootOffsetPx, cellH: cellH)
-        let x = pointPx.x - CGFloat(layer.originPx.x)
-        let y = pointPx.y - originY
-        guard x >= 0, y >= 0,
-              x < CGFloat(layer.cols) * cellW,
-              y < CGFloat(layer.rows) * cellH
-        else { return nil }
-        return (x, y, ownOffsetPx)
+        var followers: [Int64: CGFloat] = [:]
+        if scroll.hasOffsets {
+            let rootOffsetPx = drawnScrollOffsetPx(gridId, cellH: cellH, scroll: scroll)
+            lock.lock()
+            let layers = committedSurfaceLayers
+            lock.unlock()
+            for layer in layers where layer.gridId != gridId {
+                let ownOffsetPx = drawnScrollOffsetPx(layer.gridId, cellH: cellH, scroll: scroll)
+                let displacedPx = hostedLayerDrawOriginY(layer, ownOffsetPx: ownOffsetPx,
+                                                         rootOffsetPx: rootOffsetPx, cellH: cellH)
+                    - CGFloat(layer.originPx.y)
+                if displacedPx != 0 { followers[layer.gridId] = displacedPx }
+            }
+        }
+        if let displaced = resolveDisplacedFollowerHit(
+            pointPxY: pointPx.y,
+            cellHeightPx: cellH,
+            globalCol: col,
+            staticGridId: hit?.gridId ?? gridId,
+            followers: followers,
+            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
+            resolve: resolve
+        ) {
+            guard displaced.gridId == 1 else { return displaced }
+            // "What is drawn there now" names grid 1, which Neovim resolves
+            // over every window; here the root is named explicitly, so a
+            // static float under the moved one is looked up first.
+            if !requireScrollable {
+                lock.lock()
+                let layers = committedSurfaceLayers
+                lock.unlock()
+                let px = Float(pointPx.x), py = Float(pointPx.y)
+                if let under = layers.last(where: { l in
+                    l.gridId != gridId && followers[l.gridId] == nil && l.mouseEnabled
+                        && px >= l.originPx.x && px < l.originPx.x + Float(l.cols) * Float(cellW)
+                        && py >= l.originPx.y && py < l.originPx.y + Float(l.rows) * Float(cellH)
+                }) {
+                    return (under.gridId, Int32((py - under.originPx.y) / Float(cellH)),
+                            Int32((px - under.originPx.x) / Float(cellW)))
+                }
+            }
+            return resolveRootTarget(pointPx: pointPx)
+        }
+
+        guard let hit, let info = grids.first(where: { $0.gridId == hit.gridId }) else {
+            return resolveRootTarget(pointPx: pointPx)
+        }
+        return (hit.gridId,
+                scrollAdjustedLocalRow(
+                    pointPxY: pointPx.y,
+                    cellHeightPx: cellH,
+                    band: GridRowBand(of: info),
+                    scrollOffsetPx: drawnScrollOffsetPx(hit.gridId, cellH: cellH, scroll: scroll)
+                ),
+                hit.col)
     }
 
     /// Where a hosted layer's rows are DRAWN on this surface, in surface

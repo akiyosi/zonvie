@@ -255,23 +255,9 @@ fn blendAgentEmoji(dst_hdc: c.HDC, hbm: c.HBITMAP, x: i32, y: i32, px: i32) void
     _ = c.AlphaBlend(dst_hdc, x, y, px, px, mem, 0, 0, px, px, bf);
 }
 
-/// Calculate a drop target index from a mouse position along a uniform-sized item list.
-/// Works for both X-axis (titlebar) and Y-axis (sidebar) by passing the appropriate coordinate.
-/// Item i spans origin + i*stride for item_size pixels.
+/// frontend_rules.tabDropIndex in pixels: x on the titlebar, y down the sidebar.
 fn calculateDropTarget(mouse_pos: c_int, item_count: usize, origin: c_int, stride: c_int, item_size: c_int) usize {
-    var target_idx: usize = 0;
-    for (0..item_count) |i| {
-        const item_center: c_int = origin + @as(c_int, @intCast(i)) * stride + @divTrunc(item_size, 2);
-        if (mouse_pos < item_center) {
-            target_idx = i;
-            break;
-        }
-        target_idx = i + 1;
-    }
-    if (target_idx > item_count) {
-        target_idx = item_count;
-    }
-    return target_idx;
+    return core.frontend_rules.tabDropIndex(@floatFromInt(mouse_pos), @intCast(item_count), @floatFromInt(origin), @floatFromInt(stride), @floatFromInt(item_size));
 }
 
 // Content child window for D3D11 rendering (when ext_tabline enabled)

@@ -1406,3 +1406,20 @@ test "copyUtf8Truncated cuts an overflow at a UTF-8 boundary and marks it" {
     const m = helpers.copyUtf8Truncated(&buf, "abcdefghij");
     try std.testing.expectEqualStrings("abcde\u{2026}", buf[0..m]);
 }
+
+test "clampMiniContent keeps ten lines, or nine and a summary, as macOS" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("a\nb", buf[0..helpers.clampMiniContent(&buf, "a\nb\n")]);
+    const ten = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+    try std.testing.expectEqualStrings(ten, buf[0..helpers.clampMiniContent(&buf, ten)]);
+    try std.testing.expectEqualStrings(
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n\u{2026}(3 more lines)",
+        buf[0..helpers.clampMiniContent(&buf, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n")],
+    );
+    // A head past the buffer is cut, and the summary still ends it.
+    var small: [32]u8 = undefined;
+    const long = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11";
+    const out = small[0..helpers.clampMiniContent(&small, long)];
+    try std.testing.expect(std.mem.endsWith(u8, out, "\n\u{2026}(2 more lines)"));
+    try std.testing.expect(std.mem.startsWith(u8, out, "a"));
+}

@@ -2465,8 +2465,8 @@ pub fn runLoop(self: *Core) void {
         // Install the AI-agent tab-status reporter (zero user-side config).
         setupAgentStatus(self);
 
-        // Report 'mousescroll' so the trackpad path knows how many rows one
-        // wheel event is worth. No-op off macOS (see the function).
+        // Report 'mousescroll' so the trackpad path and the message float's
+        // wheel know how many rows one wheel event is worth.
         setupMouseScrollReporter(self);
 
         if (self.stdout_file == null) {
