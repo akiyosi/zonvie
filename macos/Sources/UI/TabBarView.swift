@@ -591,16 +591,9 @@ final class TabBarView: NSView {
                     // Normal in-window drag
                     dragCurrentX = location.x
 
-                    // Calculate drop target
-                    var targetIdx = 0
-                    for i in 0..<tabs.count {
-                        if location.x < tabX(i) + tabWidth / 2 {
-                            targetIdx = i
-                            break
-                        }
-                        targetIdx = i + 1
-                    }
-                    dropTargetIndex = min(targetIdx, tabs.count)
+                    dropTargetIndex = Int(zonvie_core_tab_drop_index(
+                        Double(location.x), UInt32(tabs.count), Double(tabX(0)),
+                        Double(tabWidth + tabSpacing), Double(tabWidth)))
                 }
                 needsDisplay = true
 

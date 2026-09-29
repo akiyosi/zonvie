@@ -1717,6 +1717,18 @@ ZONVIE_API void zonvie_core_cmdline_origin(
     int32_t area_left, int32_t area_top, int32_t area_right, int32_t area_bottom,
     int32_t *out_x, int32_t *out_y);
 
+/* The cmdline's width budget in cells, for zonvie_core_set_screen_cols and
+   zonvie_core_set_cmdline_default_cols (or try_update_layout_px): the work
+   area less `chrome_px` (beside the grid in the cmdline window) and
+   `margin_px`, at least 40; and 95% of the main window less the chrome, at
+   least 20. Widths are in the caller's pixels; a zero width gives 0.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_cmdline_cols(
+    uint32_t work_w_px, uint32_t main_w_px, uint32_t chrome_px,
+    uint32_t margin_px, uint32_t cell_w_px,
+    uint32_t *out_screen_cols, uint32_t *out_default_cols);
+
 /* The top-left corner of msg_show / msg_history, Y growing downward: `margin`
    in from the target rect's top-right corner, or, for msg_show while
    msg_history is up (has_history), `gap` below history_bottom. Margins are in
@@ -1758,6 +1770,35 @@ ZONVIE_API void zonvie_core_parse_ssh_target(
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_cli_next_is_value(const char *next, size_t len);
+
+/* A message or cmdline panel's background from Normal's (sRGB, 0..1): HSB
+   brightness moved 0.05 toward the middle, hue and saturation kept. `out`
+   receives r, g, b.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API void zonvie_core_panel_bg(float r, float g, float b, float out[3]);
+
+/* The colour family a message panel draws a msg_show `kind` in; the RGB of
+   each is the frontend's, NORMAL meaning Normal's foreground. Errors (emsg,
+   echoerr, lua_error, rpc_error), wmsg, prompts (confirm, confirm_sub,
+   number_prompt, return_prompt) and search_count.
+
+   Pure — no core pointer, no lock. */
+#define ZONVIE_MSG_TONE_NORMAL 0u
+#define ZONVIE_MSG_TONE_ERROR 1u
+#define ZONVIE_MSG_TONE_WARN 2u
+#define ZONVIE_MSG_TONE_PROMPT 3u
+#define ZONVIE_MSG_TONE_SEARCH 4u
+ZONVIE_API uint8_t zonvie_core_msg_kind_tone(const char *kind, size_t len);
+
+/* Whether `arg` is a file argument to nvim: not a flag (`-`), not a command
+   (`+`), not the value of the option `prev` names (`-u NONE`, `--cmd x`);
+   `prev` may be NULL. After `--` every token but `-` (stdin) is a file.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_nvim_arg_is_file(const char *prev, size_t prev_len,
+                                             const char *arg, size_t arg_len,
+                                             bool after_dash_dash);
 
 /* The `devcontainer exec --workspace-folder "<workspace>" [--config
    "<config>"] --remote-env XDG_CONFIG_HOME=/nvim-config nvim --embed` command
@@ -1811,6 +1852,14 @@ ZONVIE_API size_t zonvie_core_escape_path_for_cmdline(
 
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_shader_needs_animation(const char *source, size_t len);
+
+/* The insertion index a tab drag at `pos` drops on: the first of `count`
+   equal tabs (tab i starts at origin + i*stride and is `size` long) whose
+   centre is past `pos`, else `count`. One axis: x on a tab bar, y down a
+   sidebar.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API uint32_t zonvie_core_tab_drop_index(double pos, uint32_t count, double origin, double stride, double size);
 
 /* Move the tab at from_idx (0-based) to the drop insertion index drop_idx of
    the tab list before the move, as one command that also makes it current.
@@ -2025,13 +2074,12 @@ ZONVIE_API void zonvie_core_set_option_as_meta(zonvie_core *core, uint8_t value)
    option changes, so sub-cell scrolling can account an event as the N rows it
    is actually worth. 'ver:0' disables mouse scrolling in Neovim altogether —
    it is not a page-relative setting — and reports 0, as does a null core.
-   The reporter is installed on macOS only; elsewhere this returns Neovim's
-   default (3) and should not be relied on. */
+   The reporter is installed on every platform. */
 ZONVIE_API uint32_t zonvie_core_get_mousescroll_ver(zonvie_core *core);
 
 /* Columns one horizontal wheel event scrolls: the 'hor' component of
-   'mousescroll', from the same reporter (macOS only; elsewhere Neovim's
-   default, 6). 'hor:0' reports 0, as does a null core. */
+   'mousescroll', from the same reporter. 'hor:0' reports 0, as does a null
+   core. */
 ZONVIE_API uint32_t zonvie_core_get_mousescroll_hor(zonvie_core *core);
 
 /* Check if cursor is visible.
@@ -2153,8 +2201,8 @@ ZONVIE_API void zonvie_core_update_layout_px(
 // caller can retry on false without risking an infinite loop.
 //
 // screen_cols folds zonvie_core_set_screen_cols into the same lock: pass 0 to
-// keep the drawable-width-derived value, or a display-derived cell count to
-// override it (macOS cmdline max width). Calling the blocking
+// keep the value last supplied, or a display-derived cell count to replace
+// it. Calling the blocking
 // zonvie_core_set_screen_cols afterwards would re-acquire grid_mu and negate
 // the non-blocking guarantee. cmdline_default_cols folds
 // zonvie_core_set_cmdline_default_cols in for the same reason; 0 keeps the
@@ -2174,7 +2222,9 @@ ZONVIE_API bool zonvie_core_try_update_layout_px(
 );
 
 // Set screen width in cells (for cmdline max width).
-// This should be called when screen size or cell size changes.
+// This should be called when screen size or cell size changes. The value
+// survives layout updates and sessions; until one is supplied, or after 0,
+// the main grid's cols stand in.
 ZONVIE_API void zonvie_core_set_screen_cols(zonvie_core *core, uint32_t cols);
 
 // Set the cmdline's default width in cells: the width it shows before its

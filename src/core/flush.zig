@@ -575,6 +575,26 @@ pub inline fn simdFindRunEndU8(items: []const u8, start: usize, limit: usize, ta
     return i;
 }
 
+/// The run of cells from `c` that one underline or strikethrough quad covers:
+/// same style flags, sp, grid and base deco flags, and same fg when sp is
+/// unset (the colour falls back to fg then; with sp set, fg does not split).
+const DecoRun = struct { end: u32, flags: u8, color: [4]f32, grid_id: i64, deco: u32 };
+
+inline fn decoRun(rc: *const RenderCells, c: u32, cols: u32) DecoRun {
+    const flags = rc.style_flags_arr.items[@intCast(c)];
+    const sp = rc.sp_rgbs.items[@intCast(c)];
+    const fg = rc.fg_rgbs.items[@intCast(c)];
+    const grid_id = rc.grid_ids.items[@intCast(c)];
+    const deco = rc.deco_base_flags.items[@intCast(c)];
+    const sp_set = sp != highlight.Highlights.SP_NOT_SET;
+    const fg_end: usize = if (sp_set) cols else simdFindRunEndU32(rc.fg_rgbs.items, c + 1, cols, fg);
+    const end = @min(
+        @min(simdFindRunEndU8(rc.style_flags_arr.items, c + 1, cols, flags), simdFindRunEndU32(rc.sp_rgbs.items, c + 1, cols, sp)),
+        @min(@min(simdFindRunEndI64(rc.grid_ids.items, c + 1, cols, grid_id), simdFindRunEndU32(rc.deco_base_flags.items, c + 1, cols, deco)), fg_end),
+    );
+    return .{ .end = @intCast(end), .flags = flags, .color = VH.rgb(if (sp_set) sp else fg), .grid_id = grid_id, .deco = deco };
+}
+
 /// Fused run-end scan over up to 6 SoA attribute arrays in a single pass.
 /// Returns the first index in [start, limit) where ANY of the enabled arrays
 /// differs from its target. Equivalent to:
@@ -965,22 +985,8 @@ pub const VH = struct {
         grid_id: i64,
         base_deco_flags: u32,
     ) !void {
-        const pts = quadPx(x0, y0, x1, y1);
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const p2 = pts[2];
-        const p3 = pts[3];
-
         try out.ensureUnusedCapacity(alloc, 6);
-        const v = out.addManyAsSliceAssumeCapacity(6);
-
-        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
+        pushSolidQuadAssumeCapacity(out, x0, y0, x1, y1, col, grid_id, base_deco_flags);
     }
 
     /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
@@ -1065,166 +1071,6 @@ pub const VH = struct {
         // - UV.y = local Y position within quad (0.0 at top, 1.0 at bottom)
         const uv_top: [2]f32 = .{ -1.0, 0.0 };
         const uv_bottom: [2]f32 = .{ -1.0, 1.0 };
-
-        try out.ensureUnusedCapacity(alloc, 6);
-        const v = out.addManyAsSliceAssumeCapacity(6);
-
-        v[0] = .{ .position = p0, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-        v[1] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-        v[2] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-
-        v[3] = .{ .position = p1, .texCoord = uv_top, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-        v[4] = .{ .position = p2, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-        v[5] = .{ .position = p3, .texCoord = uv_bottom, .color = col, .grid_id = grid_id, .deco_flags = deco_flags, .deco_phase = deco_phase };
-    }
-};
-
-/// Parameters for the unified 5-pass row vertex generation.
-/// Quad emission primitives in grid-local pixels, shared by the main-surface
-/// flush and the external grid path. The frontend applies the layer
-/// transform, so nothing here knows which surface it is building for.
-const Helpers = struct {
-    /// Quad corners in grid-local pixels: TL, TR, BL, BR. The
-    /// frontend applies the layer transform.
-    inline fn quadPx(x0: f32, y0: f32, x1: f32, y1: f32) [4][2]f32 {
-        return .{
-            .{ x0, y0 },
-            .{ x1, y0 },
-            .{ x0, y1 },
-            .{ x1, y1 },
-        };
-    }
-
-    /// SIMD-accelerated RGB→float4 conversion.
-    inline fn rgb(v: u32) [4]f32 {
-        return rgba(v, 1.0);
-    }
-
-    /// SIMD-accelerated RGBA→float4 conversion.
-    inline fn rgba(v: u32, alpha: f32) [4]f32 {
-        const V4u32 = @Vector(4, u32);
-        const V4f32 = @Vector(4, f32);
-        const vv: V4u32 = @splat(v);
-        const channels = (vv >> V4u32{ 16, 8, 0, 0 }) & @as(V4u32, @splat(0xFF));
-        const floats = @as(V4f32, @floatFromInt(channels)) * @as(V4f32, @splat(1.0 / 255.0));
-        var arr: [4]f32 = floats;
-        arr[3] = alpha;
-        return arr;
-    }
-
-    const solid_uv: [2]f32 = .{ -1.0, -1.0 };
-
-    fn pushSolidQuad(
-        out: *std.ArrayListUnmanaged(c_api.Vertex),
-        alloc: std.mem.Allocator,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        col: [4]f32,
-        grid_id: i64,
-        base_deco_flags: u32,
-    ) !void {
-        const pts = quadPx(x0, y0, x1, y1);
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const p2 = pts[2];
-        const p3 = pts[3];
-
-        try out.ensureUnusedCapacity(alloc, 6);
-        const v = out.addManyAsSliceAssumeCapacity(6);
-
-        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-    }
-
-    /// Same as pushSolidQuad but caller guarantees capacity (6 vertices).
-    fn pushSolidQuadAssumeCapacity(
-        out: *std.ArrayListUnmanaged(c_api.Vertex),
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        col: [4]f32,
-        grid_id: i64,
-        base_deco_flags: u32,
-    ) void {
-        const pts = quadPx(x0, y0, x1, y1);
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const p2 = pts[2];
-        const p3 = pts[3];
-
-        const v = out.addManyAsSliceAssumeCapacity(6);
-
-        v[0] = .{ .position = p0, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[1] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[2] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-        v[3] = .{ .position = p1, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[4] = .{ .position = p2, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[5] = .{ .position = p3, .texCoord = solid_uv, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-    }
-
-    /// Glyph quad with per-corner UVs; caller guarantees capacity (6 vertices).
-    fn pushGlyphQuadAssumeCapacity(
-        out: *std.ArrayListUnmanaged(c_api.Vertex),
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        uv0: [2]f32,
-        uv1: [2]f32,
-        uv2: [2]f32,
-        uv3: [2]f32,
-        col: [4]f32,
-        grid_id: i64,
-        base_deco_flags: u32,
-    ) void {
-        const pts = quadPx(x0, y0, x1, y1);
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const p2 = pts[2];
-        const p3 = pts[3];
-
-        const v = out.addManyAsSliceAssumeCapacity(6);
-
-        v[0] = .{ .position = p0, .texCoord = uv0, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[1] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[2] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-
-        v[3] = .{ .position = p1, .texCoord = uv1, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[4] = .{ .position = p2, .texCoord = uv2, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-        v[5] = .{ .position = p3, .texCoord = uv3, .color = col, .grid_id = grid_id, .deco_flags = base_deco_flags, .deco_phase = 0 };
-    }
-
-    fn pushDecoQuad(
-        out: *std.ArrayListUnmanaged(c_api.Vertex),
-        alloc: std.mem.Allocator,
-        x0: f32,
-        y0: f32,
-        x1: f32,
-        y1: f32,
-        col: [4]f32,
-        grid_id: i64,
-        deco_flags: u32,
-        deco_phase: f32,
-    ) !void {
-        const pts = quadPx(x0, y0, x1, y1);
-        const p0 = pts[0];
-        const p1 = pts[1];
-        const p2 = pts[2];
-        const p3 = pts[3];
-
-        // Decoration UV: x = -1 sentinel, y = local position within
-        // the quad (0.0 top, 1.0 bottom) for the shader.
-        const uv_top: [2]f32 = .{ -1.0, 0.0 }; // y0 vertices (top)
-        const uv_bottom: [2]f32 = .{ -1.0, 1.0 }; // y1 vertices (bottom)
 
         try out.ensureUnusedCapacity(alloc, 6);
         const v = out.addManyAsSliceAssumeCapacity(6);
@@ -1632,36 +1478,12 @@ pub fn generateRowVertices(
             }
 
             const run_start = c;
-            const run_flags = cell_style_flags;
-            const run_sp = rc.sp_rgbs.items[@intCast(c)];
-            const run_fg = rc.fg_rgbs.items[@intCast(c)];
-            const run_grid_id = rc.grid_ids.items[@intCast(c)];
-            const run_deco = rc.deco_base_flags.items[@intCast(c)];
-
-            // fg must also match when sp is unset (deco_color falls back to fg in
-            // that case); when sp IS set, fg is irrelevant to the run so don't
-            // constrain on it (avoids splitting runs unnecessarily).
-            const fg_run_end: u32 = if (run_sp == highlight.Highlights.SP_NOT_SET)
-                @intCast(simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c + 1), @intCast(cols), run_fg))
-            else
-                cols;
-
-            const run_end: u32 = @intCast(@min(
-                simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
-                @min(
-                    simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                    @min(
-                        simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
-                        @min(
-                            simdFindRunEndU32(rc.deco_base_flags.items, @intCast(c + 1), @intCast(cols), run_deco),
-                            fg_run_end,
-                        ),
-                    ),
-                ),
-            ));
-
-            const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
-            const deco_scroll_flag: u32 = run_deco;
+            const run = decoRun(rc, c, cols);
+            const run_flags = run.flags;
+            const run_grid_id = run.grid_id;
+            const run_end = run.end;
+            const deco_color = run.color;
+            const deco_scroll_flag: u32 = run.deco;
 
             const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
             const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
@@ -2811,44 +2633,17 @@ pub fn generateRowVertices(
                 continue;
             }
 
-            const run_start = c;
-            const run_flags = c_style_flags;
-            const run_sp = rc.sp_rgbs.items[@intCast(c)];
-            const run_fg = rc.fg_rgbs.items[@intCast(c)];
-            const run_grid_id = rc.grid_ids.items[@intCast(c)];
-            const run_deco = rc.deco_base_flags.items[@intCast(c)];
-
-            const fg_run_end: u32 = if (run_sp == highlight.Highlights.SP_NOT_SET)
-                @intCast(simdFindRunEndU32(rc.fg_rgbs.items, @intCast(c + 1), @intCast(cols), run_fg))
-            else
-                cols;
-
-            const run_end: u32 = @intCast(@min(
-                simdFindRunEndU8(rc.style_flags_arr.items, @intCast(c + 1), @intCast(cols), run_flags),
-                @min(
-                    simdFindRunEndU32(rc.sp_rgbs.items, @intCast(c + 1), @intCast(cols), run_sp),
-                    @min(
-                        simdFindRunEndI64(rc.grid_ids.items, @intCast(c + 1), @intCast(cols), run_grid_id),
-                        @min(
-                            simdFindRunEndU32(rc.deco_base_flags.items, @intCast(c + 1), @intCast(cols), run_deco),
-                            fg_run_end,
-                        ),
-                    ),
-                ),
-            ));
-
-            const deco_color = if (run_sp != highlight.Highlights.SP_NOT_SET) VH.rgb(run_sp) else VH.rgb(run_fg);
-            const strike_scroll_flag: u32 = run_deco;
-            const x0: f32 = @as(f32, @floatFromInt(run_start)) * cellW;
-            const x1: f32 = @as(f32, @floatFromInt(run_end)) * cellW;
+            const run = decoRun(rc, c, cols);
+            const x0: f32 = @as(f32, @floatFromInt(c)) * cellW;
+            const x1: f32 = @as(f32, @floatFromInt(run.end)) * cellW;
             const row_y: f32 = @as(f32, @floatFromInt(r)) * cellH;
 
             const sy0 = row_y + cellH * 0.5 - 0.5;
             const sy1 = sy0 + 1.0;
             try ensureRowQuadCapacity(core, out, p.max_vertices, 1);
-            try VH.pushDecoQuad(out, core.alloc, x0, sy0, x1, sy1, deco_color, run_grid_id, c_api.DECO_STRIKETHROUGH | strike_scroll_flag, 0);
+            try VH.pushDecoQuad(out, core.alloc, x0, sy0, x1, sy1, run.color, run.grid_id, c_api.DECO_STRIKETHROUGH | run.deco, 0);
 
-            c = run_end;
+            c = run.end;
         }
         if (log_enabled) stats.strike_ns = @intCast(@max(0, clock.nowNs() - t_strike_start));
     }
@@ -3974,17 +3769,21 @@ fn failSurfaceLayout(self: *Core, err: anyerror) void {
     }
 }
 
-/// Resolve through anchors without guessing a main-window placement for an
-/// unresolved or cyclic chain. No allocation on redraw/flush paths.
-pub fn surfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
-    return grid.surfaceForGrid(grid_id);
-}
-
 /// Resolving an anchor id does not imply that its surface has a root layout.
 pub fn placedSurfaceForGrid(grid: *const grid_mod.Grid, grid_id: i64) ?i64 {
-    const surface = surfaceForGrid(grid, grid_id) orelse return null;
+    const surface = grid.surfaceForGrid(grid_id) orelse return null;
     _ = grid.bufForConst(surface) orelse return null;
     return surface;
+}
+
+/// Whether positioned grid `grid_id` is a non-empty layer of `surface_id`.
+/// An external grid is its own surface, never a layer of another.
+fn isLayerOfSurface(self: *Core, grid_id: i64, surface_id: i64) bool {
+    if (grid_id == 1) return false;
+    if (self.grid.external_grids.contains(grid_id)) return false;
+    if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) return false;
+    const sg = self.grid.sub_grids.getPtr(grid_id) orelse return false;
+    return sg.rows != 0 and sg.cols != 0;
 }
 
 fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
@@ -3992,12 +3791,7 @@ fn collectSurfaceLayerEntries(self: *Core, surface_id: i64) []const GridEntry {
     var it = self.grid.win_pos.iterator();
     while (it.next()) |e| {
         const grid_id = e.key_ptr.*;
-        if (grid_id == 1) continue;
-        // An external grid is its own surface, never a layer of another.
-        if (self.grid.external_grids.contains(grid_id)) continue;
-        if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) continue;
-        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
-        if (sg.rows == 0 or sg.cols == 0) continue;
+        if (!isLayerOfSurface(self, grid_id, surface_id)) continue;
 
         const layer = self.grid.win_layer.get(grid_id) orelse grid_mod.WinLayer{
             .zindex = 0,
@@ -4097,13 +3891,7 @@ fn collectSurfaceLayers(self: *Core, surface_id: i64) []const c_api.Layer {
 fn surfaceHasLayers(self: *Core, surface_id: i64) bool {
     var it = self.grid.win_pos.iterator();
     while (it.next()) |e| {
-        const grid_id = e.key_ptr.*;
-        if (grid_id == 1) continue;
-        if (self.grid.external_grids.contains(grid_id)) continue;
-        if (placedSurfaceForGrid(&self.grid, grid_id) != surface_id) continue;
-        const sg = self.grid.sub_grids.get(grid_id) orelse continue;
-        if (sg.rows == 0 or sg.cols == 0) continue;
-        return true;
+        if (isLayerOfSurface(self, e.key_ptr.*, surface_id)) return true;
     }
     return false;
 }
@@ -4436,7 +4224,7 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
     // DECO_CURSOR so the shader treats it as decoration, not a background
     // subject to transparency.
     try out.ensureUnusedCapacity(core.alloc, 6);
-    Helpers.pushSolidQuadAssumeCapacity(out, q.x0, ry0, rx1, ry1, Helpers.rgb(q.bg_rgb), q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
+    VH.pushSolidQuadAssumeCapacity(out, q.x0, ry0, rx1, ry1, VH.rgb(q.bg_rgb), q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
 
     // The character under a block cursor, in inverted colour.
     const cp = q.cell.cp;
@@ -4446,13 +4234,13 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
         const blk_geo = block_elements.getBlockGeometry(cp);
         if (blk_geo.count == 0) return .ok;
         try out.ensureUnusedCapacity(core.alloc, @as(usize, blk_geo.count) * 6);
-        const fg_col = Helpers.rgb(q.fg_rgb);
+        const fg_col = VH.rgb(q.fg_rgb);
         for (blk_geo.rects[0..blk_geo.count]) |rect| {
             // DECO_CURSOR for the same reason the box carries it: the shader
             // fades plain solids to `backgroundAlpha` once blur is on, so the
             // box behind the glyph would stay opaque while the glyph itself
             // went translucent.
-            Helpers.pushSolidQuadAssumeCapacity(out, q.x0 + rect.x0 * q.width, q.y0 + rect.y0 * q.cell_h, q.x0 + rect.x1 * q.width, q.y0 + rect.y1 * q.cell_h, fg_col, q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
+            VH.pushSolidQuadAssumeCapacity(out, q.x0 + rect.x0 * q.width, q.y0 + rect.y0 * q.cell_h, q.x0 + rect.x1 * q.width, q.y0 + rect.y1 * q.cell_h, fg_col, q.grid_id, c_api.DECO_CURSOR | c_api.DECO_SCROLLABLE);
         }
         return .ok;
     }
@@ -4519,7 +4307,7 @@ pub fn emitCursorQuads(core: *Core, out: *std.ArrayListUnmanaged(c_api.Vertex), 
         .{ ge.uv_max[0], span.v0 },
         .{ ge.uv_min[0], span.v1 },
         .{ ge.uv_max[0], span.v1 },
-        Helpers.rgb(q.fg_rgb),
+        VH.rgb(q.fg_rgb),
         q.grid_id,
         cursorGlyphDecoFlags(ge.bytes_per_pixel),
     );
@@ -13457,11 +13245,7 @@ test "the external-grid cursor glyph uses the same corner order as every other q
     try std.testing.expect(!std.meta.eql(VH.solid_uv, glyph[0].texCoord));
 }
 
-test "VH's two solid-quad variants emit the same corner order" {
-    // The file carries three copies of this helper -- VH and one per
-    // vertex-generating function -- but the other two are function-local and
-    // unreachable from a test. They are covered instead by the two cursor
-    // tests above, which drive the real paths. This one pins VH's own pair.
+test "VH's solid quads emit the frontend's corner order" {
     const alloc = std.testing.allocator;
     var out: std.ArrayListUnmanaged(c_api.Vertex) = .empty;
     defer out.deinit(alloc);
@@ -14550,7 +14334,7 @@ test "surface ownership follows nested anchors and rejects unresolved or cyclic 
     try core.grid.setWinFloatPos(3, 43, 1, 2, 50, 0, 2, true);
     try core.grid.resizeGrid(4, 1, 2);
     try core.grid.setWinFloatPos(4, 44, 2, 3, 60, 0, 3, true);
-    try std.testing.expectEqual(@as(?i64, 2), surfaceForGrid(&core.grid, 4));
+    try std.testing.expectEqual(@as(?i64, 2), core.grid.surfaceForGrid(4));
     const layers = collectSurfaceLayers(&core, 2);
     try std.testing.expectEqual(@as(usize, 3), layers.len);
     // A born-external root has no global origin; its sentinel is not a
@@ -14560,11 +14344,11 @@ test "surface ownership follows nested anchors and rejects unresolved or cyclic 
     try std.testing.expectEqual(@as(i32, 2), layers[2].y_px);
 
     core.grid.win_pos.getPtr(3).?.anchor_grid = 99;
-    try std.testing.expectEqual(@as(?i64, null), surfaceForGrid(&core.grid, 4));
+    try std.testing.expectEqual(@as(?i64, null), core.grid.surfaceForGrid(4));
     core.grid.win_pos.getPtr(3).?.anchor_grid = 4;
-    try std.testing.expectEqual(@as(?i64, null), surfaceForGrid(&core.grid, 4));
+    try std.testing.expectEqual(@as(?i64, null), core.grid.surfaceForGrid(4));
     core.grid.win_pos.getPtr(3).?.anchor_grid = 1;
-    try std.testing.expectEqual(@as(?i64, 1), surfaceForGrid(&core.grid, 4));
+    try std.testing.expectEqual(@as(?i64, 1), core.grid.surfaceForGrid(4));
 }
 
 test "surface migration resends unchanged nested grids but same-surface movement does not" {

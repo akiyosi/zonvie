@@ -434,10 +434,6 @@ extension ZonvieConfig {
     /// Extra margin around the cmdline window for screen-width constraint.
     static let cmdlineScreenMargin: CGFloat = 40.0
 
-    /// Fraction of the main window's width the cmdline window spans before its
-    /// content needs more room. Applies to the whole window, chrome included.
-    static let cmdlineDefaultWindowFraction: CGFloat = 0.95
-
     /// Copy-content button size in points (decorated cmdline / message windows).
     /// This is the hit area and the hover wash; the icon is drawn smaller so
     /// the wash has breathing room around it.

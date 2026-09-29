@@ -58,12 +58,6 @@ fn setExternalWindowTopmost(hwnd: c.HWND, topmost: bool) void {
     );
 }
 
-/// Turn a shell file drop into editor input.
-///
-/// `force_cmdline` is set by the external cmdline window: a drop there means
-/// "put this path here" no matter what mode the editor reports. The main
-/// window leaves it false and keeps deciding by mode, so a drop while the
-/// built-in (non-external) command line is up still expands the path.
 /// Whether a drop on this target inserts a path rather than opening the file.
 ///
 /// The drop target decides. `force_cmdline` comes from the external cmdline
@@ -2147,7 +2141,6 @@ pub export fn WndProc(
                 const committed_metrics_gen = committed.metrics_gen;
                 const rows_snapshot: u32 = committed.rows;
                 const row_verts_len: u32 = @intCast(committed.row_map.items.len);
-                const main_verts_len_snapshot: u32 = @intCast(committed.flat_verts.items.len);
 
                 // Read UI metadata under app.mu.
                 const seed_pending_snapshot = app.seed_pending;
@@ -2260,11 +2253,11 @@ pub export fn WndProc(
 
                 if (log_enabled) {
                     applog.appLog(
-                        "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d} main_verts={d}\n",
+                        "[win] WM_PAINT rcPaint=({d},{d})-({d},{d}) dirty={s} need_seed={d} row_mode={d} rows={d} row_verts_len={d}\n",
                         .{
                             ps.rcPaint.left,                       ps.rcPaint.top,                        ps.rcPaint.right,                 ps.rcPaint.bottom,
                             if (dirty == null) "null" else "rect", @as(u32, @intFromBool(did_need_seed)), @as(u32, @intFromBool(row_mode)), rows_snapshot,
-                            row_verts_len,                         main_verts_len_snapshot,
+                            row_verts_len,
                         },
                     );
                     if (row_mode and rows_mismatch) {
@@ -2409,53 +2402,46 @@ pub export fn WndProc(
                             dirty = if (dirty) |old| callbacks.unionRect(old, restored_rect) else restored_rect;
                         }
 
-                        // Non-row mode: draw directly from the refcount-protected
-                        // committed set. acquireForPaint keeps this set immutable
-                        // until releaseFromPaint, and the outer WM_PAINT guard
-                        // rejects Present-driven reentrancy, so an O(V) heap
-                        // snapshot is neither necessary nor safe under OOM.
-                        // IMPORTANT: Do NOT hold app.mu during drawEx.
-                        // drawEx calls DXGI Present which can pump Win32 messages internally.
-                        // If a re-entrant message handler tries app.mu.lock() on the same thread
-                        // -> self-deadlock (SRWLOCK is non-reentrant).
-                        var non_row_draw = false;
-                        if (!committed.row_mode) {
-                            non_row_draw = true;
-                        } else {
-                            // Row-mode flipped mid-frame; skip and let the next paint handle it.
-                            if (log_enabled) applog.appLog("[win] WM_PAINT(non-row) row_mode flipped -> skip\n", .{});
-                        }
-                        if (non_row_draw) {
-                            const cursor_items = render_helpers.cursorVertsForFrame(core.Vertex, committed_cursor.verts.items, app.cursor_blink.visible);
-                            if (g.drawEx(committed.flat_verts.items, cursor_items, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity })) {
-                                render_ok = true;
-                                // Non-row-mode equivalent of row-mode's
-                                // (back_tex_valid_snapshot AND preserve_back) OR rendered_complete.
-                                //
-                                // draw_preserved: drawEx actually preserved back_tex this paint.
-                                //   d3d11_renderer.zig:821 clears whenever
-                                //     !has_presented_once OR dirty == null OR opacity < 1.0,
-                                //   so all three conditions must hold for the previous validity
-                                //   to carry forward. (has_presented_once is true after a
-                                //   successful drawEx so is not re-checked here.)
-                                //
-                                // rendered_complete: drawEx just did a full redraw of complete
-                                //   flat_verts. dirty == null is the "full redraw" indicator
-                                //   for non-row-mode (no scissor restriction). !seed_pending
-                                //   is the proxy for "flat_verts covers the whole grid".
-                                //   Without dirty == null, a transparent partial-dirty paint
-                                //   would clear and only draw within the scissor — bv would
-                                //   then be claimed on an incomplete back_tex.
-                                const draw_preserved =
-                                    back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
-                                const rendered_complete =
-                                    !seed_pending_snapshot and dirty == null;
-                                app.mu.lockUncancelable(core.clock.io());
-                                app.back_tex_valid = draw_preserved or rendered_complete;
-                                app.mu.unlock(core.clock.io());
-                            } else |e| {
+                        // Before the first row commit: background and chrome
+                        // only. Do NOT hold app.mu here: Present can pump
+                        // Win32 messages, and a re-entrant handler taking
+                        // app.mu would self-deadlock.
+                        non_row: {
+                            g.drawEx(&.{}, &.{}, dirty, .{ .content_width = content_width, .content_y_offset = content_y_offset, .content_x_offset = content_x_offset, .sidebar_right_width = sidebar_right_width, .content_height = content_height, .tabbar_bg_color = tabbar_bg_color, .glow_enabled = glow_enabled, .glow_intensity = glow_intensity }) catch |e| {
                                 if (log_enabled) applog.appLog("gpu.draw failed: {any}\n", .{e});
-                            }
+                                break :non_row;
+                            };
+                            var dirty_rects: [1]c.RECT = undefined;
+                            if (dirty) |r| dirty_rects[0] = r;
+                            g.presentFromBack(dirty_rects[0..@intFromBool(dirty != null)], dirty == null) catch |e| {
+                                if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
+                                break :non_row;
+                            };
+                            render_ok = true;
+                            // Non-row-mode equivalent of row-mode's
+                            // (back_tex_valid_snapshot AND preserve_back) OR rendered_complete.
+                            //
+                            // draw_preserved: drawEx actually preserved back_tex this paint.
+                            //   drawEx clears whenever
+                            //     !has_presented_once OR dirty == null OR opacity < 1.0,
+                            //   so all three conditions must hold for the previous validity
+                            //   to carry forward. (has_presented_once is true after a
+                            //   successful present so is not re-checked here.)
+                            //
+                            // rendered_complete: drawEx just did a full redraw.
+                            //   dirty == null is the "full redraw" indicator
+                            //   for non-row-mode (no scissor restriction). !seed_pending
+                            //   is the proxy for "the frame covers the whole grid".
+                            //   Without dirty == null, a transparent partial-dirty paint
+                            //   would clear and only draw within the scissor — bv would
+                            //   then be claimed on an incomplete back_tex.
+                            const draw_preserved =
+                                back_tex_valid_snapshot and dirty != null and g.opacity >= 1.0;
+                            const rendered_complete =
+                                !seed_pending_snapshot and dirty == null;
+                            app.mu.lockUncancelable(core.clock.io());
+                            app.back_tex_valid = draw_preserved or rendered_complete;
+                            app.mu.unlock(core.clock.io());
                         }
                     } else {
                         // --- Row-mode ---
@@ -3164,17 +3150,8 @@ pub export fn WndProc(
                                 // no rect at all. Skipping left every one of
                                 // those hovers invisible.
 
-                                // Present1 scroll params: disabled for now.
-                                // back_tex pixel shift (scrollBackTex) already handles the retained
-                                // content shift. Adding pScrollRect/pScrollOffset to Present1 would
-                                // cause a double-shift since we CopySubresourceRegion back_tex→bb.
 
-                                if (g.presentFromBackRectsWithCursorNoResize(
-                                    present_rects_slice,
-                                    force_full_present,
-                                    null,
-                                    null,
-                                )) {
+                                if (g.presentFromBack(present_rects_slice, force_full_present)) {
                                     render_ok = true;
                                     // Assign back_tex_valid directly so it can also transition
                                     // true → false in the same paint. Two paths to true:
@@ -3207,7 +3184,7 @@ pub export fn WndProc(
                                     app.mu.unlock(core.clock.io());
                                     // last_painted_cursor_row is tracked by drawCursorOverlay above.
                                 } else |e| {
-                                    if (log_enabled) applog.appLog("presentFromBackRectsWithCursorNoResize failed: {any}\n", .{e});
+                                    if (log_enabled) applog.appLog("presentFromBack failed: {any}\n", .{e});
                                 }
 
                                 if (seed_pending_snapshot and effective_rows != 0 and effective_row_valid_count == effective_rows) {
@@ -3254,18 +3231,6 @@ pub export fn WndProc(
                                     resize_age_ms,
                                 },
                             );
-                        }
-
-                        // Nothing was submitted (the present failed, or
-                        // allow_present refused this frame), so the dirty
-                        // state consumed with the layer draw was never paid
-                        // for: put it back. recoverMainPaintFailure re-arms a
-                        // full paint below on the failure path, and this keeps
-                        // the layer present rects on whichever paint runs next.
-                        if (!render_ok and tbs_snapshot.layers.len > 1) {
-                            app.mu.lockUncancelable(core.clock.io());
-                            app_mod.rearmLayerDraw(app, tbs_snapshot.layers.slice());
-                            app.mu.unlock(core.clock.io());
                         }
 
                         if (log_enabled) {
@@ -3829,32 +3794,11 @@ pub export fn WndProc(
                             _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                         },
                         .ext_float => if (messages.statusChannel(kind_str)) |channel| {
-                            // showmode/showcmd/ruler are state, not a log
-                            // (macOS onMsgStatus's rule): each channel keeps
-                            // its latest text, the window shows the non-empty
-                            // ones and does not time out, and it hides only
-                            // when all three are empty. One shared slot made
-                            // the last writer win, and an empty showcmd hid
-                            // the mode. A blocking dialog stays.
+                            // showmode/showcmd/ruler are state, not a log: each
+                            // channel keeps its latest text and joins the toast
+                            // below the stack without timing out.
                             app.status_messages[channel] = if (dm.text_len == 0) null else dm;
-                            if (!messages.messageWindowIsConfirm(app)) {
-                                _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                                app.display_messages.clearRetainingCapacity();
-                                var shown: ?app_mod.DisplayMessage = null;
-                                var append_failed = false;
-                                for (app.status_messages) |entry| {
-                                    const m = entry orelse continue;
-                                    app.display_messages.append(app.alloc, m) catch {
-                                        append_failed = true;
-                                    };
-                                    shown = m;
-                                }
-                                if (shown) |m| {
-                                    messages.showMessageWindowOnUIThread(app, m, append_failed);
-                                } else {
-                                    messages.hideMessageWindow(app);
-                                }
-                            }
+                            messages.refreshToast(app);
                         } else {
                             // Floating window: the display stack. The rule is
                             // the core's, shared with macOS; replace_last
@@ -3898,21 +3842,11 @@ pub export fn WndProc(
                                 }
                             }
                         },
-                        .split => {
-                            // The view's default timeout is 0 (stays until
-                            // msg_clear); a route's `timeout` overrides it,
-                            // as on macOS.
-                            messages.showMessageWindowOnUIThread(app, dm, true);
-                            _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
-                            const timeout_ms = messageTimerMilliseconds(dm.timeout);
-                            if (timeout_ms > 0) {
-                                _ = c.SetTimer(hwnd, TIMER_MSG_AUTOHIDE, timeout_ms, null);
-                            }
-                        },
                         .notification => {
                             if (app.tray_icon) |*tray| tray.showBalloon("Neovim", dm.text[0..dm.text_len]);
                         },
-                        .none => {},
+                        // The core draws split itself; its statuses arrive as mini.
+                        .split, .none => {},
                     }
                 }
             }
@@ -4295,10 +4229,11 @@ pub export fn WndProc(
         c.WM_TIMER => {
             if (wParam == TIMER_MSG_AUTOHIDE) {
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: message window auto-hide\n", .{});
-                // Kill the timer and hide message window
+                // The stack expires; the statuses stay.
                 _ = c.KillTimer(hwnd, TIMER_MSG_AUTOHIDE);
                 if (getApp(hwnd)) |app| {
-                    messages.hideMessageWindow(app);
+                    app.display_messages.clearRetainingCapacity();
+                    messages.refreshToast(app);
                 }
             } else if (wParam == TIMER_MINI_AUTOHIDE) {
                 if (applog.isEnabled()) applog.appLog("[win] WM_TIMER: mini window auto-hide\n", .{});

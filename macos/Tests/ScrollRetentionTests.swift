@@ -857,6 +857,23 @@ private enum ScrollRetentionTests {
                      0, "so the other window's history is not carried as debt")
     }
 
+    /// Only the draw seeds a zero: a reader arriving first (the hit test, the
+    /// locked shader-cursor read) gets 0 and must leave the zero unset.
+    private static func verifySurfaceFloatDebtLedgerSeedsOnlyFromTheDraw() {
+        var ledger = SurfaceFloatDebtLedger()
+        var lines = 0
+        func rows(_ anchor: Int, _ seeding: Bool) -> Int {
+            ledger.rows(gridId: 5, anchorGridId: 2, anchorRowsUp: anchor, placementRowsUp: 0,
+                        seeding: seeding, surfaceId: 1, log: { _ in lines += 1 })
+        }
+        requireEqual(rows(1, false), 0, "an unseeded reader owes nothing")
+        requireEqual(rows(3, true), 0, "the draw seeds against the counters it sees")
+        requireEqual(rows(5, false), 2, "a reader after the draw reads against the draw's zero")
+        requireEqual(rows(5, true), 2, "and so does the draw")
+        requireEqual(rows(5, true), 2, "the same debt again")
+        requireEqual(lines, 1, "one line per change, from the draw only")
+    }
+
     /// A layer ledger never holds the root, and every staged layout does, so a
     /// count comparison left a single closed float's entry behind.
     private static func verifyLedgerForgetsALoneClosedLayer() {
@@ -910,6 +927,7 @@ private enum ScrollRetentionTests {
         verifyReplayLedgerKeepsDroppedShift()
         verifyLedgerForgetsALoneClosedLayer()
         verifyFloatDebtBaselineFollowsOneGrid()
+        verifySurfaceFloatDebtLedgerSeedsOnlyFromTheDraw()
         verifyCommittedRowMutationLedger()
         verifyStagedValueIsPublishedByItsOwnCommit()
         verifyCommittedScrollMerge()
