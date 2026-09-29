@@ -1660,6 +1660,12 @@ pub export fn zonvie_core_tick_msg_throttle(p: ?*zonvie_core) callconv(.c) void 
     box.core.lockGridAsRedrawOwner();
     defer box.core.unlockGridAsRedrawOwner();
 
+    if (box.core.msg_scroll_pending and
+        clock.nowNs() - box.core.msg_scroll_last_send >= flush_mod.msg_scroll_throttle_ns)
+    {
+        box.core.processPendingMsgScroll();
+    }
+
     // The timeout can create/remove external grids. onFlush runs vertex
     // generation and external-window lifecycle notification inside the same
     // frontend bracket, so atlas publication and commit are one transaction.
@@ -2023,6 +2029,16 @@ pub export fn zonvie_core_cli_next_is_value(next: ?[*]const u8, len: usize) call
     return frontend_rules.cliNextIsValue(if (next) |n| n[0..len] else null);
 }
 
+pub export fn zonvie_core_clamp_mini_content(
+    content: ?[*]const u8,
+    len: usize,
+    out: ?[*]u8,
+    cap: usize,
+) callconv(.c) usize {
+    const dst = out orelse return 0;
+    return frontend_rules.clampMiniContent(dst[0..cap], if (content) |cp| cp[0..len] else "");
+}
+
 pub export fn zonvie_core_panel_bg(r: f32, g: f32, b: f32, out: ?*[3]f32) callconv(.c) void {
     (out orelse return).* = frontend_rules.panelBg(r, g, b);
 }
@@ -2030,6 +2046,21 @@ pub export fn zonvie_core_panel_bg(r: f32, g: f32, b: f32, out: ?*[3]f32) callco
 pub export fn zonvie_core_msg_kind_tone(kind: ?[*]const u8, len: usize) callconv(.c) u8 {
     const k = kind orelse return @intFromEnum(config.MsgTone.normal);
     return @intFromEnum(config.toneForKind(k[0..len]));
+}
+
+pub export fn zonvie_core_msg_kind_is_interactive(kind: ?[*]const u8, len: usize) callconv(.c) bool {
+    const k = kind orelse return false;
+    return config.isInteractivePrompt(k[0..len]);
+}
+
+test "the interactive-prompt predicate excludes return_prompt, which shares the prompt tone" {
+    const kinds = [_][]const u8{ "confirm", "confirm_sub", "number_prompt", "return_prompt", "emsg" };
+    const want = [_]bool{ true, true, true, false, false };
+    for (kinds, want) |k, w| {
+        try std.testing.expectEqual(w, zonvie_core_msg_kind_is_interactive(k.ptr, k.len));
+    }
+    try std.testing.expectEqual(@as(u8, 3), zonvie_core_msg_kind_tone("return_prompt".ptr, "return_prompt".len));
+    try std.testing.expect(!zonvie_core_msg_kind_is_interactive(null, 0));
 }
 
 pub export fn zonvie_core_nvim_arg_is_file(

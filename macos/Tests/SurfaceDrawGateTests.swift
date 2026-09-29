@@ -770,6 +770,14 @@ private enum SurfaceDrawGateTests {
         pin.press(button: "middle") { 4 }
         expect(pin.release(button: "middle"), 4, "lone middle release")
         expect(pin.pinned, nil, "lone middle release ends the claim")
+
+        // Right, then middle (which re-pins): the right release must not end
+        // the middle's claim, or the middle release is dropped.
+        pin.press(button: "right") { 6 }
+        pin.press(button: "middle") { 7 }
+        expect(pin.release(button: "right"), 7, "right release under a middle claim")
+        expect(pin.release(button: "middle"), 7, "middle release keeps its pin")
+        expect(pin.pinned, nil, "middle release ends the claim")
     }
 
     /// SurfaceScrollBlitGate against both hand-written originals, over every

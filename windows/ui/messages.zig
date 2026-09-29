@@ -276,8 +276,8 @@ pub fn handleMsgMiniOrExtFloat(
             // Update mini window
             updateMiniWindow(app, mini_id, text_buf[0..text_len]);
         },
-        .ext_float => {
-            // Queue message for ext_float display
+        // Queued: the toast and the tray balloon belong to the UI thread.
+        .ext_float, .notification => {
             app.mu.lockUncancelable(core.clock.io());
             defer app.mu.unlock(core.clock.io());
 
@@ -291,16 +291,9 @@ pub fn handleMsgMiniOrExtFloat(
             req.replace_last = 0;
             req.append = 0;
             // No timeout: the status arm keeps the text until it is emptied.
-            req.view_type = .ext_float;
+            req.view_type = view;
 
             enqueuePendingMessage(app, req, "message");
-        },
-        .notification => {
-            // Show OS notification via balloon
-            const text = text_buf[0..text_len];
-            if (app.tray_icon) |*tray| {
-                tray.showBalloon("Neovim", text);
-            }
         },
         else => {
             // Fallback to mini for other views (confirm, split)
@@ -1143,8 +1136,9 @@ test "message window bg: darker than a light Normal bg, lighter than a dark one"
 
 test "cmdline width: clamped to the work area it is given, other surfaces untouched" {
     const laptop: c.RECT = .{ .left = 2560, .top = 0, .right = 2560 + 1366, .bottom = 768 };
-    const margin: c_int = @intCast(app_mod.CMDLINE_SCREEN_MARGIN);
-    try std.testing.expectEqual(1366 - margin, external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 3000, laptop));
-    try std.testing.expectEqual(@as(c_int, 400), external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 400, laptop));
-    try std.testing.expectEqual(@as(c_int, 3000), external_windows.clampCmdlineWidthToWorkArea(app_mod.MESSAGE_GRID_ID, 3000, laptop));
+    // CMDLINE_SCREEN_MARGIN at 200% DPI.
+    const margin: c_int = 80;
+    try std.testing.expectEqual(1366 - margin, external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 3000, laptop, margin));
+    try std.testing.expectEqual(@as(c_int, 400), external_windows.clampCmdlineWidthToWorkArea(app_mod.CMDLINE_GRID_ID, 400, laptop, margin));
+    try std.testing.expectEqual(@as(c_int, 3000), external_windows.clampCmdlineWidthToWorkArea(app_mod.MESSAGE_GRID_ID, 3000, laptop, margin));
 }

@@ -1771,6 +1771,14 @@ ZONVIE_API void zonvie_core_parse_ssh_target(
    Pure — no core pointer, no lock. */
 ZONVIE_API bool zonvie_core_cli_next_is_value(const char *next, size_t len);
 
+/* Mini window content as shown: a trailing newline dropped, and past ten
+   lines the first nine plus a "…(N more lines)" line. Written to `out`
+   (UTF-8, not NUL-terminated), cut at a UTF-8 boundary with '…' when it does
+   not fit `cap`; returns the bytes written. `len + 48` always fits.
+
+   Pure — no core pointer, no lock. */
+ZONVIE_API size_t zonvie_core_clamp_mini_content(const char *content, size_t len, char *out, size_t cap);
+
 /* A message or cmdline panel's background from Normal's (sRGB, 0..1): HSB
    brightness moved 0.05 toward the middle, hue and saturation kept. `out`
    receives r, g, b.
@@ -1790,6 +1798,12 @@ ZONVIE_API void zonvie_core_panel_bg(float r, float g, float b, float out[3]);
 #define ZONVIE_MSG_TONE_PROMPT 3u
 #define ZONVIE_MSG_TONE_SEARCH 4u
 ZONVIE_API uint8_t zonvie_core_msg_kind_tone(const char *kind, size_t len);
+
+/* Whether msg_show `kind` blocks Neovim until the user answers (confirm,
+   confirm_sub, number_prompt): the kinds the core pins to the confirm view.
+   Unlike the PROMPT tone, excludes return_prompt, which the core answers.
+   Pure — no core pointer, no lock. */
+ZONVIE_API bool zonvie_core_msg_kind_is_interactive(const char *kind, size_t len);
 
 /* Whether `arg` is a file argument to nvim: not a flag (`-`), not a command
    (`+`), not the value of the option `prev` names (`-u NONE`, `--cmd x`);

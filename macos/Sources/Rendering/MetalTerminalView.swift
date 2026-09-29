@@ -813,9 +813,8 @@ final class MetalTerminalView: GridInputView {
                 grid: info,
                 offsetYPx: Float(clampedOffsetPx),
                 gridTopYNDC: gridTopYNDC,
-                // Replaced by the layer's paint rank at draw, the scale the
-                // fixed-float mask is built on.
-                zindex: Int32(clamping: info.zindex)
+                // The paint rank is written at draw (rankOffsets).
+                zindex: 0
             ))
         }
 
@@ -986,17 +985,28 @@ final class MetalTerminalView: GridInputView {
         // offset of its own for the correction below: during an ease or a held
         // bounce a press landed rows from where it is drawn, or in the window
         // behind. See resolveDisplacedFollowerHit.
-        if let displaced = resolveDisplacedFollowerHit(
+        switch resolveDisplacedFollowerHit(
             pointPxY: pointPx.y,
             cellHeightPx: cellH,
             globalCol: globalCol,
             staticGridId: bestGridId,
             followers: drawnFollowerOffsetsPx(),
-            zindexOf: { id in grids.first(where: { $0.gridId == id })?.zindex },
-            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable) }
+            paintRankOf: { id in self.renderer?.paintRank(gridId: id) },
+            resolve: { row, col in self.pointerTargetGrid(globalRow: row, globalCol: col, requireScrollable: requireScrollable) },
+            resolveExcluding: { row, col, excluded in
+                core.resolvePointerGrid(surfaceId: 1, row: row, col: col,
+                                        requireScrollable: requireScrollable, excluding: excluded)
+            }
         ) {
-            ZonvieCore.appLog("[hitTest] result: displaced follower gridId=\(displaced.gridId) row=\(displaced.row) col=\(displaced.col)")
-            return displaced
+        case let .follower(gridId, row, col)?:
+            ZonvieCore.appLog("[hitTest] result: displaced follower gridId=\(gridId) row=\(row) col=\(col)")
+            return (gridId, row, col)
+        case let .uncovered(under)?:
+            bestGridId = under?.gridId ?? 1
+            localRow = under?.row ?? globalRow
+            localCol = under?.col ?? globalCol
+        case nil:
+            break
         }
 
         // Adjust for smooth scroll offset: during scrolling, content rows are
@@ -1141,7 +1151,7 @@ final class MetalTerminalView: GridInputView {
                 marginTop: 0,
                 marginBottom: 0,
                 clipToContent: false,
-                zindex: Int32(clamping: floatGrid.zindex),
+                zindex: 0,
                 debtAnchorRowsUp: debtAnchorRowsUp,
                 debtAnchorGridId: followedGridId
             ))
@@ -1314,8 +1324,11 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
     enum VisibilityGate { case draw, unsettled, hidden }
 
     /// Whether this surface may draw now. `.unsettled` is checked first: during
-    /// it the state `.hidden` reads is the stale one.
-    func visibilityGate() -> VisibilityGate {
+    /// it the state `.hidden` reads is the stale one. `unpresentedMayDraw`: a
+    /// surface with nothing on screen yet draws unless miniaturized, since
+    /// occlusionState lags a window just ordered in.
+    func visibilityGate(unpresentedMayDraw: Bool) -> VisibilityGate {
+        if unpresentedMayDraw, window?.isMiniaturized != true { return .draw }
         if CFAbsoluteTimeGetCurrent() < occlusionSuspectUntil { return .unsettled }
         if let win = window, win.isMiniaturized || !win.occlusionState.contains(.visible) { return .hidden }
         return .draw
@@ -1338,6 +1351,15 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
             hadRecentCommit: hadRecentCommit(withinNs: 50_000_000),
             heldActive: core?.keyInput.synthesisHeld(by: self) == true
         ) {
+            deactivateSurfaceDrawLoop()
+        }
+    }
+
+    /// A hidden frame parks the loop, except while a synthesized key repeat is
+    /// armed: its safety tick runs at the top of draw(). Showing the window
+    /// repaints it, which re-activates the loop.
+    func parkDrawLoopWhenHidden() {
+        if core?.keyInput.synthesisHeld(by: self) != true {
             deactivateSurfaceDrawLoop()
         }
     }
@@ -1399,7 +1421,10 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
 
     /// An event's position in surface pixels from the top-left.
     func surfacePointPx(_ event: NSEvent) -> CGPoint {
-        let location = convert(event.locationInWindow, from: nil)
+        surfacePointPx(atViewPoint: convert(event.locationInWindow, from: nil))
+    }
+
+    func surfacePointPx(atViewPoint location: CGPoint) -> CGPoint {
         let scale = backingScale
         return CGPoint(x: location.x * scale, y: bounds.height * scale - location.y * scale)
     }
@@ -1603,7 +1628,8 @@ class GridInputView: MTKView, NSTextInputClient, SurfaceDrawLoopHost, IMEPreedit
             guard let rebased = rebaseToPinnedGrid(event, pinned: pinned) else { return }
             target = rebased
         } else {
-            target = resolvePointerTarget(event, requireScrollable: false)
+            // No press claimed it: Neovim never saw one, as on Windows.
+            return
         }
         core.sendMouseInput(button: button, action: action, modifier: neovimModifierString(event.modifierFlags),
                             gridId: target.gridId, row: target.row, col: target.col)
@@ -1932,6 +1958,10 @@ final class IMEPreeditController {
     private func hideOverlay() {
         preeditView.isHidden = true
         preeditView.clear()
+        // A foreign view would keep it past this controller's lifetime.
+        if let superview = preeditView.superview, superview !== host?.imePreeditContainer {
+            preeditView.removeFromSuperview()
+        }
     }
 
     // MARK: Helpers
